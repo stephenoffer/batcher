@@ -6,7 +6,7 @@
 and `.mode`; pixel data is decoded lazily on access, which this source never
 triggers — so no image is ever decoded at read time.
 
-Needs the ``image`` extra (Pillow): ``pip install 'batcher[image]'``.
+Needs the ``image`` extra (Pillow): ``pip install 'batcher-engine[image]'``.
 """
 
 from __future__ import annotations
@@ -54,6 +54,6 @@ def _pil_image() -> Any:
         from PIL import Image
     except ImportError as exc:
         raise BackendError(
-            "reading images needs the image extra: pip install 'batcher[image]'"
+            "reading images needs the image extra: pip install 'batcher-engine[image]'"
         ) from exc
     return Image

@@ -8,7 +8,7 @@ schema for `schema()`; one whole file is one `Split`.
 
 All `fastavro` imports are deferred — importing this module never requires the
 optional dependency. A missing dependency raises `BackendError` with a
-``pip install 'batcher[avro]'`` hint.
+``pip install 'batcher-engine[avro]'`` hint.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def _require_fastavro() -> Any:
     try:
         import fastavro
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError("Avro support requires fastavro: pip install 'batcher[avro]'") from exc
+        raise BackendError("Avro requires fastavro: pip install 'batcher-engine[avro]'") from exc
     return fastavro
 
 

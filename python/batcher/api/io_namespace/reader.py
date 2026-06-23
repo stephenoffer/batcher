@@ -82,19 +82,19 @@ class Reader:
         return _read(path, format="arrow", **opts)
 
     def avro(self, path: str, **opts: Any) -> Dataset:
-        """Read Avro file(s) (needs ``batcher[avro]``)."""
+        """Read Avro file(s) (needs ``batcher-engine[avro]``)."""
         return _read(path, format="avro", **opts)
 
     def lance(self, path: str, **opts: Any) -> Dataset:
-        """Read a Lance dataset (needs ``batcher[lance]``)."""
+        """Read a Lance dataset (needs ``batcher-engine[lance]``)."""
         return _read(path, format="lance", **opts)
 
     def excel(self, path: str, **opts: Any) -> Dataset:
-        """Read Excel workbook(s) (needs ``batcher[excel]``)."""
+        """Read Excel workbook(s) (needs ``batcher-engine[excel]``)."""
         return _read(path, format="excel", **opts)
 
     def xml(self, path: str, **opts: Any) -> Dataset:
-        """Read XML file(s) (needs ``batcher[xml]``)."""
+        """Read XML file(s) (needs ``batcher-engine[xml]``)."""
         return _read(path, format="xml", **opts)
 
     def logs(self, path: str, **opts: Any) -> Dataset:
@@ -110,7 +110,7 @@ class Reader:
         return _read(path, format="binary", **opts)
 
     def documents(self, path: str, **opts: Any) -> Dataset:
-        """Read PDF document(s) as text rows (needs ``batcher[pdf]``)."""
+        """Read PDF document(s) as text rows (needs ``batcher-engine[pdf]``)."""
         return _read(path, format="documents", **opts)
 
     def numpy(self, path: str, **opts: Any) -> Dataset:
@@ -122,11 +122,11 @@ class Reader:
         return _read(path, format="webdataset", **opts)
 
     def hdf5(self, path: str, **opts: Any) -> Dataset:
-        """Read HDF5 file(s) (needs ``batcher[hdf5]``)."""
+        """Read HDF5 file(s) (needs ``batcher-engine[hdf5]``)."""
         return _read(path, format="hdf5", **opts)
 
     def zarr(self, path: str, **opts: Any) -> Dataset:
-        """Read a Zarr store (needs ``batcher[zarr]``)."""
+        """Read a Zarr store (needs ``batcher-engine[zarr]``)."""
         return _read(path, format="zarr", **opts)
 
     # --- Multimodal --------------------------------------------------------
@@ -134,7 +134,7 @@ class Reader:
         self, path: str, *, decode: bool = False, size: tuple[int, int] | None = None, **opts: Any
     ) -> Dataset:
         """List images (uri/bytes/size/mime + header meta); ``decode=True`` with
-        ``size=(h, w)`` appends an ``image`` (H, W, 3) uint8 tensor (``batcher[image]``)."""
+        ``size=(h, w)`` appends an ``image`` (H, W, 3) uint8 tensor (``batcher-engine[image]``)."""
         ds = _read(path, format="images", **opts)
         return _decode(ds, "image_tensor_dataset", size=size) if (decode or size) else ds
 
@@ -142,7 +142,7 @@ class Reader:
         self, path: str, *, decode: bool = False, sample_rate: int | None = None, **opts: Any
     ) -> Dataset:
         """List audio files + header meta; ``decode=True`` appends a ``waveform``
-        ``list<float32>`` column via soundfile, optionally resampled (``batcher[audio]``)."""
+        ``list<float32>`` column via soundfile, optionally resampled (``batcher-engine[audio]``)."""
         ds = _read(path, format="audio", **opts)
         return _decode(ds, "audio_dataset", sample_rate=sample_rate) if decode else ds
 
@@ -156,7 +156,7 @@ class Reader:
         **opts: Any,
     ) -> Dataset:
         """List video files + header meta; ``decode=True`` with ``size=(h, w)`` appends a
-        ``frames`` (num_frames, H, W, 3) uint8 tensor via PyAV (``batcher[video]``)."""
+        ``frames`` (num_frames, H, W, 3) uint8 tensor via PyAV (``batcher-engine[video]``)."""
         ds = _read(path, format="video", **opts)
         if not (decode or size):
             return ds

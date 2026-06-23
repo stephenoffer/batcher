@@ -45,7 +45,7 @@ def require_module(module: str, *, extra: str) -> ModuleType:
     except ImportError as exc:  # pragma: no cover - exercised only without the driver
         raise BackendError(
             f"{module!r} is required for this source; install it with "
-            f"pip install 'batcher[{extra}]'"
+            f"pip install 'batcher-engine[{extra}]'"
         ) from exc
 
 

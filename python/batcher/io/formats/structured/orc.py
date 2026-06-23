@@ -30,7 +30,7 @@ def _require_orc() -> Any:
         import pyarrow.orc as orc
     except ImportError as exc:  # pragma: no cover - pyarrow ships orc by default
         raise BackendError(
-            "ORC support requires pyarrow built with ORC: pip install 'batcher[all]'"
+            "ORC support requires pyarrow built with ORC: pip install 'batcher-engine[all]'"
         ) from exc
     return orc
 

@@ -7,7 +7,7 @@ Rust/Arrow data plane, so `HudiSink` exists only to raise a clear `BackendError`
 
 All `hudi` imports are deferred — importing this module never requires the
 optional dependency. A missing dependency raises `BackendError` with a
-``pip install 'batcher[hudi]'`` hint.
+``pip install 'batcher-engine[hudi]'`` hint.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def _require_hudi() -> Any:
         from hudi import HudiTable
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise BackendError(
-            "Hudi read support requires hudi-rs: pip install 'batcher[hudi]'"
+            "Hudi read support requires hudi-rs: pip install 'batcher-engine[hudi]'"
         ) from exc
     return HudiTable
 

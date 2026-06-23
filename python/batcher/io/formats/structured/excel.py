@@ -8,7 +8,7 @@ deserialization for a row-oriented, non-Arrow source. Excel is read-only here
 
 All `python_calamine` imports are deferred — importing this module never requires
 the optional dependency. A missing dependency raises `BackendError` with a
-``pip install 'batcher[excel]'`` hint.
+``pip install 'batcher-engine[excel]'`` hint.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ def _require_calamine() -> Any:
         import python_calamine
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise BackendError(
-            "Excel support requires python-calamine: pip install 'batcher[excel]'"
+            "Excel support requires python-calamine: pip install 'batcher-engine[excel]'"
         ) from exc
     return python_calamine
 

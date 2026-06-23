@@ -39,7 +39,7 @@ def triton_client(
         protocol: ``"http"`` or ``"grpc"``.
         model_version: optional model version (default: server-chosen).
 
-    Needs ``tritonclient`` (``pip install 'batcher[triton]'``).
+    Needs ``tritonclient`` (``pip install 'batcher-engine[triton]'``).
     """
     if protocol not in ("http", "grpc"):
         raise BackendError(f"triton protocol must be 'http' or 'grpc', got {protocol!r}")
@@ -62,7 +62,7 @@ class _TritonServingClient:
             else:
                 import tritonclient.http as tc
         except ImportError as exc:  # pragma: no cover - optional extra
-            raise BackendError("Triton needs: pip install 'batcher[triton]'") from exc
+            raise BackendError("Triton needs: pip install 'batcher-engine[triton]'") from exc
         self._tc = tc
         self._client = tc.InferenceServerClient(url=url)
         self._model = model

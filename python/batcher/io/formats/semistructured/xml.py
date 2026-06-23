@@ -7,7 +7,7 @@ as Parquet/Arrow. One whole file is one `Split`.
 
 All `xml2arrow` imports are deferred — importing this module never requires the
 optional dependency. A missing dependency raises `BackendError` with a
-``pip install 'batcher[xml]'`` hint.
+``pip install 'batcher-engine[xml]'`` hint.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ def _require_xml2arrow() -> Any:
     try:
         import xml2arrow
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError("XML support requires xml2arrow: pip install 'batcher[xml]'") from exc
+        raise BackendError("XML requires xml2arrow: pip install 'batcher-engine[xml]'") from exc
     return xml2arrow
 
 

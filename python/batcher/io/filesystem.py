@@ -120,20 +120,24 @@ class _ArrowFileSystem:
     sees its bucket-relative ones.
     """
 
-    __slots__ = ("_atomic_rename", "_fs", "_prefix")
+    __slots__ = ("_atomic_rename", "_fs", "_prefix", "_strip_query")
 
-    def __init__(self, fs: pafs.FileSystem, prefix: str, *, atomic_rename: bool) -> None:
+    def __init__(
+        self, fs: pafs.FileSystem, prefix: str, *, atomic_rename: bool, strip_query: bool = True
+    ) -> None:
         self._fs = fs
         self._prefix = prefix
         self._atomic_rename = atomic_rename
+        # Native backends carry config in the URI query (e.g. ``?endpoint_override=``),
+        # which pyarrow has already consumed — so it is dropped from the object path.
+        # fsspec-backed URLs (e.g. presigned ``https://…?signature=…``) keep it: the
+        # query IS part of the addressable object there.
+        self._strip_query = strip_query
 
     # ---- path <-> URI mapping ---------------------------------------------
     def _p(self, path: str) -> str:
-        """A full path/URI → the in-filesystem path pyarrow expects.
-
-        Any ``?query`` (e.g. ``endpoint_override``) is dropped — it is configuration
-        already baked into `self._fs`, not part of the object path."""
-        p = path.split("?", 1)[0]
+        """A full path/URI → the in-filesystem path the backend expects."""
+        p = path.split("?", 1)[0] if self._strip_query else path
         if self._prefix and p.startswith(self._prefix):
             return p[len(self._prefix) :]
         return p
@@ -290,10 +294,17 @@ def _fsspec_backed(scheme: str, path: str) -> FileSystem:
         from pyarrow.fs import FSSpecHandler, PyFileSystem
     except ImportError as exc:
         raise IOError(
-            f"reading {scheme}:// paths needs the cloud extra: pip install 'batcher[cloud]'"
+            f"reading {scheme}:// paths needs the cloud extra: pip install 'batcher-engine[cloud]'"
         ) from exc
     protocol = _SCHEME_ALIASES.get(scheme, scheme)
-    fs = PyFileSystem(FSSpecHandler(fsspec.filesystem(protocol)))
-    in_path = path[len(scheme) + 3 :]  # strip "scheme://"
-    prefix = path[: len(path) - len(in_path)]
-    return _ArrowFileSystem(fs, prefix, atomic_rename=protocol not in _OBJECT_STORE_SCHEMES)
+    fsspec_fs = fsspec.filesystem(protocol)
+    fs = PyFileSystem(FSSpecHandler(fsspec_fs))
+    # The in-filesystem path is whatever fsspec's `_strip_protocol` produces — object
+    # stores strip the scheme ("bucket/key"), but HTTP(S) keep the whole URL. Derive
+    # the prefix from that so listing/globbing line up with the paths fsspec returns,
+    # and keep the query (presigned-URL signatures live there) by not stripping it.
+    stripped = fsspec_fs._strip_protocol(path)
+    prefix = path[: len(path) - len(stripped)] if path.endswith(stripped) else ""
+    return _ArrowFileSystem(
+        fs, prefix, atomic_rename=protocol not in _OBJECT_STORE_SCHEMES, strip_query=False
+    )

@@ -9,7 +9,7 @@ search run as Rust expressions over the ``text`` column. Read-only; one file is 
 
 All `pypdf` imports are deferred — importing this module never requires the
 optional dependency. A missing dependency raises `BackendError` with a
-``pip install 'batcher[pdf]'`` hint.
+``pip install 'batcher-engine[pdf]'`` hint.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _require_pypdf() -> Any:
     try:
         import pypdf
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError("PDF support requires pypdf: pip install 'batcher[pdf]'") from exc
+        raise BackendError("PDF support requires pypdf: pip install 'batcher-engine[pdf]'") from exc
     return pypdf
 
 

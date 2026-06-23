@@ -182,11 +182,11 @@ class Writer:
         return self(path, "arrow", **opts)
 
     def avro(self, path: str, **opts: Any) -> WriteManifest:
-        """Write as Avro (needs ``batcher[avro]``)."""
+        """Write as Avro (needs ``batcher-engine[avro]``)."""
         return self(path, "avro", **opts)
 
     def lance(self, path: str, **opts: Any) -> WriteManifest:
-        """Write a Lance dataset (needs ``batcher[lance]``)."""
+        """Write a Lance dataset (needs ``batcher-engine[lance]``)."""
         return self(path, "lance", **opts)
 
     def msgpack(self, path: str, **opts: Any) -> WriteManifest:

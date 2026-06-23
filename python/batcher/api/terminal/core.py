@@ -366,7 +366,7 @@ def _to_pandas(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> 
     try:
         import pandas  # noqa: F401
     except ImportError as exc:
-        raise BackendError("to_pandas() needs: pip install 'batcher[pandas]'") from exc
+        raise BackendError("to_pandas() needs: pip install 'batcher-engine[pandas]'") from exc
     return _collect(plan, sources, columns).to_pandas()
 
 
@@ -375,7 +375,7 @@ def _to_polars(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> 
     try:
         import polars
     except ImportError as exc:
-        raise BackendError("to_polars() needs: pip install 'batcher[polars]'") from exc
+        raise BackendError("to_polars() needs: pip install 'batcher-engine[polars]'") from exc
     return polars.from_arrow(_collect(plan, sources, columns))
 
 

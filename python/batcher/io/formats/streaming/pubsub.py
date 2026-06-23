@@ -31,7 +31,7 @@ def _import_subscriber() -> Any:
         from google.cloud import pubsub_v1
     except ImportError as exc:
         raise BackendError(
-            "reading from Pub/Sub needs the pubsub extra: pip install 'batcher[pubsub]'"
+            "reading from Pub/Sub needs the pubsub extra: pip install 'batcher-engine[pubsub]'"
         ) from exc
     return pubsub_v1.SubscriberClient
 

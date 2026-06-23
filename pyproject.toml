@@ -2,13 +2,26 @@
 requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
+# The PyPI distribution name is `batcher-engine` (the bare `batcher` name is taken
+# by an unrelated project). The IMPORT name stays `batcher` — it is derived from the
+# first component of `tool.maturin.module-name` below, not from this name.
 [project]
-name = "batcher"
+name = "batcher-engine"
 description = "A native, JIT-compiling, adaptive data engine — single-node sub-second to PB-scale."
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Batcher contributors" }]
 readme = "README.md"
+keywords = ["arrow", "dataframe", "sql", "query-engine", "jit", "distributed", "etl"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Scientific/Engineering",
+]
 dynamic = ["version"]
 dependencies = [
     "pyarrow>=16",
@@ -17,6 +30,11 @@ dependencies = [
     # decide when to spill. Optional at runtime — it degrades to os.sysconf totals.
     "psutil>=5.9",
 ]
+
+[project.urls]
+Homepage = "https://github.com/stephenoffer/batcher"
+Repository = "https://github.com/stephenoffer/batcher"
+Issues = "https://github.com/stephenoffer/batcher/issues"
 
 [project.optional-dependencies]
 # Distribution is opt-in: Ray is only used for scheduling/actors, never the data plane.
@@ -82,13 +100,13 @@ video = ["av>=12"]
 # --- Framework interop (Ray Data `from_*` parity) ---
 pandas = ["pandas>=2"]
 huggingface = ["datasets>=2.18"]
-# --- Convenience bundles ---
-lakehouse = ["batcher[delta,iceberg,hudi,delta-sharing]"]
-warehouse = ["batcher[sql,connectorx,snowflake,databricks,bigquery,clickhouse,odbc]"]
-nosql = ["batcher[mongo,elasticsearch,couchbase,cassandra,nosql-redis,dynamodb,neo4j,hbase]"]
-streaming = ["batcher[kafka,kinesis,eventhubs,pubsub,pulsar]"]
-multimodal = ["batcher[image,audio,video,pdf]"]
-ml-formats = ["batcher[lance,avro,hdf5,zarr,tfrecord]"]
+# --- Convenience bundles (self-referencing extras use the distribution name) ---
+lakehouse = ["batcher-engine[delta,iceberg,hudi,delta-sharing]"]
+warehouse = ["batcher-engine[sql,connectorx,snowflake,databricks,bigquery,clickhouse,odbc]"]
+nosql = ["batcher-engine[mongo,elasticsearch,couchbase,cassandra,nosql-redis,dynamodb,neo4j,hbase]"]
+streaming = ["batcher-engine[kafka,kinesis,eventhubs,pubsub,pulsar]"]
+multimodal = ["batcher-engine[image,audio,video,pdf]"]
+ml-formats = ["batcher-engine[lance,avro,hdf5,zarr,tfrecord]"]
 dev = [
     "maturin>=1.7,<2",
     "pytest>=8",
@@ -111,9 +129,9 @@ docs = [
     "sphinx-autodoc-typehints>=2",
 ]
 all = [
-    "batcher[ray,polars,duckdb,redis,cloud,torch,tensorflow]",
-    "batcher[lance,avro,excel,xml,protobuf,msgpack,hdf5,zarr,tfrecord,pdf]",
-    "batcher[lakehouse,warehouse,nosql,streaming,multimodal,pandas,huggingface]",
+    "batcher-engine[ray,polars,duckdb,redis,cloud,torch,tensorflow]",
+    "batcher-engine[lance,avro,excel,xml,protobuf,msgpack,hdf5,zarr,tfrecord,pdf]",
+    "batcher-engine[lakehouse,warehouse,nosql,streaming,multimodal,pandas,huggingface]",
 ]
 
 [tool.maturin]

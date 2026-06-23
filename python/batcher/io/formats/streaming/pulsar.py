@@ -33,7 +33,7 @@ def _import_pulsar() -> Any:
         import pulsar
     except ImportError as exc:
         raise BackendError(
-            "reading from Pulsar needs the pulsar extra: pip install 'batcher[pulsar]'"
+            "reading from Pulsar needs the pulsar extra: pip install 'batcher-engine[pulsar]'"
         ) from exc
     return pulsar
 

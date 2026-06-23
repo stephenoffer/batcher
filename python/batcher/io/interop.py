@@ -14,7 +14,7 @@ native Arrow bridges). Per-row Python is never used to move data.
 
 ``from_arrow`` / ``from_pydict`` / ``from_numpy`` are CORE (only pyarrow / numpy).
 Every other adapter does a deferred optional import and raises `BackendError`
-with the right ``pip install 'batcher[<extra>]'`` hint if the framework is absent.
+with the right ``pip install 'batcher-engine[<extra>]'`` hint if the framework is absent.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def _source_from_table(table: pa.Table) -> Source:
 
 
 def _missing(framework: str, extra: str) -> BackendError:
-    return BackendError(f"{framework} interop needs: pip install 'batcher[{extra}]'")
+    return BackendError(f"{framework} interop needs: pip install 'batcher-engine[{extra}]'")
 
 
 # ---- CORE adapters (no optional dependency) ------------------------------

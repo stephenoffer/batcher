@@ -74,7 +74,7 @@ def audio_dataset(
 ) -> Dataset:
     """Decode an audio-bytes column into a ``list<float32>`` waveform column.
 
-    Uses `soundfile` (``batcher[audio]``). Waveforms are variable length, so the
+    Uses `soundfile` (``batcher-engine[audio]``). Waveforms are variable length, so the
     output is a list column (one waveform per row); `sample_rate` (when given)
     resamples via `librosa` if available, else the native rate is kept.
     """
@@ -105,7 +105,7 @@ def video_dataset(
     """Decode a video-bytes column into a ``(num_frames, H, W, 3)`` uint8 tensor column.
 
     Samples `num_frames` evenly-spaced frames and resizes each to `size` via `PyAV`
-    (``batcher[video]``). Fixed frame count and size make the result a fixed-shape
+    (``batcher-engine[video]``). Fixed frame count and size make the result a fixed-shape
     tensor, ready for a video model; undecodable rows become all-zero frames.
     """
     from batcher.io.formats.ml.tensor import as_tensor_column
@@ -137,7 +137,7 @@ def _decode_audio_bytes(data: bytes | None, sample_rate: int | None, mono: bool)
     try:
         import soundfile as sf
     except ImportError as exc:  # pragma: no cover - optional extra
-        raise PlanError("audio decode needs soundfile: pip install 'batcher[audio]'") from exc
+        raise PlanError("audio needs soundfile: pip install 'batcher-engine[audio]'") from exc
     wave, native_sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
     if mono:
         wave = wave.mean(axis=1)
@@ -163,7 +163,7 @@ def _decode_video_bytes(data: bytes, num_frames: int, height: int, width: int) -
     try:
         import av
     except ImportError as exc:  # pragma: no cover - optional extra
-        raise PlanError("video decode needs PyAV: pip install 'batcher[video]'") from exc
+        raise PlanError("video decode needs PyAV: pip install 'batcher-engine[video]'") from exc
     with av.open(io.BytesIO(data)) as container:
         frames = [f.to_ndarray(format="rgb24") for f in container.decode(video=0)]
     if not frames:

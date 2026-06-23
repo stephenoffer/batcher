@@ -31,7 +31,7 @@ def _require_ipc() -> Any:
         import pyarrow.ipc as ipc
     except ImportError as exc:  # pragma: no cover - pyarrow ships ipc by default
         raise BackendError(
-            "Arrow IPC support requires pyarrow: pip install 'batcher[all]'"
+            "Arrow IPC support requires pyarrow: pip install 'batcher-engine[all]'"
         ) from exc
     return ipc
 

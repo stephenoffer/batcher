@@ -9,7 +9,7 @@ point lookups; bulk scans here are the streaming path.
 
 All `lance` imports are deferred — importing this module never requires the
 optional dependency. A missing dependency raises `BackendError` with a
-``pip install 'batcher[lance]'`` hint.
+``pip install 'batcher-engine[lance]'`` hint.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def _require_lance() -> Any:
     try:
         import lance
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError("Lance support requires pylance: pip install 'batcher[lance]'") from exc
+        raise BackendError("Lance requires pylance: pip install 'batcher-engine[lance]'") from exc
     return lance
 
 

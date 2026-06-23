@@ -9,7 +9,7 @@ granularity. The caller supplies the generated message class. One file is one
 
 All `protarrow` / `google.protobuf` imports are deferred — importing this module
 never requires the optional dependency. A missing dependency raises `BackendError`
-with a ``pip install 'batcher[protobuf]'`` hint.
+with a ``pip install 'batcher-engine[protobuf]'`` hint.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def _require_protarrow() -> Any:
         import protarrow
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise BackendError(
-            "Protobuf support requires protarrow + protobuf: pip install 'batcher[protobuf]'"
+            "Protobuf support requires protarrow + protobuf: pip install 'batcher-engine[protobuf]'"
         ) from exc
     return protarrow
 

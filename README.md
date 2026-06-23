@@ -79,6 +79,28 @@ The full design, and the math behind the optimizer and resource manager, is in
 > DuckDB and Polars. Expect APIs to change, and some operators and large-scale paths
 > are still landing.
 
+## Install
+
+Batcher is distributed on PyPI as `batcher-engine` and imported as `batcher`
+(the bare `batcher` name belongs to an unrelated project). Prebuilt wheels ship for
+Linux, macOS, and Windows on Python 3.10+ — no Rust toolchain needed:
+
+```bash
+pip install batcher-engine
+```
+
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"x": [1, 2, 3]})
+print(ds.select(doubled=bt.col("x") * 2).to_pydict())
+# {'doubled': [2, 4, 6]}
+```
+
+Optional features are extras, e.g. `pip install "batcher-engine[ray,cloud]"`. To
+install an unreleased revision from source (requires a [Rust toolchain](https://rustup.rs)):
+`pip install "git+https://github.com/stephenoffer/batcher.git"`.
+
 ## Build from source
 
 ```bash

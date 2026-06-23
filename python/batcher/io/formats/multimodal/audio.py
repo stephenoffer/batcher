@@ -6,7 +6,7 @@ each file's *header* via ``soundfile.info``, which parses container/format
 metadata only — it never decodes the PCM sample array. ``duration`` is seconds
 (``frames / sample_rate``).
 
-Needs the ``audio`` extra (soundfile): ``pip install 'batcher[audio]'``.
+Needs the ``audio`` extra (soundfile): ``pip install 'batcher-engine[audio]'``.
 """
 
 from __future__ import annotations
@@ -58,6 +58,6 @@ def _soundfile() -> Any:
         import soundfile
     except ImportError as exc:
         raise BackendError(
-            "reading audio needs the audio extra: pip install 'batcher[audio]'"
+            "reading audio needs the audio extra: pip install 'batcher-engine[audio]'"
         ) from exc
     return soundfile

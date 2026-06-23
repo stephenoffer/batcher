@@ -32,7 +32,7 @@ def _import_consumer() -> Any:
         from azure.eventhub import EventHubConsumerClient
     except ImportError as exc:
         raise BackendError(
-            "reading from Event Hubs needs the eventhubs extra: pip install 'batcher[eventhubs]'"
+            "reading Event Hubs needs the eventhubs extra: pip install 'batcher-engine[eventhubs]'"
         ) from exc
     return EventHubConsumerClient
 

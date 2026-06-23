@@ -9,7 +9,7 @@ Parquet/Arrow.
 
 All `h5py` imports are deferred — importing this module never requires the optional
 dependency. A missing dependency raises `BackendError` with a
-``pip install 'batcher[hdf5]'`` hint.
+``pip install 'batcher-engine[hdf5]'`` hint.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def _require_h5py() -> Any:
     try:
         import h5py
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError("HDF5 support requires h5py: pip install 'batcher[hdf5]'") from exc
+        raise BackendError("HDF5 requires h5py: pip install 'batcher-engine[hdf5]'") from exc
     return h5py
 
 

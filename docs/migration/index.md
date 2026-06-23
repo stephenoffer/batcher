@@ -204,11 +204,11 @@ for batch in loader:          # {column: torch.Tensor}, this rank's shard
 ```
 
 Offline LLM batch inference over millions of rows wraps any text-generation engine
-(vLLM behind `batcher[vllm]`), built once per worker, with prompt templating and
+(vLLM behind `batcher-engine[vllm]`), built once per worker, with prompt templating and
 structured-output parsing:
 
 ```python
-# docs: skip  (requires a GPU + batcher[vllm]; shown for reference)
+# docs: skip  (requires a GPU + batcher-engine[vllm]; shown for reference)
 from batcher.ml import llm_generate, vllm_engine
 
 for out in llm_generate(

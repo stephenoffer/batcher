@@ -8,7 +8,7 @@ parallel unit as picklable, connection-free splits, and assembles Arrow at batch
 granularity (Arrow-native where the driver supports it). Importing this package
 imports every connector so the registry is populated as a side effect. Optional
 drivers are deferred — a missing driver raises `BackendError` with the matching
-``pip install 'batcher[<extra>]'`` hint.
+``pip install 'batcher-engine[<extra>]'`` hint.
 """
 
 from __future__ import annotations

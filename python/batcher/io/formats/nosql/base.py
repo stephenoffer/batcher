@@ -14,7 +14,7 @@ credentials. A `_ScanSplit` is a frozen, picklable value object that holds only
 the connector class, the (never-logged) connection kwargs, and the opaque
 partition locator; the worker reconstructs the connector from those and fetches
 just its partition. Missing optional drivers raise `BackendError` with an
-actionable ``pip install 'batcher[<extra>]'`` hint.
+actionable ``pip install 'batcher-engine[<extra>]'`` hint.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def require_driver(module: str, extra: str) -> Any:
         return importlib.import_module(module)
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise BackendError(
-            f"{module} is required for this source: pip install 'batcher[{extra}]'"
+            f"{module} is required for this source: pip install 'batcher-engine[{extra}]'"
         ) from exc
 
 

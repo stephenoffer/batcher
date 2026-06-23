@@ -1,8 +1,10 @@
 # Installation
 
-Batcher ships as a single package, `batcher`. The core engine (the Python control
-plane plus the compiled Rust data plane) is self-contained. Optional features such
-as distribution, file formats, and ML backends are pulled in through extras.
+Batcher is distributed on PyPI as **`batcher-engine`** and imported as **`batcher`**
+(the bare `batcher` name on PyPI belongs to an unrelated project). The core engine
+(the Python control plane plus the compiled Rust data plane) is self-contained.
+Optional features such as distribution, file formats, and ML backends are pulled in
+through extras.
 
 ## Requirements
 
@@ -15,7 +17,7 @@ The compiled engine is distributed as a native extension module
 ## Install the core engine
 
 ```
-pip install batcher
+pip install batcher-engine
 ```
 
 After it finishes, the import and a small query should work:
@@ -30,8 +32,8 @@ print(ds.select(doubled=bt.col("x") * 2).to_pydict())
 
 ## Optional extras
 
-Extras are installed with the usual `pip install "batcher[extra]"` syntax. They
-add capabilities without changing the core API.
+Extras are installed with the usual `pip install "batcher-engine[extra]"` syntax.
+They add capabilities without changing the core API.
 
 - `ray` - distributed execution and scheduling. Ray is used for task and actor
   scheduling only; bulk data moves over Arrow Flight, not the Ray object store.
@@ -43,7 +45,16 @@ add capabilities without changing the core API.
 Install several at once:
 
 ```
-pip install "batcher[ray,cloud]"
+pip install "batcher-engine[ray,cloud]"
+```
+
+## Install from GitHub
+
+To install an unreleased revision straight from source (this builds the Rust engine,
+so a [Rust toolchain](https://rustup.rs) is required):
+
+```
+pip install "git+https://github.com/stephenoffer/batcher.git"
 ```
 
 ## Building from source

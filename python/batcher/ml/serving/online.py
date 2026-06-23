@@ -7,7 +7,7 @@ requests with Serve's native ``@serve.batch``. It deliberately introduces **no**
 execution engine — the same ``build`` factory feeds both the offline `InferencePool`
 and this online deployment, so a model proven in batch serves online unchanged.
 
-Gated behind the optional ``batcher[serve]`` extra; importing this module is cheap
+Gated behind the optional ``batcher-engine[serve]`` extra; importing this module is cheap
 (Ray Serve is imported only when a deployment is built).
 """
 
@@ -48,12 +48,12 @@ def serve_deployment(
         A Ray Serve deployment class — ``serve.run(serve_deployment(...).bind())``.
 
     Raises:
-        BackendError: if Ray Serve is not installed (``pip install 'batcher[serve]'``).
+        BackendError: if Ray Serve is not installed (``pip install 'batcher-engine[serve]'``).
     """
     try:
         from ray import serve
     except ImportError as exc:  # pragma: no cover - optional extra
-        raise BackendError("online serving needs: pip install 'batcher[serve]'") from exc
+        raise BackendError("online serving needs: pip install 'batcher-engine[serve]'") from exc
 
     factory = build
 

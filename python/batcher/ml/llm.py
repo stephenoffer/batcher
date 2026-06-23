@@ -11,7 +11,7 @@ parse each structured/JSON output into typed columns.
 
 The engine is injected as a factory, so this works with vLLM, an OpenAI client, or a
 deterministic test double — the engine never depends on a specific library. A vLLM
-adapter (`vllm_engine`) lives behind the optional ``batcher[vllm]`` extra.
+adapter (`vllm_engine`) lives behind the optional ``batcher-engine[vllm]`` extra.
 """
 
 from __future__ import annotations
@@ -108,7 +108,7 @@ def vllm_engine(
     lora_path: str | None = None,
     **engine_kwargs: object,
 ) -> EngineFactory:
-    """An `EngineFactory` backed by vLLM (requires ``batcher[vllm]`` + a GPU).
+    """An `EngineFactory` backed by vLLM (requires ``batcher-engine[vllm]`` + a GPU).
 
     Returns a factory that builds a vLLM engine once per worker and exposes it as a
     ``list[str] -> list[str]`` callable, with full control over modern batch-inference

@@ -32,7 +32,7 @@ def _import_boto3() -> Any:
         import boto3
     except ImportError as exc:
         raise BackendError(
-            "reading from Kinesis needs the kinesis extra: pip install 'batcher[kinesis]'"
+            "reading from Kinesis needs the kinesis extra: pip install 'batcher-engine[kinesis]'"
         ) from exc
     return boto3
 

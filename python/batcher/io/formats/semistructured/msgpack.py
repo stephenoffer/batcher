@@ -9,7 +9,7 @@ per record), which `MsgpackSink` writes and `MsgpackSource` reads. One file is o
 
 All `ormsgpack` imports are deferred — importing this module never requires the
 optional dependency. A missing dependency raises `BackendError` with a
-``pip install 'batcher[msgpack]'`` hint.
+``pip install 'batcher-engine[msgpack]'`` hint.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def _require_ormsgpack() -> Any:
         import ormsgpack
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise BackendError(
-            "MessagePack support requires ormsgpack: pip install 'batcher[msgpack]'"
+            "MessagePack support requires ormsgpack: pip install 'batcher-engine[msgpack]'"
         ) from exc
     return ormsgpack
 

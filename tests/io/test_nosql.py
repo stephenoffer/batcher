@@ -8,7 +8,7 @@ The load-bearing invariants asserted here, all reachable without a live server:
 
 * every connector registers under its documented name (plus the ``scylla`` alias);
 * a missing driver raises a typed `BackendError` with an actionable
-  ``pip install 'batcher[<extra>]'`` hint;
+  ``pip install 'batcher-engine[<extra>]'`` hint;
 * `splits()` returns PICKLABLE, connection-free value objects — verified with a
   `pickle.dumps`/`loads` round-trip — for the connectors whose parallel unit is
   computed locally (token ranges, scan segments, slot ranges);

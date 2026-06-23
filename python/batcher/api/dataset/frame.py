@@ -877,11 +877,11 @@ class Dataset:
         return _collect(self._plan, self._sources, self.columns)
 
     def to_pandas(self):
-        """Execute and return the result as a pandas `DataFrame` (needs `batcher[pandas]`)."""
+        """Execute and return as a pandas `DataFrame` (needs `batcher-engine[pandas]`)."""
         return _to_pandas(self._plan, self._sources, self.columns)
 
     def to_polars(self):
-        """Execute and return the result as a Polars `DataFrame` (needs `batcher[polars]`)."""
+        """Execute and return as a Polars `DataFrame` (needs `batcher-engine[polars]`)."""
         return _to_polars(self._plan, self._sources, self.columns)
 
     def to_pydict(self) -> dict[str, list[Any]]:

@@ -1,6 +1,6 @@
 """Online serving — the thin Ray Serve adapter over the load-once batch primitives.
 
-Without the ``batcher[serve]`` extra, building a deployment must fail with a clear,
+Without the ``batcher-engine[serve]`` extra, building a deployment must fail with a clear,
 actionable error. With Ray Serve present, the deployment is built end to end and its
 batched predictor returns the same result as calling the model directly (the
 batch-vs-online equivalence the adapter promises).

@@ -11,7 +11,7 @@ The fallback path runs the query through a SQL warehouse with
 Arrow result files) — for arbitrary SQL the lakehouse path can't express.
 
 All optional imports are deferred to `BackendError` with a
-``pip install 'batcher[databricks]'`` hint. Tokens ride on splits as plain
+``pip install 'batcher-engine[databricks]'`` hint. Tokens ride on splits as plain
 values and are never logged.
 """
 

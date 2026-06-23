@@ -30,7 +30,7 @@ def _require_databricks_sdk() -> Any:
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise BackendError(
             "Unity Catalog credential vending requires the Databricks SDK: "
-            "pip install 'batcher[databricks]'"
+            "pip install 'batcher-engine[databricks]'"
         ) from exc
     return WorkspaceClient
 

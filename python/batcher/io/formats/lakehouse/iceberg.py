@@ -8,7 +8,7 @@ data files and register them with `add_files`.
 
 All `pyiceberg` imports are deferred — importing this module never requires the
 optional dependency. A missing dependency raises `BackendError` with a
-``pip install 'batcher[iceberg]'`` hint. Operations pyiceberg does not implement
+``pip install 'batcher-engine[iceberg]'`` hint. Operations pyiceberg does not implement
 robustly yet (merge-on-read / equality-delete writes) raise `BackendError`.
 """
 
@@ -34,7 +34,7 @@ def _require_pyiceberg() -> None:
         import pyiceberg  # noqa: F401
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise BackendError(
-            "Iceberg support requires pyiceberg: pip install 'batcher[iceberg]'"
+            "Iceberg support requires pyiceberg: pip install 'batcher-engine[iceberg]'"
         ) from exc
 
 

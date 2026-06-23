@@ -7,7 +7,7 @@ stream's metadata parses the header/index only — no video frame is decoded.
 ``duration`` is seconds; ``frames`` is the stream's declared frame count (may be
 0/None when the container does not record it).
 
-Needs the ``video`` extra (PyAV): ``pip install 'batcher[video]'``.
+Needs the ``video`` extra (PyAV): ``pip install 'batcher-engine[video]'``.
 """
 
 from __future__ import annotations
@@ -65,6 +65,6 @@ def _av() -> Any:
         import av
     except ImportError as exc:
         raise BackendError(
-            "reading video needs the video extra: pip install 'batcher[video]'"
+            "reading video needs the video extra: pip install 'batcher-engine[video]'"
         ) from exc
     return av

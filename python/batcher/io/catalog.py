@@ -57,7 +57,7 @@ def _require_pyiceberg() -> Any:
         from pyiceberg import catalog
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise BackendError(
-            "Iceberg catalogs require pyiceberg: pip install 'batcher[iceberg]'"
+            "Iceberg catalogs require pyiceberg: pip install 'batcher-engine[iceberg]'"
         ) from exc
     return catalog
 

@@ -33,7 +33,7 @@ def _import_consumer() -> Any:
         from confluent_kafka import Consumer
     except ImportError as exc:
         raise BackendError(
-            "reading from Kafka needs the kafka extra: pip install 'batcher[kafka]'"
+            "reading from Kafka needs the kafka extra: pip install 'batcher-engine[kafka]'"
         ) from exc
     return Consumer
 

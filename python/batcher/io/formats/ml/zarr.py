@@ -8,7 +8,7 @@ trailing index (``c0``, ``c1``, …). Read-only; persist results as Parquet/Arro
 
 All `zarr` imports are deferred — importing this module never requires the optional
 dependency. A missing dependency raises `BackendError` with a
-``pip install 'batcher[zarr]'`` hint.
+``pip install 'batcher-engine[zarr]'`` hint.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ def _require_zarr() -> Any:
     try:
         import zarr
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError("Zarr support requires zarr: pip install 'batcher[zarr]'") from exc
+        raise BackendError("Zarr requires zarr: pip install 'batcher-engine[zarr]'") from exc
     return zarr
 
 

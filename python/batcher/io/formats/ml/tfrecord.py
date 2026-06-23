@@ -10,7 +10,7 @@ CRC verification uses `crc32c` when present. One file is one `Split`.
 
 The `crc32c` import is deferred — importing this module never requires it (CRCs are
 simply not verified without it). A missing-but-required dependency raises
-`BackendError` with a ``pip install 'batcher[tfrecord]'`` hint.
+`BackendError` with a ``pip install 'batcher-engine[tfrecord]'`` hint.
 """
 
 from __future__ import annotations

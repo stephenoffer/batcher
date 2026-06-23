@@ -8,7 +8,7 @@ a single atomic delta-rs commit, so a distributed write is one Delta transaction
 
 All `deltalake` imports are deferred — importing this module never requires the
 optional dependency. A missing dependency raises `BackendError` with a
-``pip install 'batcher[delta]'`` hint; a concurrent-writer conflict raises
+``pip install 'batcher-engine[delta]'`` hint; a concurrent-writer conflict raises
 `CommitError`.
 """
 
@@ -35,7 +35,7 @@ def _require_deltalake() -> Any:
         import deltalake
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise BackendError(
-            "Delta Lake support requires delta-rs: pip install 'batcher[delta]'"
+            "Delta Lake support requires delta-rs: pip install 'batcher-engine[delta]'"
         ) from exc
     return deltalake
 

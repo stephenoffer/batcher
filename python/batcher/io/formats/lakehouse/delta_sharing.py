@@ -9,7 +9,7 @@ file becomes its own `Split`, so a distributed read parallelizes file-by-file.
 Reads are scoped to a shared table reference of the form
 ``<profile>#<share>.<schema>.<table>`` (the standard Delta Sharing convention).
 All `delta_sharing` imports are deferred; a missing dependency raises
-`BackendError` with a ``pip install 'batcher[delta-sharing]'`` hint.
+`BackendError` with a ``pip install 'batcher-engine[delta-sharing]'`` hint.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ def _require_delta_sharing() -> Any:
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise BackendError(
             "Delta Sharing support requires the delta-sharing client: "
-            "pip install 'batcher[delta-sharing]'"
+            "pip install 'batcher-engine[delta-sharing]'"
         ) from exc
     return delta_sharing
 
