@@ -71,8 +71,9 @@ and scheduling them as 16K-row morsels. Three things follow from that split:
   only; the data moves over Arrow Flight and never touches the Ray object store, so a
   result is identical whether it ran on one node or a hundred.
 
-The full design, and the math behind the optimizer and resource manager, is in
-[`docs/`](docs/) and `architecture.txt`.
+The full design, and the math behind the optimizer and resource manager, is in the
+[documentation](https://stephenoffer.github.io/batcher/) (sources in [`docs/`](docs/))
+and `architecture.txt`.
 
 > Status: young but working, not yet 1.0. The engine runs SQL and DataFrame workloads
 > single-node and distributed, and is benchmarked for correctness and speed against

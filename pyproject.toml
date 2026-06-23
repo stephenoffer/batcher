@@ -33,6 +33,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/stephenoffer/batcher"
+Documentation = "https://stephenoffer.github.io/batcher/"
 Repository = "https://github.com/stephenoffer/batcher"
 Issues = "https://github.com/stephenoffer/batcher/issues"
 
