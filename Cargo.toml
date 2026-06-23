@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/anyscale/batcher"
+repository = "https://github.com/stephenoffer/batcher"
 authors = ["Batcher contributors"]
 
 [workspace.dependencies]
