@@ -1,0 +1,229 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "batcher"
+description = "A native, JIT-compiling, adaptive data engine — single-node sub-second to PB-scale."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Batcher contributors" }]
+readme = "README.md"
+dynamic = ["version"]
+dependencies = [
+    "pyarrow>=16",
+    "typing_extensions>=4.7",
+    # Carbonite reads live memory pressure (available RAM) to size its envelope and
+    # decide when to spill. Optional at runtime — it degrades to os.sysconf totals.
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+# Distribution is opt-in: Ray is only used for scheduling/actors, never the data plane.
+ray = ["ray[default]>=2.9"]
+# Optional fallback backends + benchmark oracles (NOT part of the core engine).
+polars = ["polars>=1.0"]
+duckdb = ["duckdb>=1.0"]
+# Pluggable MetadataHub backends.
+redis = ["redis>=5"]
+cloud = ["fsspec", "s3fs", "gcsfs"]
+# ML / GPU data plane.
+torch = ["torch>=2.2"]
+tensorflow = ["tensorflow>=2.15"]
+# LLM batch inference operator (ds.ml.llm / batcher.ml.vllm_engine); needs a GPU.
+vllm = ["vllm>=0.6"]
+# Model-serving batch adapters (batcher.ml.serving.triton_client).
+triton = ["tritonclient[all]>=2.40"]
+# Online (low-latency) model serving (batcher.ml.serving.serve_deployment).
+serve = ["ray[serve]>=2.9"]
+# --- File formats (deferred imports; each raises a clear error if absent) ---
+lance = ["pylance>=0.10"]
+avro = ["fastavro>=1.9"]
+excel = ["python-calamine>=0.2"]
+xml = ["xml2arrow>=0.1"]
+protobuf = ["protobuf>=4", "protarrow>=0.3"]
+msgpack = ["ormsgpack>=1"]
+hdf5 = ["h5py>=3.10"]
+zarr = ["zarr>=2.17"]
+tfrecord = ["tfr-reader>=0.1"]
+pdf = ["pypdf>=4"]
+# --- Lakehouse (ACID table formats + catalogs) ---
+delta = ["deltalake>=0.18"]
+iceberg = ["pyiceberg>=0.7"]
+hudi = ["hudi>=0.2"]
+delta-sharing = ["delta-sharing>=1.1"]
+# --- SQL / warehouses (single-submission, Arrow-native) ---
+sql = ["adbc-driver-manager>=1.0", "adbc-driver-flightsql>=1.0"]
+connectorx = ["connectorx>=0.3"]
+snowflake = ["snowflake-connector-python>=3.7"]
+databricks = ["databricks-sql-connector>=3", "databricks-sdk>=0.20"]
+bigquery = ["google-cloud-bigquery-storage>=2.24", "google-cloud-bigquery>=3"]
+clickhouse = ["clickhouse-connect>=0.7"]
+odbc = ["turbodbc>=4.11"]
+# --- NoSQL / operational stores ---
+mongo = ["pymongo>=4.6", "pymongoarrow>=1.3"]
+elasticsearch = ["elasticsearch>=8.18"]
+couchbase = ["couchbase-columnar>=1"]
+cassandra = ["cassandra-driver>=3.29"]
+nosql-redis = ["redis>=5"]
+dynamodb = ["boto3>=1.34"]
+neo4j = ["neo4j>=5.18"]
+hbase = ["happybase>=1.2"]
+# --- Streaming brokers ---
+kafka = ["confluent-kafka>=2.3"]
+kinesis = ["boto3>=1.34"]
+eventhubs = ["azure-eventhub>=5.11"]
+pubsub = ["google-cloud-pubsub>=2.21"]
+pulsar = ["pulsar-client>=3.4"]
+# --- Multimodal sources ---
+image = ["pillow>=10"]
+audio = ["soundfile>=0.12"]
+video = ["av>=12"]
+# --- Framework interop (Ray Data `from_*` parity) ---
+pandas = ["pandas>=2"]
+huggingface = ["datasets>=2.18"]
+# --- Convenience bundles ---
+lakehouse = ["batcher[delta,iceberg,hudi,delta-sharing]"]
+warehouse = ["batcher[sql,connectorx,snowflake,databricks,bigquery,clickhouse,odbc]"]
+nosql = ["batcher[mongo,elasticsearch,couchbase,cassandra,nosql-redis,dynamodb,neo4j,hbase]"]
+streaming = ["batcher[kafka,kinesis,eventhubs,pubsub,pulsar]"]
+multimodal = ["batcher[image,audio,video,pdf]"]
+ml-formats = ["batcher[lance,avro,hdf5,zarr,tfrecord]"]
+dev = [
+    "maturin>=1.7,<2",
+    "pytest>=8",
+    "pytest-benchmark>=4",
+    "pytest-cov>=5",
+    "hypothesis>=6",
+    "import-linter>=2",
+    "ruff>=0.6",
+    "duckdb>=1.0",
+    "polars>=1.0",
+    "numpy>=1.24",
+    "scikit-learn>=1.3",
+]
+# Documentation toolchain (Sphinx + MyST Markdown + Furo theme). Mirrors
+# docs/requirements.txt; `just docs` builds the site and runs the doctest blocks.
+docs = [
+    "sphinx>=7",
+    "myst-parser>=2",
+    "furo>=2024.0.0",
+    "sphinx-autodoc-typehints>=2",
+]
+all = [
+    "batcher[ray,polars,duckdb,redis,cloud,torch,tensorflow]",
+    "batcher[lance,avro,excel,xml,protobuf,msgpack,hdf5,zarr,tfrecord,pdf]",
+    "batcher[lakehouse,warehouse,nosql,streaming,multimodal,pandas,huggingface]",
+]
+
+[tool.maturin]
+# src-layout: the importable Python package lives under python/.
+python-source = "python"
+# The compiled Rust extension is exposed as batcher._native.
+module-name = "batcher._native"
+# Only bc-py links PyO3; it is the workspace member we build into the wheel.
+manifest-path = "crates/bc-py/Cargo.toml"
+features = ["pyo3/extension-module"]
+
+# --- Layer separation (enforced in CI) ---------------------------------------
+# The three subsystems are fully independent: Kyber (optimization), Carbonite
+# (resources), and Core (execution) may each depend on the neutral `plan`,
+# `metadata`, `config`, and `_internal` packages, but NEVER on one another. Only
+# `api` (the conductor) may import all three. `plan` is the neutral contract layer
+# and imports none of them.
+[tool.importlinter]
+root_package = "batcher"
+
+[[tool.importlinter.contracts]]
+name = "Kyber, Carbonite, and Core are independent"
+type = "independence"
+modules = ["batcher.kyber", "batcher.carbonite", "batcher.core"]
+# Core imports the compiled engine as `batcher._native`; import-linter cannot see
+# into the extension module and mis-attributes it to the root `batcher` package
+# (which re-exports the api). Those edges are the engine dependency, not layer ones.
+# (Carbonite also drives `batcher._native` to govern the data plane — the
+# bc-resource pool / bc-transport shuffle — but grimp resolves that to the
+# `batcher._native` submodule, outside the independence set, so it needs no ignore.)
+ignore_imports = [
+    "batcher.core.executor -> batcher",
+    "batcher.core.udf -> batcher",
+    "batcher.core.stats -> batcher",
+    "batcher.core.streaming -> batcher",
+]
+
+[[tool.importlinter.contracts]]
+name = "plan is the neutral contract layer"
+type = "forbidden"
+source_modules = ["batcher.plan"]
+forbidden_modules = [
+    "batcher.kyber",
+    "batcher.carbonite",
+    "batcher.core",
+    "batcher.api",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: fast, no native engine required",
+    "differential: cross-check results against DuckDB/Polars",
+    "integration: end-to-end pipelines",
+    "property: hypothesis-driven invariants",
+    "docs: runnable code blocks extracted from the documentation",
+]
+
+# --- Coverage (pytest-cov) ----------------------------------------------------
+# Measures the Python control plane. The Rust data plane is measured separately
+# via `just cov-rust` (cargo-llvm-cov). The floor is a ratchet: it sits just below
+# the achieved baseline so it blocks regressions, and is raised as coverage grows.
+[tool.coverage.run]
+source = ["batcher"]
+branch = true
+omit = [
+    # The compiled extension and its thin FFI shim are exercised through the data
+    # plane, not the Python suite; measuring them here would be misleading.
+    "*/batcher/_native*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+    "\\.\\.\\.",
+]
+
+# --- Python lint + format (ruff is the single source of truth) ----------------
+# The control plane is the public face of the engine: lint-clean, typed, no
+# duplication, no dead code. See .claude/rules/python-quality.md.
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["python", "tests", "benchmarks", "examples"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes — unused/dead imports & vars (F401/F811/F841)
+    "I",        # import sorting
+    "B",        # bugbear
+    "UP",       # pyupgrade
+    "SIM",      # flake8-simplify
+    "C4",       # flake8-comprehensions
+    "ARG",      # unused arguments (dead code)
+    "ERA",      # eradicate — commented-out code (v1 carried ~2,587 such lines)
+    "RUF",      # ruff-native rules
+]
+# RUF003 flags "ambiguous" Unicode in comments. The engine documents its control
+# theory and math in comments using intentional notation (Greek α/β, typographic
+# dashes); enforcing ASCII there would corrupt meaning, not catch bugs.
+ignore = ["RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests may shadow/redefine fixtures and assert freely.
+"tests/**" = ["ARG"]
+# Examples define mock model/callable signatures with deliberately-unused params to
+# show the real API shape; that is illustrative, not dead code.
+"examples/**" = ["ARG"]

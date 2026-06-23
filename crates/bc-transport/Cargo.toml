@@ -1,0 +1,30 @@
+[package]
+name = "bc-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow.workspace = true
+# Arrow Flight (gRPC) inter-node transport. Pinned to 56.x to match arrow 56 so
+# the RecordBatch/Schema types are identical across the dependency graph.
+arrow-flight = "56"
+# tonic 0.13 is the gRPC stack arrow-flight 56 is built against; keeping it in
+# lockstep avoids a duplicate tonic/prost in the graph.
+tonic = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+# TcpListenerStream: lets us bind an ephemeral port, read it back, then hand the
+# listener to tonic via serve_with_incoming.
+tokio-stream = { version = "0.1", features = ["net"] }
+futures = "0.3"
+dashmap = { workspace = true }
+# async-stream: lets the producer express the credit-gated send loop as a
+# straight-line `async` generator (await a credit, yield a batch) instead of a
+# hand-rolled Stream state machine.
+async-stream = "0.3"
+# Error type. thiserror is the workspace's chosen error-derive crate.
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

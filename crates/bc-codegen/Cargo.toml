@@ -1,0 +1,22 @@
+[package]
+name = "bc-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow.workspace = true
+bc-expr.workspace = true
+thiserror.workspace = true
+
+# Cranelift JIT backend. Pinned as a mutually-compatible set; these four are
+# released in lockstep by the Cranelift project.
+cranelift-jit = "0.120"
+cranelift-frontend = "0.120"
+cranelift-codegen = "0.120"
+cranelift-module = "0.120"
+cranelift-native = "0.120"
+
+[lints]
+workspace = true

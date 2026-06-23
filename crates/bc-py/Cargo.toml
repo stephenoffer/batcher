@@ -1,0 +1,27 @@
+[package]
+name = "bc-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# Compiled into the `batcher._native` extension module (maturin renames the
+# cdylib). The pymodule init fn below must be named `_native` to match.
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+bc-ir.workspace = true
+bc-interp.workspace = true
+bc-sketches.workspace = true
+bc-transport.workspace = true
+bc-resource.workspace = true
+arrow.workspace = true
+arrow-pyarrow.workspace = true
+pyo3.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

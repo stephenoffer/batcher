@@ -1,0 +1,13 @@
+[package]
+name = "bc-sketches"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow.workspace = true
+ahash.workspace = true
+
+[lints]
+workspace = true

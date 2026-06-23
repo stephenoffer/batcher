@@ -1,0 +1,19 @@
+[package]
+name = "bc-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bc-arrow.workspace = true
+bc-sketches.workspace = true
+arrow.workspace = true
+indexmap.workspace = true
+hashbrown.workspace = true
+thiserror.workspace = true
+ahash.workspace = true
+rayon.workspace = true
+
+[lints]
+workspace = true

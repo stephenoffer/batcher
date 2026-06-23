@@ -1,0 +1,602 @@
+//! Hash join — produces match index-pairs, built to distribute.
+//!
+//! The join computes two row-index vectors (`left`, `right`) describing the
+//! output: output column `c` is `take(side_c, side_indices)`. Unmatched rows on
+//! the null-supplying side get a null index (arrow `take` yields null), which is
+//! exactly how outer joins are expressed — so inner/left/right/full/semi/anti all
+//! fall out of one index-pair builder.
+//!
+//! Distribution: because matching is purely by key equality, a global join equals
+//! the union of per-partition joins when both sides are hash-partitioned by the
+//! join key. This module is the partition-local primitive the shuffle layer calls;
+//! it carries no single-node assumptions.
+//!
+//! Keys are encoded with arrow's row format (multi-key, any type). SQL null
+//! semantics are honored: a row with any null key never matches (NULL ≠ NULL).
+
+use arrow::array::{Array, ArrayRef, UInt32Array};
+use arrow::buffer::NullBuffer;
+use arrow::row::{OwnedRow, RowConverter, SortField};
+use hashbrown::hash_table::Entry;
+use hashbrown::HashTable;
+use indexmap::IndexMap;
+
+use crate::error::RuntimeError;
+
+/// Join flavors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+    /// Left-semi: left rows that have ≥1 match (left columns only).
+    Semi,
+    /// Left-anti: left rows that have no match (left columns only).
+    Anti,
+}
+
+/// Row indices describing the join output. Nullable: a null entry means "no row
+/// on this side" (the null-supplying side of an outer join).
+pub struct JoinIndices {
+    pub left: UInt32Array,
+    pub right: UInt32Array,
+}
+
+/// Compute join output indices from the (pre-evaluated) key columns of each side.
+///
+/// The hash table is built on the **right** side and probed with the **left**,
+/// so left-outer/semi/anti stream the left side; right/full additionally emit
+/// right rows that never matched.
+pub fn hash_join_indices(
+    left_keys: &[ArrayRef],
+    right_keys: &[ArrayRef],
+    join_type: JoinType,
+) -> Result<JoinIndices, RuntimeError> {
+    let left_rows = left_keys.first().map_or(0, |a| a.len());
+    let right_rows = right_keys.first().map_or(0, |a| a.len());
+
+    // Encode both sides' keys with one shared converter (key types must align).
+    let fields: Vec<SortField> = right_keys
+        .iter()
+        .map(|a| SortField::new(a.data_type().clone()))
+        .collect();
+    let converter = RowConverter::new(fields)?;
+    let right_encoded = converter.convert_columns(right_keys)?;
+    let left_encoded = converter.convert_columns(left_keys)?;
+
+    let left_null = null_mask(left_keys, left_rows);
+    let right_null = null_mask(right_keys, right_rows);
+
+    // Build a chained hash table over the right (build) side, keyed by *row index*.
+    // Encoded rows are compared by borrow, so there is no per-row owned-key
+    // allocation (the same trick as `agg::assign_groups`). `heads` maps a key to the
+    // head of a singly-linked chain of right-row indices sharing that key; `next`
+    // threads the rest (`u32::MAX` terminates). Null-key rows are skipped — they
+    // never match (NULL ≠ NULL).
+    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
+    let mut heads: HashTable<u32> = HashTable::with_capacity(right_rows);
+    let mut next: Vec<u32> = vec![u32::MAX; right_rows];
+    for (i, &is_null) in right_null.iter().enumerate() {
+        if is_null {
+            continue;
+        }
+        let row_i = right_encoded.row(i);
+        let hash = state.hash_one(row_i);
+        match heads.entry(
+            hash,
+            |&h| right_encoded.row(h as usize) == row_i,
+            |&h| state.hash_one(right_encoded.row(h as usize)),
+        ) {
+            // Prepend i to the chain — order within a key is irrelevant (the join
+            // output is an unordered relation).
+            Entry::Occupied(mut e) => {
+                next[i] = *e.get();
+                *e.get_mut() = i as u32;
+            }
+            Entry::Vacant(e) => {
+                e.insert(i as u32);
+            }
+        }
+    }
+
+    // Probe with the left side. Pre-size outputs to the left row count — the lower
+    // bound for inner/left; outer and duplicate-key cases grow from there.
+    let mut left_out: Vec<Option<u32>> = Vec::with_capacity(left_rows);
+    let mut right_out: Vec<Option<u32>> = Vec::with_capacity(left_rows);
+    let mut right_matched = vec![false; right_rows];
+
+    let emit_right_unmatched = matches!(join_type, JoinType::Right | JoinType::Full);
+    let emit_left_unmatched = matches!(join_type, JoinType::Left | JoinType::Full);
+
+    for (i, &is_null) in left_null.iter().enumerate() {
+        // Chain head for this left key — `None` for a null key or no match. A present
+        // head always points at a real right row, so `is_some()` means "≥1 match".
+        let head = if is_null {
+            None
+        } else {
+            let row_i = left_encoded.row(i);
+            let hash = state.hash_one(row_i);
+            heads
+                .find(hash, |&h| right_encoded.row(h as usize) == row_i)
+                .copied()
+        };
+
+        match join_type {
+            JoinType::Semi => {
+                if head.is_some() {
+                    left_out.push(Some(i as u32));
+                    right_out.push(None);
+                }
+            }
+            JoinType::Anti => {
+                if head.is_none() {
+                    left_out.push(Some(i as u32));
+                    right_out.push(None);
+                }
+            }
+            _ => match head {
+                Some(mut r) => {
+                    // Walk the chain of right rows sharing this key.
+                    loop {
+                        right_matched[r as usize] = true;
+                        left_out.push(Some(i as u32));
+                        right_out.push(Some(r));
+                        let nxt = next[r as usize];
+                        if nxt == u32::MAX {
+                            break;
+                        }
+                        r = nxt;
+                    }
+                }
+                None => {
+                    if emit_left_unmatched {
+                        left_out.push(Some(i as u32));
+                        right_out.push(None);
+                    }
+                }
+            },
+        }
+    }
+
+    if emit_right_unmatched {
+        // Every unmatched right row is preserved — including null-key rows, which
+        // match nothing (NULL != NULL) but are still part of the right relation.
+        for (r, matched) in right_matched.iter().enumerate() {
+            if !matched {
+                left_out.push(None);
+                right_out.push(Some(r as u32));
+            }
+        }
+    }
+
+    Ok(JoinIndices {
+        left: UInt32Array::from(left_out),
+        right: UInt32Array::from(right_out),
+    })
+}
+
+/// Sort-merge join: sort both sides by key, then merge. Produces the **same
+/// [`JoinIndices`] relation** as [`hash_join_indices`] for every join type (output
+/// order differs — these are unordered relations). The win is no hash table: both
+/// sides stream in key order, so it suits two large (or already-sorted) inputs the
+/// way Spark's default join does. NULL keys never match (`NULL ≠ NULL`).
+pub fn sort_merge_join_indices(
+    left_keys: &[ArrayRef],
+    right_keys: &[ArrayRef],
+    join_type: JoinType,
+) -> Result<JoinIndices, RuntimeError> {
+    use std::cmp::Ordering;
+
+    let n_left = left_keys.first().map_or(0, |a| a.len());
+    let n_right = right_keys.first().map_or(0, |a| a.len());
+
+    // One shared converter so left/right encoded keys are mutually comparable.
+    let fields: Vec<SortField> = right_keys
+        .iter()
+        .map(|a| SortField::new(a.data_type().clone()))
+        .collect();
+    let converter = RowConverter::new(fields)?;
+    let left_enc = converter.convert_columns(left_keys)?;
+    let right_enc = converter.convert_columns(right_keys)?;
+    let left_null = null_mask(left_keys, n_left);
+    let right_null = null_mask(right_keys, n_right);
+
+    // Sort the non-null-key rows of each side by encoded key (null keys never match
+    // and are handled with the unmatched rows below).
+    let mut l: Vec<u32> = (0..n_left as u32)
+        .filter(|&i| !left_null[i as usize])
+        .collect();
+    let mut r: Vec<u32> = (0..n_right as u32)
+        .filter(|&i| !right_null[i as usize])
+        .collect();
+    l.sort_by(|&a, &b| left_enc.row(a as usize).cmp(&left_enc.row(b as usize)));
+    r.sort_by(|&a, &b| right_enc.row(a as usize).cmp(&right_enc.row(b as usize)));
+
+    // Left/Full/Anti preserve unmatched left rows; Right/Full preserve unmatched
+    // right rows (Semi emits only *matched* left rows, once each).
+    let emit_left_unmatched = matches!(join_type, JoinType::Left | JoinType::Full | JoinType::Anti);
+    let emit_right_unmatched = matches!(join_type, JoinType::Right | JoinType::Full);
+
+    let mut left_out: Vec<Option<u32>> = Vec::new();
+    let mut right_out: Vec<Option<u32>> = Vec::new();
+    let mut push = |lo: Option<u32>, ro: Option<u32>| {
+        left_out.push(lo);
+        right_out.push(ro);
+    };
+
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < l.len() && j < r.len() {
+        match left_enc
+            .row(l[i] as usize)
+            .cmp(&right_enc.row(r[j] as usize))
+        {
+            Ordering::Less => {
+                if emit_left_unmatched {
+                    push(Some(l[i]), None);
+                }
+                i += 1;
+            }
+            Ordering::Greater => {
+                if emit_right_unmatched {
+                    push(None, Some(r[j]));
+                }
+                j += 1;
+            }
+            Ordering::Equal => {
+                // Extents of the equal-key group on each side.
+                let key = left_enc.row(l[i] as usize);
+                let mut i2 = i + 1;
+                while i2 < l.len() && left_enc.row(l[i2] as usize) == key {
+                    i2 += 1;
+                }
+                let mut j2 = j + 1;
+                while j2 < r.len() && right_enc.row(r[j2] as usize) == key {
+                    j2 += 1;
+                }
+                match join_type {
+                    // Semi: each matched left row once (no right column).
+                    JoinType::Semi => {
+                        for &li in &l[i..i2] {
+                            push(Some(li), None);
+                        }
+                    }
+                    // Anti: matched rows are dropped (only unmatched left survives).
+                    JoinType::Anti => {}
+                    // Inner/Left/Right/Full: the group cross product.
+                    _ => {
+                        for &li in &l[i..i2] {
+                            for &rj in &r[j..j2] {
+                                push(Some(li), Some(rj));
+                            }
+                        }
+                    }
+                }
+                i = i2;
+                j = j2;
+            }
+        }
+    }
+    // Tails: rows past the other side's end are all unmatched.
+    while i < l.len() {
+        if emit_left_unmatched {
+            push(Some(l[i]), None);
+        }
+        i += 1;
+    }
+    while j < r.len() {
+        if emit_right_unmatched {
+            push(None, Some(r[j]));
+        }
+        j += 1;
+    }
+    // Null-key rows match nothing but are still part of their relation for outer joins.
+    if emit_left_unmatched {
+        for (li, &is_null) in left_null.iter().enumerate() {
+            if is_null {
+                push(Some(li as u32), None);
+            }
+        }
+    }
+    if emit_right_unmatched {
+        for (rj, &is_null) in right_null.iter().enumerate() {
+            if is_null {
+                push(None, Some(rj as u32));
+            }
+        }
+    }
+
+    Ok(JoinIndices {
+        left: UInt32Array::from(left_out),
+        right: UInt32Array::from(right_out),
+    })
+}
+
+/// A per-row mask: true where ANY key column is null (such rows never match).
+///
+/// Combines the key columns' validity bitmaps word-wise via `NullBuffer::union`
+/// (which intersects validity — a row stays valid only if valid in every column),
+/// rather than a per-row `is_null` call per column. Columns with no null buffer
+/// contribute nothing, so the all-non-null case allocates one zeroed mask and does
+/// no bit work.
+fn null_mask(keys: &[ArrayRef], rows: usize) -> Vec<bool> {
+    let mut combined: Option<NullBuffer> = None;
+    for key in keys {
+        if key.null_count() != 0 {
+            combined = NullBuffer::union(combined.as_ref(), key.nulls());
+        }
+    }
+    match combined {
+        None => vec![false; rows],
+        Some(nulls) => (0..rows).map(|i| nulls.is_null(i)).collect(),
+    }
+}
+
+/// Compute ASOF (nearest-match) join indices. Every left row is emitted (left-style);
+/// it is matched to the right row whose `on` key is nearest *in `direction`* within
+/// the same `by` group (exact `by` equality). Unmatched left rows get a null right
+/// index (arrow `take` then yields null), exactly like a left outer join.
+///
+/// `backward = true` picks the largest right.on ≤ left.on; `false` picks the smallest
+/// right.on ≥ left.on. Keys are arrow row-encoded, so `on` (order-preserving) and
+/// `by` (equality) work for any type. Rows with a null `on` never match. As with the
+/// equi-join primitive, partitioning both sides by `by` makes a global ASOF equal the
+/// union of per-partition ASOFs — the seam the distributed path can use.
+pub fn asof_join_indices(
+    left_on: &ArrayRef,
+    right_on: &ArrayRef,
+    left_by: &[ArrayRef],
+    right_by: &[ArrayRef],
+    backward: bool,
+) -> Result<JoinIndices, RuntimeError> {
+    let n_left = left_on.len();
+    let n_right = right_on.len();
+
+    // One shared converter so left/right `on` encodings are mutually order-comparable.
+    let on_conv = RowConverter::new(vec![SortField::new(right_on.data_type().clone())])?;
+    let left_on_enc = on_conv.convert_columns(std::slice::from_ref(left_on))?;
+    let right_on_enc = on_conv.convert_columns(std::slice::from_ref(right_on))?;
+
+    let by_conv = if left_by.is_empty() {
+        None
+    } else {
+        Some(RowConverter::new(
+            right_by
+                .iter()
+                .map(|a| SortField::new(a.data_type().clone()))
+                .collect(),
+        )?)
+    };
+    let left_by_enc = by_conv
+        .as_ref()
+        .map(|c| c.convert_columns(left_by))
+        .transpose()?;
+    let right_by_enc = by_conv
+        .as_ref()
+        .map(|c| c.convert_columns(right_by))
+        .transpose()?;
+
+    // Group right rows by `by` key (byte-encoded; empty key when there are no `by`
+    // columns), each group sorted ascending by `on` for binary search.
+    let mut groups: IndexMap<Vec<u8>, Vec<(OwnedRow, u32)>> = IndexMap::new();
+    for j in 0..n_right {
+        if right_on.is_null(j) {
+            continue;
+        }
+        let key = right_by_enc
+            .as_ref()
+            .map_or_else(Vec::new, |e| e.row(j).as_ref().to_vec());
+        groups
+            .entry(key)
+            .or_default()
+            .push((right_on_enc.row(j).owned(), j as u32));
+    }
+    for v in groups.values_mut() {
+        v.sort_by(|a, b| a.0.row().cmp(&b.0.row()));
+    }
+
+    let mut right_idx: Vec<Option<u32>> = Vec::with_capacity(n_left);
+    for i in 0..n_left {
+        if left_on.is_null(i) {
+            right_idx.push(None);
+            continue;
+        }
+        let key = left_by_enc
+            .as_ref()
+            .map_or_else(Vec::new, |e| e.row(i).as_ref().to_vec());
+        let target = left_on_enc.row(i);
+        let matched = groups.get(&key).and_then(|g| {
+            if backward {
+                // largest on ≤ target
+                let pp = g.partition_point(|(on, _)| on.row() <= target);
+                (pp > 0).then(|| g[pp - 1].1)
+            } else {
+                // smallest on ≥ target
+                let pp = g.partition_point(|(on, _)| on.row() < target);
+                (pp < g.len()).then(|| g[pp].1)
+            }
+        });
+        right_idx.push(matched);
+    }
+
+    Ok(JoinIndices {
+        left: UInt32Array::from((0..n_left as u32).collect::<Vec<_>>()),
+        right: UInt32Array::from(right_idx),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+
+    fn keys(v: &[i64]) -> Vec<ArrayRef> {
+        vec![Arc::new(Int64Array::from(v.to_vec())) as ArrayRef]
+    }
+
+    fn pairs(idx: &JoinIndices) -> Vec<(Option<u32>, Option<u32>)> {
+        (0..idx.left.len())
+            .map(|i| {
+                (
+                    idx.left.is_valid(i).then(|| idx.left.value(i)),
+                    idx.right.is_valid(i).then(|| idx.right.value(i)),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inner_join_pairs() {
+        // left  = [1,2,3], right = [2,3,3]
+        let idx = hash_join_indices(&keys(&[1, 2, 3]), &keys(&[2, 3, 3]), JoinType::Inner).unwrap();
+        let mut got = pairs(&idx);
+        got.sort();
+        // 2 matches right#0; 3 matches right#1 and #2.
+        assert_eq!(
+            got,
+            vec![(Some(1), Some(0)), (Some(2), Some(1)), (Some(2), Some(2))]
+        );
+    }
+
+    #[test]
+    fn left_join_keeps_unmatched() {
+        let idx = hash_join_indices(&keys(&[1, 2]), &keys(&[2]), JoinType::Left).unwrap();
+        let mut got = pairs(&idx);
+        got.sort();
+        assert_eq!(got, vec![(Some(0), None), (Some(1), Some(0))]);
+    }
+
+    #[test]
+    fn semi_and_anti() {
+        let semi = hash_join_indices(&keys(&[1, 2, 3]), &keys(&[2, 3]), JoinType::Semi).unwrap();
+        let mut s: Vec<_> = pairs(&semi).into_iter().map(|(l, _)| l).collect();
+        s.sort();
+        assert_eq!(s, vec![Some(1), Some(2)]);
+
+        let anti = hash_join_indices(&keys(&[1, 2, 3]), &keys(&[2, 3]), JoinType::Anti).unwrap();
+        let a: Vec<_> = pairs(&anti).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(a, vec![Some(0)]);
+    }
+
+    #[test]
+    fn full_join_emits_both_unmatched() {
+        let idx = hash_join_indices(&keys(&[1, 2]), &keys(&[2, 3]), JoinType::Full).unwrap();
+        let mut got = pairs(&idx);
+        got.sort();
+        // 1 unmatched (left), 2 matches, 3 unmatched (right).
+        assert_eq!(
+            got,
+            vec![(None, Some(1)), (Some(0), None), (Some(1), Some(0))]
+        );
+    }
+
+    #[test]
+    fn null_keys_never_match() {
+        let left: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(1), None]))];
+        let right: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![None, Some(1)]))];
+        let idx = hash_join_indices(&left, &right, JoinType::Inner).unwrap();
+        // Only 1==1 matches; the null rows do not.
+        assert_eq!(pairs(&idx), vec![(Some(0), Some(1))]);
+    }
+
+    #[test]
+    fn duplicate_keys_cross_product() {
+        // Both sides repeat key 5: left#0,#2 × right#0,#1,#3 = 2×3 = 6 pairs, plus
+        // the lone 7==7 match. Exercises the build-side chain walk on duplicates.
+        let left = keys(&[5, 9, 5, 7]);
+        let right = keys(&[5, 5, 8, 5, 7]);
+        let idx = hash_join_indices(&left, &right, JoinType::Inner).unwrap();
+        let mut got = pairs(&idx);
+        got.sort();
+        let mut want = vec![(Some(3), Some(4))];
+        for l in [0u32, 2] {
+            for r in [0u32, 1, 3] {
+                want.push((Some(l), Some(r)));
+            }
+        }
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn multi_key_join() {
+        // Composite key (a, b): left rows (1,2)/(1,3)/(2,2) vs right (1,2)/(2,2)/(1,9).
+        // (1,2)==right#0 and (2,2)==right#1 match; (1,3) and (1,9) share no full key.
+        let left: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![2, 3, 2])),
+        ];
+        let right: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![1, 2, 1])),
+            Arc::new(Int64Array::from(vec![2, 2, 9])),
+        ];
+        let idx = hash_join_indices(&left, &right, JoinType::Inner).unwrap();
+        let mut got = pairs(&idx);
+        got.sort();
+        assert_eq!(got, vec![(Some(0), Some(0)), (Some(2), Some(1))]);
+    }
+
+    fn sorted_pairs(idx: &JoinIndices) -> Vec<(Option<u32>, Option<u32>)> {
+        let mut p = pairs(idx);
+        p.sort();
+        p
+    }
+
+    /// Sort-merge join must produce the same relation as the hash-join oracle for
+    /// every join type — with duplicate keys (cross products) and null keys.
+    #[test]
+    fn sort_merge_matches_hash_oracle() {
+        let left: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
+            Some(2),
+            Some(1),
+            Some(2),
+            None,
+            Some(3),
+            Some(2),
+        ]))];
+        let right: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
+            Some(2),
+            Some(3),
+            Some(2),
+            Some(4),
+            None,
+        ]))];
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let hash = hash_join_indices(&left, &right, jt).unwrap();
+            let smj = sort_merge_join_indices(&left, &right, jt).unwrap();
+            assert_eq!(
+                sorted_pairs(&hash),
+                sorted_pairs(&smj),
+                "sort-merge disagrees with hash for {jt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sort_merge_handles_empty_sides() {
+        let empty: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(Vec::<i64>::new()))];
+        let some = keys(&[1, 2, 3]);
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+        ] {
+            let h = hash_join_indices(&empty, &some, jt).unwrap();
+            let s = sort_merge_join_indices(&empty, &some, jt).unwrap();
+            assert_eq!(sorted_pairs(&h), sorted_pairs(&s), "empty-left {jt:?}");
+            let h2 = hash_join_indices(&some, &empty, jt).unwrap();
+            let s2 = sort_merge_join_indices(&some, &empty, jt).unwrap();
+            assert_eq!(sorted_pairs(&h2), sorted_pairs(&s2), "empty-right {jt:?}");
+        }
+    }
+}

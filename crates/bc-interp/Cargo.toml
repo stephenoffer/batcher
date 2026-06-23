@@ -1,0 +1,22 @@
+[package]
+name = "bc-interp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bc-arrow.workspace = true
+bc-expr.workspace = true
+bc-ir.workspace = true
+bc-runtime.workspace = true
+bc-codegen.workspace = true
+bc-resource.workspace = true
+arrow.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,120 @@
+"""Batcher — a native, JIT-compiling, adaptive data engine.
+
+The public surface is intentionally small and fluent. Everything in this package
+is the *control plane*: it builds and optimizes plans and hands them to the Rust
+engine (`batcher._native`). No tuple is ever processed in Python on the hot path.
+
+    import batcher as bt
+
+    ds = bt.from_pydict({"x": [1, 2, 3], "y": [10, 20, 30]})
+    out = ds.filter(bt.col("x") > 1).select("x", xy=bt.col("x") * bt.col("y")).collect()
+"""
+
+from __future__ import annotations
+
+from batcher.api import (
+    Dataset,
+    array,
+    atan2,
+    catalog,
+    coalesce,
+    col,
+    compact,
+    count,
+    cume_dist,
+    date_range,
+    dense_rank,
+    engine_version,
+    first_value,
+    from_arrow,
+    from_batches,
+    from_dask,
+    from_huggingface,
+    from_numpy,
+    from_pandas,
+    from_polars,
+    from_pydict,
+    from_spark,
+    from_tf,
+    from_torch,
+    greatest,
+    lag,
+    last_value,
+    lead,
+    least,
+    lit,
+    ntile,
+    nullif,
+    percent_rank,
+    range,
+    rank,
+    read,
+    row_number,
+    sql,
+    when,
+)
+from batcher.config import (
+    Config,
+    ExecutionConfig,
+    FlowControlConfig,
+    MemoryConfig,
+    MetadataConfig,
+    OptimizerConfig,
+    PIDConfig,
+    config_context,
+    set_config,
+)
+
+__all__ = [
+    "Config",
+    "Dataset",
+    "ExecutionConfig",
+    "FlowControlConfig",
+    "MemoryConfig",
+    "MetadataConfig",
+    "OptimizerConfig",
+    "PIDConfig",
+    "__version__",
+    "array",
+    "atan2",
+    "catalog",
+    "coalesce",
+    "col",
+    "compact",
+    "config_context",
+    "count",
+    "cume_dist",
+    "date_range",
+    "dense_rank",
+    "engine_version",
+    "first_value",
+    "from_arrow",
+    "from_batches",
+    "from_dask",
+    "from_huggingface",
+    "from_numpy",
+    "from_pandas",
+    "from_polars",
+    "from_pydict",
+    "from_spark",
+    "from_tf",
+    "from_torch",
+    "greatest",
+    "lag",
+    "last_value",
+    "lead",
+    "least",
+    "lit",
+    "ntile",
+    "nullif",
+    "percent_rank",
+    "range",
+    "rank",
+    "read",
+    "row_number",
+    "set_config",
+    "sql",
+    "when",
+]
+
+__version__ = "0.1.0"

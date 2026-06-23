@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Batcher pre-commit gate — install with `just install-hooks`.
+#
+# Blocks commits (human or agent) that regrow v1's structural rot or break the
+# layer contract. Fast, static checks only. Bypass in a genuine emergency with
+# `git commit --no-verify`, then fix forward.
+set -euo pipefail
+
+repo="$(git rev-parse --show-toplevel)"
+cd "$repo"
+
+py="$(command -v python || command -v python3)"
+
+echo "pre-commit: structural fitness…"
+"$py" tools/lint_structure.py
+
+echo "pre-commit: ruff (lint + commented-out code)…"
+ruff check python tests benchmarks
+
+echo "pre-commit: layer-independence contracts…"
+lint-imports --config pyproject.toml
+
+echo "pre-commit: OK"

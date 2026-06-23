@@ -1,0 +1,95 @@
+"""The public, fluent, lazy, expression-first API surface.
+
+`api` is the conductor: it builds `LogicalPlan`s and orchestrates the three layers
+(Kyber → Carbonite → Core) to execute them. It is the only package allowed to
+import all three layers.
+"""
+
+from __future__ import annotations
+
+from batcher.api.dataset import Dataset, GroupBy
+from batcher.api.functions import (
+    array,
+    atan2,
+    coalesce,
+    col,
+    count,
+    cume_dist,
+    dense_rank,
+    first_value,
+    greatest,
+    lag,
+    last_value,
+    lead,
+    least,
+    lit,
+    ntile,
+    nullif,
+    percent_rank,
+    rank,
+    row_number,
+    when,
+)
+from batcher.api.io_namespace import read
+from batcher.api.session import (
+    catalog,
+    compact,
+    date_range,
+    engine_version,
+    from_arrow,
+    from_batches,
+    from_dask,
+    from_huggingface,
+    from_numpy,
+    from_pandas,
+    from_polars,
+    from_pydict,
+    from_spark,
+    from_tf,
+    from_torch,
+    range,
+    sql,
+)
+
+__all__ = [
+    "Dataset",
+    "GroupBy",
+    "array",
+    "atan2",
+    "catalog",
+    "coalesce",
+    "col",
+    "compact",
+    "count",
+    "cume_dist",
+    "date_range",
+    "dense_rank",
+    "engine_version",
+    "first_value",
+    "from_arrow",
+    "from_batches",
+    "from_dask",
+    "from_huggingface",
+    "from_numpy",
+    "from_pandas",
+    "from_polars",
+    "from_pydict",
+    "from_spark",
+    "from_tf",
+    "from_torch",
+    "greatest",
+    "lag",
+    "last_value",
+    "lead",
+    "least",
+    "lit",
+    "ntile",
+    "nullif",
+    "percent_rank",
+    "range",
+    "rank",
+    "read",
+    "row_number",
+    "sql",
+    "when",
+]

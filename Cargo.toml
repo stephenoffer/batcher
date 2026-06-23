@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/anyscale/batcher"
+authors = ["Batcher contributors"]
+
+[workspace.dependencies]
+# Arrow is the in-memory columnar contract across the whole engine.
+# Default features bring the compute kernels (arith/cmp/boolean/select) the
+# interpreter is built on; `ffi` adds the C Data Interface for zero-copy Python views;
+# `ipc` is the on-disk batch format the runtime spills through under memory pressure.
+arrow = { version = "56", features = ["ffi", "prettyprint", "ipc"] }
+
+# PyO3 boundary — abi3 so one wheel covers all CPython >= 3.10.
+# Pinned to 0.25 to match arrow-pyarrow 56 (avoids a duplicate pyo3 in the graph).
+pyo3 = { version = "0.25", features = ["abi3-py310", "extension-module"] }
+arrow-pyarrow = "56"
+
+# Plan/expr IR is exchanged Python<->Rust as a stable, language-agnostic JSON document.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Internal crates (path deps wired here so members stay terse).
+bc-arrow = { path = "crates/bc-arrow" }
+bc-resource = { path = "crates/bc-resource" }
+bc-expr = { path = "crates/bc-expr" }
+bc-ir = { path = "crates/bc-ir" }
+bc-runtime = { path = "crates/bc-runtime" }
+bc-sketches = { path = "crates/bc-sketches" }
+bc-codegen = { path = "crates/bc-codegen" }
+bc-interp = { path = "crates/bc-interp" }
+bc-transport = { path = "crates/bc-transport" }
+
+# Shared utility deps.
+thiserror = "2"
+ahash = "0.8"
+smallvec = "1"
+indexmap = "2"
+hashbrown = "0.15"
+rayon = "1"
+# Lock-striped concurrent map for the shuffle partition store + the consumer's
+# gRPC channel pool (reuse connections across fetches instead of reconnecting).
+dashmap = "6"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"

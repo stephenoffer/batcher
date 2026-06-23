@@ -1,0 +1,15 @@
+[package]
+name = "bc-resource"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The lowest crate in the data plane: process-wide memory accounting shared by the
+# operators (bc-runtime) and the transfer layer (bc-transport) so they enforce one
+# envelope. Depends only on the workspace error-derive — no Arrow, no upward edges.
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

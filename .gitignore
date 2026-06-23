@@ -1,0 +1,25 @@
+# Rust
+/target
+**/*.rs.bk
+# Cargo.lock IS committed: the engine ships as a wheel and we want reproducible builds.
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.hypothesis/
+build/
+dist/
+*.so
+.coverage
+.coverage.*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Built documentation site
+docs/_build/
