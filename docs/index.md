@@ -184,6 +184,7 @@ Memory, spill, parallelism, and the adaptive knobs.
 
 getting-started/index
 tutorials/index
+examples/index
 learning-paths/index
 ```
 
