@@ -20,12 +20,13 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DPI = "192"  # retina-crisp; furo scales images to the column width
 
-# Shared palette — control plane (Python) is blue, data plane (Rust) is orange,
-# neutral plan/engine nodes are grey. White canvas reads fine on furo light + dark.
-BLUE, BLUE_BG, BLUE_EDGE = "#9cc0f5", "#eaf1fd", "#1a73e8"
-ORANGE, ORANGE_BG, ORANGE_EDGE = "#f5c08a", "#fdf1e8", "#e8710a"
-GREY, GREY_BG = "#cfd6dd", "#f1f3f4"
-INK = "#3c4043"
+# Shared "Nebula" palette — control plane (Python) is indigo, data plane (Rust) is
+# cyan, neutral plan/engine nodes are slate. White canvas reads fine on light + dark
+# (the docs frame these PNGs in a white card). Names kept BLUE/ORANGE for stability.
+BLUE, BLUE_BG, BLUE_EDGE = "#a5b4fc", "#eef2ff", "#6366f1"  # indigo
+ORANGE, ORANGE_BG, ORANGE_EDGE = "#67e8f9", "#ecfeff", "#0891b2"  # cyan
+GREY, GREY_BG = "#cbd5e1", "#f1f5f9"  # slate
+INK = "#334155"
 
 HEADER = f"""
   graph [bgcolor="white", fontname="Helvetica", nodesep=0.35, ranksep=0.5];

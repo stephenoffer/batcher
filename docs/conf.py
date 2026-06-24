@@ -37,7 +37,16 @@ extensions = [
     "sphinx.ext.doctest",
     "sphinx_autodoc_typehints",
     "myst_parser",
+    "sphinx_design",  # cards, grids, tabs, buttons (modern layout components)
+    "sphinx_copybutton",  # one-click copy on code blocks
 ]
+
+# MyST: enable the directives the landing/marketing pages use (card grids etc.).
+myst_enable_extensions = ["colon_fence", "deflist", "tasklist", "attrs_inline"]
+
+# Copy button: don't copy the `>>>`/`$` prompts or the expected-output comment lines.
+copybutton_exclude = ".linenos, .gp, .go"
+copybutton_copy_empty_lines = False
 
 # Napoleon settings for Google-style docstrings
 napoleon_google_docstring = True
@@ -72,12 +81,6 @@ typehints_fully_qualified = False
 always_document_param_types = True
 typehints_document_rtype = True
 
-# MyST parser for Markdown support
-myst_enable_extensions = [
-    "colon_fence",
-    "deflist",
-    "tasklist",
-]
 source_suffix = {
     ".rst": "restructuredtext",
     ".md": "markdown",
@@ -115,10 +118,11 @@ html_title = "Batcher"
 html_favicon = "_static/favicon.svg"
 html_css_files = ["custom.css"]
 
-# Brand palette matches the architecture diagrams: control-plane blue is the
-# primary, data-plane orange the accent. Structural styling lives in custom.css.
-_BRAND = "#1a73e8"
-_BRAND_DARK = "#5aa0f2"
+# "Nebula" palette: indigo→violet brand with a cyan accent, dark-first slate
+# surfaces. Lighter brand tints are used in dark mode for contrast. The full
+# palette and the structural styling live in custom.css.
+_BRAND = "#6366f1"  # indigo (light mode)
+_BRAND_DARK = "#a5b4fc"  # indigo-300 (dark mode, on slate)
 
 html_theme_options = {
     "sidebar_hide_name": True,  # the wordmark is in the logo
@@ -129,11 +133,19 @@ html_theme_options = {
     "light_css_variables": {
         "color-brand-primary": _BRAND,
         "color-brand-content": _BRAND,
-        "color-admonition-title-background--note": "rgba(26, 115, 232, 0.10)",
+        "color-admonition-title-background--note": "rgba(99, 102, 241, 0.10)",
     },
     "dark_css_variables": {
         "color-brand-primary": _BRAND_DARK,
         "color-brand-content": _BRAND_DARK,
+        # Slate surfaces for the dark-first look.
+        "color-background-primary": "#0f172a",
+        "color-background-secondary": "#131c31",
+        "color-background-hover": "#1e293b",
+        "color-background-border": "#243049",
+        "color-foreground-primary": "#e2e8f0",
+        "color-foreground-secondary": "#94a3b8",
+        "color-code-background": "#131c31",
     },
 }
 
