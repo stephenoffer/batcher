@@ -118,27 +118,44 @@ html_title = "Batcher"
 html_favicon = "_static/favicon.svg"
 html_css_files = ["custom.css"]
 
-# "Nebula" palette: indigo→violet brand with a cyan accent, dark-first slate
-# surfaces. Lighter brand tints are used in dark mode for contrast. The full
-# palette and the structural styling live in custom.css.
-_BRAND = "#6366f1"  # indigo (light mode)
-_BRAND_DARK = "#a5b4fc"  # indigo-300 (dark mode, on slate)
+# Professional palette: a confident blue brand on light content, with a permanently
+# dark slate sidebar in both modes (the enterprise-docs look). Dark mode uses lighter
+# brand tints on slate surfaces. Structural styling + animations live in custom.css.
+_BRAND = "#2563eb"  # blue-600 (light mode)
+_BRAND_DARK = "#60a5fa"  # blue-400 (dark mode, on slate)
+
+# A dark sidebar, applied in both light and dark mode for a consistent shell.
+_SIDEBAR = {
+    "color-sidebar-background": "#0f172a",
+    "color-sidebar-background-border": "#1e293b",
+    "color-sidebar-caption-text": "#94a3b8",
+    "color-sidebar-link-text": "#cbd5e1",
+    "color-sidebar-link-text--top-level": "#f1f5f9",
+    "color-sidebar-item-background--hover": "#1e293b",
+    "color-sidebar-item-expander-background--hover": "#334155",
+    "color-sidebar-search-background": "#0b1120",
+    "color-sidebar-search-background--focus": "#1e293b",
+    "color-sidebar-search-border": "#334155",
+    "color-sidebar-search-foreground": "#e2e8f0",
+    "color-sidebar-search-icon": "#64748b",
+    "color-sidebar-brand-text": "#f1f5f9",
+}
 
 html_theme_options = {
     "sidebar_hide_name": True,  # the wordmark is in the logo
     "navigation_with_keys": True,
     "top_of_page_button": "edit",
-    "light_logo": "logo-light.svg",
+    "light_logo": "logo-dark.svg",  # light wordmark reads on the dark sidebar
     "dark_logo": "logo-dark.svg",
     "light_css_variables": {
         "color-brand-primary": _BRAND,
         "color-brand-content": _BRAND,
-        "color-admonition-title-background--note": "rgba(99, 102, 241, 0.10)",
+        "color-admonition-title-background--note": "rgba(37, 99, 235, 0.09)",
+        **_SIDEBAR,
     },
     "dark_css_variables": {
         "color-brand-primary": _BRAND_DARK,
         "color-brand-content": _BRAND_DARK,
-        # Slate surfaces for the dark-first look.
         "color-background-primary": "#0f172a",
         "color-background-secondary": "#131c31",
         "color-background-hover": "#1e293b",
@@ -146,6 +163,8 @@ html_theme_options = {
         "color-foreground-primary": "#e2e8f0",
         "color-foreground-secondary": "#94a3b8",
         "color-code-background": "#131c31",
+        **_SIDEBAR,
+        "color-sidebar-background": "#0b1120",  # a touch darker than the content
     },
 }
 

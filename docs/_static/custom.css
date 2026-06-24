@@ -1,46 +1,42 @@
-/* Batcher documentation theme — "Nebula", layered on top of Furo.
-   Indigo→violet brand with a cyan accent and dark-first slate surfaces. Brand
-   color variables and dark slate surfaces are set in conf.py; this file carries
-   the typography, hero, cards (sphinx-design), code, tables, and diagram framing. */
+/* Batcher documentation theme — professional, layered on top of Furo.
+   Confident blue brand on light content, a permanently dark slate sidebar (both
+   modes), restrained navy hero, Inter + JetBrains Mono. Brand colors and the dark
+   sidebar variables are set in conf.py; this file carries typography, the hero,
+   navigation polish, cards (sphinx-design), code, tables, and the animations. */
 
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap");
 
 :root {
-  --bt-indigo: #6366f1;
-  --bt-indigo-deep: #4f46e5;
-  --bt-violet: #8b5cf6;
-  --bt-cyan: #06b6d4;
+  --bt-blue: #2563eb;
+  --bt-blue-deep: #1d4ed8;
+  --bt-amber: #f59e0b;
+  --bt-navy: #0f172a;
   --bt-radius: 12px;
-  --bt-font-display: "Space Grotesk", "Inter", -apple-system, BlinkMacSystemFont,
-    "Segoe UI", sans-serif;
   --font-stack: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     Helvetica, Arial, sans-serif;
   --font-stack--monospace: "JetBrains Mono", ui-monospace, "SFMono-Regular",
     "SF Mono", Menlo, Consolas, monospace;
 }
 
-/* ---- Typography -------------------------------------------------------- */
+html { scroll-behavior: smooth; }
 
 body {
   font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
   -webkit-font-smoothing: antialiased;
 }
 
-h1, h2, h3, h4, .sidebar-brand-text {
-  font-family: var(--bt-font-display);
+/* ---- Typography -------------------------------------------------------- */
+
+h1, h2, h3, h4 {
   font-weight: 700;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.022em;
 }
-
 h1 {
-  font-size: 2.5rem;
+  font-size: 2.4rem;
+  font-weight: 800;
   line-height: 1.12;
-  background: linear-gradient(100deg, var(--bt-indigo-deep), var(--bt-violet));
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  margin-bottom: 0.6rem;
 }
-
 h2 {
   margin-top: 2.6rem;
   padding-bottom: 0.3rem;
@@ -50,7 +46,47 @@ h2 {
 article a.reference {
   text-underline-offset: 0.18em;
   text-decoration-thickness: 1px;
+  transition: color 0.12s ease;
 }
+
+/* ---- Dark sidebar + navigation ---------------------------------------- */
+
+.sidebar-drawer {
+  border-right: 1px solid #1e293b;
+}
+.sidebar-brand-text { color: #f1f5f9; }
+
+/* nav links: smooth hover, rounded hit area */
+.sidebar-tree .reference {
+  border-radius: 7px;
+  transition: background 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+}
+.sidebar-tree .reference:hover {
+  background: #1e293b;
+  color: #ffffff;
+}
+/* current page: brand accent bar + tint */
+.sidebar-tree .current-page > .reference {
+  color: #ffffff;
+  background: linear-gradient(90deg, rgba(37, 99, 235, 0.30), rgba(37, 99, 235, 0.10));
+  box-shadow: inset 3px 0 0 0 var(--bt-blue);
+  font-weight: 600;
+}
+.sidebar-tree .caption-text {
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+/* search box on the dark shell */
+.sidebar-search { border-radius: 8px; }
+.sidebar-search-container { transition: border-color 0.12s ease; }
+
+/* slim, subtle sidebar scrollbar */
+.sidebar-scroll { scrollbar-width: thin; scrollbar-color: #334155 transparent; }
+.sidebar-scroll::-webkit-scrollbar { width: 7px; }
+.sidebar-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
 
 /* ---- Landing hero ------------------------------------------------------ */
 
@@ -59,79 +95,71 @@ article a.reference {
   overflow: hidden;
   margin: 0.5rem 0 2.75rem;
   padding: 3rem 2.4rem;
-  border-radius: 20px;
+  border-radius: 18px;
   color: #f8fafc;
   background:
-    radial-gradient(1100px 380px at 12% -10%, rgba(34, 211, 238, 0.35), transparent 60%),
-    radial-gradient(900px 420px at 110% 120%, rgba(139, 92, 246, 0.55), transparent 55%),
-    linear-gradient(135deg, #312e81 0%, #4f46e5 45%, #7c3aed 100%);
-  box-shadow: 0 20px 50px -22px rgba(79, 70, 229, 0.65);
+    radial-gradient(900px 360px at 88% -20%, rgba(37, 99, 235, 0.55), transparent 60%),
+    linear-gradient(135deg, #0b1120 0%, #0f172a 45%, #1e3a8a 130%);
+  box-shadow: 0 18px 44px -24px rgba(15, 23, 42, 0.8);
 }
-
-/* faint grid texture over the gradient */
 .bt-hero::after {
   content: "";
   position: absolute;
   inset: 0;
   background-image:
-    linear-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.06) 1px, transparent 1px);
-  background-size: 34px 34px;
-  mask-image: radial-gradient(120% 120% at 0% 0%, #000 40%, transparent 75%);
+    linear-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+  background-size: 36px 36px;
+  mask-image: radial-gradient(130% 130% at 100% 0%, #000 35%, transparent 72%);
   pointer-events: none;
 }
-
 .bt-hero > * { position: relative; }
 
 .bt-hero-eyebrow {
   display: inline-block;
-  font: 600 0.78rem/1 var(--bt-font-display);
-  letter-spacing: 0.14em;
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
   text-transform: uppercase;
-  color: #a5f3fc;
+  color: var(--bt-amber);
   margin: 0 0 0.9rem;
 }
-
 .bt-hero-tagline {
-  font-family: var(--bt-font-display);
-  font-size: 2.4rem;
-  font-weight: 700;
-  line-height: 1.1;
-  letter-spacing: -0.03em;
+  font-size: 2.45rem;
+  font-weight: 800;
+  line-height: 1.08;
+  letter-spacing: -0.035em;
   margin: 0 0 0.7rem;
   color: #ffffff;
 }
-
 .bt-hero-sub {
   font-size: 1.12rem;
   line-height: 1.6;
   max-width: 44rem;
   margin: 0 0 1.6rem;
-  color: rgba(248, 250, 252, 0.86);
+  color: rgba(248, 250, 252, 0.85);
 }
-
 .bt-hero-cta { margin: 0; }
 
 .bt-btn {
   display: inline-block;
-  padding: 0.62rem 1.3rem;
+  padding: 0.6rem 1.3rem;
   margin: 0 0.55rem 0.5rem 0;
   border-radius: 9px;
   font-weight: 600;
   text-decoration: none;
-  border: 1px solid rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.5);
   color: #ffffff;
-  transition: transform 0.05s ease, background 0.15s ease, box-shadow 0.15s ease;
+  transition: transform 0.06s ease, background 0.15s ease, box-shadow 0.15s ease;
 }
 .bt-btn:hover { transform: translateY(-1px); text-decoration: none; }
-
 .bt-btn-primary {
   background: #ffffff;
-  color: #4338ca;
+  color: var(--bt-blue-deep);
   border-color: #ffffff;
-  box-shadow: 0 6px 18px -8px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 8px 20px -10px rgba(0, 0, 0, 0.55);
 }
-.bt-btn-primary:hover { background: #eef2ff; color: #3730a3; }
+.bt-btn-primary:hover { background: #eff6ff; }
 
 /* ---- sphinx-design cards / grids -------------------------------------- */
 
@@ -139,45 +167,40 @@ article a.reference {
   border-radius: var(--bt-radius) !important;
   border: 1px solid var(--color-background-border) !important;
   background: var(--color-background-secondary) !important;
-  transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease;
+  transition: transform 0.13s ease, box-shadow 0.13s ease, border-color 0.13s ease;
 }
 .sd-card:hover {
   transform: translateY(-3px);
-  border-color: var(--bt-indigo) !important;
-  box-shadow: 0 14px 32px -18px rgba(99, 102, 241, 0.7);
+  border-color: var(--bt-blue) !important;
+  box-shadow: 0 16px 34px -20px rgba(37, 99, 235, 0.65);
 }
-.sd-card .sd-card-title {
-  font-family: var(--bt-font-display);
-  font-weight: 600;
-}
-/* octicons inside cards take the brand color */
+.sd-card .sd-card-title { font-weight: 700; }
 .sd-card .sd-card-title .sd-octicon,
 .sd-card-title svg.octicon {
-  color: var(--bt-indigo);
-  fill: var(--bt-indigo);
+  color: var(--bt-blue);
+  fill: var(--bt-blue);
   margin-right: 0.45rem;
   vertical-align: -2px;
 }
-
-/* sphinx-design buttons */
 .sd-btn-primary {
-  background-color: var(--bt-indigo) !important;
-  border-color: var(--bt-indigo) !important;
+  background-color: var(--bt-blue) !important;
+  border-color: var(--bt-blue) !important;
 }
-.sd-btn-primary:hover { background-color: var(--bt-indigo-deep) !important; }
+.sd-btn-primary:hover { background-color: var(--bt-blue-deep) !important; }
 
-/* ---- Tabs (sphinx-design tab-set) ------------------------------------- */
+/* ---- Tabs (sphinx-design) --------------------------------------------- */
 
 .sd-tab-set > label {
   font-weight: 600;
   color: var(--color-foreground-secondary);
+  transition: color 0.12s ease, border-color 0.12s ease;
 }
 .sd-tab-set > input:checked + label {
-  color: var(--bt-indigo);
-  border-color: var(--bt-indigo);
+  color: var(--bt-blue);
+  border-color: var(--bt-blue);
 }
 
-/* ---- Code: rounded, JetBrains Mono, copy button ----------------------- */
+/* ---- Code + copy button ----------------------------------------------- */
 
 code.literal,
 .rst-content code:not(.xref) {
@@ -185,15 +208,13 @@ code.literal,
   padding: 0.12em 0.4em;
   font-size: 0.84em;
 }
-
 div.highlight {
   border-radius: var(--bt-radius);
   border: 1px solid var(--color-background-border);
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
 }
 div.highlight pre { padding: 0.95rem 1.1rem; }
-
-button.copybtn { border-radius: 6px; opacity: 0.45; }
+button.copybtn { border-radius: 6px; opacity: 0.4; transition: opacity 0.12s ease; }
 button.copybtn:hover { opacity: 1; }
 
 /* ---- Admonitions ------------------------------------------------------- */
@@ -203,8 +224,8 @@ button.copybtn:hover { opacity: 1; }
   border-left-width: 4px;
   box-shadow: none;
 }
-.admonition.note, .admonition.seealso { border-left-color: var(--bt-indigo); }
-.admonition.tip, .admonition.hint, .admonition.important { border-left-color: var(--bt-cyan); }
+.admonition.note, .admonition.seealso { border-left-color: var(--bt-blue); }
+.admonition.tip, .admonition.hint, .admonition.important { border-left-color: var(--bt-amber); }
 
 /* ---- Tables ------------------------------------------------------------ */
 
@@ -217,12 +238,12 @@ table.docutils {
 }
 table.docutils thead th {
   background: var(--color-background-secondary);
-  border-bottom: 2px solid var(--bt-indigo);
+  border-bottom: 2px solid var(--bt-blue);
   font-weight: 650;
 }
 table.docutils td, table.docutils th { border-color: var(--color-background-border); }
 
-/* ---- Diagrams: frame the white PNGs so they read on light and dark ----- */
+/* ---- Diagrams: frame the white PNGs ----------------------------------- */
 
 article img[src*="_images/"],
 article img[src*="/diagrams/"] {
@@ -233,10 +254,24 @@ article img[src*="/diagrams/"] {
   padding: 1rem 1.25rem;
   border-radius: 14px;
   border: 1px solid var(--color-background-border);
-  box-shadow: 0 8px 26px -14px rgba(15, 23, 42, 0.45);
+  box-shadow: 0 8px 26px -14px rgba(15, 23, 42, 0.4);
 }
 
-/* ---- Sidebar / brand --------------------------------------------------- */
+.sidebar-logo-container { margin: 0.8rem auto 0.4rem; }
+.sidebar-logo { max-width: 86%; }
 
-.sidebar-logo-container { margin: 0.7rem auto 0.3rem; }
-.sidebar-logo { max-width: 88%; }
+/* ---- Motion: subtle, and only when the user allows it ------------------ */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes bt-fade-up {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: none; }
+  }
+  .bt-hero { animation: bt-fade-up 0.5s cubic-bezier(0.22, 1, 0.36, 1) both; }
+  article .sd-row > .sd-col { animation: bt-fade-up 0.5s cubic-bezier(0.22, 1, 0.36, 1) both; }
+  article .sd-row > .sd-col:nth-child(2) { animation-delay: 0.06s; }
+  article .sd-row > .sd-col:nth-child(3) { animation-delay: 0.12s; }
+  article .sd-row > .sd-col:nth-child(4) { animation-delay: 0.18s; }
+  article .sd-row > .sd-col:nth-child(5) { animation-delay: 0.24s; }
+  article .sd-row > .sd-col:nth-child(6) { animation-delay: 0.30s; }
+}
