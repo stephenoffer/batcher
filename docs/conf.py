@@ -142,11 +142,11 @@ _SIDEBAR = {
 }
 
 html_theme_options = {
-    "sidebar_hide_name": True,  # the wordmark is in the logo
+    # Show the "Batcher" project name as the sidebar brand (a text wordmark that
+    # links home). No logo image — the mark + wordmark are styled in custom.css.
+    "sidebar_hide_name": False,
     "navigation_with_keys": True,
     "top_of_page_button": "edit",
-    "light_logo": "logo-dark.svg",  # light wordmark reads on the dark sidebar
-    "dark_logo": "logo-dark.svg",
     "light_css_variables": {
         "color-brand-primary": _BRAND,
         "color-brand-content": _BRAND,

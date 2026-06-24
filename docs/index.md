@@ -28,29 +28,27 @@ estimate corrects itself mid-flight.
 :gutter: 3
 
 :::{grid-item-card} {octicon}`shield;1.1em` Bad estimates don't sink the query
-Most engines pick a plan before seeing a row, then run it to the end even when the
-data turns out different, the classic cause of a job that stalls or runs out of
-memory. Batcher re-plans mid-query on the row counts it just measured, so a query
-that started on a wrong guess corrects itself instead of failing.
+Other engines commit to a plan before seeing a row, then run it to the end — the
+classic cause of a stalled or out-of-memory job. Batcher re-plans mid-query on the
+row counts it just measured, so a bad guess corrects itself instead of failing.
 :::
 
 :::{grid-item-card} {octicon}`server;1.1em` Scale without a rewrite
-Prototype on a sample on your laptop, then point the same code at the full dataset on
-a cluster. Operators are written once and combine across cores and machines, so
-growing from megabytes to petabytes is a deployment change, and memory stays bounded
-because every stage can spill to disk.
+Prototype on a sample, then point the same code at the full dataset on a cluster.
+Operators combine across cores and machines, so megabytes-to-petabytes is a
+deployment change — and memory stays bounded because every stage spills to disk.
 :::
 
 :::{grid-item-card} {octicon}`zap;1.1em` Fast without hand-tuning
-Column math compiles to machine code and streams in cache-sized batches, so small
-queries stay sub-second and large ones stay efficient. You don't tune batch sizes or
-partition counts to get there; the engine adapts them as it runs.
+Column math compiles to machine code and streams in cache-sized batches — small
+queries stay sub-second, large ones stay efficient. You never tune batch sizes or
+partition counts; the engine adapts them as it runs.
 :::
 
 :::{grid-item-card} {octicon}`stack;1.1em` One engine, not a stack
-SQL, DataFrames, and ML inference run on the same engine over the same Arrow data, so
-you stop gluing a query tool to a dataframe library to a serving system — and the
-seams between them stop leaking.
+SQL, DataFrames, and ML inference run on one engine over the same Arrow data. No
+gluing a query tool to a dataframe library to a serving system — and no seams
+between them to leak.
 :::
 ::::
 

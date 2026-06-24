@@ -54,7 +54,34 @@ article a.reference {
 .sidebar-drawer {
   border-right: 1px solid #1e293b;
 }
-.sidebar-brand-text { color: #f1f5f9; }
+
+/* Brand: a small gradient mark + the "Batcher" wordmark, linking home. */
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.62rem;
+  padding: 0.9rem 0 0.7rem;
+  opacity: 1;
+  transition: opacity 0.12s ease;
+}
+.sidebar-brand:hover { opacity: 0.85; text-decoration: none; }
+.sidebar-brand::before {
+  content: "";
+  flex: none;
+  width: 27px;
+  height: 27px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #60a5fa 0%, #2563eb 55%, #6366f1 100%);
+  box-shadow: 0 3px 10px -3px rgba(37, 99, 235, 0.75),
+    inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+.sidebar-brand-text {
+  color: #f8fafc;
+  font-weight: 800;
+  font-size: 1.32rem;
+  letter-spacing: -0.025em;
+  margin: 0;
+}
 
 /* nav links: smooth hover, rounded hit area */
 .sidebar-tree .reference {
@@ -174,7 +201,19 @@ article a.reference {
   border-color: var(--bt-blue) !important;
   box-shadow: 0 16px 34px -20px rgba(37, 99, 235, 0.65);
 }
-.sd-card .sd-card-title { font-weight: 700; }
+.sd-card .sd-card-body { padding: 1.35rem 1.45rem; }
+.sd-card .sd-card-title {
+  font-weight: 700;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+  margin-bottom: 0.55rem;
+}
+/* Card body reads as supporting text under the strong title. */
+.sd-card .sd-card-body > p:not(.sd-card-title) {
+  color: var(--color-foreground-secondary);
+  line-height: 1.62;
+  margin-bottom: 0;
+}
 .sd-card .sd-card-title .sd-octicon,
 .sd-card-title svg.octicon {
   color: var(--bt-blue);
@@ -257,8 +296,14 @@ article img[src*="/diagrams/"] {
   box-shadow: 0 8px 26px -14px rgba(15, 23, 42, 0.4);
 }
 
-.sidebar-logo-container { margin: 0.8rem auto 0.4rem; }
-.sidebar-logo { max-width: 86%; }
+/* ---- Responsive: scale the hero down on narrow viewports --------------- */
+
+@media (max-width: 67em) {
+  .bt-hero { padding: 2.2rem 1.5rem; }
+  .bt-hero-tagline { font-size: 1.95rem; }
+  .bt-hero-sub { font-size: 1.02rem; }
+  h1 { font-size: 2rem; }
+}
 
 /* ---- Motion: subtle, and only when the user allows it ------------------ */
 
