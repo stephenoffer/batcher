@@ -178,3 +178,13 @@ autodoc_mock_imports = [
     "cuda",
     "vllm",
 ]
+
+# The generated API reference (docs/api/complete.md) renders docstrings written in a
+# light Markdown style. Treat a bare `backtick` span as inline code so single
+# backticks don't need an explicit role, and suppress the docutils inline-markup
+# warnings those Markdown-isms (e.g. `Dataset`s) would otherwise raise under -W.
+default_role = "literal"
+suppress_warnings = ["docutils"]
+autodoc_member_order = "groupwise"
+autodoc_typehints = "description"
+autodoc_class_signature = "separated"
