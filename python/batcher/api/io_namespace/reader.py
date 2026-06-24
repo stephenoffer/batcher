@@ -58,91 +58,161 @@ class Reader:
 
     # --- File / object-store formats (path-addressed) ----------------------
     def parquet(self, path: str, **opts: Any) -> Dataset:
-        """Read a Parquet file, directory, or glob (e.g. ``d/*.parquet``)."""
+        """Read a Parquet file, directory, or glob (e.g. ``d/*.parquet``).
+
+        Kyber pushes column projection and row-group predicates into the read, so a
+        filtered/projected query touches only the needed columns and row groups.
+        """
         return _read(path, format="parquet", **opts)
 
     def parquet_dataset(self, path: str, **opts: Any) -> Dataset:
-        """Read a (Hive-)partitioned Parquet dataset directory."""
+        """Read a (Hive-)partitioned Parquet dataset directory.
+
+        Partition columns are recovered from the directory layout, and projection plus
+        predicate pushdown (including partition pruning) are applied per fragment.
+        """
         return _read(path, format="parquet_dataset", **opts)
 
     def csv(self, path: str, **opts: Any) -> Dataset:
-        """Read a CSV file, directory, or glob (e.g. ``d/*.csv``)."""
+        """Read a CSV file, directory, or glob (e.g. ``d/*.csv``).
+
+        The header row and column types are auto-inferred; column projection is pushed
+        into the read and a single large file is split into newline-aligned byte ranges
+        for parallel parsing.
+        """
         return _read(path, format="csv", **opts)
 
     def json(self, path: str, **opts: Any) -> Dataset:
-        """Read newline-delimited JSON: a file, directory, or glob."""
+        """Read newline-delimited JSON: a file, directory, or glob.
+
+        One JSON object per line; column types are inferred from the records.
+        """
         return _read(path, format="json", **opts)
 
     def orc(self, path: str, **opts: Any) -> Dataset:
-        """Read ORC file(s)."""
+        """Read ORC file(s) — file, directory, or glob — with column projection pushed in."""
         return _read(path, format="orc", **opts)
 
     def arrow(self, path: str, **opts: Any) -> Dataset:
-        """Read Arrow/Feather IPC file(s)."""
+        """Read Arrow/Feather IPC file(s) — file, directory, or glob — zero-copy into the engine."""
         return _read(path, format="arrow", **opts)
 
     def avro(self, path: str, **opts: Any) -> Dataset:
-        """Read Avro file(s) (needs ``batcher-engine[avro]``)."""
+        """Read Avro file(s): a file, directory, or glob.
+
+        Needs the optional extra: ``pip install 'batcher-engine[avro]'``.
+        """
         return _read(path, format="avro", **opts)
 
     def lance(self, path: str, **opts: Any) -> Dataset:
-        """Read a Lance dataset (needs ``batcher-engine[lance]``)."""
+        """Read a Lance dataset (columnar ML format) by directory path.
+
+        Needs the optional extra: ``pip install 'batcher-engine[lance]'``.
+        """
         return _read(path, format="lance", **opts)
 
     def excel(self, path: str, **opts: Any) -> Dataset:
-        """Read Excel workbook(s) (needs ``batcher-engine[excel]``)."""
+        """Read Excel workbook(s) — a file, directory, or glob — via python-calamine.
+
+        Needs the optional extra: ``pip install 'batcher-engine[excel]'``.
+        """
         return _read(path, format="excel", **opts)
 
     def xml(self, path: str, **opts: Any) -> Dataset:
-        """Read XML file(s) (needs ``batcher-engine[xml]``)."""
+        """Read XML file(s) — a file, directory, or glob — into columnar rows.
+
+        Needs the optional extra: ``pip install 'batcher-engine[xml]'``.
+        """
         return _read(path, format="xml", **opts)
 
     def logs(self, path: str, **opts: Any) -> Dataset:
-        """Read line-delimited log file(s); pass ``pattern=`` for grok extraction."""
+        """Read line-delimited log file(s) as rows, one raw line per row by default.
+
+        Pass ``pattern=`` to extract fields with a grok pattern instead.
+
+        Args:
+            path: A log file, directory, or glob.
+            pattern: Optional grok pattern; named captures become columns.
+        """
         return _read(path, format="logs", **opts)
 
     def text(self, path: str, **opts: Any) -> Dataset:
-        """Read text file(s) as rows (``mode="line"`` or ``"file"``)."""
+        """Read text file(s) as rows, one row per line by default.
+
+        Args:
+            path: A text file, directory, or glob.
+            mode: ``"line"`` for one row per line, or ``"file"`` for whole-file rows.
+        """
         return _read(path, format="text", **opts)
 
     def binary(self, path: str, **opts: Any) -> Dataset:
-        """Read whole files as ``{uri, bytes, size, mime}`` rows."""
+        """Read whole files as ``{uri, bytes, size, mime}`` rows.
+
+        The entry point for custom/multimodal decoding of arbitrary file(s).
+        """
         return _read(path, format="binary", **opts)
 
     def documents(self, path: str, **opts: Any) -> Dataset:
-        """Read PDF document(s) as text rows (needs ``batcher-engine[pdf]``)."""
+        """Read PDF document(s) — a file, directory, or glob — as extracted text rows.
+
+        Needs the optional extra: ``pip install 'batcher-engine[pdf]'``.
+        """
         return _read(path, format="documents", **opts)
 
     def numpy(self, path: str, **opts: Any) -> Dataset:
-        """Read NumPy ``.npy``/``.npz`` file(s)."""
+        """Read NumPy ``.npy``/``.npz`` file(s) — file, directory, or glob — as tensor rows."""
         return _read(path, format="numpy", **opts)
 
     def webdataset(self, path: str, **opts: Any) -> Dataset:
-        """Read WebDataset ``.tar`` shard(s)."""
+        """Read WebDataset ``.tar`` shard(s), grouping each sample's member files into one row."""
         return _read(path, format="webdataset", **opts)
 
     def hdf5(self, path: str, **opts: Any) -> Dataset:
-        """Read HDF5 file(s) (needs ``batcher-engine[hdf5]``)."""
+        """Read HDF5 file(s) — a file, directory, or glob — with datasets as columns.
+
+        Needs the optional extra: ``pip install 'batcher-engine[hdf5]'``.
+        """
         return _read(path, format="hdf5", **opts)
 
     def zarr(self, path: str, **opts: Any) -> Dataset:
-        """Read a Zarr store (needs ``batcher-engine[zarr]``)."""
+        """Read a Zarr store (chunked n-dimensional arrays) by path.
+
+        Needs the optional extra: ``pip install 'batcher-engine[zarr]'``.
+        """
         return _read(path, format="zarr", **opts)
 
     # --- Multimodal --------------------------------------------------------
     def images(
         self, path: str, *, decode: bool = False, size: tuple[int, int] | None = None, **opts: Any
     ) -> Dataset:
-        """List images (uri/bytes/size/mime + header meta); ``decode=True`` with
-        ``size=(h, w)`` appends an ``image`` (H, W, 3) uint8 tensor (``batcher-engine[image]``)."""
+        """List image file(s) as ``{uri, bytes, size, mime}`` + header-metadata rows.
+
+        ``decode=True`` (or passing ``size=``) appends an ``image`` (H, W, 3) uint8
+        tensor column; decoding needs the optional extra:
+        ``pip install 'batcher-engine[image]'``.
+
+        Args:
+            path: An image file, directory, or glob.
+            decode: If true, append the decoded ``image`` tensor column.
+            size: ``(height, width)`` to resize decoded images to; implies ``decode``.
+        """
         ds = _read(path, format="images", **opts)
         return _decode(ds, "image_tensor_dataset", size=size) if (decode or size) else ds
 
     def audio(
         self, path: str, *, decode: bool = False, sample_rate: int | None = None, **opts: Any
     ) -> Dataset:
-        """List audio files + header meta; ``decode=True`` appends a ``waveform``
-        ``list<float32>`` column via soundfile, optionally resampled (``batcher-engine[audio]``)."""
+        """List audio file(s) + header-metadata rows.
+
+        ``decode=True`` appends a ``waveform`` ``list<float32>`` column via soundfile,
+        optionally resampled; decoding needs the optional extra:
+        ``pip install 'batcher-engine[audio]'``.
+
+        Args:
+            path: An audio file, directory, or glob.
+            decode: If true, append the decoded ``waveform`` column.
+            sample_rate: Target sample rate in Hz to resample to when decoding.
+        """
         ds = _read(path, format="audio", **opts)
         return _decode(ds, "audio_dataset", sample_rate=sample_rate) if decode else ds
 
@@ -155,8 +225,18 @@ class Reader:
         num_frames: int = 8,
         **opts: Any,
     ) -> Dataset:
-        """List video files + header meta; ``decode=True`` with ``size=(h, w)`` appends a
-        ``frames`` (num_frames, H, W, 3) uint8 tensor via PyAV (``batcher-engine[video]``)."""
+        """List video file(s) + header-metadata rows.
+
+        ``decode=True`` (or passing ``size=``) appends a ``frames`` (num_frames, H, W, 3)
+        uint8 tensor column via PyAV; decoding needs the optional extra:
+        ``pip install 'batcher-engine[video]'``.
+
+        Args:
+            path: A video file, directory, or glob.
+            decode: If true, append the decoded ``frames`` tensor column.
+            size: ``(height, width)`` to resize decoded frames to; implies ``decode``.
+            num_frames: Number of frames to sample per video (default 8).
+        """
         ds = _read(path, format="video", **opts)
         if not (decode or size):
             return ds
@@ -171,7 +251,15 @@ class Reader:
         timestamp: str | None = None,
         **opts: Any,
     ) -> Dataset:
-        """Read a Delta Lake table (time travel via ``version=``/``timestamp=``)."""
+        """Read a Delta Lake table by URI, defaulting to its latest version.
+
+        Needs the optional extra: ``pip install 'batcher-engine[delta]'``.
+
+        Args:
+            table_uri: Path/URI of the Delta table root.
+            version: Time-travel to this table version (exclusive with ``timestamp``).
+            timestamp: Time-travel to the version current as of this ISO timestamp.
+        """
         return _read_table("delta", table_uri, version=version, timestamp=timestamp, **opts)
 
     def iceberg(
@@ -182,67 +270,142 @@ class Reader:
         snapshot_id: int | None = None,
         **opts: Any,
     ) -> Dataset:
-        """Read an Iceberg table (``catalog=``, ``snapshot_id=``)."""
+        """Read an Iceberg table by catalog identifier (e.g. ``"db.table"``).
+
+        Needs the optional extra: ``pip install 'batcher-engine[iceberg]'``.
+
+        Args:
+            identifier: Table identifier within the catalog.
+            catalog: Named catalog to resolve against (defaults to the configured one).
+            snapshot_id: Time-travel to this Iceberg snapshot id.
+        """
         return _read_table("iceberg", identifier, catalog=catalog, snapshot_id=snapshot_id, **opts)
 
     def hudi(self, table_uri: str, **opts: Any) -> Dataset:
-        """Read an Apache Hudi table (read-only)."""
+        """Read an Apache Hudi table by URI (read-only, snapshot query).
+
+        Needs the optional extra: ``pip install 'batcher-engine[hudi]'``.
+        """
         return _read_table("hudi", table_uri, **opts)
 
     def delta_sharing(self, url: str, **opts: Any) -> Dataset:
-        """Read a Delta Sharing table by profile URL."""
+        """Read a Delta Sharing table by ``<profile>#<share>.<schema>.<table>`` URL.
+
+        Needs the optional extra: ``pip install 'batcher-engine[delta-sharing]'``.
+        """
         return _read_table("delta_sharing", url, **opts)
 
     # --- SQL / warehouses --------------------------------------------------
     def sql(self, query: str | None = None, **opts: Any) -> Dataset:
-        """Read via ADBC/FlightSQL in a single submission (``query=`` or ``table=``)."""
+        """Read any ADBC/FlightSQL database in a single submission.
+
+        Supply a SQL ``query`` positionally or ``table=`` to read a whole table; the
+        connection is given via ``uri=`` / driver options.
+
+        Args:
+            query: SQL text to execute, or ``None`` when reading via ``table=``.
+        """
         return _read_table("adbc", query, **opts)
 
     def snowflake(self, query: str, **opts: Any) -> Dataset:
-        """Read a Snowflake query (parallel result-chunk fetch)."""
+        """Read the result of a Snowflake SQL query, fetching result chunks in parallel as Arrow.
+
+        Connection credentials are passed as keyword options.
+        """
         return _read_table("snowflake", query, **opts)
 
     def databricks(self, table: str, **opts: Any) -> Dataset:
-        """Read a Databricks/Unity Catalog table (credential vending → Delta)."""
+        """Read a Databricks/Unity Catalog table by name.
+
+        Uses credential vending to read the underlying Delta files directly.
+        """
         return _read_table("databricks", table, **opts)
 
     def bigquery(self, query: str | None = None, **opts: Any) -> Dataset:
-        """Read BigQuery via the Storage Read API (parallel Arrow streams)."""
+        """Read BigQuery via the Storage Read API as parallel Arrow streams.
+
+        Supply a SQL ``query`` positionally, or ``table=`` to read a whole table.
+
+        Args:
+            query: SQL text to execute, or ``None`` when reading via ``table=``.
+        """
         return _read_table("bigquery", query, **opts)
 
     def clickhouse(self, query: str, **opts: Any) -> Dataset:
-        """Read a ClickHouse query (Arrow-native)."""
+        """Read the result of a ClickHouse SQL query over the Arrow-native interface.
+
+        Connection details are passed as keyword options.
+        """
         return _read_table("clickhouse", query, **opts)
 
     # --- NoSQL -------------------------------------------------------------
     def mongo(self, **opts: Any) -> Dataset:
-        """Read a MongoDB collection (Arrow-native via pymongoarrow)."""
+        """Read a MongoDB collection Arrow-natively via pymongoarrow.
+
+        Pass connection, database, collection, and any query/projection as keyword options.
+        """
         return _read_table("mongo", **opts)
 
     def cassandra(self, **opts: Any) -> Dataset:
-        """Read Cassandra/Scylla via token-range splits."""
+        """Read a Cassandra/Scylla table, fanning out across token-range splits for parallelism.
+
+        Pass connection, keyspace, and table as keyword options.
+        """
         return _read_table("cassandra", **opts)
 
     def dynamodb(self, **opts: Any) -> Dataset:
-        """Read DynamoDB via native parallel scan segments."""
+        """Read a DynamoDB table using native parallel scan segments.
+
+        Pass the table name and AWS connection options as keywords.
+        """
         return _read_table("dynamodb", **opts)
 
     def elasticsearch(self, **opts: Any) -> Dataset:
-        """Read Elasticsearch via ES|QL Arrow / sliced scroll."""
+        """Read an Elasticsearch index via ES|QL Arrow output (or a sliced scroll fallback).
+
+        Pass the host, index, and query as keyword options.
+        """
         return _read_table("elasticsearch", **opts)
 
     # --- Streaming ---------------------------------------------------------
     def kafka(self, **opts: Any) -> Dataset:
-        """Read a Kafka topic as an unbounded streaming source."""
+        """Read a Kafka topic as an unbounded streaming source.
+
+        Pass ``topic=`` and broker/connection options as keywords; needs the optional
+        extra: ``pip install 'batcher-engine[kafka]'``.
+        """
         return _read_table("kafka", **opts)
 
     def kinesis(self, **opts: Any) -> Dataset:
-        """Read an AWS Kinesis stream as an unbounded source."""
+        """Read an AWS Kinesis stream as an unbounded source.
+
+        Pass the stream name and AWS options as keywords; needs the optional extra:
+        ``pip install 'batcher-engine[kinesis]'``.
+        """
         return _read_table("kinesis", **opts)
 
     def files_incremental(self, path: str, file_format: str, **opts: Any) -> Dataset:
-        """Incrementally discover new files under `path` (Auto Loader analog)."""
+        """Incrementally discover and read newly arrived files under `path`.
+
+        A Databricks Auto Loader analog: tracks already-seen files across runs.
+
+        Args:
+            path: Directory or glob to watch for new files.
+            file_format: Underlying format of those files (e.g. ``"parquet"``, ``"json"``).
+        """
         return _read_table("files_incremental", path, file_format, **opts)
+
+    def rate(self, rows_per_second: int = 1, **opts: Any) -> Dataset:
+        """Generate ``(timestamp, value)`` rows at `rows_per_second` (Spark `rate`).
+
+        A dev/benchmark source. Pass ``num_rows=`` to bound it (and ``pace=False`` to
+        emit without the one-second cadence).
+        """
+        return _read_table("rate", rows_per_second, **opts)
+
+    def socket(self, host: str = "localhost", port: int = 9999, **opts: Any) -> Dataset:
+        """Read newline-delimited text from a TCP socket (Spark `socket`; dev only)."""
+        return _read_table("socket", host, port, **opts)
 
 
 read = Reader()
