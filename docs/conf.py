@@ -5,6 +5,9 @@
 
 import os
 import sys
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
 # Add the project root to the path so autodoc can find the modules
 sys.path.insert(0, os.path.abspath(".."))
@@ -12,9 +15,16 @@ sys.path.insert(0, os.path.abspath(".."))
 # -- Project information -----------------------------------------------------
 
 project = "Batcher"
-copyright = "2024, Batcher Contributors"
 author = "Batcher Contributors"
-release = "0.1.0"
+copyright = f"{datetime.now(tz=timezone.utc):%Y}, Batcher Contributors"
+
+# Track the installed package version (set in the workspace Cargo.toml) instead of a
+# hardcoded literal; fall back when the docs are built without the engine installed.
+try:
+    release = _pkg_version("batcher-engine")
+except PackageNotFoundError:
+    release = "0.1.0"
+version = release
 
 # -- General configuration ---------------------------------------------------
 
