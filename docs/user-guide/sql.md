@@ -1,11 +1,11 @@
 # SQL
 
-Batcher runs SQL through the same engine as the DataFrame API. `bt.sql(query, ...)`
+Batcher runs SQL through the same engine as the DataFrame API. {py:obj}`bt.sql(query, ...) <batcher.sql>`
 parses a query, binds each named table to a Dataset, and returns a new Dataset.
 Because the result is a Dataset, you can keep chaining DataFrame operations onto a
 SQL query, or feed a DataFrame pipeline into SQL.
 
-`bt.sql` is single-dialect. It supports a focused subset of SQL, not a multi-dialect
+{py:obj}`bt.sql <batcher.sql>` is single-dialect. It supports a focused subset of SQL, not a multi-dialect
 translation layer.
 
 ```python

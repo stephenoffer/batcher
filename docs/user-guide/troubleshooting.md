@@ -48,7 +48,7 @@ print(ds.with_columns(z=bt.col("x") + bt.col("y")).columns)
 ## filter needs an expression, not a string
 
 `filter` takes an `Expr`. A raw string is not a predicate; build the condition with
-`bt.col`.
+{py:obj}`bt.col <batcher.col>`.
 
 ```python
 try:
@@ -62,7 +62,7 @@ print(ok.to_pydict())
 # {'x': [2, 3], 'y': [20, 30]}
 ```
 
-To filter with SQL syntax instead, use `bt.sql`.
+To filter with SQL syntax instead, use {py:obj}`bt.sql <batcher.sql>`.
 
 ## Aggregates are keyword arguments
 
@@ -100,7 +100,7 @@ bt.col("y")) < 30` and will not do what you want.
 
 The surface is deliberately small and some operations live in a specific place:
 
-- There is no `ds.sql(...)` method. Use the top-level `bt.sql(query, table=ds)`.
+- There is no `ds.sql(...)` method. Use the top-level {py:obj}`bt.sql(query, table=ds) <batcher.sql>`.
 - There is no dataset-level `.cast`, `.fill_null`, or `.drop_nulls`. Cast and
   fill nulls on an expression: `ds.with_columns(x=bt.col("x").cast("Float64"))`,
   `ds.with_columns(x=bt.col("x").fill_null(0))`.

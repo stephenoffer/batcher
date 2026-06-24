@@ -19,7 +19,7 @@ shown but not executed.
 
 ## Reading from object storage
 
-`bt.read` infers the format from the extension. The format-specific readers
+{py:obj}`bt.read <batcher.read>` infers the format from the extension. The format-specific readers
 (`bt.read.parquet`, `bt.read.csv`, `bt.read.json`) take the same cloud paths.
 
 ```python

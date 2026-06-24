@@ -1,12 +1,12 @@
 # Synthetic data generation
 
-Build test datasets in memory with plain Python and `bt.from_pydict`. This is the
+Build test datasets in memory with plain Python and {py:obj}`bt.from_pydict <batcher.from_pydict>`. This is the
 simplest way to produce inputs for trying out a pipeline at a chosen size and shape.
 Everything here runs as written.
 
 ## A small fixed dataset
 
-`bt.from_pydict` takes a column-oriented dict, so generate each column as a list.
+{py:obj}`bt.from_pydict <batcher.from_pydict>` takes a column-oriented dict, so generate each column as a list.
 
 ```python
 import batcher as bt

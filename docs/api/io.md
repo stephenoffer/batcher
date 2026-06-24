@@ -1,8 +1,8 @@
 # Reading and Writing
 
-Readers hang off `bt.read` and return a lazy `Dataset`; writers hang off
+Readers hang off {py:obj}`bt.read <batcher.read>` and return a lazy `Dataset`; writers hang off
 `ds.write` and are terminal (they execute the plan and return a `WriteManifest`).
-`bt.read(path, format=None, **opts)` infers the format from the path; the dedicated
+{py:obj}`bt.read(path, format=None, **opts) <batcher.read>` infers the format from the path; the dedicated
 readers below are explicit. Some connectors need an optional dependency — the
 "Extra" column gives the install (`pip install 'batcher-engine[<extra>]'`).
 

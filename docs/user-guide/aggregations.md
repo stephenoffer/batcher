@@ -22,7 +22,7 @@ ds = bt.from_pydict(
 ## group_by and agg
 
 `group_by` takes the grouping keys; `agg` takes the output aggregates as keyword
-arguments. `bt.count()` is `COUNT(*)`; the column aggregates (`.sum()`, `.mean()`,
+arguments. {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; the column aggregates (`.sum()`, `.mean()`,
 and so on) are methods on an expression.
 
 ```python
@@ -40,7 +40,7 @@ print(out.to_pydict())
 
 The aggregate methods available inside `agg` are `sum`, `min`, `max`, `mean`,
 `var`, `std`, `median`, `quantile(q)`, `count`, and `n_unique` (also spelled
-`count_distinct`). `bt.count()` counts rows.
+`count_distinct`). {py:obj}`bt.count() <batcher.count>` counts rows.
 
 ```python
 stats = ds.group_by("category").agg(

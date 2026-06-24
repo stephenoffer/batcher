@@ -22,7 +22,7 @@ ds = bt.from_pydict(
 
 ## Columns and literals
 
-`bt.col(name)` refers to an input column. `bt.lit(value)` is a constant. Both are
+{py:obj}`bt.col(name) <batcher.col>` refers to an input column. {py:obj}`bt.lit(value) <batcher.lit>` is a constant. Both are
 expressions, so they compose with operators and methods.
 
 ```python
@@ -55,7 +55,7 @@ print(out.to_pydict())
 
 ## Conditionals: when / then / otherwise
 
-`bt.when(cond).then(value)` builds a SQL `CASE`. Chain more `.when(...).then(...)`
+{py:obj}`bt.when(cond).then(value) <batcher.when>` builds a SQL `CASE`. Chain more `.when(...).then(...)`
 clauses and close with `.otherwise(default)`.
 
 ```python
@@ -73,8 +73,8 @@ print(out.to_pydict())
 
 ## Null handling
 
-`bt.coalesce` returns the first non-null argument. `bt.nullif(a, b)` returns null
-when `a == b`. `bt.greatest` and `bt.least` pick the extreme across columns. On a
+{py:obj}`bt.coalesce <batcher.coalesce>` returns the first non-null argument. {py:obj}`bt.nullif(a, b) <batcher.nullif>` returns null
+when `a == b`. {py:obj}`bt.greatest <batcher.greatest>` and {py:obj}`bt.least <batcher.least>` pick the extreme across columns. On a
 single expression, `.fill_null(value)`, `.is_null()`, and `.is_not_null()` apply.
 
 ```python
@@ -111,7 +111,7 @@ Numeric expressions carry a full set of math methods, including `.abs()`,
 `.log10()`, `.log2()`, `.exp()`, the trig family (`.sin()`, `.cos()`, `.tan()`,
 `.asin()`, `.acos()`, `.atan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`),
 `.sign()`, `.trunc()`, `.cbrt()`, `.degrees()`, and `.radians()`.
-`bt.atan2(y, x)` is a top-level two-argument form.
+{py:obj}`bt.atan2(y, x) <batcher.atan2>` is a top-level two-argument form.
 
 ```python
 nums = bt.from_pydict({"x": [1.0, 4.0, 9.0]})
@@ -217,7 +217,7 @@ print(out.to_pydict())
 
 Aggregate methods such as `.sum()`, `.mean()`, `.min()`, `.max()`, `.median()`,
 `.std()`, `.var()`, `.quantile(q)`, `.count()`, and `.n_unique()` are used inside
-`group_by(...).agg(...)`. `bt.count()` is the top-level `COUNT(*)`.
+`group_by(...).agg(...)`. {py:obj}`bt.count() <batcher.count>` is the top-level `COUNT(*)`.
 
 ```python
 out = ds.group_by().agg(

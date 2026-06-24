@@ -31,7 +31,7 @@ no work runs until a terminal operation such as `to_pydict` or `collect`.
 
 ## Filter rows
 
-Filters are expressions built from `bt.col(...)`. Combine conditions with `&`
+Filters are expressions built from {py:obj}`bt.col(...) <batcher.col>`. Combine conditions with `&`
 (and), `|` (or), and `~` (not).
 
 ```python
@@ -58,7 +58,7 @@ print(enriched.columns)
 ## Aggregate
 
 Group with `group_by` and finalize with `agg`. Each aggregate is a keyword whose
-value is an aggregate expression; `bt.count()` is `COUNT(*)`.
+value is an aggregate expression; {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`.
 
 ```python
 summary = (

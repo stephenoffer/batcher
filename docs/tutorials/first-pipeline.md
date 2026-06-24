@@ -7,7 +7,7 @@ and so is not executed.
 
 ## Build a dataset
 
-A `Dataset` is a lazy, immutable handle to a query plan. `bt.from_pydict` builds one
+A `Dataset` is a lazy, immutable handle to a query plan. {py:obj}`bt.from_pydict <batcher.from_pydict>` builds one
 from a column-oriented dict. No work runs until a terminal operation.
 
 ```python

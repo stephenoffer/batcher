@@ -79,7 +79,7 @@ ds = bt.from_pandas(pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}))
 File readers load from local paths, glob patterns, and object-store URLs. They
 need real files, so the examples below are shown but not executed here.
 
-`bt.read(path, format=None, **opts)` detects the format from the path when
+{py:obj}`bt.read(path, format=None, **opts) <batcher.read>` detects the format from the path when
 `format` is omitted. Format-specific helpers (`read.parquet`, `read.csv`,
 `read.json`, `read.table`) accept the same path and option style.
 

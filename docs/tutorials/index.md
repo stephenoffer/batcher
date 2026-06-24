@@ -9,7 +9,7 @@ matches what you are building.
 - [Batch inference](batch-inference.md): run a model over Arrow batches with the
   `.ml` accessor.
 - [Synthetic data generation](synthetic-data-generation.md): build test datasets in
-  memory with Python and `bt.from_pydict`.
+  memory with Python and {py:obj}`bt.from_pydict <batcher.from_pydict>`.
 
 ```{toctree}
 :maxdepth: 1

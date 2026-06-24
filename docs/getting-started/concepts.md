@@ -27,7 +27,7 @@ handle and reuse it without copying data.
 
 ## Expressions run in Rust
 
-Column work is expressed with `Expr` values built from `bt.col(...)` and `bt.lit(...)`.
+Column work is expressed with `Expr` values built from {py:obj}`bt.col(...) <batcher.col>` and {py:obj}`bt.lit(...) <batcher.lit>`.
 An expression is a description, not a Python loop. When the plan executes, the
 expression is evaluated in the Rust data plane over whole Arrow batches, never row
 by row in Python.

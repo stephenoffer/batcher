@@ -13,7 +13,7 @@ answer.
    and date accessors.
 4. [Filtering](../user-guide/filtering.md): predicates and `is_in` / `between`.
 5. [Aggregations](../user-guide/aggregations.md): `group_by`, `.agg`, quantiles.
-6. [SQL](../user-guide/sql.md): query a dataset with `bt.sql`.
+6. [SQL](../user-guide/sql.md): query a dataset with {py:obj}`bt.sql <batcher.sql>`.
 7. [Window functions](../user-guide/window-functions.md): ranking and rolling
    aggregates.
 8. [Expression API reference](../api/expressions.md) and
@@ -43,7 +43,7 @@ print(summary.to_pydict())
 
 ## Example: ask the same question in SQL
 
-`bt.sql` runs a query against a dataset bound to a table name and returns a new
+{py:obj}`bt.sql <batcher.sql>` runs a query against a dataset bound to a table name and returns a new
 dataset.
 
 ```python

@@ -9,7 +9,7 @@ method, every terminal method, and the `GroupBy` builder.
 
 ## Construction
 
-The most direct entry point is `bt.from_pydict`, which builds a dataset from a
+The most direct entry point is {py:obj}`bt.from_pydict <batcher.from_pydict>`, which builds a dataset from a
 column-oriented dict. It is used throughout this page because it needs no files.
 
 ```python
@@ -28,13 +28,13 @@ print(ds.columns)
 
 | Entry point | Source |
 | --- | --- |
-| `bt.from_pydict(mapping)` | A column-oriented dict (`{name: [values]}`). |
-| `bt.from_arrow(table_or_batches)` | A pyarrow `Table`, `RecordBatch`, or list of batches. |
-| `bt.from_batches(factory, schema)` | A reusable factory that yields Arrow batches (streaming source). |
-| `bt.from_pandas(df)` | A pandas `DataFrame`. |
-| `bt.from_polars(df)` | A Polars `DataFrame`. |
-| `bt.from_numpy(...)` | NumPy arrays. |
-| `bt.from_spark`, `bt.from_dask`, `bt.from_huggingface`, `bt.from_torch`, `bt.from_tf` | Framework adapters. |
+| {py:obj}`bt.from_pydict(mapping) <batcher.from_pydict>` | A column-oriented dict (`{name: [values]}`). |
+| {py:obj}`bt.from_arrow(table_or_batches) <batcher.from_arrow>` | A pyarrow `Table`, `RecordBatch`, or list of batches. |
+| {py:obj}`bt.from_batches(factory, schema) <batcher.from_batches>` | A reusable factory that yields Arrow batches (streaming source). |
+| {py:obj}`bt.from_pandas(df) <batcher.from_pandas>` | A pandas `DataFrame`. |
+| {py:obj}`bt.from_polars(df) <batcher.from_polars>` | A Polars `DataFrame`. |
+| {py:obj}`bt.from_numpy(...) <batcher.from_numpy>` | NumPy arrays. |
+| {py:obj}`bt.from_spark <batcher.from_spark>`, {py:obj}`bt.from_dask <batcher.from_dask>`, {py:obj}`bt.from_huggingface <batcher.from_huggingface>`, {py:obj}`bt.from_torch <batcher.from_torch>`, {py:obj}`bt.from_tf <batcher.from_tf>` | Framework adapters. |
 
 File and object-store readers share the same surface; only the source changes.
 
@@ -45,7 +45,7 @@ ds = bt.read.parquet("data/events.parquet")
 ds = bt.read.csv("data/events.csv")
 ```
 
-`bt.read(path, format=None, **opts)` dispatches on the path or an explicit
+{py:obj}`bt.read(path, format=None, **opts) <batcher.read>` dispatches on the path or an explicit
 `format`. Dedicated readers exist for parquet, csv, json, orc, arrow, avro,
 lance, delta, iceberg, hudi, images, audio, video, and SQL/warehouse sources
 (`read.snowflake`, `read.bigquery`, `read.kafka`, and more).
@@ -223,7 +223,7 @@ print(with_total.select("category", "total").to_pydict())
 Pass exactly one sizing option: `num_files` (split into that many files),
 `target_size_mb` (coalesce into ~that-size files — the small-files fix), or neither
 with only `by` to Hive-partition by column(s). `by` may combine with a sizing
-option. For in-place use against an existing path, see `bt.compact`.
+option. For in-place use against an existing path, see {py:obj}`bt.compact <batcher.compact>`.
 
 ```python
 # docs: skip
@@ -235,7 +235,7 @@ ds.repartition(by="dt").write("out/")
 
 `group_by(*keys, **derived)` returns a `GroupBy`. Finalize it with
 `agg(**named_aggregates)`, where each keyword names an output column and its value
-is an aggregate expression. `bt.count()` is `COUNT(*)`; column aggregates such as
+is an aggregate expression. {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; column aggregates such as
 `.sum()` and `.mean()` are methods on an expression. There is no `.alias` on an
 aggregate; the keyword is the name.
 

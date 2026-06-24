@@ -1,6 +1,6 @@
 # SQL
 
-`bt.sql` runs a SQL query against one or more in-memory datasets and returns a
+{py:obj}`bt.sql <batcher.sql>` runs a SQL query against one or more in-memory datasets and returns a
 lazy `Dataset`. The query is parsed, lowered to the same plan the DataFrame API
 builds, and optimized by the same passes, so SQL and DataFrame code share one
 engine and one set of semantics.
@@ -24,8 +24,8 @@ print(out.to_pydict())
 # {'category': ['a', 'b', 'c'], 'n': [3, 2, 1]}
 ```
 
-`bt.sql` returns a `Dataset`, so it is lazy and composes with the rest of the API:
-add `.filter`, `.with_columns`, or another `bt.sql` on top before a terminal
+{py:obj}`bt.sql <batcher.sql>` returns a `Dataset`, so it is lazy and composes with the rest of the API:
+add `.filter`, `.with_columns`, or another {py:obj}`bt.sql <batcher.sql>` on top before a terminal
 operation runs the whole plan.
 
 ## Supported SQL
@@ -118,7 +118,7 @@ print(out.to_pydict())
 ## What is not here
 
 There is no `SQLContext`, no `from batcher.sql import ...`, and no `ds.sql(...)`
-method on a `Dataset`. `bt.sql` is the one entry point. For anything outside the
+method on a `Dataset`. {py:obj}`bt.sql <batcher.sql>` is the one entry point. For anything outside the
 supported subset, build the query with the DataFrame API, which exposes the full
 operator set.
 
