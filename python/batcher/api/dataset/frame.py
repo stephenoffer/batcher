@@ -95,7 +95,26 @@ def _unknown_cols(missing: set[str], available: list[str]) -> str:
 
 
 class Dataset:
-    """A lazy relation. Construct via `batcher.from_arrow` / `from_pydict`."""
+    """A lazy, immutable relation — the fluent entry point to the engine.
+
+    A `Dataset` is a handle to a query plan plus its bound inputs. Construct one
+    with a session constructor (`batcher.from_pydict`, `from_arrow`, `read`, …),
+    then build it up with transformations (`filter`, `select`, `with_columns`,
+    `group_by`, `join`, …). Every transformation is **lazy** and returns a *new*
+    `Dataset`; nothing mutates and no work runs until a **terminal** operation
+    (`collect`, `to_pydict`, `to_pylist`, `iter_batches`, `write`, `count`, …)
+    executes the optimized plan. Expressions (`batcher.col("x") * 2`) describe
+    column work that runs in the Rust data plane; per-row Python never enters the
+    hot path.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, 2, 3], "g": ["a", "a", "b"]})
+            >>> ds.filter(bt.col("x") > 1).select("x").to_pydict()
+            {'x': [2, 3]}
+    """
 
     __slots__ = ("_plan", "_repartition", "_sources", "_watermark")
 
@@ -455,11 +474,41 @@ class Dataset:
         return session._run(query, {table_name: self})
 
     def with_column(self, name: str, expr: Expr) -> Dataset:
-        """Add or replace a single column (sugar for `with_columns`)."""
+        """Add a column `name` from `expr`, or replace it if it already exists.
+
+        The single-column sugar for `with_columns`; all existing columns are kept.
+        Lazy — returns a new `Dataset`.
+
+        Args:
+            name: The output column name (replaced if present).
+            expr: The expression computing the column.
+
+        Returns:
+            A new `Dataset` with the column added or replaced.
+        """
         return self.with_columns(**{name: expr})
 
     def drop(self, *columns: str) -> Dataset:
-        """Return a dataset without the named columns."""
+        """Return a dataset without the named columns, preserving the rest in order.
+
+        The complement of `select`: name the columns to remove rather than the ones
+        to keep. Lazy. Raises `PlanError` on an unknown column (with a suggestion)
+        or if every column would be dropped.
+
+        Args:
+            *columns: Names of the columns to remove.
+
+        Returns:
+            A new `Dataset` with the remaining columns.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1, 2], "b": [3, 4], "c": [5, 6]})
+                >>> ds.drop("b").to_pydict()
+                {'a': [1, 2], 'c': [5, 6]}
+        """
         to_drop = set(columns)
         available = self._plan.available_columns()
         missing = to_drop - set(available)
@@ -781,7 +830,18 @@ class Dataset:
         return build_fill_null(self, value)
 
     def drop_nulls(self, subset: list[str] | None = None) -> Dataset:
-        """Drop rows that are null in any of `subset` (default: any column)."""
+        """Drop rows that are null in any of `subset` (default: any column).
+
+        The row-filtering counterpart to `fill_null`: a row survives only if all of
+        the considered columns are non-null. Lazy. Pass `subset` to consider only
+        those columns; otherwise a null anywhere in the row drops it.
+
+        Args:
+            subset: Columns to check for nulls; ``None`` checks every column.
+
+        Returns:
+            A new `Dataset` with the null-containing rows removed.
+        """
         return build_drop_nulls(self, subset)
 
     def cast(self, dtypes: str | dict[str, str], *, strict: bool = True) -> Dataset:
@@ -878,7 +938,25 @@ class Dataset:
         return self._derive(Limit(self._plan, n, offset))
 
     def head(self, n: int = 5) -> Dataset:
-        """Keep the first `n` rows (alias for `limit(n)`)."""
+        """Keep the first `n` rows (alias for ``limit(n)``).
+
+        Lazy — returns a new `Dataset`. Without a preceding `sort` the rows are in
+        an unspecified order, so pair it with `sort` (or use `top_k`) when you need
+        a deterministic preview.
+
+        Args:
+            n: Maximum number of rows to keep.
+
+        Returns:
+            A new `Dataset` with at most `n` rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3, 4, 5]}).sort("x").head(2).to_pydict()
+                {'x': [1, 2]}
+        """
         return self.limit(n)
 
     def join(
@@ -1080,7 +1158,16 @@ class Dataset:
         )
 
     def explain(self) -> str:
-        """Return a human-readable optimized plan with cardinality estimates."""
+        """Return the optimized plan as human-readable text, without executing.
+
+        Runs the Kyber optimizer on the plan and renders the resulting operator
+        tree with per-operator cardinality estimates, so you can inspect join order,
+        pushdowns, and chosen strategies before running anything. For *measured*
+        per-operator metrics from an actual run, use `stats` instead.
+
+        Returns:
+            The optimized plan rendered as text.
+        """
         return _explain(self._plan, self._sources)
 
     def stats(self) -> RunStats:
@@ -1167,23 +1254,64 @@ class Dataset:
         return Writer(self)
 
     def to_arrow(self) -> pa.Table:
-        """Execute and return the result as a `pyarrow.Table` (the named form of `collect`)."""
+        """Execute the plan and return the result as a `pyarrow.Table`.
+
+        The named form of `collect` with its default settings — a terminal
+        operation that runs the optimized query and materializes the output (raises
+        `PlanError` on an unbounded streaming source; stream with `iter_batches`).
+
+        Returns:
+            The materialized result table.
+        """
         return _collect(self._plan, self._sources, self.columns)
 
     def to_pandas(self):
-        """Execute and return as a pandas `DataFrame` (needs `batcher-engine[pandas]`)."""
+        """Execute the plan and return the result as a pandas `DataFrame`.
+
+        A terminal operation. Materializes the Arrow result and converts it via
+        pyarrow's pandas bridge, so it needs pandas installed
+        (``pip install 'batcher-engine[pandas]'``); otherwise raises `BackendError`.
+        """
         return _to_pandas(self._plan, self._sources, self.columns)
 
     def to_polars(self):
-        """Execute and return as a Polars `DataFrame` (needs `batcher-engine[polars]`)."""
+        """Execute the plan and return the result as a Polars `DataFrame`.
+
+        A terminal operation. Polars is Arrow-backed, so the materialized result is
+        handed over without a row-wise copy. Needs polars installed
+        (``pip install 'batcher-engine[polars]'``); otherwise raises `BackendError`.
+        """
         return _to_polars(self._plan, self._sources, self.columns)
 
     def to_pydict(self) -> dict[str, list[Any]]:
-        """Execute and return the result as a column-oriented dict (pyarrow-style)."""
+        """Execute the plan and return the result as a column-oriented dict.
+
+        A terminal operation: the inverse of `from_pydict`, mapping each output
+        column name to its list of values (pyarrow-style). Materializes the whole
+        result in memory — use `iter_batches` for larger-than-memory output.
+
+        Returns:
+            Column name to its list of values.
+        """
         return _to_pydict(self._plan, self._sources, self.columns)
 
     def to_pylist(self) -> list[dict[str, Any]]:
-        """Execute and return the result as a list of row dicts (pyarrow-style)."""
+        """Execute the plan and return the result as a row-oriented list of dicts.
+
+        A terminal operation: one ``{column: value}`` dict per row (pyarrow-style),
+        the row-major counterpart of `to_pydict`. Materializes the whole result in
+        memory.
+
+        Returns:
+            One ``{column: value}`` dict per row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"a": [1, 2], "b": ["x", "y"]}).to_pylist()
+                [{'a': 1, 'b': 'x'}, {'a': 2, 'b': 'y'}]
+        """
         return _to_pylist(self._plan, self._sources, self.columns)
 
     def to_torch(self, *, columns: list[str] | None = None, batch_size: int | None = None) -> Any:
@@ -1221,5 +1349,13 @@ class Dataset:
         return to_tf(self, columns, batch_size)
 
     def show(self, limit: int = 10) -> None:
-        """Print a preview of the result."""
+        """Print a preview of the first `limit` result rows to stdout.
+
+        A terminal operation for interactive use: it executes the plan (capped at
+        `limit` rows) and prints the result, returning nothing. For programmatic
+        access to the data use `to_pydict` / `to_pylist` / `collect`.
+
+        Args:
+            limit: Maximum number of rows to print.
+        """
         _show(self._plan, self._sources, self.columns, limit)

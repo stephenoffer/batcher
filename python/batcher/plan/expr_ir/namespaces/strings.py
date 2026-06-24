@@ -439,18 +439,17 @@ class _StrNamespace:
         return StrFunc("regexp_replace_all", self._e, pattern=pattern, replacement=replacement)
 
     def initcap(self) -> StrFunc:
-        """Capitalize the first letter of each word, lowercasing the rest."""
+        """Uppercase each word's first letter, lowercasing the rest; a word starts after
+        whitespace or punctuation, so ``"a-b c"`` → ``"A-B C"`` (``initcap``; null → null)."""
         return StrFunc("initcap", self._e)
 
     def octet_length(self) -> StrFunc:
-        """Count the UTF-8 bytes in the string (→ Int64).
-
-        Differs from :meth:`len` (character count) for multi-byte text.
-        """
+        """Count the UTF-8 bytes (not characters) in the string (→ Int64); differs from
+        :meth:`len` (character count) for multi-byte text; null → null."""
         return StrFunc("octet_length", self._e)
 
     def bit_length(self) -> StrFunc:
-        """Count the bits in the string, i.e. UTF-8 bytes times 8 (→ Int64)."""
+        """Count the bits in the string, i.e. UTF-8 bytes times 8 (→ Int64); null → null."""
         return StrFunc("bit_length", self._e)
 
     def hex(self) -> StrFunc:
@@ -462,11 +461,11 @@ class _StrNamespace:
         return StrFunc("base64", self._e)
 
     def from_base64(self) -> StrFunc:
-        """Decode standard base64 to a UTF-8 string; null if invalid (→ Utf8)."""
+        """Decode standard base64 to a UTF-8 string; null if invalid or null (→ Utf8)."""
         return StrFunc("from_base64", self._e)
 
     def unhex(self) -> StrFunc:
-        """Decode pairs of hex digits to a UTF-8 string; null if invalid (→ Utf8)."""
+        """Decode pairs of hex digits to a UTF-8 string; null if invalid or null (→ Utf8)."""
         return StrFunc("unhex", self._e)
 
     def translate(self, from_chars: str, to_chars: str) -> StrFunc:

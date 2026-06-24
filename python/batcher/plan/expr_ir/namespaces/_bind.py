@@ -19,44 +19,64 @@ from batcher.plan.expr_ir.core import Expr
 # the per-family fallback handles anything absent. Verified against the engine —
 # do not edit without re-checking behavior.
 _DESCRIPTIONS: dict[str, str] = {
-    # --- .str string→string transforms --------------------------------------
-    "upper": "Uppercase each string.",
-    "lower": "Lowercase each string.",
+    # --- .str string→string transforms (null → null) ------------------------
+    "upper": "The string with every letter uppercased.",
+    "lower": "The string with every letter lowercased.",
     # --- .dt date/time field extraction (all → Int64 unless noted) ----------
-    "year": "Extract the year (e.g. 2021).",
-    "month": "Extract the month of year, 1-12.",
-    "day": "Extract the day of month, 1-31.",
-    "hour": "Extract the hour of day, 0-23.",
-    "minute": "Extract the minute of hour, 0-59.",
-    "second": "Extract the second of minute, 0-59.",
-    "quarter": "Extract the calendar quarter, 1-4.",
-    "week": "Extract the ISO week number, 1-53.",
-    "dayofweek": "Extract the day of week, Sunday = 0 through Saturday = 6.",
-    "dayofyear": "Extract the day of year, 1-366.",
-    "epoch": "Seconds since the Unix epoch (1970-01-01 UTC).",
-    "dayname": 'Full English weekday name, e.g. "Monday" (→ Utf8).',
-    "monthname": 'Full English month name, e.g. "January" (→ Utf8).',
-    "isodow": "ISO day of week, Monday = 1 through Sunday = 7.",
+    "year": "The year component, e.g. 2021.",
+    "month": "The month-of-year component, 1-12.",
+    "day": "The day-of-month component, 1-31.",
+    "hour": "The hour-of-day component, 0-23.",
+    "minute": "The minute-of-hour component, 0-59.",
+    "second": "The second-of-minute component, 0-59.",
+    "quarter": "The calendar quarter, 1-4.",
+    "week": "The ISO 8601 week number, 1-53.",
+    "dayofweek": "The day of week, Sunday = 0 through Saturday = 6.",
+    "dayofyear": "The day of year, 1 through 366.",
+    "epoch": (
+        "Seconds since the Unix epoch, 1970-01-01 00:00:00 UTC (→ Int64).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2021, 3, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(bt.col("d").dt.epoch().alias("r")).to_pydict()\n'
+        "        {'r': [1615815930]}"
+    ),
+    "dayname": 'The full English weekday name, e.g. "Monday" (→ Utf8).',
+    "monthname": 'The full English month name, e.g. "January" (→ Utf8).',
+    "isodow": "The ISO day of week, Monday = 1 through Sunday = 7.",
     "century": "The century, e.g. 2021 → 21.",
     "decade": "The decade, e.g. 2021 → 202.",
     "millennium": "The millennium, e.g. 2021 → 3.",
-    "last_day": "Last day of the month at 00:00:00 (→ Timestamp).",
+    "last_day": "The last day of the month at 00:00:00 (→ Timestamp).",
     # --- .list per-row reductions over each list value ----------------------
-    "len": "Number of elements in each list (→ Int64).",
-    "sum": "Sum of the elements of each list.",
-    "min": "Smallest element of each list.",
-    "max": "Largest element of each list.",
-    "mean": "Arithmetic mean of the elements of each list (→ Float64).",
-    "n_unique": "Count of distinct elements in each list (→ Int64).",
+    # The reductions return null on an empty or null list; len/n_unique return 0
+    # for an empty list and null for a null list.
+    "len": "The number of elements in each list (→ Int64).",
+    "sum": "The sum of the elements of each list.",
+    "min": "The smallest element of each list.",
+    "max": "The largest element of each list.",
+    "mean": "The arithmetic mean of the elements of each list (→ Float64).",
+    "n_unique": "The count of distinct elements in each list (→ Int64).",
     "sort": "Each list sorted ascending (→ list).",
-    "product": "Product of the elements of each list.",
-    "std": "Sample standard deviation of each list (→ Float64).",
-    "var": "Sample variance of each list (→ Float64).",
-    "unique": "Distinct elements of each list, first-seen order preserved (→ list).",
-    "median": "Median of the elements of each list (→ Float64).",
-    "arg_min": "Index of the smallest element of each list (→ Int64).",
-    "arg_max": "Index of the largest element of each list (→ Int64).",
-    "l2_norm": "Euclidean norm, sqrt(sum of squares), of each list (→ Float64).",
+    "product": "The product of the elements of each list.",
+    "std": "The sample standard deviation of the elements of each list (→ Float64).",
+    "var": "The sample variance of the elements of each list (→ Float64).",
+    "unique": "The distinct elements of each list, first-seen order preserved (→ list).",
+    "median": "The median of the elements of each list (→ Float64).",
+    "arg_min": "The 0-based index of the smallest element of each list (→ Int64).",
+    "arg_max": (
+        "The 0-based index of the largest element of each list (→ Int64).\n\n"
+        "Ties take the first occurrence.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"a": [[3.0, 1.0, 4.0, 1.0]]})\n'
+        '        >>> ds.select(bt.col("a").list.arg_max().alias("r")).to_pydict()\n'
+        "        {'r': [2]}"
+    ),
+    "l2_norm": "The Euclidean norm, sqrt(sum of squares), of each list (→ Float64).",
     "normalize": "Each list L2-normalized to unit length (→ list); embedding prep.",
     # `reverse` is shared by .str (reverse characters) and .list (reverse order);
     # the per-family fallback disambiguates it, so it is intentionally omitted here.

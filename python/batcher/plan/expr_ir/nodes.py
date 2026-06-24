@@ -239,12 +239,29 @@ def lead(expr: IntoExpr, n: int = 1) -> WindowExpr:
 
 
 def first_value(expr: IntoExpr) -> WindowExpr:
-    """The first value in the ordered partition (SQL ``FIRST_VALUE``)."""
+    """The first value of the ordered partition (SQL ``FIRST_VALUE``).
+
+    Reads the **whole partition** (``ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
+    FOLLOWING``), not the running frame, so every row of a partition gets the same
+    value. Bind with ``.over(partition_by=…, order_by=…)``.
+
+    Args:
+        expr: The column (or expression) to read the first value of.
+    """
     return WindowExpr("first_value", _wrap(expr), [], [], None)
 
 
 def last_value(expr: IntoExpr) -> WindowExpr:
-    """The last value in the ordered partition so far (SQL ``LAST_VALUE``)."""
+    """The last value of the ordered partition (SQL ``LAST_VALUE``).
+
+    Reads the **whole partition** (``ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
+    FOLLOWING``), not the running frame — so this is the partition's final value, the
+    same for every row, not a running "last seen so far". Bind with
+    ``.over(partition_by=…, order_by=…)``.
+
+    Args:
+        expr: The column (or expression) to read the last value of.
+    """
     return WindowExpr("last_value", _wrap(expr), [], [], None)
 
 

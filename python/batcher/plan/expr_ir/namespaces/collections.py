@@ -258,11 +258,17 @@ class _ListNamespace:
         return ListGet(self._e, index)
 
     def first(self) -> ListGet:
-        """Return the first element of each list (null for an empty or null list)."""
+        """The first element of each list; null for an empty or null list.
+
+        Shorthand for :meth:`get` at index ``0``.
+        """
         return ListGet(self._e, 0)
 
     def last(self) -> ListGet:
-        """Return the last element of each list (null for an empty or null list)."""
+        """The last element of each list; null for an empty or null list.
+
+        Shorthand for :meth:`get` at index ``-1``.
+        """
         return ListGet(self._e, -1)
 
     def contains(self, value: int | float | bool | str) -> ListContains:

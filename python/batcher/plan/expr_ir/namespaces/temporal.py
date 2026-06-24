@@ -105,11 +105,19 @@ class _DtNamespace:
         return DateTrunc(self._e, unit)
 
     def is_leap_year(self) -> DateFunc:
-        """Test whether each row's year is a leap year (→ Bool)."""
+        """Test whether each row's year is a leap year (→ Bool).
+
+        Follows the proleptic Gregorian rule: divisible by 4, except centuries that
+        are not divisible by 400. Null → null.
+        """
         return DateFunc("is_leap_year", self._e)
 
     def days_in_month(self) -> DateFunc:
-        """Return the number of days in each row's month, 28 to 31 (→ Int64)."""
+        """The number of days in each row's month, 28 to 31 (→ Int64).
+
+        Accounts for leap years (February yields 29 in a leap year, else 28). Null →
+        null.
+        """
         return DateFunc("days_in_month", self._e)
 
     def iso_year(self) -> DateFunc:

@@ -66,8 +66,14 @@ class ExecutionConfig:
     split_bytes: int = 128 * 1024 * 1024
     # CPU shares requested per distributed Ray task. Makes Ray's implicit default of
     # 1 explicit and tunable (a heavy native op can ask for more); the scheduler
-    # places tasks against this.
+    # places tasks against this. This is the CPU-heavy default (a breaker that
+    # saturates a core); CPU-light stages use `cpu_share_io` below.
     cpus_per_task: float = 1.0
+    # CPU shares a CPU-light / IO-bound distributed stage requests (scan, filter,
+    # project, write, CPU-only preprocessing). Below 1.0 so such tasks pack more than
+    # one per core — they wait on IO/decode rather than saturating a core. Affects the
+    # distributed (Ray) path only; single-node uses the rayon pool (`parallelism`).
+    cpu_share_io: float = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,7 +373,24 @@ class DistributedConfig:
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """The complete engine configuration. Immutable; derive with `replace()`."""
+    """The complete engine configuration — every tunable in one frozen object.
+
+    The single source of truth for engine tunables, grouped into typed sections:
+    `execution` (parallelism, morsel size, file splits), `memory` (the memory
+    envelope and spill tiers), `flow_control` (credit-based shuffle backpressure),
+    `optimizer` (Kyber join planning, cost, and cardinality), `pid` (the adaptive
+    batch-size controller gains), `metadata` (where learned statistics live and how
+    fast they age), and `distributed` (Ray attachment and shuffle transport).
+
+    Immutable: derive a variant with `replace` (whole-section swap) rather than
+    mutating, and read the one in effect via `active_config`. The Rust-relevant
+    subset is shipped to the data plane by `engine_config_json`.
+
+    Precedence, highest first: `config_context` > `set_config` > ``BATCHER_*`` env
+    vars > a JSON file at ``BATCHER_CONFIG_FILE`` > the defaults below. The env and
+    file layers are read once at import; `set_config` / `config_context` override
+    them at runtime.
+    """
 
     execution: ExecutionConfig = ExecutionConfig()
     memory: MemoryConfig = MemoryConfig()
@@ -394,15 +417,34 @@ class Config:
         `memory.hard_limit`; otherwise it is `0` (unbounded — the engine stays fully
         in-memory, so the default fast path is unchanged).
         """
-        return json.dumps(
-            {
-                "morsel_rows": self.execution.morsel_rows,
-                "morsel_bytes": self.execution.morsel_bytes,
-                "parallelism": self.execution.parallelism,
-                "memory_budget_bytes": self._rust_memory_budget_bytes(),
-                "spill_dir": self.memory.spill_dir,
-            }
-        )
+        return json.dumps(self._engine_config_dict())
+
+    def engine_config_json_with(self, op_budgets: dict[int, int]) -> str:
+        """`engine_config_json` plus Kyber's per-operator spill budgets.
+
+        `op_budgets` maps a pre-order `op_id` to its byte envelope
+        (`PhysicalPlan.op_budgets()`). The engine budgets each stateful operator
+        against *its* entry instead of the single global `memory_budget_bytes`, so a
+        small operator no longer spills while a large neighbour assumes the whole
+        budget. JSON object keys must be strings; the Rust side parses them back to
+        the operator id. An empty map reproduces `engine_config_json` exactly, so
+        callers with no `PhysicalOp` DAG (streaming, UDFs, distributed workers) are
+        unaffected.
+        """
+        cfg = self._engine_config_dict()
+        if op_budgets:
+            cfg["op_budgets"] = {str(op_id): budget for op_id, budget in op_budgets.items()}
+        return json.dumps(cfg)
+
+    def _engine_config_dict(self) -> dict[str, object]:
+        """The Rust-relevant execution knobs as a plain dict (shared serialization)."""
+        return {
+            "morsel_rows": self.execution.morsel_rows,
+            "morsel_bytes": self.execution.morsel_bytes,
+            "parallelism": self.execution.parallelism,
+            "memory_budget_bytes": self._rust_memory_budget_bytes(),
+            "spill_dir": self.memory.spill_dir,
+        }
 
     def validate(self) -> Config:
         """Validate the configuration, raising `ConfigError` on a bad value.

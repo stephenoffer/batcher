@@ -45,7 +45,11 @@ plane never touches a tuple. The only place user Python sees data is
 ## Terminal operations trigger execution
 
 Operations are lazy. The plan is built up as you chain calls, and the optimizer
-runs only when you call a terminal operation. The common terminals are:
+runs only when you call a terminal operation.
+
+![The query lifecycle: reading and transforming build a lazy LogicalPlan; a terminal operation triggers optimization and execution, returning an Arrow result.](../_static/diagrams/lifecycle.png)
+
+The common terminals are:
 
 - `to_pydict()` - a column-oriented dict.
 - `to_pylist()` - a list of row dicts.
@@ -75,6 +79,8 @@ merges states associatively, and `finalize` produces rows. The same
 implementation runs on one core, many cores, or many machines. A distributed run
 is a scheduling concern, not a second set of semantics, so a result is identical
 whether it is produced on a laptop or a cluster.
+
+![Mergeable algebra: each partition computes a partial state, an associative combine merges them in any order, and finalize produces the result — the same code on one core or many machines.](../_static/diagrams/mergeable.png)
 
 ```python
 counts = ds.group_by("g").agg(n=bt.count()).sort("g")

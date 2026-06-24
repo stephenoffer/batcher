@@ -55,7 +55,14 @@ __all__ = [
 
 
 def engine_version() -> str:
-    """Return the version reported by the compiled Rust engine."""
+    """Return the version string reported by the compiled Rust data plane.
+
+    The version of the native ``bc_py`` extension, distinct from the Python
+    package version. Useful for confirming which engine build is loaded.
+
+    Returns:
+        The engine version, e.g. ``"0.1.0"``.
+    """
     from batcher import _native
 
     return _native.__engine_version__
@@ -167,7 +174,14 @@ def read_memory(name: str) -> Dataset:
 
 
 def streams() -> list[Any]:
-    """All currently-active streaming queries (Spark ``spark.streams.active``)."""
+    """List the currently-active streaming queries (Spark ``spark.streams.active``).
+
+    Each entry is a handle to a query started by a streaming write that is still
+    running, so you can track or stop it. Empty when no stream is active.
+
+    Returns:
+        The active streaming-query handles.
+    """
     from batcher.api.streaming import active_streams
 
     return active_streams()
@@ -201,7 +215,26 @@ def _empty_batch(schema: pa.Schema) -> pa.RecordBatch:
 
 
 def from_pydict(mapping: dict[str, list[Any]]) -> Dataset:
-    """Create a `Dataset` from a column-oriented Python dict."""
+    """Create a `Dataset` from a column-oriented ``{name: values}`` dict.
+
+    Each key is a column and each value its list of cells (all the same length);
+    types are inferred by Arrow. The most direct way to get small in-memory data
+    into the engine. Returns a lazy `Dataset` — no work runs until a terminal op.
+
+    Args:
+        mapping: Column name to its list of values.
+
+    Returns:
+        A lazy `Dataset` over the data.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"region": ["w", "e"], "amount": [10, 20]})
+            >>> ds.to_pydict()
+            {'region': ['w', 'e'], 'amount': [10, 20]}
+    """
     return from_arrow(pa.table(mapping))
 
 
@@ -320,42 +353,90 @@ def from_batches(
 
 # --- Framework-interop constructors (foreign object → Dataset) -------------
 def from_numpy(ndarray: Any, *, column: str = "data") -> Dataset:
-    """Create a `Dataset` from a NumPy array (1-D scalar or 2-D fixed-size-list)."""
+    """Create a single-column `Dataset` from a NumPy array under name `column`.
+
+    The leading axis is the row axis: a 1-D array becomes a scalar column, an
+    ``(n, dim)`` array a fixed-size-list column (the embedding convention), and a
+    higher-rank array a fixed-shape-tensor column. Needs only ``numpy`` (core).
+
+    Args:
+        ndarray: The array to ingest; its first axis indexes rows.
+        column: The name of the single output column.
+
+    Returns:
+        A lazy `Dataset` with one column over the array.
+    """
     return _scan(interop.from_numpy(ndarray, column=column))
 
 
 def from_pandas(df: Any) -> Dataset:
-    """Create a `Dataset` from a pandas `DataFrame` (zero-copy via Arrow)."""
+    """Create a `Dataset` from a pandas `DataFrame` via its Arrow bridge.
+
+    Needs pandas (``pip install 'batcher-engine[pandas]'``); raises `BackendError`
+    if it is absent. Goes through ``pyarrow.Table.from_pandas`` — no per-row Python.
+    """
     return _scan(interop.from_pandas(df))
 
 
 def from_polars(df: Any) -> Dataset:
-    """Create a `Dataset` from a Polars `DataFrame` (zero-copy Arrow export)."""
+    """Create a `Dataset` from a Polars `DataFrame` via its zero-copy Arrow export.
+
+    Polars is Arrow-backed, so the buffers are referenced directly, not copied.
+    Needs polars (``pip install 'batcher-engine[polars]'``); raises `BackendError`
+    if it is absent.
+    """
     return _scan(interop.from_polars(df))
 
 
 def from_huggingface(hf_dataset: Any) -> Dataset:
-    """Create a `Dataset` from a HuggingFace `datasets.Dataset` (Arrow-backed)."""
+    """Create a `Dataset` from a HuggingFace ``datasets.Dataset`` (Arrow-backed).
+
+    HuggingFace datasets are Arrow tables underneath, so the table is taken
+    directly. Needs ``datasets`` (``pip install 'batcher-engine[huggingface]'``);
+    raises `BackendError` if it is absent.
+    """
     return _scan(interop.from_huggingface(hf_dataset))
 
 
 def from_torch(dataset_or_tensors: Any) -> Dataset:
-    """Create a `Dataset` from a PyTorch tensor, tuple of tensors, or `Dataset`."""
+    """Create a `Dataset` from a PyTorch tensor, tuple of tensors, or `Dataset`.
+
+    Tensors are moved to CPU and adapted via their NumPy buffers (one column per
+    tensor); only bulk buffers cross into the engine, never per-row Python. Needs
+    ``torch`` (``pip install 'batcher-engine[torch]'``); raises `BackendError` if
+    it is absent.
+    """
     return _scan(interop.from_torch(dataset_or_tensors))
 
 
 def from_tf(tf_dataset: Any) -> Dataset:
-    """Create a `Dataset` from a ``tf.data.Dataset`` (materialized to Arrow)."""
+    """Create a `Dataset` from a ``tf.data.Dataset``, materializing it to Arrow.
+
+    Each element's tensors are converted to NumPy and concatenated column-wise.
+    Needs ``tensorflow`` (``pip install 'batcher-engine[tensorflow]'``); raises
+    `BackendError` if it is absent.
+    """
     return _scan(interop.from_tf(tf_dataset))
 
 
 def from_spark(spark_df: Any) -> Dataset:
-    """Create a `Dataset` from a Spark `DataFrame` (Arrow collection)."""
+    """Create a `Dataset` from a Spark `DataFrame` by collecting it through Arrow.
+
+    The Spark frame is collected to the driver via its Arrow bridge, so this
+    materializes the data — for large frames write to a shared store and `read` it
+    instead. Needs ``pyspark`` (``pip install 'batcher-engine[spark]'``); raises
+    `BackendError` if it is absent.
+    """
     return _scan(interop.from_spark(spark_df))
 
 
 def from_dask(ddf: Any) -> Dataset:
-    """Create a streaming `Dataset` from a Dask `DataFrame` (one partition per batch)."""
+    """Create a streaming `Dataset` from a Dask `DataFrame`, one partition per batch.
+
+    Partitions stream lazily into the engine in bounded memory rather than being
+    materialized at once. Needs ``dask`` (``pip install 'batcher-engine[dask]'``);
+    raises `BackendError` if it is absent.
+    """
     return _scan(interop.from_dask(ddf))
 
 

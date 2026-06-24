@@ -67,10 +67,32 @@ def _wrap(value: IntoExpr) -> Expr:
 
 
 class Expr:
-    """Base class for scalar expressions. Subclasses are immutable IR nodes."""
+    """Base class for scalar expressions — the one expression type in Batcher.
+
+    An ``Expr`` is an immutable IR node, built lazily with operator overloading and
+    fluent methods (``col("x") * 2``, ``col("x").sqrt()``, ``col("g").sum()``) and
+    serialized via :meth:`to_ir` to the JSON the Rust ``bc-expr`` engine evaluates —
+    no Python touches a row. Methods come in families: arithmetic/comparison/boolean
+    operators, math functions (``sqrt``, ``ln``, ``sin``, …), null/NaN predicates
+    (``is_null``, ``is_nan``, ``fill_null``), aggregates for ``group_by().agg(...)``
+    / ``.over(...)`` (``sum``, ``mean``, ``count``, …), cumulative window helpers
+    (``cum_sum``, ``shift``), and the typed accessor namespaces (``.str``, ``.dt``,
+    ``.list``, ``.struct``, ``.json``, ``.image``, ``.audio``, ``.video``, ``.map``,
+    ``.arr``, ``.embedding``) that hold the per-type breadth.
+
+    Subclasses are the concrete IR nodes (``Lit``, ``Binary``, ``MathExpr``, …); user
+    code constructs expressions through ``col``/``lit`` and these methods, not the
+    node classes directly.
+    """
 
     # --- serialization -----------------------------------------------------
     def to_ir(self) -> dict[str, Any]:  # pragma: no cover - overridden
+        """Serialize this expression to its JSON IR dict — the wire contract with the engine.
+
+        Each node emits ``{"e": <tag>, ...}`` matching the ``bc_expr::Expr`` serde
+        tags the Rust interpreter and JIT deserialize. Overridden by every subclass;
+        the base raises ``NotImplementedError``. Internal — not part of the user API.
+        """
         raise NotImplementedError
 
     # --- comparison operators (yield boolean expressions) ------------------
@@ -241,23 +263,28 @@ class Expr:
 
     # --- bitwise integer operators (distinct from the boolean `&`/`|`) ------
     def bitwise_and(self, other: IntoExpr) -> Expr:
-        """Bitwise AND of two integer expressions (operands cast to Int64)."""
+        """Bitwise AND ``self & other`` of two integer expressions.
+
+        Operates per row on the integer bit patterns (operands cast to Int64), unlike
+        the ``&`` operator which is boolean AND on predicates. The method spelling is
+        unambiguous; nulls propagate.
+        """
         return Binary("bit_and", self, _wrap(other))
 
     def bitwise_or(self, other: IntoExpr) -> Expr:
-        """Bitwise OR of two integer expressions."""
+        """Bitwise OR ``self | other`` of two integers (per-row; Int64; nulls propagate)."""
         return Binary("bit_or", self, _wrap(other))
 
     def bitwise_xor(self, other: IntoExpr) -> Expr:
-        """Bitwise XOR of two integer expressions."""
+        """Bitwise XOR ``self ^ other`` of two integers (per-row; Int64; nulls propagate)."""
         return Binary("bit_xor", self, _wrap(other))
 
     def bitwise_left_shift(self, other: IntoExpr) -> Expr:
-        """Left-shift this integer expression by `other` bits."""
+        """Left-shift this integer expression by `other` bits (per-row; Int64; nulls propagate)."""
         return Binary("shift_left", self, _wrap(other))
 
     def bitwise_right_shift(self, other: IntoExpr) -> Expr:
-        """Right-shift this integer expression by `other` bits."""
+        """Right-shift this integer expression by `other` bits (per-row; Int64; nulls propagate)."""
         return Binary("shift_right", self, _wrap(other))
 
     # --- naming ------------------------------------------------------------
@@ -303,9 +330,15 @@ class Expr:
         return Cast(self, dtype, try_cast=try_cast)
 
     def is_null(self) -> IsNull:
+        """True where the value is NULL (SQL ``IS NULL``).
+
+        A boolean expression that never itself yields null — a null input maps to
+        true. Distinct from :meth:`is_nan`, which is the float-only NaN notion.
+        """
         return IsNull(self)
 
     def is_not_null(self) -> IsNotNull:
+        """True where the value is non-NULL (SQL ``IS NOT NULL``); negation of :meth:`is_null`."""
         return IsNotNull(self)
 
     def is_in(self, values: Iterable[IntoExpr]) -> Expr:
@@ -323,7 +356,17 @@ class Expr:
         return expr
 
     def between(self, low: IntoExpr, high: IntoExpr) -> Expr:
-        """``self BETWEEN low AND high`` (inclusive), matching SQL/DuckDB."""
+        """``self BETWEEN low AND high`` (inclusive on both bounds), matching SQL/DuckDB.
+
+        Desugars to ``(self >= low) & (self <= high)``, so it follows SQL three-valued
+        logic — a null operand makes the result null. The idiomatic spelling for a
+        range filter (chained comparisons like ``low <= col("x") <= high`` are
+        rejected; see :meth:`__bool__`).
+
+        Args:
+            low: Inclusive lower bound.
+            high: Inclusive upper bound.
+        """
         return (self >= low) & (self <= high)
 
     def eq_missing(self, other: IntoExpr) -> Expr:
@@ -356,30 +399,57 @@ class Expr:
 
     @property
     def str(self) -> _StrNamespace:
-        """String functions: `col("s").str.upper()`, `.str.contains("x")`, ..."""
+        """String-function accessor — grouped string ops on this (string) column.
+
+        Returns a namespace holding string transforms and predicates such as
+        ``.str.upper()``, ``.str.contains("x")``, ``.str.replace(...)``,
+        ``.str.slice(...)``, and ``.str.len()``.
+        """
         from batcher.plan.expr_ir.namespaces import _StrNamespace
 
         return _StrNamespace(self)
 
     @property
     def dt(self) -> _DtNamespace:
-        """Date/time field extraction: `col("d").dt.year()`, `.dt.month()`, ..."""
+        """Date/time accessor — grouped temporal field extraction on this (date/timestamp) column.
+
+        Returns a namespace with components such as ``.dt.year()``, ``.dt.month()``,
+        ``.dt.day()``, ``.dt.hour()``, and ``.dt.weekday()``.
+        """
         from batcher.plan.expr_ir.namespaces import _DtNamespace
 
         return _DtNamespace(self)
 
     # --- math functions ----------------------------------------------------
     def abs(self) -> MathExpr:
+        """Absolute value, preserving the input numeric dtype (nulls propagate)."""
         return MathExpr("abs", self)
 
     def round(self, digits: int | None = None) -> Expr:
-        """Round to the nearest integer, or to ``digits`` decimal places."""
+        """Round half-away-from-zero to the nearest integer, or to `digits` decimal places.
+
+        Args:
+            digits: Number of decimal places to keep. ``None`` (the default) rounds to
+                a whole number.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.234, 2.567]})
+                >>> ds.select(r=bt.col("x").round(2)).to_pydict()
+                {'r': [1.23, 2.57]}
+        """
         if digits is None:
             return MathExpr("round", self)
         return Math2Expr("round", self, Lit(digits))
 
     def pow(self, exponent: IntoExpr) -> Math2Expr:
-        """This value raised to ``exponent`` (→ Float64)."""
+        """This value raised to `exponent` (→ Float64); the method spelling of the ``**`` operator.
+
+        Args:
+            exponent: A scalar or expression power; applied per row, nulls propagate.
+        """
         return Math2Expr("pow", self, _wrap(exponent))
 
     def __pow__(self, other: IntoExpr) -> Math2Expr:
@@ -389,83 +459,108 @@ class Expr:
         return Math2Expr("pow", _wrap(other), self)
 
     def floor(self) -> MathExpr:
+        """Round down toward negative infinity to the nearest integer value (nulls propagate)."""
         return MathExpr("floor", self)
 
     def ceil(self) -> MathExpr:
+        """Round up toward positive infinity to the nearest integer value (nulls propagate)."""
         return MathExpr("ceil", self)
 
     def sqrt(self) -> MathExpr:
+        """Square root (→ Float64). Negative inputs yield NaN; nulls propagate."""
         return MathExpr("sqrt", self)
 
     def ln(self) -> MathExpr:
-        """Natural logarithm (→ Float64)."""
+        """Natural logarithm, base e (→ Float64). Non-positive inputs yield NaN/-inf; nulls keep."""
         return MathExpr("ln", self)
 
     def log10(self) -> MathExpr:
-        """Base-10 logarithm (→ Float64)."""
+        """Base-10 logarithm (→ Float64). Non-positive inputs yield NaN/-inf; nulls propagate."""
         return MathExpr("log10", self)
 
     def log2(self) -> MathExpr:
-        """Base-2 logarithm (→ Float64)."""
+        """Base-2 logarithm (→ Float64). Non-positive inputs yield NaN/-inf; nulls propagate."""
         return MathExpr("log2", self)
 
     def exp(self) -> MathExpr:
-        """e raised to this value (→ Float64)."""
+        """``e`` raised to this value, the inverse of :meth:`ln` (→ Float64; nulls propagate)."""
         return MathExpr("exp", self)
 
     def sin(self) -> MathExpr:
+        """Sine of an angle given in radians (→ Float64; nulls propagate). See :meth:`radians`."""
         return MathExpr("sin", self)
 
     def cos(self) -> MathExpr:
+        """Cosine of an angle given in radians (→ Float64; nulls propagate). See :meth:`radians`."""
         return MathExpr("cos", self)
 
     def tan(self) -> MathExpr:
+        """Tangent of an angle in radians (→ Float64; nulls propagate). See :meth:`radians`."""
         return MathExpr("tan", self)
 
     def sign(self) -> MathExpr:
-        """-1, 0, or 1 by sign (→ Float64)."""
+        """Sign of the value as ``-1.0``, ``0.0``, or ``1.0`` (→ Float64; nulls propagate)."""
         return MathExpr("sign", self)
 
     def trunc(self) -> MathExpr:
-        """Truncate toward zero (→ Float64)."""
+        """Truncate toward zero, dropping the fractional part (→ Float64; nulls propagate)."""
         return MathExpr("trunc", self)
 
     def cbrt(self) -> MathExpr:
-        """Cube root (→ Float64)."""
+        """Cube root (→ Float64; defined for negatives, unlike :meth:`sqrt`; nulls propagate)."""
         return MathExpr("cbrt", self)
 
     def asin(self) -> MathExpr:
+        """Arcsine in radians, inverse of :meth:`sin` (→ Float64; outside [-1, 1] → NaN)."""
         return MathExpr("asin", self)
 
     def acos(self) -> MathExpr:
+        """Arccosine in radians, inverse of :meth:`cos` (→ Float64; outside [-1, 1] → NaN)."""
         return MathExpr("acos", self)
 
     def atan(self) -> MathExpr:
+        """Arctangent in radians, the inverse of :meth:`tan` (→ Float64; nulls propagate)."""
         return MathExpr("atan", self)
 
     def sinh(self) -> MathExpr:
+        """Hyperbolic sine (→ Float64; nulls propagate)."""
         return MathExpr("sinh", self)
 
     def cosh(self) -> MathExpr:
+        """Hyperbolic cosine (→ Float64; nulls propagate)."""
         return MathExpr("cosh", self)
 
     def tanh(self) -> MathExpr:
+        """Hyperbolic tangent (→ Float64; nulls propagate)."""
         return MathExpr("tanh", self)
 
     def degrees(self) -> MathExpr:
-        """Radians → degrees (→ Float64)."""
+        """Convert an angle from radians to degrees (→ Float64; nulls propagate)."""
         return MathExpr("degrees", self)
 
     def radians(self) -> MathExpr:
-        """Degrees → radians (→ Float64)."""
+        """Convert an angle from degrees to radians (→ Float64; nulls propagate).
+
+        The trig functions (:meth:`sin`/:meth:`cos`/:meth:`tan`) expect radians, so
+        pair this with them when starting from degrees.
+        """
         return MathExpr("radians", self)
 
     def cot(self) -> MathExpr:
-        """Cotangent, 1/tan (→ Float64)."""
+        """Cotangent (``1 / tan``) of an angle in radians (→ Float64; nulls propagate)."""
         return MathExpr("cot", self)
 
     def factorial(self) -> MathExpr:
-        """``n!`` — factorial of a non-negative integer (DuckDB ``factorial``)."""
+        """``n!`` — factorial of a non-negative integer (DuckDB ``factorial``; → Float64).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [5]})
+                >>> ds.select(f=bt.col("x").factorial()).to_pydict()
+                {'f': [120.0]}
+        """
         return MathExpr("factorial", self)
 
     def bit_count(self) -> MathExpr:
@@ -475,21 +570,28 @@ class Expr:
 
     @property
     def list(self) -> _ListNamespace:
-        """List/array reductions: `col("a").list.len()`, `.list.sum()`, …"""
+        """List accessor — grouped per-row reductions and element access on a list column.
+
+        Returns a namespace with ops such as ``.list.len()``, ``.list.sum()``,
+        ``.list.get(i)``, ``.list.slice(offset, length)``, and ``.list.join(sep)``.
+        """
         from batcher.plan.expr_ir.namespaces import _ListNamespace
 
         return _ListNamespace(self)
 
-    # `.arr` is an alias for `.list` (Polars spelling).
     @property
     def arr(self) -> _ListNamespace:
+        """Array accessor — alias for :attr:`list` (the Polars ``.arr`` spelling)."""
         from batcher.plan.expr_ir.namespaces import _ListNamespace
 
         return _ListNamespace(self)
 
     @property
     def struct(self) -> _StructNamespace:
-        """Struct field access: `col("s").struct.field("x")`."""
+        """Struct accessor — grouped field access on a struct column, e.g. ``.struct.field("x")``.
+
+        Returns a namespace whose ``.field(name)`` projects a named field as a column.
+        """
         from batcher.plan.expr_ir.namespaces import _StructNamespace
 
         return _StructNamespace(self)
@@ -504,41 +606,69 @@ class Expr:
 
     @property
     def map(self):
-        """Map-column accessors: `col("m").map.keys()`, `.values()`, `.get(key)`."""
+        """Map accessor — grouped key/value access on a map column.
+
+        Returns a namespace with ``.map.keys()``, ``.map.values()``, and
+        ``.map.get(key)``.
+        """
         from batcher.plan.expr_ir.namespaces import _MapNamespace
 
         return _MapNamespace(self)
 
     @property
     def json(self) -> _JsonNamespace:
-        """JSON access on a string column: `col("j").json.extract_string("$.a")`."""
+        """JSON accessor — grouped JSONPath extraction on a JSON-string column.
+
+        Returns a namespace with typed extractors such as
+        ``.json.extract_string("$.a")``, evaluated in the engine (no Python parsing).
+        """
         from batcher.plan.expr_ir.namespaces import _JsonNamespace
 
         return _JsonNamespace(self)
 
     @property
     def image(self) -> _ImageNamespace:
-        """Lazy image decode: `col("bytes").image.decode()` / `.image.to_tensor(224, 224)`."""
+        """Image accessor — grouped lazy image-decode ops on a binary column.
+
+        Returns a namespace with ops such as ``.image.decode()`` and
+        ``.image.to_tensor(224, 224)``; decoding stays in the Rust data plane.
+        """
         from batcher.plan.expr_ir.image import _ImageNamespace
 
         return _ImageNamespace(self)
 
     @property
     def audio(self):
-        """Lazy audio decode: `col("bytes").audio.decode()` / `.audio.to_waveform()`."""
+        """Audio accessor — grouped lazy audio-decode ops on a binary column.
+
+        Returns a namespace with ops such as ``.audio.decode()`` and
+        ``.audio.to_waveform()``.
+        """
         from batcher.plan.expr_ir.audio import _AudioNamespace
 
         return _AudioNamespace(self)
 
     @property
     def video(self):
-        """Lazy video decode: `col("bytes").video.decode()` (needs the ``video`` engine feature)."""
+        """Video accessor — grouped lazy video-decode ops on a binary column.
+
+        Returns a namespace with ops such as ``.video.decode()`` (requires the engine
+        built with the ``video`` feature).
+        """
         from batcher.plan.expr_ir.video import _VideoNamespace
 
         return _VideoNamespace(self)
 
     def fill_null(self, value: IntoExpr) -> Coalesce:
-        """Replace nulls with `value` (COALESCE of two)."""
+        """Replace nulls with `value`, leaving non-null values unchanged (SQL ``COALESCE``).
+
+        `value` may be a scalar or another expression (e.g. a column to fall back to).
+        Only NULL is replaced — float NaN is not a null, so use :meth:`is_nan` to
+        handle it.
+
+        Args:
+            value: The replacement used wherever this expression is null.
+        """
         return Coalesce([self, _wrap(value)])
 
     # --- NaN handling / clamping -------------------------------------------
@@ -552,7 +682,11 @@ class Expr:
         return IsNan(self)
 
     def is_not_nan(self) -> Expr:
-        """True where the value is not NaN (the negation of `is_nan`; null → null)."""
+        """True where the float value is not IEEE NaN — the negation of :meth:`is_nan`.
+
+        Nulls propagate (a null input yields null, not true). NaN is distinct from
+        NULL; use :meth:`is_not_null` for the null check.
+        """
         return Not(IsNan(self))
 
     def is_infinite(self) -> Expr:
@@ -586,23 +720,49 @@ class Expr:
 
     # --- aggregate constructors (used inside group_by().agg(...)) -----------
     def sum(self) -> AggExpr:
+        """Sum of non-null values per group. Use in ``group_by().agg(...)`` or ``.over(...)``.
+
+        An aggregate: it collapses a group to one row (or, via :meth:`AggExpr.over`,
+        broadcasts the group result to each row). Mergeable, so identical single-node
+        and distributed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 10]})
+                >>> ds.group_by("g").agg(total=bt.col("x").sum()).sort("g").to_pydict()
+                {'g': ['a', 'b'], 'total': [3, 10]}
+        """
         return AggExpr("sum", self)
 
     def min(self) -> AggExpr:
+        """Minimum non-null value per group. Use in ``group_by().agg(...)`` or ``.over(...)``."""
         return AggExpr("min", self)
 
     def max(self) -> AggExpr:
+        """Maximum non-null value per group. Use in ``group_by().agg(...)`` or ``.over(...)``."""
         return AggExpr("max", self)
 
     def mean(self) -> AggExpr:
+        """Arithmetic mean of non-null values per group (→ Float64).
+
+        An aggregate for ``group_by().agg(...)`` / ``.over(...)``.
+        """
         return AggExpr("mean", self)
 
     def var(self) -> AggExpr:
-        """Sample variance (Bessel-corrected)."""
+        """Sample variance per group, Bessel-corrected (divides by ``n - 1``).
+
+        An aggregate for ``group_by().agg(...)``.
+        """
         return AggExpr("var", self)
 
     def std(self) -> AggExpr:
-        """Sample standard deviation."""
+        """Sample standard deviation per group — the square root of :meth:`var`.
+
+        An aggregate for ``group_by().agg(...)``.
+        """
         return AggExpr("stddev", self)
 
     def skewness(self) -> AggExpr:
@@ -617,7 +777,9 @@ class Expr:
         return AggExpr("kurtosis", self)
 
     def median(self) -> AggExpr:
-        """Median (exact; averages the two middle values for an even count)."""
+        """Exact median per group — the 0.5 quantile, averaging the two middle values
+        for an even count (→ Float64). Equals ``quantile(0.5)``. An aggregate for
+        ``group_by().agg(...)``; see :meth:`approx_median` for a bounded-memory sketch."""
         return AggExpr("median", self)
 
     def quantile(self, q: float) -> AggExpr:
@@ -633,11 +795,19 @@ class Expr:
         return AggExpr("quantile", self, param=float(q))
 
     def count(self) -> AggExpr:
-        """COUNT of non-null values of this expression."""
+        """Number of non-null values per group (SQL ``COUNT(expr)``; nulls are skipped).
+
+        An aggregate for ``group_by().agg(...)``. For a row count that includes nulls,
+        count a non-null key or use the top-level ``count()``.
+        """
         return AggExpr("count", self)
 
     def n_unique(self) -> AggExpr:
-        """COUNT(DISTINCT) — number of distinct non-null values of this expression."""
+        """Number of distinct non-null values per group (SQL ``COUNT(DISTINCT)``).
+
+        Exact, so it holds every distinct value — see :meth:`approx_n_unique` for the
+        bounded-memory, skew-safe sketch. An aggregate for ``group_by().agg(...)``.
+        """
         return AggExpr("count_distinct", self)
 
     # SQL spelling; same aggregate as `n_unique`.
@@ -764,20 +934,44 @@ class Expr:
     def cum_sum(
         self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
     ) -> WindowExpr:
-        """Cumulative (running) sum from the first row to the current one — Polars
-        ``cum_sum``. Pass `partition_by` for a per-group running sum."""
+        """Cumulative (running) sum from the first row to the current one — Polars ``cum_sum``.
+
+        A window expression (one value per row, no row collapse) — use it in
+        ``with_columns``/``select``, not in scalar arithmetic or ``filter``. Without
+        `order_by` the running order is the row order.
+
+        Args:
+            partition_by: Restart the running sum per group of these key expressions.
+            order_by: Order rows by these expressions before accumulating.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
+                >>> ds.with_columns(cs=bt.col("x").cum_sum()).to_pydict()
+                {'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10]}
+        """
         return self._running("sum", partition_by, order_by)
 
     def cum_min(
         self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
     ) -> WindowExpr:
-        """Cumulative (running) minimum up to the current row — Polars ``cum_min``."""
+        """Cumulative (running) minimum up to the current row — Polars ``cum_min``.
+
+        A window expression; use it in ``with_columns``/``select``. Pass
+        `partition_by` to restart per group and `order_by` to set the running order.
+        """
         return self._running("min", partition_by, order_by)
 
     def cum_max(
         self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
     ) -> WindowExpr:
-        """Cumulative (running) maximum up to the current row — Polars ``cum_max``."""
+        """Cumulative (running) maximum up to the current row — Polars ``cum_max``.
+
+        A window expression; use it in ``with_columns``/``select``. Pass
+        `partition_by` to restart per group and `order_by` to set the running order.
+        """
         return self._running("max", partition_by, order_by)
 
     def cum_count(

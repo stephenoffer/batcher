@@ -20,7 +20,23 @@ __all__ = ["GroupBy"]
 
 
 class GroupBy:
-    """An in-progress grouped aggregation. Finish with `.agg(...)`."""
+    """An in-progress grouped aggregation, produced by `Dataset.group_by`.
+
+    Not constructed directly: `Dataset.group_by(*keys)` returns one, holding the
+    chosen group keys (and any derived keys). It is a builder with a single
+    finisher — call `agg` with the named aggregates to get back a new `Dataset`
+    whose columns are the group keys followed by those aggregates. Like everything
+    in the API it is lazy; no work runs until the resulting `Dataset` hits a
+    terminal operation.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "v": [1, 2, 3]})
+            >>> ds.group_by("g").agg(total=bt.col("v").sum()).sort("g").to_pydict()
+            {'g': ['a', 'b'], 'total': [3, 3]}
+    """
 
     __slots__ = ("_keys", "_named", "_source")
 
