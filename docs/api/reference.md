@@ -144,6 +144,23 @@ print(out.to_pydict())
 | `bt.array(*exprs)` | build a list column |
 | `bt.atan2(y, x)` | two-argument arctangent |
 | `bt.count()` | COUNT(*) aggregate |
+| `bt.iff(condition, if_true, if_false)` | `if_true` where `condition` is true, else `if_false` (DuckDB `IFF`) |
+| `bt.ifnull(value, fallback)` | `value` unless it is NULL, then `fallback` |
+| `bt.nanvl(value, fallback)` | `value` unless it is NaN, then `fallback` (Spark `nanvl`) |
+| `bt.concat(*exprs)` | concatenate values into one string |
+| `bt.concat_ws(separator, *exprs)` | concatenate values with `separator` between them |
+| `bt.format_string(format, *exprs)` | interpolate values into a `{}` template (Polars `format`) |
+| `bt.log(base, value)` | logarithm of `value` in the given `base` (→ Float64) |
+| `bt.concat(*exprs)` | concatenate values into one string; NULLs treated as empty (DuckDB `concat`) |
+
+## Top-level helpers
+
+| Call | Returns |
+| --- | --- |
+| `bt.catalog` | a process-local registry of named tables for SQL and cross-query reuse (`.register`, `.table`) |
+| `bt.date_range(start, end, *, interval_days=1, name="date")` | a one-column Dataset of dates (inclusive ISO `YYYY-MM-DD`) — the date-dimension generator |
+| `bt.compact(path, *, target_size_mb=128.0, num_files=None, by=None, format=None, **opts)` | rewrite many small files at `path` into fewer larger ones in place; returns a `WriteManifest` |
+| `bt.engine_version()` | the version reported by the compiled Rust engine (`str`) |
 
 ## Expression methods
 

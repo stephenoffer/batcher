@@ -1,0 +1,221 @@
+/* Batcher documentation theme — layered on top of Furo.
+   Brand: control-plane blue (#1a73e8) + data-plane orange (#e8710a), matching the
+   architecture diagrams. Furo brand color variables are set in conf.py
+   (light_css_variables / dark_css_variables); this file carries the structural
+   polish: typography, code, admonitions, tables, framed diagrams, and the hero. */
+
+:root {
+  --bt-blue: #1a73e8;
+  --bt-blue-deep: #1557b0;
+  --bt-orange: #e8710a;
+  --bt-radius: 10px;
+  --font-stack: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  --font-stack--monospace: "JetBrains Mono", "SFMono-Regular", "SF Mono", Menlo,
+    Consolas, "Liberation Mono", monospace;
+}
+
+/* ---- Typography -------------------------------------------------------- */
+
+body {
+  font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-weight: 700;
+  letter-spacing: -0.018em;
+}
+
+h1 {
+  font-size: 2.3rem;
+  line-height: 1.15;
+  background: linear-gradient(95deg, var(--bt-blue-deep), var(--bt-blue));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* A thin brand rule under section headings keeps long pages scannable. */
+h2 {
+  margin-top: 2.4rem;
+  padding-bottom: 0.25rem;
+  border-bottom: 2px solid var(--color-background-border);
+}
+
+article a.reference {
+  text-underline-offset: 0.18em;
+}
+
+/* ---- Inline + block code ---------------------------------------------- */
+
+code.literal,
+.rst-content code:not(.xref) {
+  border-radius: 6px;
+  padding: 0.12em 0.38em;
+  font-size: 0.86em;
+}
+
+div.highlight {
+  border-radius: var(--bt-radius);
+  border: 1px solid var(--color-background-border);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+div.highlight pre {
+  padding: 0.95rem 1.1rem;
+}
+
+/* ---- Admonitions: brand-tinted, less boxy ----------------------------- */
+
+.admonition,
+div.admonition {
+  border-radius: var(--bt-radius);
+  border-left-width: 4px;
+  box-shadow: none;
+}
+
+.admonition.note,
+.admonition.seealso {
+  border-left-color: var(--bt-blue);
+}
+
+.admonition.tip,
+.admonition.hint,
+.admonition.important {
+  border-left-color: var(--bt-orange);
+}
+
+/* ---- Tables: lighter, with a tinted header ---------------------------- */
+
+table.docutils {
+  border-radius: var(--bt-radius);
+  overflow: hidden;
+  border-collapse: separate;
+  border-spacing: 0;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+}
+
+table.docutils thead th {
+  background: var(--color-background-secondary);
+  border-bottom: 2px solid var(--color-background-border);
+  font-weight: 650;
+}
+
+table.docutils td,
+table.docutils th {
+  border-color: var(--color-background-border);
+}
+
+/* ---- Diagrams: frame the white PNGs so they read on light and dark ---- */
+/* Sphinx rewrites referenced image paths to _images/; match that (and the raw
+   _static/diagrams path used in local previews). */
+
+article img[src*="_images/"],
+article img[src*="/diagrams/"] {
+  display: block;
+  margin: 1.5rem auto;
+  max-width: 100%;
+  background: #ffffff;
+  padding: 1rem 1.25rem;
+  border-radius: 12px;
+  border: 1px solid var(--color-background-border);
+  box-shadow: 0 2px 10px rgba(15, 23, 42, 0.07);
+}
+
+/* ---- Sidebar logo breathing room -------------------------------------- */
+
+.sidebar-logo-container {
+  margin: 0.6rem auto 0.2rem;
+}
+.sidebar-logo {
+  max-width: 90%;
+}
+
+/* ---- Landing hero ------------------------------------------------------ */
+
+.bt-hero {
+  margin: 0.5rem 0 2.5rem;
+  padding: 2.2rem 2rem;
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(26, 115, 232, 0.10), rgba(232, 113, 10, 0.08));
+  border: 1px solid var(--color-background-border);
+}
+
+.bt-hero-tagline {
+  font-size: 1.9rem;
+  font-weight: 750;
+  line-height: 1.18;
+  letter-spacing: -0.02em;
+  margin: 0 0 0.6rem;
+  color: var(--color-content-foreground);
+}
+
+.bt-hero-sub {
+  font-size: 1.08rem;
+  line-height: 1.6;
+  max-width: 46rem;
+  margin: 0 0 1.4rem;
+  color: var(--color-foreground-secondary);
+}
+
+.bt-hero-cta {
+  margin: 0;
+}
+
+.bt-btn {
+  display: inline-block;
+  padding: 0.55rem 1.15rem;
+  margin: 0 0.5rem 0.5rem 0;
+  border-radius: 8px;
+  font-weight: 600;
+  text-decoration: none;
+  border: 1px solid var(--bt-blue);
+  color: var(--bt-blue);
+  transition: transform 0.04s ease, background 0.15s ease;
+}
+
+.bt-btn:hover {
+  transform: translateY(-1px);
+  text-decoration: none;
+}
+
+.bt-btn-primary {
+  background: var(--bt-blue);
+  color: #ffffff;
+}
+
+.bt-btn-primary:hover {
+  background: var(--bt-blue-deep);
+  color: #ffffff;
+}
+
+/* Key-point cards on the landing page (a plain bullet list becomes a grid
+   when wrapped in .bt-points). */
+.bt-points {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.bt-points > div {
+  padding: 1.1rem 1.2rem;
+  border-radius: 12px;
+  border: 1px solid var(--color-background-border);
+  background: var(--color-background-secondary);
+}
+
+.bt-points h3 {
+  margin: 0 0 0.4rem;
+  font-size: 1.02rem;
+}
+
+.bt-points p {
+  margin: 0;
+  font-size: 0.92rem;
+  color: var(--color-foreground-secondary);
+  line-height: 1.55;
+}

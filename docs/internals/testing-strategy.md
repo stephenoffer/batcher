@@ -1,6 +1,6 @@
 # Testing strategy
 
-Batcher's claim is to be faster than DuckDB, Spark, Polars, and Ray Data *and*
+Batcher's claim is to be faster than DuckDB, Spark, and Polars *and*
 correct. That is only credible if correctness is proven mechanically against a
 reference on every change. So the rule is blunt: correctness before speed, and a
 fast wrong answer is a bug. The benchmark harness enforces it literally — it refuses

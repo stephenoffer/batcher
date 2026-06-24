@@ -74,6 +74,7 @@ Each method returns a new `Dataset`. They chain.
 | `.window(...)` | Per-row windowed columns (see below). |
 | `.group_by(*keys, **derived)` | Start a grouped aggregation (returns `GroupBy`). |
 | `.map_batches(fn, ...)` | Apply a Python function to whole Arrow batches. |
+| `.repartition(num_files=None, *, by=None, target_size_mb=None)` | Set how the next `write` lays out files (data unchanged). |
 
 ### filter
 
@@ -216,6 +217,20 @@ print(with_total.select("category", "total").to_pydict())
 #  'total': [10.0, 40.0, 90.0, 160.0, 250.0, 360.0]}
 ```
 
+### repartition
+
+`repartition` changes only the file layout the next `write` produces, not the data.
+Pass exactly one sizing option: `num_files` (split into that many files),
+`target_size_mb` (coalesce into ~that-size files — the small-files fix), or neither
+with only `by` to Hive-partition by column(s). `by` may combine with a sizing
+option. For in-place use against an existing path, see `bt.compact`.
+
+```python
+# docs: skip
+ds.repartition(target_size_mb=128).write("out/")
+ds.repartition(by="dt").write("out/")
+```
+
 ## GroupBy
 
 `group_by(*keys, **derived)` returns a `GroupBy`. Finalize it with
@@ -335,6 +350,17 @@ ds.describe().show()
 print(ds.null_count().to_pydict())
 # {'g': [0], 'x': [0]}
 ```
+
+`profile()` is the quick "what does this column look like" check before a load: it
+**executes** and returns one row per column with `count`, `null_count`,
+`null_fraction`, and `approx_distinct` (HyperLogLog cardinality).
+
+## Data quality and dimension upserts
+
+| Accessor | Purpose |
+| --- | --- |
+| `.dq` | Data-quality expectations. Constraint methods accumulate (returning a new `DatasetDQ`); a terminal method (`fail` / `drop` / `quarantine` / `validate`) applies them. |
+| `.scd` | Slowly-changing-dimension upserts. The dataset is the incoming dimension snapshot (natural keys + attributes). |
 
 ## Next steps
 

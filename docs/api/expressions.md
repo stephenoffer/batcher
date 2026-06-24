@@ -101,6 +101,14 @@ print(out.to_pydict())
 # {'root': [3.1622776601683795, 4.47213595499958, 5.477225575051661], 'third': [3.33, 6.67, 10.0]}
 ```
 
+## Other core methods
+
+| Method | Description |
+| --- | --- |
+| `.eq_missing(other)` | null-safe equality (SQL `IS NOT DISTINCT FROM`): two nulls compare equal, null vs non-null is false (never null) |
+| `.try_cast(type)` | like `.cast` but unconvertible values become NULL instead of erroring (DuckDB `TRY_CAST`) — the safe-ingest spelling |
+| `.approx_count_distinct()` | approximate `COUNT(DISTINCT)` via a HyperLogLog sketch (~2% error) |
+
 ## Aggregation methods
 
 Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
@@ -160,6 +168,40 @@ Breadth lives on accessor namespaces rather than on the expression itself.
 | `.struct` | `field(name)` |
 | `.json` | `extract_string(path)` |
 | `.image` | `decode()`, `to_tensor(width, height)` |
+
+### More `.str` methods
+
+| Method | Description |
+| --- | --- |
+| `.lpad(width, fill=" ")` / `.rpad(width, fill=" ")` | pad to `width` characters with `fill` (cycled); truncate if longer |
+| `.repeat(n)` | repeat the string `n` times (`n` ≤ 0 → empty) |
+| `.normalize_whitespace()` | collapse every run of whitespace to a single space and trim the ends |
+| `.position(pattern)` | 1-based index of `pattern`, 0 if absent (→ Int64) |
+| `.regexp_matches(pattern)` | true where the regex matches anywhere (→ Bool) |
+| `.ascii()` | Unicode codepoint of the first character, 0 if empty (→ Int64) |
+| `.bit_length()` / `.octet_length()` | number of bits / UTF-8 bytes in the string (→ Int64) |
+| `.from_base64()` | decode standard base64 to a UTF-8 string; null if invalid |
+| `.unhex()` | decode pairs of hex digits to a UTF-8 string; null if invalid |
+| `.md5()` / `.sha1()` / `.sha256()` | cryptographic digest as lowercase hex; null → null |
+| `.crc32()` | CRC-32 (IEEE) checksum of the UTF-8 bytes (Spark `crc32`, → Int64) |
+| `.hash64()` | deterministic FNV-1a 64-bit hash, stable across partitions/machines — surrogate-key building block (→ Int64) |
+| `.xxhash64()` | fast non-cryptographic 64-bit xxHash; the standard bucketing/sharding hash (→ Int64) |
+| `.to_date(format="%Y-%m-%d")` | parse into a Date with a strftime format; unmatched → NULL (→ Date32) |
+| `.to_datetime(format)` | parse into a Timestamp (DuckDB `try_strptime`); unmatched → NULL (→ Timestamp(us)) |
+
+### More `.dt` methods
+
+`.century()`, `.decade()`, `.isodow()` (ISO day of week), `.last_day()` (last day
+of the month), `.millennium()` — each extracts the named field of a date/time
+column (→ Int64).
+
+### More `.json` methods
+
+| Method | Description |
+| --- | --- |
+| `.extract_int(path)` | the integer value at JSON `path`; null if absent or non-integral (→ Int64) |
+| `.extract_float(path)` | the numeric value at JSON `path` as a float; null if absent or non-numeric |
+| `.extract_bool(path)` | the boolean value at JSON `path`; null if absent or non-boolean |
 
 For retrieval / RAG, the vector ops score each row's embedding against a query
 vector (a broadcast `array(...)` literal): `bt.col("emb").list.cosine_similarity(

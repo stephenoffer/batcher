@@ -32,6 +32,21 @@ to change them.
 | `config.pid` | Adaptive batch-size controller gains |
 | `config.metadata` | Learned-stats backend and decay |
 
+### Section classes
+
+The section dataclasses are exported so you can construct one and slot it into
+`Config.replace`. Their fields are documented in
+[configuration/options](../configuration/options.md); each is summarized here.
+
+| Class | Configures |
+| --- | --- |
+| `ExecutionConfig` | parallelism, morsel size, file-split size, CPUs per task |
+| `MemoryConfig` | buffer-pool envelope, soft/hard limits, and spill thresholds |
+| `FlowControlConfig` | credit-based shuffle backpressure and AIMD credit tuning |
+| `OptimizerConfig` | Kyber planning thresholds, cost model, and cardinality defaults |
+| `PIDConfig` | gains for the adaptive batch-size PID controller |
+| `MetadataConfig` | learned-stats backend, URI, and decay rate |
+
 ### Config.replace
 
 `Config.replace(**section_overrides)` returns a new `Config` with whole sections
@@ -77,6 +92,12 @@ from batcher import Config
 
 cfg = Config.from_file("/etc/batcher/config.json")
 ```
+
+### Config.validate and Config.engine_config_json
+
+`Config.validate()` checks the configuration and raises `ConfigError` on a bad
+value. `Config.engine_config_json()` serializes the Rust-relevant execution knobs
+for the data plane (the JSON the engine actually receives).
 
 ## set_config
 

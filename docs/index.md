@@ -1,32 +1,58 @@
 # Batcher
 
-Batcher is a native, JIT-compiling data engine with an adaptive optimizer. A
-Python control plane builds and optimizes a query plan; a Rust data plane runs it
-over Apache Arrow. The same engine targets sub-second queries on a laptop and
-PB-scale jobs on a cluster, for SQL, DataFrame, and ML workloads.
+```{raw} html
+<div class="bt-hero">
+  <p class="bt-hero-tagline">One data engine, from your laptop to your cluster.</p>
+  <p class="bt-hero-sub">
+    Batcher runs SQL, DataFrame, and ML workloads on a JIT-compiling Rust core, and
+    re-optimizes the query while it is still running. Sub-second on a laptop,
+    bounded-memory at petabyte scale &mdash; the same code either way.
+  </p>
+  <p class="bt-hero-cta">
+    <a class="bt-btn bt-btn-primary" href="getting-started/index.html">Get started</a>
+    <a class="bt-btn" href="getting-started/quickstart.html">Quickstart</a>
+    <a class="bt-btn" href="https://github.com/stephenoffer/batcher">GitHub</a>
+  </p>
+</div>
+```
 
-The design splits cleanly in two. Python builds a plan, optimizes it, and decides
-how much it should cost, but never touches a row of data. All per-row work runs in
-Rust over Arrow record batches. The boundary between them is a JSON plan plus
-zero-copy Arrow batches.
+Most engines plan a query once, before they have seen a single row, then commit to
+that plan whatever the data turns out to be. Batcher does not. It measures the data
+as it flows and re-plans the rest of the query on real numbers, so a query that
+starts on a bad estimate corrects itself mid-flight.
 
-## What sets it apart
+The design splits in two. Python builds the plan, optimizes it, and decides how much
+it should cost, but never touches a row. Every per-row operation runs in Rust over
+Apache Arrow. Between them sits one boundary: a JSON plan going down, zero-copy Arrow
+batches coming back.
 
-- **Adaptive re-optimization.** The optimizer (Kyber) re-plans during a query, at
-  pipeline breakers, using measured cardinalities rather than static estimates.
-  DuckDB optimizes once before execution; Spark adapts only at stage boundaries.
-- **One algebra, single node to cluster.** Stateful operators are written once as
-  mergeable `partial / combine / finalize` primitives. The same code runs on one
-  core, many cores, or many machines, with bounded per-node memory and spill to
-  disk.
-- **JIT-compiled expressions.** A Cranelift fast path compiles column expressions
-  once per operator and reuses the compiled code across batches, with a checked
-  fallback to the interpreter.
-- **Lazy and immutable API.** A `Dataset` is a handle to a plan. Every operation
-  returns a new `Dataset`; no work runs until a terminal operation such as
-  `collect`, `to_pydict`, or `write.parquet`.
+```{raw} html
+<div class="bt-points">
+  <div>
+    <h3>Adaptive re-optimization</h3>
+    <p>Kyber re-plans at pipeline breakers using measured cardinalities. DuckDB
+    optimizes once; Spark adapts only at stage boundaries.</p>
+  </div>
+  <div>
+    <h3>One algebra, one to many machines</h3>
+    <p>Stateful operators are written once as mergeable partial / combine / finalize
+    primitives. One core or a thousand run the same code, with bounded memory and
+    spill to disk.</p>
+  </div>
+  <div>
+    <h3>JIT-compiled expressions</h3>
+    <p>A Cranelift fast path compiles column expressions once per operator and reuses
+    the machine code across batches, with a checked fallback to the interpreter.</p>
+  </div>
+  <div>
+    <h3>Lazy, immutable API</h3>
+    <p>A Dataset is a handle to a plan. Each operation returns a new one; nothing runs
+    until a terminal call such as <code>collect</code> or <code>write.parquet</code>.</p>
+  </div>
+</div>
+```
 
-## Quick example
+## A first query
 
 ```python
 import batcher as bt
@@ -50,7 +76,7 @@ print(summary.to_pydict())
 # {'category': ['a', 'b'], 'revenue': [220.0, 200.0], 'orders': [3, 2]}
 ```
 
-Reading from files or object stores uses the same API; only the source changes:
+Files and object stores use the same API. Only the source changes.
 
 ```python
 # docs: skip

@@ -111,14 +111,30 @@ exclude_patterns = [
 
 html_theme = "furo"
 html_static_path = ["_static"]
-html_title = "Batcher Documentation"
-html_logo = None
-html_favicon = None
+html_title = "Batcher"
+html_favicon = "_static/favicon.svg"
+html_css_files = ["custom.css"]
+
+# Brand palette matches the architecture diagrams: control-plane blue is the
+# primary, data-plane orange the accent. Structural styling lives in custom.css.
+_BRAND = "#1a73e8"
+_BRAND_DARK = "#5aa0f2"
 
 html_theme_options = {
-    "sidebar_hide_name": False,
+    "sidebar_hide_name": True,  # the wordmark is in the logo
     "navigation_with_keys": True,
     "top_of_page_button": "edit",
+    "light_logo": "logo-light.svg",
+    "dark_logo": "logo-dark.svg",
+    "light_css_variables": {
+        "color-brand-primary": _BRAND,
+        "color-brand-content": _BRAND,
+        "color-admonition-title-background--note": "rgba(26, 115, 232, 0.10)",
+    },
+    "dark_css_variables": {
+        "color-brand-primary": _BRAND_DARK,
+        "color-brand-content": _BRAND_DARK,
+    },
 }
 
 # -- Options for autodoc -----------------------------------------------------

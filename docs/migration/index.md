@@ -1,9 +1,9 @@
 # Migrating to Batcher
 
 Batcher's surface is deliberately close to the libraries you already know. If you
-come from pandas, Polars, PySpark, or Ray Data, most of your vocabulary carries
-over — the table below maps the common operations, and the round-trip adapters
-let you move data in and out without copying.
+come from pandas, Polars, or PySpark, most of your vocabulary carries over. The
+tables below map the common operations, and the round-trip adapters let you move
+data in and out without copying.
 
 The one concept to internalize: a `Dataset` is **lazy**. Transformations
 (`select`, `filter`, `group_by().agg()`, `join`, …) build a plan and return a new
@@ -132,36 +132,34 @@ table = ds.to_arrow()                                 # Batcher -> pyarrow.Table
 | TensorFlow | `bt.from_tf(ds)` | `ds.to_tf()` |
 
 The `to_torch` / `to_tf` exporters yield a re-iterable dataset of per-batch tensor
-dicts, so a multi-epoch training loop streams the query in bounded memory (the
-counterpart to Ray Data's `iter_torch_batches`).
+dicts, so a multi-epoch training loop streams the query in bounded memory.
 
-## Notes for Ray Data users
+## Batch inference and ML pipelines
 
-Batcher's `ds.map_batches(fn)` and the `ds.ml.infer(model)` / `ds.ml.embed(model)`
-accessors mirror Ray Data's batch-mapping and inference APIs (pass a class to load
-a model once per worker, with `num_gpus=`/`concurrency=` for GPU actor pools). The
-difference is that Batcher puts a real optimizer (Kyber) and an adaptive resource
-manager (Carbonite) underneath, so relational work around the model is planned and
-sized for you rather than executed as-authored.
+`ds.map_batches(fn)` runs a function over Arrow batches; `ds.ml.infer(model)` and
+`ds.ml.embed(model)` run a model. Pass a class instead of an instance and the model
+loads once per worker, with `num_gpus=` / `concurrency=` for GPU actor pools. What
+sits underneath is the point: a real optimizer (Kyber) and an adaptive resource
+manager (Carbonite), so the relational work around the model is planned and sized
+for you instead of executed as written.
 
-| Ray Data | Batcher | Note |
-|----------|---------|------|
-| `ds.map_batches(Model, ...)` | `ds.ml.map_batches(Model, ...)` | class = model loaded once per worker |
-| (batch inference) | `ds.ml.infer(model, num_gpus=, concurrency=)` | CPU readers feed GPU actors |
-| (embeddings) | `ds.ml.embed(model)` / `batcher.ml.embed(...)` | text/image → vector column |
-| Ray Data LLM + vLLM | `batcher.ml.llm_generate(..., engine=vllm_engine("..."))` | engine self-batches; no outer PID |
-| `ray.train` + `iter_torch_batches` | `ds.ml.stream_loader(world_size=, rank=, ...)` | deterministic, balanced, **resumable** |
-| `ds.stats()` | `ds.stats()` | *measured* per-op metrics + bottleneck |
-| `write_parquet(num_rows_per_output_file=)` | `ds.write.parquet(max_rows_per_file=)` | honored even with `partition_by` |
-| (no resume) | `ds.write.parquet(resume=True)` | skips committed shards on re-run |
+| Task | Batcher | Note |
+|------|---------|------|
+| Map a model over batches | `ds.ml.map_batches(Model, ...)` | class = model loaded once per worker |
+| Batch inference | `ds.ml.infer(model, num_gpus=, concurrency=)` | CPU readers feed GPU actors |
+| Embeddings | `ds.ml.embed(model)` / `batcher.ml.embed(...)` | text or image to a vector column |
+| LLM generation | `batcher.ml.llm_generate(..., engine=vllm_engine("..."))` | engine self-batches; no outer PID |
+| Distributed training feed | `ds.ml.stream_loader(world_size=, rank=, ...)` | deterministic, balanced, resumable |
+| Per-op metrics | `ds.stats()` | measured rows, time, bytes, and bottleneck |
+| Bounded output files | `ds.write.parquet(max_rows_per_file=)` | honored even with `partition_by` |
+| Resumable writes | `ds.write.parquet(resume=True)` | skips committed shards on re-run |
 
-Several knobs Ray Data makes you set by hand are measured defaults here: batch size
-adapts toward throughput under a VRAM cap, `num_gpus` adapts to observed utilization,
-and there is no object-store proportion to tune (the data plane bypasses it). On the
-sub-million-row queries where Ray Data's per-query overhead dominates, Batcher's
-low-overhead engine runs the same filter/group-by/aggregate **markedly faster** —
-see `benchmarks/` (run `python benchmarks/run.py --family ray-data`) for the
-correctness-gated head-to-head.
+Settings other engines make you tune by hand are measured defaults here. Batch size
+adapts toward throughput under a VRAM cap, `num_gpus` adapts to observed GPU
+utilization, and there is no object-store proportion to set, because the data plane
+bypasses it. The engine's low fixed overhead also keeps small queries fast, so the
+sub-million-row filter, group-by, and aggregate stay sub-second. `benchmarks/` holds
+the correctness-gated numbers against DuckDB and Polars (`python benchmarks/run.py`).
 
 `ds.stats()` is the answer to "where is my time going" — it runs the query and
 reports each operator's measured rows, wall time, peak bytes, spill, and the
