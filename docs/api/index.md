@@ -5,21 +5,34 @@ it with expression-based operations, and execute it with a terminal operation th
 returns Arrow or writes to a sink. Everything reachable from `import batcher as bt`
 is documented in this section.
 
-Start with the quick reference for a one-page map of the surface, then drill into
-the page for the area you are working in. The
-[complete reference](complete.md) is generated from the source docstrings and
-documents every public name, with a page per function.
+This section has three layers. The **quick reference** is a one-page map of the
+surface. The **topic pages** explain each area with runnable examples. The
+**complete reference** is generated from the source docstrings and documents every
+public name, with a page per function.
+
+```{toctree}
+:hidden:
+:caption: Overview
+
+reference
+```
 
 ```{toctree}
 :maxdepth: 1
+:caption: Topics
 
-reference
-complete
 dataset
 expressions
 io
 sql
-configuration
 ml
+configuration
 exceptions
+```
+
+```{toctree}
+:hidden:
+:caption: Complete reference
+
+complete
 ```

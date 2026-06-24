@@ -174,16 +174,34 @@ Memory, spill, parallelism, and the adaptive knobs.
 
 ```{toctree}
 :hidden:
-:caption: Documentation
+:caption: Learn
 
 getting-started/index
 tutorials/index
-user-guide/index
-migration/index
-api/index
-configuration/index
-ml/index
 learning-paths/index
+```
+
+```{toctree}
+:hidden:
+:caption: Guides
+
+user-guide/index
+ml/index
+configuration/index
+migration/index
+```
+
+```{toctree}
+:hidden:
+:caption: Reference
+
+api/index
+```
+
+```{toctree}
+:hidden:
+:caption: Design
+
 architecture/index
 internals/index
 ```
