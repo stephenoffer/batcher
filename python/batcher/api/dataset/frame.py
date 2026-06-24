@@ -169,7 +169,26 @@ class Dataset:
 
     # --- transformations ---------------------------------------------------
     def filter(self, predicate: Expr) -> Dataset:
-        """Keep rows where `predicate` evaluates to true."""
+        """Keep only the rows where `predicate` is true.
+
+        The predicate is an expression built from columns, e.g.
+        ``col("amount") > 100``. Combine conditions with ``&`` (and), ``|`` (or),
+        and ``~`` (not), parenthesizing each side because those operators bind
+        tighter than comparisons. Rows where the predicate is null are dropped.
+        Like every transformation this is lazy and returns a new `Dataset`.
+
+        Args:
+            predicate: A boolean expression evaluated per row.
+
+        Returns:
+            A new `Dataset` with the matching rows.
+
+        Example:
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, 5, 9], "ok": [True, False, True]})
+            >>> ds.filter((bt.col("x") > 2) & bt.col("ok")).to_pydict()
+            {'x': [9], 'ok': [True]}
+        """
         if not isinstance(predicate, Expr):
             raise PlanError("filter() requires an expression, e.g. col('x') > 0")
         return self._derive(Filter(self._plan, predicate))
@@ -628,7 +647,26 @@ class Dataset:
         return list(self.columns)
 
     def limit(self, n: int, offset: int = 0) -> Dataset:
-        """Keep at most `n` rows after skipping `offset`."""
+        """Take at most `n` rows, after skipping the first `offset`.
+
+        The SQL ``LIMIT`` / ``OFFSET``. Pair it with `sort` for a deterministic
+        result — without an order, which rows you get is unspecified. To find the
+        largest or smallest rows, prefer `top_k`, which the optimizer can push down
+        instead of sorting the whole dataset.
+
+        Args:
+            n: Maximum number of rows to return.
+            offset: Number of leading rows to skip first.
+
+        Returns:
+            A new `Dataset` with at most `n` rows.
+
+        Example:
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, 2, 3, 4, 5]})
+            >>> ds.sort("x").limit(2, offset=1).to_pydict()
+            {'x': [2, 3]}
+        """
         if n < 0 or offset < 0:
             raise PlanError("limit() requires non-negative n and offset")
         return self._derive(Limit(self._plan, n, offset))
