@@ -1,8 +1,8 @@
-# Complete API reference
+# Complete reference
 
-Every public name in `batcher`, generated from the source docstrings. The other
-pages in this section are example-first guides; this one is the exhaustive
-reference. Each top-level function links to its own page.
+Every public name in `batcher`, generated from the source docstrings — the
+exhaustive backstop behind the [quick reference](reference.md) and the
+example-first [area pages](index.md). Each top-level function links to its own page.
 
 ## Top-level functions
 
@@ -59,6 +59,14 @@ reference. Each top-level function links to its own page.
 
 ```{eval-rst}
 .. autoclass:: batcher.Dataset
+   :members:
+   :member-order: groupwise
+```
+
+## GroupBy
+
+```{eval-rst}
+.. autoclass:: batcher.GroupBy
    :members:
    :member-order: groupwise
 ```
