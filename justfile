@@ -83,6 +83,11 @@ docs:
     sphinx-build -b html -E -W --keep-going docs docs/_build/html
     @echo "docs built -> docs/_build/html/index.html"
 
+# Regenerate the architecture diagram PNGs from their Graphviz sources (needs
+# graphviz: `brew install graphviz`). The PNGs are committed; rerun after editing.
+diagrams:
+    python docs/_static/diagrams/render.py
+
 # Run the operator-mix benchmark vs DuckDB/Polars (optional row count argument).
 bench rows="":
     python benchmarks/run.py {{rows}}

@@ -54,15 +54,7 @@ filter, project, probe. A breaker is an operator that must collect its input bef
 it can produce output: a hash-join build, an aggregate, a sort, a distinct, a
 window.
 
-```
-Scan → Filter → Project        pipeline (streams, never materializes)
-        │
-        ▼  (breaker: build the hash table)
-HashJoin build
-        │
-        ▼  (breaker: partial aggregate)
-Aggregate
-```
+![A streaming Scan-Filter-Project pipeline feeding two pipeline breakers: the HashJoin build, then the Aggregate.](../_static/diagrams/pipeline_breakers.png)
 
 Breakers are the load-bearing points of the model. Data materializes there, spills
 there under memory pressure, shuffles there when a query is distributed, and gets

@@ -9,11 +9,7 @@ running it out of memory.
 
 Carbonite sits in the contract loop between the optimizer and the executor:
 
-```
-Kyber decides ──(plan + estimated cost)──> Carbonite protects ──(allocations)──> Core executes
-     ▲                                                                                │
-     └───────────────────── measured cardinalities, peak memory ─────────────────────┘
-```
+![The Kyber-Carbonite-Core feedback loop: Kyber decides (plan + estimated cost), Carbonite protects (allocations), Core executes, and measured cardinalities and peak memory flow back to Kyber.](../_static/diagrams/carbonite_loop.png)
 
 Kyber decides what to run and what it should cost. Carbonite decides whether that
 fits, and protects against OOM and cascading failure. Core runs the plan and

@@ -4,73 +4,7 @@ This section provides deep technical documentation on Batcher's internal archite
 
 ## Architecture overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              User API Layer                                  │
-│                                                                              │
-│    bt.read()   bt.col()   ds.filter()   ds.join()   ds.collect()           │
-│                                                                              │
-└───────────────────────────────────────────┬─────────────────────────────────┘
-                                            │
-                                            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Dataset API                                     │
-│                                                                              │
-│    Lazy operations that build logical plans                                  │
-│                                                                              │
-└───────────────────────────────────────────┬─────────────────────────────────┘
-                                            │
-                                            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Logical Plan                                    │
-│                                                                              │
-│    Tree of logical operators: Scan, Filter, Project, Join, Aggregate        │
-│                                                                              │
-└───────────────────────────────────────────┬─────────────────────────────────┘
-                                            │
-                                            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Kyber Optimizer                                 │
-│                                                                              │
-│    Rule + cost-based passes (normalize→pushdown→reorder→selection)           │
-│    Learned cardinality; intra-query adaptive re-optimization                 │
-│                                                                              │
-└───────────────────────────────────────────┬─────────────────────────────────┘
-                                            │
-                                            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Physical Plan                                   │
-│                                                                              │
-│    Concrete operators: HashJoin (shuffle + broadcast), Aggregate, Sort,     │
-│    Window - all mergeable (single-node == distributed)                       │
-│                                                                              │
-└───────────────────────────────────────────┬─────────────────────────────────┘
-                                            │
-                                            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Execution Engine                                │
-│                                                                              │
-│    Plan compilation, task scheduling, progress tracking                      │
-│                                                                              │
-└───────────────────────────────────────────┬─────────────────────────────────┘
-                                            │
-                                            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Carbonite                                       │
-│                                                                              │
-│    Memory management, caching, spill-to-disk, data transfer                  │
-│                                                                              │
-└───────────────────────────────────────────┬─────────────────────────────────┘
-                                            │
-                                            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                       Ray (optional, distributed only)                       │
-│                                                                              │
-│    Task and actor scheduling plus control-plane metadata. Bulk Arrow batches │
-│    bypass the Ray object store and move over Arrow Flight (bc-transport).    │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+![Batcher's layered architecture from the User API down through the Dataset API, Logical Plan, Kyber optimizer, Physical Plan, Execution Engine, Carbonite, and optional Ray.](../_static/diagrams/layer_stack.png)
 
 Ray is an optional dependency used only for distributed scheduling. Single-node
 execution does not require it, and even on a cluster the data plane moves Arrow
@@ -119,37 +53,7 @@ primitives run on one core, many cores, or many machines.
 
 A typical query flows through the system:
 
-```
-1. User writes: ds.filter(col("x") > 10).select("a", "b")
-                                    │
-2. Dataset builds logical plan:     │
-   LogicalProject(a, b)             │
-       └── LogicalFilter(x > 10)    │
-               └── LogicalScan(ds)  │
-                                    ▼
-3. Kyber optimizes:
-   - Push filter before project
-   - Prune unused columns
-   - Select scan strategy
-                                    │
-4. Physical plan:                   │
-   PhysicalProject(a, b)            │
-       └── PhysicalFilter(x > 10)   │
-               └── PhysicalScan(ds) │
-                                    ▼
-5. Execution engine:
-   - Compile to a task graph
-   - Schedule morsels (Ray on a cluster, threads on one node)
-   - Stream results
-                                    │
-6. Carbonite:                       │
-   - Manage memory and spill        │
-   - Move batches over Arrow Flight │
-                                    ▼
-7. The Rust data plane executes the operators over Arrow batches
-                                    │
-8. Results collected                ▼
-```
+![The eight-step data flow from user code through logical plan, Kyber optimization, physical plan, execution engine, Carbonite, the Rust data plane, and collected results.](../_static/diagrams/data_flow.png)
 
 ## Key concepts
 

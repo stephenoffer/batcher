@@ -14,15 +14,7 @@ re-optimization mid-query, possible.
 
 ## The two planes
 
-```
-Python (control plane)                  Rust (data plane)
-  Dataset / SQL  ─ lazy, immutable                bc-py   FFI boundary (zero-copy Arrow)
-        │ LogicalPlan                             bc-interp  interpreter · parallel · JIT
-   Kyber ─ optimize → PhysicalPlan                bc-runtime mergeable agg/join/sort/window
-   Carbonite ─ check feasibility, allocate        bc-codegen Cranelift JIT for expressions
-   Core ─ drive execution, measure                bc-sketches HLL/KLL/Count-Min
-        │ JSON IR + Arrow batches  ───────────▶   bc-transport Arrow Flight shuffle
-```
+![Batcher's two planes: a Python control plane (Dataset/SQL, Kyber, Carbonite, Core) handing a JSON IR plus Arrow batches to the Rust data plane (bc-py, bc-interp, bc-runtime, bc-codegen, bc-sketches, bc-transport).](../_static/diagrams/two_planes.png)
 
 The Python side carries the plan as JSON IR across the FFI boundary in `bc-py`; the
 data comes back as Arrow `RecordBatch`es with no copy and no serialization. The Rust
