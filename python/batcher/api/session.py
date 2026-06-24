@@ -36,10 +36,13 @@ __all__ = [
     "from_batches",
     "from_dask",
     "from_huggingface",
+    "from_items",
     "from_numpy",
     "from_pandas",
     "from_polars",
     "from_pydict",
+    "from_pylist",
+    "from_ray_dataset",
     "from_spark",
     "from_tf",
     "from_torch",
@@ -99,10 +102,34 @@ catalog = _Catalog()
 
 
 def sql(query: str, **tables: Any) -> Dataset:
-    """Run a SQL query over named tables (`Dataset`s or pyarrow tables).
+    """Run a SQL query over named tables, returning a lazy `Dataset`.
 
-    Unqualified table names resolve from the `bt.catalog` registry when not passed
-    explicitly here, so ``bt.catalog.register("t", ds); bt.sql("SELECT * FROM t")`` works.
+    Each keyword binds a table name used in the query to a `Dataset` or a pyarrow
+    table. The query is parsed and optimized through the same engine as the
+    DataFrame API, so the two interoperate freely: the result is itself a lazy
+    `Dataset` you can keep building on (``.filter``, ``.with_columns``, another
+    ``sql``) before a terminal operation runs the whole plan.
+
+    Unqualified names that are not passed here resolve from the `bt.catalog`
+    registry, so ``bt.catalog.register("t", ds)`` lets later ``bt.sql("... FROM t")``
+    calls omit the binding.
+
+    Args:
+        query: A SQL statement. Table names refer to the bound keywords.
+        **tables: Named inputs, each a `Dataset` or pyarrow table.
+
+    Returns:
+        A lazy `Dataset` of the query result.
+
+    Example:
+        >>> import batcher as bt
+        >>> sales = bt.from_pydict({"region": ["w", "e", "w"], "amount": [10, 20, 30]})
+        >>> out = bt.sql(
+        ...     "SELECT region, SUM(amount) AS total FROM sales GROUP BY region ORDER BY region",
+        ...     sales=sales,
+        ... )
+        >>> out.to_pydict()
+        {'region': ['e', 'w'], 'total': [20, 40]}
     """
     from batcher._sql import sql as _sql_fn
 
@@ -167,6 +194,24 @@ def _empty_batch(schema: pa.Schema) -> pa.RecordBatch:
 def from_pydict(mapping: dict[str, list[Any]]) -> Dataset:
     """Create a `Dataset` from a column-oriented Python dict."""
     return from_arrow(pa.table(mapping))
+
+
+def from_pylist(rows: list[dict[str, Any]]) -> Dataset:
+    """Create a `Dataset` from a row-oriented list of ``{column: value}`` dicts.
+
+    The row-major counterpart to `from_pydict` (e.g. JSON records); the union of keys
+    is the schema and missing keys are null. ``bt.from_pylist([{"a": 1}, {"a": 2}])``.
+    """
+    return from_arrow(pa.Table.from_pylist(rows))
+
+
+def from_items(items: list[Any], *, column: str = "item") -> Dataset:
+    """Create a `Dataset` from a list of items, one row per item (Ray Data style).
+
+    Dict items expand to columns (like `from_pylist`); scalar/other items become a
+    single `column`. ``bt.from_items([1, 2, 3])`` / ``bt.from_items([{"a": 1}])``.
+    """
+    return _scan(interop.from_items(items, column=column))
 
 
 def compact(
@@ -303,3 +348,12 @@ def from_spark(spark_df: Any) -> Dataset:
 def from_dask(ddf: Any) -> Dataset:
     """Create a streaming `Dataset` from a Dask `DataFrame` (one partition per batch)."""
     return _scan(interop.from_dask(ddf))
+
+
+def from_ray_dataset(ray_dataset: Any) -> Dataset:
+    """Create a streaming `Dataset` from a Ray Dataset (one Arrow block per batch).
+
+    The migration on-ramp from Ray Data: blocks stream lazily into the engine in
+    bounded memory. Requires `ray`.
+    """
+    return _scan(interop.from_ray_dataset(ray_dataset))
