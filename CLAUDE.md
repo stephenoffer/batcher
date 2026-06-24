@@ -48,7 +48,9 @@ tests you wrote pass.
     DuckDB/Polars via `benchmarks/`, and reasoned about vs Spark/Ray Data.
     → `.claude/rules/performance.md`
 11. **Python stays clean.** `ruff check` + `ruff format` clean, fully typed, no
-    duplication, no dead code, and a small curated public API with docstrings.
+    duplication, no dead code, and a small curated public API with **Google-style
+    docstrings** (one-line summary inline with the quotes; `Args:`/`Returns:` carry
+    no types; runnable `Examples:` in a `.. doctest::` block).
     → `.claude/rules/python-quality.md`
 12. **Structure stays bounded.** File/dir/class size limits (Python ≤500 lines, Rust
     ≤800 excl. tests, ≤12 files/dir, ≤5 levels deep, `__init__` ≤120 re-export-only);

@@ -60,10 +60,42 @@ expression API). Hold it to a higher bar:
   smallest surface that covers the use case; one obvious way to do each thing (see
   `.claude/rules/python-control-plane.md`). Don't expose internal types
   (LogicalPlan internals, IR dicts, `_native`) to users.
-- **Docstrings that earn their place.** Every public class/function has a docstring:
-  one-line summary, then the contract (args, returns, raised errors, laziness
-  semantics). Match the existing voice — concise, declarative, "one obvious way."
-  Examples in docstrings must be runnable.
+- **Docstrings that earn their place.** Every public class/function has a docstring.
+  Match the existing voice — concise, declarative, "one obvious way" — and follow the
+  **Google docstring style** below. The first sentence is a one-line summary on the
+  same line as the opening quotes; never make it span lines. Then optional explanatory
+  paragraphs, then the typed sections. Put types in the **signature only**, never in
+  the docstring. Examples are runnable and wrapped in a `.. doctest::` directive under
+  an `Examples:` heading.
+
+  ```python
+  def ray_canonical_doc_style(param1: int, param2: str) -> bool:
+      """First sentence MUST be inline with the quotes and fit on one line.
+
+      Additional explanatory text can be added in paragraphs such as this one.
+      Do not introduce multi-line first sentences.
+
+      Examples:
+          .. doctest::
+
+              >>> # Provide code examples for key use cases, as possible.
+              >>> ray_canonical_doc_style(41, "hello")
+              True
+
+              >>> # A second example.
+              >>> ray_canonical_doc_style(72, "goodbye")
+              False
+
+      Args:
+          param1: The first parameter. Do not include the types in the
+              docstring. They should be defined only in the signature.
+              Multi-line parameter docs should be indented by four spaces.
+          param2: The second parameter.
+
+      Returns:
+          The return value. Do not include types here.
+      """
+  ```
 - **Typed and discoverable.** Full type hints so editors/`pyright` can drive
   completion. Overloads where a method legitimately takes `str | Expr`.
 - **Errors are first-class.** Raise the project's typed exceptions

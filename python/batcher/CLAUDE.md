@@ -15,7 +15,9 @@ The non-negotiables:
 - **The JSON IR is a stable wire contract.** `to_ir()` tags must match
   `bc_ir::RelOp` / `bc_expr::Expr` serde tags exactly; change both sides together.
 - **Public API hygiene.** Lazy + immutable `Dataset`, expression-first, one obvious
-  way to do each thing. Curated `__all__`, full type hints, docstrings, typed
+  way to do each thing. Curated `__all__`, full type hints, **Google-style docstrings**
+  (one-line summary inline with the quotes; `Args:`/`Returns:` without types — those
+  live in the signature; runnable `Examples:` in a `.. doctest::` block), typed
   errors (`batcher._internal.errors`). Small surface — additions are commitments.
 - **Clean code.** `ruff check`/`ruff format` clean, no duplication (share via the
   neutral layers), no dead code. (`.claude/rules/python-quality.md`)

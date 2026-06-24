@@ -35,12 +35,14 @@ def when(cond: Expr) -> CaseBuilder:
     Returns:
         A `CaseBuilder`; call ``.then(...).otherwise(...)`` to produce the expression.
 
-    Example:
-        >>> import batcher as bt
-        >>> ds = bt.from_pydict({"x": [-1, 0, 5]})
-        >>> grade = bt.when(bt.col("x") > 0).then(bt.lit("pos")).otherwise(bt.lit("non-pos"))
-        >>> ds.select(grade=grade).to_pydict()
-        {'grade': ['non-pos', 'non-pos', 'pos']}
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [-1, 0, 5]})
+            >>> grade = bt.when(bt.col("x") > 0).then(bt.lit("pos")).otherwise(bt.lit("non-pos"))
+            >>> ds.select(grade=grade).to_pydict()
+            {'grade': ['non-pos', 'non-pos', 'pos']}
     """
     return CaseBuilder().when(cond)
 
@@ -58,11 +60,13 @@ def array(*elements: IntoExpr) -> Array:
     Returns:
         An expression producing a `List` column.
 
-    Example:
-        >>> import batcher as bt
-        >>> ds = bt.from_pydict({"a": [1], "b": [2]})
-        >>> ds.select(pair=bt.array(bt.col("a"), bt.col("b"))).to_pydict()
-        {'pair': [[1, 2]]}
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1], "b": [2]})
+            >>> ds.select(pair=bt.array(bt.col("a"), bt.col("b"))).to_pydict()
+            {'pair': [[1, 2]]}
     """
     if not elements:
         raise ValueError("array() requires at least one element")
@@ -136,11 +140,13 @@ def greatest(*exprs: IntoExpr) -> Greatest:
     Returns:
         An expression equal to the per-row maximum.
 
-    Example:
-        >>> import batcher as bt
-        >>> ds = bt.from_pydict({"a": [1, 9], "b": [4, 2]})
-        >>> ds.select(hi=bt.greatest(bt.col("a"), bt.col("b"))).to_pydict()
-        {'hi': [4, 9]}
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1, 9], "b": [4, 2]})
+            >>> ds.select(hi=bt.greatest(bt.col("a"), bt.col("b"))).to_pydict()
+            {'hi': [4, 9]}
     """
     if not exprs:
         raise ValueError("greatest() requires at least one argument")
@@ -201,11 +207,13 @@ def col(name: str) -> Col:
     Returns:
         An expression that evaluates to that column's values.
 
-    Example:
-        >>> import batcher as bt
-        >>> ds = bt.from_pydict({"price": [10, 20], "qty": [2, 3]})
-        >>> ds.select(total=bt.col("price") * bt.col("qty")).to_pydict()
-        {'total': [20, 60]}
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"price": [10, 20], "qty": [2, 3]})
+            >>> ds.select(total=bt.col("price") * bt.col("qty")).to_pydict()
+            {'total': [20, 60]}
     """
     return Col(name)
 
@@ -220,11 +228,13 @@ def count() -> AggExpr:
     Returns:
         An aggregate expression; pass it to ``.agg(...)``.
 
-    Example:
-        >>> import batcher as bt
-        >>> ds = bt.from_pydict({"g": ["a", "a", "b"]})
-        >>> ds.group_by("g").agg(n=bt.count()).sort("g").to_pydict()
-        {'g': ['a', 'b'], 'n': [2, 1]}
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"g": ["a", "a", "b"]})
+            >>> ds.group_by("g").agg(n=bt.count()).sort("g").to_pydict()
+            {'g': ['a', 'b'], 'n': [2, 1]}
     """
     return AggExpr("count_star", None)
 
