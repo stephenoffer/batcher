@@ -60,6 +60,16 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # name it as legitimately wide); its heavy method bodies are already extracted to
     # dataset/_build.py, leaving thin methods + docstrings that shouldn't be cut.
     "python/batcher/api/dataset/frame.py": "Dataset fluent builder; bodies in _build.py",
+    # The single source of truth for every tunable: ~11 frozen dataclasses whose fields
+    # map 1:1 to bc_ir::EngineConfig. They are one contract meant to be read together;
+    # splitting them across modules would scatter that contract and the env/file/Rust
+    # wiring. Public-API docstrings (python-quality.md) push it just over the limit.
+    "python/batcher/config/config.py": "single config contract; maps to bc_ir::EngineConfig",
+    # The parallel executor is one cohesive `match` over every RelOp arm (filter /
+    # project / aggregate / sort / join / window / …); splitting arms across files
+    # would scatter the dispatch and the shared spill/admit scaffolding. Operator
+    # *logic* already lives in `ops/`; this file is the scheduling shell.
+    "crates/bc-interp/src/par.rs": "parallel-executor dispatch hub; per-arm split scatters scheduling",
 }
 
 fails: list[str] = []

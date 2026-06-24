@@ -43,6 +43,13 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class ExecutionConfig:
+    """How work is sized and scheduled: thread count and morsel dimensions.
+
+    The engine's unit of work is a morsel — a small `RecordBatch` sized to fit cache
+    so scheduling stays granular and cache-friendly. These defaults saturate every
+    core without tuning; the per-field reference is in the configuration guide.
+    """
+
     # 0 means "use all available cores".
     parallelism: int = 0
     # Default morsel size in rows (§1.4): fits L2/L3, amortizes scheduling. This is
@@ -65,6 +72,13 @@ class ExecutionConfig:
 
 @dataclass(frozen=True, slots=True)
 class MemoryConfig:
+    """The memory envelope and when to spill to disk.
+
+    Carbonite keeps per-node memory bounded against these limits: it throttles at the
+    soft limit and spills aggregating, joining, and sorting operators to disk before
+    the hard limit, so a large query stays alive instead of running out of memory.
+    """
+
     soft_limit: float = 0.85  # throttle at 85% of the envelope
     hard_limit: float = 0.90  # spill at 90%
     # Hard memory cap in bytes for the buffer pool / spill decision. None derives it
@@ -97,6 +111,14 @@ class MemoryConfig:
 
 @dataclass(frozen=True, slots=True)
 class FlowControlConfig:
+    """Credit-based backpressure for the shuffle and data transport.
+
+    A credit is one in-flight batch slot; a producer blocks when its peer runs out,
+    so a fast stage cannot flood a slow one and blow up memory. The credit window
+    adapts with an AIMD loop (like TCP). Tune these only for unusual cluster shapes;
+    the per-field reference is in the configuration guide.
+    """
+
     # Credit window (in-flight RecordBatch slots) when the operator has no estimate.
     # One credit = one buffered batch, so this bounds a shuffle channel's memory.
     # Carbonite is the authority that supplies it, and clamps any per-operator
@@ -164,6 +186,14 @@ class CostCoefficients:
 
 @dataclass(frozen=True, slots=True)
 class OptimizerConfig:
+    """Knobs for the Kyber optimizer: join planning, cost, and cardinality.
+
+    Controls how hard the optimizer works (exact dynamic-programming join ordering up
+    to a table count, greedy beyond it), how it estimates cost and row counts from
+    learned statistics and sketches, and when a measured estimate is wrong enough to
+    trigger re-optimization mid-query. Defaults suit most workloads.
+    """
+
     join_dp_max_tables: int = 12  # DP-CCP exact threshold
     greedy_max_tables: int = 25  # greedy heuristic threshold
     # Build a per-column membership bloom index when persisting a written source's
@@ -213,6 +243,14 @@ class PIDConfig:
 
 @dataclass(frozen=True, slots=True)
 class MetadataConfig:
+    """Where learned statistics live and how fast they age.
+
+    Core measures real cardinalities and operator costs each run and records them in
+    the `MetadataHub`; Kyber reads them back to plan better next time. This selects
+    the backend (in-process, SQLite, Redis, object storage) and how quickly old
+    observations decay, so plans keep improving as a query is re-run.
+    """
+
     backend: str = "in_process"  # "in_process" | "sqlite" | "redis" | "object_storage"
     uri: str | None = None
     decay_per_day: float = 0.1  # confidence half-life ~ a week
