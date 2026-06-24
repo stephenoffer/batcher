@@ -116,6 +116,6 @@ ds.filter(bt.col("status") == "active").write.parquet("output/active.parquet")
 
 ## Next steps
 
-- [Core concepts](concepts.md): the lazy, immutable execution model.
+- [Core concepts](concepts/index.md): the lazy, immutable execution model.
 - [Transformations](../user-guide/transformations.md) and
   [Aggregations](../user-guide/aggregations.md) cover the operators in depth.

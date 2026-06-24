@@ -20,7 +20,7 @@ Build, filter, transform, aggregate, and join a dataset in a few lines.
 :::
 
 :::{grid-item-card} {octicon}`light-bulb;1.1em` Core concepts
-:link: concepts
+:link: concepts/index
 :link-type: doc
 Lazy, immutable datasets, expressions, and the control-plane / data-plane split.
 :::
@@ -31,5 +31,5 @@ Lazy, immutable datasets, expressions, and the control-plane / data-plane split.
 
 installation
 quickstart
-concepts
+concepts/index
 ```

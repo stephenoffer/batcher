@@ -8,7 +8,7 @@ answer.
 ## Reading order
 
 1. [Getting started](../getting-started/index.md): install and run a first query.
-2. [Concepts](../getting-started/concepts.md): datasets, laziness, expressions.
+2. [Concepts](../getting-started/concepts/index.md): datasets, laziness, expressions.
 3. [Expressions](../user-guide/expressions.md): column math, conditionals, string
    and date accessors.
 4. [Filtering](../user-guide/filtering.md): predicates and `is_in` / `between`.

@@ -72,4 +72,4 @@ Once built, `import batcher` resolves the local `batcher._native` extension.
 ## Next steps
 
 - The [quickstart](quickstart.md) runs an end-to-end query.
-- The [concepts](concepts.md) page explains the lazy, immutable Dataset model.
+- The [concepts](concepts/index.md) page explains the lazy, immutable Dataset model.
