@@ -17,11 +17,13 @@ print(ds.columns)
 | Call | Source |
 | --- | --- |
 | `bt.from_pydict(mapping)` | column-oriented dict |
+| `bt.from_pylist(rows)` | row-oriented list of dicts (JSON records) |
+| `bt.from_items(items)` | list of items, one row each (dicts → columns) |
 | `bt.from_arrow(table_or_batches)` | pyarrow Table, RecordBatch, or batch list |
 | `bt.from_batches(factory, schema)` | streaming source from a batch factory |
 | `bt.from_pandas(df)` / `bt.from_polars(df)` / `bt.from_numpy(...)` | framework adapters |
-| `bt.from_spark(...)` / `bt.from_dask(...)` / `bt.from_huggingface(...)` | framework adapters |
-| `bt.from_torch(...)` / `bt.from_tf(...)` | framework adapters |
+| `bt.from_spark(...)` / `bt.from_dask(...)` / `bt.from_ray_dataset(...)` | distributed-frame adapters |
+| `bt.from_torch(...)` / `bt.from_tf(...)` / `bt.from_huggingface(...)` | framework adapters |
 
 ## Readers
 
@@ -151,7 +153,8 @@ print(out.to_pydict())
 | `bt.concat_ws(separator, *exprs)` | concatenate values with `separator` between them |
 | `bt.format_string(format, *exprs)` | interpolate values into a `{}` template (Polars `format`) |
 | `bt.log(base, value)` | logarithm of `value` in the given `base` (→ Float64) |
-| `bt.concat(*exprs)` | concatenate values into one string; NULLs treated as empty (DuckDB `concat`) |
+| `bt.date_add(expr, days)` | add a whole number of `days` to a date/time column (Spark `date_add`) |
+| `bt.date_sub(expr, days)` | subtract a whole number of `days` from a date/time column (Spark `date_sub`) |
 
 ## Top-level helpers
 

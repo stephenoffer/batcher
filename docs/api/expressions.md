@@ -114,12 +114,15 @@ print(out.to_pydict())
 Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
 `.var()`, `.std()`, `.median()`, `.quantile(q)`, `.count()`, `.n_unique()`
 (aliased `.count_distinct()`), `.mode()`, `.bool_and()`, `.bool_or()`,
-`.array_agg()` (collect each group's values into a `List`; SQL `array_agg` /
+`.bit_and()` / `.bit_or()` / `.bit_xor()` (bitwise reduction of the non-null
+`Int64` values in each group), `.array_agg()` (collect each group's values into a
+`List`; SQL `array_agg` /
 Spark `collect_list`), `.arg_min(by=…)` / `.arg_max(by=…)` (the value at the
 row with the extreme `by` key), and `.first(order_by=…)` / `.last(order_by=…)`
 (the value at the first/last row in `order_by` order — a required argument, since
 an arrival-order first/last would not be partition-independent). `bt.count()` is
-the top-level `COUNT(*)`.
+the top-level `COUNT(*)`. Each of these returns an `AggExpr`, the aggregate type
+that `group_by(...).agg(...)` and `.over(...)` consume; you rarely name it directly.
 
 For heavy skew, the bounded-memory **approximate** variants keep one fixed-size
 sketch per group instead of every value, so a hot key cannot OOM: `.approx_n_unique()`
