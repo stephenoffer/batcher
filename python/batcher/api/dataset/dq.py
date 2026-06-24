@@ -97,28 +97,64 @@ class DatasetDQ:
 
     # --- constraints -------------------------------------------------------
     def not_null(self, *cols: str) -> DatasetDQ:
-        """Require every column in `cols` to be non-null."""
+        """Require every column in `cols` to be non-null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1, None, 3]})
+                >>> ds.dq.not_null("id").drop().to_pydict()
+                {'id': [1, 3]}
+        """
         if not cols:
             raise ValueError("not_null() requires at least one column")
         valid = reduce(lambda a, b: a & b, (Col(c).is_not_null() for c in cols))
         return self._add(RowConstraint(f"not_null({', '.join(cols)})", valid))
 
     def unique(self, keys: str | list[str]) -> DatasetDQ:
-        """Require the combination of `keys` to be unique across all rows."""
+        """Require the combination of `keys` to be unique across all rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1, 1, 2]})
+                >>> ds.dq.unique("id").drop().to_pydict()
+                {'id': [2]}
+        """
         key_list = [keys] if isinstance(keys, str) else list(keys)
         if not key_list:
             raise ValueError("unique() requires at least one key column")
         return self._add(UniqueConstraint(f"unique({', '.join(key_list)})", tuple(key_list)))
 
     def in_range(self, column: str, low: Any, high: Any) -> DatasetDQ:
-        """Require `column` ∈ ``[low, high]`` (NULL passes; add `not_null` to forbid)."""
+        """Require `column` ∈ ``[low, high]`` (NULL passes; add `not_null` to forbid).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, -3]})
+                >>> ds.dq.in_range("x", 0, 10).drop().to_pydict()
+                {'x': [1, 2]}
+        """
         c = Col(column)
         return self._add(
             RowConstraint(f"in_range({column}, {low}, {high})", c.is_null() | c.between(low, high))
         )
 
     def matches(self, column: str, pattern: str) -> DatasetDQ:
-        """Require `column` to match the regex `pattern` (NULL passes)."""
+        """Require `column` to match the regex `pattern` (NULL passes).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"code": ["A1", "B2", "xx"]})
+                >>> ds.dq.matches("code", r"^[A-Z][0-9]$").drop().to_pydict()
+                {'code': ['A1', 'B2']}
+        """
         c = Col(column)
         return self._add(
             RowConstraint(
@@ -127,14 +163,32 @@ class DatasetDQ:
         )
 
     def accepted_values(self, column: str, values: Iterable[Any]) -> DatasetDQ:
-        """Require `column` to be one of `values` (NULL passes)."""
+        """Require `column` to be one of `values` (NULL passes).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"c": ["a", "b", "z"]})
+                >>> ds.dq.accepted_values("c", ["a", "b"]).drop().to_pydict()
+                {'c': ['a', 'b']}
+        """
         c = Col(column)
         return self._add(
             RowConstraint(f"accepted_values({column})", c.is_null() | c.is_in(list(values)))
         )
 
     def check(self, predicate: Expr, *, name: str) -> DatasetDQ:
-        """A custom constraint — any boolean `predicate` that is TRUE for a valid row."""
+        """A custom constraint — any boolean `predicate` that is TRUE for a valid row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, -3]})
+                >>> ds.dq.check(bt.col("x") > 0, name="positive").drop().to_pydict()
+                {'x': [1, 2]}
+        """
         return self._add(RowConstraint(name, predicate))
 
     def foreign_key(
@@ -151,6 +205,15 @@ class DatasetDQ:
 
         ``ds.dq.foreign_key("customer_id", references=customers)`` → rows referencing
         a customer that does not exist.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> orders = bt.from_pydict({"customer_id": [1, 2, 9]})
+                >>> customers = bt.from_pydict({"customer_id": [1, 2]})
+                >>> orders.dq.foreign_key("customer_id", references=customers).to_pydict()
+                {'customer_id': [9]}
         """
         cols = [columns] if isinstance(columns, str) else list(columns)
         ref_cols = (
@@ -163,7 +226,16 @@ class DatasetDQ:
 
     # --- terminals ---------------------------------------------------------
     def validate(self) -> ValidationReport:
-        """Execute the checks and return per-constraint violation counts (no raise)."""
+        """Execute the checks and return per-constraint violation counts (no raise).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, -3]})
+                >>> str(ds.dq.in_range("x", 0, 10).validate())
+                'ValidationReport(violations: in_range(x, 0, 10)=1)'
+        """
         violations: dict[str, int] = {}
         rows = [c for c in self._constraints if isinstance(c, RowConstraint)]
         if rows:
@@ -184,7 +256,16 @@ class DatasetDQ:
 
     def fail(self) -> Dataset:
         """Raise `DataQualityError` if any constraint is violated; else return the
-        dataset unchanged — the data-contract gate at a pipeline boundary."""
+        dataset unchanged — the data-contract gate at a pipeline boundary.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.dq.in_range("x", 0, 10).fail().to_pydict()
+                {'x': [1, 2, 3]}
+        """
         report = self.validate()
         if not report.ok:
             raise DataQualityError(
@@ -193,14 +274,33 @@ class DatasetDQ:
         return self._ds
 
     def drop(self) -> Dataset:
-        """Return only the rows that satisfy every constraint."""
+        """Return only the rows that satisfy every constraint.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, -3]})
+                >>> ds.dq.in_range("x", 0, 10).drop().to_pydict()
+                {'x': [1, 2]}
+        """
         prepared, valid, helpers = self._prepared()
         kept = prepared.filter(when(valid).then(lit(True)).otherwise(lit(False)))
         return kept.drop(*helpers) if helpers else kept
 
     def quarantine(self) -> tuple[Dataset, Dataset]:
         """Return ``(clean, rejected)`` — valid rows and violating rows — so the bad
-        rows can be written to a dead-letter sink instead of failing the run."""
+        rows can be written to a dead-letter sink instead of failing the run.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, -3]})
+                >>> clean, rejected = ds.dq.in_range("x", 0, 10).quarantine()
+                >>> clean.to_pydict(), rejected.to_pydict()
+                ({'x': [1, 2]}, {'x': [-3]})
+        """
         prepared, valid, helpers = self._prepared()
         keep = when(valid).then(lit(True)).otherwise(lit(False))
         reject = when(valid).then(lit(False)).otherwise(lit(True))

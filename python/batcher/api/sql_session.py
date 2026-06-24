@@ -4,8 +4,8 @@ A `Session` is the DuckDB ``con`` / SparkSession analogue: it owns the
 control-plane metadata a SQL query resolves against — a table catalog, a registry
 of Python functions callable from SQL, and the sqlglot read dialect — and nothing
 else. Registering never executes; it only records a plan binding. The module-level
-``bt.sql`` / ``bt.catalog`` delegate to a hidden default `Session`, so the global,
-zero-setup spelling keeps working while `bt.Session(...)` scopes tables and
+``bt.sql`` / ``bt.register_function`` delegate to a hidden default `Session`, so the
+global, zero-setup spelling keeps working while `bt.Session(...)` scopes tables and
 functions to a single workload.
 
 This is the `api` layer: it builds `Dataset`s and calls the `_sql` translator. It
@@ -58,9 +58,9 @@ class Session:
     """A SQL execution context: a table catalog, a Python-function registry, and a dialect.
 
     Mirrors DuckDB's ``con`` and SparkSession. Build one to scope tables and
-    functions to a workload, or use the module-level ``bt.sql`` / ``bt.catalog``,
-    which delegate to a shared default `Session`. All state is control-plane
-    metadata — registering a table or function never executes anything.
+    functions to a workload, or use the module-level ``bt.sql`` /
+    ``bt.register_function``, which delegate to a shared default `Session`. All state
+    is control-plane metadata — registering a table or function never executes anything.
 
     Examples:
         .. doctest::
@@ -93,27 +93,80 @@ class Session:
 
         Returns:
             The bound `Dataset`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = s.register("t", bt.from_pydict({"x": [1, 2, 3]}))
+                >>> s.list()
+                ['t']
         """
         ds = self._as_dataset(dataset)
         self._tables[name] = ds
         return ds
 
     def table(self, name: str) -> Dataset:
-        """Return the `Dataset` registered as `name`, raising `PlanError` if absent."""
+        """Return the `Dataset` registered as `name`, raising `PlanError` if absent.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = s.register("t", bt.from_pydict({"x": [1, 2, 3]}))
+                >>> s.table("t").to_pydict()
+                {'x': [1, 2, 3]}
+        """
         if name not in self._tables:
             raise PlanError(f"no table {name!r} in catalog; registered: {self.list()}")
         return self._tables[name]
 
     def list(self) -> list[str]:
-        """The sorted names of all registered tables."""
+        """The sorted names of all registered tables.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = s.register("b", bt.from_pydict({"x": [2]}))
+                >>> _ = s.register("a", bt.from_pydict({"x": [1]}))
+                >>> s.list()
+                ['a', 'b']
+        """
         return sorted(self._tables)
 
     def drop(self, name: str) -> None:
-        """Remove table `name` from the catalog (no error if absent)."""
+        """Remove table `name` from the catalog (no error if absent).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = s.register("a", bt.from_pydict({"x": [1]}))
+                >>> _ = s.register("b", bt.from_pydict({"x": [2]}))
+                >>> s.drop("a")
+                >>> s.list()
+                ['b']
+        """
         self._tables.pop(name, None)
 
     def clear(self) -> None:
-        """Remove every registered table (registered functions and dialect are kept)."""
+        """Remove every registered table (registered functions and dialect are kept).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = s.register("t", bt.from_pydict({"x": [1, 2, 3]}))
+                >>> s.clear()
+                >>> s.list()
+                []
+        """
         self._tables.clear()
 
     # --- functions ---------------------------------------------------------
@@ -159,6 +212,17 @@ class Session:
             output_columns: Table-function result column names.
             batch_format: Table form `map_batches` batch format.
             **config: Extra `map_batches` keyword arguments (table form).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow.compute as pc
+                >>> s = bt.Session()
+                >>> _ = s.register("t", bt.from_pydict({"x": [1, 2, 3]}))
+                >>> s.register_function("dbl", lambda a: pc.multiply(a, 2), result_type="int64")
+                >>> s.sql("SELECT dbl(x) AS y FROM t").to_pydict()
+                {'y': [2, 4, 6]}
         """
         if table:
             config = {"batch_format": batch_format, **config}
@@ -174,7 +238,18 @@ class Session:
         )
 
     def list_functions(self) -> list[str]:
-        """The sorted names of all registered functions."""
+        """The sorted names of all registered functions.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow.compute as pc
+                >>> s = bt.Session()
+                >>> s.register_function("dbl", lambda a: pc.multiply(a, 2), result_type="int64")
+                >>> s.list_functions()
+                ['dbl']
+        """
         return sorted(self._functions)
 
     # --- execution ---------------------------------------------------------
@@ -192,6 +267,15 @@ class Session:
 
         Returns:
             A lazy `Dataset` of the result (the registered relation for DDL).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = s.register("nums", bt.from_pydict({"v": [1, 2, 3]}))
+                >>> s.sql("SELECT SUM(v) AS total FROM nums").to_pydict()
+                {'total': [6]}
         """
         return self._run(query, tables)
 

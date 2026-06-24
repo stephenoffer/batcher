@@ -43,7 +43,22 @@ class DatasetSCD:
 
     def type1(self, target: str, *, keys: str | list[str], **opts) -> WriteManifest:
         """SCD type 1 — overwrite changed attributes in place (no history). A keyed
-        upsert into `target` (delegates to `ds.write.merge`)."""
+        upsert into `target` (delegates to `ds.write.merge`).
+
+        Examples:
+            .. doctest::
+
+                >>> import os
+                >>> import tempfile
+
+                >>> import batcher as bt
+                >>> target = os.path.join(tempfile.mkdtemp(), "dim.parquet")
+                >>> base = bt.from_pydict({"id": [1, 2], "city": ["NYC", "LA"]})
+                >>> _ = base.write.parquet(target)
+                >>> _ = bt.from_pydict({"id": [2], "city": ["SF"]}).scd.type1(target, keys="id")
+                >>> bt.read.parquet(target).sort("id").to_pydict()
+                {'id': [1, 2], 'city': ['NYC', 'SF']}
+        """
         return self._ds.write.merge(target, on=keys, when_matched="update", **opts)
 
     def type2(
@@ -66,6 +81,21 @@ class DatasetSCD:
         appended (``valid_from = as_of``, ``valid_to = NULL``, ``is_current = True``).
         Brand-new keys are inserted as a first version; unchanged keys are untouched.
         `as_of` is the effective timestamp (e.g. the batch date), stored as a string.
+
+        Examples:
+            .. doctest::
+
+                >>> import os
+                >>> import tempfile
+
+                >>> import batcher as bt
+                >>> target = os.path.join(tempfile.mkdtemp(), "dim.parquet")
+                >>> v1 = bt.from_pydict({"id": [1], "city": ["NYC"]})
+                >>> _ = v1.scd.type2(target, keys="id", track=["city"], as_of="2024-01-01")
+                >>> v2 = bt.from_pydict({"id": [1], "city": ["LA"]})
+                >>> _ = v2.scd.type2(target, keys="id", track=["city"], as_of="2024-06-01")
+                >>> bt.read.parquet(target).sort("valid_from").to_pydict()
+                {'id': [1, 1], 'city': ['NYC', 'LA'], 'valid_from': ['2024-01-01', '2024-06-01'], 'valid_to': ['2024-06-01', None], 'is_current': [False, True]}
         """
         from batcher.api.session import read as _read
         from batcher.io.detect import detect_format
@@ -122,7 +152,25 @@ class DatasetSCD:
         """SCD type 3 — keep the immediately previous value of each `track` attribute
         in a ``<attr>_prev`` column (limited history). For a matched key the existing
         current value moves to ``<attr>_prev`` and the incoming value becomes current;
-        new keys get NULL previous values; untouched target keys are preserved."""
+        new keys get NULL previous values; untouched target keys are preserved.
+
+        Examples:
+            .. doctest::
+
+                >>> import os
+                >>> import tempfile
+
+                >>> import batcher as bt
+                >>> target = os.path.join(tempfile.mkdtemp(), "dim.parquet")
+                >>> _ = bt.from_pydict({"id": [1], "city": ["NYC"]}).scd.type3(
+                ...     target, keys="id", track=["city"]
+                ... )
+                >>> _ = bt.from_pydict({"id": [1], "city": ["LA"]}).scd.type3(
+                ...     target, keys="id", track=["city"]
+                ... )
+                >>> bt.read.parquet(target).to_pydict()
+                {'id': [1], 'city': ['LA'], 'city_prev': ['NYC']}
+        """
         from batcher.api.session import read as _read
         from batcher.io.detect import detect_format
         from batcher.io.filesystem import resolve_filesystem

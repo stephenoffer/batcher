@@ -53,6 +53,18 @@ class GroupBy:
         Each keyword binds an output column name to an aggregate expression
         (`col("x").sum()`, `count()`, ...). The result columns are the group keys
         followed by the named aggregates.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict(
+                ...     {"dept": ["eng", "eng", "sales"], "salary": [100, 120, 90]}
+                ... )
+                >>> ds.group_by("dept").agg(
+                ...     total=bt.col("salary").sum(), n=bt.count()
+                ... ).sort("dept").to_pydict()
+                {'dept': ['eng', 'sales'], 'total': [220, 90], 'n': [2, 1]}
         """
         if not named:
             raise PlanError("agg() requires at least one named aggregate")

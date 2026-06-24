@@ -82,6 +82,12 @@ class Writer:
         * ``"append"`` — add to an existing table; only the transactional lakehouse
           sinks (`delta`/`iceberg`/`hudi`) support it (others raise).
 
+        ``replace_where=<predicate>`` is a dynamic partition/range overwrite (Delta
+        ``replaceWhere`` / the backfill pattern): atomically replace only the rows
+        matching the predicate and keep the rest. This is predicate-scoped, not
+        key-matched — for a key-matched upsert (update/insert by join key) use
+        `merge` instead.
+
         ``resume=True`` makes the write idempotent: output files already present
         (necessarily fully committed, since writes are atomic) are skipped, so a job
         re-run after a crash or spot preemption finishes only the unwritten shards —
@@ -222,7 +228,19 @@ class Writer:
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
-        """Stream each micro-batch to stdout (development sink)."""
+        """Stream each micro-batch to stdout (development sink).
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                stream = bt.read.json("events/", stream=True)
+                query = stream.write.console(
+                    num_rows=10, trigger=bt.Trigger.processing_time("5 seconds")
+                )
+                query.await_termination()
+        """
         from batcher.io.formats.streaming.sinks import ConsoleStreamSink
 
         return self._start_stream(
@@ -238,7 +256,18 @@ class Writer:
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
-        """Stream into an in-memory table queryable via ``bt.read_memory(name)``."""
+        """Stream into an in-memory table queryable via ``bt.read_memory(name)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> query = ds.write.memory("scratch")
+                >>> _ = query.await_termination()
+                >>> bt.read_memory("scratch").count()
+                3
+        """
         from batcher.io.formats.streaming.sinks import MemoryStreamSink
 
         return self._start_stream(
@@ -263,6 +292,19 @@ class Writer:
         The callback gets the whole Arrow table for the micro-batch — the sanctioned
         hook for custom upserts (``MERGE``/SCD), multi-sink fan-out, or any per-batch
         commit logic (the sink-side twin of `map_batches`).
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                def upsert(table, batch_id):
+                    print(f"batch {batch_id}: {table.num_rows} rows")
+                    table.to_pandas().to_sql("events", engine, if_exists="append")
+
+                stream = bt.read.json("events/", stream=True)
+                query = stream.write.for_each_batch(upsert)
+                query.await_termination()
         """
         from batcher.io.formats.streaming.sinks import ForeachBatchStreamSink
 
@@ -279,7 +321,20 @@ class Writer:
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
-        """Stream each row of each micro-batch into a user callback ``fn(row)``."""
+        """Stream each row of each micro-batch into a user callback ``fn(row)``.
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                def send(row):
+                    requests.post("https://example.com/ingest", json=row)
+
+                stream = bt.read.json("events/", stream=True)
+                query = stream.write.for_each(send)
+                query.await_termination()
+        """
         from batcher.io.formats.streaming.sinks import ForeachStreamSink
 
         return self._start_stream(
@@ -287,35 +342,117 @@ class Writer:
         )
 
     def parquet(self, path: str, *, compression: str = "zstd", **opts: Any) -> WriteManifest:
-        """Write as Parquet (see `__call__` for `partition_by`/`distributed`)."""
+        """Write as Parquet (see `__call__` for `partition_by`/`distributed`).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> out = os.path.join(tempfile.mkdtemp(), "t")
+                >>> _ = ds.write.parquet(out)
+                >>> bt.read.parquet(out).count()
+                3
+        """
         return self(path, "parquet", compression=compression, **opts)
 
     def csv(self, path: str, **opts: Any) -> WriteManifest:
-        """Write as CSV."""
+        """Write as CSV.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> out = os.path.join(tempfile.mkdtemp(), "t")
+                >>> _ = ds.write.csv(out)
+                >>> bt.read.csv(out).count()
+                3
+        """
         return self(path, "csv", **opts)
 
     def json(self, path: str, **opts: Any) -> WriteManifest:
-        """Write as newline-delimited JSON."""
+        """Write as newline-delimited JSON.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> out = os.path.join(tempfile.mkdtemp(), "t")
+                >>> _ = ds.write.json(out)
+                >>> bt.read.json(out).count()
+                3
+        """
         return self(path, "json", **opts)
 
     def orc(self, path: str, **opts: Any) -> WriteManifest:
-        """Write as ORC."""
+        """Write as ORC.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> out = os.path.join(tempfile.mkdtemp(), "t")
+                >>> _ = ds.write.orc(out)
+                >>> bt.read.orc(out).count()
+                3
+        """
         return self(path, "orc", **opts)
 
     def arrow(self, path: str, **opts: Any) -> WriteManifest:
-        """Write as Arrow/Feather IPC."""
+        """Write as Arrow/Feather IPC.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> out = os.path.join(tempfile.mkdtemp(), "t")
+                >>> _ = ds.write.arrow(out)
+                >>> bt.read.arrow(out).count()
+                3
+        """
         return self(path, "arrow", **opts)
 
     def avro(self, path: str, **opts: Any) -> WriteManifest:
-        """Write as Avro (needs ``batcher-engine[avro]``)."""
+        """Write as Avro (needs ``batcher-engine[avro]``).
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                ds = bt.from_pydict({"x": [1, 2, 3]})
+                ds.write.avro("data.avro")
+        """
         return self(path, "avro", **opts)
 
     def lance(self, path: str, **opts: Any) -> WriteManifest:
-        """Write a Lance dataset (needs ``batcher-engine[lance]``)."""
+        """Write a Lance dataset (needs ``batcher-engine[lance]``).
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                ds = bt.from_pydict({"x": [1, 2, 3]})
+                ds.write.lance("data.lance")
+        """
         return self(path, "lance", **opts)
 
     def msgpack(self, path: str, **opts: Any) -> WriteManifest:
-        """Write as MessagePack."""
+        """Write as MessagePack (needs ``batcher-engine[msgpack]``).
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                ds = bt.from_pydict({"x": [1, 2, 3]})
+                ds.write.msgpack("data.msgpack")
+        """
         return self(path, "msgpack", **opts)
 
     def merge(
@@ -338,6 +475,24 @@ class Writer:
 
         File merge is read-modify-write over the whole path — single-writer only; use a
         Delta target for concurrent writers.
+
+        Use `merge` for **key-matched upserts** (reconcile rows by `on`). For replacing
+        a known slice of a partitioned table wholesale — a backfill or idempotent
+        partition reload — use ``write(path, replace_where=<predicate>)`` instead, which
+        overwrites every row matching the predicate regardless of keys.
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                updates = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
+                updates.write.merge(
+                    "warehouse/orders",
+                    on="id",
+                    when_matched="update",
+                    when_not_matched="insert",
+                )
         """
         from batcher.api.merge import execute_merge
 
@@ -367,6 +522,14 @@ class Writer:
         matched rows are updated and new rows inserted (Spark/Delta ``MERGE``). The
         keys build the match predicate; pass `merge_predicate=` instead for a custom
         one. Otherwise `mode` is ``"append"`` (default) or ``"overwrite"``.
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
+                ds.write.delta("warehouse/orders", merge_on="id")
         """
         if merge_on is not None:
             from batcher.api.merge import merge_predicate_for
@@ -375,22 +538,67 @@ class Writer:
         return self(uri, "delta", mode=mode, **opts)
 
     def iceberg(self, identifier: str, *, mode: str = "append", **opts: Any) -> WriteManifest:
-        """Write to an Iceberg table (``mode="append"|"overwrite"``)."""
+        """Write to an Iceberg table (``mode="append"|"overwrite"``).
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
+                ds.write.iceberg("db.orders", mode="append")
+        """
         return self(identifier, "iceberg", mode=mode, **opts)
 
     def hudi(self, table_uri: str, *, mode: str = "append", **opts: Any) -> WriteManifest:
-        """Write to an Apache Hudi table (``mode="append"|"overwrite"``)."""
+        """Write to an Apache Hudi table (``mode="append"|"overwrite"``).
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
+                ds.write.hudi("s3://lake/orders", mode="append")
+        """
         return self(table_uri, "hudi", mode=mode, **opts)
 
     # --- SQL / warehouses --------------------------------------------------
     def sql(self, table: str, **opts: Any) -> WriteManifest:
-        """Write to a database table via ADBC/FlightSQL."""
+        """Write to a database table via ADBC/FlightSQL.
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
+                ds.write.sql("orders", uri="postgresql://localhost/warehouse")
+        """
         return self(table, "adbc", **opts)
 
     def snowflake(self, table: str, **opts: Any) -> WriteManifest:
-        """Write to a Snowflake table."""
+        """Write to a Snowflake table.
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
+                ds.write.snowflake("ORDERS", account="acct", warehouse="WH", database="DB")
+        """
         return self(table, "snowflake", **opts)
 
     def mongo(self, collection: str, **opts: Any) -> WriteManifest:
-        """Write to a MongoDB collection."""
+        """Write to a MongoDB collection.
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
+                ds.write.mongo("orders", uri="mongodb://localhost:27017", database="shop")
+        """
         return self(collection, "mongo", **opts)

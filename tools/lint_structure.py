@@ -92,6 +92,12 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # every public constructor now carries a runnable `.. doctest::` example, which is
     # what pushes it over — the bodies stay thin.
     "python/batcher/api/session.py": "session/constructor façade; per-constructor runnable examples push it over",
+    # The IO reader/writer namespaces: one method per format/connector, each now
+    # carrying a usage example (runnable for local file formats, illustrative for
+    # service-backed sinks/sources). The examples, not the thin dispatch bodies, push
+    # these over; they are one cohesive `bt.read` / `ds.write` façade.
+    "python/batcher/api/io_namespace/reader.py": "bt.read façade; per-format examples push it over",
+    "python/batcher/api/io_namespace/writer.py": "ds.write façade; per-format examples push it over",
 }
 
 fails: list[str] = []
