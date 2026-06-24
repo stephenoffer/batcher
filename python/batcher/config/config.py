@@ -48,6 +48,13 @@ class ExecutionConfig:
     The engine's unit of work is a morsel — a small `RecordBatch` sized to fit cache
     so scheduling stays granular and cache-friendly. These defaults saturate every
     core without tuning; the per-field reference is in the configuration guide.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import ExecutionConfig
+            >>> ExecutionConfig().morsel_rows
+            16384
     """
 
     # 0 means "use all available cores".
@@ -73,7 +80,13 @@ class ExecutionConfig:
     # project, write, CPU-only preprocessing). Below 1.0 so such tasks pack more than
     # one per core — they wait on IO/decode rather than saturating a core. Affects the
     # distributed (Ray) path only; single-node uses the rayon pool (`parallelism`).
+    # This is the per-operator-kind *cold-start* prior; once a query has run, Kyber
+    # overrides it with the measured CPU utilization of each operator family.
     cpu_share_io: float = 0.5
+    # Floor for the adaptive per-task CPU share. A learned utilization below this
+    # still requests this many cores, so an IO-bound stage never asks for an
+    # unschedulable sliver of a CPU (mirrors the GPU fraction's 0.25 floor).
+    cpu_share_min: float = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +96,13 @@ class MemoryConfig:
     Carbonite keeps per-node memory bounded against these limits: it throttles at the
     soft limit and spills aggregating, joining, and sorting operators to disk before
     the hard limit, so a large query stays alive instead of running out of memory.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import MemoryConfig
+            >>> MemoryConfig().soft_limit
+            0.85
     """
 
     soft_limit: float = 0.85  # throttle at 85% of the envelope
@@ -123,6 +143,13 @@ class FlowControlConfig:
     so a fast stage cannot flood a slow one and blow up memory. The credit window
     adapts with an AIMD loop (like TCP). Tune these only for unusual cluster shapes;
     the per-field reference is in the configuration guide.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import FlowControlConfig
+            >>> FlowControlConfig().default_credits
+            4
     """
 
     # Credit window (in-flight RecordBatch slots) when the operator has no estimate.
@@ -151,7 +178,15 @@ class FlowControlConfig:
 @dataclass(frozen=True, slots=True)
 class CardinalityConfig:
     """Selinger-style defaults the cardinality estimator falls back to before
-    anything is learned. Superseded by learned/sketch values when present."""
+    anything is learned. Superseded by learned/sketch values when present.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import CardinalityConfig
+            >>> CardinalityConfig().eq_selectivity
+            0.1
+    """
 
     # Used when a source's size is unknown (e.g. CSV): large enough that an unknown
     # side is never preferred as the (smaller) build side.
@@ -198,6 +233,13 @@ class OptimizerConfig:
     to a table count, greedy beyond it), how it estimates cost and row counts from
     learned statistics and sketches, and when a measured estimate is wrong enough to
     trigger re-optimization mid-query. Defaults suit most workloads.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import OptimizerConfig
+            >>> OptimizerConfig().join_dp_max_tables
+            12
     """
 
     join_dp_max_tables: int = 12  # DP-CCP exact threshold
@@ -218,6 +260,13 @@ class OptimizerConfig:
     target_bytes_per_task: int = 256 * 1024 * 1024  # 256 MiB
     fixpoint_iterations: int = 8  # max rewrite-phase iterations before bailing
     row_bytes: int = 64  # per-row footprint for the memory-budgeting estimate
+    # Build-side byte threshold below which a join is broadcast (the right side is
+    # replicated to every worker) rather than shuffled — Spark's
+    # autoBroadcastJoinThreshold. Both the planner's *estimate*-based decision and the
+    # distributed executor's *runtime* guard read this one value: if the materialized
+    # build side actually exceeds it (the estimate was wrong), the executor falls back
+    # to a shuffle join instead of OOMing the driver by replicating an over-large side.
+    broadcast_max_bytes: int = 10 * 1024 * 1024  # 10 MiB
     learning_smoothing_alpha: float = 0.5  # exp-smoothing toward new observations
     # Cost-model calibration from measured op_stats: a kind needs at least this many
     # samples before its coefficient is calibrated (else the default constant stands),
@@ -238,7 +287,15 @@ class PIDConfig:
     latency error that grows/shrinks the per-batch row count toward a target
     latency. Implemented identically in `bc-udf::BatchSizeController` (data plane)
     and `ml.inference._LatencyController` (Python); shipped to Rust as `EngineConfig`
-    so the two never drift."""
+    so the two never drift.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import PIDConfig
+            >>> PIDConfig().kp
+            0.4
+    """
 
     kp: float = 0.4
     ki: float = 0.05
@@ -255,6 +312,13 @@ class MetadataConfig:
     the `MetadataHub`; Kyber reads them back to plan better next time. This selects
     the backend (in-process, SQLite, Redis, object storage) and how quickly old
     observations decay, so plans keep improving as a query is re-run.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import MetadataConfig
+            >>> MetadataConfig().backend
+            'in_process'
     """
 
     backend: str = "in_process"  # "in_process" | "sqlite" | "redis" | "object_storage"
@@ -390,6 +454,13 @@ class Config:
     vars > a JSON file at ``BATCHER_CONFIG_FILE`` > the defaults below. The env and
     file layers are read once at import; `set_config` / `config_context` override
     them at runtime.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import Config
+            >>> Config().execution.morsel_rows
+            16384
     """
 
     execution: ExecutionConfig = ExecutionConfig()
@@ -563,6 +634,15 @@ def set_config(config: Config) -> None:
 
     Validates `config` first, so a bad tunable raises `ConfigError` here rather than
     surfacing later as a confusing runtime failure.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import Config, ExecutionConfig, active_config, set_config
+            >>> set_config(Config().replace(execution=ExecutionConfig(morsel_rows=4096)))
+            >>> active_config().execution.morsel_rows
+            4096
+            >>> set_config(Config())  # restore defaults
     """
     _active.set(config.validate())
 
@@ -572,6 +652,17 @@ def config_context(config: Config) -> Iterator[Config]:
     """Temporarily activate `config` for the duration of the `with` block.
 
     Validates `config` on entry (raises `ConfigError` on a bad value).
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import Config, ExecutionConfig, active_config, config_context
+            >>> cfg = Config().replace(execution=ExecutionConfig(morsel_rows=4096))
+            >>> with config_context(cfg):
+            ...     active_config().execution.morsel_rows
+            4096
+            >>> active_config().execution.morsel_rows
+            16384
     """
     token = _active.set(config.validate())
     try:

@@ -19,6 +19,14 @@ def concat(*exprs: IntoExpr) -> Expr:
     Each argument is cast to text; NULLs are treated as the empty string (DuckDB
     semantics), so ``concat("a", lit(None), "b")`` is ``"ab"`` — unlike the raw
     ``a || b`` operator, which propagates NULL. Requires at least one argument.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": ["x", "y"], "b": ["1", "2"]})
+            >>> ds.select(c=bt.concat(bt.col("a"), bt.col("b"))).to_pydict()
+            {'c': ['x1', 'y2']}
     """
     if not exprs:
         raise PlanError("concat() requires at least one argument")
@@ -36,6 +44,14 @@ def concat_ws(separator: str, *exprs: IntoExpr) -> Expr:
     NULL arguments are skipped entirely — no doubled separator — matching DuckDB:
     ``concat_ws(",", "a", lit(None), "b")`` is ``"a,b"``. Each argument is cast to
     text. Requires at least one value argument.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": ["x", "y"], "b": ["1", "2"]})
+            >>> ds.select(c=bt.concat_ws("-", bt.col("a"), bt.col("b"))).to_pydict()
+            {'c': ['x-1', 'y-2']}
     """
     if not exprs:
         raise PlanError("concat_ws() requires at least one value argument")
@@ -51,6 +67,14 @@ def format_string(format: str, *exprs: IntoExpr) -> Expr:
     number of ``{}`` placeholders must equal the number of arguments. Values are cast
     to text with the same NULL-as-empty rule as :func:`concat`. The placeholder is the
     literal two-character ``{}`` (no printf width/precision — keep formatting in SQL).
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": ["x", "y"], "b": ["1", "2"]})
+            >>> ds.select(c=bt.format_string("{}={}", bt.col("a"), bt.col("b"))).to_pydict()
+            {'c': ['x=1', 'y=2']}
     """
     chunks = format.split("{}")
     if len(chunks) - 1 != len(exprs):

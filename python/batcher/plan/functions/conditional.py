@@ -14,6 +14,14 @@ def iff(condition: Expr, if_true: IntoExpr, if_false: IntoExpr) -> Expr:
     """``if_true`` where `condition` is true, else ``if_false`` (DuckDB ``IF``/``IFF``).
 
     The two-branch shorthand for ``when(condition).then(if_true).otherwise(if_false)``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [-1, 2]})
+            >>> ds.select(s=bt.iff(bt.col("x") > 0, bt.lit("pos"), bt.lit("neg"))).to_pydict()
+            {'s': ['neg', 'pos']}
     """
     return when(condition).then(_wrap(if_true)).otherwise(_wrap(if_false))
 
@@ -23,6 +31,14 @@ def nanvl(value: IntoExpr, fallback: IntoExpr) -> Expr:
 
     Distinct from :func:`ifnull` — this replaces IEEE NaN, not NULL. A NULL `value`
     passes through unchanged (NULL is not NaN).
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1.0, float("nan")]})
+            >>> ds.select(r=bt.nanvl(bt.col("x"), bt.lit(0.0))).to_pydict()
+            {'r': [1.0, 0.0]}
     """
     v = _wrap(value)
     return when(v.is_nan()).then(_wrap(fallback)).otherwise(v)
@@ -32,5 +48,13 @@ def ifnull(value: IntoExpr, fallback: IntoExpr) -> Expr:
     """`value` unless it is NULL, in which case `fallback` (DuckDB ``ifnull``).
 
     The two-argument spelling of `coalesce`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, None]})
+            >>> ds.select(r=bt.ifnull(bt.col("x"), bt.lit(0))).to_pydict()
+            {'r': [1, 0]}
     """
     return Coalesce([_wrap(value), _wrap(fallback)])

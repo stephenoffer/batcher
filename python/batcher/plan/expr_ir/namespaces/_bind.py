@@ -20,19 +20,125 @@ from batcher.plan.expr_ir.core import Expr
 # do not edit without re-checking behavior.
 _DESCRIPTIONS: dict[str, str] = {
     # --- .str string→string transforms (null → null) ------------------------
-    "upper": "The string with every letter uppercased.",
-    "lower": "The string with every letter lowercased.",
+    "upper": (
+        "The string with every letter uppercased.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"s": ["Hello"]})\n'
+        '        >>> ds.select(r=bt.col("s").str.upper()).to_pydict()\n'
+        "        {'r': ['HELLO']}"
+    ),
+    "lower": (
+        "The string with every letter lowercased.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"s": ["Hello"]})\n'
+        '        >>> ds.select(r=bt.col("s").str.lower()).to_pydict()\n'
+        "        {'r': ['hello']}"
+    ),
     # --- .dt date/time field extraction (all → Int64 unless noted) ----------
-    "year": "The year component, e.g. 2021.",
-    "month": "The month-of-year component, 1-12.",
-    "day": "The day-of-month component, 1-31.",
-    "hour": "The hour-of-day component, 0-23.",
-    "minute": "The minute-of-hour component, 0-59.",
-    "second": "The second-of-minute component, 0-59.",
-    "quarter": "The calendar quarter, 1-4.",
-    "week": "The ISO 8601 week number, 1-53.",
-    "dayofweek": "The day of week, Sunday = 0 through Saturday = 6.",
-    "dayofyear": "The day of year, 1 through 366.",
+    "year": (
+        "The year component, e.g. 2021.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.year()).to_pydict()\n'
+        "        {'r': [2024]}"
+    ),
+    "month": (
+        "The month-of-year component, 1-12.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.month()).to_pydict()\n'
+        "        {'r': [2]}"
+    ),
+    "day": (
+        "The day-of-month component, 1-31.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.day()).to_pydict()\n'
+        "        {'r': [15]}"
+    ),
+    "hour": (
+        "The hour-of-day component, 0-23.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.hour()).to_pydict()\n'
+        "        {'r': [13]}"
+    ),
+    "minute": (
+        "The minute-of-hour component, 0-59.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.minute()).to_pydict()\n'
+        "        {'r': [45]}"
+    ),
+    "second": (
+        "The second-of-minute component, 0-59.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.second()).to_pydict()\n'
+        "        {'r': [30]}"
+    ),
+    "quarter": (
+        "The calendar quarter, 1-4.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.quarter()).to_pydict()\n'
+        "        {'r': [1]}"
+    ),
+    "week": (
+        "The ISO 8601 week number, 1-53.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.week()).to_pydict()\n'
+        "        {'r': [7]}"
+    ),
+    "dayofweek": (
+        "The day of week, Sunday = 0 through Saturday = 6.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.dayofweek()).to_pydict()\n'
+        "        {'r': [4]}"
+    ),
+    "dayofyear": (
+        "The day of year, 1 through 366.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.dayofyear()).to_pydict()\n'
+        "        {'r': [46]}"
+    ),
     "epoch": (
         "Seconds since the Unix epoch, 1970-01-01 00:00:00 UTC (→ Int64).\n\n"
         "Examples:\n"
@@ -43,29 +149,196 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(bt.col("d").dt.epoch().alias("r")).to_pydict()\n'
         "        {'r': [1615815930]}"
     ),
-    "dayname": 'The full English weekday name, e.g. "Monday" (→ Utf8).',
-    "monthname": 'The full English month name, e.g. "January" (→ Utf8).',
-    "isodow": "The ISO day of week, Monday = 1 through Sunday = 7.",
-    "century": "The century, e.g. 2021 → 21.",
-    "decade": "The decade, e.g. 2021 → 202.",
-    "millennium": "The millennium, e.g. 2021 → 3.",
-    "last_day": "The last day of the month at 00:00:00 (→ Timestamp).",
+    "dayname": (
+        'The full English weekday name, e.g. "Monday" (→ Utf8).\n\n'
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.dayname()).to_pydict()\n'
+        "        {'r': ['Thursday']}"
+    ),
+    "monthname": (
+        'The full English month name, e.g. "January" (→ Utf8).\n\n'
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.monthname()).to_pydict()\n'
+        "        {'r': ['February']}"
+    ),
+    "isodow": (
+        "The ISO day of week, Monday = 1 through Sunday = 7.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.isodow()).to_pydict()\n'
+        "        {'r': [4]}"
+    ),
+    "century": (
+        "The century, e.g. 2021 → 21.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.century()).to_pydict()\n'
+        "        {'r': [21]}"
+    ),
+    "decade": (
+        "The decade, e.g. 2021 → 202.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.decade()).to_pydict()\n'
+        "        {'r': [202]}"
+    ),
+    "millennium": (
+        "The millennium, e.g. 2021 → 3.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.millennium()).to_pydict()\n'
+        "        {'r': [3]}"
+    ),
+    "last_day": (
+        "The last day of the month at 00:00:00 (→ Timestamp).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        "        >>> import datetime as dt\n"
+        '        >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})\n'
+        '        >>> ds.select(r=bt.col("d").dt.last_day()).to_pydict()\n'
+        "        {'r': [datetime.datetime(2024, 2, 29, 0, 0)]}"
+    ),
     # --- .list per-row reductions over each list value ----------------------
     # The reductions return null on an empty or null list; len/n_unique return 0
     # for an empty list and null for a null list.
-    "len": "The number of elements in each list (→ Int64).",
-    "sum": "The sum of the elements of each list.",
-    "min": "The smallest element of each list.",
-    "max": "The largest element of each list.",
-    "mean": "The arithmetic mean of the elements of each list (→ Float64).",
-    "n_unique": "The count of distinct elements in each list (→ Int64).",
-    "sort": "Each list sorted ascending (→ list).",
-    "product": "The product of the elements of each list.",
-    "std": "The sample standard deviation of the elements of each list (→ Float64).",
-    "var": "The sample variance of the elements of each list (→ Float64).",
-    "unique": "The distinct elements of each list, first-seen order preserved (→ list).",
-    "median": "The median of the elements of each list (→ Float64).",
-    "arg_min": "The 0-based index of the smallest element of each list (→ Int64).",
+    "len": (
+        "The number of elements in each list (→ Int64).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[3, 1, 2]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.len()).to_pydict()\n'
+        "        {'r': [3]}"
+    ),
+    "sum": (
+        "The sum of the elements of each list.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.sum()).to_pydict()\n'
+        "        {'r': [6.0]}"
+    ),
+    "min": (
+        "The smallest element of each list.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[3, 1, 2]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.min()).to_pydict()\n'
+        "        {'r': [1.0]}"
+    ),
+    "max": (
+        "The largest element of each list.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[3, 1, 2]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.max()).to_pydict()\n'
+        "        {'r': [3.0]}"
+    ),
+    "mean": (
+        "The arithmetic mean of the elements of each list (→ Float64).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.mean()).to_pydict()\n'
+        "        {'r': [2.0]}"
+    ),
+    "n_unique": (
+        "The count of distinct elements in each list (→ Int64).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 2, 3]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.n_unique()).to_pydict()\n'
+        "        {'r': [3]}"
+    ),
+    "sort": (
+        "Each list sorted ascending (→ list).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[3, 1, 2]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.sort()).to_pydict()\n'
+        "        {'r': [[1, 2, 3]]}"
+    ),
+    "product": (
+        "The product of the elements of each list.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3, 4]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.product()).to_pydict()\n'
+        "        {'r': [24.0]}"
+    ),
+    "std": (
+        "The sample standard deviation of the elements of each list (→ Float64).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.std()).to_pydict()\n'
+        "        {'r': [1.0]}"
+    ),
+    "var": (
+        "The sample variance of the elements of each list (→ Float64).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.var()).to_pydict()\n'
+        "        {'r': [1.0]}"
+    ),
+    "unique": (
+        "The distinct elements of each list, first-seen order preserved (→ list).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 2, 3]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.unique()).to_pydict()\n'
+        "        {'r': [[1, 2, 3]]}"
+    ),
+    "median": (
+        "The median of the elements of each list (→ Float64).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3, 4]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.median()).to_pydict()\n'
+        "        {'r': [2.5]}"
+    ),
+    "arg_min": (
+        "The 0-based index of the smallest element of each list (→ Int64).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[3, 1, 2]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.arg_min()).to_pydict()\n'
+        "        {'r': [1]}"
+    ),
     "arg_max": (
         "The 0-based index of the largest element of each list (→ Int64).\n\n"
         "Ties take the first occurrence.\n\n"
@@ -76,8 +349,24 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(bt.col("a").list.arg_max().alias("r")).to_pydict()\n'
         "        {'r': [2]}"
     ),
-    "l2_norm": "The Euclidean norm, sqrt(sum of squares), of each list (→ Float64).",
-    "normalize": "Each list L2-normalized to unit length (→ list); embedding prep.",
+    "l2_norm": (
+        "The Euclidean norm, sqrt(sum of squares), of each list (→ Float64).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[3.0, 4.0]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.l2_norm()).to_pydict()\n'
+        "        {'r': [5.0]}"
+    ),
+    "normalize": (
+        "Each list L2-normalized to unit length (→ list); embedding prep.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[3.0, 4.0]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.normalize()).to_pydict()\n'
+        "        {'r': [[0.6, 0.8]]}"
+    ),
     # `reverse` is shared by .str (reverse characters) and .list (reverse order);
     # the per-family fallback disambiguates it, so it is intentionally omitted here.
 }

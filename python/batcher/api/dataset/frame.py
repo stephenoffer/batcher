@@ -137,7 +137,15 @@ class Dataset:
     # --- introspection -----------------------------------------------------
     @property
     def columns(self) -> list[str]:
-        """The output column names of the current plan."""
+        """The output column names of the current plan.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"a": [1], "b": [2]}).columns
+                ['a', 'b']
+        """
         return self._plan.available_columns()
 
     @property
@@ -146,6 +154,13 @@ class Dataset:
 
         A streaming dataset cannot be `collect()`-ed (it would never finish); consume
         it incrementally with `iter_batches()` or write it to a sink instead.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3]}).is_streaming
+                False
         """
         from batcher.io.source import is_bounded
 
@@ -245,6 +260,14 @@ class Dataset:
         watermark bounds state: once it passes a window's end, that window is emitted
         and evicted, and rows older than the watermark are dropped as late. Carried
         through to the next ``group_by(window(...)).agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"ts": [1, 2, 3], "v": [1, 2, 3]})
+                >>> ds.with_watermark("ts", "10m").columns
+                ['ts', 'v']
         """
         from batcher.plan.functions.temporal import _duration_micros
 
@@ -285,6 +308,14 @@ class Dataset:
         Positional args are column names (strings), bare ``col(...)`` references, or
         aliased expressions (``expr.alias("name")``); keyword args bind a new name to
         an expression: ``ds.select("id", total=col("price") * col("qty"))``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3], "g": ["a", "b", "a"]})
+                >>> ds.select("x", y=bt.col("x") * 2).to_pydict()
+                {'x': [1, 2, 3], 'y': [2, 4, 6]}
         """
         items: list[Projection] = []
         for c in columns:
@@ -313,6 +344,14 @@ class Dataset:
         ``agg.over(...)`` (e.g. ``with_columns(total=col("x").sum().over(partition_by=["g"]))``),
         which append windowed columns. Mixing window and non-window values in one call
         is not supported — use separate calls.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.with_columns(y=bt.col("x") + 1).to_pydict()
+                {'x': [1, 2, 3], 'y': [2, 3, 4]}
         """
         if not named:
             raise PlanError("with_columns() requires at least one named column")
@@ -346,6 +385,14 @@ class Dataset:
 
         `descending`/`nulls_first` are either a single bool applied to all keys or
         a list matching the number of keys.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [3, 1, 2]})
+                >>> ds.sort("x", descending=True).to_pydict()
+                {'x': [3, 2, 1]}
         """
         if not by:
             raise PlanError("sort() requires at least one key")
@@ -379,6 +426,14 @@ class Dataset:
         end)`` pair of signed row offsets (negative = preceding, ``0`` = current,
         positive = following, ``None`` = unbounded), so ``frame=(-2, 0)`` is a
         trailing 3-row window.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "v": [1, 2, 3]})
+                >>> ds.window(partition_by=["g"], functions={"s": ("sum", "v")}).to_pydict()
+                {'g': ['a', 'a', 'b'], 'v': [1, 2, 3], 's': [3, 3, 3]}
         """
         return build_window(
             self,
@@ -391,7 +446,16 @@ class Dataset:
     @property
     def ml(self) -> DatasetML:
         """ML/multimodal accessor: batch `infer`/`embed`/`map_batches` with GPU and
-        actor-pool scheduling (`ds.ml.infer(model, num_gpus=1, concurrency=4)`)."""
+        actor-pool scheduling (`ds.ml.infer(model, num_gpus=1, concurrency=4)`).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.ml.map(lambda r: {"x": r["x"] * 10}).to_pydict()
+                {'x': [10, 20, 30]}
+        """
         return DatasetML(self)
 
     @property
@@ -400,14 +464,32 @@ class Dataset:
         (`not_null`/`unique`/`in_range`/`matches`/`accepted_values`/`check`) then
         `fail()` (raise), `drop()` (keep valid), `quarantine()` (split valid/rejected),
         or `validate()` (counts). E.g.
-        ``ds.dq.not_null("id").unique(["id"]).in_range("age", 0, 120).quarantine()``."""
+        ``ds.dq.not_null("id").unique(["id"]).in_range("age", 0, 120).quarantine()``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1, 2, 3], "age": [30, 200, -5]})
+                >>> ds.dq.in_range("age", 0, 120).drop().to_pydict()
+                {'id': [1], 'age': [30]}
+        """
         return DatasetDQ(self)
 
     @property
     def scd(self) -> DatasetSCD:
         """Slowly-changing-dimension accessor: upsert this incoming snapshot into a
         target as `scd.type1` (overwrite), `scd.type2` (effective-dated history), or
-        `scd.type3` (previous-value column)."""
+        `scd.type3` (previous-value column).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1], "v": ["a"]})
+                >>> hasattr(ds.scd, "type2")
+                True
+        """
         return DatasetSCD(self)
 
     def map_batches(
@@ -420,9 +502,22 @@ class Dataset:
         num_gpus: float = 0.0,
         concurrency: int | None = None,
         batch_format: str = "pyarrow",
+        multiprocessing: bool = False,
     ) -> Dataset:
         """Apply a Python function to each batch — `ds.ml.map_batches`, kept
-        top-level for the familiar spelling (see `ds.ml` for the full ML surface)."""
+        top-level for the familiar spelling (see `ds.ml` for the full ML surface).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow.compute as pc
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> def add_one(batch):
+                ...     return batch.set_column(0, "x", pc.add(batch.column("x"), 1))
+                >>> ds.map_batches(add_one).to_pydict()
+                {'x': [2, 3, 4]}
+        """
         return self.ml.map_batches(
             fn,
             batch_size=batch_size,
@@ -431,16 +526,35 @@ class Dataset:
             num_gpus=num_gpus,
             concurrency=concurrency,
             batch_format=batch_format,
+            multiprocessing=multiprocessing,
         )
 
     def map(self, fn: Callable, *, output_columns: list[str] | None = None) -> Dataset:
         """Apply a per-row function ``fn(row) -> row`` (Ray Data ``map``) — sugar for
-        `ds.ml.map`. Prefer `map_batches` (vectorized) when you can; see `ds.ml`."""
+        `ds.ml.map`. Prefer `map_batches` (vectorized) when you can; see `ds.ml`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.map(lambda row: {"x": row["x"] * 2}).to_pydict()
+                {'x': [2, 4, 6]}
+        """
         return self.ml.map(fn, output_columns=output_columns)
 
     def flat_map(self, fn: Callable, *, output_columns: list[str] | None = None) -> Dataset:
         """Apply a per-row function ``fn(row) -> iterable[row]`` and flatten (Ray Data
-        ``flat_map``) — sugar for `ds.ml.flat_map`; see `ds.ml`."""
+        ``flat_map``) — sugar for `ds.ml.flat_map`; see `ds.ml`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2]})
+                >>> ds.flat_map(lambda row: [{"x": row["x"]}, {"x": row["x"]}]).to_pydict()
+                {'x': [1, 1, 2, 2]}
+        """
         return self.ml.flat_map(fn, output_columns=output_columns)
 
     def sql(self, query: str, *, table_name: str = "self", dialect: str | None = None) -> Dataset:
@@ -485,6 +599,14 @@ class Dataset:
 
         Returns:
             A new `Dataset` with the column added or replaced.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.with_column("y", bt.col("x") * 10).to_pydict()
+                {'x': [1, 2, 3], 'y': [10, 20, 30]}
         """
         return self.with_columns(**{name: expr})
 
@@ -521,7 +643,16 @@ class Dataset:
 
     def rename(self, mapping: dict[str, str] | None = None, **renames: str) -> Dataset:
         """Rename columns, preserving order. Pass a ``{old: new}`` dict or kwargs
-        (``rename(old="new")``); a dict and kwargs may be combined."""
+        (``rename(old="new")``); a dict and kwargs may be combined.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1], "b": [2]})
+                >>> ds.rename(a="x").to_pydict()
+                {'x': [1], 'b': [2]}
+        """
         merged = {**(mapping or {}), **renames}
         available = self._plan.available_columns()
         missing = set(merged) - set(available)
@@ -544,6 +675,14 @@ class Dataset:
         `order_by` order (required for first/last); `keep="any"` keeps an arbitrary
         deterministic row. Lowers to ``row_number() OVER (PARTITION BY subset
         ORDER BY ...)`` + filter — no new IR.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 1, 2, 2, 3]})
+                >>> ds.distinct().sort("x").to_pydict()
+                {'x': [1, 2, 3]}
         """
         if subset is None:
             return self._derive(Distinct(self._plan))
@@ -563,6 +702,14 @@ class Dataset:
         neither with only `by` to Hive-partition by column(s). `by` may combine with
         a sizing option. ``ds.repartition(target_size_mb=128).write("out/")``;
         ``ds.repartition(by="dt").write("out/")``. See `bt.compact` for in-place use.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.repartition(num_files=2).to_pydict()
+                {'x': [1, 2, 3]}
         """
         if num_files is not None and target_size_mb is not None:
             raise PlanError("repartition(): pass num_files or target_size_mb, not both")
@@ -579,7 +726,16 @@ class Dataset:
     def value_counts(self, column: str, *, name: str = "count", sort: bool = True) -> Dataset:
         """Count occurrences of each distinct value of `column` (pandas/Polars
         ``value_counts``). Returns ``[column, name]``, sorted by count descending
-        unless `sort=False`. Sugar over ``group_by(column).agg(count())``."""
+        unless `sort=False`. Sugar over ``group_by(column).agg(count())``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"c": ["a", "a", "b"]})
+                >>> ds.value_counts("c").to_pydict()
+                {'c': ['a', 'b'], 'count': [2, 1]}
+        """
         from batcher.api.functions import count
 
         out = self.group_by(column).agg(**{name: count()})
@@ -593,6 +749,14 @@ class Dataset:
         count / null_count / mean / std / min / the requested `percentiles` (default
         quartiles) / max; non-numeric columns report count and null_count only.
         Composes the already-tested aggregates — no per-row work in Python.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
+                >>> ds.describe().columns
+                ['statistic', 'x']
         """
         from batcher.api.dataset._describe import describe
 
@@ -603,6 +767,14 @@ class Dataset:
 
         Lazy: lowers to a single global aggregate and a `select`, so it stays
         mergeable and identical single-node and distributed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, None, 3], "y": [1, 2, 3]})
+                >>> ds.null_count().to_pydict()
+                {'x': [1], 'y': [0]}
         """
         from batcher.api.dataset._describe import null_count
 
@@ -612,6 +784,14 @@ class Dataset:
         """A per-column data-quality profile (**executes**): one row per column with
         ``count``/``null_count``/``null_fraction``/``approx_distinct`` (HyperLogLog
         cardinality). The quick "what does this column look like" check before a load.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 2]})
+                >>> ds.profile().columns
+                ['column', 'count', 'null_count', 'null_fraction', 'approx_distinct']
         """
         from batcher.api.dataset._describe import profile
 
@@ -619,7 +799,16 @@ class Dataset:
 
     def top_k(self, k: int, by: str | list[str], *, descending: bool = True) -> Dataset:
         """The `k` rows ranked highest (or lowest, `descending=False`) by `by` — sugar
-        for ``sort(by, descending).limit(k)`` (the engine fuses sort+limit to a top-N)."""
+        for ``sort(by, descending).limit(k)`` (the engine fuses sort+limit to a top-N).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [5, 1, 3, 2, 4]})
+                >>> ds.top_k(2, "x").to_pydict()
+                {'x': [5, 4]}
+        """
         keys = by if isinstance(by, list) else [by]
         return self.sort(*keys, descending=descending).limit(k)
 
@@ -628,6 +817,15 @@ class Dataset:
 
         Lowered to an equi-join on a constant key, so it reuses the join engine; the
         temporary key is dropped from the output (colliding names get `suffix`).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> left = bt.from_pydict({"a": [1, 2]})
+                >>> right = bt.from_pydict({"b": ["x"]})
+                >>> left.cross_join(right).to_pydict()
+                {'a': [1, 2], 'b': ['x', 'x']}
         """
         from batcher.plan.expr_ir import lit
 
@@ -642,6 +840,14 @@ class Dataset:
         Other columns repeat per element; null/empty lists produce no rows. The
         exploded column replaces `column` in place (renamed to `alias` if given) and
         streams (no breaker). Raises `PlanError` if `column` is not a column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1, 2], "xs": [[1, 2], [3]]})
+                >>> ds.explode("xs").to_pydict()
+                {'id': [1, 1, 2], 'xs': [1, 2, 3]}
         """
         return build_explode(self, column, alias)
 
@@ -707,6 +913,19 @@ class Dataset:
         ``dropDuplicatesWithinWatermark``). Over a *bounded* source this is exact
         deduplication (plain `distinct`); over a stream it runs the watermark-bounded
         driver. Consume with `iter_batches()` (or `for_each_batch`).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime
+                >>> t0 = datetime.datetime(2024, 1, 1)
+                >>> ds = bt.from_pydict({"id": [1, 1, 2], "ts": [t0, t0, t0]})
+                >>> out = ds.drop_duplicates_within_watermark(
+                ...     ["id"], event_time="ts", lateness="10m"
+                ... )
+                >>> sorted(out.to_pydict()["id"])
+                [1, 2]
         """
         from batcher.io.source import is_bounded
         from batcher.plan.functions.temporal import _duration_micros
@@ -739,6 +958,20 @@ class Dataset:
 
         Composed from the window + group-by engine (no new operator), so it is
         differential-tested against DuckDB and runs single-node or distributed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime
+                >>> t0 = datetime.datetime(2024, 1, 1)
+                >>> dt = datetime.timedelta(seconds=60)
+                >>> ds = bt.from_pydict(
+                ...     {"ts": [t0, t0 + dt, t0 + 10 * dt, t0 + 11 * dt], "v": [1, 2, 3, 4]}
+                ... )
+                >>> out = ds.session_window("ts", "5m", total=bt.col("v").sum())
+                >>> sorted(out.to_pydict()["total"])
+                [3, 7]
         """
         from batcher.api.dataset._build import build_session_window
 
@@ -751,6 +984,14 @@ class Dataset:
         Each struct field becomes a column where the struct was; non-struct columns
         are unchanged. Raises `PlanError` if a column is not a struct or if an
         expanded field name would collide with an existing column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": [{"a": 1, "b": 2}]})
+                >>> ds.unnest("s").to_pydict()
+                {'a': [1], 'b': [2]}
         """
         return build_unnest(self, list(columns))
 
@@ -769,6 +1010,14 @@ class Dataset:
         breaker, each row kept iff its hash is under `fraction`); `n` keeps exactly
         the `n` smallest-hash rows (a breaker). Pass exactly one of `fraction`/`n`.
         With `seed=None` a fresh seed is baked at plan-build.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": list(range(100))})
+                >>> ds.sample(n=3, seed=1).count()
+                3
         """
         return build_sample(self, fraction, seed, n)
 
@@ -788,6 +1037,16 @@ class Dataset:
         (`aggregate` ∈ sum/mean/min/max/count). With `columns` omitted the pivot
         values are discovered by an eager pre-pass over `on`; pass `columns=[...]` to
         fix them (and avoid the pre-pass). Lowers to a grouped conditional aggregate.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict(
+                ...     {"idx": ["r", "r", "s"], "k": ["a", "b", "a"], "v": [1, 2, 3]}
+                ... )
+                >>> ds.pivot(index=["idx"], on="k", values="v").sort("idx").to_pydict()
+                {'idx': ['r', 's'], 'a': [1, 3], 'b': [2, None]}
         """
         return build_pivot(self, index, on, values, aggregate, columns)
 
@@ -805,6 +1064,14 @@ class Dataset:
         `variable_name` column (the melted column's name) and a `value_name` column
         (its value). Omit `on` to melt every non-`index` column, or omit `index` to
         keep every non-`on` column as an identifier. The `on` columns must share a type.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1], "a": [10], "b": [20]})
+                >>> ds.unpivot(index=["id"]).to_pydict()
+                {'id': [1, 1], 'variable': ['a', 'b'], 'value': [10, 20]}
         """
         return build_unpivot(self, index, on, variable_name, value_name)
 
@@ -820,6 +1087,14 @@ class Dataset:
         Pass `strategy` instead of `value` to fill from a statistic: ``"mean"``,
         ``"min"``, ``"max"`` (the column's whole-relation aggregate) or ``"zero"``.
         `subset` limits a strategy fill to specific columns.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, None, 3]})
+                >>> ds.fill_null(0).to_pydict()
+                {'x': [1, 0, 3]}
         """
         if strategy is not None:
             if value is not None:
@@ -841,6 +1116,14 @@ class Dataset:
 
         Returns:
             A new `Dataset` with the null-containing rows removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, None, 3]})
+                >>> ds.drop_nulls().to_pydict()
+                {'x': [1, 3]}
         """
         return build_drop_nulls(self, subset)
 
@@ -849,6 +1132,14 @@ class Dataset:
 
         With `strict=False`, values that cannot be converted become NULL (DuckDB
         ``TRY_CAST``) instead of erroring the query — the safe-ingest spelling.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.cast({"x": "float64"}).to_pydict()
+                {'x': [1.0, 2.0, 3.0]}
         """
         return build_cast(self, dtypes, strict=strict)
 
@@ -857,6 +1148,15 @@ class Dataset:
 
         All datasets must have identical columns. Sources are merged so each
         side's scans resolve correctly.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> a = bt.from_pydict({"x": [1, 2]})
+                >>> b = bt.from_pydict({"x": [3, 4]})
+                >>> a.union(b).to_pydict()
+                {'x': [1, 2, 3, 4]}
         """
         plans: list[LogicalPlan] = [self._plan]
         sources = list(self._sources)
@@ -871,6 +1171,15 @@ class Dataset:
         NULLs compare equal, matching SQL set semantics: a row that is identical —
         nulls included — in both inputs is in the result. Returns distinct rows
         (INTERSECT ALL multiplicity is not supported).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> a = bt.from_pydict({"x": [1, 2, 3]})
+                >>> b = bt.from_pydict({"x": [2, 3, 4]})
+                >>> a.intersect(b).sort("x").to_pydict()
+                {'x': [2, 3]}
         """
         cols = self._same_columns(other, "intersect")
         return self._set_membership(other, cols, both=True)
@@ -880,6 +1189,15 @@ class Dataset:
 
         NULLs compare equal (a wholly-null row in both inputs is excluded), matching
         SQL set semantics. Returns distinct rows (EXCEPT ALL is not supported).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> a = bt.from_pydict({"x": [1, 2, 3]})
+                >>> b = bt.from_pydict({"x": [2]})
+                >>> a.except_(b).sort("x").to_pydict()
+                {'x': [1, 3]}
         """
         cols = self._same_columns(other, "except")
         return self._set_membership(other, cols, both=False)
@@ -975,6 +1293,15 @@ class Dataset:
         `how` is one of inner/left/right/semi/anti. Output keeps the key columns
         (named after the left keys), then the remaining left columns, then the
         remaining right columns (colliding names get `suffix`).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> left = bt.from_pydict({"id": [1, 2], "v": ["a", "b"]})
+                >>> right = bt.from_pydict({"id": [1, 2], "w": ["x", "y"]})
+                >>> left.join(right, on="id").to_pydict()
+                {'id': [1, 2], 'v': ['a', 'b'], 'w': ['x', 'y']}
         """
         how = "full" if how == "outer" else how
         if how not in {"inner", "left", "right", "full", "semi", "anti"}:
@@ -1029,6 +1356,20 @@ class Dataset:
         state be evicted once the watermark passes, keeping memory bounded over two
         unbounded streams. Over bounded sources it is a plain inner join plus the
         interval filter. Consume the streaming result with `iter_batches()`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime
+                >>> t0 = datetime.datetime(2024, 1, 1)
+                >>> left = bt.from_pydict({"k": [1, 2], "lt": [t0, t0]})
+                >>> right = bt.from_pydict({"k": [1, 2], "rt": [t0, t0]})
+                >>> joined = left.join_stream(
+                ...     right, on="k", left_time="lt", right_time="rt", within="1h"
+                ... )
+                >>> joined.count()
+                2
         """
         from batcher.io.source import is_bounded
         from batcher.plan.functions.temporal import _duration_micros
@@ -1077,6 +1418,15 @@ class Dataset:
         same `by` group (exact). Left-style: every left row is kept (null right columns
         when unmatched). Both sides should be sorted on `on` within `by` for the
         intended semantics. Specify keys via `on`/`by` (shared) or `*_on`/`*_by`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> left = bt.from_pydict({"t": [1, 5, 10], "v": ["a", "b", "c"]})
+                >>> right = bt.from_pydict({"t": [2, 6], "w": ["x", "y"]})
+                >>> left.join_asof(right, on="t").to_pydict()
+                {'t': [1, 5, 10], 'v': ['a', 'b', 'c'], 'w': [None, 'x', 'y']}
         """
         l_on, r_on = left_on or on, right_on or on
         if l_on is None or r_on is None:
@@ -1098,6 +1448,14 @@ class Dataset:
         Follow with ``.agg(name=expr)``:
         ``ds.group_by("dept").agg(total=col("salary").sum(), n=count())``.
         Global aggregation (no keys) is ``ds.group_by().agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "b", "a"], "v": [1, 2, 3]})
+                >>> ds.group_by("g").agg(s=bt.col("v").sum()).sort("g").to_pydict()
+                {'g': ['a', 'b'], 's': [4, 2]}
         """
         available = set(self._plan.available_columns())
         for k in keys:
@@ -1122,6 +1480,14 @@ class Dataset:
 
         Shorthand for ``group_by().agg(...)``: ``ds.agg(total=col("x").sum())`` returns
         a single-row dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
+                >>> ds.agg(total=bt.col("x").sum()).to_pydict()
+                {'total': [10]}
         """
         return self.group_by().agg(**aggregates)
 
@@ -1144,6 +1510,14 @@ class Dataset:
         it and `num_partitions` overrides the bucket count. The result is identical
         whichever way it runs. Raises `PlanError` if the dataset is unbounded (a
         streaming source) — use `iter_batches()` / `write()`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.collect().num_rows
+                3
         """
         return _collect(
             self._plan,
@@ -1167,6 +1541,14 @@ class Dataset:
 
         Returns:
             The optimized plan rendered as text.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> len(ds.filter(bt.col("x") > 1).explain()) > 0
+                True
         """
         return _explain(self._plan, self._sources)
 
@@ -1191,6 +1573,13 @@ class Dataset:
         exact — ``ds.limit(n).count()`` is ``min(n, ds.count())``, a global
         aggregate is ``1``, an empty source is ``0`` — and falls back to a full
         run otherwise. The result is always identical to executing.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3]}).count()
+                3
         """
         return _count(self._plan, self._sources, self.columns)
 
@@ -1200,6 +1589,13 @@ class Dataset:
         Answered from metadata when the row count is provably known; otherwise a
         single-row probe (which the streaming path reads without scanning the
         whole source).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1]}).filter(bt.col("x") > 10).is_empty()
+                True
         """
         return _is_empty(self._plan, self._sources, self.columns)
 
@@ -1210,12 +1606,27 @@ class Dataset:
         A scan returns its source schema directly; other plans resolve derived
         column types via a zero-row execution. Use `columns` for just the names
         (always free).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3]}).schema.names
+                ['x']
         """
         return _schema(self._plan, self._sources, self.columns)
 
     @property
     def dtypes(self) -> list[pa.DataType]:
-        """The output column Arrow types, in order (see `schema`)."""
+        """The output column Arrow types, in order (see `schema`).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> [str(t) for t in bt.from_pydict({"x": [1, 2, 3]}).dtypes]
+                ['int64']
+        """
         return list(self.schema.types)
 
     def approx_quantile(self, column: str, q: float) -> float | None:
@@ -1225,6 +1636,14 @@ class Dataset:
         (p99/p999) and far cheaper than the exact sort `quantile` would need.
         Returns ``None`` for a non-numeric or empty column. Use the exact
         aggregate when precision matters.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": list(range(1, 101))})
+                >>> ds.approx_quantile("x", 0.5) is not None
+                True
         """
         from batcher.api.orchestration import approx_quantile
 
@@ -1240,6 +1659,14 @@ class Dataset:
         Other plans (sort / join / window / multi-source) materialize first; if the
         source is unbounded and the plan cannot stream, a `PlanError` is raised
         rather than hanging. `batch_size` rebatches the output.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> sum(batch.num_rows for batch in ds.iter_batches())
+                3
         """
         yield from _iter_batches(self._plan, self._sources, self.columns, batch_size=batch_size)
 
@@ -1248,6 +1675,18 @@ class Dataset:
         """The write namespace: ``ds.write(path)`` autodetects the sink format from the
         path; ``ds.write.<format>(...)`` (``parquet``/``delta``/…) is explicit. All
         accept `partition_by=`/`distributed=`/`num_workers=` and return a `WriteManifest`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import tempfile, os
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> with tempfile.TemporaryDirectory() as d:
+                ...     path = os.path.join(d, "out.parquet")
+                ...     _ = ds.write(path)
+                ...     bt.read(path).count()
+                3
         """
         from batcher.api.io_namespace import Writer
 
@@ -1262,6 +1701,13 @@ class Dataset:
 
         Returns:
             The materialized result table.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3]}).to_arrow().num_rows
+                3
         """
         return _collect(self._plan, self._sources, self.columns)
 
@@ -1271,6 +1717,13 @@ class Dataset:
         A terminal operation. Materializes the Arrow result and converts it via
         pyarrow's pandas bridge, so it needs pandas installed
         (``pip install 'batcher-engine[pandas]'``); otherwise raises `BackendError`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3]}).to_pandas().shape  # doctest: +SKIP
+                (3, 1)
         """
         return _to_pandas(self._plan, self._sources, self.columns)
 
@@ -1280,6 +1733,13 @@ class Dataset:
         A terminal operation. Polars is Arrow-backed, so the materialized result is
         handed over without a row-wise copy. Needs polars installed
         (``pip install 'batcher-engine[polars]'``); otherwise raises `BackendError`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3]}).to_polars().height  # doctest: +SKIP
+                3
         """
         return _to_polars(self._plan, self._sources, self.columns)
 
@@ -1292,6 +1752,13 @@ class Dataset:
 
         Returns:
             Column name to its list of values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"a": [1, 2], "b": ["x", "y"]}).to_pydict()
+                {'a': [1, 2], 'b': ['x', 'y']}
         """
         return _to_pydict(self._plan, self._sources, self.columns)
 
@@ -1320,6 +1787,14 @@ class Dataset:
         Each item is a ``{column: torch.Tensor}`` for one engine batch (non-numeric
         columns are skipped). Re-iterating runs the query again, so it is safe for
         multi-epoch training and streams in bounded memory. Needs `torch`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> next(iter(ds.to_torch()))["x"].shape  # doctest: +SKIP
+                torch.Size([3])
         """
         from batcher.api.dataset._export import to_torch
 
@@ -1333,6 +1808,14 @@ class Dataset:
         The engine already batches, so the loader wraps :meth:`to_torch` with
         ``batch_size=None``; pass `batch_size` to size engine batches and forward
         any other `DataLoader` kwargs (`num_workers`, `pin_memory`, …). Needs `torch`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> type(ds.to_torch_dataloader()).__name__  # doctest: +SKIP
+                'DataLoader'
         """
         from batcher.api.dataset._export import to_torch_dataloader
 
@@ -1343,6 +1826,14 @@ class Dataset:
 
         Each element is one engine batch's numeric columns as TensorFlow tensors;
         non-numeric columns are skipped.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> next(iter(ds.to_tf()))["x"].shape  # doctest: +SKIP
+                TensorShape([3])
         """
         from batcher.api.dataset._export import to_tf
 
@@ -1357,5 +1848,11 @@ class Dataset:
 
         Args:
             limit: Maximum number of rows to print.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3]}).show()  # doctest: +SKIP
         """
         _show(self._plan, self._sources, self.columns, limit)

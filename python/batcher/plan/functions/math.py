@@ -60,6 +60,14 @@ def lcm(a: IntoExpr, b: IntoExpr) -> Math2Expr:
     Args:
         a: First integer operand (column or literal).
         b: Second integer operand (column or literal).
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [4, 6], "b": [6, 8]})
+            >>> ds.select(bt.lcm(bt.col("a"), bt.col("b")).alias("r")).to_pydict()
+            {'r': [12.0, 24.0]}
     """
     return Math2Expr("lcm", _wrap(a), _wrap(b))
 

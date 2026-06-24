@@ -33,6 +33,14 @@ class _StrNamespace:
         """Count the characters in the string (→ Int64).
 
         Counts Unicode characters, not bytes (see :meth:`octet_length`). Null → null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["héllo", "hi"]})
+                >>> ds.select(bt.col("s").str.len().alias("r")).to_pydict()
+                {'r': [5, 2]}
         """
         return StrFunc("len", self._e)
 
@@ -41,6 +49,14 @@ class _StrNamespace:
 
         Stable across partitions, runs, and machines — the basis for surrogate keys
         and slowly-changing-dimension change detection. Null → null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc"]})
+                >>> ds.select(bt.col("s").str.hash64().alias("r")).to_pydict()
+                {'r': [-1792535898324117685]}
         """
         return StrFunc("hash64", self._e)
 
@@ -48,6 +64,14 @@ class _StrNamespace:
         """Compute the MD5 digest as lowercase hex (DuckDB ``md5``).
 
         Returns Utf8; null → null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc"]})
+                >>> ds.select(bt.col("s").str.md5().alias("r")).to_pydict()
+                {'r': ['900150983cd24fb0d6963f7d28e17f72']}
         """
         return StrFunc("md5", self._e)
 
@@ -55,6 +79,14 @@ class _StrNamespace:
         """Compute the SHA-1 digest as lowercase hex (DuckDB ``sha1``).
 
         Returns Utf8; null → null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc"]})
+                >>> ds.select(bt.col("s").str.sha1().alias("r")).to_pydict()
+                {'r': ['a9993e364706816aba3e25717850c26c9cd0d89d']}
         """
         return StrFunc("sha1", self._e)
 
@@ -62,6 +94,14 @@ class _StrNamespace:
         """Compute the SHA-256 digest as lowercase hex (DuckDB ``sha256``).
 
         Returns Utf8; null → null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc"]})
+                >>> ds.select(bt.col("s").str.sha256().alias("r")).to_pydict()
+                {'r': ['ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad']}
         """
         return StrFunc("sha256", self._e)
 
@@ -70,6 +110,14 @@ class _StrNamespace:
 
         Returns Int64 — an integrity check, not a sharding hash (use
         :meth:`xxhash64`).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc"]})
+                >>> ds.select(bt.col("s").str.crc32().alias("r")).to_pydict()
+                {'r': [891568578]}
         """
         return StrFunc("crc32", self._e)
 
@@ -77,6 +125,14 @@ class _StrNamespace:
         """Compute a fast non-cryptographic 64-bit xxHash of the bytes (→ Int64).
 
         The standard bucketing/sharding hash, deterministic across machines. Null → null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc"]})
+                >>> ds.select(bt.col("s").str.xxhash64().alias("r")).to_pydict()
+                {'r': [4952883123889572249]}
         """
         return StrFunc("xxhash64", self._e)
 
@@ -109,6 +165,14 @@ class _StrNamespace:
 
         Args:
             format: A chrono/strftime pattern; defaults to ISO ``"%Y-%m-%d"``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["2024-02-15"]})
+                >>> ds.select(bt.col("s").str.to_date().alias("r")).to_pydict()
+                {'r': [datetime.date(2024, 2, 15)]}
         """
         return Cast(Strptime(self._e, format), "date", try_cast=True)
 
@@ -119,6 +183,14 @@ class _StrNamespace:
 
         Args:
             pattern: The literal substring to search for.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello", "world"]})
+                >>> ds.select(bt.col("s").str.contains("ell").alias("r")).to_pydict()
+                {'r': [True, False]}
         """
         return StrFunc("contains", self._e, pattern=pattern)
 
@@ -127,6 +199,14 @@ class _StrNamespace:
 
         Args:
             pattern: The literal prefix to test for.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello", "world"]})
+                >>> ds.select(bt.col("s").str.starts_with("he").alias("r")).to_pydict()
+                {'r': [True, False]}
         """
         return StrFunc("starts_with", self._e, pattern=pattern)
 
@@ -135,6 +215,14 @@ class _StrNamespace:
 
         Args:
             pattern: The literal suffix to test for.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello", "world"]})
+                >>> ds.select(bt.col("s").str.ends_with("ld").alias("r")).to_pydict()
+                {'r': [False, True]}
         """
         return StrFunc("ends_with", self._e, pattern=pattern)
 
@@ -147,6 +235,14 @@ class _StrNamespace:
         Args:
             start: 1-based index of the first character to keep.
             length: Number of characters to take; all remaining if omitted.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello"]})
+                >>> ds.select(bt.col("s").str.substr(2, 3).alias("r")).to_pydict()
+                {'r': ['ell']}
         """
         return StrFunc("substr", self._e, start=start, length=length)
 
@@ -155,6 +251,14 @@ class _StrNamespace:
 
         Args:
             n: Number of leading characters to keep.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello"]})
+                >>> ds.select(bt.col("s").str.left(3).alias("r")).to_pydict()
+                {'r': ['hel']}
         """
         return StrFunc("substr", self._e, start=1, length=n)
 
@@ -163,6 +267,14 @@ class _StrNamespace:
 
         Args:
             n: Repeat count; ``n`` ≤ 0 yields an empty string.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ab"]})
+                >>> ds.select(bt.col("s").str.repeat(3).alias("r")).to_pydict()
+                {'r': ['ababab']}
         """
         return StrFunc("repeat", self._e, start=n)
 
@@ -172,6 +284,14 @@ class _StrNamespace:
         Args:
             width: Target character width.
             fill: Pad string, cycled as needed; defaults to a space.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ab"]})
+                >>> ds.select(bt.col("s").str.lpad(5, "*").alias("r")).to_pydict()
+                {'r': ['***ab']}
         """
         return StrFunc("lpad", self._e, start=width, pattern=fill)
 
@@ -181,6 +301,14 @@ class _StrNamespace:
         Args:
             width: Target character width.
             fill: Pad string, cycled as needed; defaults to a space.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ab"]})
+                >>> ds.select(bt.col("s").str.rpad(5, "*").alias("r")).to_pydict()
+                {'r': ['ab***']}
         """
         return StrFunc("rpad", self._e, start=width, pattern=fill)
 
@@ -191,6 +319,14 @@ class _StrNamespace:
 
         Args:
             pattern: The literal substring to locate.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello"]})
+                >>> ds.select(bt.col("s").str.position("lo").alias("r")).to_pydict()
+                {'r': [4]}
         """
         return StrFunc("position", self._e, pattern=pattern)
 
@@ -201,6 +337,14 @@ class _StrNamespace:
 
         Args:
             substring: The literal substring to locate.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello"]})
+                >>> ds.select(bt.col("s").str.instr("lo").alias("r")).to_pydict()
+                {'r': [4]}
         """
         return StrFunc("position", self._e, pattern=substring)
 
@@ -213,6 +357,14 @@ class _StrNamespace:
         Args:
             delimiter: The delimiter to count occurrences of.
             count: Which occurrence to cut at; sign selects the direction.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a.b.c.d"]})
+                >>> ds.select(bt.col("s").str.substring_index(".", 2).alias("r")).to_pydict()
+                {'r': ['a.b']}
         """
         return StrFunc("substring_index", self._e, pattern=delimiter, start=count)
 
@@ -226,6 +378,14 @@ class _StrNamespace:
             replacement: The string to splice in.
             pos: 1-based index where the replacement begins.
             length: Characters to overwrite; defaults to ``len(replacement)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello"]})
+                >>> ds.select(bt.col("s").str.overlay("XY", 2).alias("r")).to_pydict()
+                {'r': ['hXYlo']}
         """
         return StrFunc("overlay", self._e, replacement=replacement, start=pos, length=length)
 
@@ -257,6 +417,14 @@ class _StrNamespace:
 
         Args:
             pattern: The regular expression to match.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1b2c3"]})
+                >>> ds.select(bt.col("s").str.regexp_count(r"\\d").alias("r")).to_pydict()
+                {'r': [3]}
         """
         return StrFunc("regexp_count", self._e, pattern=pattern)
 
@@ -268,6 +436,14 @@ class _StrNamespace:
 
         Args:
             target: The literal string to measure distance to.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["sitting"]})
+                >>> ds.select(bt.col("s").str.levenshtein("kitten").alias("r")).to_pydict()
+                {'r': [3]}
         """
         return StrFunc("levenshtein", self._e, pattern=target)
 
@@ -275,6 +451,14 @@ class _StrNamespace:
         """Compute the American Soundex phonetic code, a 4-character key.
 
         Groups words that sound alike (DuckDB ``soundex``). Returns Utf8.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["Robert"]})
+                >>> ds.select(bt.col("s").str.soundex().alias("r")).to_pydict()
+                {'r': ['R163']}
         """
         return StrFunc("soundex", self._e)
 
@@ -283,6 +467,14 @@ class _StrNamespace:
 
         Args:
             n: Number of trailing characters to keep.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello"]})
+                >>> ds.select(bt.col("s").str.right(3).alias("r")).to_pydict()
+                {'r': ['llo']}
         """
         return StrFunc("right", self._e, start=n)
 
@@ -290,6 +482,14 @@ class _StrNamespace:
         """Return the Unicode codepoint of the first character, 0 if empty (→ Int64).
 
         Despite the name, returns the full codepoint, not just ASCII.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["A", "a"]})
+                >>> ds.select(bt.col("s").str.ascii().alias("r")).to_pydict()
+                {'r': [65, 97]}
         """
         return StrFunc("ascii", self._e)
 
@@ -300,6 +500,14 @@ class _StrNamespace:
 
         Args:
             delimiter: The literal separator to split on.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a-b-c"]})
+                >>> ds.select(bt.col("s").str.split("-").alias("r")).to_pydict()
+                {'r': [['a', 'b', 'c']]}
         """
         return StrFunc("split", self._e, pattern=delimiter)
 
@@ -310,6 +518,14 @@ class _StrNamespace:
 
         Args:
             pattern: The regular expression to test.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1", "bb"]})
+                >>> ds.select(bt.col("s").str.regexp_matches(r"\\d+").alias("r")).to_pydict()
+                {'r': [True, False]}
         """
         return StrFunc("regexp_matches", self._e, pattern=pattern)
 
@@ -320,6 +536,14 @@ class _StrNamespace:
 
         Args:
             pattern: A SQL ``LIKE`` pattern using ``%`` and ``_`` wildcards.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello", "world"]})
+                >>> ds.select(bt.col("s").str.like("h%o").alias("r")).to_pydict()
+                {'r': [True, False]}
         """
         return StrFunc("like", self._e, pattern=pattern)
 
@@ -328,6 +552,14 @@ class _StrNamespace:
 
         Args:
             pattern: A SQL ``LIKE`` pattern using ``%`` and ``_`` wildcards.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello", "world"]})
+                >>> ds.select(bt.col("s").str.ilike("H%O").alias("r")).to_pydict()
+                {'r': [True, False]}
         """
         return StrFunc("ilike", self._e, pattern=pattern)
 
@@ -339,6 +571,14 @@ class _StrNamespace:
         Args:
             pattern: The regular expression to match.
             replacement: The replacement text; ``$1``…​ refer to capture groups.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1b2"]})
+                >>> ds.select(bt.col("s").str.regexp_replace(r"\\d", "X").alias("r")).to_pydict()
+                {'r': ['aXb2']}
         """
         return StrFunc("regexp_replace", self._e, pattern=pattern, replacement=replacement)
 
@@ -348,6 +588,14 @@ class _StrNamespace:
         Args:
             pattern: The regular expression to match.
             group: Capture group index; 0 (default) is the whole match.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc123"]})
+                >>> ds.select(bt.col("s").str.regexp_extract(r"(\\d+)", 1).alias("r")).to_pydict()
+                {'r': ['123']}
         """
         return StrFunc("regexp_extract", self._e, pattern=pattern, start=group)
 
@@ -379,6 +627,14 @@ class _StrNamespace:
 
         Args:
             chars: The set of characters to strip; whitespace if omitted.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["  hi  "]})
+                >>> ds.select(bt.col("s").str.trim().alias("r")).to_pydict()
+                {'r': ['hi']}
         """
         return StrFunc("trim", self._e, pattern=chars)
 
@@ -405,6 +661,14 @@ class _StrNamespace:
 
         Args:
             chars: The set of characters to strip; whitespace if omitted.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["  hi  "]})
+                >>> ds.select(bt.col("s").str.lstrip().alias("r")).to_pydict()
+                {'r': ['hi  ']}
         """
         return StrFunc("l_trim", self._e, pattern=chars)
 
@@ -413,6 +677,14 @@ class _StrNamespace:
 
         Args:
             chars: The set of characters to strip; whitespace if omitted.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["  hi  "]})
+                >>> ds.select(bt.col("s").str.rstrip().alias("r")).to_pydict()
+                {'r': ['  hi']}
         """
         return StrFunc("r_trim", self._e, pattern=chars)
 
@@ -424,6 +696,14 @@ class _StrNamespace:
         Args:
             delimiter: The literal separator to split on.
             n: 1-based index of the field to return.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a-b-c"]})
+                >>> ds.select(bt.col("s").str.split_part("-", 2).alias("r")).to_pydict()
+                {'r': ['b']}
         """
         return StrFunc("split_part", self._e, pattern=delimiter, start=n)
 
@@ -435,37 +715,109 @@ class _StrNamespace:
         Args:
             pattern: The regular expression to match.
             replacement: The replacement text; ``$1``…​ refer to capture groups.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1b2"]})
+                >>> r = bt.col("s").str.regexp_replace_all(r"\\d", "X")
+                >>> ds.select(r.alias("r")).to_pydict()
+                {'r': ['aXbX']}
         """
         return StrFunc("regexp_replace_all", self._e, pattern=pattern, replacement=replacement)
 
     def initcap(self) -> StrFunc:
         """Uppercase each word's first letter, lowercasing the rest; a word starts after
-        whitespace or punctuation, so ``"a-b c"`` → ``"A-B C"`` (``initcap``; null → null)."""
+        whitespace or punctuation, so ``"a-b c"`` → ``"A-B C"`` (``initcap``; null → null).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello world"]})
+                >>> ds.select(bt.col("s").str.initcap().alias("r")).to_pydict()
+                {'r': ['Hello World']}
+        """
         return StrFunc("initcap", self._e)
 
     def octet_length(self) -> StrFunc:
         """Count the UTF-8 bytes (not characters) in the string (→ Int64); differs from
-        :meth:`len` (character count) for multi-byte text; null → null."""
+        :meth:`len` (character count) for multi-byte text; null → null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["héllo"]})
+                >>> ds.select(bt.col("s").str.octet_length().alias("r")).to_pydict()
+                {'r': [6]}
+        """
         return StrFunc("octet_length", self._e)
 
     def bit_length(self) -> StrFunc:
-        """Count the bits in the string, i.e. UTF-8 bytes times 8 (→ Int64); null → null."""
+        """Count the bits in the string, i.e. UTF-8 bytes times 8 (→ Int64); null → null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc"]})
+                >>> ds.select(bt.col("s").str.bit_length().alias("r")).to_pydict()
+                {'r': [24]}
+        """
         return StrFunc("bit_length", self._e)
 
     def hex(self) -> StrFunc:
-        """Encode the UTF-8 bytes as uppercase hexadecimal; inverse of :meth:`unhex` (→ Utf8)."""
+        """Encode the UTF-8 bytes as uppercase hexadecimal; inverse of :meth:`unhex` (→ Utf8).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc"]})
+                >>> ds.select(bt.col("s").str.hex().alias("r")).to_pydict()
+                {'r': ['616263']}
+        """
         return StrFunc("hex", self._e)
 
     def base64(self) -> StrFunc:
-        """Encode the UTF-8 bytes as standard base64; inverse of :meth:`from_base64` (→ Utf8)."""
+        """Encode the UTF-8 bytes as standard base64; inverse of :meth:`from_base64` (→ Utf8).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc"]})
+                >>> ds.select(bt.col("s").str.base64().alias("r")).to_pydict()
+                {'r': ['YWJj']}
+        """
         return StrFunc("base64", self._e)
 
     def from_base64(self) -> StrFunc:
-        """Decode standard base64 to a UTF-8 string; null if invalid or null (→ Utf8)."""
+        """Decode standard base64 to a UTF-8 string; null if invalid or null (→ Utf8).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["YWJj"]})
+                >>> ds.select(bt.col("s").str.from_base64().alias("r")).to_pydict()
+                {'r': ['abc']}
+        """
         return StrFunc("from_base64", self._e)
 
     def unhex(self) -> StrFunc:
-        """Decode pairs of hex digits to a UTF-8 string; null if invalid or null (→ Utf8)."""
+        """Decode pairs of hex digits to a UTF-8 string; null if invalid or null (→ Utf8).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["616263"]})
+                >>> ds.select(bt.col("s").str.unhex().alias("r")).to_pydict()
+                {'r': ['abc']}
+        """
         return StrFunc("unhex", self._e)
 
     def translate(self, from_chars: str, to_chars: str) -> StrFunc:
@@ -478,6 +830,14 @@ class _StrNamespace:
             from_chars: Characters to map from.
             to_chars: Characters to map to, positionally; shorter than
                 ``from_chars`` deletes the surplus.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["aabbcc"]})
+                >>> ds.select(bt.col("s").str.translate("abc", "xyz").alias("r")).to_pydict()
+                {'r': ['xxyyzz']}
         """
         return StrFunc("translate", self._e, pattern=from_chars, replacement=to_chars)
 

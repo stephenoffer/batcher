@@ -88,6 +88,16 @@ class Trigger:
     * ``Trigger.continuous("1 second")`` — lowest-latency processing: micro-batches
       run back-to-back with no inter-batch delay, a checkpoint epoch committed on the
       interval. Stateless pipelines only (filter / select / map_batches), as in Spark.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.Trigger.processing_time("5 seconds")
+            Trigger(kind='processing_time', interval_seconds=5.0)
+
+            >>> bt.Trigger.once()
+            Trigger(kind='once', interval_seconds=None)
     """
 
     kind: Literal["processing_time", "once", "available_now", "continuous"]
@@ -124,6 +134,16 @@ class OutputMode:
       valid for aggregations; the result must fit the sink).
     * ``UPDATE`` — only the result rows whose value changed in this micro-batch are
       emitted (keyed upsert into the sink).
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.OutputMode.APPEND
+            'append'
+
+            >>> bt.OutputMode.validate("complete")
+            'complete'
     """
 
     APPEND: Final = "append"

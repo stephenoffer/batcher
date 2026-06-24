@@ -86,6 +86,17 @@ def udf(fn: Callable | None = None, *, per_row: bool = False, **config: Any) -> 
 
     Pass ``per_row=True`` to write a ``fn(row) -> row`` per-row callback instead of a
     batch function. Usable bare (``@udf``) or with options (``@udf(...)``).
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow.compute as pc
+            >>> import batcher as bt
+            >>> @bt.udf
+            ... def add_one(batch):
+            ...     return batch.set_column(0, "x", pc.add(batch.column("x"), 1))
+            >>> add_one(bt.from_pydict({"x": [1, 2, 3]})).to_pydict()
+            {'x': [2, 3, 4]}
     """
 
     def wrap(f: Callable) -> Udf:

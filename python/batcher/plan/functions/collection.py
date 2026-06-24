@@ -22,6 +22,14 @@ def struct(**fields: IntoExpr) -> Expr:
 
     ``struct(x=col("a"), y=col("b") + 1)`` produces a struct ``{x, y}`` per row; read
     a field back with ``col("s").struct.field("x")``. Requires at least one field.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1], "b": [2]})
+            >>> ds.select(s=bt.struct(x=bt.col("a"), y=bt.col("b"))).to_pydict()
+            {'s': [{'x': 1, 'y': 2}]}
     """
     if not fields:
         raise PlanError("struct() requires at least one field")
@@ -33,6 +41,14 @@ def named_struct(*args: object) -> Expr:
 
     ``named_struct("x", col("a"), "y", col("b"))`` is equivalent to
     ``struct(x=col("a"), y=col("b"))``. Field names must be strings.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1], "b": [2]})
+            >>> ds.select(s=bt.named_struct("x", bt.col("a"), "y", bt.col("b"))).to_pydict()
+            {'s': [{'x': 1, 'y': 2}]}
     """
     if not args or len(args) % 2 != 0:
         raise PlanError("named_struct() requires an even number of name, value arguments")
@@ -52,6 +68,14 @@ def sequence(start: IntoExpr, stop: IntoExpr, step: IntoExpr = 1) -> Expr:
     steps by 2. The bounds and step may be columns or literals (cast to Int64); a null
     argument yields a null list, and a ``step`` of 0 raises. Pair with ``explode`` to
     fan a range out into rows.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1], "b": [4]})
+            >>> ds.select(s=bt.sequence(bt.col("a"), bt.col("b"))).to_pydict()
+            {'s': [[1, 2, 3, 4]]}
     """
     return Sequence(_wrap(start), _wrap(stop), _wrap(step))
 
@@ -63,5 +87,13 @@ def element() -> Expr:
     Use it to build the per-element expression: ``col("a").list.transform(element() * 2)``
     doubles each element, ``col("a").list.filter(element() > 0)`` keeps the positives.
     Outside a list higher-order op it has no binding.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [[1, 2, 3]]})
+            >>> ds.select(d=bt.col("a").list.transform(bt.element() * 2)).to_pydict()
+            {'d': [[2, 4, 6]]}
     """
     return Col(_ELEMENT_COL)

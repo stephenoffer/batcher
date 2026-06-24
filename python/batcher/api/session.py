@@ -62,6 +62,13 @@ def engine_version() -> str:
 
     Returns:
         The engine version, e.g. ``"0.1.0"``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> isinstance(bt.engine_version(), str)
+            True
     """
     from batcher import _native
 
@@ -141,6 +148,16 @@ def read(path: str, *, format: str | None = None, **opts: Any) -> Dataset:
     file extension. ``read("s3://b/*.parquet")`` → Parquet; ``read("data/",
     format="csv")``. For database/catalog sources use `read_table` or the typed
     ``read_*`` helpers.
+
+    Examples:
+        .. doctest::
+
+            >>> import tempfile, os
+            >>> import batcher as bt
+            >>> path = os.path.join(tempfile.mkdtemp(), "t.parquet")
+            >>> _ = bt.from_pydict({"x": [1, 2, 3]}).write(path, format="parquet")
+            >>> bt.read(path).count()
+            3
     """
     fmt = detect_format(path, format)
     return _scan(SOURCES.get(fmt)(path, **opts))
@@ -181,6 +198,13 @@ def streams() -> list[Any]:
 
     Returns:
         The active streaming-query handles.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.streams()
+            []
     """
     from batcher.api.streaming import active_streams
 
@@ -193,6 +217,14 @@ def from_arrow(data: pa.Table | pa.RecordBatch | Sequence[pa.RecordBatch]) -> Da
     An empty (zero-row) table or batch is allowed — its schema is preserved via a
     single empty morsel, so an empty input flows through the engine like any other.
     A bare empty sequence of batches carries no schema and is rejected.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> import batcher as bt
+            >>> bt.from_arrow(pa.table({"x": [1, 2]})).to_pydict()
+            {'x': [1, 2]}
     """
     if isinstance(data, pa.Table):
         # A zero-row Table yields no batches; keep its schema with one empty morsel.
@@ -273,6 +305,19 @@ def compact(
     now-stale part-files the rewrite replaced. The data is fully materialized before
     the overwrite, so the rewrite is safe. Single-writer only. Returns the
     `WriteManifest` of the compacted output.
+
+    Examples:
+        .. doctest::
+
+            >>> import tempfile, os, glob
+            >>> import batcher as bt
+            >>> d = tempfile.mkdtemp()
+            >>> _ = bt.from_pydict({"x": [1, 2, 3, 4]}).repartition(num_files=2).write(
+            ...     d, format="parquet"
+            ... )
+            >>> _ = bt.compact(d, num_files=1, format="parquet")
+            >>> len(glob.glob(os.path.join(d, "*.parquet")))
+            1
     """
     import os
 
@@ -309,6 +354,13 @@ def range(start: int, stop: int, step: int = 1, *, name: str = "value") -> Datas
 
     The generator source for synthetic keys and joins; for date dimensions see
     `date_range`. ``bt.range(0, 5)`` → ``value = 0,1,2,3,4``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.range(0, 5).to_pydict()
+            {'value': [0, 1, 2, 3, 4]}
     """
     import builtins
 
@@ -321,6 +373,13 @@ def date_range(start: str, end: str, *, interval_days: int = 1, name: str = "dat
     inclusive) stepped by `interval_days` — the calendar/date-dimension generator.
 
     ``bt.date_range("2024-01-01", "2024-12-31")`` builds a daily date dimension.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.date_range("2024-01-01", "2024-01-03").count()
+            3
     """
     import builtins
     from datetime import date, timedelta
@@ -347,6 +406,16 @@ def from_batches(
 
     Pass ``bounded=False`` for a genuinely infinite stream so terminal operations
     that must materialize (`collect`, `count`, `to_*`) fail fast instead of hanging.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> import batcher as bt
+            >>> schema = pa.schema([("x", pa.int64())])
+            >>> ds = bt.from_batches(lambda: iter([pa.record_batch({"x": [1, 2, 3]})]), schema)
+            >>> ds.count()
+            3
     """
     return _scan(IteratorSource(factory, schema, bounded=bounded))
 
@@ -365,6 +434,14 @@ def from_numpy(ndarray: Any, *, column: str = "data") -> Dataset:
 
     Returns:
         A lazy `Dataset` with one column over the array.
+
+    Examples:
+        .. doctest::
+
+            >>> import numpy as np
+            >>> import batcher as bt
+            >>> bt.from_numpy(np.array([1, 2, 3])).to_pydict()
+            {'data': [1, 2, 3]}
     """
     return _scan(interop.from_numpy(ndarray, column=column))
 
@@ -374,6 +451,14 @@ def from_pandas(df: Any) -> Dataset:
 
     Needs pandas (``pip install 'batcher-engine[pandas]'``); raises `BackendError`
     if it is absent. Goes through ``pyarrow.Table.from_pandas`` — no per-row Python.
+
+    Examples:
+        .. doctest::
+
+            >>> import pandas as pd
+            >>> import batcher as bt
+            >>> bt.from_pandas(pd.DataFrame({"a": [1, 2], "b": [3, 4]})).to_pydict()
+            {'a': [1, 2], 'b': [3, 4]}
     """
     return _scan(interop.from_pandas(df))
 
@@ -384,6 +469,14 @@ def from_polars(df: Any) -> Dataset:
     Polars is Arrow-backed, so the buffers are referenced directly, not copied.
     Needs polars (``pip install 'batcher-engine[polars]'``); raises `BackendError`
     if it is absent.
+
+    Examples:
+        .. doctest::
+
+            >>> import polars as pl
+            >>> import batcher as bt
+            >>> bt.from_polars(pl.DataFrame({"a": [1, 2, 3]})).to_pydict()
+            {'a': [1, 2, 3]}
     """
     return _scan(interop.from_polars(df))
 
@@ -394,6 +487,15 @@ def from_huggingface(hf_dataset: Any) -> Dataset:
     HuggingFace datasets are Arrow tables underneath, so the table is taken
     directly. Needs ``datasets`` (``pip install 'batcher-engine[huggingface]'``);
     raises `BackendError` if it is absent.
+
+    Examples:
+        ::
+
+            import batcher as bt
+            from datasets import load_dataset
+
+            hf = load_dataset("imdb", split="train")
+            ds = bt.from_huggingface(hf)
     """
     return _scan(interop.from_huggingface(hf_dataset))
 
@@ -405,6 +507,14 @@ def from_torch(dataset_or_tensors: Any) -> Dataset:
     tensor); only bulk buffers cross into the engine, never per-row Python. Needs
     ``torch`` (``pip install 'batcher-engine[torch]'``); raises `BackendError` if
     it is absent.
+
+    Examples:
+        .. doctest::
+
+            >>> import torch
+            >>> import batcher as bt
+            >>> bt.from_torch(torch.tensor([1, 2, 3])).to_pydict()
+            {'data': [1, 2, 3]}
     """
     return _scan(interop.from_torch(dataset_or_tensors))
 
@@ -415,6 +525,15 @@ def from_tf(tf_dataset: Any) -> Dataset:
     Each element's tensors are converted to NumPy and concatenated column-wise.
     Needs ``tensorflow`` (``pip install 'batcher-engine[tensorflow]'``); raises
     `BackendError` if it is absent.
+
+    Examples:
+        ::
+
+            import tensorflow as tf
+            import batcher as bt
+
+            tf_ds = tf.data.Dataset.from_tensor_slices({"x": [1, 2, 3]})
+            ds = bt.from_tf(tf_ds)
     """
     return _scan(interop.from_tf(tf_dataset))
 
@@ -426,6 +545,16 @@ def from_spark(spark_df: Any) -> Dataset:
     materializes the data — for large frames write to a shared store and `read` it
     instead. Needs ``pyspark`` (``pip install 'batcher-engine[spark]'``); raises
     `BackendError` if it is absent.
+
+    Examples:
+        ::
+
+            import batcher as bt
+            from pyspark.sql import SparkSession
+
+            spark = SparkSession.builder.getOrCreate()
+            sdf = spark.createDataFrame([(1,), (2,), (3,)], ["x"])
+            ds = bt.from_spark(sdf)
     """
     return _scan(interop.from_spark(spark_df))
 
@@ -436,6 +565,16 @@ def from_dask(ddf: Any) -> Dataset:
     Partitions stream lazily into the engine in bounded memory rather than being
     materialized at once. Needs ``dask`` (``pip install 'batcher-engine[dask]'``);
     raises `BackendError` if it is absent.
+
+    Examples:
+        ::
+
+            import dask.dataframe as dd
+            import pandas as pd
+            import batcher as bt
+
+            ddf = dd.from_pandas(pd.DataFrame({"x": [1, 2, 3]}), npartitions=2)
+            ds = bt.from_dask(ddf)
     """
     return _scan(interop.from_dask(ddf))
 

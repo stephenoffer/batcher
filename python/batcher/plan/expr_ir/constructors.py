@@ -85,6 +85,14 @@ def coalesce(*exprs: IntoExpr) -> Coalesce:
 
     Returns:
         An expression equal to the first non-null argument.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1, None, 3], "b": [10, 20, 30]})
+            >>> ds.select(c=bt.coalesce(bt.col("a"), bt.col("b"))).to_pydict()
+            {'c': [1, 20, 3]}
     """
     if not exprs:
         raise ValueError("coalesce() requires at least one argument")
@@ -105,6 +113,14 @@ def nullif(left: IntoExpr, right: IntoExpr) -> NullIf:
 
     Returns:
         An expression that is null on equality, else ``left``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, 5, 5]})
+            >>> ds.select(r=bt.nullif(bt.col("x"), bt.lit(5))).to_pydict()
+            {'r': [1, None, None]}
     """
     return NullIf(_wrap(left), _wrap(right))
 
@@ -122,6 +138,14 @@ def atan2(y: IntoExpr, x: IntoExpr) -> Math2Expr:
 
     Returns:
         A Float64 expression of the angle in radians.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"y": [0.0], "x": [1.0]})
+            >>> ds.select(r=bt.atan2(bt.col("y"), bt.col("x"))).to_pydict()
+            {'r': [0.0]}
     """
     return Math2Expr("atan2", _wrap(y), _wrap(x))
 
@@ -164,6 +188,14 @@ def least(*exprs: IntoExpr) -> Least:
 
     Returns:
         An expression equal to the per-row minimum.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1, 9], "b": [4, 2]})
+            >>> ds.select(lo=bt.least(bt.col("a"), bt.col("b"))).to_pydict()
+            {'lo': [1, 2]}
     """
     if not exprs:
         raise ValueError("least() requires at least one argument")
@@ -173,7 +205,16 @@ def least(*exprs: IntoExpr) -> Least:
 def sum_horizontal(*exprs: IntoExpr) -> Expr:
     """Row-wise sum across the given columns, treating nulls as 0 (Polars
     ``sum_horizontal``). Complements `greatest`/`least` (row-wise max/min). An
-    all-null row sums to 0. ``sum_horizontal(col("a"), col("b"), col("c"))``."""
+    all-null row sums to 0. ``sum_horizontal(col("a"), col("b"), col("c"))``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1, None], "b": [10, 20]})
+            >>> ds.select(s=bt.sum_horizontal(bt.col("a"), bt.col("b"))).to_pydict()
+            {'s': [11, 20]}
+    """
     if not exprs:
         raise ValueError("sum_horizontal() requires at least one argument")
     parts = [coalesce(_wrap(e), Lit(0)) for e in exprs]
@@ -183,7 +224,16 @@ def sum_horizontal(*exprs: IntoExpr) -> Expr:
 def mean_horizontal(*exprs: IntoExpr) -> Expr:
     """Row-wise mean across the given columns, ignoring nulls (Polars
     ``mean_horizontal``): the sum of the non-null values divided by how many were
-    non-null. An all-null row yields null (no division by zero)."""
+    non-null. An all-null row yields null (no division by zero).
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1.0, None], "b": [3.0, 20.0]})
+            >>> ds.select(m=bt.mean_horizontal(bt.col("a"), bt.col("b"))).to_pydict()
+            {'m': [2.0, 20.0]}
+    """
     if not exprs:
         raise ValueError("mean_horizontal() requires at least one argument")
     wrapped = [_wrap(e) for e in exprs]
@@ -252,5 +302,13 @@ def lit(value: int | float | bool | str) -> Lit:
 
     Returns:
         An expression that evaluates to ``value`` on every row.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, 2]})
+            >>> ds.select(y=bt.col("x") + bt.lit(100)).to_pydict()
+            {'y': [101, 102]}
     """
     return Lit(value)

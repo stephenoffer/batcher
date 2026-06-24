@@ -109,6 +109,15 @@ class _DtNamespace:
 
         Follows the proleptic Gregorian rule: divisible by 4, except centuries that
         are not divisible by 400. Null → null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.date(2024, 1, 1), dt.date(2023, 1, 1)]})
+                >>> ds.select(bt.col("d").dt.is_leap_year().alias("r")).to_pydict()
+                {'r': [True, False]}
         """
         return DateFunc("is_leap_year", self._e)
 
@@ -117,6 +126,15 @@ class _DtNamespace:
 
         Accounts for leap years (February yields 29 in a leap year, else 28). Null →
         null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.date(2024, 2, 15), dt.date(2023, 2, 15)]})
+                >>> ds.select(bt.col("d").dt.days_in_month().alias("r")).to_pydict()
+                {'r': [29, 28]}
         """
         return DateFunc("days_in_month", self._e)
 
@@ -125,6 +143,15 @@ class _DtNamespace:
 
         May differ from the calendar year for dates in the first or last days of a
         year (e.g. 2021-01-01 can belong to ISO year 2020).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.date(2021, 1, 1)]})
+                >>> ds.select(bt.col("d").dt.iso_year().alias("r")).to_pydict()
+                {'r': [2020]}
         """
         return DateFunc("iso_year", self._e)
 

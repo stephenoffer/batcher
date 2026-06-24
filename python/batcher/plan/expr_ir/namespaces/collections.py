@@ -261,6 +261,14 @@ class _ListNamespace:
         """The first element of each list; null for an empty or null list.
 
         Shorthand for :meth:`get` at index ``0``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[3, 1, 2], [], None]})
+                >>> ds.select(bt.col("a").list.first().alias("r")).to_pydict()
+                {'r': [3, None, None]}
         """
         return ListGet(self._e, 0)
 
@@ -268,6 +276,14 @@ class _ListNamespace:
         """The last element of each list; null for an empty or null list.
 
         Shorthand for :meth:`get` at index ``-1``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[3, 1, 2], [], None]})
+                >>> ds.select(bt.col("a").list.last().alias("r")).to_pydict()
+                {'r': [2, None, None]}
         """
         return ListGet(self._e, -1)
 
@@ -296,35 +312,88 @@ class _ListNamespace:
 
         Args:
             value: The literal to locate.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[3, 1, 2]]})
+                >>> ds.select(bt.col("a").list.position(2).alias("r")).to_pydict()
+                {'r': [3]}
         """
         return ListPosition(self._e, value)
 
     def intersect(self, other: Any) -> ListSet:
         """The distinct elements present in **both** this list and ``other`` (Spark
-        ``array_intersect``), in this list's order. → List."""
+        ``array_intersect``), in this list's order. → List.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2, 3]], "b": [[2, 3, 4]]})
+                >>> ds.select(bt.col("a").list.intersect(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[2, 3]]}
+        """
         return ListSet("array_intersect", self._e, _wrap(other))
 
     def difference(self, other: Any) -> ListSet:
         """The distinct elements in this list but **not** in ``other`` (Spark
-        ``array_except``), in this list's order. → List."""
+        ``array_except``), in this list's order. → List.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2, 3]], "b": [[2, 3, 4]]})
+                >>> ds.select(bt.col("a").list.difference(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[1]]}
+        """
         return ListSet("array_except", self._e, _wrap(other))
 
     def union(self, other: Any) -> ListSet:
         """The distinct elements in **either** this list or ``other`` (Spark
         ``array_union``) — this list's distinct elements followed by the new ones from
-        ``other``. → List."""
+        ``other``. → List.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2]], "b": [[2, 3]]})
+                >>> ds.select(bt.col("a").list.union(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[1, 2, 3]]}
+        """
         return ListSet("array_union", self._e, _wrap(other))
 
     def transform(self, func: Any) -> ListTransform:
         """Apply `func` to every element, preserving lengths (DuckDB ``list_transform``;
         Polars ``list.eval``). `func` is an expression over ``element()`` (the current
-        element), e.g. ``col("a").list.transform(element() * 2)``. → List."""
+        element), e.g. ``col("a").list.transform(element() * 2)``. → List.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2, 3]]})
+                >>> ds.select(bt.col("a").list.transform(bt.element() * 2).alias("r")).to_pydict()
+                {'r': [[2, 4, 6]]}
+        """
         return ListTransform(self._e, _wrap(func))
 
     def filter(self, predicate: Any) -> ListFilter:
         """Keep the elements where `predicate` (an expression over ``element()``) is
         true (DuckDB ``list_filter``), e.g. ``col("a").list.filter(element() > 0)``.
-        → List."""
+        → List.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[-1, 2, -3, 4]]})
+                >>> ds.select(bt.col("a").list.filter(bt.element() > 0).alias("r")).to_pydict()
+                {'r': [[2, 4]]}
+        """
         return ListFilter(self._e, _wrap(predicate))
 
     def slice(self, offset: int, length: int | None = None) -> ListSlice:
@@ -336,6 +405,14 @@ class _ListNamespace:
         Args:
             offset: 0-based start index.
             length: Number of elements to take; ``None`` means to the end.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[10, 20, 30, 40]]})
+                >>> ds.select(bt.col("a").list.slice(1, 2).alias("r")).to_pydict()
+                {'r': [[20, 30]]}
         """
         return ListSlice(self._e, offset, length)
 
@@ -381,6 +458,14 @@ class _ListNamespace:
 
         Args:
             other: The other vector column (or an ``array(...)`` literal).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1.0, 2.0, 3.0]], "b": [[4.0, 5.0, 6.0]]})
+                >>> ds.select(bt.col("a").list.dot(bt.col("b")).alias("r")).to_pydict()
+                {'r': [32.0]}
         """
         return ListBinary("dot", self._e, _wrap(other))
 
@@ -412,6 +497,14 @@ class _ListNamespace:
 
         Args:
             other: The other vector column (or an ``array(...)`` literal).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[0.0, 0.0]], "b": [[3.0, 4.0]]})
+                >>> ds.select(bt.col("a").list.l2_distance(bt.col("b")).alias("r")).to_pydict()
+                {'r': [5.0]}
         """
         return ListBinary("l2_distance", self._e, _wrap(other))
 

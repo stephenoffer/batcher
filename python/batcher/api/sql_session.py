@@ -67,8 +67,7 @@ class Session:
 
             >>> import batcher as bt
             >>> s = bt.Session()
-            >>> s.register("nums", bt.from_pydict({"v": [1, 2, 3]}))  # doctest: +ELLIPSIS
-            <batcher...Dataset object at ...>
+            >>> _ = s.register("nums", bt.from_pydict({"v": [1, 2, 3]}))
             >>> s.sql("SELECT SUM(v) AS total FROM nums").to_pydict()
             {'total': [6]}
     """

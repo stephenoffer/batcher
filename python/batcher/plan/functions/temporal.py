@@ -55,6 +55,24 @@ def window(time_col: IntoExpr, duration: str, slide: str | None = None) -> Expr:
 
     Raises:
         PlanError: If a duration uses a calendar unit or is not positive.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> import datetime as dt
+            >>> ds = bt.from_pydict(
+            ...     {
+            ...         "ts": [dt.datetime(2024, 1, 1, 10, 5), dt.datetime(2024, 1, 1, 11, 5)],
+            ...         "v": [1, 3],
+            ...     }
+            ... )
+            >>> agg = ds.group_by(w=bt.window(bt.col("ts"), "1h")).agg(s=bt.col("v").sum())
+            >>> out = agg.sort("w").to_pydict()
+            >>> out["w"]
+            [datetime.datetime(2024, 1, 1, 10, 0), datetime.datetime(2024, 1, 1, 11, 0)]
+            >>> out["s"]
+            [1, 3]
     """
     width = _duration_micros(duration, arg="window duration")
     expr = _wrap(time_col)
@@ -117,6 +135,15 @@ def current_timestamp() -> Lit:
 
     Returns:
         A timestamp literal expression.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, 2]})
+            >>> out = ds.with_columns(t=bt.current_timestamp()).to_pydict()
+            >>> out["t"][0] == out["t"][1]  # same value for every row
+            True
     """
     return Lit(_dt.datetime.now())
 
@@ -129,6 +156,15 @@ def current_date() -> Lit:
 
     Returns:
         A date literal expression.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, 2]})
+            >>> out = ds.with_columns(d=bt.current_date()).to_pydict()
+            >>> out["d"][0] == out["d"][1]  # same date for every row
+            True
     """
     return Lit(_dt.date.today())
 
@@ -140,6 +176,15 @@ def today() -> Lit:
 
     Returns:
         A date literal expression.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, 2]})
+            >>> out = ds.with_columns(d=bt.today()).to_pydict()
+            >>> out["d"][0] == out["d"][1]  # same date for every row
+            True
     """
     return Lit(_dt.date.today())
 
@@ -157,6 +202,17 @@ def date_part(part: str, expr: IntoExpr) -> Expr:
 
     Raises:
         PlanError: If ``part`` is not a recognized unit.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> import datetime as dt
+            >>> ds = bt.from_pydict({"d": [dt.date(2024, 3, 15)]})
+            >>> y = bt.date_part("year", bt.col("d"))
+            >>> m = bt.date_part("month", bt.col("d"))
+            >>> ds.select(y=y, m=m).to_pydict()
+            {'y': [2024], 'm': [3]}
     """
     method = _PART_TO_DT.get(part.lower())
     if method is None:
@@ -194,5 +250,14 @@ def date_sub(expr: IntoExpr, days: int) -> Expr:
     Args:
         expr: The date/time column to shift.
         days: Number of days to subtract (may be negative).
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> import datetime as dt
+            >>> ds = bt.from_pydict({"d": [dt.date(2024, 3, 15)]})
+            >>> ds.select(bt.date_sub(bt.col("d"), 5).alias("r")).to_pydict()
+            {'r': [datetime.date(2024, 3, 10)]}
     """
     return _wrap(expr).dt.offset_by(f"{-int(days)}d")

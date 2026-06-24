@@ -75,6 +75,23 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # grows by one small arm per relational operator; splitting the dispatch across
     # files would scatter the column-need logic that must stay consistent between them.
     "python/batcher/kyber/rules/projections.py": "projection-pushdown dispatch hub; per-operator arms",
+    # The distributed join is one cohesive strategy module — broadcast, co-partition
+    # shuffle, skew salting, bloom pruning, and the post-join aggregate all share the
+    # same reducer-IR / partition / Ray-task scaffolding and the `_shuffle_join`
+    # fallback the broadcast path depends on. Splitting the broadcast path into a
+    # sibling forces a base<->fallback import cycle with `_shuffle_join`.
+    "python/batcher/dist/executors/join.py": "distributed-join strategy hub; broadcast/shuffle split forces an import cycle",
+    # The expression accessor namespaces: each is one bound family (`.str` / `.list`)
+    # whose every public method carries a Google-style docstring with a runnable
+    # `.. doctest::` example (python-quality.md). The examples — not the code — push
+    # these over the limit; the methods are one cohesive accessor that the factory
+    # binds as a unit, so splitting them would scatter one namespace across files.
+    "python/batcher/plan/expr_ir/namespaces/strings.py": "one bound .str accessor; per-method runnable examples push it over",
+    "python/batcher/plan/expr_ir/namespaces/collections.py": "one bound .list accessor; per-method runnable examples push it over",
+    # The session/constructor surface (from_*, read, sql, range, …) is one façade;
+    # every public constructor now carries a runnable `.. doctest::` example, which is
+    # what pushes it over — the bodies stay thin.
+    "python/batcher/api/session.py": "session/constructor façade; per-constructor runnable examples push it over",
 }
 
 fails: list[str] = []
