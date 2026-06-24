@@ -42,11 +42,28 @@ def _iter_batches(
     pipeline); other plans materialize first. An unbounded source whose plan cannot
     stream raises `PlanError` instead of hanging on `_collect`.
     """
-    from batcher.plan.logical import Aggregate, Distinct, Limit, Sort, is_streamable
+    from batcher.plan.logical import (
+        Aggregate,
+        Distinct,
+        Limit,
+        Sort,
+        WatermarkDedup,
+        WatermarkStreamJoin,
+        is_streamable,
+    )
+
+    # Stream-stream interval join: two streams, buffered + watermark-evicted.
+    if isinstance(plan, WatermarkStreamJoin) and len(sources) == 2:
+        yield from _stream_stream_join(plan, sources, batch_size)
+        return
 
     if len(sources) == 1:
         if is_streamable(plan):
             yield from _iter_streaming(plan, sources, batch_size)
+            return
+        # Watermark-bounded streaming deduplication (bounded seen-key state).
+        if isinstance(plan, WatermarkDedup) and is_streamable(plan.input):
+            yield from _stream_watermark_dedup(plan, sources[0], batch_size)
             return
         # A top-level aggregate/distinct over a breaker-free relational input streams
         # with bounded memory: fold each micro-batch's partial into one running state.
@@ -57,6 +74,13 @@ def _iter_batches(
             and is_streamable(plan.input)
             and not core.has_map_batches(plan.input)
         ):
+            # A watermarked windowed aggregation emits each window as the watermark
+            # closes it (bounded state); a plain aggregate folds one running state.
+            if isinstance(plan, Aggregate) and plan.watermark is not None:
+                from batcher.core.streaming import stream_windowed_aggregate
+
+                yield from stream_windowed_aggregate(plan, sources[0], batch_size)
+                return
             from batcher.core.streaming import stream_aggregate, stream_distinct
 
             driver = stream_distinct if isinstance(plan, Distinct) else stream_aggregate
@@ -194,3 +218,165 @@ def _iter_streaming(
             else:
                 for off in range(0, b.num_rows, batch_size):
                     yield b.slice(off, batch_size)
+
+
+def _stream_watermark_dedup(
+    plan, source: Source, batch_size: int | None
+) -> Iterator[pa.RecordBatch]:
+    """Deduplicate a stream by `plan.subset`, evicting seen keys past the watermark.
+
+    Per micro-batch: drop late rows, dedup the batch by `subset` (keep earliest by
+    event time), anti-join against the running seen-keys table to emit only genuinely
+    new keys, fold those keys into the seen set, advance the watermark, and evict seen
+    keys older than it — so memory is bounded by the keys still inside the watermark
+    window. Every value-touching step (filter, distinct, anti-join) runs in the Rust
+    engine; this only advances a scalar and threads the small seen-keys table.
+    """
+    import pyarrow.compute as pc
+
+    from batcher import core, kyber
+    from batcher.api.session import from_arrow
+
+    subset = list(plan.subset)
+    et = plan.event_time
+    lateness = plan.lateness_micros
+    hub = core.default_hub()
+    opt = kyber.optimize(plan.input, sources=[source], hub=hub)
+    seen: pa.Table | None = None
+    wm: int | None = None
+
+    for raw in source.iter_batches(None):
+        if raw.num_rows == 0:
+            continue
+        for b in core.execute_local(opt, [[raw]], feedback=hub):
+            if b.num_rows == 0:
+                continue
+            table = pa.Table.from_batches([b])
+            if wm is not None:  # drop rows below the watermark (late)
+                table = table.filter(pc.greater_equal(pc.cast(table.column(et), pa.int64()), wm))
+                if table.num_rows == 0:
+                    continue
+            # Duplicate check against the seen-keys state *before* advancing the
+            # watermark (a key is a duplicate while it is still in state).
+            deduped = from_arrow(table).distinct(subset, keep="first", order_by=[(et, False)])
+            if seen is not None:
+                new = deduped.join(from_arrow(seen), on=subset, how="anti").collect()
+            else:
+                new = deduped.collect()
+            # Advance the watermark from this batch's max event time, fold the new
+            # keys into state, then evict keys the watermark has now passed — every
+            # batch, so duplicates falling out of the window are forgotten (bounded).
+            hi = pc.max(table.column(et))
+            if hi.is_valid:
+                cand = pc.cast(hi, pa.int64()).as_py() - lateness
+                wm = cand if wm is None else max(wm, cand)
+            if new.num_rows:
+                fresh = new.select([*subset, et])
+                seen = fresh if seen is None else pa.concat_tables([seen, fresh])
+            if seen is not None and wm is not None:
+                keep = pc.greater_equal(pc.cast(seen.column(et), pa.int64()), wm)
+                seen = seen.filter(keep)
+            if new.num_rows:
+                rebatch = batch_size is not None
+                yield from (
+                    new.to_batches(max_chunksize=batch_size) if rebatch else new.to_batches()
+                )
+
+
+def _stream_stream_join(
+    plan, sources: list[Source], batch_size: int | None
+) -> Iterator[pa.RecordBatch]:
+    """Watermark-bounded stream-stream interval inner join over two sources.
+
+    Symmetric incremental hash join: each side's rows are buffered; an arriving
+    batch from one side joins against the *other* side's buffer (so every matching
+    pair is emitted exactly once), filtered to the event-time interval
+    ``|left_time - right_time| <= within``. Per-side watermarks advance from the
+    batches; a buffered row is evicted once the opposite side's watermark guarantees
+    no future match (``time < other_watermark - within``), keeping state bounded. The
+    joins/filters run in the Rust engine; this threads the small buffers and scalars.
+    """
+    import pyarrow.compute as pc
+
+    from batcher import core, kyber
+    from batcher.api.session import from_arrow
+    from batcher.plan.logical import remap_sources
+
+    lt, rt = plan.left_time, plan.right_time
+    within, lateness = plan.within_micros, plan.lateness_micros
+    lk, rk = list(plan.left_keys), list(plan.right_keys)
+    hub = core.default_hub()
+    left_opt = kyber.optimize(plan.left, sources=[sources[0]], hub=hub)
+    right_opt = kyber.optimize(remap_sources(plan.right, -1), sources=[sources[1]], hub=hub)
+
+    state = {"bufL": None, "bufR": None, "wmL": None, "wmR": None}
+
+    def micros(col):
+        hi = pc.max(col)
+        return pc.cast(hi, pa.int64()).as_py() if hi.is_valid else None
+
+    def evict():
+        # A buffered row can be dropped once the *other* stream's watermark has moved
+        # past its match window: left row t can still match a future right row only if
+        # t >= wmR - within (and symmetrically).
+        if state["wmR"] is not None and state["bufL"] is not None:
+            keep = pc.greater_equal(
+                pc.cast(state["bufL"].column(lt), pa.int64()), state["wmR"] - within
+            )
+            state["bufL"] = state["bufL"].filter(keep)
+        if state["wmL"] is not None and state["bufR"] is not None:
+            keep = pc.greater_equal(
+                pc.cast(state["bufR"].column(rt), pa.int64()), state["wmL"] - within
+            )
+            state["bufR"] = state["bufR"].filter(keep)
+
+    def emit(side_table, other_buf, *, left_side):
+        """Join `side_table` against the opposite buffer, interval-filtered."""
+        if other_buf is None or other_buf.num_rows == 0:
+            return []
+        left_ds = from_arrow(side_table if left_side else other_buf)
+        right_ds = from_arrow(other_buf if left_side else side_table)
+        joined = left_ds.join(right_ds, left_on=lk, right_on=rk, how="inner")
+        diff = joined[lt].cast("int64") - joined[rt].cast("int64")
+        res = joined.filter((diff <= within) & (diff >= -within)).collect()
+        if res.num_rows == 0:
+            return []
+        return res.to_batches() if batch_size is None else res.to_batches(max_chunksize=batch_size)
+
+    def push(raw, opt, *, left_side):
+        out = []
+        for b in core.execute_local(opt, [[raw]], feedback=hub):
+            if b.num_rows == 0:
+                continue
+            table = pa.Table.from_batches([b])
+            other = state["bufR"] if left_side else state["bufL"]
+            out.extend(emit(table, other, left_side=left_side))
+            key = "bufL" if left_side else "bufR"
+            state[key] = table if state[key] is None else pa.concat_tables([state[key], table])
+            hi = micros(table.column(lt if left_side else rt))
+            if hi is not None:
+                wk = "wmL" if left_side else "wmR"
+                cand = hi - lateness
+                state[wk] = cand if state[wk] is None else max(state[wk], cand)
+            evict()
+        return out
+
+    it_l, it_r = sources[0].iter_batches(None), sources[1].iter_batches(None)
+    done_l = done_r = False
+    while not (done_l and done_r):
+        if not done_l:
+            try:
+                raw = next(it_l)
+            except StopIteration:
+                done_l = True
+            else:
+                if raw.num_rows:
+                    yield from push(raw, left_opt, left_side=True)
+        if not done_r:
+            try:
+                raw = next(it_r)
+            except StopIteration:
+                done_r = True
+            else:
+                if raw.num_rows:
+                    yield from push(raw, right_opt, left_side=False)

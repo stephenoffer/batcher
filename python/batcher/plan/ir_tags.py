@@ -36,6 +36,7 @@ class Op:
     LIMIT: Final = "limit"
     UNNEST: Final = "unnest"
     UNPIVOT: Final = "unpivot"
+    ROW_ID: Final = "row_id"
     SAMPLE: Final = "sample"
     ASOF_JOIN: Final = "asof_join"
 
@@ -53,6 +54,7 @@ class ExprTag:
     IS_NULL: Final = "is_null"
     IS_NOT_NULL: Final = "is_not_null"
     IS_NAN: Final = "is_nan"
+    IS_INF: Final = "is_inf"
     CASE: Final = "case"
     STR: Final = "str"
     MATH: Final = "math"
@@ -62,19 +64,31 @@ class ExprTag:
     GREATEST: Final = "greatest"
     LEAST: Final = "least"
     ARRAY: Final = "array"
+    SEQUENCE: Final = "sequence"
     DATE: Final = "date"
     DATE_TRUNC: Final = "date_trunc"
     DATE_OFFSET: Final = "date_offset"
+    WINDOW_START: Final = "window_start"
+    WINDOW_BUCKETS: Final = "window_buckets"
     STRFTIME: Final = "strftime"
     STRPTIME: Final = "strptime"
+    CONVERT_TIMEZONE: Final = "convert_timezone"
     LIST: Final = "list"
     LIST_BINARY: Final = "list_binary"
     LIST_JOIN: Final = "list_join"
     LIST_GET: Final = "list_get"
     LIST_CONTAINS: Final = "list_contains"
+    LIST_POSITION: Final = "list_position"
+    LIST_SET: Final = "list_set"
+    LIST_TRANSFORM: Final = "list_transform"
+    LIST_FILTER: Final = "list_filter"
     LIST_SLICE: Final = "list_slice"
     STRUCT_FIELD: Final = "struct_field"
+    MAKE_STRUCT: Final = "make_struct"
+    MAP: Final = "map"
     IMAGE: Final = "image"
+    AUDIO: Final = "audio"
+    VIDEO: Final = "video"
 
 
 # Window-function names, mirroring the Rust `WindowFn` enum (serde snake_case).
@@ -84,5 +98,5 @@ WINDOW_RANKING: Final = frozenset(
     {"row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile"}
 )
 WINDOW_AGGREGATES: Final = frozenset({"sum", "avg", "min", "max", "count"})
-WINDOW_VALUE: Final = frozenset({"first_value", "last_value", "lag", "lead"})
+WINDOW_VALUE: Final = frozenset({"first_value", "last_value", "lag", "lead", "nth_value"})
 WINDOW_FUNCS: Final = WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE

@@ -56,3 +56,8 @@ class _ImageNamespace:
     def to_tensor(self, width: int, height: int) -> ImageFunc:
         """Decode + resize to ``(width, height)`` → ``FixedSizeList<u8>`` (H·W·3, RGB8)."""
         return ImageFunc("to_tensor", self._e, width=width, height=height)
+
+    def resize(self, width: int, height: int) -> ImageFunc:
+        """Resize image bytes to ``(width, height)``, re-encoded as PNG bytes (Daft
+        ``image.resize``). Null/undecodable input → null. → Binary."""
+        return ImageFunc("resize", self._e, width=width, height=height)

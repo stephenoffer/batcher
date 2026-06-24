@@ -12,5 +12,8 @@ serde.workspace = true
 serde_json = { workspace = true }
 thiserror.workspace = true
 
+[features]
+video = ["bc-expr/video"]
+
 [lints]
 workspace = true

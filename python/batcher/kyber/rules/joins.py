@@ -23,7 +23,6 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase, RuleCategory
 from batcher.plan.expr_ir import (
-    AggExpr,
     Binary,
     Cast,
     Col,
@@ -39,11 +38,9 @@ from batcher.plan.expr_ir import (
 )
 from batcher.plan.logical import (
     Aggregate,
-    AggregateSpec,
     Distinct,
     Filter,
     Join,
-    JoinOutputCol,
     LogicalPlan,
     Project,
     Projection,
@@ -51,16 +48,51 @@ from batcher.plan.logical import (
 from batcher.plan.stats import ColumnStat, Provenance
 
 __all__ = [
-    "eager_aggregation",
     "eliminate_left_join",
+    "join_to_semijoin",
     "outer_to_inner_join",
     "runtime_join_filter",
 ]
 
-# Aggregates that are idempotent under row duplication, so pushing them below a join
-# is correct regardless of the join's fan-out (`min(min(x)) == min(x)` over dupes).
-# `sum`/`count`/`avg` are NOT — a fan-out of f would multiply them by f.
-_FANOUT_SAFE_AGGS = frozenset({"min", "max"})
+
+@rule(name="join_to_semijoin", phase=Phase.REWRITE, matches=(Distinct,))
+def join_to_semijoin(node: Distinct, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`Distinct(Project_left-only(Inner Join(L, R)))` → `Distinct(Project(SemiJoin(L, R)))`.
+
+    When a deduplicated projection over an inner join reads only the left side, the
+    right side is used purely to test existence — a semi-join. This is correct with no
+    uniqueness precondition: an inner join repeats each left row once per matching
+    right row, but the enclosing `Distinct` collapses those duplicates, so the result
+    equals the deduplicated left rows that have a match — exactly the semi-join. The
+    win is avoiding the inner join's fan-out (and materializing right columns). Returns
+    None unless the projection touches no right-side output column.
+    """
+    proj = node.input
+    if not isinstance(proj, Project):
+        return None
+    join = proj.input
+    if not isinstance(join, Join) or join.join_type != "inner":
+        return None
+    left_aliases = {o.alias for o in join.output if o.side == "left"}
+    right_aliases = {o.alias for o in join.output if o.side == "right"}
+    used: set[str] = set()
+    for item in proj.items:
+        used |= referenced_columns(item.expr)
+    if (used & right_aliases) or not (used <= left_aliases):
+        return None
+    # Semi-join output is the left-side columns the projection still needs (same aliases).
+    new_output = tuple(o for o in join.output if o.side == "left")
+    semi = Join(
+        join.left,
+        join.right,
+        join.left_keys,
+        join.right_keys,
+        "semi",
+        new_output,
+        join.strategy,
+    )
+    return Distinct(Project(semi, proj.items))
+
 
 # Comparisons and arithmetic propagate a null operand to a null result; boolean
 # `and`/`or` do not (three-valued logic: `true OR null = true`).
@@ -218,88 +250,6 @@ def _right_unique_on_keys(join: Join, ctx: OptimizerContext) -> bool:
         ):
             return True
     return False
-
-
-@rule(name="eager_aggregation", phase=Phase.REWRITE, matches=(Aggregate,))
-def eager_aggregation(node: Aggregate, ctx: OptimizerContext) -> LogicalPlan | None:
-    """Push a fan-out-safe partial aggregate below an inner join.
-
-    `Aggregate(group=G, [min/max(L.x)])(Join(L, R))` → the same aggregate over
-    `Join(Aggregate(L, group=G_L + keys, [min/max]), R)`. Pre-aggregating the join
-    side that the aggregate collapses shrinks the join's input. Restricted to
-    `min`/`max`, which are idempotent under the join's row duplication, so the
-    rewrite is correct for *any* fan-out (no uniqueness assumption needed).
-
-    Cost-gated: fires only when the pushed aggregate actually reduces the side's row
-    count (per the estimator's `ndv`) — which both avoids pessimizing a non-reducing
-    group-by and makes the rule idempotent (a second push finds no further
-    reduction). All aggregate inputs and group keys must be plain columns drawn from
-    the left side. Returns None otherwise.
-    """
-    join = node.input
-    if not isinstance(join, Join) or join.join_type != "inner" or not node.aggregates:
-        return None
-    out_map = {o.alias: o for o in join.output}
-    left_aliases = {a for a, o in out_map.items() if o.side == "left"}
-
-    left_group_sources: list[str] = []
-    for key in node.group_keys:
-        if not isinstance(key.expr, Col) or key.expr.name not in out_map:
-            return None  # only plain column group keys, drawn from the join output
-        if key.expr.name in left_aliases:
-            left_group_sources.append(out_map[key.expr.name].name)
-
-    agg_sources: list[str] = []
-    for spec in node.aggregates:
-        agg = spec.agg
-        if agg.func not in _FANOUT_SAFE_AGGS or not isinstance(agg.input, Col):
-            return None
-        if agg.input.name not in left_aliases or agg.input2 is not None:
-            return None
-        src = out_map[agg.input.name].name
-        if src in left_group_sources:
-            return None  # a column both grouped and aggregated — leave it alone
-        agg_sources.append(src)
-
-    # Build the pushed (partial) aggregate on the left input: group by the left group
-    # columns plus the join keys (needed for the join), aggregate the same way.
-    keep_sources: list[str] = list(dict.fromkeys([*left_group_sources, *join.left_keys]))
-    partial_keys = tuple(Projection(s, Col(s)) for s in keep_sources)
-    partials = tuple(
-        AggregateSpec(f"__eag_{i}", AggExpr(spec.agg.func, Col(src)))
-        for i, (spec, src) in enumerate(zip(node.aggregates, agg_sources, strict=True))
-    )
-    pushed = Aggregate(join.left, partial_keys, partials)
-
-    # Cost gate: fire only on a *measured* reduction (a learned `ndv`, not the
-    # estimator's default guess), so a stats-less plan never pushes a pointless
-    # group-by and a second push (already reduced) finds no further gain → no-op.
-    pushed_stats = ctx.estimator.estimate(pushed)
-    if pushed_stats.provenance is Provenance.DEFAULT:
-        return None
-    if not pushed_stats.rows < ctx.estimator.estimate(join.left).rows:
-        return None
-
-    # Rewrite the join output: keep right columns and the left columns the pushed
-    # aggregate still provides (group keys / join keys); drop aggregated-away columns;
-    # add the partial columns. Then combine the partials in the final aggregate.
-    provided = set(keep_sources) | {f"__eag_{i}" for i in range(len(partials))}
-    new_output = [o for o in join.output if o.side == "right" or o.name in provided]
-    new_output += [JoinOutputCol("left", f"__eag_{i}", f"__eag_{i}") for i in range(len(partials))]
-    new_join = Join(
-        pushed,
-        join.right,
-        join.left_keys,
-        join.right_keys,
-        "inner",
-        tuple(new_output),
-        join.strategy,
-    )
-    final_aggs = tuple(
-        AggregateSpec(spec.alias, AggExpr(spec.agg.func, Col(f"__eag_{i}")))
-        for i, spec in enumerate(node.aggregates)
-    )
-    return Aggregate(new_join, node.group_keys, final_aggs)
 
 
 def _null_propagating_cols(expr: Expr) -> set[str]:

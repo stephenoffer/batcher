@@ -43,12 +43,13 @@ def _inline_named_windows(node) -> None:
 def _window(ds: Dataset, projections) -> Dataset:
     """Apply window functions from the SELECT list, appending output columns.
 
-    Window items are grouped by their (partition_by, order_by) spec; each
-    distinct spec becomes one chained `ds.window(...)` call.
+    Window items are grouped by their (partition_by, order_by, frame) spec; each
+    distinct spec becomes one chained `ds.window(...)` call (one call carries a
+    single frame, so functions with different frames go to different calls).
     """
 
-    # Group window items by their (partition, order) spec, preserving order.
-    groups: list[tuple[tuple, tuple, dict]] = []
+    # Group window items by their (partition, order, frame) spec, preserving order.
+    groups: list[tuple[tuple, tuple, tuple | None, dict]] = []
     for p in projections:
         if not _is_window(p):
             continue
@@ -57,22 +58,85 @@ def _window(ds: Dataset, projections) -> Dataset:
         part = _window_partition(win)
         order = _window_order(win)
         func = _window_func(win, order)
+        frame = _resolve_frame(win)
 
-        key = (part, order)
-        for gpart, gorder, funcs in groups:
-            if (gpart, gorder) == key:
+        key = (part, order, frame)
+        for gpart, gorder, gframe, funcs in groups:
+            if (gpart, gorder, gframe) == key:
                 funcs[alias] = func
                 break
         else:
-            groups.append((part, order, {alias: func}))
+            groups.append((part, order, frame, {alias: func}))
 
-    for part, order, funcs in groups:
+    for part, order, frame, funcs in groups:
         ds = ds.window(
             partition_by=list(part),
             order_by=list(order),
             functions=funcs,
+            frame=frame,
         )
     return ds
+
+
+def _is_agg_window(win) -> bool:
+    """Whether the window function is an aggregate (frames apply to these only)."""
+    return type(win.this).__name__.lower() in {"sum", "avg", "min", "max", "count"}
+
+
+def _resolve_frame(win) -> tuple[int | None, int | None] | None:
+    """The explicit ROWS frame for this window, validated against what the engine
+    can honour. Aggregates take the frame; ranking / LAG / LEAD ignore it (as SQL
+    does); an explicit frame on FIRST_VALUE / LAST_VALUE — which SQL *does* honour
+    but the engine cannot yet — is rejected rather than silently mis-evaluated."""
+    frame = _window_frame(win)
+    if frame is None or _is_agg_window(win):
+        return frame
+    if type(win.this).__name__.lower() in {"firstvalue", "lastvalue"}:
+        raise NotImplementedError(
+            "explicit ROWS frames on FIRST_VALUE / LAST_VALUE are not supported yet"
+        )
+    return None  # ranking / LAG / LEAD: the frame is meaningless, ignore it
+
+
+def _window_frame(win) -> tuple[int | None, int | None] | None:
+    """Translate an explicit ``ROWS BETWEEN …`` frame to a ``(start, end)`` offset pair.
+
+    Returns ``None`` when there is no explicit frame (the default cumulative/whole
+    partition behavior is unchanged). Only ROWS frames are supported; an explicit
+    numeric RANGE/GROUPS frame raises, since the engine frame is row-indexed.
+    """
+    spec = win.args.get("spec")
+    if spec is None:
+        return None
+    kind = (spec.args.get("kind") or "").upper()
+    if kind != "ROWS":
+        if spec.args.get("start") is not None or spec.args.get("end") is not None:
+            raise NotImplementedError("only ROWS window frames are supported (not RANGE/GROUPS)")
+        return None
+    return (
+        _frame_bound(spec.args.get("start"), spec.args.get("start_side")),
+        _frame_bound(spec.args.get("end"), spec.args.get("end_side")),
+    )
+
+
+def _frame_bound(value, side) -> int | None:
+    """A frame bound → signed row offset: UNBOUNDED→None, CURRENT ROW→0, n P/F→∓n."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.upper()
+        if text == "UNBOUNDED":
+            return None
+        if text == "CURRENT ROW":
+            return 0
+        raise NotImplementedError(f"unsupported window frame bound {value!r}")
+    n = int(value.this)  # a numeric Literal node
+    sided = (side or "").upper()
+    if sided == "PRECEDING":
+        return -n
+    if sided == "FOLLOWING":
+        return n
+    raise NotImplementedError(f"window frame bound needs PRECEDING/FOLLOWING, got {side!r}")
 
 
 def _window_partition(win) -> tuple:

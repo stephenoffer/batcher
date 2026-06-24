@@ -113,7 +113,7 @@ def test_identity_does_not_require_backend_or_leak_creds() -> None:
 
 
 def test_require_driver_missing_raises_actionable() -> None:
-    with pytest.raises(BackendError, match=r"batcher\[mongo\]"):
+    with pytest.raises(BackendError, match=r"\[mongo\]"):
         require_driver("definitely_not_a_real_module_xyz", extra="mongo")
 
 
@@ -167,7 +167,7 @@ def test_missing_driver_raises_for_each(
         return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(builtins, "__import__", _block)
-    with pytest.raises(BackendError, match=rf"batcher\[{extra}\]"):
+    with pytest.raises(BackendError, match=rf"\[{extra}\]"):
         make()
 
 

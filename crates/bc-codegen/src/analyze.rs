@@ -170,6 +170,7 @@ pub(crate) fn analyze(
         Expr::IsNull { .. } => Err(CodegenError::Unsupported("is_null".into())),
         Expr::IsNotNull { .. } => Err(CodegenError::Unsupported("is_not_null".into())),
         Expr::IsNan { .. } => Err(CodegenError::Unsupported("is_nan".into())),
+        Expr::IsInf { .. } => Err(CodegenError::Unsupported("is_inf".into())),
         Expr::Case {
             branches,
             otherwise,
@@ -207,8 +208,15 @@ pub(crate) fn analyze(
         Expr::Str { .. } => Err(CodegenError::Unsupported("string function".into())),
         Expr::Date { .. } => Err(CodegenError::Unsupported("date function".into())),
         Expr::Image { .. } => Err(CodegenError::Unsupported("image function".into())),
+        Expr::Audio { .. } => Err(CodegenError::Unsupported("audio function".into())),
+        Expr::Video { .. } => Err(CodegenError::Unsupported("video function".into())),
         Expr::Coalesce { .. } => Err(CodegenError::Unsupported("coalesce".into())),
         Expr::Array { .. } => Err(CodegenError::Unsupported("array literal".into())),
+        Expr::Sequence { .. } => Err(CodegenError::Unsupported("sequence".into())),
+        Expr::ListSet { .. } => Err(CodegenError::Unsupported("list set op".into())),
+        Expr::ListTransform { .. } => Err(CodegenError::Unsupported("list transform".into())),
+        Expr::ListFilter { .. } => Err(CodegenError::Unsupported("list filter".into())),
+        Expr::MakeStruct { .. } => Err(CodegenError::Unsupported("struct construction".into())),
         Expr::ListJoin { .. } => Err(CodegenError::Unsupported("list join".into())),
         Expr::Math { func, input } => {
             use bc_expr::MathFunc::*;
@@ -261,11 +269,16 @@ pub(crate) fn analyze(
         Expr::ListGet { .. } => Err(CodegenError::Unsupported("list index".into())),
         Expr::StructField { .. } => Err(CodegenError::Unsupported("struct field".into())),
         Expr::ListContains { .. } => Err(CodegenError::Unsupported("list contains".into())),
+        Expr::ListPosition { .. } => Err(CodegenError::Unsupported("list position".into())),
+        Expr::Map { .. } => Err(CodegenError::Unsupported("map function".into())),
         Expr::ListSlice { .. } => Err(CodegenError::Unsupported("list slice".into())),
         Expr::DateTrunc { .. } => Err(CodegenError::Unsupported("date_trunc".into())),
         Expr::Strftime { .. } => Err(CodegenError::Unsupported("strftime".into())),
+        Expr::ConvertTimezone { .. } => Err(CodegenError::Unsupported("convert_timezone".into())),
         Expr::Strptime { .. } => Err(CodegenError::Unsupported("strptime".into())),
         Expr::ListBinary { .. } => Err(CodegenError::Unsupported("list binary op".into())),
         Expr::DateOffset { .. } => Err(CodegenError::Unsupported("offset_by".into())),
+        Expr::WindowStart { .. } => Err(CodegenError::Unsupported("window_start".into())),
+        Expr::WindowBuckets { .. } => Err(CodegenError::Unsupported("window_buckets".into())),
     }
 }

@@ -290,7 +290,8 @@ def run_relational(
     ctx: ExecutionContext,
     *,
     distributed: bool = False,
-) -> tuple[pa.Table, list[BuildSideDecision]]:
+    materialize: bool = True,
+) -> tuple[pa.Table | Source, list[BuildSideDecision]]:
     """Run one relational (non-UDF) plan through Kyber → Carbonite → Core.
 
     Returns the materialized result and the optimizer's per-join build-side
@@ -324,17 +325,18 @@ def run_relational(
         from batcher import dist
 
         envelope = rm.scheduling_envelope(opt, ctx.num_workers)
-        table = dist.execute_distributed(
+        result = dist.execute_distributed(
             plan,
             sources,
             ctx.num_workers,
             transport=ctx.transport,
             envelope=envelope,
             hub=ctx.hub,
+            materialize=materialize,
         )
         # Core collects metadata on every path so later plans improve with use.
         _collect_source_metadata(ctx.hub, sources)
-        return table, decisions
+        return result, decisions
 
     # Carbonite decides out-of-core: if the estimated working set won't fit the
     # memory envelope (admission counter-offer or the spill estimate), run the

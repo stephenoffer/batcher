@@ -34,6 +34,9 @@ pub enum ExprError {
     #[error("image decode failed: {0}")]
     ImageDecode(String),
 
+    #[error("{func} requires building the engine with the `{feature}` cargo feature")]
+    FeatureDisabled { func: String, feature: &'static str },
+
     #[error(transparent)]
     Arrow(#[from] ArrowError),
 }

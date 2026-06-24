@@ -9,6 +9,6 @@ working.
 
 from __future__ import annotations
 
-from batcher._sql.parser.translator import sql
+from batcher._sql.parser.translator import sql, translate_ast
 
-__all__ = ["sql"]
+__all__ = ["sql", "translate_ast"]

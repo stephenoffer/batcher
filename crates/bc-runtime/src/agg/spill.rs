@@ -220,7 +220,7 @@ pub fn combine_finalize_spilling(
         let partials: Vec<Partial> = batches
             .iter()
             .map(|b| unpack_partial(b, n_keys, funcs))
-            .collect();
+            .collect::<Result<_, _>>()?;
         let merged = combine(&partials, funcs)?;
         let aggs = finalize(funcs, &merged)?;
         group_parts.push(merged.group_columns);
@@ -264,20 +264,36 @@ fn pack_partial(p: &Partial) -> Result<RecordBatch, RuntimeError> {
 
 /// Rebuild a [`Partial`] from a [`pack_partial`] batch using the key arity and the
 /// per-aggregate state arity (which `funcs` determines).
-fn unpack_partial(b: &RecordBatch, n_keys: usize, funcs: &[AggFunc]) -> Partial {
+///
+/// Validates the batch's column count against the packed format (`n_keys + Σ arity`)
+/// before slicing, so a truncated or otherwise malformed spill batch surfaces a
+/// typed [`RuntimeError::MalformedPartial`] instead of panicking on an out-of-range
+/// slice.
+fn unpack_partial(
+    b: &RecordBatch,
+    n_keys: usize,
+    funcs: &[AggFunc],
+) -> Result<Partial, RuntimeError> {
+    let arities: Vec<usize> = funcs.iter().map(|f| f.state_arity()).collect();
+    let expected = n_keys + arities.iter().sum::<usize>();
+    if b.num_columns() != expected {
+        return Err(RuntimeError::MalformedPartial {
+            expected,
+            got: b.num_columns(),
+        });
+    }
     let cols = b.columns();
     let group_columns = cols[..n_keys].to_vec();
     let mut states = Vec::with_capacity(funcs.len());
     let mut idx = n_keys;
-    for &f in funcs {
-        let arity = f.state_arity();
+    for arity in arities {
         states.push(cols[idx..idx + arity].to_vec());
         idx += arity;
     }
-    Partial {
+    Ok(Partial {
         group_columns,
         states,
-    }
+    })
 }
 
 /// Partition a packed partial's rows by a stable hash of its group-key columns.
@@ -339,6 +355,23 @@ mod tests {
     }
     fn i64s(v: &[i64]) -> ArrayRef {
         Arc::new(Int64Array::from(v.to_vec()))
+    }
+
+    /// A truncated spilled partial (fewer columns than `n_keys + Σ arity`) is
+    /// rejected with a typed error rather than panicking on an out-of-range slice.
+    #[test]
+    fn unpack_rejects_malformed_partial() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        // n_keys=1 + Sum(1) + CountStar(1) = 3 expected; give a 1-column batch.
+        let funcs = [AggFunc::Sum, AggFunc::CountStar];
+        let schema = Arc::new(Schema::new(vec![Field::new("g0", DataType::Int64, true)]));
+        let bad = RecordBatch::try_new(schema, vec![i64s(&[1])]).unwrap();
+        match unpack_partial(&bad, 1, &funcs) {
+            Err(RuntimeError::MalformedPartial { expected, got }) => {
+                assert_eq!((expected, got), (3, 1))
+            }
+            _ => panic!("expected Err(MalformedPartial)"),
+        }
     }
 
     const FUNCS: [AggFunc; 6] = [

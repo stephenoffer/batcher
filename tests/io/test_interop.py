@@ -16,16 +16,59 @@ import pytest
 from batcher.io.interop import (
     from_arrow,
     from_huggingface,
+    from_items,
     from_numpy,
     from_pandas,
     from_polars,
     from_pydict,
+    from_pylist,
+    from_ray_dataset,
 )
 from batcher.io.source import Source
 
 
 def _table(source: Source) -> pa.Table:
     return pa.Table.from_batches(source.read(), schema=source.schema())
+
+
+def test_from_pylist_row_oriented():
+    src = from_pylist([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}, {"a": 3}])
+    assert isinstance(src, Source)
+    table = _table(src)
+    assert table.column("a").to_pylist() == [1, 2, 3]
+    assert table.column("b").to_pylist() == ["x", "y", None]  # missing key -> null
+
+
+def test_from_items_scalars_and_dicts():
+    scalars = _table(from_items([1, 2, 3]))
+    assert scalars.column_names == ["item"]
+    assert scalars.column("item").to_pylist() == [1, 2, 3]
+
+    dicts = _table(from_items([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]))
+    assert dicts.column("a").to_pylist() == [1, 2]
+    assert dicts.column("b").to_pylist() == ["x", "y"]
+
+    named = _table(from_items(["x", "y"], column="word"))
+    assert named.column("word").to_pylist() == ["x", "y"]
+
+
+def test_from_ray_dataset_streams_blocks():
+    pytest.importorskip("ray", reason="ray not installed")
+    import ray
+    import ray.data
+
+    ray.init(
+        include_dashboard=False,
+        ignore_reinit_error=True,
+        configure_logging=False,
+        log_to_driver=False,
+    )
+    rds = ray.data.from_arrow(pa.table({"k": [1, 2, 3, 4], "v": [10, 20, 30, 40]}))
+    src = from_ray_dataset(rds)
+    assert isinstance(src, Source)
+    table = _table(src)
+    assert sorted(table.column("v").to_pylist()) == [10, 20, 30, 40]
+    assert src.schema().names == ["k", "v"]
 
 
 def test_from_arrow_table_roundtrip():
@@ -75,9 +118,15 @@ def test_from_numpy_2d_fixed_size_list():
     assert got.column("emb").to_pylist() == [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]
 
 
-def test_from_numpy_3d_raises():
-    with pytest.raises(ValueError, match="1-D or 2-D"):
-        from_numpy(np.zeros((2, 2, 2)))
+def test_from_numpy_3d_is_tensor_column():
+    # A rank->=2-per-row array becomes a fixed-shape-tensor column (the ML tensor path).
+    from batcher.io.formats.ml.tensor import is_tensor_column
+
+    src = from_numpy(np.zeros((4, 2, 2, 3), dtype=np.uint8))
+    table = _table(src)
+    field = table.schema.field("data")
+    assert is_tensor_column(field.type)
+    assert field.type.shape == [2, 2, 3]
 
 
 def test_from_pandas_roundtrip():
@@ -118,5 +167,5 @@ def test_optional_adapter_missing_dep_raises_backenderror(monkeypatch):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _no_polars)
-    with pytest.raises(BackendError, match="batcher\\[polars\\]"):
+    with pytest.raises(BackendError, match=r"\[polars\]"):
         from_polars(object())

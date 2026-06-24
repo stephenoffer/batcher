@@ -28,7 +28,8 @@ use rayon::prelude::*;
 
 use crate::error::InterpError;
 use crate::join_par::{
-    broadcast_join, is_skewed_bucket, skew_salting_eligible, spilling_hash_join,
+    broadcast_join, is_skewed_bucket, is_skewed_bucket_bytes, skew_salting_eligible,
+    spilling_asof_join, spilling_hash_join,
 };
 use crate::metrics::{ExecMetrics, IdGen, OpMetric};
 use crate::ops;
@@ -289,6 +290,9 @@ fn exec(
                 .par_iter()
                 .map(|b| ops::project_batch_jit(b, exprs, &jits))
                 .collect::<Result<_, InterpError>>()?;
+            // A projection can add a wide column (a large string, an embedding, a
+            // decoded image), so re-bound the output to the byte budget.
+            let out = ops::remorselize(out, opts.morsel_target());
             push_metric(m, op_id, "project", rows_in, &out, t0, false, backend);
             Ok(out)
         }
@@ -305,7 +309,26 @@ fn exec(
                 .par_iter()
                 .map(|b| ops::unnest_batch(b, column, alias))
                 .collect::<Result<_, InterpError>>()?;
+            // Unnest multiplies rows (a list of N explodes one row into N), so a
+            // within-budget input morsel can produce an over-budget output morsel.
+            let out = ops::remorselize(out, opts.morsel_target());
             push_metric(m, op_id, "unnest", rows_in, &out, t0, false, "interp");
+            Ok(out)
+        }
+
+        RelOp::RowId {
+            input,
+            alias,
+            offset,
+        } => {
+            // A global sequential counter, so the id pass is single-threaded over the
+            // ordered upstream morsels — identical to the sequential path. (The
+            // upstream still runs in parallel; only the cheap id fill is serial.)
+            let parts = exec(input, sources, opts, m, ids)?;
+            let rows_in = count_rows(&parts);
+            let t0 = Instant::now();
+            let out = ops::add_row_ids(&parts, alias, *offset)?;
+            push_metric(m, op_id, "row_id", rows_in, &out, t0, false, "interp");
             Ok(out)
         }
 
@@ -323,6 +346,9 @@ fn exec(
                 .par_iter()
                 .map(|b| ops::unpivot_batch(b, index, on, variable_name, value_name))
                 .collect::<Result<_, InterpError>>()?;
+            // Unpivot stacks `on` columns into rows, multiplying row count, so
+            // re-bound the output to the byte budget.
+            let out = ops::remorselize(out, opts.morsel_target());
             push_metric(m, op_id, "unpivot", rows_in, &out, t0, false, "interp");
             Ok(out)
         }
@@ -379,11 +405,32 @@ fn exec(
                 Admit::Spill => {
                     let sp = opts.agg_spill.as_ref().expect("spill implies an envelope");
                     spilled = true;
-                    let p = grace_partitions(&partials, sp.memory_budget_bytes);
-                    let dir = sp.dir.join(format!("agg-{p}p"));
-                    let mut store = DiskSpillStore::new(dir, p)?;
-                    let res = combine_finalize_spilling(partials, &funcs, &mut store)?;
-                    (res.group_columns, res.agg_columns)
+                    // A lone median/quantile, n_unique, or mode spills out-of-core
+                    // with bounded memory (their per-group value list can exceed memory
+                    // on a hot key); every other aggregate uses the in-memory grace
+                    // path. An aggregate has exactly one func, so at most one dispatch
+                    // does work — the rest return `None` in O(1).
+                    let bounded =
+                        ops::try_bounded_quantile_spill(&parts, group_keys, aggregates, &sp.dir)?
+                            .or(ops::try_bounded_distinct_spill(
+                                &parts, group_keys, aggregates, &sp.dir,
+                            )?)
+                            .or(ops::try_bounded_mode_spill(
+                                &parts, group_keys, aggregates, &sp.dir,
+                            )?)
+                            .or(ops::try_bounded_histogram_spill(
+                                &parts, group_keys, aggregates, &sp.dir,
+                            )?);
+                    match bounded {
+                        Some((gc, ac)) => (gc, ac),
+                        None => {
+                            let p = grace_partitions(&partials, sp.memory_budget_bytes);
+                            let mut store =
+                                DiskSpillStore::new(sp.dir.join(format!("agg-{p}p")), p)?;
+                            let res = combine_finalize_spilling(partials, &funcs, &mut store)?;
+                            (res.group_columns, res.agg_columns)
+                        }
+                    }
                 }
                 Admit::InMemory(_reservation) => {
                     let merged = agg::combine(&partials, &funcs)?;
@@ -547,26 +594,65 @@ fn exec(
             let t0 = Instant::now();
             let left = ops::materialize(&left_batches)?;
             let right = ops::materialize(&right_batches)?;
+            let mut spilled = false;
             let out = if left_by.is_empty() {
+                // A keyless ASOF needs one global order on `on`, so it cannot
+                // grace-partition. If a memory envelope is configured and the inputs
+                // exceed it, fail loudly with a typed error rather than risk an OOM
+                // (mirrors the no-PARTITION-BY window). With no envelope (the default)
+                // it runs in memory exactly as before.
+                let bytes = left.get_array_memory_size() + right.get_array_memory_size();
+                if let Some(sp) = opts.agg_spill.as_ref() {
+                    if bytes > sp.memory_budget_bytes {
+                        return Err(InterpError::MemoryBudgetExceeded {
+                            needed: bytes,
+                            budget: sp.memory_budget_bytes,
+                            reason: "keyless ASOF join needs one global order and cannot spill",
+                        });
+                    }
+                }
                 vec![ops::asof_join_batches(
                     &left, &right, left_on, right_on, left_by, right_by, *backward, output,
                 )?]
             } else {
-                let p = rayon::current_num_threads().max(1);
-                let li = ops::key_indices(&left, left_by)?;
-                let ri = ops::key_indices(&right, right_by)?;
-                let lb = shuffle::partition_by_keys(&left, &li, p)?;
-                let rb = shuffle::partition_by_keys(&right, &ri, p)?;
-                (0..p)
-                    .into_par_iter()
-                    .map(|i| {
-                        ops::asof_join_batches(
-                            &lb[i], &rb[i], left_on, right_on, left_by, right_by, *backward, output,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, InterpError>>()?
+                // Spill to a grace ASOF join when the larger side exceeds the budget
+                // or the shared pool can't admit it; otherwise join each co-partitioned
+                // bucket in memory. Both yield the same relation.
+                let bytes = left
+                    .get_array_memory_size()
+                    .max(right.get_array_memory_size());
+                let static_over = opts
+                    .agg_spill
+                    .as_ref()
+                    .is_some_and(|sp| bytes > sp.memory_budget_bytes);
+                match admit(opts, bytes, static_over) {
+                    Admit::Spill => {
+                        let sp = opts.agg_spill.as_ref().expect("spill implies an envelope");
+                        spilled = true;
+                        spilling_asof_join(
+                            &left, &right, left_on, right_on, left_by, right_by, *backward, output,
+                            sp,
+                        )?
+                    }
+                    Admit::InMemory(_reservation) => {
+                        let p = rayon::current_num_threads().max(1);
+                        let li = ops::key_indices(&left, left_by)?;
+                        let ri = ops::key_indices(&right, right_by)?;
+                        let lb = shuffle::partition_by_keys(&left, &li, p)?;
+                        let rb = shuffle::partition_by_keys(&right, &ri, p)?;
+                        (0..p)
+                            .into_par_iter()
+                            .map(|i| {
+                                ops::asof_join_batches(
+                                    &lb[i], &rb[i], left_on, right_on, left_by, right_by,
+                                    *backward, output,
+                                )
+                            })
+                            .collect::<Result<Vec<_>, InterpError>>()?
+                    }
+                }
             };
-            push_metric(m, op_id, "asof_join", rows_in, &out, t0, false, "interp");
+            push_metric(m, op_id, "asof_join", rows_in, &out, t0, spilled, "interp");
             Ok(out)
         }
 
@@ -634,14 +720,19 @@ fn exec(
             // Every bucket still computes the same relation.
             let salt = skew_salting_eligible(*join_type);
             let driving_is_right = matches!(*join_type, bc_ir::JoinType::Right);
-            let driving = |bucket: &RecordBatch| bucket.num_rows();
-            let avg = if driving_is_right {
-                right.num_rows()
-            } else {
-                left.num_rows()
-            } / p.max(1);
-            let bucket_driving = |i: usize| driving(if driving_is_right { &rb[i] } else { &lb[i] });
-            let skewed_any = salt && (0..p).any(|i| is_skewed_bucket(bucket_driving(i), avg));
+            let driving_bucket = |i: usize| if driving_is_right { &rb[i] } else { &lb[i] };
+            let driving_side = if driving_is_right { &right } else { &left };
+            let avg = driving_side.num_rows() / p.max(1);
+            let avg_bytes = driving_side.get_array_memory_size() / p.max(1);
+            // Hot by rows OR by bytes: a hot key of wide rows concentrates work even
+            // at a modest row count, which the row-only test cannot see. Salting is
+            // result-invisible, so widening the trigger never changes the output.
+            let is_hot = |i: usize| {
+                let b = driving_bucket(i);
+                is_skewed_bucket(b.num_rows(), avg)
+                    || is_skewed_bucket_bytes(b.get_array_memory_size(), avg_bytes)
+            };
+            let skewed_any = salt && (0..p).any(is_hot);
 
             // Per-bucket join honors the planner's strategy (hash or sort-merge);
             // equal keys share a bucket, so the union of per-bucket joins is the
@@ -649,7 +740,7 @@ fn exec(
             let out: Vec<RecordBatch> = (0..p)
                 .into_par_iter()
                 .map(|i| -> Result<Vec<RecordBatch>, InterpError> {
-                    if salt && is_skewed_bucket(bucket_driving(i), avg) {
+                    if salt && is_hot(i) {
                         broadcast_join(&lb[i], &rb[i], left_keys, right_keys, *join_type, output)
                     } else {
                         Ok(vec![ops::join_batches(
@@ -959,6 +1050,385 @@ mod tests {
         let par2 = execute_parallel(&plan, &[many]).unwrap();
         assert_eq!(rows(&seq), rows(&par1));
         assert_eq!(rows(&seq), rows(&par2));
+    }
+
+    /// `{k -> median*1000 (rounded), or a sentinel for a null result}` from an
+    /// aggregate result of `[k:i64, m:f64]`, for order-independent comparison.
+    fn quantile_by_key(batches: &[RecordBatch]) -> std::collections::BTreeMap<i64, i64> {
+        use arrow::array::Float64Array;
+        let mut map = std::collections::BTreeMap::new();
+        for b in batches {
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let m = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                let v = if m.is_null(i) {
+                    i64::MIN // sentinel: null quantile (all-null group)
+                } else {
+                    (m.value(i) * 1000.0).round() as i64
+                };
+                map.insert(k.value(i), v);
+            }
+        }
+        map
+    }
+
+    fn median_plan(q_param: Option<f64>) -> RelOp {
+        use bc_expr::Expr;
+        use bc_ir::{AggFunc, AggregateItem, ProjectionItem};
+        let (func, param) = match q_param {
+            None => (AggFunc::Median, None),
+            Some(q) => (AggFunc::Quantile, Some(q)),
+        };
+        RelOp::Aggregate {
+            input: Box::new(RelOp::Scan { source_id: 0 }),
+            group_keys: vec![ProjectionItem {
+                expr: Expr::Col { name: "k".into() },
+                alias: "k".into(),
+            }],
+            aggregates: vec![AggregateItem {
+                func,
+                input: Some(Expr::Col { name: "v".into() }),
+                input2: None,
+                param,
+                alias: "m".into(),
+            }],
+        }
+    }
+
+    /// A `[k:i64 (non-null), v:i64 (nullable)]` batch.
+    fn nbatch(ks: &[i64], vs: &[Option<i64>]) -> RecordBatch {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ]);
+        RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![
+                std::sync::Arc::new(Int64Array::from(ks.to_vec())),
+                std::sync::Arc::new(Int64Array::from(vs.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The bounded out-of-core median (forced via a tiny spill budget) must equal the
+    /// in-memory median exactly — including a hot key, nulls, and an all-null group.
+    #[test]
+    fn spilling_median_matches_in_memory() {
+        let plan = median_plan(None);
+        // Hot key 0 dominates (200 values, each of 0..49 four times → median 24.5);
+        // cold keys; a key with a null value (ignored); an all-null group (→ null).
+        let mut ks: Vec<i64> = Vec::new();
+        let mut vs: Vec<Option<i64>> = Vec::new();
+        for i in 0..200i64 {
+            ks.push(0);
+            vs.push(Some(i % 50));
+        }
+        for v in [Some(3), Some(1), Some(2)] {
+            ks.push(1);
+            vs.push(v);
+        }
+        for v in [Some(10), None, Some(30)] {
+            // non-null {10,30} → median 20
+            ks.push(2);
+            vs.push(v);
+        }
+        for _ in 0..2 {
+            ks.push(3);
+            vs.push(None); // all-null group → null median
+        }
+        let data = vec![nbatch(&ks, &vs)];
+
+        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("bc_med_spill_{}", std::process::id()));
+        let opts = ExecOptions {
+            agg_spill: Some(SpillOptions {
+                memory_budget_bytes: 1, // force the bounded out-of-core path
+                dir,
+            }),
+            morsel_rows: 8, // many morsels → many spilled runs
+            ..ExecOptions::default()
+        };
+        let spilled = execute_parallel_with(&plan, &[data], &opts).unwrap();
+        assert_eq!(quantile_by_key(&seq), quantile_by_key(&spilled));
+    }
+
+    /// The bounded out-of-core n_unique (COUNT DISTINCT, forced via a tiny spill
+    /// budget) must equal the in-memory n_unique exactly — including a hot key with
+    /// many duplicates, nulls (excluded), and an all-null group (→ 0).
+    #[test]
+    fn spilling_n_unique_matches_in_memory() {
+        use bc_expr::Expr;
+        use bc_ir::{AggFunc, AggregateItem, ProjectionItem};
+
+        let plan = RelOp::Aggregate {
+            input: Box::new(RelOp::Scan { source_id: 0 }),
+            group_keys: vec![ProjectionItem {
+                expr: Expr::Col { name: "k".into() },
+                alias: "k".into(),
+            }],
+            aggregates: vec![AggregateItem {
+                func: AggFunc::CountDistinct,
+                input: Some(Expr::Col { name: "v".into() }),
+                input2: None,
+                param: None,
+                alias: "nd".into(),
+            }],
+        };
+        // Hot key 0: values 0..49 repeated 4× → 50 distinct. Cold key 1: {1,1,2} → 2.
+        // Key 2: {10, null, 30} → 2 (null excluded). Key 3: all null → 0.
+        let mut ks: Vec<i64> = Vec::new();
+        let mut vs: Vec<Option<i64>> = Vec::new();
+        for i in 0..200i64 {
+            ks.push(0);
+            vs.push(Some(i % 50));
+        }
+        for v in [Some(1), Some(1), Some(2)] {
+            ks.push(1);
+            vs.push(v);
+        }
+        for v in [Some(10), None, Some(30)] {
+            ks.push(2);
+            vs.push(v);
+        }
+        for _ in 0..2 {
+            ks.push(3);
+            vs.push(None);
+        }
+        let data = vec![nbatch(&ks, &vs)];
+
+        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("bc_ndistinct_spill_{}", std::process::id()));
+        let opts = ExecOptions {
+            agg_spill: Some(SpillOptions {
+                memory_budget_bytes: 1, // force the bounded out-of-core path
+                dir,
+            }),
+            morsel_rows: 8, // many morsels → many spilled runs
+            ..ExecOptions::default()
+        };
+        let spilled = execute_parallel_with(&plan, &[data], &opts).unwrap();
+        assert_eq!(count_by_key(&seq), count_by_key(&spilled));
+        // Sanity: the expected distinct counts.
+        let expected: std::collections::BTreeMap<i64, i64> =
+            [(0, 50), (1, 2), (2, 2), (3, 0)].into_iter().collect();
+        assert_eq!(count_by_key(&seq), expected);
+    }
+
+    fn count_by_key(batches: &[RecordBatch]) -> std::collections::BTreeMap<i64, i64> {
+        let mut map = std::collections::BTreeMap::new();
+        for b in batches {
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let c = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                map.insert(k.value(i), c.value(i));
+            }
+        }
+        map
+    }
+
+    /// The bounded out-of-core mode (forced via a tiny spill budget) must equal the
+    /// in-memory mode exactly — most frequent value, ties → smallest, nulls excluded,
+    /// all-null group → null.
+    #[test]
+    fn spilling_mode_matches_in_memory() {
+        use bc_expr::Expr;
+        use bc_ir::{AggFunc, AggregateItem, ProjectionItem};
+
+        let plan = RelOp::Aggregate {
+            input: Box::new(RelOp::Scan { source_id: 0 }),
+            group_keys: vec![ProjectionItem {
+                expr: Expr::Col { name: "k".into() },
+                alias: "k".into(),
+            }],
+            aggregates: vec![AggregateItem {
+                func: AggFunc::Mode,
+                input: Some(Expr::Col { name: "v".into() }),
+                input2: None,
+                param: None,
+                alias: "mo".into(),
+            }],
+        };
+        // key 0: 5 appears most (→ 5). key 1: 1,1,2,2 tie → smallest (1).
+        // key 2: {10, null, 30} each once → tie → smallest non-null (10).
+        // key 3: all null → null.
+        let mut ks: Vec<i64> = Vec::new();
+        let mut vs: Vec<Option<i64>> = Vec::new();
+        for v in [Some(5), Some(5), Some(5), Some(1), Some(1), Some(2)] {
+            ks.push(0);
+            vs.push(v);
+        }
+        for v in [Some(1), Some(1), Some(2), Some(2)] {
+            ks.push(1);
+            vs.push(v);
+        }
+        for v in [Some(10), None, Some(30)] {
+            ks.push(2);
+            vs.push(v);
+        }
+        for _ in 0..2 {
+            ks.push(3);
+            vs.push(None);
+        }
+        let data = vec![nbatch(&ks, &vs)];
+
+        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("bc_mode_spill_{}", std::process::id()));
+        let opts = ExecOptions {
+            agg_spill: Some(SpillOptions {
+                memory_budget_bytes: 1, // force the bounded out-of-core path
+                dir,
+            }),
+            morsel_rows: 4, // many morsels → many spilled runs (runs span batches)
+            ..ExecOptions::default()
+        };
+        let spilled = execute_parallel_with(&plan, &[data], &opts).unwrap();
+        assert_eq!(mode_by_key(&seq), mode_by_key(&spilled));
+        let expected: std::collections::BTreeMap<i64, Option<i64>> =
+            [(0, Some(5)), (1, Some(1)), (2, Some(10)), (3, None)]
+                .into_iter()
+                .collect();
+        assert_eq!(mode_by_key(&seq), expected);
+    }
+
+    fn mode_by_key(batches: &[RecordBatch]) -> std::collections::BTreeMap<i64, Option<i64>> {
+        let mut map = std::collections::BTreeMap::new();
+        for b in batches {
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let mo = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                let v = if mo.is_null(i) {
+                    None
+                } else {
+                    Some(mo.value(i))
+                };
+                map.insert(k.value(i), v);
+            }
+        }
+        map
+    }
+
+    /// The bounded out-of-core histogram (forced via a tiny spill budget) must equal
+    /// the in-memory histogram exactly — distinct value→count maps, nulls excluded,
+    /// all-null group → null map.
+    #[test]
+    fn spilling_histogram_matches_in_memory() {
+        use bc_expr::Expr;
+        use bc_ir::{AggFunc, AggregateItem, ProjectionItem};
+
+        let plan = RelOp::Aggregate {
+            input: Box::new(RelOp::Scan { source_id: 0 }),
+            group_keys: vec![ProjectionItem {
+                expr: Expr::Col { name: "k".into() },
+                alias: "k".into(),
+            }],
+            aggregates: vec![AggregateItem {
+                func: AggFunc::Histogram,
+                input: Some(Expr::Col { name: "v".into() }),
+                input2: None,
+                param: None,
+                alias: "h".into(),
+            }],
+        };
+        // key 0: {5:3, 1:2, 2:1}. key 1: {1:2, 2:2}. key 2: {10:1, 30:1} (null skipped).
+        // key 3: all null → null map.
+        let mut ks: Vec<i64> = Vec::new();
+        let mut vs: Vec<Option<i64>> = Vec::new();
+        for v in [Some(5), Some(5), Some(5), Some(1), Some(1), Some(2)] {
+            ks.push(0);
+            vs.push(v);
+        }
+        for v in [Some(1), Some(1), Some(2), Some(2)] {
+            ks.push(1);
+            vs.push(v);
+        }
+        for v in [Some(10), None, Some(30)] {
+            ks.push(2);
+            vs.push(v);
+        }
+        for _ in 0..2 {
+            ks.push(3);
+            vs.push(None);
+        }
+        let data = vec![nbatch(&ks, &vs)];
+
+        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("bc_hist_spill_{}", std::process::id()));
+        let opts = ExecOptions {
+            agg_spill: Some(SpillOptions {
+                memory_budget_bytes: 1,
+                dir,
+            }),
+            morsel_rows: 4,
+            ..ExecOptions::default()
+        };
+        let spilled = execute_parallel_with(&plan, &[data], &opts).unwrap();
+        assert_eq!(histogram_by_key(&seq), histogram_by_key(&spilled));
+        let mut expected: std::collections::BTreeMap<i64, Option<Vec<(i64, i64)>>> =
+            std::collections::BTreeMap::new();
+        expected.insert(0, Some(vec![(1, 2), (2, 1), (5, 3)]));
+        expected.insert(1, Some(vec![(1, 2), (2, 2)]));
+        expected.insert(2, Some(vec![(10, 1), (30, 1)]));
+        expected.insert(3, None);
+        assert_eq!(histogram_by_key(&seq), expected);
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn histogram_by_key(
+        batches: &[RecordBatch],
+    ) -> std::collections::BTreeMap<i64, Option<Vec<(i64, i64)>>> {
+        use arrow::array::MapArray;
+        let mut out = std::collections::BTreeMap::new();
+        for b in batches {
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let m = b.column(1).as_any().downcast_ref::<MapArray>().unwrap();
+            for i in 0..b.num_rows() {
+                let entry = if m.is_null(i) {
+                    None
+                } else {
+                    let s = m.value(i);
+                    let keys = s.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                    let vals = s.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                    let mut pairs: Vec<(i64, i64)> = (0..keys.len())
+                        .map(|j| (keys.value(j), vals.value(j)))
+                        .collect();
+                    pairs.sort();
+                    Some(pairs)
+                };
+                out.insert(k.value(i), entry);
+            }
+        }
+        out
+    }
+
+    /// Same, for a non-median continuous quantile (q = 0.25).
+    #[test]
+    fn spilling_quantile_matches_in_memory() {
+        let plan = median_plan(Some(0.25));
+        let mut ks: Vec<i64> = Vec::new();
+        let mut vs: Vec<Option<i64>> = Vec::new();
+        for i in 0..120i64 {
+            ks.push(0);
+            vs.push(Some(i));
+        }
+        for v in [Some(5), Some(15), Some(25), Some(35)] {
+            ks.push(1);
+            vs.push(v);
+        }
+        let data = vec![nbatch(&ks, &vs)];
+        let seq = execute(&plan, &[data.clone()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("bc_q_spill_{}", std::process::id()));
+        let opts = ExecOptions {
+            agg_spill: Some(SpillOptions {
+                memory_budget_bytes: 1,
+                dir,
+            }),
+            morsel_rows: 7,
+            ..ExecOptions::default()
+        };
+        let spilled = execute_parallel_with(&plan, &[data], &opts).unwrap();
+        assert_eq!(quantile_by_key(&seq), quantile_by_key(&spilled));
     }
 
     /// Unnest explodes a list column into one row per element (dropping null/empty
@@ -1473,6 +1943,92 @@ mod tests {
         let seq = execute(&plan, &[left.clone(), right.clone()]).unwrap();
         let par = execute_parallel(&plan, &[left, right]).unwrap();
         assert_eq!(rows(&seq), rows(&par));
+    }
+
+    /// Grace ASOF join (forced by a tiny budget → both sides partitioned to disk and
+    /// joined one bucket pair at a time) must equal the in-memory ASOF — the
+    /// mergeable-spill invariant for the new bounded-memory ASOF path.
+    #[test]
+    fn spilling_asof_join_matches_in_memory() {
+        use bc_ir::{JoinOutputCol, JoinSide};
+
+        let plan = RelOp::AsofJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_on: "v".into(),
+            right_on: "v".into(),
+            left_by: vec!["k".into()],
+            right_by: vec!["k".into()],
+            backward: true,
+            output: vec![
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "k".into(),
+                    alias: "k".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "v".into(),
+                    alias: "lv".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Right,
+                    name: "v".into(),
+                    alias: "rv".into(),
+                },
+            ],
+        };
+        // Several `by` groups so partitioning spreads them across buckets.
+        let left = vec![batch(&[1, 1, 2, 3, 4, 5], &[10, 25, 40, 5, 7, 9])];
+        let right = vec![batch(&[1, 1, 2, 3, 4], &[5, 20, 30, 1, 8])];
+        let in_mem = execute(&plan, &[left.clone(), right.clone()]).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("bc_asof_spill_{}", std::process::id()));
+        let opts = ExecOptions {
+            agg_spill: Some(SpillOptions {
+                memory_budget_bytes: 1, // force grace partitioning
+                dir,
+            }),
+            ..ExecOptions::default()
+        };
+        let spilled = execute_parallel_with(&plan, &[left, right], &opts).unwrap();
+        assert_eq!(rows(&in_mem), rows(&spilled), "spilled ASOF mismatch");
+    }
+
+    /// A keyless ASOF over a configured envelope it exceeds fails loudly with a typed
+    /// error (it cannot grace-partition), instead of risking an OOM.
+    #[test]
+    fn keyless_asof_over_budget_errors() {
+        use bc_ir::{JoinOutputCol, JoinSide};
+
+        let plan = RelOp::AsofJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_on: "v".into(),
+            right_on: "v".into(),
+            left_by: vec![],
+            right_by: vec![],
+            backward: true,
+            output: vec![JoinOutputCol {
+                side: JoinSide::Left,
+                name: "v".into(),
+                alias: "lv".into(),
+            }],
+        };
+        let left = vec![batch(&[1, 2, 3], &[10, 20, 30])];
+        let right = vec![batch(&[1, 2, 3], &[5, 15, 25])];
+        let opts = ExecOptions {
+            agg_spill: Some(SpillOptions {
+                memory_budget_bytes: 1, // any real input exceeds this
+                dir: std::env::temp_dir(),
+            }),
+            ..ExecOptions::default()
+        };
+        let err = execute_parallel_with(&plan, &[left, right], &opts).unwrap_err();
+        assert!(
+            matches!(err, InterpError::MemoryBudgetExceeded { .. }),
+            "expected MemoryBudgetExceeded, got {err:?}"
+        );
     }
 
     /// External merge sort (tiny budget + tiny morsels → many spilled runs, then a

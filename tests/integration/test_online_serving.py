@@ -32,7 +32,7 @@ def _serve_installed() -> bool:
 
 @pytest.mark.skipif(_serve_installed(), reason="ray serve installed; guard not exercised")
 def test_requires_serve_extra_when_absent():
-    with pytest.raises(BackendError, match="batcher\\[serve\\]"):
+    with pytest.raises(BackendError, match=r"\[serve\]"):
         serve_deployment(_build)
 
 

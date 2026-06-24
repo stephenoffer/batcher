@@ -24,28 +24,41 @@ from batcher.plan.logical.base import LogicalPlan, _validate_refs
 __all__ = ["Window", "WindowFrame", "WindowFuncSpec"]
 
 
+_FRAME_UNITS = ("rows", "range", "groups")
+
+
 @dataclass(frozen=True, slots=True)
 class WindowFrame:
-    """An explicit ``ROWS`` window frame.
+    """An explicit window frame.
 
-    `start` and `end` are signed row offsets from the current row: negative =
+    `start` and `end` are signed offsets from the current row: negative =
     *preceding*, ``0`` = current row, positive = *following*; ``None`` = unbounded
-    (`UNBOUNDED PRECEDING` for `start`, `UNBOUNDED FOLLOWING` for `end`). For
-    example ``WindowFrame(-2, 0)`` is ``ROWS BETWEEN 2 PRECEDING AND CURRENT ROW``
-    (a trailing 3-row window). Only ``ROWS`` frames are supported; the default
-    (no frame) is SQL's ``RANGE`` running/whole-partition frame.
+    (`UNBOUNDED PRECEDING` for `start`, `UNBOUNDED FOLLOWING` for `end`). `units`
+    selects how the offsets are counted:
+
+    - ``"rows"`` (default) — physical rows. ``WindowFrame(-2, 0)`` is
+      ``ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`` (a trailing 3-row window).
+    - ``"groups"`` — peer groups (rows sharing an ORDER BY value).
+      ``WindowFrame(-1, 0, "groups")`` covers the current peer group and the one
+      before it.
+    - ``"range"`` — value-based peers; only peer bounds (current row / unbounded)
+      are honored, e.g. ``WindowFrame(None, 0, "range")``. A numeric ``range``
+      offset falls back to the default running frame.
     """
 
     start: int | None
     end: int | None
+    units: str = "rows"
 
     def __post_init__(self) -> None:
+        if self.units not in _FRAME_UNITS:
+            raise PlanError(f"window frame units must be one of {_FRAME_UNITS}, got {self.units!r}")
         if self.start is not None and self.end is not None and self.start > self.end:
             raise PlanError(f"window frame start {self.start} is after end {self.end}")
 
     def to_ir(self) -> dict[str, Any]:
         return {
-            "units": "rows",
+            "units": self.units,
             "start": _bound_ir(self.start, preceding=True),
             "end": _bound_ir(self.end, preceding=False),
         }

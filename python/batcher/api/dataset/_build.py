@@ -38,7 +38,7 @@ def build_window(
     partition_by: list[str | Expr],
     order_by: list[str | tuple[str, bool] | Expr],
     functions: dict[str, str | tuple[str, str]],
-    frame: tuple[int | None, int | None] | None,
+    frame: tuple[int | None, int | None] | tuple[int | None, int | None, str] | None,
 ) -> Dataset:
     """Construct a `Window` node (see `Dataset.window` for the contract)."""
     if not functions:
@@ -82,6 +82,39 @@ def build_window(
             )
 
     return ds._derive(Window(ds._plan, part_keys, tuple(order_specs), tuple(specs)))
+
+
+_RANDOM_MODULUS = 2147483647  # 2^31 - 1 (prime): the uniform denominator.
+
+
+def build_with_random(ds: Dataset, name: str, *, seed: int, normal: bool) -> Dataset:
+    """Add a reproducible pseudo-random column keyed by ``(seed, row index)``.
+
+    Pure desugaring: a `with_row_index` provides a stable per-row key, an xxhash of
+    ``seed:salt:index`` provides a well-distributed integer, and that maps to a
+    uniform ``[0, 1)`` (or, with `normal`, a standard normal via Box-Muller from two
+    independent hashes). Keyed on the stable index, so it is reproducible and matches
+    on the single-node and parallel paths.
+    """
+    from batcher.plan.expr_ir import Col, lit
+    from batcher.plan.functions.string import concat_ws
+
+    rid = f"__bc_random_idx_{name}"
+
+    def uniform_int(salt: str) -> Expr:
+        keyed = concat_ws(":", lit(f"{seed}:{salt}"), Col(rid).cast("string"))
+        h = keyed.str.xxhash64()  # well-distributed Int64
+        return ((h % _RANDOM_MODULUS) + _RANDOM_MODULUS) % _RANDOM_MODULUS  # [0, M)
+
+    if normal:
+        import math
+
+        u1 = (uniform_int("a") + 1).cast("float64") / float(_RANDOM_MODULUS + 1)  # (0, 1]
+        u2 = uniform_int("b").cast("float64") / float(_RANDOM_MODULUS)  # [0, 1)
+        expr = (-2.0 * u1.ln()).sqrt() * (2.0 * math.pi * u2).cos()  # Box-Muller
+    else:
+        expr = uniform_int("u").cast("float64") / float(_RANDOM_MODULUS)  # [0, 1)
+    return ds.with_row_index(rid).with_columns(**{name: expr}).drop(rid)
 
 
 def build_fill_null(ds: Dataset, value: Any | dict[str, Any]) -> Dataset:
@@ -217,6 +250,45 @@ def build_explode(ds: Dataset, column: str, alias: str | None) -> Dataset:
     if column not in ds.columns:
         raise PlanError(f"explode(): unknown column {column!r}")
     return ds._derive(Unnest(ds._plan, column, alias or column))
+
+
+def build_session_window(
+    ds: Dataset, time_col: str, gap: str, partition_by: list[str], aggs: dict[str, Any]
+) -> Dataset:
+    """Session-window aggregation (Spark ``session_window``) with no new operator.
+
+    A session groups consecutive events (per `partition_by`) whose gap is below
+    `gap`. Computed by composing existing ops: order by event time, mark a *new
+    session* where the gap to the previous event exceeds `gap` (or it is the first),
+    assign a session id as the running sum of those markers, then group by
+    ``partition_by + session_id`` — emitting ``session_start``/``session_end`` and the
+    requested aggregates. All row work is the existing window + group-by engine.
+    """
+    from batcher.plan.expr_ir import col
+    from batcher.plan.functions.temporal import _duration_micros
+
+    if time_col not in ds.columns:
+        raise PlanError(f"session_window(): unknown time column {time_col!r}")
+    if not aggs:
+        raise PlanError("session_window() requires at least one named aggregate")
+    gap_us = _duration_micros(gap, arg="session gap")
+    pk = list(partition_by)
+    order = [(time_col, False)]
+    # Epoch micros for gap arithmetic and min/max (the engine has no Timestamp min/max).
+    s = ds.with_columns(_t=col(time_col).cast("int64"))
+    s = build_window(
+        s, partition_by=pk, order_by=order, functions={"_prev": ("lag", "_t", 1)}, frame=None
+    )
+    new_session = ((col("_t") - col("_prev") > gap_us) | col("_prev").is_null()).cast("int64")
+    s = s.with_columns(_new=new_session)
+    s = build_window(
+        s, partition_by=pk, order_by=order, functions={"_sid": ("sum", "_new")}, frame=None
+    )
+    grouped = s.group_by(*pk, "_sid").agg(_ss=col("_t").min(), _se=col("_t").max(), **aggs)
+    out = grouped.with_columns(
+        session_start=col("_ss").cast("timestamp"), session_end=col("_se").cast("timestamp")
+    )
+    return out.select(*pk, "session_start", "session_end", *aggs.keys())
 
 
 def build_unnest(ds: Dataset, columns: str | list[str]) -> Dataset:

@@ -16,29 +16,25 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray,
+    ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
     TimestampMicrosecondArray,
 };
-use arrow::compute::kernels::boolean;
-use arrow::compute::kernels::zip::zip;
-use arrow::compute::{cast_with_options, is_not_null, is_null, CastOptions};
 use serde::Deserialize;
 
 mod error;
 pub use error::ExprError;
 
+// The per-variant evaluation bodies (and `Expr::eval` itself) live in `eval`; the
+// wire-contract enum definitions stay here in `lib.rs`.
 mod eval;
-use eval::binary::{as_bool, coerce_numeric, eval_binary, try_scalar_binary};
-use eval::date::{
-    eval_date, eval_date_offset, eval_date_trunc, eval_strftime, eval_strptime, parse_dtype,
-};
-use eval::image::eval_image;
-use eval::list::{
-    eval_array, eval_list, eval_list_binary, eval_list_contains, eval_list_get, eval_list_join,
-    eval_struct_field, rebuild_list, require_list,
-};
-use eval::math::{eval_coalesce, eval_extreme, eval_is_nan, eval_math, eval_math2};
-use eval::str::eval_str;
+
+/// One named field of a `MakeStruct` — a field name paired with the sub-expression
+/// whose per-row value populates it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NamedExpr {
+    pub name: String,
+    pub value: Box<Expr>,
+}
 
 /// A scalar expression over the columns of a record batch.
 ///
@@ -82,6 +78,11 @@ pub enum Expr {
     /// so the `x != x` trick cannot detect NaN. The JIT falls back to interpret it.
     IsNan { input: Box<Expr> },
 
+    /// IEEE infinity predicate (true where a float value is `+inf` or `-inf`;
+    /// null → null). A first-class op because `±inf` literals do not survive the
+    /// JSON IR, so a comparison against them cannot express this. The JIT falls back.
+    IsInf { input: Box<Expr> },
+
     /// SQL CASE: the first branch whose `when` is true yields its `then`,
     /// otherwise `otherwise`.
     Case {
@@ -123,12 +124,59 @@ pub enum Expr {
         height: Option<i64>,
     },
 
+    /// An audio decode op over a binary (audio-bytes) sub-expression. Library-backed
+    /// (symphonia), so the JIT falls back to this interpreter path (like `Image`).
+    Audio {
+        #[serde(rename = "fn")]
+        func: AudioFunc,
+        input: Box<Expr>,
+    },
+
+    /// A video decode op over a binary (video-bytes) sub-expression. Backed by the
+    /// system FFmpeg behind the `video` feature; without it, evaluation errors. The
+    /// JIT falls back to this interpreter path.
+    Video {
+        #[serde(rename = "fn")]
+        func: VideoFunc,
+        input: Box<Expr>,
+    },
+
     /// First non-null among the sub-expressions, per row (SQL COALESCE).
     Coalesce { inputs: Vec<Expr> },
 
     /// An array literal `[e0, e1, …]` — each row becomes a `List` of the
     /// per-row element values (all elements coerced to a common type).
     Array { elements: Vec<Expr> },
+
+    /// `sequence(start, stop, step)` — the integer series from `start` to `stop`
+    /// **inclusive**, stepping by `step` (Spark `sequence`). → `List<Int64>`.
+    Sequence {
+        start: Box<Expr>,
+        stop: Box<Expr>,
+        step: Box<Expr>,
+    },
+
+    /// A set operation between two `List` columns (`array_intersect`/`array_except`):
+    /// the distinct left elements that are present in / absent from the right list.
+    ListSet {
+        #[serde(rename = "fn")]
+        op: ListSetOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+
+    /// `list.transform(func)` — apply the element sub-expression `func` (which reads
+    /// the reserved `element` column) to every list element, preserving lengths.
+    ListTransform { input: Box<Expr>, func: Box<Expr> },
+
+    /// `list.filter(pred)` — keep the elements where the boolean element predicate
+    /// `pred` (reading the reserved `element` column) is true.
+    ListFilter { input: Box<Expr>, pred: Box<Expr> },
+
+    /// Struct construction (SQL `struct_pack` / Spark `struct`) — each row becomes a
+    /// `Struct` with the named fields, each field's value being the per-row value of
+    /// its sub-expression. The read-side counterpart is `StructField`.
+    MakeStruct { fields: Vec<NamedExpr> },
 
     /// A unary math function over a numeric sub-expression.
     Math {
@@ -173,6 +221,20 @@ pub enum Expr {
     /// `list.contains(value)` — true where any element equals the literal. → Bool.
     ListContains { input: Box<Expr>, value: Literal },
 
+    /// `list.position(value)` — the 1-based index of the first element equal to the
+    /// literal; null if absent (DuckDB `list_position`). → Int64.
+    ListPosition { input: Box<Expr>, value: Literal },
+
+    /// Map accessors over a `Map` column: `map_keys`/`map_values` (→ `List`) or
+    /// `element_at` (per-row value for a literal `key`, null if absent).
+    Map {
+        #[serde(rename = "fn")]
+        func: MapFunc,
+        input: Box<Expr>,
+        #[serde(default)]
+        key: Option<Literal>,
+    },
+
     /// `list.slice(offset, length)` — the 0-based sub-range of each row's `List`.
     ListSlice {
         input: Box<Expr>,
@@ -188,6 +250,14 @@ pub enum Expr {
     /// `strftime(ts, format)` — format a Date/Timestamp with a chrono/strftime
     /// `format` string (e.g. `%Y-%m-%d`). Null instants format to null. → Utf8.
     Strftime { input: Box<Expr>, format: String },
+
+    /// `convert_timezone(from_tz, to_tz, ts)` — shift each naive timestamp's
+    /// wall-clock from `from_tz` to `to_tz` (DST-aware). → Timestamp(us).
+    ConvertTimezone {
+        input: Box<Expr>,
+        from_tz: String,
+        to_tz: String,
+    },
 
     /// `strptime(s, format)` — parse a Utf8 column into a Timestamp(microsecond)
     /// using a chrono/strftime `format`. Unparseable values → NULL (DuckDB
@@ -212,6 +282,29 @@ pub enum Expr {
     /// `list_join(list, sep)` — concatenate each row's `List` elements (cast to
     /// Utf8, nulls skipped) with `separator` → Utf8. Backs SQL `string_agg`.
     ListJoin { input: Box<Expr>, separator: String },
+
+    /// `window_start(ts, width_micros, origin_micros)` — the start of the fixed-width
+    /// tumbling window containing each instant: `origin + ⌊(t−origin)/width⌋·width`
+    /// (floored, so negative instants land correctly). → Timestamp(us). Null → null.
+    /// The event-time window-assignment expression: a windowed aggregation is a
+    /// group-by on this key, so it reuses the existing mergeable aggregate.
+    WindowStart {
+        input: Box<Expr>,
+        width_micros: i64,
+        #[serde(default)]
+        origin_micros: i64,
+    },
+
+    /// `window_buckets(ts, width_micros, slide_micros)` — the starts of every sliding
+    /// window that contains each instant (`⌈width/slide⌉` of them) as a
+    /// `List<Timestamp(us)>`. Fan it out with `Unnest` to one row per window, then
+    /// group-by the start — sliding windows over the existing mergeable aggregate,
+    /// no new stateful operator. Null → null.
+    WindowBuckets {
+        input: Box<Expr>,
+        width_micros: i64,
+        slide_micros: i64,
+    },
 
     /// A pairwise reduction over two `List` columns of equal length per row
     /// (`dot`/`cosine_similarity`/`l2_distance`) → Float64. The vector-search
@@ -246,6 +339,12 @@ pub enum Math2Func {
     Atan2,
     /// `round(x, digits)` — round to `digits` decimal places.
     Round,
+    /// `gcd(a, b)` — greatest common divisor of two integers (DuckDB `gcd`).
+    Gcd,
+    /// `lcm(a, b)` — least common multiple of two integers (DuckDB `lcm`).
+    Lcm,
+    /// `hypot(a, b)` = sqrt(a² + b²), the Euclidean norm (DuckDB `hypot`).
+    Hypot,
 }
 
 /// Image decode operations for the `.image` namespace. `Decode` reads each
@@ -256,6 +355,52 @@ pub enum Math2Func {
 pub enum ImageFunc {
     Decode,
     ToTensor,
+    /// `resize(width, height)` → re-encoded PNG bytes at the new size (Daft
+    /// `image.resize`). Null/undecodable input → null. → Binary.
+    Resize,
+}
+
+/// Set operations between two `List` columns (the `.list` set methods). Wire tags
+/// are snake_case (`array_intersect` / `array_except`).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListSetOp {
+    #[serde(rename = "array_intersect")]
+    Intersect,
+    #[serde(rename = "array_except")]
+    Except,
+    #[serde(rename = "array_union")]
+    Union,
+}
+
+/// Audio-decode operations for the `.audio` namespace. `Decode` reads each clip's
+/// metadata into a struct; `ToWaveform` decodes to a mono `List<Float32>` signal.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioFunc {
+    Decode,
+    ToWaveform,
+}
+
+/// Video-decode operations for the `.video` namespace. `Decode` reads each clip's
+/// metadata into a struct. Requires the `video` cargo feature (system FFmpeg).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoFunc {
+    Decode,
+}
+
+/// Map-column accessors (over an Arrow `Map` column). Wire tags are snake_case (the
+/// contract with the Python `.map` namespace).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MapFunc {
+    /// `map_keys(m)` → `List<K>` of each row's keys (DuckDB `map_keys`).
+    MapKeys,
+    /// `map_values(m)` → `List<V>` of each row's values (DuckDB `map_values`).
+    MapValues,
+    /// `element_at(m, key)` → the value for the literal `key` (null if absent).
+    ElementAt,
 }
 
 /// Per-row scalar reductions over a `List` column. `len`/`n_unique` → Int64; the
@@ -297,6 +442,11 @@ pub enum ListFunc {
     /// Euclidean (L2) norm `sqrt(Σ xᵢ²)` of the non-null elements → Float64;
     /// empty/null row → null. The vector magnitude used in similarity search.
     L2Norm,
+    /// L2-normalize each row to unit length: `xᵢ / sqrt(Σ xⱼ²)` → `List<Float64>`.
+    /// A zero vector maps to all zeros (no division by zero); per-element nulls are
+    /// preserved and excluded from the norm; a null/empty row stays null/empty. The
+    /// standard preprocessing step before cosine/dot retrieval.
+    Normalize,
     /// Concatenate a `List<List<T>>` into a `List<T>` per row, in order (DuckDB
     /// `flatten`; Polars `list.explode`-free flatten). Null inner lists are skipped;
     /// a null outer row stays null. Element type `T` is preserved.
@@ -338,6 +488,11 @@ pub enum MathFunc {
     Radians,
     /// Cotangent (1/tan).
     Cot,
+    /// `n!` — factorial of a non-negative integer (DuckDB `factorial`). → Float64.
+    Factorial,
+    /// Population count: the number of set bits in the Int64 two's-complement value
+    /// (DuckDB `bit_count`). → Float64 (integral-valued).
+    BitCount,
 }
 
 /// String functions. `upper`/`lower` → Utf8; `len` → Int64; `contains`/
@@ -428,6 +583,38 @@ pub enum StrFunc {
     Like,
     /// SQL `ILIKE`: case-insensitive `LIKE`. → Boolean.
     Ilike,
+    /// MD5 digest of the UTF-8 bytes as lowercase hex (DuckDB `md5`). → Utf8.
+    Md5,
+    /// SHA-1 digest of the UTF-8 bytes as lowercase hex (DuckDB `sha1`). → Utf8.
+    Sha1,
+    /// SHA-256 digest of the UTF-8 bytes as lowercase hex (DuckDB `sha256`). → Utf8.
+    Sha256,
+    /// CRC-32 (IEEE) checksum of the UTF-8 bytes (Spark `crc32`). → Int64.
+    Crc32,
+    /// 64-bit xxHash of the UTF-8 bytes (the u64 digest reinterpreted as i64). The
+    /// fast non-cryptographic hash for bucketing/sharding. Null → null. → Int64.
+    #[serde(rename = "xxhash64")]
+    XxHash64,
+    /// `substring_index(s, delim, count)`: the substring before the `count`-th
+    /// (1-based) occurrence of `pattern` (the delimiter). `count > 0` counts from the
+    /// left, `count < 0` from the right (Spark `substring_index`; `start` carries
+    /// `count`). → Utf8.
+    SubstringIndex,
+    /// `overlay(s, replacement, pos, len)`: replace `length` characters starting at
+    /// 1-based `start` (`pos`) with `replacement` (SQL `OVERLAY`). `len` defaults to
+    /// the replacement's length. → Utf8.
+    Overlay,
+    /// Every match of regex `pattern` (capture group 0) as a `List<Utf8>` (DuckDB
+    /// `regexp_extract_all`; empty list if none, null input → null). → List<Utf8>.
+    RegexpExtractAll,
+    /// Number of non-overlapping matches of regex `pattern` (DuckDB `regexp_count`).
+    /// → Int64.
+    RegexpCount,
+    /// Levenshtein edit distance to the literal string `pattern` (DuckDB
+    /// `levenshtein` against a constant). → Int64.
+    Levenshtein,
+    /// American Soundex phonetic code, a 4-character key (DuckDB `soundex`). → Utf8.
+    Soundex,
 }
 
 /// Date/time field extractions (→ Int64). Wire tags are snake_case (the contract
@@ -531,224 +718,6 @@ pub enum BinaryOp {
     /// Add `right` calendar months to a Date32/Timestamp `left` (negative to
     /// subtract); used for `date + INTERVAL n MONTH/YEAR`.
     AddMonths,
-}
-
-impl Expr {
-    /// Evaluate the expression against `batch`, returning a full-length column.
-    pub fn eval(&self, batch: &RecordBatch) -> Result<ArrayRef, ExprError> {
-        match self {
-            Expr::Col { name } => batch
-                .column_by_name(name)
-                .cloned()
-                .ok_or_else(|| ExprError::UnknownColumn(name.clone())),
-            Expr::Lit { value } => Ok(value.to_array(batch.num_rows())),
-            Expr::Not { input } => {
-                let arr = input.eval(batch)?;
-                let b = as_bool(&arr, "not")?;
-                Ok(Arc::new(boolean::not(b)?))
-            }
-            Expr::Binary { op, left, right } => {
-                // Fast path: a numeric literal operand broadcasts as a scalar instead
-                // of materializing a full N-length array (bit-identical result).
-                if let Some(out) = try_scalar_binary(*op, left, right, batch)? {
-                    return Ok(out);
-                }
-                let l = left.eval(batch)?;
-                let r = right.eval(batch)?;
-                eval_binary(*op, &l, &r)
-            }
-            Expr::Cast {
-                input,
-                dtype,
-                try_cast,
-            } => {
-                let arr = input.eval(batch)?;
-                cast_expr(&arr, &parse_dtype(dtype)?, *try_cast)
-            }
-            Expr::IsNull { input } => Ok(Arc::new(is_null(&input.eval(batch)?)?)),
-            Expr::IsNotNull { input } => Ok(Arc::new(is_not_null(&input.eval(batch)?)?)),
-            Expr::IsNan { input } => eval_is_nan(&input.eval(batch)?),
-            Expr::Case {
-                branches,
-                otherwise,
-            } => {
-                // Fold from the default upward: later branches are overridden by
-                // earlier ones (first matching WHEN wins).
-                let mut acc = otherwise.eval(batch)?;
-                for branch in branches.iter().rev() {
-                    let mask_arr = branch.when.eval(batch)?;
-                    let mask = as_bool(&mask_arr, "case")?;
-                    // SQL CASE semantics: a WHEN that evaluates to NULL is *not*
-                    // taken (it falls through to ELSE), matching DuckDB. `zip` would
-                    // otherwise let a null mask pick the THEN branch, so collapse a
-                    // null mask element to false (true only where value AND valid).
-                    let mask = match mask.nulls() {
-                        Some(n) => BooleanArray::new(mask.values() & n.inner(), None),
-                        None => mask.clone(),
-                    };
-                    let then = branch.then.eval(batch)?;
-                    // `zip` requires matching branch types; coerce Int64/Float64
-                    // (and decimal) to a common numeric type the way COALESCE and
-                    // the binary ops do, so a `when(...).then(0).otherwise(x)` over a
-                    // float column (or `clip`/`fill_nan`) doesn't error on a mixed
-                    // int/float literal.
-                    let (then, acc_c) = coerce_numeric(&then, &acc)?;
-                    acc = zip(&mask, &then.as_ref(), &acc_c.as_ref())?;
-                }
-                Ok(acc)
-            }
-            Expr::Str {
-                func,
-                input,
-                pattern,
-                replacement,
-                start,
-                length,
-            } => {
-                let arr = input.eval(batch)?;
-                eval_str(
-                    *func,
-                    &arr,
-                    pattern.as_deref(),
-                    replacement.as_deref(),
-                    *start,
-                    *length,
-                )
-            }
-            Expr::Date { func, input } => {
-                let arr = input.eval(batch)?;
-                eval_date(*func, &arr)
-            }
-            Expr::Image {
-                func,
-                input,
-                width,
-                height,
-            } => {
-                let arr = input.eval(batch)?;
-                eval_image(*func, &arr, *width, *height)
-            }
-            Expr::Coalesce { inputs } => eval_coalesce(inputs, batch),
-            Expr::Array { elements } => eval_array(elements, batch),
-            Expr::ListJoin { input, separator } => eval_list_join(&input.eval(batch)?, separator),
-            Expr::Math { func, input } => {
-                let arr = input.eval(batch)?;
-                eval_math(*func, &arr)
-            }
-            Expr::List { func, input } => {
-                let arr = input.eval(batch)?;
-                eval_list(*func, &arr)
-            }
-            Expr::NullIf { left, right } => {
-                let l = left.eval(batch)?;
-                let r = right.eval(batch)?;
-                let eq = eval_binary(BinaryOp::Eq, &l, &r)?;
-                let mask = as_bool(&eq, "nullif")?;
-                Ok(arrow::compute::nullif(&l, mask)?)
-            }
-            Expr::Greatest { inputs } => eval_extreme(inputs, batch, true),
-            Expr::Least { inputs } => eval_extreme(inputs, batch, false),
-            Expr::Math2 { func, left, right } => {
-                let l = left.eval(batch)?;
-                let r = right.eval(batch)?;
-                eval_math2(*func, &l, &r)
-            }
-            Expr::ListGet { input, index } => {
-                let arr = input.eval(batch)?;
-                eval_list_get(&arr, *index)
-            }
-            Expr::StructField { input, field } => {
-                let arr = input.eval(batch)?;
-                eval_struct_field(&arr, field)
-            }
-            Expr::ListContains { input, value } => {
-                let arr = input.eval(batch)?;
-                eval_list_contains(&arr, value)
-            }
-            Expr::ListBinary { func, left, right } => {
-                let l = left.eval(batch)?;
-                let r = right.eval(batch)?;
-                eval_list_binary(*func, &l, &r)
-            }
-            Expr::DateTrunc { input, unit } => {
-                let arr = input.eval(batch)?;
-                eval_date_trunc(&arr, unit)
-            }
-            Expr::Strftime { input, format } => {
-                let arr = input.eval(batch)?;
-                eval_strftime(&arr, format)
-            }
-            Expr::Strptime { input, format } => {
-                let arr = input.eval(batch)?;
-                eval_strptime(&arr, format)
-            }
-            Expr::DateOffset {
-                input,
-                months,
-                days,
-                micros,
-            } => {
-                let arr = input.eval(batch)?;
-                eval_date_offset(&arr, *months, *days, *micros)
-            }
-            Expr::ListSlice {
-                input,
-                offset,
-                length,
-            } => {
-                let arr = input.eval(batch)?;
-                let list = require_list(&arr, "list.slice")?;
-                rebuild_list(list, |s, e| {
-                    let begin = (s as i64 + (*offset).max(0)).min(e as i64) as usize;
-                    let end = match length {
-                        Some(l) => (begin as i64 + (*l).max(0)).min(e as i64) as usize,
-                        None => e,
-                    };
-                    (begin..end).map(|k| k as u32).collect()
-                })
-            }
-        }
-    }
-}
-
-/// Cast `arr` to `target` with DuckDB float→int semantics. Arrow's float→int cast
-/// truncates toward zero; DuckDB rounds half-to-even (`cast(2.5)` = 2, `cast(3.5)`
-/// = 4), so float inputs are rounded to an integral value before the cast. All
-/// other casts defer to the arrow kernel unchanged. (The JIT never compiles
-/// float→int, so this interpreter-only behavior keeps tier parity intact.)
-///
-/// `try_cast` selects arrow's *safe* cast (a value that cannot be converted
-/// becomes NULL — DuckDB `TRY_CAST`); the strict default (`false`) errors on an
-/// invalid value (DuckDB `CAST`).
-fn cast_expr(
-    arr: &ArrayRef,
-    target: &arrow::datatypes::DataType,
-    try_cast: bool,
-) -> Result<ArrayRef, ExprError> {
-    use arrow::datatypes::DataType::{
-        Float16, Float32, Float64, Int16, Int32, Int64, Int8, UInt16, UInt32, UInt64, UInt8,
-    };
-    let opts = CastOptions {
-        safe: try_cast,
-        ..Default::default()
-    };
-    let int_target = matches!(
-        target,
-        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
-    );
-    let float_src = matches!(arr.data_type(), Float16 | Float32 | Float64);
-    if int_target && float_src {
-        // Round half-to-even first (DuckDB), then cast the now-integral floats.
-        let f = cast_with_options(arr, &Float64, &opts)?;
-        let f = f
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("cast to Float64 yields Float64Array");
-        let rounded: Float64Array = f.iter().map(|o| o.map(f64::round_ties_even)).collect();
-        let rounded: ArrayRef = Arc::new(rounded);
-        return Ok(cast_with_options(&rounded, target, &opts)?);
-    }
-    Ok(cast_with_options(arr, target, &opts)?)
 }
 
 impl Literal {

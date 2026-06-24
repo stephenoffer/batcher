@@ -88,8 +88,11 @@ def _projection_map(tr, ds: Dataset, projections) -> dict[str, Expr]:
         # all current columns. (Qualified `t.*` expands to every column; in a
         # single-table query that is exactly t's columns.)
         if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star)):
+            # Internal columns materialized by UDF hoisting (`__bc_…`) are an
+            # implementation detail and must never leak through `*`.
             for c in ds.columns:
-                named[c] = col(c)
+                if not c.startswith("__bc_"):
+                    named[c] = col(c)
             continue
         alias = _alias_of(p)
         if tr._is_window(p):

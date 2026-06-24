@@ -249,6 +249,8 @@ class Reader:
         *,
         version: int | None = None,
         timestamp: str | None = None,
+        stream: bool = False,
+        starting_version: int = 0,
         **opts: Any,
     ) -> Dataset:
         """Read a Delta Lake table by URI, defaulting to its latest version.
@@ -259,8 +261,28 @@ class Reader:
             table_uri: Path/URI of the Delta table root.
             version: Time-travel to this table version (exclusive with ``timestamp``).
             timestamp: Time-travel to the version current as of this ISO timestamp.
+            stream: Read the table as an unbounded stream of new commits (Spark
+                ``readStream``) instead of a snapshot — see `delta_stream`. Requires
+                ``delta.enableChangeDataFeed = true`` on the table.
+            starting_version: When streaming, the first version to read from (default 0).
         """
+        if stream:
+            return _read_table("delta_stream", table_uri, starting_version=starting_version, **opts)
         return _read_table("delta", table_uri, version=version, timestamp=timestamp, **opts)
+
+    def read_change_feed(
+        self, table_uri: str, *, starting_version: int = 0, **opts: Any
+    ) -> Dataset:
+        """Stream a Delta table's Change Data Feed (Databricks ``readChangeFeed``).
+
+        Yields row-level changes — ``_change_type`` (insert/update/delete),
+        ``_commit_version``, ``_commit_timestamp`` plus the data columns — for every
+        commit after `starting_version`, as an unbounded source. Requires
+        ``delta.enableChangeDataFeed = true`` on the table.
+        """
+        return _read_table(
+            "delta_stream", table_uri, starting_version=starting_version, change_feed=True, **opts
+        )
 
     def iceberg(
         self,

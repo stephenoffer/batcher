@@ -44,6 +44,7 @@ from batcher.plan.expr_ir import (
     StrFunc,
     StructField,
 )
+from batcher.plan.expr_ir.core import IsInf
 from batcher.plan.expr_ir.image import ImageFunc
 from batcher.plan.logical import (
     Aggregate,
@@ -126,6 +127,8 @@ def transform_expr_up(expr: Expr, rule: ExprRule) -> Expr:
         rebuilt = IsNotNull(transform_expr_up(expr.input, rule))
     elif isinstance(expr, IsNan):
         rebuilt = IsNan(transform_expr_up(expr.input, rule))
+    elif isinstance(expr, IsInf):
+        rebuilt = IsInf(transform_expr_up(expr.input, rule))
     elif isinstance(expr, MathExpr):
         rebuilt = MathExpr(expr.fn, transform_expr_up(expr.input, rule))
     elif isinstance(expr, DateFunc):

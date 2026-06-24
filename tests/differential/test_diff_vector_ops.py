@@ -53,6 +53,29 @@ def test_l2_distance_matches_duckdb(duck):
         assert x == pytest.approx(y)
 
 
+def test_normalize_produces_unit_vectors():
+    t = pa.table({"a": [[3.0, 4.0], [1.0, 2.0, 2.0], [0.0, 0.0]]})
+    got = bt.from_arrow(t).select(n=col("a").list.normalize()).to_pydict()["n"]
+    assert got[0] == pytest.approx([0.6, 0.8])
+    assert math.isclose(sum(x * x for x in got[1]), 1.0)  # unit length
+    assert got[2] == [0.0, 0.0]  # zero vector → zeros (no div-by-zero)
+
+
+def test_normalize_makes_dot_equal_cosine(duck):
+    # dot(normalize(a), normalize(b)) == cosine_similarity(a, b): cross-checks the new
+    # op against the existing cosine implementation (and DuckDB's).
+    t = _vecs()
+    duck.register("t", t)
+    got = (
+        bt.from_arrow(t)
+        .select(d=col("a").list.normalize().list.dot(col("b").list.normalize()))
+        .to_pydict()["d"]
+    )
+    exp = duck.sql("SELECT list_cosine_similarity(a, b) c FROM t").to_arrow_table().to_pydict()["c"]
+    for x, y in zip(got, exp, strict=True):
+        assert x == pytest.approx(y)
+
+
 def test_cosine_zero_norm_is_null():
     t = pa.table({"a": [[0.0, 0.0]], "b": [[1.0, 1.0]]})
     out = bt.from_arrow(t).select(c=col("a").list.cosine_similarity(col("b"))).to_pydict()["c"]

@@ -127,6 +127,8 @@ def _scalar(tr, node) -> Expr:
         if method is None:
             raise NotImplementedError(f"EXTRACT field {part!r} is not supported")
         return getattr(tr._scalar(node.expression).dt, method)()
+    if isinstance(node, exp.RegexpReplace):
+        return _regexp_replace(tr, node)
 
     # Date ± INTERVAL, date_add/date_sub, date_diff (DATE operands).
     if isinstance(node, (exp.Add, exp.Sub)) and isinstance(node.expression, exp.Interval):
@@ -148,6 +150,13 @@ def _scalar(tr, node) -> Expr:
     if fn is not None:
         return fn
 
+    # An unknown function call (parsed as Anonymous) is the most common cause —
+    # name it and point at registration rather than a generic node-type error.
+    if isinstance(node, exp.Anonymous):
+        raise NotImplementedError(
+            f"unknown function {node.name!r}: it is not a supported SQL function and "
+            f"is not registered (use bt.register_function to call a Python function)"
+        )
     raise NotImplementedError(f"unsupported SQL expression: {type(node).__name__}")
 
 
@@ -175,7 +184,8 @@ def _scalar_function(tr, node):
             return tr._scalar(value).log10()
         if isinstance(base, exp.Literal) and base.this == "2":
             return tr._scalar(value).log2()
-        raise NotImplementedError("only log base 10 / base 2 are supported")
+        # General base: log_b(x) = ln(x) / ln(b).
+        return tr._scalar(value).ln() / tr._scalar(base).ln()
     if name == "Trim":
         return tr._scalar(node.this).str.trim()
     if name == "Substring":
@@ -253,6 +263,20 @@ def _raw_value(node):
         return node.name
     text = node.name
     return float(text) if ("." in text or "e" in text.lower()) else int(text)
+
+
+def _regexp_replace(tr, node) -> Expr:
+    """`regexp_replace(s, pattern, replacement)` — replace the first match (DuckDB
+    default; constant pattern/replacement)."""
+    from sqlglot import expressions as exp
+
+    pat = node.expression
+    repl = node.args.get("replacement")
+    if not (isinstance(pat, exp.Literal) and pat.is_string):
+        raise NotImplementedError("regexp_replace requires a constant string pattern")
+    if not (isinstance(repl, exp.Literal) and repl.is_string):
+        raise NotImplementedError("regexp_replace requires a constant string replacement")
+    return tr._scalar(node.this).str.regexp_replace(pat.this, repl.this)
 
 
 def _date_diff(tr, node) -> Expr:

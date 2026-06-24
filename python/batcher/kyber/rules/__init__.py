@@ -9,6 +9,7 @@ new one imported here) — nothing else changes.
 
 from __future__ import annotations
 
+from batcher.kyber.rules import agg_pushdown as _agg_pushdown  # noqa: F401  (registers rules)
 from batcher.kyber.rules import algebraic as _algebraic  # noqa: F401  (registers rules on import)
 from batcher.kyber.rules import fusion as _fusion  # noqa: F401  (rule bodies)
 from batcher.kyber.rules import join_order as _join_order  # noqa: F401  (registers rules)

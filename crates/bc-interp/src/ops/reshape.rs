@@ -7,14 +7,42 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, GenericListArray, LargeListArray, ListArray, OffsetSizeTrait,
-    RecordBatch, StringArray, UInt32Array,
+    Array, ArrayRef, BooleanArray, GenericListArray, Int64Array, LargeListArray, ListArray,
+    OffsetSizeTrait, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::compute::{concat, filter_record_batch, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::row::{OwnedRow, RowConverter, SortField};
 
 use crate::error::InterpError;
+
+/// Append a sequential row-index column (`alias`) starting at `offset`, numbered in
+/// batch-arrival order across the whole input (Polars `with_row_index`). A single
+/// counter runs over the batches, so the result matches on the sequential and
+/// parallel paths whenever the upstream preserves row order.
+pub(crate) fn add_row_ids(
+    batches: &[RecordBatch],
+    alias: &str,
+    offset: i64,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    let mut next = offset;
+    let mut out = Vec::with_capacity(batches.len());
+    for b in batches {
+        let n = b.num_rows();
+        let ids: Int64Array = (next..next + n as i64).collect();
+        next += n as i64;
+        // Prepend the index column (Polars `with_row_index` convention).
+        let mut fields: Vec<Arc<Field>> = vec![Arc::new(Field::new(alias, DataType::Int64, false))];
+        fields.extend(b.schema().fields().iter().cloned());
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(ids)];
+        columns.extend(b.columns().iter().cloned());
+        out.push(RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            columns,
+        )?);
+    }
+    Ok(out)
+}
 
 /// Explode the list/array column `column` into one row per element, binding the
 /// element values to `alias`. The named column is replaced in place; every other

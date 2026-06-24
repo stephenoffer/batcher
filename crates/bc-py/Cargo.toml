@@ -23,5 +23,9 @@ pyo3.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
+[features]
+# Forward to the optional FFmpeg-backed video decode in bc-expr.
+video = ["bc-ir/video", "bc-interp/video"]
+
 [lints]
 workspace = true

@@ -34,6 +34,21 @@ pub enum InterpError {
     ThreadPool(usize),
 
     #[error(
+        "malformed partial-state batch: expected {expected} columns \
+         ({n_keys} group keys + {state} state), got {got}"
+    )]
+    MalformedPartial {
+        /// Total columns the wire format requires (`n_keys + Σ widths`).
+        expected: usize,
+        /// Group-key column count.
+        n_keys: usize,
+        /// Aggregate-state column count (`Σ widths`).
+        state: usize,
+        /// Columns actually present on the received batch.
+        got: usize,
+    },
+
+    #[error(
         "operator state ({needed} bytes) exceeds the memory budget ({budget} bytes) \
          and cannot spill: {reason}"
     )]

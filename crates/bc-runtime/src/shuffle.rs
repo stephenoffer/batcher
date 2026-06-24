@@ -140,6 +140,9 @@ pub fn salted_partition_by_keys(
 
     let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); num_partitions];
     let mut cursor: u32 = 0;
+    // Reused dedup marks (all-false between rows) so a replicated build row lands in
+    // each DISTINCT salt bucket exactly once — see the `replicate` branch.
+    let mut seen = vec![false; num_partitions];
     for i in 0..n {
         let kh = SEED.hash_one(rows.row(i));
         let is_hot = key_str
@@ -148,8 +151,20 @@ pub fn salted_partition_by_keys(
         if !is_hot {
             buckets[bucket_of(kh, num_partitions) as usize].push(i as u32);
         } else if replicate {
+            // Replicate the build hot row to each DISTINCT salt bucket once. When
+            // `salt_count > num_partitions` (or two salts simply collide), pushing
+            // per-salt would place the build row in one bucket multiple times, so the
+            // reducer joins each salted probe row against several copies and the join
+            // output is duplicated. Dedupe via `seen`, then restore it to all-false.
             for s in 0..salt_count {
-                buckets[bucket_of(salted_hash(kh, s), num_partitions) as usize].push(i as u32);
+                let b = bucket_of(salted_hash(kh, s), num_partitions) as usize;
+                if !seen[b] {
+                    seen[b] = true;
+                    buckets[b].push(i as u32);
+                }
+            }
+            for s in 0..salt_count {
+                seen[bucket_of(salted_hash(kh, s), num_partitions) as usize] = false;
             }
         } else {
             let s = cursor % salt_count;
@@ -317,6 +332,45 @@ mod tests {
         assert!(
             buckets_touched > 1,
             "hot key should spread across multiple buckets, got {buckets_touched}"
+        );
+    }
+
+    #[test]
+    fn salted_build_replication_dedupes_when_salt_exceeds_partitions() {
+        // Regression: with salt_count > num_partitions, distinct salts hash to the
+        // same bucket, so replicating the build hot row *per salt* put multiple copies
+        // in one bucket and the reducer doubled the join output. The build row must
+        // land in each distinct salt bucket exactly once.
+        let probe = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(Int64Array::from(vec![1i64; 50])) as ArrayRef,
+        )])
+        .unwrap();
+        let build = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(Int64Array::from(vec![1i64])) as ArrayRef, // one build row for the hot key
+        )])
+        .unwrap();
+        let hot: HashSet<String> = ["1".to_string()].into_iter().collect();
+        let n = 3usize; // fewer partitions than salts → guaranteed bucket collisions
+        let salt = 8u32;
+
+        let probe_parts = salted_partition_by_keys(&probe, &[0], n, &hot, salt, false).unwrap();
+        let build_parts = salted_partition_by_keys(&build, &[0], n, &hot, salt, true).unwrap();
+
+        // The salted per-bucket join must equal the whole-relation join (no dup rows).
+        let global = join_pairs(&probe, &build); // 50 probe × 1 build
+        let salted: usize = probe_parts
+            .iter()
+            .zip(&build_parts)
+            .map(|(p, b)| join_pairs(p, b))
+            .sum();
+        assert_eq!(salted, global, "salted join must equal the unsalted join");
+        // The single build row is replicated to at most `num_partitions` buckets.
+        let build_rows: usize = build_parts.iter().map(|b| b.num_rows()).sum();
+        assert!(
+            build_rows <= n,
+            "build row over-replicated: {build_rows} > {n}"
         );
     }
 

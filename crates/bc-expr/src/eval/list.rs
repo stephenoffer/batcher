@@ -220,7 +220,59 @@ pub(crate) fn eval_list_contains(arr: &ArrayRef, value: &Literal) -> Result<Arra
     Ok(Arc::new(b.finish()))
 }
 
+/// `list.position(value)` — the 1-based index of the first element equal to the
+/// literal `value`; null if absent or the list row is null (DuckDB `list_position`).
+/// → Int64.
+pub(crate) fn eval_list_position(arr: &ArrayRef, value: &Literal) -> Result<ArrayRef, ExprError> {
+    use arrow::array::{Array, Int64Builder};
+
+    let list = require_list(arr, "list.position")?;
+    let offsets = list.value_offsets();
+    let target = value.to_array(1);
+    let child = cast(list.values(), target.data_type())?;
+    let eqs = eval_binary(BinaryOp::Eq, &child, &value.to_array(child.len()))?;
+    let eq = eqs.as_any().downcast_ref::<BooleanArray>().expect("bool");
+
+    let mut b = Int64Builder::with_capacity(list.len());
+    for i in 0..list.len() {
+        if list.is_null(i) {
+            b.append_null();
+            continue;
+        }
+        let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
+        match (s..e).position(|k| eq.is_valid(k) && eq.value(k)) {
+            Some(p) => b.append_value((p + 1) as i64),
+            None => b.append_null(), // not found → null (DuckDB), not 0 (Spark)
+        }
+    }
+    Ok(Arc::new(b.finish()))
+}
+
 /// Extract field `name` from a `Struct` column, propagating struct-level nulls.
+/// Build a `Struct` column from named sub-expressions (one field per `NamedExpr`),
+/// each field carrying that expression's per-row value. The read-side counterpart
+/// is `eval_struct_field`.
+pub(crate) fn eval_make_struct(
+    fields: &[crate::NamedExpr],
+    batch: &RecordBatch,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::StructArray;
+    use arrow::datatypes::{Field, Fields};
+
+    let mut arrow_fields: Vec<Arc<Field>> = Vec::with_capacity(fields.len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let arr = f.value.eval(batch)?;
+        arrow_fields.push(Arc::new(Field::new(&f.name, arr.data_type().clone(), true)));
+        columns.push(arr);
+    }
+    Ok(Arc::new(StructArray::new(
+        Fields::from(arrow_fields),
+        columns,
+        None,
+    )))
+}
+
 pub(crate) fn eval_struct_field(arr: &ArrayRef, name: &str) -> Result<ArrayRef, ExprError> {
     use arrow::array::{Array, AsArray};
 
@@ -388,6 +440,37 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     // `flatten`: List<List<T>> → List<T>, concatenating each row's inner lists.
     if let ListFunc::Flatten = func {
         return eval_flatten(list);
+    }
+
+    // `normalize`: divide each row's elements by its L2 norm → List<Float64> (unit
+    // length). Zero vector → zeros; per-element nulls preserved; null/empty row kept.
+    if let ListFunc::Normalize = func {
+        use arrow::array::{Float64Builder, ListBuilder};
+        let child = cast(list.values(), &DataType::Float64)?;
+        let f = child.as_primitive::<arrow::datatypes::Float64Type>();
+        let mut b = ListBuilder::new(Float64Builder::new());
+        for i in 0..list.len() {
+            if list.is_null(i) {
+                b.append_null();
+                continue;
+            }
+            let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
+            let norm = (s..e)
+                .filter(|&k| f.is_valid(k))
+                .map(|k| f.value(k) * f.value(k))
+                .sum::<f64>()
+                .sqrt();
+            let vb = b.values();
+            for k in s..e {
+                if f.is_valid(k) {
+                    vb.append_value(if norm > 0.0 { f.value(k) / norm } else { 0.0 });
+                } else {
+                    vb.append_null();
+                }
+            }
+            b.append(true);
+        }
+        return Ok(Arc::new(b.finish()));
     }
 
     if let ListFunc::Len = func {
@@ -577,5 +660,29 @@ mod tests {
         let b = lists(&[Some(vec![1.0]), None]);
         let dot = eval_list_binary(ListBinaryFunc::Dot, &a, &b).unwrap();
         assert_eq!(f64s(&dot), vec![None, None]);
+    }
+
+    #[test]
+    fn normalize_to_unit_length() {
+        use arrow::array::{Array, AsArray};
+        let a = lists(&[
+            Some(vec![3.0, 4.0]),      // norm 5 -> [0.6, 0.8]
+            Some(vec![0.0, 0.0]),      // zero vector -> zeros
+            None,                      // null row stays null
+            Some(vec![1.0, 1.0, 1.0]), // unit -> each 1/sqrt(3)
+        ]);
+        let out = eval_list(ListFunc::Normalize, &a).unwrap();
+        let list = out.as_list::<i32>();
+        // Row 0: [0.6, 0.8], L2 norm == 1.
+        let r0 = f64s(&list.value(0));
+        assert!((r0[0].unwrap() - 0.6).abs() < 1e-9 && (r0[1].unwrap() - 0.8).abs() < 1e-9);
+        // Row 1: zero vector → zeros (no NaN from div-by-zero).
+        assert_eq!(f64s(&list.value(1)), vec![Some(0.0), Some(0.0)]);
+        // Row 2: null preserved.
+        assert!(list.is_null(2));
+        // Row 3: unit length.
+        let r3 = f64s(&list.value(3));
+        let norm: f64 = r3.iter().map(|v| v.unwrap().powi(2)).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-9);
     }
 }

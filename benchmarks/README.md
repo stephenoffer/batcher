@@ -175,3 +175,12 @@ so none are quoted here.
 `b/duck` is `batcher_ms / duckdb_ms` (lower means Batcher is faster). Timings vary
 run to run; treat them as order-of-magnitude. The status column is the gate: only
 `OK` rows have been verified to match the reference engine.
+
+## Daft head-to-head
+
+`daft_compare.py` runs core relational queries on Batcher vs Daft (and DuckDB/Polars)
+over the same synthetic data, correctness-gated against DuckDB, reporting best-of-5 ms
+and the Batcher/Daft ratio. **Build the release engine first** (`just build-release`).
+
+    python benchmarks/daft_compare.py [n_rows]
+

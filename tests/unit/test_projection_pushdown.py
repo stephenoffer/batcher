@@ -38,9 +38,26 @@ def test_join_prunes_each_side_keeping_keys():
     dept = bt.from_pydict({"dept_id": [10], "dept": ["eng"], "budget": [99]})
     ds = emp.join(dept, on="dept_id").select("name", "dept")
     req = _req(ds)
-    # Left side (source 0): name + the join key. Right side (source 1): dept + key.
-    assert req[0] == ["dept_id", "name"]
-    assert req[1] == ["dept", "dept_id"]  # budget pruned
+    # Each side's projection is in the source's *schema* order (not alphabetical),
+    # since it is read from the source as-is and sets the output column order.
+    # Left (source 0) schema [id, name, dept_id] → keep name + the join key.
+    assert req[0] == ["name", "dept_id"]
+    # Right (source 1) schema [dept_id, dept, budget] → keep key + dept (budget pruned).
+    assert req[1] == ["dept_id", "dept"]
+
+
+def test_collect_preserves_column_order():
+    # Regression: the per-source projection was `sorted(...)`, so every result's
+    # columns came back alphabetical instead of in query/schema order. The
+    # differential oracle reorders columns before comparing, so only an
+    # order-sensitive check like this catches it.
+    ds = bt.from_pydict({"zebra": [1], "apple": [2], "mango": [3]})
+    assert ds.collect().schema.names == ["zebra", "apple", "mango"]
+    assert ds.select("mango", "zebra").collect().schema.names == ["mango", "zebra"]
+    filtered = ds.filter(col("apple") > 0).select("zebra", "apple")
+    assert filtered.collect().schema.names == ["zebra", "apple"]
+    out = bt.sql("SELECT zebra, apple FROM t WHERE apple > 0", t=ds)
+    assert out.collect().schema.names == ["zebra", "apple"]
 
 
 def test_pushdown_does_not_change_results():

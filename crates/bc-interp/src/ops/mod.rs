@@ -30,9 +30,18 @@ use bc_runtime::window_frame;
 use crate::error::InterpError;
 
 mod joins;
+mod morsel;
+mod quantile_spill;
 mod reshape;
 pub(crate) use joins::{asof_join_batches, join_batches, key_indices};
-pub(crate) use reshape::{sample_batch, sample_n_batches, unnest_batch, unpivot_batch};
+pub(crate) use morsel::{morselize, remorselize};
+pub(crate) use quantile_spill::{
+    try_bounded_distinct_spill, try_bounded_histogram_spill, try_bounded_mode_spill,
+    try_bounded_quantile_spill,
+};
+pub(crate) use reshape::{
+    add_row_ids, sample_batch, sample_n_batches, unnest_batch, unpivot_batch,
+};
 
 // --- filter / project --------------------------------------------------------
 
@@ -215,6 +224,16 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
         AggFunc::Mode => agg::AggFunc::Mode,
         AggFunc::ArgMin => agg::AggFunc::ArgMin,
         AggFunc::ArgMax => agg::AggFunc::ArgMax,
+        AggFunc::Product => agg::AggFunc::Product,
+        AggFunc::BitAnd => agg::AggFunc::BitAnd,
+        AggFunc::BitOr => agg::AggFunc::BitOr,
+        AggFunc::BitXor => agg::AggFunc::BitXor,
+        AggFunc::CovarPop => agg::AggFunc::CovarPop,
+        AggFunc::CovarSamp => agg::AggFunc::CovarSamp,
+        AggFunc::Corr => agg::AggFunc::Corr,
+        AggFunc::Skewness => agg::AggFunc::Skewness,
+        AggFunc::Kurtosis => agg::AggFunc::Kurtosis,
+        AggFunc::Histogram => agg::AggFunc::Histogram,
     }
 }
 
@@ -282,6 +301,32 @@ pub(crate) fn external_merge_sort(
     keys: &[SortKey],
     dir: &std::path::Path,
 ) -> Result<Vec<RecordBatch>, InterpError> {
+    let Some(mut store) = external_sort_to_final_store(parts, keys, dir)? else {
+        return Ok(Vec::new());
+    };
+    // The final run holds the globally sorted result; stream its morsels out.
+    let mut out = Vec::new();
+    if let Some(reader) = store.open_reader(0).map_err(InterpError::from)? {
+        for batch in reader {
+            let batch = batch?;
+            if batch.num_rows() > 0 {
+                out.push(batch);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Spill + bounded multi-pass merge, returning the final [`DiskSpillStore`] whose
+/// partition 0 holds the globally sorted run (or `None` for empty input). The store
+/// is returned so a caller can stream the sorted output via `open_reader(0)` more
+/// than once (e.g. the two-pass spilling quantile) without materializing it. Memory
+/// is bounded throughout (one batch per run in flight); see [`external_merge_sort`].
+pub(crate) fn external_sort_to_final_store(
+    parts: Vec<RecordBatch>,
+    keys: &[SortKey],
+    dir: &std::path::Path,
+) -> Result<Option<bc_runtime::agg::spill::DiskSpillStore>, InterpError> {
     use bc_runtime::agg::spill::{DiskSpillStore, SpillStore};
 
     // Pass 0: sort each input morsel into a run and spill it, dropping each input
@@ -299,7 +344,7 @@ pub(crate) fn external_merge_sort(
         // `b` and `run` drop here — the input morsel's memory is released.
     }
     if n_runs == 0 {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     // Merge passes: each merges groups of <= FANIN runs into one larger (spilled) run,
@@ -324,18 +369,7 @@ pub(crate) fn external_merge_sort(
         store = next;
         n_runs = n_groups;
     }
-
-    // The final run holds the globally sorted result; stream its morsels out.
-    let mut out = Vec::new();
-    if let Some(reader) = store.open_reader(0).map_err(InterpError::from)? {
-        for batch in reader {
-            let batch = batch?;
-            if batch.num_rows() > 0 {
-                out.push(batch);
-            }
-        }
-    }
-    Ok(out)
+    Ok(Some(store))
 }
 
 /// A streaming reader over one spilled run's batches.
@@ -434,7 +468,9 @@ fn flush_selection(
         cols.push(interleave(&refs, sel)?);
     }
     let batch = RecordBatch::try_new(schema.clone(), cols)?;
-    store.append(out_partition, &batch).map_err(InterpError::from)?;
+    store
+        .append(out_partition, &batch)
+        .map_err(InterpError::from)?;
     sel.clear();
     Ok(())
 }
@@ -491,7 +527,11 @@ fn stream_merge_group(
         let n = cur[ri].as_ref().map_or(0, |b| b.num_rows());
         if idx[ri] < n {
             heap.push(Reverse((
-                cur_rows[ri].as_ref().expect("live cursor").row(idx[ri]).owned(),
+                cur_rows[ri]
+                    .as_ref()
+                    .expect("live cursor")
+                    .row(idx[ri])
+                    .owned(),
                 ri,
             )));
         } else {
@@ -638,21 +678,40 @@ fn map_window_func(f: WindowFn) -> window::WindowFn {
         WindowFn::LastValue => window::WindowFn::LastValue,
         WindowFn::Lag => window::WindowFn::Lag,
         WindowFn::Lead => window::WindowFn::Lead,
+        WindowFn::NthValue => window::WindowFn::NthValue,
     }
 }
 
-/// Map an IR window frame to the runtime frame. Only `ROWS` frames are honored;
-/// an explicit `RANGE` frame falls back to `None` (the default peer-`RANGE`
-/// running aggregate the runtime already implements).
+/// Map an IR window frame to the runtime frame. `ROWS` and `GROUPS` frames are
+/// honored directly. A `RANGE` frame is honored only for peer bounds (CURRENT ROW /
+/// UNBOUNDED); a numeric `RANGE` offset is value-based (typed order-key arithmetic
+/// we don't implement), so it falls back to `None` — the default peer-`RANGE`
+/// running aggregate the runtime already provides.
 fn map_frame(frame: Option<WindowFrame>) -> Option<window_frame::Frame> {
     let f = frame?;
-    if f.units != FrameUnits::Rows {
-        return None;
-    }
+    let unit = match f.units {
+        FrameUnits::Rows => window_frame::FrameUnit::Rows,
+        FrameUnits::Groups => window_frame::FrameUnit::Groups,
+        FrameUnits::Range => {
+            if is_numeric_offset(f.start) || is_numeric_offset(f.end) {
+                return None;
+            }
+            window_frame::FrameUnit::Range
+        }
+    };
     Some(window_frame::Frame {
+        unit,
         start: map_bound(f.start),
         end: map_bound(f.end),
     })
+}
+
+/// Whether a frame bound carries a numeric `n` offset (`<n> PRECEDING/FOLLOWING`).
+fn is_numeric_offset(b: FrameBound) -> bool {
+    matches!(
+        b,
+        FrameBound::Preceding { .. } | FrameBound::Following { .. }
+    )
 }
 
 fn map_bound(b: FrameBound) -> window_frame::FrameBound {
@@ -697,51 +756,4 @@ pub(crate) fn limit(batches: Vec<RecordBatch>, n: usize, offset: usize) -> Vec<R
         }
     }
     out
-}
-
-/// Split morsels that exceed the target's row OR byte bound, so there is enough
-/// work to parallelize and no morsel's working set balloons on wide/variable-width
-/// data. A row whose own width already exceeds the byte budget is emitted as a
-/// one-row morsel (never coalesced): a giant cell cannot co-reside with 16 k
-/// others, and it is never dropped or silently OOM'd.
-///
-/// With a row-only target (`MorselTarget::rows`, byte bound = `usize::MAX`) this is
-/// byte-for-byte identical to the historical row-count morselizer.
-pub(crate) fn morselize(
-    batches: &[RecordBatch],
-    target: bc_arrow::MorselTarget,
-) -> Vec<RecordBatch> {
-    let mut out = Vec::new();
-    for b in batches {
-        let n = b.num_rows();
-        let chunk = morsel_chunk_rows(b, n, target);
-        if n <= chunk {
-            out.push(b.clone());
-        } else {
-            let mut off = 0;
-            while off < n {
-                let len = (n - off).min(chunk);
-                out.push(b.slice(off, len));
-                off += len;
-            }
-        }
-    }
-    out
-}
-
-/// Rows per output chunk for one batch: the row target, further capped so a chunk
-/// stays within the byte budget. Returns `target.rows` for a row-only target or an
-/// empty/zero-byte batch (the historical behavior); a single row wider than the
-/// whole budget yields a chunk of 1 (a one-row morsel).
-fn morsel_chunk_rows(b: &RecordBatch, n: usize, target: bc_arrow::MorselTarget) -> usize {
-    if !target.byte_bounded() || n == 0 {
-        return target.rows;
-    }
-    let bytes = b.get_array_memory_size();
-    if bytes == 0 {
-        return target.rows;
-    }
-    let avg = (bytes as f64 / n as f64).max(1.0);
-    let by_bytes = ((target.bytes as f64 / avg).floor() as usize).max(1);
-    target.rows.min(by_bytes)
 }

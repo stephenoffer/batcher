@@ -23,12 +23,17 @@ Both are registered as `plan_rule`s in `Phase.NORMALIZE` (see
 from __future__ import annotations
 
 from batcher.kyber.pass_base import OptimizerContext
-from batcher.kyber.registry import DEFAULT_REGISTRY
+from batcher.kyber.registry import DEFAULT_REGISTRY, rule
 from batcher.kyber.rule import Phase, plan_rule
-from batcher.plan.expr_ir import Binary, Expr, Lit, Not
+from batcher.plan.expr_ir import Binary, Cast, Col, Expr, Lit, Not
 from batcher.plan.expr_ir.namespaces import StrFunc
-from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
-from batcher.plan.logical import LogicalPlan
+from batcher.plan.expr_rewrite import (
+    combine_conjuncts,
+    map_node_expressions,
+    split_conjuncts,
+    transform_expr_up,
+)
+from batcher.plan.logical import Filter, LogicalPlan
 from batcher.plan.visitor import transform_up
 
 __all__ = [
@@ -36,6 +41,7 @@ __all__ = [
     "ExprSimplification",
     "fold_constants",
     "like_prefix_to_range",
+    "or_to_in_and_range",
     "simplify_expressions",
 ]
 
@@ -163,6 +169,17 @@ def _simplify(expr: Expr) -> Expr:
     if isinstance(expr, Not) and isinstance(expr.input, Not):
         return expr.input.input  # NOT NOT x → x
 
+    # Cast(Cast(x, t), t) → Cast(x, t): casting to a type then to that same type again
+    # is redundant. Only when the dtype AND try_cast semantics match — a strict cast
+    # wrapping a try-cast (or vice versa) is not equivalent (different null behavior).
+    if (
+        isinstance(expr, Cast)
+        and isinstance(expr.input, Cast)
+        and expr.input.dtype == expr.dtype
+        and expr.input.try_cast == expr.try_cast
+    ):
+        return Cast(expr.input.input, expr.dtype, try_cast=expr.try_cast)
+
     if not isinstance(expr, Binary):
         return expr
     op, left, right = expr.op, expr.left, expr.right
@@ -279,3 +296,65 @@ DEFAULT_REGISTRY.add(
         lambda plan, _ctx: like_prefix_to_range(plan),
     )
 )
+
+
+def _flat_or_equalities(expr: Expr) -> tuple[str, list] | None:
+    """If `expr` is `c == v1 OR c == v2 OR …` (≥2 disjuncts, one column, literal
+    values), return `(column, [values])`; else None. The shape SQL `IN (...)` and
+    chained `OR` equalities lower to."""
+    if not (isinstance(expr, Binary) and expr.op == "or"):
+        return None
+    leaves: list[tuple[str, object]] = []
+
+    def collect(e: Expr) -> bool:
+        if isinstance(e, Binary) and e.op == "or":
+            return collect(e.left) and collect(e.right)
+        if isinstance(e, Binary) and e.op == "eq":
+            left, right = e.left, e.right
+            if isinstance(left, Col) and isinstance(right, Lit):
+                leaves.append((left.name, right.value))
+                return True
+            if isinstance(right, Col) and isinstance(left, Lit):
+                leaves.append((right.name, left.value))
+                return True
+        return False
+
+    if not collect(expr) or len(leaves) < 2:
+        return None
+    cols = {name for name, _ in leaves}
+    values = [v for _, v in leaves]
+    if len(cols) != 1 or any(v is None or isinstance(v, bool) for v in values):
+        return None
+    return cols.pop(), values
+
+
+@rule(name="or_to_in_and_range", phase=Phase.NORMALIZE, matches=(Filter,))
+def or_to_in_and_range(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """Add `c >= min AND c <= max` alongside a `c = v1 OR c = v2 OR …` conjunct.
+
+    A disjunction of equalities (what `IN (...)` lowers to) is opaque to range-based
+    zone-map pruning. Its values imply the bound `min(vs) ≤ c ≤ max(vs)`, a superset
+    that — ANDed with the original disjunction — leaves the result unchanged but gives
+    `zonemap_prune_filter` a range it can use to skip whole row groups (and each
+    equality is still a bloom-index probe). Idempotent: the bounds are added only if
+    not already present. Skipped when the literals aren't mutually comparable.
+    """
+    conjuncts = split_conjuncts(node.predicate)
+    existing = [c.to_ir() for c in conjuncts]  # IR dicts are unhashable → list + `in`
+    added: list[Expr] = []
+    for conj in conjuncts:
+        info = _flat_or_equalities(conj)
+        if info is None:
+            continue
+        col_name, values = info
+        try:
+            lo, hi = min(values), max(values)
+        except TypeError:
+            continue  # values not mutually comparable (mixed types)
+        for bound in (Binary("ge", Col(col_name), Lit(lo)), Binary("le", Col(col_name), Lit(hi))):
+            if bound.to_ir() not in existing:
+                added.append(bound)
+                existing.append(bound.to_ir())
+    if not added:
+        return None
+    return Filter(node.input, combine_conjuncts([*conjuncts, *added]))

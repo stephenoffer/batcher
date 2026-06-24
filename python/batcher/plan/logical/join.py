@@ -12,7 +12,7 @@ from batcher._internal.errors import PlanError
 from batcher.plan.ir_tags import Op
 from batcher.plan.logical.base import LogicalPlan
 
-__all__ = ["AsofJoin", "Join", "JoinOutputCol"]
+__all__ = ["AsofJoin", "Join", "JoinOutputCol", "WatermarkStreamJoin"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +70,31 @@ class Join(LogicalPlan):
             "output": [{"side": o.side, "name": o.name, "alias": o.alias} for o in self.output],
             "strategy": self.strategy,
         }
+
+    def available_columns(self) -> list[str]:
+        return [o.alias for o in self.output]
+
+
+@dataclass(frozen=True, slots=True)
+class WatermarkStreamJoin(LogicalPlan):
+    """A watermark-bounded stream-stream interval inner join (Spark stream-stream join).
+
+    Joins two streams on equality keys *and* an event-time interval
+    (``|left_time - right_time| <= within``), which is what lets buffered state be
+    evicted once the watermark guarantees no future match — keeping memory bounded.
+    A streaming-only node executed by the driver (over bounded sources a plain `join`
+    is used), so it is never lowered to the Rust IR.
+    """
+
+    left: LogicalPlan
+    right: LogicalPlan
+    left_keys: tuple[str, ...]
+    right_keys: tuple[str, ...]
+    output: tuple[JoinOutputCol, ...]
+    left_time: str
+    right_time: str
+    within_micros: int
+    lateness_micros: int
 
     def available_columns(self) -> list[str]:
         return [o.alias for o in self.output]

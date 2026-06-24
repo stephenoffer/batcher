@@ -8,11 +8,13 @@ classes from `core` and `namespaces`.
 
 from __future__ import annotations
 
+from batcher.plan.expr_ir.audio import AudioFunc
 from batcher.plan.expr_ir.core import (
     Binary,
     Cast,
     Coalesce,
     Expr,
+    IsInf,
     IsNan,
     IsNotNull,
     IsNull,
@@ -20,22 +22,40 @@ from batcher.plan.expr_ir.core import (
     MathExpr,
     Not,
 )
+from batcher.plan.expr_ir.func_nodes import WindowBuckets, WindowStart
 from batcher.plan.expr_ir.image import ImageFunc
 from batcher.plan.expr_ir.namespaces import (
+    ConvertTimezone,
     DateFunc,
     DateOffset,
     DateTrunc,
     ListBinary,
     ListContains,
+    ListFilter,
     ListFunc,
     ListGet,
+    ListPosition,
+    ListSet,
     ListSlice,
+    ListTransform,
+    MapFunc,
     Strftime,
     StrFunc,
     Strptime,
     StructField,
 )
-from batcher.plan.expr_ir.nodes import Array, Case, Col, Greatest, Least, ListJoin, NullIf
+from batcher.plan.expr_ir.nodes import (
+    Array,
+    Case,
+    Col,
+    Greatest,
+    Least,
+    ListJoin,
+    MakeStruct,
+    NullIf,
+    Sequence,
+)
+from batcher.plan.expr_ir.video import VideoFunc
 
 
 def referenced_columns(expr: Expr) -> set[str]:
@@ -54,17 +74,26 @@ def referenced_columns(expr: Expr) -> set[str]:
             IsNan,
             StrFunc,
             Strftime,
+            ConvertTimezone,
             DateFunc,
             DateOffset,
             DateTrunc,
             ImageFunc,
+            AudioFunc,
+            VideoFunc,
             MathExpr,
             ListFunc,
             ListGet,
             ListContains,
+            ListPosition,
+            ListTransform,
+            ListFilter,
             ListSlice,
             ListJoin,
             StructField,
+            MapFunc,
+            WindowStart,
+            WindowBuckets,
         ),
     ):
         return referenced_columns(expr.input)
@@ -78,7 +107,18 @@ def referenced_columns(expr: Expr) -> set[str]:
         for e in expr.elements:
             out |= referenced_columns(e)
         return out
-    if isinstance(expr, (NullIf, Math2Expr, ListBinary)):
+    if isinstance(expr, MakeStruct):
+        cols: set[str] = set()
+        for _name, value in expr.fields:
+            cols |= referenced_columns(value)
+        return cols
+    if isinstance(expr, Sequence):
+        return (
+            referenced_columns(expr.start)
+            | referenced_columns(expr.stop)
+            | referenced_columns(expr.step)
+        )
+    if isinstance(expr, (NullIf, Math2Expr, ListBinary, ListSet)):
         return referenced_columns(expr.left) | referenced_columns(expr.right)
     if isinstance(expr, Case):
         cols = referenced_columns(expr.otherwise)
@@ -111,6 +151,8 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         return IsNotNull(remap_columns(expr.input, mapping))
     if isinstance(expr, IsNan):
         return IsNan(remap_columns(expr.input, mapping))
+    if isinstance(expr, IsInf):
+        return IsInf(remap_columns(expr.input, mapping))
     if isinstance(expr, StrFunc):
         return StrFunc(
             expr.fn,
@@ -126,14 +168,28 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         return ImageFunc(
             expr.fn, remap_columns(expr.input, mapping), width=expr.width, height=expr.height
         )
+    if isinstance(expr, AudioFunc):
+        return AudioFunc(expr.fn, remap_columns(expr.input, mapping))
+    if isinstance(expr, VideoFunc):
+        return VideoFunc(expr.fn, remap_columns(expr.input, mapping))
     if isinstance(expr, DateTrunc):
         return DateTrunc(remap_columns(expr.input, mapping), expr.unit)
     if isinstance(expr, Strftime):
         return Strftime(remap_columns(expr.input, mapping), expr.format)
     if isinstance(expr, Strptime):
         return Strptime(remap_columns(expr.input, mapping), expr.format)
+    if isinstance(expr, ConvertTimezone):
+        return ConvertTimezone(remap_columns(expr.input, mapping), expr.from_tz, expr.to_tz)
     if isinstance(expr, DateOffset):
         return DateOffset(remap_columns(expr.input, mapping), expr.months, expr.days, expr.micros)
+    if isinstance(expr, WindowStart):
+        return WindowStart(
+            remap_columns(expr.input, mapping), expr.width_micros, expr.origin_micros
+        )
+    if isinstance(expr, WindowBuckets):
+        return WindowBuckets(
+            remap_columns(expr.input, mapping), expr.width_micros, expr.slide_micros
+        )
     if isinstance(expr, MathExpr):
         return MathExpr(expr.fn, remap_columns(expr.input, mapping))
     if isinstance(expr, ListFunc):
@@ -142,18 +198,38 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         return ListGet(remap_columns(expr.input, mapping), expr.index)
     if isinstance(expr, ListContains):
         return ListContains(remap_columns(expr.input, mapping), expr.value)
+    if isinstance(expr, ListPosition):
+        return ListPosition(remap_columns(expr.input, mapping), expr.value)
+    if isinstance(expr, ListTransform):
+        return ListTransform(remap_columns(expr.input, mapping), expr.func)
+    if isinstance(expr, ListFilter):
+        return ListFilter(remap_columns(expr.input, mapping), expr.pred)
     if isinstance(expr, ListSlice):
         return ListSlice(remap_columns(expr.input, mapping), expr.offset, expr.length)
     if isinstance(expr, StructField):
         return StructField(remap_columns(expr.input, mapping), expr.field)
+    if isinstance(expr, MapFunc):
+        return MapFunc(expr.fn, remap_columns(expr.input, mapping), expr.key)
     if isinstance(expr, ListJoin):
         return ListJoin(remap_columns(expr.input, mapping), expr.separator)
     if isinstance(expr, ListBinary):
         return ListBinary(
             expr.fn, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
         )
+    if isinstance(expr, ListSet):
+        return ListSet(
+            expr.fn, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
+        )
     if isinstance(expr, Array):
         return Array([remap_columns(e, mapping) for e in expr.elements])
+    if isinstance(expr, MakeStruct):
+        return MakeStruct([(n, remap_columns(v, mapping)) for n, v in expr.fields])
+    if isinstance(expr, Sequence):
+        return Sequence(
+            remap_columns(expr.start, mapping),
+            remap_columns(expr.stop, mapping),
+            remap_columns(expr.step, mapping),
+        )
     if isinstance(expr, Coalesce):
         return Coalesce([remap_columns(e, mapping) for e in expr.inputs])
     if isinstance(expr, Greatest):

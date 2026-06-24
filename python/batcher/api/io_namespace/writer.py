@@ -8,13 +8,18 @@ merge helpers; sink implementations live in `io/formats/` and register into the
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from batcher.api.session import read as _read
 
 if TYPE_CHECKING:
+    import pyarrow as pa
+
     from batcher.api.dataset import Dataset
+    from batcher.api.streaming import StreamingQuery
     from batcher.io.manifest import WriteManifest
+    from batcher.plan.streaming import Trigger
 
 __all__ = ["Writer"]
 
@@ -55,9 +60,19 @@ class Writer:
         resume: bool = False,
         max_rows_per_file: int | None = None,
         replace_where: Any = None,
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        checkpoint: str | None = None,
+        query_name: str | None = None,
         **opts: Any,
-    ) -> WriteManifest:
+    ) -> WriteManifest | StreamingQuery:
         """Execute and write the result, inferring `format` from the path when omitted.
+
+        **Batch vs streaming is one API.** With a bounded source and no `trigger`,
+        this is a one-shot write returning a `WriteManifest` (the behavior below).
+        If `trigger` is set, or any source is unbounded (a stream), the write runs as
+        a streaming query — micro-batches are appended to `path` per the `trigger`
+        cadence and `output_mode` — and it returns a `StreamingQuery` handle instead.
 
         `mode` is the save mode (Spark ``SaveMode`` parity):
 
@@ -88,10 +103,17 @@ class Writer:
         from batcher.api.terminal import _write
         from batcher.io.detect import detect_format
         from batcher.io.manifest import WriteManifest
+        from batcher.io.source import is_bounded
 
         if mode not in _SAVE_MODES:
             raise PlanError(f"write(): unknown mode {mode!r}; use one of {list(_SAVE_MODES)}")
         fmt = detect_format(path, format)
+
+        # Unified surface: a trigger or an unbounded source means this is a streaming
+        # write — append micro-batches to `path` and return a StreamingQuery.
+        if trigger is not None or any(not is_bounded(s) for s in self._ds._sources):
+            sink = self._stream_sink_for(path, fmt, opts)
+            return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
 
         # `replace_where` = dynamic partition/range overwrite (Delta `replaceWhere` /
         # the backfill pattern): atomically replace only the rows matching the
@@ -159,6 +181,109 @@ class Writer:
             num_files=num_files,
             target_bytes_per_file=target_bytes,
             sink_kwargs=sink_kwargs,
+        )
+
+    # --- streaming sink targets -------------------------------------------
+    def _start_stream(
+        self,
+        sink: Any,
+        trigger: Trigger | None,
+        output_mode: str,
+        query_name: str | None,
+        checkpoint: str | None = None,
+    ) -> StreamingQuery:
+        """Launch a streaming query writing this dataset's stream to `sink`."""
+        from batcher.api.streaming import start_streaming_query
+
+        return start_streaming_query(
+            self._ds._plan,
+            self._ds._sources,
+            sink,
+            trigger=trigger,
+            output_mode=output_mode,
+            name=query_name,
+            checkpoint=checkpoint,
+        )
+
+    def _stream_sink_for(self, path: str, fmt: str, opts: dict[str, Any]) -> Any:
+        """Build the per-micro-batch `StreamSink` for a path/format streaming write."""
+        from batcher.io.formats.streaming.sinks import DeltaStreamSink, FileStreamSink
+
+        if fmt in _MODE_AWARE_SINKS:
+            return DeltaStreamSink(path, **opts)
+        return FileStreamSink(path, fmt, **opts)
+
+    def console(
+        self,
+        *,
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        num_rows: int = 20,
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+    ) -> StreamingQuery:
+        """Stream each micro-batch to stdout (development sink)."""
+        from batcher.io.formats.streaming.sinks import ConsoleStreamSink
+
+        return self._start_stream(
+            ConsoleStreamSink(num_rows=num_rows), trigger, output_mode, query_name, checkpoint
+        )
+
+    def memory(
+        self,
+        name: str,
+        *,
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+    ) -> StreamingQuery:
+        """Stream into an in-memory table queryable via ``bt.read_memory(name)``."""
+        from batcher.io.formats.streaming.sinks import MemoryStreamSink
+
+        return self._start_stream(
+            MemoryStreamSink(name, output_mode=output_mode),
+            trigger,
+            output_mode,
+            query_name,
+            checkpoint,
+        )
+
+    def for_each_batch(
+        self,
+        fn: Callable[[pa.Table, int], Any],
+        *,
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+    ) -> StreamingQuery:
+        """Stream each micro-batch into a user callback ``fn(table, batch_id)``.
+
+        The callback gets the whole Arrow table for the micro-batch — the sanctioned
+        hook for custom upserts (``MERGE``/SCD), multi-sink fan-out, or any per-batch
+        commit logic (the sink-side twin of `map_batches`).
+        """
+        from batcher.io.formats.streaming.sinks import ForeachBatchStreamSink
+
+        return self._start_stream(
+            ForeachBatchStreamSink(fn), trigger, output_mode, query_name, checkpoint
+        )
+
+    def for_each(
+        self,
+        fn: Callable[[dict[str, Any]], Any],
+        *,
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+    ) -> StreamingQuery:
+        """Stream each row of each micro-batch into a user callback ``fn(row)``."""
+        from batcher.io.formats.streaming.sinks import ForeachStreamSink
+
+        return self._start_stream(
+            ForeachStreamSink(fn), trigger, output_mode, query_name, checkpoint
         )
 
     def parquet(self, path: str, *, compression: str = "zstd", **opts: Any) -> WriteManifest:

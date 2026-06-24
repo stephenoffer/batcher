@@ -121,6 +121,44 @@ class Array(Expr):
         return {"e": ExprTag.ARRAY, "elements": [e.to_ir() for e in self.elements]}
 
 
+class Sequence(Expr):
+    """`sequence(start, stop, step)` — each row becomes a list of the integer series
+    from ``start`` to ``stop`` inclusive, stepping by ``step`` (Spark ``sequence``).
+    → ``List<Int64>``."""
+
+    __slots__ = ("start", "step", "stop")
+
+    def __init__(self, start: Expr, stop: Expr, step: Expr) -> None:
+        self.start = start
+        self.stop = stop
+        self.step = step
+
+    def to_ir(self) -> dict[str, Any]:
+        return {
+            "e": ExprTag.SEQUENCE,
+            "start": self.start.to_ir(),
+            "stop": self.stop.to_ir(),
+            "step": self.step.to_ir(),
+        }
+
+
+class MakeStruct(Expr):
+    """Struct construction: each row becomes a struct with the named fields, each
+    field's value being the per-row value of its sub-expression (SQL ``struct_pack``;
+    Spark ``struct``). Built by ``struct(**fields)`` / ``named_struct(...)``."""
+
+    __slots__ = ("fields",)
+
+    def __init__(self, fields: list[tuple[str, Expr]]) -> None:
+        self.fields = fields
+
+    def to_ir(self) -> dict[str, Any]:
+        return {
+            "e": ExprTag.MAKE_STRUCT,
+            "fields": [{"name": name, "value": value.to_ir()} for name, value in self.fields],
+        }
+
+
 class ListJoin(Expr):
     """Concatenate a list column's elements (cast to text, nulls skipped) with a
     separator → text. Backs SQL ``string_agg`` over an ``array_agg`` input."""
@@ -208,6 +246,22 @@ def first_value(expr: IntoExpr) -> WindowExpr:
 def last_value(expr: IntoExpr) -> WindowExpr:
     """The last value in the ordered partition so far (SQL ``LAST_VALUE``)."""
     return WindowExpr("last_value", _wrap(expr), [], [], None)
+
+
+def nth_value(expr: IntoExpr, n: int) -> WindowExpr:
+    """The value of the ``n``-th row (1-based) of the ordered partition (SQL
+    ``NTH_VALUE``); null if the partition has fewer than ``n`` rows. Bind with
+    ``.over(partition_by=…, order_by=…)``.
+
+    Like :func:`first_value`/:func:`last_value`, this reads the **whole partition**
+    (equivalent to ``ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING``), not
+    the running frame — so the ``n``-th value is the same for every row of a partition.
+    """
+    if n < 1:
+        from batcher._internal.errors import PlanError
+
+        raise PlanError(f"nth_value(n) requires n >= 1, got {n}")
+    return WindowExpr("nth_value", _wrap(expr), [], [], None, int(n))
 
 
 def row_number() -> WindowExpr:

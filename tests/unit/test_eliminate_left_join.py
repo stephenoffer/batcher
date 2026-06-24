@@ -17,8 +17,8 @@ def _fact():
 
 def _dim_unique():
     # GROUP BY k → provably unique on k.
-    return bt.from_pydict({"k": [1, 1, 2, 3], "p": [5, 6, 7, 8]}).group_by("k").agg(
-        tot=col("p").sum()
+    return (
+        bt.from_pydict({"k": [1, 1, 2, 3], "p": [5, 6, 7, 8]}).group_by("k").agg(tot=col("p").sum())
     )
 
 

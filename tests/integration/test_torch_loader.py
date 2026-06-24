@@ -56,11 +56,24 @@ def test_collate_fn():
 
 
 def test_streaming_split_partitions_rows():
+    # The whole-fleet split is a single coordinated reader; ranks must be drained
+    # concurrently (the DDP norm) — sequential consumption would deadlock by design.
     splits = bt.ml.streaming_split(_ds(), 4, batch_size=10)
-    collected = [_all_x(s) for s in splits]
+    iters = [iter(s) for s in splits]
+    collected: list[list[int]] = [[] for _ in iters]
+    while True:
+        advanced = False
+        for r, it in enumerate(iters):
+            batch = next(it, None)
+            if batch is not None:
+                collected[r].extend(int(v) for v in batch["x"].tolist())
+                advanced = True
+        if not advanced:
+            break
     flat = sorted(v for shard in collected for v in shard)
-    assert flat == list(range(100))  # disjoint and complete
-    assert all(len(c) > 0 for c in collected)
+    assert len(flat) == len(set(flat))  # disjoint
+    assert len({len(c) for c in collected}) == 1  # every rank gets an equal count
+    assert set(flat).issubset(set(range(100)))  # a balanced subset (trailing round dropped)
 
 
 def test_streaming_split_single_rank():

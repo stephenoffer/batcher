@@ -23,6 +23,21 @@ def test_resolve_pool_size():
     assert _resolve_pool_size((4, 8), 2, 4) == 4  # floored at min
 
 
+def test_autoscale_action_decisions():
+    from batcher.dist.executors.map import _autoscale_action
+
+    # backlog with headroom → grow
+    assert _autoscale_action(pending=5, n_actors=2, n_idle=0, min_size=2, max_size=8) == "up"
+    # backlog but already at max → hold
+    assert _autoscale_action(pending=5, n_actors=8, n_idle=0, min_size=2, max_size=8) == "hold"
+    # drained backlog, idle actors above the floor → shrink
+    assert _autoscale_action(pending=0, n_actors=5, n_idle=2, min_size=2, max_size=8) == "down"
+    # drained at the floor → hold
+    assert _autoscale_action(pending=0, n_actors=2, n_idle=2, min_size=2, max_size=8) == "hold"
+    # drained but all actors busy (none idle) → hold
+    assert _autoscale_action(pending=0, n_actors=5, n_idle=0, min_size=2, max_size=8) == "hold"
+
+
 def test_merge_concurrency():
     from batcher.dist.executors.map import _merge_concurrency
 

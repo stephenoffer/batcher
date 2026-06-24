@@ -26,7 +26,25 @@ from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.splits import Split, WholeSourceSplit
 from batcher.plan.source_stats import SourceStatistics
 
-__all__ = ["DeltaSink", "DeltaSource"]
+__all__ = ["DeltaSink", "DeltaSource", "DeltaStreamSource"]
+
+# CDF metadata columns delta-rs adds to a change feed.
+_CDF_META = ("_change_type", "_commit_version", "_commit_timestamp")
+
+
+def _normalize_view_types(table: pa.Table) -> pa.Table:
+    """Cast Arrow ``string_view``/``binary_view`` columns (delta-rs ≥ 1.x) to the
+    standard ``string``/``binary`` the engine and pyarrow kernels expect."""
+    fields = []
+    changed = False
+    for field in table.schema:
+        ty = field.type
+        if pa.types.is_string_view(ty):
+            ty, changed = pa.string(), True
+        elif pa.types.is_binary_view(ty):
+            ty, changed = pa.binary(), True
+        fields.append(pa.field(field.name, ty))
+    return table.cast(pa.schema(fields)) if changed else table
 
 
 def _require_deltalake() -> Any:
@@ -159,7 +177,12 @@ class DeltaSource:
         return table
 
     def schema(self) -> pa.Schema:
-        return self._table().schema().to_pyarrow()
+        # delta-rs returns an Arrow C-interface (arro3) schema; adapt to pyarrow.
+        return pa.schema(self._table().schema().to_arrow())
+
+    def _add_actions(self) -> pa.Table:
+        """The table's add-action stats as a pyarrow table (delta-rs returns arro3)."""
+        return pa.table(self._table().get_add_actions(flatten=True))
 
     @staticmethod
     def _pa_filter(predicate: dict | None) -> Any:
@@ -185,8 +208,7 @@ class DeltaSource:
         """Exact row count summed from the transaction log's add actions."""
         import pyarrow.compute as pc
 
-        actions = self._table().get_add_actions(flatten=True)
-        col = actions.column("num_records")
+        col = self._add_actions().column("num_records")
         return int(pc.sum(col).as_py() or 0)
 
     def statistics(self) -> SourceStatistics | None:
@@ -194,7 +216,7 @@ class DeltaSource:
         from batcher.io.stats import delta_statistics
 
         try:
-            return delta_statistics(self._table().get_add_actions(flatten=True))
+            return delta_statistics(self._add_actions())
         except Exception:
             return None
 
@@ -211,7 +233,8 @@ class DeltaSource:
                 starting_version=starting_version,
                 ending_version=ending_version,
             )
-            return pa.Table.from_batches(reader)
+            # delta-rs returns an Arrow C-stream (arro3) reader; adapt it to pyarrow.
+            return pa.RecordBatchReader.from_stream(reader).read_all()
         except Exception as exc:
             raise BackendError(f"failed to read Delta CDF for {self._table_uri!r}: {exc}") from exc
 
@@ -236,6 +259,103 @@ class DeltaSource:
             DeltaFileSplit(self._table_uri, path, self._storage_options, self._version)
             for path in paths
         ]
+
+
+@SOURCES.register("delta_stream")
+class DeltaStreamSource:
+    """A Delta table read incrementally as an unbounded stream (Spark ``readStream``).
+
+    Each `iter_batches` pass reads the Change Data Feed for every commit after the
+    last-processed version and advances the cursor — so chaining medallion layers
+    (bronze → silver → gold) reads only new commits. ``change_feed=False`` (default)
+    yields appended rows in the table's own schema (insert changes, metadata columns
+    dropped); ``change_feed=True`` yields the full CDC stream including
+    ``_change_type``/``_commit_version``/``_commit_timestamp`` (updates/deletes too).
+    Requires ``delta.enableChangeDataFeed = true`` on the table.
+
+    Checkpointable: the read position is the Delta version, so a streaming query
+    resumes exactly-once after a restart.
+    """
+
+    bounded = False
+
+    __slots__ = ("_cdf", "_cursor", "_storage_options", "_table_uri")
+
+    def __init__(
+        self,
+        table_uri: str,
+        *,
+        starting_version: int = 0,
+        change_feed: bool = False,
+        storage_options: dict[str, str] | None = None,
+    ) -> None:
+        self._table_uri = table_uri
+        self._cdf = change_feed
+        self._storage_options = storage_options
+        self._cursor = starting_version - 1  # next read starts at starting_version
+
+    def _delta_table(self) -> Any:
+        return _require_deltalake().DeltaTable(
+            self._table_uri, storage_options=self._storage_options
+        )
+
+    def schema(self) -> pa.Schema:
+        # delta-rs returns an Arrow C-interface (arro3) schema; adapt to pyarrow.
+        base = pa.schema(self._delta_table().schema().to_arrow())
+        if not self._cdf:
+            return base
+        extra = [
+            pa.field("_change_type", pa.string()),
+            pa.field("_commit_version", pa.int64()),
+            pa.field("_commit_timestamp", pa.timestamp("us")),
+        ]
+        return pa.schema(list(base) + extra)
+
+    def _latest_version(self) -> int:
+        return int(self._delta_table().version())
+
+    def snapshot_position(self) -> dict:
+        return {"version": self._cursor}
+
+    def seek(self, position: dict) -> None:
+        self._cursor = int(position["version"])
+
+    def row_count(self) -> int | None:
+        return None
+
+    def identity(self) -> str:
+        return f"delta_stream:{self._table_uri}"
+
+    def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
+        return [WholeSourceSplit(self)]
+
+    def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
+        return list(self.iter_batches(projection))
+
+    def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
+        latest = self._latest_version()
+        start = self._cursor + 1
+        if start > latest:
+            return  # no new commits since the last pass
+        try:
+            reader = self._delta_table().load_cdf(starting_version=start, ending_version=latest)
+            table = _normalize_view_types(pa.RecordBatchReader.from_stream(reader).read_all())
+        except Exception as exc:
+            raise BackendError(
+                f"failed to read Delta change feed for {self._table_uri!r} "
+                f"(is delta.enableChangeDataFeed set?): {exc}"
+            ) from exc
+        self._cursor = latest
+        if not self._cdf:
+            # Append mode: keep insert changes, present the table's own schema.
+            import pyarrow.compute as pc
+
+            change_type = pc.cast(table.column("_change_type"), pa.string())
+            table = table.filter(pc.equal(change_type, "insert")).drop(list(_CDF_META))
+        if table.num_rows == 0:
+            return
+        out = table.select(projection) if projection is not None else table
+        yield from out.to_batches()
 
 
 @SINKS.register("delta")

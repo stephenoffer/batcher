@@ -19,7 +19,7 @@ from batcher.plan.logical.aggregate import (
     SortKeySpec,
 )
 from batcher.plan.logical.base import LogicalPlan
-from batcher.plan.logical.join import AsofJoin, Join, JoinOutputCol
+from batcher.plan.logical.join import AsofJoin, Join, JoinOutputCol, WatermarkStreamJoin
 from batcher.plan.logical.relational import (
     Distinct,
     Filter,
@@ -27,11 +27,13 @@ from batcher.plan.logical.relational import (
     MapBatches,
     Project,
     Projection,
+    RowId,
     Sample,
     Scan,
     Union,
     Unnest,
     Unpivot,
+    WatermarkDedup,
 )
 from batcher.plan.logical.transforms import is_streamable, remap_sources
 from batcher.plan.logical.window import Window, WindowFrame, WindowFuncSpec
@@ -49,6 +51,7 @@ __all__ = [
     "MapBatches",
     "Project",
     "Projection",
+    "RowId",
     "Sample",
     "Scan",
     "Sort",
@@ -56,6 +59,8 @@ __all__ = [
     "Union",
     "Unnest",
     "Unpivot",
+    "WatermarkDedup",
+    "WatermarkStreamJoin",
     "Window",
     "WindowFrame",
     "WindowFuncSpec",

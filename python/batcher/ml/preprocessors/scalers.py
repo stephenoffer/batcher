@@ -9,19 +9,21 @@ become constants in the transform expression.
 
 from __future__ import annotations
 
+import functools
 import math
+import operator
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
 from batcher.ml.preprocessors.base import Preprocessor, fit_aggregate
-from batcher.plan.expr_ir import col
+from batcher.plan.expr_ir import col, when
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from batcher.api.dataset import Dataset
 
-__all__ = ["MaxAbsScaler", "MinMaxScaler", "RobustScaler", "StandardScaler"]
+__all__ = ["MaxAbsScaler", "MinMaxScaler", "Normalizer", "RobustScaler", "StandardScaler"]
 
 
 def _check_columns(columns: Sequence[str]) -> list[str]:
@@ -216,3 +218,37 @@ class RobustScaler(Preprocessor):
                 expr = expr / self.iqr_[c]
             new[c] = expr
         return ds.with_columns(**new)
+
+
+class Normalizer(Preprocessor):
+    """Scale each **row** to unit norm across the given columns (sklearn
+    ``Normalizer``) — a per-row operation, so it is **stateless** (no `fit`).
+
+    ``norm="l2"`` (default) divides each value by ``sqrt(Σ xᵢ²)`` over the row's
+    columns; ``"l1"`` by ``Σ|xᵢ|``; ``"max"`` by ``max|xᵢ|``. A zero-norm row (all
+    zeros) is left unchanged. The whole transform is one `Expr` per column — no
+    per-row Python.
+    """
+
+    __slots__ = ("columns", "norm")
+
+    def __init__(self, columns: Sequence[str], *, norm: str = "l2") -> None:
+        self.columns = _check_columns(columns)
+        if norm not in ("l1", "l2", "max"):
+            raise PlanError(f"norm must be 'l1', 'l2', or 'max', got {norm!r}")
+        self.norm = norm
+        self._fitted = True  # stateless
+
+    def transform(self, ds: Dataset) -> Dataset:
+        cols = [col(c) for c in self.columns]
+        if self.norm == "l2":
+            norm = functools.reduce(operator.add, (c * c for c in cols)).sqrt()
+        elif self.norm == "l1":
+            norm = functools.reduce(operator.add, (c.abs() for c in cols))
+        else:  # max
+            from batcher.plan.expr_ir.constructors import greatest
+
+            norm = greatest(*(c.abs() for c in cols))
+        # Guard a zero-norm row: divide by 1 so the (all-zero) values stay unchanged.
+        divisor = when(norm == 0.0).then(1.0).otherwise(norm)
+        return ds.with_columns(**{c: col(c) / divisor for c in self.columns})

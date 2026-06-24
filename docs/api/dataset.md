@@ -181,7 +181,10 @@ without collapsing rows. `functions` maps an output name to a spec:
 
 `order_by` entries are a column name, `("col", descending_bool)`, or an
 expression. `frame=(start, end)` gives ROWS offsets where negative is preceding,
-0 is current, positive is following, and `None` is unbounded.
+0 is current, positive is following, and `None` is unbounded. A third element
+selects the frame unit — `frame=(start, end, "groups")` counts peer groups (ties in
+the order key) instead of physical rows, and `frame=(None, 0, "range")` is the
+value-based peer frame (`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`).
 
 ```python
 ranked = ds.window(

@@ -54,6 +54,62 @@ def test_median_via_sql(duck, t):
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
+def _skewed_with_nulls():
+    """A hot key (75% of rows) plus ~10% null values and an all-null group — the
+    shape that makes the exact per-group value list exceed a tight memory budget."""
+    rng = np.random.default_rng(3)
+    n = 20000
+    k = np.concatenate([np.zeros(15000, "int64"), rng.integers(1, 50, n - 15000).astype("int64")])
+    vals = rng.integers(0, 1000, n).astype("float64")
+    v = pa.array(vals, mask=rng.random(n) < 0.1)  # ~10% NULL (Arrow nulls, not NaN)
+    # An all-null group (key 99) whose median must come back NULL.
+    k = np.concatenate([k, np.full(60, 99, "int64")])
+    v = pa.concat_arrays([v, pa.array(np.zeros(60), mask=np.ones(60, bool))])
+    return pa.table({"k": k, "v": v})
+
+
+# A memory cap small enough that the per-group value list spills, forcing the bounded
+# out-of-core median/quantile path (a hot key is computed on disk).
+def _tight_cap():
+    from batcher.config import Config, MemoryConfig
+
+    return Config().replace(memory=MemoryConfig(max_memory_bytes=1 << 14))
+
+
+def test_median_grouped_spilled(duck):
+    from batcher.config import config_context
+    from conftest import assert_same
+
+    tbl = _skewed_with_nulls()
+    duck.register("s", tbl)
+    with config_context(_tight_cap()):
+        out = bt.from_arrow(tbl).group_by("k").agg(m=col("v").median()).collect()
+    assert_same(out, duck.sql("SELECT k, median(v) m FROM s GROUP BY k"))
+
+
+@pytest.mark.parametrize("p", [0.1, 0.25, 0.5, 0.9])
+def test_quantile_grouped_spilled(duck, p):
+    from batcher.config import config_context
+    from conftest import assert_same
+
+    tbl = _skewed_with_nulls()
+    duck.register("s", tbl)
+    with config_context(_tight_cap()):
+        out = bt.from_arrow(tbl).group_by("k").agg(q=col("v").quantile(p)).collect()
+    assert_same(out, duck.sql(f"SELECT k, quantile_cont(v, {p}) q FROM s GROUP BY k"))
+
+
+def test_median_global_spilled(duck):
+    from batcher.config import config_context
+    from conftest import assert_same
+
+    tbl = _skewed_with_nulls()
+    duck.register("s", tbl)
+    with config_context(_tight_cap()):
+        out = bt.from_arrow(tbl).group_by().agg(m=col("v").median()).collect()
+    assert_same(out, duck.sql("SELECT median(v) m FROM s"))
+
+
 def test_median_partition_independent():
     # Mergeability: same result whether input is one chunk or many.
     rng = np.random.default_rng(2)

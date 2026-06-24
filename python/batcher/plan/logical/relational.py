@@ -28,6 +28,7 @@ __all__ = [
     "Union",
     "Unnest",
     "Unpivot",
+    "WatermarkDedup",
 ]
 
 
@@ -132,6 +133,27 @@ class Distinct(LogicalPlan):
 
 
 @dataclass(frozen=True, slots=True)
+class WatermarkDedup(LogicalPlan):
+    """Watermark-bounded streaming deduplication (Spark ``dropDuplicatesWithinWatermark``).
+
+    Keeps the first row per `subset` key seen within the event-time watermark window;
+    once the watermark (``max event time - lateness``) passes a key, the key is
+    forgotten so a much-later duplicate may re-appear — which is what keeps the
+    seen-key state bounded. A *streaming-only* node (over a bounded source, plain
+    `distinct` is exact and used instead), executed entirely by the streaming driver,
+    so it is never lowered to the Rust IR.
+    """
+
+    input: LogicalPlan
+    subset: tuple[str, ...]
+    event_time: str
+    lateness_micros: int
+
+    def available_columns(self) -> list[str]:
+        return self.input.available_columns()
+
+
+@dataclass(frozen=True, slots=True)
 class Union(LogicalPlan):
     """Concatenate relations with identical schemas (UNION ALL, or UNION if distinct)."""
 
@@ -191,6 +213,36 @@ class Unnest(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return [self.alias if c == self.column else c for c in self.input.available_columns()]
+
+
+@dataclass(frozen=True, slots=True)
+class RowId(LogicalPlan):
+    """Append a 0-based (plus `offset`) sequential row-index column (Polars
+    ``with_row_index``).
+
+    The index numbers rows in arrival order across the whole input via one sequential
+    counter, so it is identical on the single-node and parallel paths for an
+    order-preserving pipeline. Streaming.
+    """
+
+    input: LogicalPlan
+    alias: str
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        if self.alias in self.input.available_columns():
+            raise PlanError(f"with_row_index name {self.alias!r} collides with an existing column")
+
+    def to_ir(self) -> dict[str, Any]:
+        return {
+            "op": Op.ROW_ID,
+            "input": self.input.to_ir(),
+            "alias": self.alias,
+            "offset": self.offset,
+        }
+
+    def available_columns(self) -> list[str]:
+        return [self.alias, *self.input.available_columns()]
 
 
 @dataclass(frozen=True, slots=True)

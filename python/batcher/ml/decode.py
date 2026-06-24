@@ -24,7 +24,130 @@ from batcher._internal.errors import PlanError
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
-__all__ = ["audio_dataset", "image_tensor_dataset", "video_dataset"]
+__all__ = [
+    "audio_dataset",
+    "download_dataset",
+    "image_tensor_dataset",
+    "upload_dataset",
+    "video_dataset",
+]
+
+
+def upload_dataset(
+    ds: Dataset,
+    *,
+    data_column: str,
+    directory: str,
+    output_column: str = "path",
+    name_column: str | None = None,
+    extension: str = "",
+    max_concurrency: int = 16,
+) -> Dataset:
+    """Write each row's bytes to a file under `directory`, appending the written path.
+
+    The counterpart to `download_dataset` (cf. Daft's ``url.upload``) — write decoded
+    or transformed media back to ``s3://`` / ``gs://`` / ``az://`` / local storage.
+    File names come from `name_column` (plus `extension`) or a content-addressed hash
+    when no name column is given (collision-free across distributed workers). Writes
+    each batch's rows concurrently and parallelizes across the cluster.
+
+    Args:
+        data_column: the binary column to write.
+        directory: the destination directory/prefix.
+        output_column: the appended column of written paths.
+        name_column: optional column of file names (else a content hash is used).
+        extension: appended to the file name (e.g. ``".jpg"``).
+        max_concurrency: concurrent writes per batch.
+    """
+    base = directory.rstrip("/")
+
+    def _write(name: str, data: bytes | None) -> str | None:
+        if data is None:
+            return None
+        from batcher.io.filesystem import resolve_filesystem
+
+        path = f"{base}/{name}{extension}"
+        with resolve_filesystem(path).atomic_writer(path) as handle:
+            handle.write(data)
+        return path
+
+    def _udf(batch: Any) -> Any:
+        import hashlib
+        from concurrent.futures import ThreadPoolExecutor
+
+        import pyarrow as pa
+
+        data = batch.column(data_column).to_pylist()
+        if name_column is not None:
+            names = [str(n) for n in batch.column(name_column).to_pylist()]
+        else:
+            names = [hashlib.sha1(b).hexdigest() if b is not None else "" for b in data]
+        with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
+            paths = list(pool.map(_write, names, data))
+        col = pa.array(paths, type=pa.large_string())
+        if output_column in batch.schema.names:
+            return batch.set_column(batch.schema.get_field_index(output_column), output_column, col)
+        return batch.append_column(output_column, col)
+
+    out_cols = list(ds.columns) if output_column in ds.columns else [*ds.columns, output_column]
+    return ds.map_batches(_udf, output_columns=out_cols)
+
+
+def download_dataset(
+    ds: Dataset,
+    *,
+    url_column: str,
+    output_column: str = "bytes",
+    max_concurrency: int = 16,
+    on_error: str = "raise",
+) -> Dataset:
+    """Fetch the bytes at each URL/path into a ``large_binary`` column.
+
+    The entry point of a multimodal pipeline (URL table → bytes → decode → model),
+    the counterpart to Daft's ``col(url).url.download()``. Reads ``s3://`` / ``gs://`` /
+    ``az://`` / ``http(s)://`` / local paths through the shared filesystem resolver,
+    fetching the rows of each batch **concurrently** (`max_concurrency` connections).
+    Runs as a `map_batches` stage, so it parallelizes across the Ray cluster like any
+    other operator. `on_error="null"` turns a failed/missing fetch into a null instead
+    of raising — so one bad URL doesn't kill the job.
+
+    Args:
+        url_column: the column of URLs/paths to fetch.
+        output_column: the appended (or replaced) bytes column.
+        max_concurrency: concurrent fetches per batch (I/O-bound, GIL-releasing).
+        on_error: ``"raise"`` (default) or ``"null"``.
+    """
+    if on_error not in ("raise", "null"):
+        raise PlanError(f"download on_error must be 'raise' or 'null', got {on_error!r}")
+
+    def _fetch(url: str | None) -> bytes | None:
+        if url is None:
+            return None
+        from batcher.io.filesystem import resolve_filesystem
+
+        try:
+            with resolve_filesystem(url).open(url) as handle:
+                return handle.read()
+        except Exception:
+            if on_error == "null":
+                return None
+            raise
+
+    def _udf(batch: Any) -> Any:
+        from concurrent.futures import ThreadPoolExecutor
+
+        import pyarrow as pa
+
+        urls = batch.column(url_column).to_pylist()
+        with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
+            data = list(pool.map(_fetch, urls))
+        col = pa.array(data, type=pa.large_binary())
+        if output_column in batch.schema.names:
+            return batch.set_column(batch.schema.get_field_index(output_column), output_column, col)
+        return batch.append_column(output_column, col)
+
+    out_cols = list(ds.columns) if output_column in ds.columns else [*ds.columns, output_column]
+    return ds.map_batches(_udf, output_columns=out_cols)
 
 
 def _require_size(size: tuple[int, int] | None, who: str) -> tuple[int, int]:

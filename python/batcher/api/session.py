@@ -19,6 +19,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher.api.dataset import Dataset
+from batcher.api.sql_session import Session
 from batcher.io import interop
 from batcher.io.detect import detect_format
 from batcher.io.formats.base import SOURCES
@@ -48,6 +49,7 @@ __all__ = [
     "from_torch",
     "read",
     "read_table",
+    "register_function",
     "sql",
 ]
 
@@ -59,49 +61,13 @@ def engine_version() -> str:
     return _native.__engine_version__
 
 
-class _Catalog:
-    """A process-local registry of named tables for SQL and cross-query reuse.
-
-    ``bt.catalog.register("customers", ds)`` then ``bt.sql("SELECT * FROM customers")``
-    or ``bt.catalog.table("customers")``. Names passed explicitly to `bt.sql` override
-    registered ones. This is control-plane metadata only — registering does not execute.
-    """
-
-    __slots__ = ("_tables",)
-
-    def __init__(self) -> None:
-        self._tables: dict[str, Dataset] = {}
-
-    def register(self, name: str, dataset: Dataset) -> Dataset:
-        """Register `dataset` under `name` (replacing any existing entry)."""
-        self._tables[name] = dataset
-        return dataset
-
-    def table(self, name: str) -> Dataset:
-        """Return the dataset registered as `name` (raises `PlanError` if absent)."""
-        if name not in self._tables:
-            from batcher._internal.errors import PlanError
-
-            raise PlanError(f"no table {name!r} in catalog; registered: {self.list()}")
-        return self._tables[name]
-
-    def list(self) -> list[str]:
-        """The sorted names of all registered tables."""
-        return sorted(self._tables)
-
-    def drop(self, name: str) -> None:
-        """Remove `name` from the catalog (no error if absent)."""
-        self._tables.pop(name, None)
-
-    def clear(self) -> None:
-        """Remove every registered table."""
-        self._tables.clear()
+# The process-global default SQL session. `bt.catalog` exposes it (so the
+# established `bt.catalog.register/table/drop/clear/list` surface keeps working),
+# and the module-level `sql` / `register_function` below delegate to it.
+catalog = Session()
 
 
-catalog = _Catalog()
-
-
-def sql(query: str, **tables: Any) -> Dataset:
+def sql(query: str, *, dialect: str | None = None, **tables: Any) -> Dataset:
     """Run a SQL query over named tables, returning a lazy `Dataset`.
 
     Each keyword binds a table name used in the query to a `Dataset` or a pyarrow
@@ -112,29 +78,48 @@ def sql(query: str, **tables: Any) -> Dataset:
 
     Unqualified names that are not passed here resolve from the `bt.catalog`
     registry, so ``bt.catalog.register("t", ds)`` lets later ``bt.sql("... FROM t")``
-    calls omit the binding.
+    calls omit the binding. Functions registered with `bt.register_function` are
+    callable from the query. ``CREATE TABLE/VIEW AS`` and ``DROP TABLE`` register and
+    unregister tables in `bt.catalog`. For an isolated catalog use `bt.Session`.
 
     Args:
         query: A SQL statement. Table names refer to the bound keywords.
+        dialect: Override the sqlglot read dialect for this call (default ``duckdb``).
         **tables: Named inputs, each a `Dataset` or pyarrow table.
 
     Returns:
         A lazy `Dataset` of the query result.
 
-    Example:
-        >>> import batcher as bt
-        >>> sales = bt.from_pydict({"region": ["w", "e", "w"], "amount": [10, 20, 30]})
-        >>> out = bt.sql(
-        ...     "SELECT region, SUM(amount) AS total FROM sales GROUP BY region ORDER BY region",
-        ...     sales=sales,
-        ... )
-        >>> out.to_pydict()
-        {'region': ['e', 'w'], 'total': [20, 40]}
-    """
-    from batcher._sql import sql as _sql_fn
+    Examples:
+        .. doctest::
 
-    resolved = {**catalog._tables, **tables}
-    return _sql_fn(query, **resolved)
+            >>> import batcher as bt
+            >>> sales = bt.from_pydict({"region": ["w", "e", "w"], "amount": [10, 20, 30]})
+            >>> out = bt.sql(
+            ...     "SELECT region, SUM(amount) AS total "
+            ...     "FROM sales GROUP BY region ORDER BY region",
+            ...     sales=sales,
+            ... )
+            >>> out.to_pydict()
+            {'region': ['e', 'w'], 'total': [20, 40]}
+    """
+    session = catalog if dialect is None else catalog._with_dialect(dialect)
+    return session._run(query, tables)
+
+
+def register_function(name: str, fn: Callable, **options: Any) -> None:
+    """Register a Python function callable from `bt.sql` (the default session).
+
+    Sugar for ``bt.catalog.register_function``; see `Session.register_function` for
+    the call forms (scalar ``SELECT f(x)`` vs table ``SELECT * FROM f(t)``) and
+    options.
+
+    Args:
+        name: The SQL name the function is called by.
+        fn: The Python callable.
+        **options: Forwarded to `Session.register_function`.
+    """
+    catalog.register_function(name, fn, **options)
 
 
 def _scan(source: Source) -> Dataset:
@@ -162,6 +147,30 @@ def read_table(format: str, *args: Any, **opts: Any) -> Dataset:
     common backends.
     """
     return _scan(SOURCES.get(format)(*args, **opts))
+
+
+def read_memory(name: str) -> Dataset:
+    """Read the in-memory table written by a ``ds.write.memory(name, ...)`` query.
+
+    The streaming `memory` sink accumulates each micro-batch under `name`; this
+    snapshots the current contents as a `Dataset`. Raises `PlanError` if no query
+    has written to `name`.
+    """
+    from batcher._internal.errors import PlanError
+    from batcher.io.formats.streaming.sinks import memory_table
+
+    try:
+        table = memory_table(name)
+    except KeyError:
+        raise PlanError(f"no in-memory streaming sink named {name!r}") from None
+    return from_arrow(table)
+
+
+def streams() -> list[Any]:
+    """All currently-active streaming queries (Spark ``spark.streams.active``)."""
+    from batcher.api.streaming import active_streams
+
+    return active_streams()
 
 
 def from_arrow(data: pa.Table | pa.RecordBatch | Sequence[pa.RecordBatch]) -> Dataset:

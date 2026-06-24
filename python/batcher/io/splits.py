@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "FileSplit",
+    "IpcFileSplit",
     "LineRangeSplit",
     "RowGroupSplit",
     "Split",
@@ -132,6 +133,44 @@ class WholeSourceSplit:
 
     def identity(self) -> str:
         return self.source.identity()
+
+
+@dataclass(frozen=True, slots=True)
+class IpcFileSplit:
+    """One whole Arrow IPC stream file, read locator-only by path.
+
+    The unit a `MaterializedSource` advertises: a distributed-stage result that
+    stayed on disk (one IPC file per reducer) is re-scanned shared-nothing, each
+    worker reading only its own file directly — the intermediate is never collected
+    back to the driver. `rows` is the exact count captured when the file was written,
+    so balancing never re-opens it. Reads IPC via `pyarrow` directly so `io` stays
+    free of any `dist` dependency.
+    """
+
+    path: str
+    rows: int | None = None
+
+    def schema(self) -> pa.Schema:
+        with pa.OSFile(self.path, "rb") as src, pa.ipc.open_stream(src) as reader:
+            return reader.schema
+
+    def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
+        with pa.OSFile(self.path, "rb") as src, pa.ipc.open_stream(src) as reader:
+            batches = list(reader)
+        if projection is not None:
+            batches = [b.select(projection) for b in batches]
+        return batches
+
+    def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
+        with pa.OSFile(self.path, "rb") as src, pa.ipc.open_stream(src) as reader:
+            for b in reader:
+                yield b.select(projection) if projection is not None else b
+
+    def row_count(self) -> int | None:
+        return self.rows
+
+    def identity(self) -> str:
+        return f"ipc:{self.path}"
 
 
 @dataclass(frozen=True, slots=True)

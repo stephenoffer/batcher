@@ -106,3 +106,92 @@ def test_distributed_adaptive_equals_single_node():
 
     assert _rowset(adaptive_local) == _rowset(base)
     assert _rowset(adaptive_dist) == _rowset(base)
+
+
+def test_distributed_adaptive_aggregate_then_join_equals_single_node():
+    # An aggregate feeding a join: the aggregate is an *intermediate* breaker, so the
+    # distributed adaptive path keeps its result partitioned on disk (a
+    # MaterializedSource) and scans it in place for the join — never collecting it to
+    # the driver. The result must still equal single-node.
+    fact, dim = _big_small()
+
+    def query(ds_fact, ds_dim):
+        agg = ds_fact.group_by("k").agg(s=col("v").sum())
+        return agg.join(ds_dim, on="k")
+
+    base = query(fact, dim).collect()
+    adaptive_dist = query(fact, dim).collect(distributed=True, adaptive=True, num_workers=2)
+    assert _rowset(adaptive_dist) == _rowset(base)
+
+
+def test_execute_distributed_materialize_false_keeps_aggregate_partitioned():
+    # The mechanism: a distributed aggregate run with materialize=False returns a
+    # MaterializedSource over its on-disk reducer output (not a collected table), with
+    # an exact row count and the same data as the collected path.
+    from batcher.dist import execute_distributed
+    from batcher.io.source import MaterializedSource
+
+    fact, _ = _big_small()
+    agg = fact.group_by("k").agg(s=col("v").sum())
+    plan, sources = agg._plan, agg._sources
+
+    collected = execute_distributed(plan, sources, num_workers=2, transport="disk")
+    partitioned = execute_distributed(
+        plan, sources, num_workers=2, transport="disk", materialize=False
+    )
+    try:
+        assert isinstance(partitioned, MaterializedSource)
+        assert partitioned.row_count() == collected.num_rows
+        scanned = pa.Table.from_batches(partitioned.read(), schema=partitioned.schema())
+        assert _rowset(scanned) == _rowset(collected)
+    finally:
+        partitioned.cleanup()
+
+
+def test_flight_aggregate_materialize_false_keeps_result_on_actors():
+    # The multi-node mechanism: a Flight aggregate run with materialize=False keeps its
+    # result on the worker actors and returns a FlightMaterializedSource (not a
+    # collected table) — its buckets are read back shared-nothing over Flight. The
+    # actors persist until cleanup(); the data + exact count match the collected path.
+    # (Adaptive cross-stage Flight materialize is deferred — it needs a shared actor
+    # fleet to avoid placement contention — so this exercises the mechanism directly.)
+    from batcher.dist.flight_aggregate import execute_aggregate_flight
+    from batcher.dist.flight_worker import FlightMaterializedSource
+
+    fact, _ = _big_small()
+    agg = fact.group_by("k").agg(s=col("v").sum())
+    plan, sources = agg._plan, agg._sources
+
+    collected = execute_aggregate_flight([], plan, sources, 2)
+    partitioned = execute_aggregate_flight([], plan, sources, 2, materialize=False)
+    try:
+        assert isinstance(partitioned, FlightMaterializedSource)
+        assert partitioned.row_count() == collected.num_rows
+        scanned = pa.Table.from_batches(partitioned.read(), schema=partitioned.schema())
+        assert _rowset(scanned) == _rowset(collected)
+    finally:
+        partitioned.cleanup()
+
+
+def test_execute_distributed_materialize_false_keeps_join_partitioned():
+    # The same mechanism for a co-partition shuffle join: materialize=False returns a
+    # MaterializedSource over the reducer IPC output (not a collected table) with an
+    # exact row count and identical data — the common join → group-by adaptive pattern.
+    from batcher.dist import execute_distributed
+    from batcher.io.source import MaterializedSource
+
+    fact, dim = _big_small()
+    joined = fact.join(dim, on="k")
+    plan, sources = joined._plan, joined._sources
+
+    collected = execute_distributed(plan, sources, num_workers=2, transport="disk")
+    partitioned = execute_distributed(
+        plan, sources, num_workers=2, transport="disk", materialize=False
+    )
+    try:
+        assert isinstance(partitioned, MaterializedSource)
+        assert partitioned.row_count() == collected.num_rows
+        scanned = pa.Table.from_batches(partitioned.read(), schema=partitioned.schema())
+        assert _rowset(scanned) == _rowset(collected)
+    finally:
+        partitioned.cleanup()

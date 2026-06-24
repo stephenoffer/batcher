@@ -23,7 +23,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.stats.selectivity import comparison_col_side
-from batcher.plan.expr_ir import Binary
+from batcher.plan.expr_ir import Binary, referenced_columns
 from batcher.plan.expr_rewrite import combine_conjuncts, split_conjuncts
 from batcher.plan.ir_tags import WINDOW_RANKING
 from batcher.plan.logical import (
@@ -36,8 +36,9 @@ from batcher.plan.logical import (
     Union,
     Window,
 )
+from batcher.plan.logical.aggregate import SortKeySpec
 
-__all__ = ["fuse_topn", "qualify_to_partition_topn"]
+__all__ = ["collapse_adjacent_windows", "fuse_topn", "qualify_to_partition_topn"]
 
 # Flip a comparison operator when the column is on the right (`lit <= col` ≡ `col >= lit`).
 _FLIP = {"lt": "gt", "gt": "lt", "le": "ge", "ge": "le", "eq": "eq", "ne": "ne"}
@@ -105,9 +106,7 @@ def qualify_to_partition_topn(node: Filter, _ctx: OptimizerContext) -> LogicalPl
     if limit is None:
         return None
 
-    fused = Window(
-        win.input, win.partition_keys, win.order_keys, win.functions, rank_limit=limit
-    )
+    fused = Window(win.input, win.partition_keys, win.order_keys, win.functions, rank_limit=limit)
     return fused if not rest else Filter(fused, combine_conjuncts(rest))
 
 
@@ -134,3 +133,53 @@ def _rank_bound(conj: object, rank_alias: str) -> int | None:
     if op == "eq" and value == 1:
         return 1
     return None
+
+
+def _key_sig(key: object) -> object:
+    """A comparable signature for a partition expr or an order-key spec — by lowered
+    IR (never `==`, which `Expr.__eq__` overloads to build a comparison expression)."""
+    if isinstance(key, SortKeySpec):
+        return (key.expr.to_ir(), key.descending, key.nulls_first)
+    return key.to_ir()
+
+
+def _keys_match(a: tuple, b: tuple) -> bool:
+    """Whether two partition/order key tuples are structurally identical."""
+    return len(a) == len(b) and all(_key_sig(x) == _key_sig(y) for x, y in zip(a, b, strict=True))
+
+
+@rule(name="collapse_adjacent_windows", phase=Phase.FUSION, matches=(Window,))
+def collapse_adjacent_windows(node: Window, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`Window(Window(x, P, O, fns1), P, O, fns2)` → `Window(x, P, O, fns1 + fns2)`.
+
+    Two windows over the *same* partitioning and ordering are one full-data pass, not
+    two — a single `Window` computing every function. Safe only when (a) neither
+    carries a `rank_limit` (which filters rows), (b) the partition and order keys are
+    identical, (c) the outer functions don't read a column the inner window produces
+    (the merged pass computes them together, so an inner output isn't yet available),
+    and (d) the two function sets have no alibi alias collision. Returns None otherwise,
+    so the rule is idempotent.
+    """
+    inner = node.input
+    if not isinstance(inner, Window):
+        return None
+    if node.rank_limit is not None or inner.rank_limit is not None:
+        return None
+    if not _keys_match(node.partition_keys, inner.partition_keys):
+        return None
+    if not _keys_match(node.order_keys, inner.order_keys):
+        return None
+    inner_aliases = {f.alias for f in inner.functions}
+    # Outer functions must not depend on a column the inner window introduces.
+    for f in node.functions:
+        if f.input is not None and referenced_columns(f.input) & inner_aliases:
+            return None
+    if inner_aliases & {f.alias for f in node.functions}:
+        return None  # alias collision — keep them separate
+    return Window(
+        inner.input,
+        node.partition_keys,
+        node.order_keys,
+        inner.functions + node.functions,
+        node.rank_limit,
+    )

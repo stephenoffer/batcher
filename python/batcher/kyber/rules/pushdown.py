@@ -22,7 +22,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.stats.selectivity import comparison_col_side
-from batcher.plan.expr_ir import Binary, Expr, referenced_columns, remap_columns
+from batcher.plan.expr_ir import Binary, Col, Expr, referenced_columns, remap_columns
 from batcher.plan.expr_rewrite import combine_conjuncts, split_conjuncts, substitute_columns
 from batcher.plan.logical import (
     Aggregate,
@@ -33,6 +33,7 @@ from batcher.plan.logical import (
     Limit,
     LogicalPlan,
     Project,
+    RowId,
     Sample,
     Scan,
     Sort,
@@ -46,6 +47,7 @@ __all__ = [
     "infer_join_predicates",
     "push_filter_through_aggregate",
     "push_filter_through_sort",
+    "push_filter_through_window",
     "rewrite_predicate",
 ]
 
@@ -117,6 +119,11 @@ def _pp(node: LogicalPlan) -> LogicalPlan:
         if all(a is b for a, b in zip(inputs, node.inputs, strict=True)):
             return node
         return Union(inputs, node.distinct)
+    if isinstance(node, RowId):
+        # A filter must NOT push below RowId: removing rows under it would change the
+        # row numbering. Stay above (recurse into the subtree only).
+        child = _pp(node.input)
+        return node if child is node.input else RowId(child, node.alias, node.offset)
     if isinstance(node, Unnest):
         # A filter above an Unnest stays above it: a predicate on the exploded
         # column cannot exist below the explode, so we conservatively never push
@@ -209,11 +216,11 @@ def infer_join_predicates(node: Join, _ctx: OptimizerContext) -> LogicalPlan | N
     new_left, new_right = node.left, node.right
     changed = False
     for lk, rk in zip(node.left_keys, node.right_keys, strict=True):
-        left_cons = _key_constraints(node.left, lk)
+        left_cons = _column_constraints(node.left, lk)
         if left_cons:
             new_right, added = _add_inferred(new_right, rk, left_cons, lk)
             changed = changed or added
-        right_cons = _key_constraints(node.right, rk)
+        right_cons = _column_constraints(node.right, rk)
         if right_cons:
             new_left, added = _add_inferred(new_left, lk, right_cons, rk)
             changed = changed or added
@@ -230,18 +237,51 @@ def infer_join_predicates(node: Join, _ctx: OptimizerContext) -> LogicalPlan | N
     )
 
 
-def _key_constraints(side: LogicalPlan, key: str) -> list[Expr]:
-    """Constant `key OP literal` conjuncts in `side`'s immediate filter (if any)."""
-    if not isinstance(side, Filter):
+def _column_constraints(side: LogicalPlan, col: str) -> list[Expr]:
+    """Constant `col OP literal` constraints provably true for column `col` of `side`'s
+    output, found by tracing `col` *down* through the subtree.
+
+    Following the column through filters (collect), through row-preserving operators
+    (sort/limit/sample/distinct), through a projection that merely renames it, and into
+    the originating side of an **inner** join is what makes inference *transitive*: a
+    constraint deep under a chain of joins (`a.k = b.k = c.k AND a.k > 10`) reaches
+    every member. Renames are followed by name, never guessed — a projection that
+    *computes* `col`, or a non-inner join (whose rows may be null-extended), stops the
+    trace, so a found constraint always holds for `side`'s output rows. Constraints are
+    rephrased onto `col` so the caller can mirror them across the join's key pair.
+    """
+    if isinstance(side, Filter):
+        # Conjuncts constraining `col` itself; `col` passes a filter unchanged, so
+        # constraints below it apply too. (Already phrased on `col` — no remap.)
+        here = [c for c in split_conjuncts(side.predicate) if _sole_constrained_column(c) == col]
+        return here + _column_constraints(side.input, col)
+    if isinstance(side, (Sort, Limit, Sample, Distinct)):
+        return _column_constraints(side.input, col)
+    if isinstance(side, Project):
+        for item in side.items:
+            if item.alias == col and isinstance(item.expr, Col):  # pure rename `col ← src`
+                src = item.expr.name
+                return [remap_columns(c, {src: col}) for c in _column_constraints(side.input, src)]
         return []
-    out: list[Expr] = []
-    for conj in split_conjuncts(side.predicate):
-        if not isinstance(conj, Binary) or conj.op not in _INFERABLE_COMPARISONS:
-            continue
-        cs = comparison_col_side(conj)
-        if cs is not None and cs[0] == key and referenced_columns(conj) == {key}:
-            out.append(conj)
-    return out
+    if isinstance(side, Join) and side.join_type == "inner":
+        for o in side.output:
+            if o.alias == col:  # map the output alias to its source side+name
+                child = side.left if o.side == "left" else side.right
+                below = _column_constraints(child, o.name)
+                return [remap_columns(c, {o.name: col}) for c in below]
+        return []
+    return []  # Scan / Aggregate / Window / Union / non-inner join: stop the trace
+
+
+def _sole_constrained_column(conj: Expr) -> str | None:
+    """The column name of a `col OP literal` conjunct that references only that one
+    column (an inferable constant constraint), else None."""
+    if not isinstance(conj, Binary) or conj.op not in _INFERABLE_COMPARISONS:
+        return None
+    cs = comparison_col_side(conj)
+    if cs is not None and referenced_columns(conj) == {cs[0]}:
+        return cs[0]
+    return None
 
 
 def _add_inferred(
@@ -298,3 +338,38 @@ def push_filter_through_sort(node: Filter, _ctx: OptimizerContext) -> LogicalPla
     if isinstance(inner, Sort) and inner.limit is None:
         return Sort(Filter(inner.input, node.predicate), inner.keys, None)
     return None
+
+
+@rule(name="push_filter_through_window", phase=Phase.PUSHDOWN, matches=(Filter,))
+def push_filter_through_window(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`Filter(Window(x, partition=P, …), p)` → `Window(Filter(x, p), …)` when `p`
+    references only (simple-column) partition keys.
+
+    A predicate on the partition key keeps or drops *whole* partitions, and a window
+    is computed independently per partition — so dropping those partitions before the
+    window yields the identical result for every surviving partition (true even with
+    `rank_limit`, a per-partition top-k). A predicate touching a window-function
+    output (a rank/sum column) genuinely needs the windowed result and cannot move.
+    The partition keys are pass-through columns of `x` under the same names, so the
+    predicate transfers unchanged. Conjuncts are split so a mixed predicate pushes its
+    partition-only part and keeps the rest above.
+    """
+    win = node.input
+    if not isinstance(win, Window):
+        return None
+    part_cols = {pk.name for pk in win.partition_keys if isinstance(pk, Col)}
+    if len(part_cols) != len(win.partition_keys):
+        return None  # a non-trivial partition expression — be conservative
+    pushable, keep = [], []
+    for conj in split_conjuncts(node.predicate):
+        (pushable if referenced_columns(conj) <= part_cols else keep).append(conj)
+    if not pushable:
+        return None
+    new_win = Window(
+        Filter(win.input, combine_conjuncts(pushable)),
+        win.partition_keys,
+        win.order_keys,
+        win.functions,
+        win.rank_limit,
+    )
+    return new_win if not keep else Filter(new_win, combine_conjuncts(keep))

@@ -80,6 +80,27 @@ def test_is_nan_matches_duckdb(duck):
     assert_same(out, duck.sql("SELECT isnan(x) AS n FROM t"))
 
 
+_INF = float("inf")
+
+
+def test_is_infinite_matches_duckdb(duck):
+    from conftest import assert_same
+
+    data = pa.table({"x": pa.array([1.0, _INF, _NAN, -_INF, None], type=pa.float64())})
+    out = bt.from_arrow(data).select(n=col("x").is_infinite()).collect()
+    duck.register("t", data)
+    assert_same(out, duck.sql("SELECT isinf(x) AS n FROM t"))
+
+
+def test_is_finite_matches_duckdb(duck):
+    from conftest import assert_same
+
+    data = pa.table({"x": pa.array([1.0, _INF, _NAN, -_INF, None], type=pa.float64())})
+    out = bt.from_arrow(data).select(n=col("x").is_finite()).collect()
+    duck.register("t", data)
+    assert_same(out, duck.sql("SELECT isfinite(x) AS n FROM t"))
+
+
 def test_is_not_nan_matches_duckdb(duck):
     from conftest import assert_same
 

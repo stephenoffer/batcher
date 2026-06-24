@@ -17,7 +17,7 @@ import pytest
 
 import batcher as bt
 from batcher import col, count
-from batcher.config import Config, MemoryConfig, config_context
+from batcher.config import Config, DistributedConfig, MemoryConfig, config_context
 
 pytestmark = pytest.mark.integration
 
@@ -71,6 +71,30 @@ def test_distributed_sort_spills_and_matches_single_node():
         dist = ds.collect(distributed=True, num_workers=3).to_pylist()
     # Sort is order-significant: compare the sequences directly.
     assert [r["v"] for r in dist] == [r["v"] for r in single]
+
+
+def test_distributed_join_learned_skew_matches_single_node():
+    # Metadata-driven skew: the first run opts into salting (runs the detection
+    # pre-pass and persists the hot keys); the second run uses the default config
+    # (no pre-pass) yet auto-engages salting from the learned hot keys. Both
+    # distributed runs must equal single-node — salting is result-preserving.
+    rng = np.random.default_rng(7)
+    ids = np.concatenate(
+        [np.zeros(8000, dtype="int64"), rng.integers(1, 500, 2000).astype("int64")]
+    )
+    left = pa.table({"id": ids, "v": np.arange(ids.size)})
+    right = pa.table({"id": np.arange(500, dtype="int64"), "w": np.arange(500)})
+    ds = bt.from_arrow(left).join(bt.from_arrow(right), on="id")
+    single = _sort_key(ds.collect().to_pylist(), ("id", "v", "w"))
+
+    # First run: opt into salting → learns + persists the hot key (0).
+    with config_context(Config().replace(distributed=DistributedConfig(skew_join_salt=4))):
+        learned_run = ds.collect(distributed=True, num_workers=3).to_pylist()
+    # Second run: default config (salt off) → auto-salts from the learned hot key.
+    auto_run = ds.collect(distributed=True, num_workers=3).to_pylist()
+
+    assert _sort_key(learned_run, ("id", "v", "w")) == single
+    assert _sort_key(auto_run, ("id", "v", "w")) == single
 
 
 def test_distributed_skewed_join_spills_and_matches_single_node():

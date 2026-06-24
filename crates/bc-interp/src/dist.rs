@@ -82,13 +82,29 @@ fn partial_to_batch(
 
 /// Decode partial-state batches back into `Partial`s, splitting the synthetic
 /// state columns by each aggregate's width.
+///
+/// The batches arrive from other Ray workers, so their column count is validated
+/// against the wire format (`n_keys + Σ widths`) before any column is indexed: a
+/// version-skewed or corrupt partial yields a typed [`InterpError::MalformedPartial`]
+/// the orchestrator can treat as a failed task (recompute) rather than panicking the
+/// reducer on an out-of-bounds access.
 fn batches_to_partials(
     n_keys: usize,
     widths: &[usize],
     partial_batches: &[RecordBatch],
-) -> Vec<agg::Partial> {
+) -> Result<Vec<agg::Partial>, InterpError> {
+    let state: usize = widths.iter().sum();
+    let expected = n_keys + state;
     let mut partials = Vec::with_capacity(partial_batches.len());
     for batch in partial_batches {
+        if batch.num_columns() != expected {
+            return Err(InterpError::MalformedPartial {
+                expected,
+                n_keys,
+                state,
+                got: batch.num_columns(),
+            });
+        }
         let group_columns: Vec<ArrayRef> = (0..n_keys).map(|i| batch.column(i).clone()).collect();
         let mut states = Vec::with_capacity(widths.len());
         let mut off = n_keys;
@@ -101,7 +117,7 @@ fn batches_to_partials(
             states,
         });
     }
-    partials
+    Ok(partials)
 }
 
 /// Combine step (no finalize): merge partial-state batches into a single partial
@@ -114,7 +130,7 @@ pub fn combine(
     partial_batches: &[RecordBatch],
 ) -> Result<RecordBatch, InterpError> {
     let widths = agg_widths(aggregates);
-    let partials = batches_to_partials(group_keys.len(), &widths, partial_batches);
+    let partials = batches_to_partials(group_keys.len(), &widths, partial_batches)?;
     if partials.is_empty() {
         return Err(InterpError::EmptyAggregateInput);
     }
@@ -131,7 +147,7 @@ pub fn combine_finalize(
     partial_batches: &[RecordBatch],
 ) -> Result<RecordBatch, InterpError> {
     let widths = agg_widths(aggregates);
-    let partials = batches_to_partials(group_keys.len(), &widths, partial_batches);
+    let partials = batches_to_partials(group_keys.len(), &widths, partial_batches)?;
     if partials.is_empty() {
         return Err(InterpError::EmptyAggregateInput);
     }
@@ -179,4 +195,48 @@ pub fn salted_partition_batches(
         replicate,
     )?;
     Ok(parts.into_iter().map(|b| vec![b]).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::DataType;
+
+    fn batch(n_cols: usize) -> RecordBatch {
+        let fields: Vec<Field> = (0..n_cols)
+            .map(|i| Field::new(format!("c{i}"), DataType::Int64, true))
+            .collect();
+        let cols: Vec<ArrayRef> = (0..n_cols)
+            .map(|_| Arc::new(Int64Array::from(vec![1i64])) as ArrayRef)
+            .collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+    }
+
+    /// A version-skewed/corrupt partial (wrong column count) from another worker is
+    /// rejected with a typed error before any column is indexed — never an
+    /// out-of-bounds panic on the reducer.
+    #[test]
+    fn malformed_partial_is_typed_error_not_panic() {
+        // Expect n_keys (1) + widths (2 + 1 = 3) = 4 columns; give 2.
+        match batches_to_partials(1, &[2, 1], &[batch(2)]) {
+            Err(InterpError::MalformedPartial {
+                expected,
+                n_keys,
+                state,
+                got,
+            }) => assert_eq!((expected, n_keys, state, got), (4, 1, 3, 2)),
+            _ => panic!("expected Err(MalformedPartial)"),
+        }
+    }
+
+    /// A correctly-shaped batch decodes into one partial with the right arity split.
+    #[test]
+    fn well_formed_partial_decodes() {
+        let partials = batches_to_partials(1, &[2, 1], &[batch(4)]).unwrap();
+        assert_eq!(partials.len(), 1);
+        assert_eq!(partials[0].group_columns.len(), 1);
+        let widths: Vec<usize> = partials[0].states.iter().map(|s| s.len()).collect();
+        assert_eq!(widths, vec![2, 1]);
+    }
 }

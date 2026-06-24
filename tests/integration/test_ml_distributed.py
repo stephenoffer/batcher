@@ -88,6 +88,23 @@ def test_distributed_infer_loads_model_once_per_actor():
     assert len({r["tag"] for r in rows}) <= 2
 
 
+def test_autoscaling_pool_correct_results():
+    # concurrency=(min, max) runs the dynamic-autoscaling pool: it must still produce
+    # every row exactly once, with the model built at most `max` times.
+    n = 1500
+    ds = bt.from_pydict({"x": list(range(n))})
+    out = ds.ml.infer(
+        _TaggingModel,
+        output_columns=["x", "y", "tag"],
+        concurrency=(1, 3),
+    ).collect(distributed=True, num_workers=4)
+
+    rows = out.to_pylist()
+    assert sorted(r["x"] for r in rows) == list(range(n))  # complete, no dup/loss
+    assert all(r["y"] == r["x"] * 2 for r in rows)
+    assert len({r["tag"] for r in rows}) <= 3  # never exceeded max actors
+
+
 def test_dataset_infer_and_embed_single_node():
     ds = bt.from_pydict({"x": [1, 2, 3, 4]})
 

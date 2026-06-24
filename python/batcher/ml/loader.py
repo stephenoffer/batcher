@@ -25,6 +25,7 @@ shard-streaming with a local cache is a drop-in follow-up behind the same API.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
@@ -211,6 +212,7 @@ def iter_torch_batches(
     collate_fn: Any = None,
     prefetch_batches: int = 1,
     pin_memory: bool = False,
+    zero_copy: bool = False,
     local_shuffle_buffer_size: int | None = None,
     seed: int = 0,
 ) -> Any:
@@ -234,6 +236,9 @@ def iter_torch_batches(
         prefetch_batches: batches to prefetch on a background thread (0 disables).
         pin_memory: page-lock CPU tensors for faster asynchronous host→device copies
             (only meaningful with a non-CPU `device`).
+        zero_copy: for **read-only inference**, hand the Arrow buffer to torch via
+            DLPack (one fewer CPU copy before the device move). Do not mutate the
+            tensors; leave False for training (which mutates batches in place).
         local_shuffle_buffer_size: if set, shuffle within blocks of this many rows
             before batching (a streaming approximation of a global shuffle).
         seed: seed for the local shuffle.
@@ -255,9 +260,8 @@ def iter_torch_batches(
         arrow_batches = _local_shuffle(arrow_batches, local_shuffle_buffer_size, out_rows, seed)
     numpy_stream = to_numpy_batches(arrow_batches, columns=columns)
     move = device if device not in (None, "cpu") else None
-    tensors = (
-        _to_torch_out(a, arrays_to_torch, collate_fn, move, pin_memory) for a in numpy_stream
-    )
+    to_torch = partial(arrays_to_torch, zero_copy=zero_copy)
+    tensors = (_to_torch_out(a, to_torch, collate_fn, move, pin_memory) for a in numpy_stream)
     if prefetch_batches and prefetch_batches > 0:
         yield from _prefetch(tensors, prefetch_batches)
     else:
@@ -269,30 +273,77 @@ def streaming_split(
     world_size: int,
     *,
     rank: int | None = None,
+    queue_depth: int = 2,
     **loader_kwargs: Any,
 ) -> Any:
     """Split the stream across `world_size` ranks for data-parallel training (lazy).
 
-    Each rank consumes a disjoint shard of the batches (by batch index modulo
-    `world_size`) as an `iter_torch_batches` stream — the streaming counterpart to
-    `stream_loader`'s exact indexed split. Use this for unbounded/streaming sources
-    that have no global length; use `stream_loader` when a deterministic global order
-    across a known corpus is required.
+    Two modes, both yielding `iter_torch_batches`-shaped ``{column: tensor}`` batches:
 
-    Returns a single rank's iterator when `rank` is given, else a list of `world_size`
-    iterators (one per rank).
+    * **Whole fleet** (no `rank`) → a list of `world_size` iterators. A single reader
+      consumes the dataset **once** and fans batches out round-robin to per-rank
+      queues, so the data is read once total (not once per rank). All ranks must be
+      consumed **concurrently** (the DDP norm); bounded `queue_depth` applies
+      backpressure. Each rank yields the *same* number of batches (a trailing partial
+      round is dropped) so no rank stalls the all-reduce barrier.
+    * **Single rank** (`rank` given) → one iterator that reads and keeps its
+      ``i % world_size == rank`` shard. For separate DDP processes over a *bounded*
+      corpus prefer `stream_loader`, whose indexed split is exactly balanced,
+      deterministic, and resumable without re-reading the others' shards.
+
+    Use either for unbounded/streaming sources that have no global length.
     """
     if world_size < 1:
         raise PlanError("streaming_split requires world_size >= 1")
     if rank is not None:
-        return _rank_stream(dataset, world_size, rank, loader_kwargs)
-    return [_rank_stream(dataset, world_size, r, loader_kwargs) for r in range(world_size)]
+        full = iter_torch_batches(dataset, **loader_kwargs)
+        return (batch for i, batch in enumerate(full) if i % world_size == rank)
+    return _round_robin_split(dataset, world_size, queue_depth, loader_kwargs)
 
 
-def _rank_stream(dataset: Dataset, world_size: int, rank: int, loader_kwargs: dict) -> Any:
-    """One rank's shard: every `world_size`-th batch of the full tensor stream."""
-    full = iter_torch_batches(dataset, **loader_kwargs)
-    return (batch for i, batch in enumerate(full) if i % world_size == rank)
+def _round_robin_split(
+    dataset: Dataset, world_size: int, queue_depth: int, loader_kwargs: dict
+) -> list:
+    """A single reader fans the tensor stream out to `world_size` per-rank queues.
+
+    The dataset is read once; a producer thread distributes complete rounds of
+    `world_size` batches (one per rank), dropping any trailing partial round so every
+    rank yields an equal count. A producer error surfaces to every rank's consumer."""
+    import queue
+    import threading
+
+    queues: list[queue.Queue] = [queue.Queue(maxsize=queue_depth) for _ in range(world_size)]
+    state: dict = {"error": None}
+    done = object()
+
+    def _producer() -> None:
+        try:
+            round_: list = []
+            for batch in iter_torch_batches(dataset, **loader_kwargs):
+                round_.append(batch)
+                if len(round_) == world_size:
+                    for i, item in enumerate(round_):
+                        queues[i].put(item)
+                    round_ = []
+            # A trailing partial round is dropped to keep all ranks balanced.
+        except Exception as exc:  # surface to every consumer
+            state["error"] = exc
+        finally:
+            for q in queues:
+                q.put(done)
+
+    threading.Thread(target=_producer, daemon=True).start()
+
+    def _rank_iter(q: queue.Queue) -> Any:
+        while True:
+            item = q.get()
+            if item is done:
+                if state["error"] is not None:
+                    raise state["error"]
+                return
+            yield item
+
+    return [_rank_iter(q) for q in queues]
 
 
 def _to_torch_out(

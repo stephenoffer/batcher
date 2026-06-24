@@ -454,6 +454,101 @@ pub(crate) fn add_months(dates: &ArrayRef, months: &ArrayRef) -> Result<ArrayRef
     }
 }
 
+/// Floor-divide `a` by positive `b` (rounds toward −∞, unlike Rust's `/`).
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    if (a % b != 0) && ((a < 0) != (b < 0)) {
+        q - 1
+    } else {
+        q
+    }
+}
+
+/// `window_start(ts, width, origin)` — the start of the fixed-width tumbling window
+/// containing each instant: `origin + ⌊(t−origin)/width⌋·width`. → Timestamp(us).
+pub(crate) fn eval_window_start(
+    arr: &ArrayRef,
+    width_micros: i64,
+    origin_micros: i64,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::{Int64Type, TimeUnit};
+
+    if width_micros <= 0 {
+        return Err(ExprError::MissingArgument {
+            func: "window_start".into(),
+            arg: "width (must be > 0)",
+        });
+    }
+    let ts = cast(arr, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
+    let micros = cast(&ts, &DataType::Int64)?;
+    let m = micros.as_primitive::<Int64Type>();
+    let out: Int64Array = (0..m.len())
+        .map(|i| {
+            (!m.is_null(i)).then(|| {
+                origin_micros + floor_div(m.value(i) - origin_micros, width_micros) * width_micros
+            })
+        })
+        .collect();
+    Ok(cast(
+        &(Arc::new(out) as ArrayRef),
+        &DataType::Timestamp(TimeUnit::Microsecond, None),
+    )?)
+}
+
+/// `window_buckets(ts, width, slide)` — the starts of every sliding window that
+/// contains each instant, as a `List<Timestamp(us)>`. A window with start `s = k·slide`
+/// contains `t` iff `s ≤ t < s+width`, so `k ∈ (⌊(t−width)/slide⌋, ⌊t/slide⌋]`.
+pub(crate) fn eval_window_buckets(
+    arr: &ArrayRef,
+    width_micros: i64,
+    slide_micros: i64,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::{Array, AsArray, Int64Builder, ListArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{Field, Int64Type, TimeUnit};
+
+    if width_micros <= 0 || slide_micros <= 0 {
+        return Err(ExprError::MissingArgument {
+            func: "window_buckets".into(),
+            arg: "width/slide (must be > 0)",
+        });
+    }
+    let ts = cast(arr, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
+    let micros = cast(&ts, &DataType::Int64)?;
+    let m = micros.as_primitive::<Int64Type>();
+    let mut values = Int64Builder::new();
+    let mut lengths: Vec<usize> = Vec::with_capacity(m.len());
+    for i in 0..m.len() {
+        if m.is_null(i) {
+            lengths.push(0);
+            continue;
+        }
+        let t = m.value(i);
+        let k_hi = floor_div(t, slide_micros);
+        let k_lo = floor_div(t - width_micros, slide_micros) + 1;
+        let mut n = 0usize;
+        let mut k = k_lo;
+        while k <= k_hi {
+            values.append_value(k * slide_micros);
+            n += 1;
+            k += 1;
+        }
+        lengths.push(n);
+    }
+    let child = cast(
+        &(Arc::new(values.finish()) as ArrayRef),
+        &DataType::Timestamp(TimeUnit::Microsecond, None),
+    )?;
+    let field = Arc::new(Field::new(
+        "item",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        true,
+    ));
+    let offsets = OffsetBuffer::from_lengths(lengths);
+    Ok(Arc::new(ListArray::new(field, offsets, child, None)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +624,58 @@ mod tests {
     fn offset_subday_on_date_errors() {
         let arr: ArrayRef = Arc::new(Date32Array::from(vec![date(2024, 1, 1)]));
         assert!(eval_date_offset(&arr, 0, 0, 3_600_000_000).is_err());
+    }
+
+    #[test]
+    fn window_start_floors_to_width_and_handles_negative() {
+        use arrow::datatypes::{TimeUnit, TimestampMicrosecondType};
+        // width = 100us; 250→200, 100→100, 99→0, -1→-100 (floored), null→null.
+        let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(250),
+            Some(100),
+            Some(99),
+            Some(-1),
+            None,
+        ]));
+        let out = eval_window_start(&arr, 100, 0).unwrap();
+        let ts = out.as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(
+            out.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(ts.value(0), 200);
+        assert_eq!(ts.value(1), 100);
+        assert_eq!(ts.value(2), 0);
+        assert_eq!(ts.value(3), -100);
+        assert!(ts.is_null(4));
+    }
+
+    #[test]
+    fn window_buckets_emits_overlapping_windows() {
+        use arrow::array::AsArray;
+        use arrow::datatypes::TimestampMicrosecondType;
+        // width=100, slide=50 → 2 windows per row. t=120 ∈ windows [50,150) and
+        // [100,200): starts {50, 100}. t=0 ∈ only [0,100) (start 0; window [-50,50)
+        // also contains 0 → start -50). So t=0 → {-50, 0}.
+        let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(120),
+            Some(0),
+            None,
+        ]));
+        let out = eval_window_buckets(&arr, 100, 50).unwrap();
+        let list = out.as_list::<i32>();
+        let row0 = list.value(0);
+        let v0 = row0.as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(
+            (0..v0.len()).map(|i| v0.value(i)).collect::<Vec<_>>(),
+            vec![50, 100]
+        );
+        let row1 = list.value(1);
+        let v1 = row1.as_primitive::<TimestampMicrosecondType>();
+        assert_eq!(
+            (0..v1.len()).map(|i| v1.value(i)).collect::<Vec<_>>(),
+            vec![-50, 0]
+        );
+        assert_eq!(list.value(2).len(), 0); // null input → empty list
     }
 }

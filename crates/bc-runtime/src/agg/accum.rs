@@ -217,6 +217,66 @@ pub(crate) fn bool_acc(
     Ok(Arc::new(out))
 }
 
+/// Fold each group's non-null Int64 values with a bitwise op (`bit_and`/`bit_or`/
+/// `bit_xor`). Null-skipping; an all-null group yields null. The op is associative
+/// and commutative, so the same fold merges already-partial state across partitions.
+pub(crate) fn bitfold_acc(
+    values: &ArrayRef,
+    group_ids: &[u32],
+    num_groups: usize,
+    func: AggFunc,
+) -> Result<ArrayRef, RuntimeError> {
+    let arr = values
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| RuntimeError::UnsupportedAggregate {
+            func: func.name().to_string(),
+            dtype: values.data_type().to_string(),
+        })?;
+    let mut cur = vec![0i64; num_groups];
+    let mut valid = vec![false; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        if arr.is_valid(i) {
+            let (g, v) = (g as usize, arr.value(i));
+            if !valid[g] {
+                cur[g] = v;
+                valid[g] = true;
+            } else {
+                cur[g] = match func {
+                    AggFunc::BitAnd => cur[g] & v,
+                    AggFunc::BitOr => cur[g] | v,
+                    AggFunc::BitXor => cur[g] ^ v,
+                    _ => unreachable!("bitfold_acc on non-bitwise func"),
+                };
+            }
+        }
+    }
+    Ok(Arc::new(masked_i64(cur, valid)))
+}
+
+/// Product of each group's non-null values as Float64 (DuckDB `product` returns
+/// DOUBLE; f64 avoids the silent integer overflow a wrapping i64 product would hit).
+/// Null-skipping; an all-null group yields null. Associative — the same fold merges
+/// the (already-Float64) partial state.
+pub(crate) fn product_acc(
+    values: &ArrayRef,
+    group_ids: &[u32],
+    num_groups: usize,
+) -> Result<ArrayRef, RuntimeError> {
+    let f = arrow::compute::cast(values, &DataType::Float64)?;
+    let arr = f.as_primitive::<Float64Type>();
+    let mut cur = vec![1f64; num_groups];
+    let mut valid = vec![false; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        if arr.is_valid(i) {
+            let g = g as usize;
+            cur[g] *= arr.value(i);
+            valid[g] = true;
+        }
+    }
+    Ok(Arc::new(masked_f64(cur, valid)))
+}
+
 pub(crate) fn masked_i64(vals: Vec<i64>, valid: Vec<bool>) -> Int64Array {
     Int64Array::from_iter(vals.into_iter().zip(valid).map(|(v, ok)| ok.then_some(v)))
 }
@@ -257,5 +317,26 @@ mod tests {
         let group_ids = [0u32, 0, 0];
         let out = sum_acc(&values, &group_ids, 1, AggFunc::Sum).unwrap();
         assert_eq!(out.as_primitive::<Int64Type>().value(0), 60);
+    }
+
+    #[test]
+    fn product_skips_nulls_and_uses_f64() {
+        // [2, 3, null, 4] in one group → 24.0; the null is skipped, no overflow.
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(2), Some(3), None, Some(4)]));
+        let group_ids = [0u32, 0, 0, 0];
+        let out = product_acc(&values, &group_ids, 1).unwrap();
+        assert_eq!(out.as_primitive::<Float64Type>().value(0), 24.0);
+    }
+
+    #[test]
+    fn bitfold_and_or_xor() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![6, 3, 5]));
+        let g = [0u32, 0, 0];
+        let and = bitfold_acc(&values, &g, 1, AggFunc::BitAnd).unwrap();
+        let or = bitfold_acc(&values, &g, 1, AggFunc::BitOr).unwrap();
+        let xor = bitfold_acc(&values, &g, 1, AggFunc::BitXor).unwrap();
+        assert_eq!(and.as_primitive::<Int64Type>().value(0), 6 & 3 & 5);
+        assert_eq!(or.as_primitive::<Int64Type>().value(0), 6 | 3 | 5);
+        assert_eq!(xor.as_primitive::<Int64Type>().value(0), 6 ^ 3 ^ 5);
     }
 }

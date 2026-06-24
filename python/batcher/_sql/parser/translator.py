@@ -9,6 +9,8 @@ class reads as one cohesive object while each theme stays under the file ceiling
 
 from __future__ import annotations
 
+from typing import Any
+
 import pyarrow as pa
 
 from batcher._sql.parser import clauses, grouping, scalar, subquery, windowing
@@ -17,16 +19,33 @@ from batcher.api.dataset import Dataset
 from batcher.api.session import from_arrow
 from batcher.plan.expr_ir import AggExpr, Expr
 
-__all__ = ["sql"]
+__all__ = ["sql", "translate_ast"]
 
 
-def sql(query: str, **tables: Dataset | pa.Table) -> Dataset:
-    """Run a SQL query against the named tables, returning a lazy `Dataset`."""
+def sql(
+    query: str,
+    *,
+    dialect: str = "duckdb",
+    functions: dict[str, Any] | None = None,
+    **tables: Dataset | pa.Table,
+) -> Dataset:
+    """Parse `query` in `dialect` and translate it against the named tables/functions."""
     import sqlglot
 
+    ast = sqlglot.parse_one(query, read=dialect)
+    return translate_ast(ast, functions=functions, **tables)
+
+
+def translate_ast(
+    ast: Any, *, functions: dict[str, Any] | None = None, **tables: Dataset | pa.Table
+) -> Dataset:
+    """Translate an already-parsed sqlglot statement into a lazy `Dataset`.
+
+    The string entry point (`sql`) and the session DDL path (which has parsed the
+    statement to dispatch ``CREATE``/``DROP``) share this one translator entry.
+    """
     registry = {name: _as_dataset(t) for name, t in tables.items()}
-    ast = sqlglot.parse_one(query, read="duckdb")
-    return _Translator(registry).statement(ast)
+    return _Translator(registry, functions or {}).statement(ast)
 
 
 def _as_dataset(t: Dataset | pa.Table) -> Dataset:
@@ -38,11 +57,13 @@ def _as_dataset(t: Dataset | pa.Table) -> Dataset:
 
 
 class _Translator:
-    def __init__(self, registry: dict[str, Dataset]) -> None:
+    def __init__(self, registry: dict[str, Dataset], functions: dict[str, Any]) -> None:
         self._registry = registry
+        self._functions = functions
         self._agg_map: dict[str, tuple[str, AggExpr]] | None = None
         self._agg_n = 0
         self._scalar_sub_n = 0
+        self._udf_n = 0
 
     # --- statement ---------------------------------------------------------
     def statement(self, node) -> Dataset:
@@ -90,6 +111,12 @@ class _Translator:
 
     def _order(self, ds: Dataset, order, projections=None) -> Dataset:
         return clauses._order(self, ds, order, projections)
+
+    # --- registered Python functions (udf.py) ------------------------------
+    def _hoist_udfs(self, ds: Dataset, clause_nodes):
+        from batcher._sql.parser import udf
+
+        return udf._hoist_udfs(self, ds, clause_nodes)
 
     # --- subquery decorrelation (subquery.py) ------------------------------
     def _apply_subquery_predicates(self, ds: Dataset, pred):

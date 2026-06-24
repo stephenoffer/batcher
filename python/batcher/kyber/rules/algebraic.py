@@ -144,19 +144,26 @@ def merge_adjacent_filters(node: Filter, _ctx: OptimizerContext) -> LogicalPlan 
 
 
 @rule(name="remove_redundant_distinct", phase=Phase.REWRITE, matches=(Distinct,))
-def remove_redundant_distinct(node: Distinct, _ctx: OptimizerContext) -> LogicalPlan | None:
+def remove_redundant_distinct(node: Distinct, ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop a `Distinct` whose input is already duplicate-free:
 
     - `Distinct(Distinct(x))`        → `Distinct(x)`        (idempotent)
     - `Distinct(Union(..., distinct=True))` → the union     (already dedupes)
     - `Distinct(Aggregate(...))`     → the aggregate         (one row per group key,
        and the group keys are in the output, so rows are already distinct)
+    - `Distinct(x)` where `x` provably has ≤ 1 row — a 0/1-row relation cannot hold
+       a duplicate, so the dedup is pure overhead (e.g. `DISTINCT` over a scalar
+       aggregate). Gated on an EXACT row count so an estimate can never wrongly drop it.
     """
     inner = node.input
     if isinstance(inner, (Distinct, Aggregate)):
         return inner
     if isinstance(inner, Union) and inner.distinct:
         return inner
+    if ctx is not None:
+        stats = ctx.estimator.estimate(inner)
+        if stats.rows <= 1 and stats.provenance.is_exact:
+            return inner
     return None
 
 

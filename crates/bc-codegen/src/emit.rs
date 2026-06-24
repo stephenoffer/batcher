@@ -8,12 +8,68 @@ use cranelift_frontend::FunctionBuilder;
 
 use crate::{libm_binary_symbol, libm_unary_symbol, ColumnSet, ScalarTy};
 
+/// Vector (SIMD) emitter for the pure-`F64` arithmetic subset. Produces an
+/// `F64X2` value holding lanes `[i, i+1]`, so a loop stepping `i` by 2 computes two
+/// rows per iteration. Only `Col` (F64), `Lit::Float`, and `Add`/`Sub`/`Mul`/`Div`
+/// reach here (`compile_simd`'s `simd_supported` guarantees it); these are exactly
+/// the ops whose IEEE result is per-lane identical to the scalar path, so the
+/// vectorized body stays bit-for-bit equal to the interpreter. A scalar remainder
+/// loop (the ordinary [`Codegen`]) handles the trailing odd row.
+pub(crate) struct SimdCodegen<'a, 'b> {
+    pub(crate) b: &'a mut FunctionBuilder<'b>,
+    pub(crate) cols: &'a ColumnSet,
+    pub(crate) col_ptrs: &'a [Value],
+    /// The vector loop index (the first of the two lanes); stepped by 2.
+    pub(crate) i: Value,
+}
+
+impl SimdCodegen<'_, '_> {
+    /// Emit the `F64X2` value of `expr` for lanes `[i, i+1]`.
+    pub(crate) fn emit(&mut self, expr: &bc_expr::Expr) -> Value {
+        use bc_expr::{BinaryOp, Expr, Literal};
+        match expr {
+            Expr::Col { name } => {
+                // Contiguous 16-byte (2×f64) load. Use unaligned (notrap-only) flags:
+                // the output buffer is only 8-byte aligned, so the engine never
+                // asserts 16-byte alignment for these vector accesses.
+                let idx = self.cols.index(name);
+                let base = self.col_ptrs[idx];
+                let off = self.b.ins().imul_imm(self.i, 8);
+                let addr = self.b.ins().iadd(base, off);
+                let flags = MemFlags::new().with_notrap();
+                self.b.ins().load(types::F64X2, flags, addr, 0)
+            }
+            Expr::Lit {
+                value: Literal::Float(x),
+            } => {
+                let s = self.b.ins().f64const(*x);
+                self.b.ins().splat(types::F64X2, s)
+            }
+            Expr::Binary { op, left, right } => {
+                let l = self.emit(left);
+                let r = self.emit(right);
+                match op {
+                    BinaryOp::Add => self.b.ins().fadd(l, r),
+                    BinaryOp::Sub => self.b.ins().fsub(l, r),
+                    BinaryOp::Mul => self.b.ins().fmul(l, r),
+                    BinaryOp::Div => self.b.ins().fdiv(l, r),
+                    _ => unreachable!("simd_supported admits only +,-,*,/"),
+                }
+            }
+            _ => unreachable!("simd_supported admits only Col(F64)/Lit::Float/arith"),
+        }
+    }
+}
+
 /// Per-element IR emitter. Recurses over the expression building Cranelift
 /// values; loads happen at the current loop index `i`.
 pub(crate) struct Codegen<'a, 'b> {
     pub(crate) b: &'a mut FunctionBuilder<'b>,
     pub(crate) cols: &'a ColumnSet,
     pub(crate) col_ptrs: &'a [Value],
+    /// Per-column validity (i8, 1 = valid) base pointers, parallel to `col_ptrs`.
+    /// `Some` only in the Kleene value+validity compile mode (`emit_validity`).
+    pub(crate) null_ptrs: Option<&'a [Value]>,
     pub(crate) i: Value,
     /// Imported libc `fmod`, used for float remainder.
     pub(crate) fmod: cranelift_codegen::ir::FuncRef,
@@ -29,6 +85,77 @@ impl Codegen<'_, '_> {
     pub(crate) fn emit(&mut self, expr: &bc_expr::Expr) -> Value {
         let (v, _ty) = self.emit_typed(expr);
         v
+    }
+
+    /// Emit the i8 validity (1 = valid, 0 = null) of `expr` for the current row,
+    /// used only in the Kleene (value + validity) compile mode. `And`/`Or` follow
+    /// the Kleene truth tables — a result is non-null even when one operand is null
+    /// if the other alone determines it (`false AND null = false`, `true OR null =
+    /// true`). Every other supported node propagates nulls (validity = AND of its
+    /// operands'). `compile`'s `needs_kleene` guarantees only these node kinds reach
+    /// here (no `Case`/`Coalesce`, whose value itself depends on validity).
+    pub(crate) fn emit_validity(&mut self, expr: &bc_expr::Expr) -> Value {
+        use bc_expr::{BinaryOp, Expr};
+        match expr {
+            Expr::Col { name } => {
+                // Load this row's validity byte from the column's parallel i8 array.
+                let idx = self.cols.index(name);
+                let base = self.null_ptrs.expect("kleene mode sets null_ptrs")[idx];
+                let addr = self.b.ins().iadd(base, self.i); // 1 byte per element
+                self.b.ins().load(types::I8, MemFlags::trusted(), addr, 0)
+            }
+            Expr::Lit { .. } => self.b.ins().iconst(types::I8, 1),
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                let lvalid = self.emit_validity(left);
+                let rvalid = self.emit_validity(right);
+                let (lv, _) = self.emit_typed(left);
+                let (rv, _) = self.emit_typed(right);
+                // Non-null iff both operands valid, OR either is a valid `false`
+                // (which alone settles the AND to false).
+                let both = self.b.ins().band(lvalid, rvalid);
+                let l_false = {
+                    let lnot = self.b.ins().bxor_imm(lv, 1);
+                    self.b.ins().band(lvalid, lnot)
+                };
+                let r_false = {
+                    let rnot = self.b.ins().bxor_imm(rv, 1);
+                    self.b.ins().band(rvalid, rnot)
+                };
+                let t = self.b.ins().bor(both, l_false);
+                self.b.ins().bor(t, r_false)
+            }
+            Expr::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
+                let lvalid = self.emit_validity(left);
+                let rvalid = self.emit_validity(right);
+                let (lv, _) = self.emit_typed(left);
+                let (rv, _) = self.emit_typed(right);
+                // Non-null iff both operands valid, OR either is a valid `true`.
+                let both = self.b.ins().band(lvalid, rvalid);
+                let l_true = self.b.ins().band(lvalid, lv);
+                let r_true = self.b.ins().band(rvalid, rv);
+                let t = self.b.ins().bor(both, l_true);
+                self.b.ins().bor(t, r_true)
+            }
+            // Arithmetic / comparison / two-arg math: result null iff an operand is.
+            Expr::Binary { left, right, .. } | Expr::Math2 { left, right, .. } => {
+                let l = self.emit_validity(left);
+                let r = self.emit_validity(right);
+                self.b.ins().band(l, r)
+            }
+            // Unary value ops propagate their operand's validity unchanged.
+            Expr::Not { input } | Expr::Cast { input, .. } | Expr::Math { input, .. } => {
+                self.emit_validity(input)
+            }
+            _ => unreachable!("needs_kleene guarantees a validity-supported node"),
+        }
     }
 
     fn emit_typed(&mut self, expr: &bc_expr::Expr) -> (Value, ScalarTy) {

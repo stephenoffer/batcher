@@ -73,6 +73,55 @@ pub(crate) fn spilling_hash_join(
     Ok(out)
 }
 
+/// Grace ASOF join: when an ASOF join with `by` keys is too large to hold both
+/// sides in memory, partition both sides by the `by` keys to disk and ASOF-join one
+/// bucket pair at a time — only one bucket of each side is ever resident. Equal `by`
+/// values hash to the same bucket on both sides (the fixed-seed partitioner), and a
+/// nearest-`on` match never crosses a `by` group, so each bucket is an independent
+/// ASOF join and their union is the full result — identical to the in-memory path,
+/// with bounded memory. Bucket count is sized so the larger side's bucket ≈ one
+/// budget.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spilling_asof_join(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_on: &str,
+    right_on: &str,
+    left_by: &[String],
+    right_by: &[String],
+    backward: bool,
+    output: &[bc_ir::JoinOutputCol],
+    sp: &SpillOptions,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    let li = ops::key_indices(left, left_by)?;
+    let ri = ops::key_indices(right, right_by)?;
+    let bytes = left
+        .get_array_memory_size()
+        .max(right.get_array_memory_size());
+    let p = bytes.div_ceil(sp.memory_budget_bytes.max(1)).max(2);
+    let lb = shuffle::partition_by_keys(left, &li, p)?;
+    let rb = shuffle::partition_by_keys(right, &ri, p)?;
+
+    let mut lstore = DiskSpillStore::new(sp.dir.join("asof-left"), p)?;
+    let mut rstore = DiskSpillStore::new(sp.dir.join("asof-right"), p)?;
+    for i in 0..p {
+        lstore.append(i, &lb[i])?;
+        rstore.append(i, &rb[i])?;
+    }
+    drop(lb);
+    drop(rb);
+
+    let mut out = Vec::with_capacity(p);
+    for i in 0..p {
+        let lpart = ops::materialize(&lstore.read(i)?)?;
+        let rpart = ops::materialize(&rstore.read(i)?)?;
+        out.push(ops::asof_join_batches(
+            &lpart, &rpart, left_on, right_on, left_by, right_by, backward, output,
+        )?);
+    }
+    Ok(out)
+}
+
 /// Broadcast hash join: the build side is small enough to replicate, so the large
 /// probe side is joined *without* being shuffled by key. Inner/left/semi/anti are
 /// left-row-local, so the probe parallelizes over row-range chunks of the left
@@ -139,9 +188,22 @@ pub(crate) fn broadcast_join(
 /// (a hot key concentrating there) and is large enough that spreading it pays off.
 const SKEW_BUCKET_FACTOR: usize = 4;
 pub(crate) const SKEW_MIN_BUCKET_ROWS: usize = 4 * bc_arrow::DEFAULT_MORSEL_ROWS;
+/// Byte floor mirroring [`SKEW_MIN_BUCKET_ROWS`]. A bucket whose *bytes* dwarf the
+/// average is a straggler even at a modest row count — wide rows (large strings,
+/// blobs, embeddings) concentrate work the row-only test cannot see (65 k wide rows
+/// look identical to 65 k narrow ones by row count).
+pub(crate) const SKEW_MIN_BUCKET_BYTES: usize = 4 * bc_arrow::DEFAULT_MORSEL_BYTES;
 
 pub(crate) fn is_skewed_bucket(bucket_rows: usize, avg_rows: usize) -> bool {
     bucket_rows >= SKEW_MIN_BUCKET_ROWS && bucket_rows > SKEW_BUCKET_FACTOR * avg_rows.max(1)
+}
+
+/// Byte-aware companion to [`is_skewed_bucket`]: the same factor test on Arrow
+/// bytes. The driving side of a bucket is hot if it is skewed by *either* rows or
+/// bytes, so a hot key of wide rows triggers the same spread-the-bucket mitigation
+/// that a hot key of many narrow rows already does.
+pub(crate) fn is_skewed_bucket_bytes(bucket_bytes: usize, avg_bytes: usize) -> bool {
+    bucket_bytes >= SKEW_MIN_BUCKET_BYTES && bucket_bytes > SKEW_BUCKET_FACTOR * avg_bytes.max(1)
 }
 
 /// Skew salting (spreading a hot bucket's probe rows across worker chunks against
@@ -173,4 +235,44 @@ fn split_rows(batch: &RecordBatch, parts: usize) -> Vec<RecordBatch> {
         off += len;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The byte-aware skew test fires when a bucket's bytes dwarf the average even
+    /// though its row count is far under the row-skew floor — the case a hot key of
+    /// wide rows creates and the row-only test misses.
+    #[test]
+    fn byte_skew_fires_where_row_skew_cannot() {
+        // A bucket well under SKEW_MIN_BUCKET_ROWS rows, so the row test is blind.
+        let rows = 1_000;
+        let avg_rows = 250;
+        assert!(
+            !is_skewed_bucket(rows, avg_rows),
+            "row test must not trip here"
+        );
+
+        // Same bucket carries wide rows: bytes exceed the floor and 4× the average.
+        let bucket_bytes = SKEW_MIN_BUCKET_BYTES + 1;
+        let avg_bytes = bucket_bytes / 8;
+        assert!(
+            is_skewed_bucket_bytes(bucket_bytes, avg_bytes),
+            "byte test must detect a wide-row hot bucket"
+        );
+    }
+
+    /// Byte skew respects both gates: a bucket above 4× average but below the byte
+    /// floor is not hot (spreading a small bucket would not pay off).
+    #[test]
+    fn byte_skew_requires_the_floor() {
+        let small = SKEW_MIN_BUCKET_BYTES / 2;
+        assert!(!is_skewed_bucket_bytes(small, small / 8));
+        // And a large bucket only modestly above average is not hot either.
+        assert!(!is_skewed_bucket_bytes(
+            SKEW_MIN_BUCKET_BYTES,
+            SKEW_MIN_BUCKET_BYTES
+        ));
+    }
 }

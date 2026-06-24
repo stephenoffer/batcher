@@ -59,6 +59,9 @@ pub enum WindowFn {
     Lag,
     /// Value `offset` rows after the current row (null if out of range).
     Lead,
+    /// Value of the `offset`-th row (1-based) of the partition in order; null if the
+    /// partition has fewer than `offset` rows (SQL `nth_value`).
+    NthValue,
 }
 
 impl WindowFn {
@@ -79,6 +82,7 @@ impl WindowFn {
             WindowFn::LastValue => "last_value",
             WindowFn::Lag => "lag",
             WindowFn::Lead => "lead",
+            WindowFn::NthValue => "nth_value",
         }
     }
 
@@ -99,7 +103,11 @@ impl WindowFn {
     fn is_value(self) -> bool {
         matches!(
             self,
-            WindowFn::FirstValue | WindowFn::LastValue | WindowFn::Lag | WindowFn::Lead
+            WindowFn::FirstValue
+                | WindowFn::LastValue
+                | WindowFn::Lag
+                | WindowFn::Lead
+                | WindowFn::NthValue
         )
     }
 }
@@ -177,6 +185,7 @@ pub fn window(
                 &ordered,
                 require(call.values.as_ref(), f)?,
                 call.frame.expect("frame present"),
+                order_rows.as_ref(),
                 num_rows,
             )?,
             // With an ORDER BY, an aggregate window is a *running* (cumulative)
@@ -217,6 +226,9 @@ fn value_window(
                 WindowFn::LastValue => Some(len - 1),
                 WindowFn::Lag => pos.checked_sub(off),
                 WindowFn::Lead => (pos + off < len).then_some(pos + off),
+                // nth_value: the `off`-th row (1-based), same for every row of the
+                // partition; null if the partition is shorter than `off`.
+                WindowFn::NthValue => (off >= 1 && off <= len).then_some(off - 1),
                 _ => unreachable!("value_window on non-value function"),
             };
             src[row] = take_pos.map(|p| part[p] as u32);

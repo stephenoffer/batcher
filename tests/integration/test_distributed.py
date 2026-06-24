@@ -143,6 +143,50 @@ def test_distributed_window_running_aggregate_matches_single_node():
     assert _norm(single) == _norm(distrib)
 
 
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_streaming_source_partitions_in_bounded_memory(transport):
+    """A non-splittable streaming source distributes correctly without the driver
+    materializing the whole source.
+
+    Previously the driver did `pa.Table.from_batches(read_source(...))`, holding the
+    entire source at once (driver OOM on a larger-than-RAM stream). The partitioner
+    now streams `iter_source` one batch at a time; a live-batch counter in the
+    factory proves the driver never holds more than a single batch concurrently, and
+    the result still equals single-node.
+    """
+    t = _data()
+    chunks = t.to_batches(max_chunksize=8_192)  # many small batches to stream
+    live = 0
+    peak = 0
+
+    def factory():
+        nonlocal live, peak
+
+        def gen():
+            nonlocal live, peak
+            for b in chunks:
+                live += 1
+                peak = max(peak, live)
+                yield b
+                live -= 1
+
+        return gen()
+
+    def q(ds):
+        return ds.group_by("k").agg(s=col("v").sum(), n=count())
+
+    single = q(bt.from_arrow(t)).collect()
+    distrib = q(bt.from_batches(factory, t.schema)).collect(
+        distributed=True, num_workers=4, transport=transport
+    )
+    assert _norm(single) == _norm(distrib)
+    # The disk path streams into IPC files one batch at a time; the Flight path
+    # accumulates per-worker references but still pulls the source one batch at a
+    # time (no whole-source Table concat). Either way the generator is never driven
+    # to hold more than one batch live on the driver.
+    assert peak == 1, f"driver held {peak} batches at once; expected streaming (1)"
+
+
 def test_distributed_multikey_sort_matches_single_node():
     # Leading key `k` range-partitions; ties broken by `v` within each bucket.
     # Lots of ties on `k` (0..29 over 200k rows) stress the equal-value boundary.
@@ -251,6 +295,10 @@ def test_distributed_skew_join_salting_equals_single_node(how, monkeypatch):
     with bt.config_context(scoped):
         salted = left.join(right, on="k", how=how).collect(distributed=True, num_workers=4)
 
+    # Row COUNT, not just the row set: salting must not duplicate (or drop) rows. The
+    # set comparison alone can't catch duplication when the data has repeated rows
+    # (which it does here), so assert the multiset size too.
+    assert single.num_rows == salted.num_rows
     assert _rowset(single) == _rowset(salted)
 
 
@@ -301,9 +349,7 @@ def test_distributed_runtime_bloom_join_equals_single_node(how, monkeypatch):
     lk = rng.integers(0, 1000, 5000).astype("int64")
     left_tbl = pa.table(
         {
-            "k": pa.array(
-                [None if i % 500 == 0 else int(v) for i, v in enumerate(lk)], pa.int64()
-            ),
+            "k": pa.array([None if i % 500 == 0 else int(v) for i, v in enumerate(lk)], pa.int64()),
             "lv": pa.array(rng.integers(0, 10, lk.size).astype("int64")),
         }
     )
@@ -396,6 +442,42 @@ def test_distributed_aggregate_correct_with_speculation_enabled():
             .collect(distributed=True, num_workers=4)
         )
     assert _rowset(single) == _rowset(distrib)
+
+
+def test_distributed_sort_correct_with_speculation_enabled():
+    # The disk sort's sample/map/reduce barriers go through `gather_with_backups`,
+    # so with speculation enabled a straggler can be backed up; the deterministic
+    # tasks make the globally-sorted result identical to single-node regardless.
+    from batcher.config import DistributedConfig
+
+    t = _data()
+    single = bt.from_arrow(t).sort("k", "v", descending=[False, True]).collect().to_pylist()
+    scoped = bt.Config().replace(distributed=DistributedConfig(speculation_max_backups=2))
+    with bt.config_context(scoped):
+        distrib = (
+            bt.from_arrow(t)
+            .sort("k", "v", descending=[False, True])
+            .collect(distributed=True, num_workers=4)
+            .to_pylist()
+        )
+    assert single == distrib  # globally ordered → exact, position-by-position
+
+
+def test_distributed_window_correct_with_speculation_enabled():
+    # Same for the disk window shuffle: its map/reduce barriers are backed up under
+    # speculation, and each whole partition still lands on one reducer → identical.
+    from batcher.config import DistributedConfig
+
+    t = _data()
+
+    def q(ds):
+        return ds.window(partition_by=["k"], functions={"tot": ("sum", "v"), "hi": ("max", "v")})
+
+    single = q(bt.from_arrow(t)).collect()
+    scoped = bt.Config().replace(distributed=DistributedConfig(speculation_max_backups=2))
+    with bt.config_context(scoped):
+        distrib = q(bt.from_arrow(t)).collect(distributed=True, num_workers=4)
+    assert _norm(single) == _norm(distrib)
 
 
 def test_distributed_map_batches_matches_single_node():

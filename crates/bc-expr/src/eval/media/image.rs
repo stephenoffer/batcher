@@ -35,7 +35,42 @@ pub(crate) fn eval_image(
     match func {
         ImageFunc::Decode => decode_dims(bytes),
         ImageFunc::ToTensor => to_tensor(bytes, width, height),
+        ImageFunc::Resize => resize(bytes, width, height),
     }
+}
+
+/// `resize(w, h)` → re-encoded PNG bytes at the new size. Null/undecodable → null.
+fn resize(
+    bytes: &BinaryArray,
+    width: Option<i64>,
+    height: Option<i64>,
+) -> Result<ArrayRef, ExprError> {
+    let w = width.ok_or(ExprError::MissingImageArg {
+        func: "resize".into(),
+        arg: "width",
+    })? as u32;
+    let h = height.ok_or(ExprError::MissingImageArg {
+        func: "resize".into(),
+        arg: "height",
+    })? as u32;
+    let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(bytes.len());
+    for i in 0..bytes.len() {
+        if bytes.is_null(i) {
+            out.push(None);
+        } else {
+            out.push(resize_png(bytes.value(i), w, h));
+        }
+    }
+    Ok(Arc::new(BinaryArray::from_iter(out)))
+}
+
+/// Decode, resize to `(w, h)`, and re-encode as PNG; `None` on any failure.
+fn resize_png(data: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(data).ok()?;
+    let resized = img.resize_exact(w, h, image::imageops::FilterType::Triangle);
+    let mut buf = Cursor::new(Vec::new());
+    resized.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some(buf.into_inner())
 }
 
 /// `decode` → struct `{width: Int32, height: Int32}` (header read only).
@@ -183,5 +218,21 @@ mod tests {
         assert_eq!(px.value(0), 255);
         assert_eq!(px.value(1), 0);
         assert_eq!(px.value(2), 0);
+    }
+
+    #[test]
+    fn resize_reencodes_at_new_size() {
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(red_png(8, 8).as_slice()),
+            None,
+            Some(b"not an image".as_slice()),
+        ]));
+        let out = eval_image(ImageFunc::Resize, &arr, Some(4), Some(2)).unwrap();
+        let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(b.is_valid(0));
+        // The re-encoded PNG decodes back to the requested 4×2 dimensions.
+        assert_eq!(image_dimensions(b.value(0)), Some((4, 2)));
+        assert!(b.is_null(1)); // null input → null
+        assert!(b.is_null(2)); // undecodable input → null
     }
 }

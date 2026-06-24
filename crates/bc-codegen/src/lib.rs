@@ -72,9 +72,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, PrimitiveArray, RecordBatch,
-};
+use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, PrimitiveArray, RecordBatch};
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Float64Type, Int64Type};
 
@@ -82,7 +80,7 @@ use cranelift_codegen::ir::{types, Type};
 use cranelift_jit::JITModule;
 
 use crate::analyze::analyze;
-use crate::compile::compile;
+use crate::compile::{compile, compile_simd};
 
 mod analyze;
 mod compile;
@@ -154,6 +152,73 @@ pub struct CompiledExpr {
     /// (Kleene `And`/`Or`, `Case`, `Coalesce`) falls back to the interpreter when a
     /// referenced column contains nulls.
     null_safe: bool,
+    /// Whether this was compiled in the Kleene value+validity ABI (it contains a
+    /// boolean `And`/`Or` and no `Case`/`Coalesce`). When set, `eval` supplies
+    /// per-column validity arrays and reads back a validity buffer, so nullable
+    /// compound predicates run on the JIT with correct three-valued logic instead of
+    /// falling back to the interpreter.
+    kleene: bool,
+}
+
+/// True if `expr` should use the Kleene value+validity ABI: it contains a boolean
+/// `And`/`Or` (whose null semantics the simple combined-mask gets wrong) and every
+/// node is one `emit_validity` supports — i.e. no `Case`/`Coalesce`, whose result
+/// value itself depends on validity. Such an `And`/`Or` over a `Case` keeps falling
+/// back to the interpreter on nullable input (the value-only path).
+fn needs_kleene(expr: &bc_expr::Expr) -> bool {
+    contains_and_or(expr) && kleene_supported(expr)
+}
+
+fn contains_and_or(expr: &bc_expr::Expr) -> bool {
+    use bc_expr::{BinaryOp, Expr};
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And | BinaryOp::Or,
+            ..
+        } => true,
+        Expr::Binary { left, right, .. } | Expr::Math2 { left, right, .. } => {
+            contains_and_or(left) || contains_and_or(right)
+        }
+        Expr::Not { input } | Expr::Cast { input, .. } | Expr::Math { input, .. } => {
+            contains_and_or(input)
+        }
+        _ => false,
+    }
+}
+
+fn kleene_supported(expr: &bc_expr::Expr) -> bool {
+    use bc_expr::Expr;
+    match expr {
+        Expr::Col { .. } | Expr::Lit { .. } => true,
+        Expr::Binary { left, right, .. } | Expr::Math2 { left, right, .. } => {
+            kleene_supported(left) && kleene_supported(right)
+        }
+        Expr::Not { input } | Expr::Cast { input, .. } | Expr::Math { input, .. } => {
+            kleene_supported(input)
+        }
+        _ => false, // Case/Coalesce/etc. — value depends on validity; not supported.
+    }
+}
+
+/// True if `expr` is the pure-`F64` arithmetic subset the vector (`compile_simd`)
+/// path handles: every leaf is an `F64` column or a float literal, every interior
+/// node is `+`/`-`/`*`/`/`. These are exactly the ops whose `F64X2` lanes are IEEE-
+/// identical to the scalar path (so parity holds), and whose result is `F64` — no
+/// comparisons (boolean output), no `Mod` (libcall), no int/cast lanes, no libm.
+fn simd_supported(expr: &bc_expr::Expr, cols: &ColumnSet) -> bool {
+    use bc_expr::{BinaryOp, Expr, Literal};
+    match expr {
+        Expr::Col { name } => cols.ty.get(name) == Some(&ScalarTy::F64),
+        Expr::Lit {
+            value: Literal::Float(_),
+        } => true,
+        Expr::Binary {
+            op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
+            left,
+            right,
+        } => simd_supported(left, cols) && simd_supported(right, cols),
+        _ => false,
+    }
 }
 
 /// True if every node is in the null-propagating subset, so the JIT may run on
@@ -224,12 +289,22 @@ pub fn compile_expr(
 ) -> Result<CompiledExpr, CodegenError> {
     let mut cols = ColumnSet::default();
     let result_ty = analyze(expr, batch, &mut cols)?;
-    let compiled = compile(expr, &cols, result_ty)?;
+    let kleene = needs_kleene(expr);
+    // The vector path is a drop-in for the scalar F64 value path (same ABI, same
+    // null-propagating masking in `eval`), so it needs no flag — only a different
+    // compiled body. Used for the pure-F64 arithmetic subset.
+    let simd = !kleene && result_ty == ScalarTy::F64 && simd_supported(expr, &cols);
+    let compiled = if simd {
+        compile_simd(expr, &cols)?
+    } else {
+        compile(expr, &cols, result_ty, kleene)?
+    };
     Ok(CompiledExpr {
         columns: cols.order,
         result_ty,
         compiled,
         null_safe: is_null_propagating(expr),
+        kleene,
     })
 }
 
@@ -239,6 +314,9 @@ impl CompiledExpr {
     /// type, or contains nulls) so the caller can fall back to the interpreter
     /// for that particular batch.
     pub fn eval(&self, batch: &RecordBatch) -> Result<ArrayRef, CodegenError> {
+        if self.kleene {
+            return self.eval_kleene(batch);
+        }
         let n = batch.num_rows();
         let mut col_ptrs: Vec<*const u8> = Vec::with_capacity(self.columns.len());
         // Combined validity for the null-propagating path: starts all-valid and
@@ -313,6 +391,67 @@ impl CompiledExpr {
             }
         }
     }
+
+    /// Kleene path: supply each referenced column's value buffer **and** a parallel
+    /// per-row validity array (1 = valid), run the value+validity ABI, and build the
+    /// boolean result from the value and validity outputs. A Kleene expression is
+    /// always boolean, so the result is a `BooleanArray` whose nulls come from the
+    /// computed validity (correct three-valued logic for `And`/`Or`).
+    fn eval_kleene(&self, batch: &RecordBatch) -> Result<ArrayRef, CodegenError> {
+        let n = batch.num_rows();
+        let mut col_ptrs: Vec<*const u8> = Vec::with_capacity(self.columns.len());
+        let mut valid_arrays: Vec<Vec<u8>> = Vec::with_capacity(self.columns.len());
+        for name in &self.columns {
+            let arr = batch
+                .column_by_name(name)
+                .ok_or_else(|| CodegenError::UnknownColumn(name.clone()))?;
+            let ptr = match arr.data_type() {
+                DataType::Int64 => arr
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .as_ptr() as *const u8,
+                DataType::Float64 => arr
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .values()
+                    .as_ptr() as *const u8,
+                other => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "column `{name}` has type {other:?}"
+                    )))
+                }
+            };
+            col_ptrs.push(ptr);
+            // Per-column validity bytes (all-valid when the column has no nulls).
+            let mut v = vec![1u8; n];
+            if arr.null_count() != 0 {
+                for (i, slot) in v.iter_mut().enumerate() {
+                    *slot = arr.is_valid(i) as u8;
+                }
+            }
+            valid_arrays.push(v);
+        }
+        let null_ptrs: Vec<*const u8> = valid_arrays.iter().map(|v| v.as_ptr()).collect();
+        let mut out = vec![0u8; n];
+        let mut valid_out = vec![1u8; n];
+        run_kleene(
+            self.compiled.ptr,
+            self.compiled.nargs,
+            n,
+            &col_ptrs,
+            &null_ptrs,
+            out.as_mut_ptr(),
+            valid_out.as_mut_ptr(),
+        );
+        Ok(Arc::new(BooleanArray::from_iter(
+            out.iter()
+                .zip(valid_out)
+                .map(|(b, ok)| (ok != 0).then_some(*b != 0)),
+        )))
+    }
 }
 
 /// Build a primitive array from the JIT's raw output values, nulling out positions
@@ -357,6 +496,32 @@ fn run(p: *const u8, nargs: usize, n: usize, cols: &[*const u8], out: *mut u8) {
     unsafe {
         let f: extern "C" fn(i64, *const *const u8, *mut u8) = std::mem::transmute(p);
         f(n, cols.as_ptr(), out);
+    }
+}
+
+/// Invoke the Kleene-ABI compiled function:
+/// `(n, cols: *const *const u8, nulls: *const *const u8, out: *mut u8, valid: *mut u8)`.
+/// `cols`/`nulls` each carry `nargs` pointers; `out` and `valid` cover `n` bytes each.
+#[allow(clippy::too_many_arguments)]
+fn run_kleene(
+    p: *const u8,
+    nargs: usize,
+    n: usize,
+    cols: &[*const u8],
+    nulls: &[*const u8],
+    out: *mut u8,
+    valid: *mut u8,
+) {
+    let n = n as i64;
+    debug_assert_eq!(nargs, cols.len());
+    debug_assert_eq!(nargs, nulls.len());
+    // SAFETY: `p` is the finalized Kleene-ABI function built in `compile` with
+    // `kleene = true`; `cols`/`nulls` each have exactly `nargs` pointers valid for
+    // `n` elements, and `out`/`valid` are distinct buffers of `n` bytes.
+    unsafe {
+        let f: extern "C" fn(i64, *const *const u8, *const *const u8, *mut u8, *mut u8) =
+            std::mem::transmute(p);
+        f(n, cols.as_ptr(), nulls.as_ptr(), out, valid);
     }
 }
 
@@ -406,7 +571,9 @@ pub(crate) fn libm_binary_symbol(func: bc_expr::Math2Func) -> Option<&'static st
     Some(match func {
         Pow => "pow",
         Atan2 => "atan2",
-        Round => return None,
+        // Round (digit count), and the integer-semantics gcd/lcm/hypot, are not a
+        // single libm call — they stay on the interpreter (the JIT falls back).
+        Round | Gcd | Lcm | Hypot => return None,
     })
 }
 
@@ -1175,21 +1342,60 @@ mod tests {
     }
 
     #[test]
-    fn nullable_column_nonsafe_falls_back() {
-        // An expression outside the null-propagating subset (boolean AND → Kleene
-        // logic) over a nullable column must defer to the interpreter.
+    fn nullable_and_or_kleene_parity() {
+        // Boolean AND/OR over nullable columns now compile in the Kleene value+
+        // validity ABI and run on the JIT with correct three-valued logic
+        // (false AND null = false, true OR null = true), matching the interpreter
+        // bit-for-bit instead of falling back. `assert_parity` drives the JIT eval,
+        // so a pass proves the Kleene path — not the interpreter — produced it.
+        let batch = nullable_batch();
+        let and = |l, r| bin(BinaryOp::And, l, r);
+        let or = |l, r| bin(BinaryOp::Or, l, r);
+        let p1 = || {
+            and(
+                bin(BinaryOp::Gt, col("a"), lit_i(0)),
+                bin(BinaryOp::Lt, col("b"), lit_i(5)),
+            )
+        };
+        let cases = [
+            p1(),
+            or(
+                bin(BinaryOp::Gt, col("a"), lit_i(0)),
+                bin(BinaryOp::Lt, col("b"), lit_i(5)),
+            ),
+            // nested mix across three nullable columns
+            or(p1(), bin(BinaryOp::Gt, col("c"), lit_f(1.0))),
+            // NOT over a Kleene AND (NOT null = null)
+            Expr::Not {
+                input: Box::new(p1()),
+            },
+        ];
+        for e in &cases {
+            assert!(needs_kleene(e), "expected Kleene compile for {e:?}");
+            assert_parity(e, &batch);
+        }
+    }
+
+    #[test]
+    fn nullable_case_still_falls_back() {
+        // CASE's result value depends on which branch is selected, so it is not
+        // Kleene-supported and not null-propagating; over a nullable column it still
+        // defers to the interpreter for correct branch-null semantics.
+        use bc_expr::CaseBranch;
         let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]))],
         )
         .unwrap();
-        let pred = bin(
-            BinaryOp::And,
-            bin(BinaryOp::Gt, col("a"), lit_i(0)),
-            bin(BinaryOp::Lt, col("a"), lit_i(10)),
-        );
-        let compiled = compile_expr(&pred, &batch).expect("compiles on the sample shape");
+        let case = Expr::Case {
+            branches: vec![CaseBranch {
+                when: bin(BinaryOp::Gt, col("a"), lit_i(0)),
+                then: col("a"),
+            }],
+            otherwise: Box::new(lit_i(0)),
+        };
+        let compiled = compile_expr(&case, &batch).expect("compiles on the sample shape");
         assert!(matches!(
             compiled.eval(&batch),
             Err(CodegenError::Unsupported(_))
@@ -1511,6 +1717,161 @@ mod tests {
             };
             let batch = &batches[it % batches.len()];
             assert_parity(&expr, batch);
+        }
+    }
+
+    /// Differential fuzzer for the Kleene path: random boolean `And`/`Or`/`Not` trees
+    /// of comparisons over **nullable** columns, asserting the JIT's value+validity
+    /// output matches the interpreter's three-valued logic bit-for-bit. The null-free
+    /// `differential_fuzz` validates the value bits; this validates the validity bits
+    /// (`false AND null = false`, `true OR null = true`, `NOT null = null`, …).
+    #[test]
+    fn differential_fuzz_kleene_nullable() {
+        fn make_nullable(n: usize, seed: u64) -> RecordBatch {
+            let mut rng = Rng(seed);
+            let mut a = Vec::with_capacity(n);
+            let mut b = Vec::with_capacity(n);
+            let mut c = Vec::with_capacity(n);
+            for _ in 0..n {
+                // ~1 in 4 values null, independently per column.
+                a.push((rng.next_u64() % 4 != 0).then(|| rng.i64_small()));
+                b.push((rng.next_u64() % 4 != 0).then(|| rng.i64_small()));
+                c.push((rng.next_u64() % 4 != 0).then(|| rng.f64_small()));
+            }
+            let schema = Schema::new(vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Int64, true),
+                Field::new("c", DataType::Float64, true),
+            ]);
+            RecordBatch::try_new(
+                Arc::new(schema),
+                vec![
+                    Arc::new(Int64Array::from(a)),
+                    Arc::new(Int64Array::from(b)),
+                    Arc::new(Float64Array::from(c)),
+                ],
+            )
+            .unwrap()
+        }
+        fn gen_num(rng: &mut Rng, depth: u32) -> Expr {
+            if depth == 0 || rng.next_u64() % 3 == 0 {
+                return match rng.next_u64() % 5 {
+                    0 => col("a"),
+                    1 => col("b"),
+                    2 => col("c"),
+                    3 => lit_i(rng.i64_small()),
+                    _ => lit_f(rng.f64_small()),
+                };
+            }
+            let op = match rng.next_u64() % 3 {
+                0 => BinaryOp::Add,
+                1 => BinaryOp::Sub,
+                _ => BinaryOp::Mul,
+            };
+            bin(op, gen_num(rng, depth - 1), gen_num(rng, depth - 1))
+        }
+        fn gen_bool(rng: &mut Rng, depth: u32) -> Expr {
+            if depth == 0 || rng.next_u64() % 3 == 0 {
+                let op = match rng.next_u64() % 6 {
+                    0 => BinaryOp::Eq,
+                    1 => BinaryOp::Ne,
+                    2 => BinaryOp::Lt,
+                    3 => BinaryOp::Le,
+                    4 => BinaryOp::Gt,
+                    _ => BinaryOp::Ge,
+                };
+                let d = depth.saturating_sub(1);
+                return bin(op, gen_num(rng, d), gen_num(rng, d));
+            }
+            match rng.next_u64() % 3 {
+                0 => Expr::Not {
+                    input: Box::new(gen_bool(rng, depth - 1)),
+                },
+                1 => bin(
+                    BinaryOp::And,
+                    gen_bool(rng, depth - 1),
+                    gen_bool(rng, depth - 1),
+                ),
+                _ => bin(
+                    BinaryOp::Or,
+                    gen_bool(rng, depth - 1),
+                    gen_bool(rng, depth - 1),
+                ),
+            }
+        }
+        let mut master = Rng(0x5EED_1234_ABCD_0001);
+        let batches = [
+            make_nullable(131, 0xAAAA_0001),
+            make_nullable(131, 0xBBBB_0002),
+            make_nullable(131, 0xCCCC_0003),
+        ];
+        for it in 0..2000 {
+            let mut rng = Rng(master.next_u64() | 1);
+            let expr = gen_bool(&mut rng, 4);
+            assert_parity(&expr, &batches[it % batches.len()]);
+        }
+    }
+
+    #[test]
+    fn simd_f64_arithmetic_parity_across_sizes() {
+        use bc_expr::BinaryOp::{Add, Div, Mul, Sub};
+        let exprs = [
+            bin(Add, col("c"), lit_f(1.5)),
+            bin(Mul, col("c"), col("c")),
+            bin(Sub, bin(Mul, col("c"), lit_f(2.0)), col("c")),
+            bin(Div, bin(Add, col("c"), lit_f(10.0)), lit_f(3.0)), // constant denominator
+        ];
+        // Confirm these actually take the vector path (not silently the scalar one).
+        let sample = make_batch(8, 1);
+        for e in &exprs {
+            let mut cols = ColumnSet::default();
+            analyze(e, &sample, &mut cols).unwrap();
+            assert!(simd_supported(e, &cols), "expected SIMD path for {e:?}");
+        }
+        // Parity at even AND odd sizes — odd exercises the scalar remainder loop.
+        for &n in &[1usize, 2, 3, 7, 8, 64, 129] {
+            let batch = make_batch(n, 0x51AB ^ n as u64);
+            for e in &exprs {
+                assert_parity(e, &batch);
+            }
+        }
+    }
+
+    /// Pure-F64 arithmetic fuzzer over NULLABLE columns: exercises the SIMD value
+    /// lanes, the scalar remainder (odd sizes), and the null-propagating mask
+    /// (applied in `eval` exactly as on the scalar path). `+,-,*` only — no `/`, so
+    /// no `0/0` NaN can make `assert_eq!` spuriously differ (inf still compares equal).
+    #[test]
+    fn simd_f64_fuzz_nullable() {
+        fn make_c(n: usize, seed: u64) -> RecordBatch {
+            let mut rng = Rng(seed);
+            let c: Vec<Option<f64>> = (0..n)
+                .map(|_| (rng.next_u64() % 4 != 0).then(|| rng.f64_small()))
+                .collect();
+            let schema = Schema::new(vec![Field::new("c", DataType::Float64, true)]);
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Float64Array::from(c))]).unwrap()
+        }
+        fn gen(rng: &mut Rng, depth: u32) -> Expr {
+            if depth == 0 || rng.next_u64() % 3 == 0 {
+                return if rng.next_u64() % 2 == 0 {
+                    col("c")
+                } else {
+                    lit_f(rng.f64_small())
+                };
+            }
+            let op = match rng.next_u64() % 3 {
+                0 => BinaryOp::Add,
+                1 => BinaryOp::Sub,
+                _ => BinaryOp::Mul,
+            };
+            bin(op, gen(rng, depth - 1), gen(rng, depth - 1))
+        }
+        let mut master = Rng(0xABCD_0123_4567_89AB);
+        let batches = [make_c(129, 0x11), make_c(130, 0x22), make_c(63, 0x33)];
+        for it in 0..1000 {
+            let mut rng = Rng(master.next_u64() | 1);
+            let e = gen(&mut rng, 4);
+            assert_parity(&e, &batches[it % batches.len()]);
         }
     }
 

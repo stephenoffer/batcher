@@ -88,7 +88,7 @@ def test_missing_backend_raises_actionable_error(monkeypatch) -> None:
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _block)
-    with pytest.raises(BackendError, match=r"batcher\[delta\]"):
+    with pytest.raises(BackendError, match=r"\[delta\]"):
         DeltaSource("/tmp/t").schema()
 
 

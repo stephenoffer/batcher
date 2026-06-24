@@ -70,6 +70,11 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # would scatter the dispatch and the shared spill/admit scaffolding. Operator
     # *logic* already lives in `ops/`; this file is the scheduling shell.
     "crates/bc-interp/src/par.rs": "parallel-executor dispatch hub; per-arm split scatters scheduling",
+    # The projection-pushdown rule is two exhaustive per-RelOp dispatches (`_rewrite`
+    # column pruning + `_visit` source-projection analysis). Like the executor hubs it
+    # grows by one small arm per relational operator; splitting the dispatch across
+    # files would scatter the column-need logic that must stay consistent between them.
+    "python/batcher/kyber/rules/projections.py": "projection-pushdown dispatch hub; per-operator arms",
 }
 
 fails: list[str] = []

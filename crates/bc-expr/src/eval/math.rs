@@ -34,6 +34,24 @@ pub(crate) fn eval_is_nan(array: &ArrayRef) -> Result<ArrayRef, ExprError> {
     Ok(Arc::new(out))
 }
 
+/// `is_inf` — true where a float value is `+inf`/`-inf`; null → null. Mirrors
+/// `eval_is_nan` (cast to f64, per-element predicate, validity preserved).
+pub(crate) fn eval_is_inf(array: &ArrayRef) -> Result<ArrayRef, ExprError> {
+    let f = cast(array, &DataType::Float64)?;
+    let a = f
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("cast to f64");
+    let out: BooleanArray = if a.null_count() == 0 {
+        a.values().iter().map(|&x| Some(x.is_infinite())).collect()
+    } else {
+        (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i).is_infinite()))
+            .collect()
+    };
+    Ok(Arc::new(out))
+}
+
 /// Two-argument math: align both sides to Float64, apply element-wise (nulls
 /// propagate). `round`'s second argument is the (per-row) decimal-place count.
 pub(crate) fn eval_math2(
@@ -72,6 +90,17 @@ fn apply_binary(func: Math2Func, x: f64, y: f64) -> f64 {
             let f = 10f64.powi(y as i32);
             (x * f).round() / f
         }
+        Math2Func::Gcd => gcd_i64(x as i64, y as i64) as f64,
+        Math2Func::Lcm => {
+            let (a, b) = (x as i64, y as i64);
+            let g = gcd_i64(a, b);
+            if g == 0 {
+                0.0
+            } else {
+                (a / g * b).unsigned_abs() as f64
+            }
+        }
+        Math2Func::Hypot => x.hypot(y),
     }
 }
 
@@ -209,5 +238,23 @@ fn apply_unary(func: MathFunc, v: f64) -> f64 {
         Degrees => v.to_degrees(),
         Radians => v.to_radians(),
         Cot => 1.0 / v.tan(),
+        Factorial => {
+            let n = v as i64;
+            if n < 0 {
+                f64::NAN
+            } else {
+                (1..=n).map(|i| i as f64).product()
+            }
+        }
+        BitCount => (v as i64).count_ones() as f64,
     }
+}
+
+/// Greatest common divisor of two integers (Euclid; non-negative result).
+fn gcd_i64(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.unsigned_abs(), b.unsigned_abs());
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a as i64
 }

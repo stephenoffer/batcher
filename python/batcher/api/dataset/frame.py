@@ -11,7 +11,7 @@ for choosing/deriving the full output, `with_columns` for adding/replacing.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
@@ -40,6 +40,7 @@ from batcher.api.dataset._build import (
     build_unpivot,
     build_window,
     build_window_columns,
+    build_with_random,
 )
 from batcher.api.dataset.dq import DatasetDQ
 from batcher.api.dataset.ml import DatasetML
@@ -71,12 +72,14 @@ from batcher.plan.logical import (
     LogicalPlan,
     Project,
     Projection,
+    RowId,
     Sort,
     SortKeySpec,
     Union,
     remap_sources,
 )
 from batcher.plan.schema import suggest_columns
+from batcher.plan.streaming import Watermark
 
 if TYPE_CHECKING:
     from batcher.api.io_namespace import Writer
@@ -94,19 +97,23 @@ def _unknown_cols(missing: set[str], available: list[str]) -> str:
 class Dataset:
     """A lazy relation. Construct via `batcher.from_arrow` / `from_pydict`."""
 
-    __slots__ = ("_plan", "_repartition", "_sources")
+    __slots__ = ("_plan", "_repartition", "_sources", "_watermark")
 
     def __init__(
         self,
         plan: LogicalPlan,
         sources: list[Source],
         repartition: RepartitionSpec | None = None,
+        watermark: Watermark | None = None,
     ) -> None:
         self._plan = plan
         self._sources = sources
         # An optional output-layout hint consumed by `write` (set by `repartition`);
         # transformations drop it (it is a pre-write concern), so it never propagates.
         self._repartition = repartition
+        # An event-time watermark set by `with_watermark`; carried through
+        # breaker-free transforms so the next `group_by().agg()` can attach it.
+        self._watermark = watermark
 
     # --- introspection -----------------------------------------------------
     @property
@@ -164,8 +171,68 @@ class Dataset:
         """Row count — ``len(ds)`` is sugar for `count()` (a terminal operation)."""
         return self.count()
 
+    def __iter__(self) -> Iterator[pa.RecordBatch]:
+        """Iterate the result as Arrow ``RecordBatch``es — ``for batch in ds``.
+
+        Sugar for `iter_batches()`. The unit is a **batch**, never a row: per-row
+        Python iteration would touch tuples in the control plane (forbidden), so to
+        process individual rows, work on each batch's columns (Arrow/NumPy) instead.
+        A terminal, streaming operation.
+        """
+        return iter(self.iter_batches())
+
+    def __contains__(self, name: object) -> bool:
+        """Column-membership test — ``"x" in ds`` is true if ``x`` is an output
+        column. Resolved from the schema with no execution (never a value scan)."""
+        return isinstance(name, str) and name in self.columns
+
+    def __add__(self, other: Dataset) -> Dataset:
+        """``ds1 + ds2`` — concatenate rows (UNION ALL). Operator sugar for
+        ``union(other)``; use `union` directly for ``distinct=True`` or many inputs."""
+        if not isinstance(other, Dataset):
+            return NotImplemented
+        return self.union(other)
+
+    def __or__(self, other: Dataset) -> Dataset:
+        """``ds1 | ds2`` — concatenate and deduplicate rows (UNION). Operator sugar
+        for ``union(other, distinct=True)``."""
+        if not isinstance(other, Dataset):
+            return NotImplemented
+        return self.union(other, distinct=True)
+
+    def __and__(self, other: Dataset) -> Dataset:
+        """``ds1 & ds2`` — distinct rows in BOTH (SQL INTERSECT). Sugar for `intersect`."""
+        if not isinstance(other, Dataset):
+            return NotImplemented
+        return self.intersect(other)
+
+    def __sub__(self, other: Dataset) -> Dataset:
+        """``ds1 - ds2`` — distinct rows in this but not `other` (SQL EXCEPT). Sugar
+        for `except_`."""
+        if not isinstance(other, Dataset):
+            return NotImplemented
+        return self.except_(other)
+
     def _derive(self, plan: LogicalPlan) -> Dataset:
-        return Dataset(plan, self._sources)
+        # Carry the watermark through breaker-free transforms so a `with_watermark`
+        # before a `filter`/`select` still reaches the downstream `group_by().agg()`.
+        return Dataset(plan, self._sources, watermark=self._watermark)
+
+    def with_watermark(self, time_col: str, lateness: str) -> Dataset:
+        """Declare an event-time watermark on `time_col` (Spark ``withWatermark``).
+
+        `lateness` is how late a row may arrive and still be counted (a fixed
+        duration like ``"10m"`` / ``"1h"``). On a windowed streaming aggregation the
+        watermark bounds state: once it passes a window's end, that window is emitted
+        and evicted, and rows older than the watermark are dropped as late. Carried
+        through to the next ``group_by(window(...)).agg(...)``.
+        """
+        from batcher.plan.functions.temporal import _duration_micros
+
+        if time_col not in self._plan.available_columns():
+            raise PlanError(f"with_watermark(): unknown column {time_col!r}")
+        wm = Watermark(time_col, _duration_micros(lateness, arg="watermark lateness"))
+        return Dataset(self._plan, self._sources, repartition=self._repartition, watermark=wm)
 
     # --- transformations ---------------------------------------------------
     def filter(self, predicate: Expr) -> Dataset:
@@ -347,6 +414,46 @@ class Dataset:
             batch_format=batch_format,
         )
 
+    def map(self, fn: Callable, *, output_columns: list[str] | None = None) -> Dataset:
+        """Apply a per-row function ``fn(row) -> row`` (Ray Data ``map``) — sugar for
+        `ds.ml.map`. Prefer `map_batches` (vectorized) when you can; see `ds.ml`."""
+        return self.ml.map(fn, output_columns=output_columns)
+
+    def flat_map(self, fn: Callable, *, output_columns: list[str] | None = None) -> Dataset:
+        """Apply a per-row function ``fn(row) -> iterable[row]`` and flatten (Ray Data
+        ``flat_map``) — sugar for `ds.ml.flat_map`; see `ds.ml`."""
+        return self.ml.flat_map(fn, output_columns=output_columns)
+
+    def sql(self, query: str, *, table_name: str = "self", dialect: str | None = None) -> Dataset:
+        """Run a SQL query with this dataset bound to `table_name` (default ``self``).
+
+        The Polars-style ``ds.sql("SELECT ... FROM self")``: a lazy `Dataset` that
+        composes with the rest of the API. Other tables registered in `bt.catalog`
+        (and functions from `bt.register_function`) resolve too, so the query can
+        join ``self`` against them. For multi-table SQL with several ad-hoc inputs,
+        use `bt.sql(query, a=ds1, b=ds2)`.
+
+        Args:
+            query: A SQL statement referring to this dataset as `table_name`.
+            table_name: The name this dataset is bound to in the query.
+            dialect: Override the sqlglot read dialect (default ``duckdb``).
+
+        Returns:
+            A lazy `Dataset` of the query result.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1, 2, 3]})
+                >>> ds.sql("SELECT a, a * 2 AS d FROM self WHERE a > 1").to_pydict()
+                {'a': [2, 3], 'd': [4, 6]}
+        """
+        from batcher.api.session import catalog
+
+        session = catalog if dialect is None else catalog._with_dialect(dialect)
+        return session._run(query, {table_name: self})
+
     def with_column(self, name: str, expr: Expr) -> Dataset:
         """Add or replace a single column (sugar for `with_columns`)."""
         return self.with_columns(**{name: expr})
@@ -488,6 +595,105 @@ class Dataset:
         streams (no breaker). Raises `PlanError` if `column` is not a column.
         """
         return build_explode(self, column, alias)
+
+    def with_row_index(self, name: str = "index", *, offset: int = 0) -> Dataset:
+        """Add a sequential row-index column (Polars ``with_row_index``).
+
+        The new `name` column numbers rows ``offset, offset+1, …`` in their current
+        order (a single counter, so the single-node and parallel paths agree on an
+        order-preserving pipeline). Add it after any reorder you want it to reflect.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": ["a", "b", "c"]}).with_row_index().to_pydict()
+                {'index': [0, 1, 2], 'x': ['a', 'b', 'c']}
+
+        Args:
+            name: The index column's name.
+            offset: The value assigned to the first row.
+
+        Returns:
+            A new `Dataset` with the index column appended.
+        """
+        return self._derive(RowId(self._plan, name, offset))
+
+    def with_random(self, name: str = "random", *, seed: int = 0, normal: bool = False) -> Dataset:
+        """Add a reproducible pseudo-random column (`seed`-keyed, one value per row).
+
+        Values are uniform in ``[0, 1)`` by default, or standard normal when `normal`
+        is set. The sequence is keyed by ``seed`` and each row's position, so it is
+        reproducible across runs and identical on the single-node and parallel paths
+        (unlike a wall-clock-seeded RNG). Use it for deterministic sampling/shuffling.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> a = ds.with_random(seed=7).to_pydict()["random"]
+                >>> b = ds.with_random(seed=7).to_pydict()["random"]
+                >>> a == b and all(0.0 <= v < 1.0 for v in a)
+                True
+
+        Args:
+            name: The output column's name.
+            seed: Seeds the sequence; the same seed reproduces the same values.
+            normal: Draw from the standard normal instead of the uniform.
+
+        Returns:
+            A new `Dataset` with the random column appended.
+        """
+        return build_with_random(self, name, seed=seed, normal=normal)
+
+    def drop_duplicates_within_watermark(
+        self, subset: list[str], *, event_time: str, lateness: str
+    ) -> Dataset:
+        """Deduplicate a stream by `subset`, bounding state with a watermark.
+
+        Keeps the first row per `subset` key seen within the event-time watermark
+        (``max(event_time) - lateness``); once the watermark passes a key it is
+        forgotten, so seen-key memory stays bounded (Spark
+        ``dropDuplicatesWithinWatermark``). Over a *bounded* source this is exact
+        deduplication (plain `distinct`); over a stream it runs the watermark-bounded
+        driver. Consume with `iter_batches()` (or `for_each_batch`).
+        """
+        from batcher.io.source import is_bounded
+        from batcher.plan.functions.temporal import _duration_micros
+        from batcher.plan.logical import WatermarkDedup
+
+        missing = [c for c in [*subset, event_time] if c not in self.columns]
+        if missing:
+            raise PlanError(f"drop_duplicates_within_watermark(): unknown column(s) {missing}")
+        if all(is_bounded(s) for s in self._sources):
+            return self.distinct(subset, keep="first", order_by=[(event_time, False)])
+        lateness_us = _duration_micros(lateness, arg="watermark lateness")
+        return self._derive(WatermarkDedup(self._plan, tuple(subset), event_time, lateness_us))
+
+    def session_window(
+        self,
+        time_col: str,
+        gap: str,
+        *,
+        partition_by: list[str] | None = None,
+        **aggs: Expr,
+    ) -> Dataset:
+        """Aggregate by event-time **session** windows (Spark ``session_window``).
+
+        A session groups consecutive events (within each `partition_by` group) whose
+        inter-arrival gap is below `gap` (a fixed duration like ``"10m"``); a larger
+        gap starts a new session. Returns one row per session with `partition_by`,
+        ``session_start``/``session_end``, and the named aggregates::
+
+            ds.session_window("ts", "5m", partition_by=["user"], hits=col("v").sum())
+
+        Composed from the window + group-by engine (no new operator), so it is
+        differential-tested against DuckDB and runs single-node or distributed.
+        """
+        from batcher.api.dataset._build import build_session_window
+
+        return build_session_window(self, time_col, gap, partition_by or [], aggs)
 
     def unnest(self, *columns: str) -> Dataset:
         """Expand each struct `column` into its fields as top-level columns
@@ -724,6 +930,56 @@ class Dataset:
             Projection(c, Col(c)) for c in node.available_columns() if not c.startswith("__fk_")
         ]
         return Dataset(Project(node, tuple(items)), combined_sources)
+
+    def join_stream(
+        self,
+        other: Dataset,
+        on: str | list[str] | None = None,
+        *,
+        left_on: str | list[str] | None = None,
+        right_on: str | list[str] | None = None,
+        left_time: str,
+        right_time: str,
+        within: str,
+        lateness: str | None = None,
+    ) -> Dataset:
+        """Watermark-bounded stream-stream interval inner join (Spark stream-stream join).
+
+        Joins two streams on equality keys (`on` / `left_on`+`right_on`) **and** an
+        event-time interval — a row pair matches only if
+        ``|left_time - right_time| <= within``. That time bound is what lets buffered
+        state be evicted once the watermark passes, keeping memory bounded over two
+        unbounded streams. Over bounded sources it is a plain inner join plus the
+        interval filter. Consume the streaming result with `iter_batches()`.
+        """
+        from batcher.io.source import is_bounded
+        from batcher.plan.functions.temporal import _duration_micros
+        from batcher.plan.logical import WatermarkStreamJoin
+
+        left_keys, right_keys = _resolve_join_keys(on, left_on, right_on)
+        within_us = _duration_micros(within, arg="join within")
+        lateness_us = _duration_micros(lateness, arg="join lateness") if lateness else 0
+        offset = len(self._sources)
+        combined = self._sources + other._sources
+
+        if all(is_bounded(s) for s in combined):
+            joined = self.join(other, left_on=left_keys, right_on=right_keys, how="inner")
+            diff = Col(left_time).cast("int64") - Col(right_time).cast("int64")
+            return joined.filter((diff <= within_us) & (diff >= -within_us))
+
+        output = _join_output(self.columns, other.columns, left_keys, right_keys, "inner", "_right")
+        node = WatermarkStreamJoin(
+            self._plan,
+            remap_sources(other._plan, offset),
+            tuple(left_keys),
+            tuple(right_keys),
+            tuple(output),
+            left_time,
+            right_time,
+            within_us,
+            lateness_us,
+        )
+        return Dataset(node, combined)
 
     def join_asof(
         self,

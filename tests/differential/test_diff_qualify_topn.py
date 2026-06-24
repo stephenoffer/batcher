@@ -35,10 +35,7 @@ def test_row_number_top2(duck):
     out = _topn(_t(duck), "row_number", 2).collect()
     assert_same(
         out,
-        duck.sql(
-            "SELECT k, v FROM t "
-            "QUALIFY row_number() OVER (PARTITION BY k ORDER BY v) <= 2"
-        ),
+        duck.sql("SELECT k, v FROM t QUALIFY row_number() OVER (PARTITION BY k ORDER BY v) <= 2"),
     )
 
 

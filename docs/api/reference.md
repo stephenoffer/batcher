@@ -72,6 +72,8 @@ Each returns a new lazy Dataset.
 | Method | Effect |
 | --- | --- |
 | `.explode(column, alias=None)` | one row per element of a list column |
+| `.with_row_index(name="index", offset=0)` | prepend a sequential row-index column (Polars) |
+| `.with_random(name="random", seed=0, normal=False)` | add a reproducible seeded random column (uniform or standard normal) |
 | `.unnest(*columns)` | lift struct fields into top-level columns |
 | `.pivot(index=[...], on=, values=, aggregate="sum")` | long → wide |
 | `.unpivot(on=[...], index=[...], ...)` | wide → long |
@@ -153,6 +155,20 @@ print(out.to_pydict())
 | `bt.concat_ws(separator, *exprs)` | concatenate values with `separator` between them |
 | `bt.format_string(format, *exprs)` | interpolate values into a `{}` template (Polars `format`) |
 | `bt.log(base, value)` | logarithm of `value` in the given `base` (→ Float64) |
+| `bt.gcd(a, b)` / `bt.lcm(a, b)` | greatest common divisor / least common multiple |
+| `bt.hypot(a, b)` | Euclidean norm `sqrt(a² + b²)` |
+| `bt.width_bucket(value, low, high, count)` | histogram bucket index over `[low, high]` |
+| `bt.struct(**fields)` / `bt.named_struct(name, value, ...)` | build a struct column |
+| `bt.sequence(start, stop, step=1)` | per-row integer list `[start..stop]` inclusive (DuckDB `generate_series`) |
+| `bt.element()` | the current element inside `list.transform` / `list.filter` (Polars) |
+| `bt.sum_horizontal(*exprs)` / `bt.mean_horizontal(*exprs)` | row-wise sum / mean across columns, ignoring nulls (Polars) |
+| `bt.count_if(condition)` | count rows where `condition` is true (aggregate) |
+| `bt.corr(x, y)` | Pearson correlation (aggregate) |
+| `bt.covar_pop(x, y)` / `bt.covar_samp(x, y)` | population / sample covariance (aggregate) |
+| `bt.nth_value(expr, n)` | the `n`-th value of the ordered partition (window) |
+| `bt.now()` / `bt.current_timestamp()` | current timestamp, bound at plan-build time |
+| `bt.current_date()` / `bt.today()` | today's date, bound at plan-build time |
+| `bt.date_part(part, expr)` | extract a calendar field (`year`/`month`/`dow`/…) |
 | `bt.date_add(expr, days)` | add a whole number of `days` to a date/time column (Spark `date_add`) |
 | `bt.date_sub(expr, days)` | subtract a whole number of `days` from a date/time column (Spark `date_sub`) |
 
@@ -170,7 +186,7 @@ print(out.to_pydict())
 - Operators: `+ - * / % **`; `== != > >= < <=`; `& | ~`
 - Types and nulls: `.cast("Int64")`, `.is_null()`, `.is_not_null()`, `.is_in([...])`,
   `.between(low, high)`, `.fill_null(value)`, `.is_nan()`, `.is_not_nan()`,
-  `.clip(lower, upper)`
+  `.is_finite()`, `.is_infinite()`, `.clip(lower, upper)`
 - Math: `.abs()`, `.round(digits)`, `.pow(e)`, `.sqrt()`, `.floor()`, `.ceil()`,
   `.ln()`, `.log10()`, `.log2()`, `.exp()`, `.sin()`, `.cos()`, `.tan()`, `.asin()`,
   `.acos()`, `.atan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`, `.sign()`,
@@ -200,8 +216,12 @@ print(out.to_pydict())
 | `.dt` | calendar parts (`year`, `month`, `day`, `hour`, `dayname`, `quarter`, `truncate`, ...) |
 | `.list` (alias `.arr`) | list reductions and reshaping (`len`, `sum`, `sort`, `get`, `join`, `contains`, ...) |
 | `.struct` | `field(name)` |
+| `.map` | Arrow `Map` columns: `keys()`, `values()`, `get(key)` / `element_at(key)` |
 | `.json` | `extract_string(path)` |
-| `.image` | `decode()`, `to_tensor(width, height)` |
+| `.image` | `decode()`, `to_tensor(width, height)`, `resize(width, height)` |
+| `.audio` | native WAV/FLAC decode: `decode()` (metadata struct), `to_waveform()` (mono `List<Float32>`) |
+| `.video` | native FFmpeg decode: `decode()` (metadata struct) — needs the `video` engine build feature |
+| `.embedding` | vector ops for retrieval/RAG (`cosine_similarity`, `cosine_distance`, `l2_distance`, `dot`, `normalize`) |
 
 ## SQL
 

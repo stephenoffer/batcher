@@ -13,7 +13,17 @@ thiserror.workspace = true
 regex = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# IANA timezone database for `convert_timezone` (DST-aware tz conversion).
+chrono-tz = { version = "0.10", default-features = false }
 serde_json = "1"
+# Cryptographic / non-cryptographic hashes for the `md5`/`sha1`/`sha256`/`crc32`/
+# `xxhash64` string functions (all pure-Rust). Differential-tested vs DuckDB where it
+# has the same function (md5/sha1/sha256), fixture-tested otherwise (crc32/xxhash64).
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+crc32fast = "1"
+twox-hash = "1"
 # Image decode for the `.image` expression namespace (interpreter oracle path);
 # limited to common codecs to keep the dependency footprint small.
 image = { version = "0.25", default-features = false, features = [
@@ -23,6 +33,20 @@ image = { version = "0.25", default-features = false, features = [
     "bmp",
     "webp",
 ] }
+# Audio decode for the `.audio` expression namespace (interpreter oracle path, like
+# `image`). Pure-Rust; scoped to WAV/PCM + FLAC to keep the footprint small.
+symphonia = { version = "0.5", default-features = false, features = [
+    "wav",
+    "pcm",
+    "flac",
+] }
+# Video decode for the `.video` namespace — OPTIONAL (links the system FFmpeg C
+# libraries). Off by default; build with `--features video` to enable. Without it,
+# the `Expr::Video` variant still deserializes but evaluating it errors clearly.
+ffmpeg-next = { version = "8", optional = true }
+
+[features]
+video = ["dep:ffmpeg-next"]
 
 [lints]
 workspace = true

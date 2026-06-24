@@ -65,5 +65,5 @@ def test_missing_framework_raises_backend_error(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", _no_pandas)
     ds = bt.from_pydict({"a": [1]})
-    with pytest.raises(BackendError, match="batcher\\[pandas\\]"):
+    with pytest.raises(BackendError, match="\\[pandas\\]"):
         ds.to_pandas()

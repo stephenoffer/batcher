@@ -155,3 +155,48 @@ def test_sklearn_cross_check_standard_scaler():
     got = _col(StandardScaler(["x"]).fit_transform(ds), "x")
     expected = sk.StandardScaler().fit_transform(x.reshape(-1, 1)).ravel()
     assert np.allclose(got, expected)
+
+
+def test_normalizer_l2_matches_reference():
+    from batcher.ml.preprocessors import Normalizer
+
+    ds = bt.from_pydict({"a": [3.0, 1.0, 0.0], "b": [4.0, 1.0, 0.0]})
+    out = Normalizer(["a", "b"], norm="l2").fit_transform(ds).collect().to_pydict()
+    assert [round(v, 6) for v in out["a"]] == [0.6, round(1 / 2**0.5, 6), 0.0]
+    assert [round(v, 6) for v in out["b"]] == [0.8, round(1 / 2**0.5, 6), 0.0]
+
+
+def test_normalizer_l1():
+    from batcher.ml.preprocessors import Normalizer
+
+    ds = bt.from_pydict({"a": [1.0, 0.0], "b": [3.0, 0.0]})
+    out = Normalizer(["a", "b"], norm="l1").fit_transform(ds).collect().to_pydict()
+    assert [round(v, 6) for v in out["a"]] == [0.25, 0.0]
+    assert [round(v, 6) for v in out["b"]] == [0.75, 0.0]
+
+
+def test_kbins_uniform_equal_width():
+    from batcher.ml.preprocessors import KBinsDiscretizer
+
+    ds = bt.from_pydict({"x": [float(i) for i in range(10)]})
+    out = KBinsDiscretizer(["x"], n_bins=5, strategy="uniform").fit_transform(ds).collect()
+    assert out.to_pydict()["x"] == [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
+
+
+def test_kbins_quantile_balances_counts():
+    from batcher.ml.preprocessors import KBinsDiscretizer
+
+    ds = bt.from_pydict({"x": [float(i) for i in range(10)]})
+    out = KBinsDiscretizer(["x"], n_bins=5, strategy="quantile").fit_transform(ds).collect()
+    bins = out.to_pydict()["x"]
+    assert min(bins) == 0 and max(bins) == 4  # spans all bins
+
+
+def test_multihot_encoder_indicators():
+    from batcher.ml.preprocessors import MultiHotEncoder
+
+    ds = bt.from_pydict({"tags": [["a", "b"], ["b", "c"], ["a"]]})
+    out = MultiHotEncoder("tags").fit_transform(ds).collect().to_pydict()
+    assert out["tags_a"] == [1, 0, 1]
+    assert out["tags_b"] == [1, 1, 0]
+    assert out["tags_c"] == [0, 1, 0]

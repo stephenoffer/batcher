@@ -7,7 +7,7 @@ from batcher import col
 from batcher.config import active_config
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rules.joins import eager_aggregation
+from batcher.kyber.rules.agg_pushdown import eager_aggregation
 from batcher.kyber.stats.estimator import StatsEstimator
 from batcher.plan.logical import Aggregate, Join
 
@@ -23,9 +23,7 @@ def _dept():
 def _ctx(ds, ndv=None):
     learned = {"__column_ndv__": ndv} if ndv else {}
     est = StatsEstimator(ds._sources, learned=learned)
-    return OptimizerContext(
-        config=active_config(), sources=ds._sources, hub=None, estimator=est
-    )
+    return OptimizerContext(config=active_config(), sources=ds._sources, hub=None, estimator=est)
 
 
 def _grouped_max():
@@ -64,12 +62,7 @@ def test_sum_not_pushed():
 
 def test_right_side_aggregate_not_pushed():
     # The aggregate input is a right column → not a left-side push.
-    ds = (
-        _emp()
-        .join(_dept(), on="dept_id")
-        .group_by("dept_id")
-        .agg(top=col("name").max())
-    )
+    ds = _emp().join(_dept(), on="dept_id").group_by("dept_id").agg(top=col("name").max())
     assert eager_aggregation(ds._plan, _ctx(ds, ndv={"dept_id": 3.0})) is None
 
 

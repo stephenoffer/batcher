@@ -32,6 +32,7 @@ if TYPE_CHECKING:
         _StrNamespace,
         _StructNamespace,
     )
+    from batcher.plan.expr_ir.nodes import WindowExpr
 
 # A value that can be promoted to an expression: another Expr or a Python scalar.
 IntoExpr = Union["Expr", int, float, bool, str]
@@ -126,6 +127,58 @@ class Expr:
     def __rmod__(self, other: IntoExpr) -> Expr:
         return Binary("mod", _wrap(other), self)
 
+    def __floordiv__(self, other: IntoExpr) -> Expr:
+        """Floor division ``a // b`` — ``floor(a / b)`` (Polars/Python semantics:
+        rounds toward negative infinity, unlike SQL integer division which truncates
+        toward zero). The numerator is cast to Float64 so the division is true
+        (not integer) division before flooring; desugars to existing ops, no new IR."""
+        return MathExpr("floor", Binary("div", self.cast("float64"), _wrap(other)))
+
+    def __rfloordiv__(self, other: IntoExpr) -> Expr:
+        return MathExpr("floor", Binary("div", _wrap(other).cast("float64"), self))
+
+    # --- unary arithmetic operators ----------------------------------------
+    def __neg__(self) -> Expr:
+        """Arithmetic negation ``-x`` (desugars to ``0 - x``; type-preserving)."""
+        return Binary("sub", Lit(0), self)
+
+    def __pos__(self) -> Expr:
+        """Unary plus ``+x`` — the identity, returning this expression unchanged."""
+        return self
+
+    def __abs__(self) -> MathExpr:
+        """Absolute value ``abs(x)`` (Python ``abs()`` protocol)."""
+        return MathExpr("abs", self)
+
+    def __round__(self, ndigits: int | None = None) -> Expr:
+        """Python ``round(expr)`` / ``round(expr, n)`` → :meth:`round`."""
+        return self.round(ndigits)
+
+    def __floor__(self) -> MathExpr:
+        """``math.floor(expr)`` — round toward negative infinity."""
+        return MathExpr("floor", self)
+
+    def __ceil__(self) -> MathExpr:
+        """``math.ceil(expr)`` — round toward positive infinity."""
+        return MathExpr("ceil", self)
+
+    def __trunc__(self) -> MathExpr:
+        """``math.trunc(expr)`` — round toward zero."""
+        return MathExpr("trunc", self)
+
+    def __bool__(self) -> bool:
+        """Guard against using an expression in a boolean context.
+
+        ``col("x") > 0`` builds an expression; it has no truth value. Python would
+        otherwise treat it as truthy in ``if expr:``, ``expr in (...)``, or
+        ``a < expr < b`` (chained comparison) — silent logic bugs. Use ``&``/``|``/
+        ``~`` to combine predicates and `is_in`/`between` for membership/ranges.
+        """
+        raise PlanError(
+            "the truth value of an Expr is ambiguous; use & | ~ to combine predicates, "
+            "and is_in()/between() instead of chained comparisons or `in`"
+        )
+
     # --- boolean operators (bitwise spelling, like Polars/pandas) ----------
     def __and__(self, other: IntoExpr) -> Expr:
         return Binary("and", self, _wrap(other))
@@ -133,8 +186,58 @@ class Expr:
     def __or__(self, other: IntoExpr) -> Expr:
         return Binary("or", self, _wrap(other))
 
+    # reflected forms so `True & col("x")` / `lit_on_left | col(...)` work
+    def __rand__(self, other: IntoExpr) -> Expr:
+        return Binary("and", _wrap(other), self)
+
+    def __ror__(self, other: IntoExpr) -> Expr:
+        return Binary("or", _wrap(other), self)
+
     def __invert__(self) -> Expr:
         return Not(self)
+
+    def __xor__(self, other: IntoExpr) -> Expr:
+        """Bitwise XOR ``a ^ b`` of two integer expressions (operands cast to Int64);
+        the operator spelling of :meth:`bitwise_xor`."""
+        return Binary("bit_xor", self, _wrap(other))
+
+    def __lshift__(self, other: IntoExpr) -> Expr:
+        """Left shift ``a << b``; the operator spelling of :meth:`bitwise_left_shift`."""
+        return Binary("shift_left", self, _wrap(other))
+
+    def __rshift__(self, other: IntoExpr) -> Expr:
+        """Right shift ``a >> b``; the operator spelling of :meth:`bitwise_right_shift`."""
+        return Binary("shift_right", self, _wrap(other))
+
+    def __rxor__(self, other: IntoExpr) -> Expr:
+        return Binary("bit_xor", _wrap(other), self)
+
+    def __getitem__(self, key: int | slice | str) -> Expr:
+        """Index into a list or struct column with ``[]`` — the idiomatic spelling of
+        the ``.list``/``.struct`` accessors it delegates to.
+
+        - ``col("a")[2]`` → list element at index 2 (negative counts from the end),
+          equivalent to ``col("a").list.get(2)``.
+        - ``col("a")[1:3]`` → list sub-range ``[1, 3)``, equivalent to
+          ``col("a").list.slice(1, 2)`` (a ``step`` other than 1 raises).
+        - ``col("s")["field"]`` → struct field, equivalent to
+          ``col("s").struct.field("field")``.
+        """
+        from batcher.plan.expr_ir.func_nodes import ListGet, ListSlice, StructField
+
+        if isinstance(key, bool):  # bool is an int subclass; reject it explicitly
+            raise PlanError("cannot index an expression with a bool")
+        if isinstance(key, int):
+            return ListGet(self, key)
+        if isinstance(key, str):
+            return StructField(self, key)
+        if isinstance(key, slice):
+            if key.step not in (None, 1):
+                raise PlanError("expression slice does not support a step other than 1")
+            offset = key.start or 0
+            length = None if key.stop is None else max(0, key.stop - offset)
+            return ListSlice(self, offset, length)
+        raise PlanError(f"cannot index an expression with {type(key).__name__}")
 
     # --- bitwise integer operators (distinct from the boolean `&`/`|`) ------
     def bitwise_and(self, other: IntoExpr) -> Expr:
@@ -361,6 +464,15 @@ class Expr:
         """Cotangent, 1/tan (→ Float64)."""
         return MathExpr("cot", self)
 
+    def factorial(self) -> MathExpr:
+        """``n!`` — factorial of a non-negative integer (DuckDB ``factorial``)."""
+        return MathExpr("factorial", self)
+
+    def bit_count(self) -> MathExpr:
+        """Population count — the number of set bits in the integer value
+        (DuckDB ``bit_count``)."""
+        return MathExpr("bit_count", self)
+
     @property
     def list(self) -> _ListNamespace:
         """List/array reductions: `col("a").list.len()`, `.list.sum()`, …"""
@@ -383,6 +495,21 @@ class Expr:
         return _StructNamespace(self)
 
     @property
+    def embedding(self):
+        """Embedding-vector ops (Daft-style): `col("v").embedding.cosine_distance(q)`,
+        `.cosine_similarity(q)`, `.l2_distance(q)`, `.dot(q)`."""
+        from batcher.plan.expr_ir.namespaces import _EmbeddingNamespace
+
+        return _EmbeddingNamespace(self)
+
+    @property
+    def map(self):
+        """Map-column accessors: `col("m").map.keys()`, `.values()`, `.get(key)`."""
+        from batcher.plan.expr_ir.namespaces import _MapNamespace
+
+        return _MapNamespace(self)
+
+    @property
     def json(self) -> _JsonNamespace:
         """JSON access on a string column: `col("j").json.extract_string("$.a")`."""
         from batcher.plan.expr_ir.namespaces import _JsonNamespace
@@ -395,6 +522,20 @@ class Expr:
         from batcher.plan.expr_ir.image import _ImageNamespace
 
         return _ImageNamespace(self)
+
+    @property
+    def audio(self):
+        """Lazy audio decode: `col("bytes").audio.decode()` / `.audio.to_waveform()`."""
+        from batcher.plan.expr_ir.audio import _AudioNamespace
+
+        return _AudioNamespace(self)
+
+    @property
+    def video(self):
+        """Lazy video decode: `col("bytes").video.decode()` (needs the ``video`` engine feature)."""
+        from batcher.plan.expr_ir.video import _VideoNamespace
+
+        return _VideoNamespace(self)
 
     def fill_null(self, value: IntoExpr) -> Coalesce:
         """Replace nulls with `value` (COALESCE of two)."""
@@ -413,6 +554,19 @@ class Expr:
     def is_not_nan(self) -> Expr:
         """True where the value is not NaN (the negation of `is_nan`; null → null)."""
         return Not(IsNan(self))
+
+    def is_infinite(self) -> Expr:
+        """True where the value is ``+inf`` or ``-inf`` (Polars/pandas ``is_infinite``).
+
+        A dedicated op because ``±inf`` literals do not survive the JSON IR, so a
+        comparison against them cannot express this. Nulls propagate (null → null).
+        """
+        return IsInf(self)
+
+    def is_finite(self) -> Expr:
+        """True where the value is finite — not NaN and not ``±inf`` (Polars/pandas
+        ``is_finite``). Nulls propagate (null → null)."""
+        return Not(IsNan(self)) & Not(IsInf(self))
 
     def clip(self, lower: IntoExpr | None = None, upper: IntoExpr | None = None) -> Expr:
         """Clamp values into ``[lower, upper]`` (either bound optional).
@@ -450,6 +604,17 @@ class Expr:
     def std(self) -> AggExpr:
         """Sample standard deviation."""
         return AggExpr("stddev", self)
+
+    def skewness(self) -> AggExpr:
+        """Sample skewness of this expression's non-null values per group
+        (adjusted Fisher-Pearson, matching DuckDB; -> Float64). Null when the group
+        has fewer than 3 values. Mergeable (sum-of-powers moment state)."""
+        return AggExpr("skewness", self)
+
+    def kurtosis(self) -> AggExpr:
+        """Sample excess kurtosis per group (0 for a normal distribution, matching
+        DuckDB; → Float64). Null when the group has fewer than 4 values. Mergeable."""
+        return AggExpr("kurtosis", self)
 
     def median(self) -> AggExpr:
         """Median (exact; averages the two middle values for an even count)."""
@@ -546,6 +711,33 @@ class Expr:
         (null when the group has no non-null value)."""
         return AggExpr("bool_or", self)
 
+    def product(self) -> AggExpr:
+        """Product of this expression's non-null values per group (DuckDB
+        ``product``; → Float64). Mergeable, so identical single-node and distributed."""
+        return AggExpr("product", self)
+
+    def bit_and(self) -> AggExpr:
+        """Bitwise AND of this expression's non-null Int64 values per group
+        (Spark/DuckDB ``bit_and``). Mergeable."""
+        return AggExpr("bit_and", self)
+
+    def bit_or(self) -> AggExpr:
+        """Bitwise OR of this expression's non-null Int64 values per group
+        (Spark/DuckDB ``bit_or``). Mergeable."""
+        return AggExpr("bit_or", self)
+
+    def bit_xor(self) -> AggExpr:
+        """Bitwise XOR of this expression's non-null Int64 values per group
+        (Spark/DuckDB ``bit_xor``). Mergeable."""
+        return AggExpr("bit_xor", self)
+
+    def histogram(self) -> AggExpr:
+        """Collect this expression's non-null values per group into a
+        ``Map<value, count>`` (DuckDB ``histogram``). Keys are the distinct values
+        sorted ascending; values are their counts. Mergeable, so identical
+        single-node and distributed."""
+        return AggExpr("histogram", self)
+
     def array_agg(self) -> AggExpr:
         """Collect this expression's non-null values in each group into a ``List``
         (SQL ``array_agg``; Spark ``collect_list``). Without an explicit order the
@@ -556,6 +748,52 @@ class Expr:
         ``ds.group_by("g").agg(tags=col("t").array_agg())`` then
         ``col("tags").list.join(",")``."""
         return AggExpr("list_agg", self)
+
+    # --- Cumulative / shift (Polars-style window conveniences) ------------------
+    # Each returns a window expression (running aggregate / lag-lead), so use it in
+    # `with_columns`/`select`; window expressions do not nest in scalar arithmetic
+    # or `filter`. `partition_by` gives a per-group running value; without `order_by`
+    # the order is the row order (Polars' default), matching `cum_*` semantics.
+    def _running(
+        self, agg: str, partition_by: Iterable[IntoExpr], order_by: Iterable[IntoExpr]
+    ) -> WindowExpr:
+        return AggExpr(agg, self).over(
+            partition_by=partition_by, order_by=order_by, frame=(None, 0)
+        )
+
+    def cum_sum(
+        self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
+    ) -> WindowExpr:
+        """Cumulative (running) sum from the first row to the current one — Polars
+        ``cum_sum``. Pass `partition_by` for a per-group running sum."""
+        return self._running("sum", partition_by, order_by)
+
+    def cum_min(
+        self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
+    ) -> WindowExpr:
+        """Cumulative (running) minimum up to the current row — Polars ``cum_min``."""
+        return self._running("min", partition_by, order_by)
+
+    def cum_max(
+        self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
+    ) -> WindowExpr:
+        """Cumulative (running) maximum up to the current row — Polars ``cum_max``."""
+        return self._running("max", partition_by, order_by)
+
+    def cum_count(
+        self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
+    ) -> WindowExpr:
+        """Cumulative count of non-null values up to the current row — Polars
+        ``cum_count``."""
+        return self._running("count", partition_by, order_by)
+
+    def shift(self, n: int = 1) -> WindowExpr:
+        """Shift values by `n` rows in row order (Polars ``shift``): positive `n` lags
+        (moves down, vacated leading rows null), negative `n` leads (moves up). A
+        window expression — use in ``with_columns``/``select``."""
+        from batcher.plan.expr_ir.nodes import lag, lead
+
+        return lag(self, n) if n >= 0 else lead(self, -n)
 
 
 class Lit(Expr):
@@ -682,6 +920,18 @@ class IsNan(Expr):
 
     def to_ir(self) -> dict[str, Any]:
         return {"e": ExprTag.IS_NAN, "input": self.input.to_ir()}
+
+
+class IsInf(Expr):
+    """True where a float value is ``+inf`` or ``-inf`` (null → null)."""
+
+    __slots__ = ("input",)
+
+    def __init__(self, input: Expr) -> None:
+        self.input = input
+
+    def to_ir(self) -> dict[str, Any]:
+        return {"e": ExprTag.IS_INF, "input": self.input.to_ir()}
 
 
 class Aliased(Expr):

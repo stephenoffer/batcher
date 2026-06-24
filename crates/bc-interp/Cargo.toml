@@ -18,5 +18,8 @@ rayon.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
+[features]
+video = ["bc-expr/video"]
+
 [lints]
 workspace = true

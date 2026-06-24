@@ -16,7 +16,7 @@ from batcher import col
 from batcher.api.dataset.frame import Dataset
 from batcher.config import active_config
 from batcher.kyber.pass_base import OptimizerContext
-from batcher.kyber.rules.joins import eager_aggregation
+from batcher.kyber.rules.agg_pushdown import eager_aggregation
 from batcher.kyber.stats.estimator import StatsEstimator
 
 
@@ -39,8 +39,11 @@ def test_max_grouped_by_right_column(duck):
     dept = pa.table({"dept_id": [1, 2, 3], "name": ["eng", "sales", "ops"]})
     duck.register("emp", emp)
     duck.register("dept", dept)
-    ds = bt.from_arrow(emp).join(bt.from_arrow(dept), on="dept_id").group_by("name").agg(
-        top=col("sal").max()
+    ds = (
+        bt.from_arrow(emp)
+        .join(bt.from_arrow(dept), on="dept_id")
+        .group_by("name")
+        .agg(top=col("sal").max())
     )
     expected = duck.sql(
         "SELECT name, max(sal) AS top FROM emp JOIN dept USING (dept_id) GROUP BY name"
@@ -58,8 +61,11 @@ def test_min_max_under_fan_out(duck):
     dim = pa.table({"k": [1, 1, 2, 2, 3], "g": ["a", "a", "b", "b", "c"]})  # fan-out on k
     duck.register("fact", fact)
     duck.register("dim", dim)
-    ds = bt.from_arrow(fact).join(bt.from_arrow(dim), on="k").group_by("g").agg(
-        lo=col("v").min(), hi=col("v").max()
+    ds = (
+        bt.from_arrow(fact)
+        .join(bt.from_arrow(dim), on="k")
+        .group_by("g")
+        .agg(lo=col("v").min(), hi=col("v").max())
     )
     expected = duck.sql(
         "SELECT g, min(v) AS lo, max(v) AS hi FROM fact JOIN dim USING (k) GROUP BY g"
@@ -81,9 +87,7 @@ def test_grouped_by_left_column(duck):
     dim = pa.table({"k": [1, 2], "d": [100, 200]})
     duck.register("f2", fact)
     duck.register("d2", dim)
-    ds = bt.from_arrow(fact).join(bt.from_arrow(dim), on="k").group_by("cat").agg(
-        hi=col("v").max()
-    )
+    ds = bt.from_arrow(fact).join(bt.from_arrow(dim), on="k").group_by("cat").agg(hi=col("v").max())
     expected = duck.sql("SELECT cat, max(v) AS hi FROM f2 JOIN d2 USING (k) GROUP BY cat")
     assert_same(ds.collect(), expected)
     # 6 rows, ndv(cat)*ndv(k) = 4 estimated groups < 6 → the estimator sees a reduction.

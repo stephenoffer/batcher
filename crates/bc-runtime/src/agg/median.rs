@@ -191,6 +191,69 @@ pub(crate) fn finalize_mode(state: &ArrayRef) -> Result<ArrayRef, RuntimeError> 
     Ok(take(child.as_ref(), &UInt32Array::from(winners), None)?)
 }
 
+/// `histogram` finalize: turn each group's value list into a `Map<value, count>`
+/// (DuckDB `histogram`). Keys are the distinct values **sorted ascending** (via the
+/// order-preserving row format, so any value type works); values are their counts.
+pub(crate) fn finalize_histogram(state: &ArrayRef) -> Result<ArrayRef, RuntimeError> {
+    use arrow::array::{MapArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{Field, Fields};
+
+    let list = state.as_list::<i32>();
+    let child = list.values();
+    let converter = RowConverter::new(vec![SortField::new(child.data_type().clone())])?;
+    let rows = converter.convert_columns(std::slice::from_ref(child))?;
+    let offsets = list.value_offsets();
+
+    let mut key_idx: Vec<u32> = Vec::new();
+    let mut counts: Vec<i64> = Vec::new();
+    let mut map_offsets: Vec<i32> = Vec::with_capacity(list.len() + 1);
+    // A group with no values (all-null) yields a NULL map, not an empty one (DuckDB).
+    let mut valid: Vec<bool> = Vec::with_capacity(list.len());
+    map_offsets.push(0);
+    for row in 0..list.len() {
+        let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+        valid.push(start < end);
+        if start < end {
+            // Sort the group's element indices by value; equal values form a run,
+            // and each run is one (key, count) entry of the histogram map.
+            let mut idxs: Vec<u32> = (start as u32..end as u32).collect();
+            idxs.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
+            let mut run_start = 0usize;
+            for j in 1..=idxs.len() {
+                let breaks = j == idxs.len()
+                    || rows.row(idxs[j] as usize) != rows.row(idxs[run_start] as usize);
+                if breaks {
+                    key_idx.push(idxs[run_start]);
+                    counts.push((j - run_start) as i64);
+                    run_start = j;
+                }
+            }
+        }
+        map_offsets.push(key_idx.len() as i32);
+    }
+
+    let keys = take(child.as_ref(), &UInt32Array::from(key_idx), None)?;
+    let vals: ArrayRef = Arc::new(Int64Array::from(counts));
+    let key_field = Arc::new(Field::new("key", keys.data_type().clone(), false));
+    let val_field = Arc::new(Field::new("value", DataType::Int64, true));
+    let struct_fields = Fields::from(vec![key_field, val_field]);
+    let entries = StructArray::new(struct_fields.clone(), vec![keys, vals], None);
+    let entries_field = Arc::new(Field::new(
+        "entries",
+        DataType::Struct(struct_fields),
+        false,
+    ));
+    let map = MapArray::try_new(
+        entries_field,
+        OffsetBuffer::new(map_offsets.into()),
+        entries,
+        Some(arrow::buffer::NullBuffer::from(valid)),
+        false,
+    )?;
+    Ok(Arc::new(map))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +279,23 @@ mod tests {
         let state = median_state(&values, &[0u32, 1], 2).unwrap();
         let modes = finalize_mode(&state).unwrap();
         assert!(modes.is_valid(0) && !modes.is_valid(1));
+    }
+
+    #[test]
+    fn histogram_counts_and_null_group() {
+        use arrow::array::{Int64Array, MapArray};
+        // group 0: [1,1,2] → {1:2, 2:1}; group 1: [None] → null map.
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(2), None]));
+        let state = median_state(&values, &[0u32, 0, 0, 1], 2).unwrap();
+        let out = finalize_histogram(&state).unwrap();
+        let m = out.as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(m.is_valid(0));
+        assert_eq!(m.value_length(0), 2); // two distinct keys
+        let counts = m.value(0);
+        let counts = counts.column(1).as_primitive::<Int64Type>();
+        assert_eq!(counts.value(0), 2); // key 1 → count 2 (sorted ascending)
+        assert_eq!(counts.value(1), 1); // key 2 → count 1
+        assert!(m.is_null(1)); // all-null group → NULL map
     }
 
     #[test]

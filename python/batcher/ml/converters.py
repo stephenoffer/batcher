@@ -19,27 +19,37 @@ if TYPE_CHECKING:
 __all__ = ["arrays_to_torch", "to_numpy_batches", "to_tf_dataset", "to_torch_iterable"]
 
 
-def arrays_to_torch(arrays: dict[str, np.ndarray]) -> dict[str, Any]:
+def arrays_to_torch(arrays: dict[str, np.ndarray], *, zero_copy: bool = False) -> dict[str, Any]:
     """Convert a `{column: np.ndarray}` dict to `{column: torch.Tensor}`.
 
     Only numeric columns (``bool``/``int``/``uint``/``float``/``complex``) convert;
     others are dropped (move text/ids through the engine, not the trainer hot path).
-    Each tensor owns a **writable** copy — a training loop mutates batches in place
-    and the Arrow-backed buffer is read-only (torch's "undefined behavior" warning).
+
+    By default each tensor owns a **writable** copy — a training loop mutates batches
+    in place and the Arrow-backed buffer is read-only (torch's "undefined behavior"
+    warning). Set `zero_copy=True` for **read-only inference** to skip that copy: the
+    tensor is a DLPack view sharing the Arrow buffer (one fewer CPU copy before a
+    ``.to(device)``), so do not mutate it. Falls back to a copy for buffers DLPack
+    can't view (non-contiguous, unsupported dtype).
 
     Args:
         arrays: a column-name → NumPy array dict (e.g. one `to_numpy_batches` item).
+        zero_copy: hand the Arrow/NumPy buffer to torch via DLPack (read-only).
 
     Returns:
         A `{column: torch.Tensor}` dict over the numeric columns. Requires `torch`.
     """
     import torch
 
-    return {
-        name: torch.from_numpy(array.copy())
-        for name, array in arrays.items()
-        if array.dtype.kind in "biufc"
-    }
+    def _convert(array: np.ndarray) -> Any:
+        if zero_copy:
+            try:
+                return torch.from_dlpack(array)  # zero-copy view (read-only)
+            except (TypeError, RuntimeError, BufferError, ValueError):
+                pass  # non-contiguous / unsupported → fall through to a copy
+        return torch.from_numpy(array.copy())
+
+    return {name: _convert(array) for name, array in arrays.items() if array.dtype.kind in "biufc"}
 
 
 def to_numpy_batches(

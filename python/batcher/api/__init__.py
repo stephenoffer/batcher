@@ -2,34 +2,16 @@
 
 `api` is the conductor: it builds `LogicalPlan`s and orchestrates the three layers
 (Kyber → Carbonite → Core) to execute them. It is the only package allowed to
-import all three layers.
+import all three layers. This module is a re-export façade — the expression
+functions come from `api.functions` (re-exported wholesale, governed by its
+``__all__``), plus the Dataset, IO, and a curated set of session constructors.
 """
 
 from __future__ import annotations
 
+from batcher.api import functions as _functions
 from batcher.api.dataset import Dataset, GroupBy
-from batcher.api.functions import (
-    array,
-    atan2,
-    coalesce,
-    col,
-    count,
-    cume_dist,
-    dense_rank,
-    first_value,
-    greatest,
-    lag,
-    last_value,
-    lead,
-    least,
-    lit,
-    ntile,
-    nullif,
-    percent_rank,
-    rank,
-    row_number,
-    when,
-)
+from batcher.api.functions import *  # noqa: F403  (governed by functions.__all__)
 from batcher.api.io_namespace import read
 from batcher.api.session import (
     catalog,
@@ -40,56 +22,56 @@ from batcher.api.session import (
     from_batches,
     from_dask,
     from_huggingface,
+    from_items,
     from_numpy,
     from_pandas,
     from_polars,
     from_pydict,
+    from_pylist,
+    from_ray_dataset,
     from_spark,
     from_tf,
     from_torch,
     range,
+    read_memory,
+    register_function,
     sql,
+    streams,
 )
+from batcher.api.sql_session import Session
+from batcher.plan.streaming import OutputMode, Trigger
 
+# Session names listed as literals so ruff recognizes the explicit imports above as
+# re-exports; the expression functions come in via `*_functions.__all__`.
 __all__ = [
     "Dataset",
     "GroupBy",
-    "array",
-    "atan2",
+    "OutputMode",
+    "Session",
+    "Trigger",
     "catalog",
-    "coalesce",
-    "col",
     "compact",
-    "count",
-    "cume_dist",
     "date_range",
-    "dense_rank",
     "engine_version",
-    "first_value",
     "from_arrow",
     "from_batches",
     "from_dask",
     "from_huggingface",
+    "from_items",
     "from_numpy",
     "from_pandas",
     "from_polars",
     "from_pydict",
+    "from_pylist",
+    "from_ray_dataset",
     "from_spark",
     "from_tf",
     "from_torch",
-    "greatest",
-    "lag",
-    "last_value",
-    "lead",
-    "least",
-    "lit",
-    "ntile",
-    "nullif",
-    "percent_rank",
     "range",
-    "rank",
     "read",
-    "row_number",
+    "read_memory",
+    "register_function",
     "sql",
-    "when",
+    "streams",
+    *_functions.__all__,
 ]

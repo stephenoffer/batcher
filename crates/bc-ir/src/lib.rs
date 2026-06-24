@@ -155,6 +155,19 @@ pub enum RelOp {
         alias: String,
     },
 
+    /// Append a 0-based (plus `offset`) sequential row-index column over the input,
+    /// in batch-arrival order (Polars `with_row_index`). The id is assigned by a
+    /// single sequential counter, so it is identical on the sequential and parallel
+    /// paths for an order-preserving pipeline.
+    RowId {
+        input: Box<RelOp>,
+        /// Output column name for the index.
+        alias: String,
+        /// Starting value for the first row (default 0).
+        #[serde(default)]
+        offset: i64,
+    },
+
     /// Reshape wide → long (SQL `UNPIVOT`, pandas `melt`, Polars `unpivot`). Each
     /// input row becomes one row per `on` column: the `index` columns repeat, a
     /// `variable_name` string column holds the source column's name, and a
@@ -309,6 +322,24 @@ pub enum AggFunc {
     /// ordering key (`input2`). Two-input, 2-column-state, mergeable.
     ArgMin,
     ArgMax,
+    /// `product` — product of a group's non-null values as Float64 (mergeable).
+    Product,
+    /// `bit_and`/`bit_or`/`bit_xor` — bitwise fold of a group's non-null Int64
+    /// values (mergeable: each op associates and commutes).
+    BitAnd,
+    BitOr,
+    BitXor,
+    /// `covar_pop`/`covar_samp`/`corr` — two-input covariance/correlation (the
+    /// second input rides `AggregateItem::input2`). 6-column sum-of-powers state.
+    CovarPop,
+    CovarSamp,
+    Corr,
+    /// `skewness`/`kurtosis` — single-input moment aggregates (5-column state).
+    Skewness,
+    Kurtosis,
+    /// `histogram` — a `Map<value, count>` per group (same value-list state as
+    /// `Median`; finalize counts).
+    Histogram,
 }
 
 /// One window function in a `Window`: a function over an optional input
@@ -343,13 +374,15 @@ pub struct WindowFrame {
     pub end: FrameBound,
 }
 
-/// Frame units. `Rows` counts physical rows; `Range` is value-based (peer) — only
-/// the default `Range` frame is supported, so an explicit frame must be `Rows`.
+/// Frame units. `Rows` counts physical rows; `Range`/`Groups` count peer groups
+/// (rows with an equal ORDER BY value). `Range` supports peer bounds (CURRENT ROW /
+/// UNBOUNDED); a numeric `RANGE` offset falls back to the default running frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameUnits {
     Rows,
     Range,
+    Groups,
 }
 
 /// One edge of a window frame. `n` is a non-negative row offset for the bounded
@@ -387,6 +420,9 @@ pub enum WindowFn {
     LastValue,
     Lag,
     Lead,
+    /// `nth_value(expr, n)` — value of the `offset`-th row (1-based) of the
+    /// partition in order; null if the partition has fewer than `offset` rows.
+    NthValue,
 }
 
 /// One output column of a `Project`: an expression and the name it is bound to.

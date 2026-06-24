@@ -1,16 +1,21 @@
 # The ML accessor
 
-ML work attaches to a `Dataset` through the `.ml` accessor. It exposes three
-methods that run Python code over whole Arrow batches inside the engine:
+ML work attaches to a `Dataset` through the `.ml` accessor:
 
 | Method | Use |
 | --- | --- |
 | `ds.ml.map_batches(fn, ...)` | Apply an arbitrary function to each Arrow batch. |
 | `ds.ml.infer(model, ...)` | Run batch inference with a model callable. |
 | `ds.ml.embed(model, ...)` | Generate embeddings with a model callable. |
+| `ds.ml.embed_text(col, model, ...)` | Embed text with a sentence-transformers model. |
+| `ds.ml.download(url_col, ...)` | Fetch bytes at each URL/path into a column. |
+| `ds.ml.upload(data_col, dir, ...)` | Write a bytes column out to object storage. |
+| `ds.ml.iter_torch_batches(...)` | Stream the dataset to PyTorch as tensor batches. |
+| `ds.ml.stream_loader(...)` | A distributed-training `IterableDataset` for one rank. |
 
-All three operate on whole `pyarrow.RecordBatch` objects, never on individual
-rows. They are lazy like every other transformation and return a new `Dataset`.
+These operate on whole `pyarrow.RecordBatch` objects, never on individual rows.
+They are lazy like every other transformation and return a new `Dataset` (except the
+loaders, which return a torch iterator).
 
 ## Whole-batch semantics
 
@@ -89,12 +94,16 @@ All three methods share these keywords:
 | --- | --- |
 | `batch_size` | Rows per batch handed to `fn`. Defaults to the engine morsel size. |
 | `output_columns` | Names of the columns the function produces, when they differ from the input. |
+| `batch_format` | What `fn` receives/returns: `"pyarrow"` (default), `"numpy"`, `"pandas"`, or `"torch"`. |
 | `num_gpus` | GPUs to reserve per worker (a fraction packs several workers onto one GPU). |
-| `concurrency` | Number of parallel actors in the worker pool. |
+| `concurrency` | Actor-pool size: an `int` for a fixed pool, or a `(min, max)` tuple to autoscale to the workload. |
+| `accelerator_type` | Pin GPU actors to a device model (a `ray.util.accelerators` name such as `"NVIDIA_A100"`). |
+| `model_memory_gb` | The model's GB footprint — budgets host memory per worker (OOM protection) and VRAM-packs small models onto a shared GPU. |
 | `num_workers` | Number of workers (`map_batches`). |
 
 `num_gpus` and `concurrency` together describe a GPU actor pool: each actor holds
-`num_gpus` of a device, and `concurrency` actors run in parallel. See
+`num_gpus` of a device, and `concurrency` actors run in parallel. `batch_format`
+converts only around the call; the engine boundary stays Arrow. See
 [GPU scheduling](../ml/gpu.md).
 
 ## infer and embed
@@ -114,16 +123,20 @@ vectors = ds.ml.embed(Embedder(), batch_size=256, num_gpus=1, concurrency=2)
 See [Inference](../ml/inference.md) for the inference workflow and
 [Streaming](../ml/streaming.md) for feeding training loops.
 
-## What is not here
+## The `batcher.ml` package
 
-There is no `StreamingDataLoader`, no `from batcher.ml import ...`, and no
-top-level `ds.embed(...)` / `ds.infer(...)` methods. Everything ML-related goes
-through the `.ml` accessor, and the model functions take no `text_column=` or
-`input_columns=` keywords; they receive the whole batch and pick columns
-themselves.
+Operators that are not `Dataset` methods live in `batcher.ml` — the standalone
+`embed` / `llm_generate` functions, the [preprocessors](../ml/preprocessors.md),
+the [serving adapters](../ml/serving.md), [vector search](../ml/multimodal.md), and
+the [LLM engines](../ml/llm.md). A model passed to `map_batches`/`infer` still
+receives the whole batch and picks its own columns (no `input_columns=` keyword);
+`embed_text` is the exception that takes a `text_column`.
 
 ## Next steps
 
 - [Inference](../ml/inference.md): batch prediction and embeddings.
-- [Streaming](../ml/streaming.md): streaming consumption for training.
+- [Preprocessors](../ml/preprocessors.md): fit/transform feature engineering.
+- [Multimodal](../ml/multimodal.md): download, decode, tensors, vector search.
+- [Serving](../ml/serving.md) and [LLM inference](../ml/llm.md).
+- [PyTorch](../ml/pytorch.md) and [streaming](../ml/streaming.md) training loaders.
 - [GPU scheduling](../ml/gpu.md): how `num_gpus` and `concurrency` map to actors.

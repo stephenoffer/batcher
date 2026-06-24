@@ -95,6 +95,55 @@ class ListBinary(Expr):
         }
 
 
+class ListSet(Expr):
+    """A set op between two List columns (`array_intersect`/`array_except`) — the
+    distinct left elements present in / absent from the right list. Built via
+    ``.list.intersect`` / ``.list.difference``. → List."""
+
+    __slots__ = ("fn", "left", "right")
+
+    def __init__(self, fn: str, left: Expr, right: Expr) -> None:
+        self.fn = fn
+        self.left = left
+        self.right = right
+
+    def to_ir(self) -> dict[str, Any]:
+        return {
+            "e": ExprTag.LIST_SET,
+            "fn": self.fn,
+            "left": self.left.to_ir(),
+            "right": self.right.to_ir(),
+        }
+
+
+class ListTransform(Expr):
+    """`list.transform(func)` — apply the element sub-expression `func` (over
+    ``element()``) to every list element, preserving lengths. → List."""
+
+    __slots__ = ("func", "input")
+
+    def __init__(self, input: Expr, func: Expr) -> None:
+        self.input = input
+        self.func = func
+
+    def to_ir(self) -> dict[str, Any]:
+        return {"e": ExprTag.LIST_TRANSFORM, "input": self.input.to_ir(), "func": self.func.to_ir()}
+
+
+class ListFilter(Expr):
+    """`list.filter(pred)` — keep elements where the boolean element predicate `pred`
+    (over ``element()``) is true. → List."""
+
+    __slots__ = ("input", "pred")
+
+    def __init__(self, input: Expr, pred: Expr) -> None:
+        self.input = input
+        self.pred = pred
+
+    def to_ir(self) -> dict[str, Any]:
+        return {"e": ExprTag.LIST_FILTER, "input": self.input.to_ir(), "pred": self.pred.to_ir()}
+
+
 class Strftime(Expr):
     """`strftime(ts, format)` — format a Date/Timestamp with a chrono/strftime
     format string (e.g. ``%Y-%m-%d``). → Utf8."""
@@ -124,6 +173,26 @@ class Strptime(Expr):
         return {"e": ExprTag.STRPTIME, "input": self.input.to_ir(), "format": self.format}
 
 
+class ConvertTimezone(Expr):
+    """`convert_timezone(from_tz, to_tz, ts)` — shift each naive timestamp's
+    wall-clock from `from_tz` to `to_tz` (DST-aware). Type-preserving (Timestamp)."""
+
+    __slots__ = ("from_tz", "input", "to_tz")
+
+    def __init__(self, input: Expr, from_tz: str, to_tz: str) -> None:
+        self.input = input
+        self.from_tz = from_tz
+        self.to_tz = to_tz
+
+    def to_ir(self) -> dict[str, Any]:
+        return {
+            "e": ExprTag.CONVERT_TIMEZONE,
+            "input": self.input.to_ir(),
+            "from_tz": self.from_tz,
+            "to_tz": self.to_tz,
+        }
+
+
 class DateOffset(Expr):
     """`offset_by` — shift a Date/Timestamp by `months` (calendar), `days`, and
     `micros` (exact). Built via ``.dt.offset_by``. Type-preserving."""
@@ -146,6 +215,49 @@ class DateOffset(Expr):
         if self.micros:
             ir["micros"] = self.micros
         return ir
+
+
+class WindowStart(Expr):
+    """`window_start(ts, width, origin)` — the start of the fixed-width tumbling
+    window containing each instant. Built via `window(col, duration)`. → Timestamp."""
+
+    __slots__ = ("input", "origin_micros", "width_micros")
+
+    def __init__(self, input: Expr, width_micros: int, origin_micros: int = 0) -> None:
+        self.input = input
+        self.width_micros = width_micros
+        self.origin_micros = origin_micros
+
+    def to_ir(self) -> dict[str, Any]:
+        ir: dict[str, Any] = {
+            "e": ExprTag.WINDOW_START,
+            "input": self.input.to_ir(),
+            "width_micros": self.width_micros,
+        }
+        if self.origin_micros:
+            ir["origin_micros"] = self.origin_micros
+        return ir
+
+
+class WindowBuckets(Expr):
+    """`window_buckets(ts, width, slide)` — the starts of every sliding window that
+    contains each instant, as a `List<Timestamp>`. Built via `window(col, duration,
+    slide)`; fan out with `unnest` then group-by the start."""
+
+    __slots__ = ("input", "slide_micros", "width_micros")
+
+    def __init__(self, input: Expr, width_micros: int, slide_micros: int) -> None:
+        self.input = input
+        self.width_micros = width_micros
+        self.slide_micros = slide_micros
+
+    def to_ir(self) -> dict[str, Any]:
+        return {
+            "e": ExprTag.WINDOW_BUCKETS,
+            "input": self.input.to_ir(),
+            "width_micros": self.width_micros,
+            "slide_micros": self.slide_micros,
+        }
 
 
 class ListFunc(Expr):
@@ -194,6 +306,24 @@ class ListContains(Expr):
         }
 
 
+class ListPosition(Expr):
+    """`list.position(value)` — the 1-based index of the first element equal to the
+    literal, 0 if absent (DuckDB `list_position`). → Int64."""
+
+    __slots__ = ("input", "value")
+
+    def __init__(self, input: Expr, value: int | float | bool | str) -> None:
+        self.input = input
+        self.value = value
+
+    def to_ir(self) -> dict[str, Any]:
+        return {
+            "e": ExprTag.LIST_POSITION,
+            "input": self.input.to_ir(),
+            "value": Lit(self.value).to_ir()["value"],
+        }
+
+
 class ListSlice(Expr):
     """`list.slice(offset, length)` — the 0-based sub-range of each row's list."""
 
@@ -227,3 +357,21 @@ class StructField(Expr):
 
     def to_ir(self) -> dict[str, Any]:
         return {"e": ExprTag.STRUCT_FIELD, "input": self.input.to_ir(), "field": self.field}
+
+
+class MapFunc(Expr):
+    """A Map-column accessor (``map_keys``/``map_values``/``element_at``) built via
+    the ``.map`` namespace. `element_at` carries a literal lookup ``key``."""
+
+    __slots__ = ("fn", "input", "key")
+
+    def __init__(self, fn: str, input: Expr, key: object | None = None) -> None:
+        self.fn = fn
+        self.input = input
+        self.key = key
+
+    def to_ir(self) -> dict[str, Any]:
+        ir: dict[str, Any] = {"e": ExprTag.MAP, "fn": self.fn, "input": self.input.to_ir()}
+        if self.key is not None:
+            ir["key"] = Lit(self.key).to_ir()["value"]
+        return ir

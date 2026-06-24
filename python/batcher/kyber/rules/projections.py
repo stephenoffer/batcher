@@ -18,10 +18,12 @@ projection) — consumed by the optimizer to build `PhysicalPlan.source_projecti
 
 from __future__ import annotations
 
+import dataclasses
+
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
-from batcher.plan.expr_ir import Col, Expr, referenced_columns
+from batcher.plan.expr_ir import AggExpr, Col, Expr, referenced_columns
 from batcher.plan.expr_rewrite import substitute_columns as _substitute_cols
 from batcher.plan.expr_rewrite import transform_expr_up
 from batcher.plan.logical import (
@@ -34,6 +36,7 @@ from batcher.plan.logical import (
     LogicalPlan,
     Project,
     Projection,
+    RowId,
     Sample,
     Scan,
     Sort,
@@ -46,11 +49,49 @@ from batcher.plan.logical import (
 __all__ = [
     "eliminate_identity_project",
     "merge_projections",
+    "projection_inlining_into_agg",
     "push_filter_through_project",
     "required_columns_per_source",
     "required_predicates_per_source",
     "rewrite_projection",
 ]
+
+
+@rule(name="projection_inlining_into_agg", phase=Phase.REWRITE, matches=(Aggregate,))
+def projection_inlining_into_agg(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`Aggregate(Project(x, renames))` → `Aggregate(x, …)` with the rename inlined.
+
+    A pure pass-through / rename projection feeding an aggregate is one operator of
+    pure overhead: the aggregate can read `x`'s columns directly. Every reference in
+    the group keys and aggregate inputs to a projection alias is substituted by its
+    defining column, and the projection is dropped. Restricted to projections whose
+    items are all bare columns (rename/passthrough), so inlining adds zero compute
+    (a computed projection might be referenced several times). Returns None otherwise.
+    """
+    proj = node.input
+    if not isinstance(proj, Project):
+        return None
+    mapping: dict[str, Expr] = {}
+    for item in proj.items:
+        if not isinstance(item.expr, Col):
+            return None  # a computed projection — leave it (avoid duplicating work)
+        mapping[item.alias] = item.expr
+
+    def subst(expr: Expr) -> Expr:
+        return _substitute_cols(expr, mapping)
+
+    # Build the new aggregate directly over `proj.input` (rewriting and re-parenting in
+    # one step — a piecewise rebuild would transiently reference columns of neither side).
+    new_keys = tuple(Projection(k.alias, subst(k.expr)) for k in node.group_keys)
+    new_aggs = []
+    for spec in node.aggregates:
+        if spec.agg.input is None:
+            new_aggs.append(spec)
+            continue
+        input2 = subst(spec.agg.input2) if spec.agg.input2 is not None else None
+        agg = AggExpr(spec.agg.func, subst(spec.agg.input), spec.agg.param, input2=input2)
+        new_aggs.append(dataclasses.replace(spec, agg=agg))
+    return Aggregate(proj.input, new_keys, tuple(new_aggs))
 
 
 def _col_ref_counts(exprs: list[Expr]) -> dict[str, int]:
@@ -175,11 +216,15 @@ def rewrite_projection(plan: LogicalPlan) -> LogicalPlan:
 
 
 def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
+    # Each branch returns `node` unchanged when recursion pruned nothing and rewrote no
+    # child (preserving identity → O(1) fixpoint). `kept`/`new_output` are subsequences
+    # of the originals, so an equal length means nothing was dropped (a value `==` would
+    # invoke `Expr.__eq__` and build a comparison — never compare projection items that way).
     if isinstance(node, Scan):
         return node
     if isinstance(node, Filter):
         child = _rewrite(node.input, need | referenced_columns(node.predicate))
-        return Filter(child, node.predicate)
+        return node if child is node.input else Filter(child, node.predicate)
     if isinstance(node, Project):
         # Drop output columns nothing downstream consumes (keep ≥1), then prune
         # the scan to only what the surviving expressions read.
@@ -189,7 +234,10 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
         child_need: set[str] = set()
         for item in kept:
             child_need |= referenced_columns(item.expr)
-        return Project(_rewrite(node.input, child_need), kept)
+        child = _rewrite(node.input, child_need)
+        if child is node.input and len(kept) == len(node.items):
+            return node
+        return Project(child, kept)
     if isinstance(node, Aggregate):
         child_need = set()
         for key in node.group_keys:
@@ -200,31 +248,47 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
             # arg_min/arg_max also reference an ordering key (the second input).
             if spec.agg.input2 is not None:
                 child_need |= referenced_columns(spec.agg.input2)
-        return Aggregate(_rewrite(node.input, child_need), node.group_keys, node.aggregates)
+        child = _rewrite(node.input, child_need)
+        if child is node.input:
+            return node
+        return Aggregate(child, node.group_keys, node.aggregates)
     if isinstance(node, Sort):
         child_need = set(need)
         for key in node.keys:
             child_need |= referenced_columns(key.expr)
-        return Sort(_rewrite(node.input, child_need), node.keys, node.limit)
+        child = _rewrite(node.input, child_need)
+        return node if child is node.input else Sort(child, node.keys, node.limit)
     if isinstance(node, Window):
         child_need = _window_child_need(node, need)
+        child = _rewrite(node.input, child_need)
+        if child is node.input:
+            return node
         return Window(
-            _rewrite(node.input, child_need),
+            child,
             node.partition_keys,
             node.order_keys,
             node.functions,
             node.rank_limit,
         )
+    if isinstance(node, RowId):
+        # The index `alias` is synthesized here (reads no input column); pass the
+        # remaining downstream needs through to the child.
+        child = _rewrite(node.input, need - {node.alias})
+        return node if child is node.input else RowId(child, node.alias, node.offset)
     if isinstance(node, Unnest):
         # The exploded `column` is always needed (it sets the row count); other
         # downstream needs pass through, with `alias` mapping back to `column`.
-        return Unnest(_rewrite(node.input, _unnest_child_need(node, need)), node.column, node.alias)
+        child = _rewrite(node.input, _unnest_child_need(node, need))
+        return node if child is node.input else Unnest(child, node.column, node.alias)
     if isinstance(node, Unpivot):
         # Unpivot's child must produce the index + melted `on` columns; the output's
         # variable/value columns are synthesized here, not read from the child.
         child_need = set(node.index) | set(node.on)
+        child = _rewrite(node.input, child_need)
+        if child is node.input:
+            return node
         return Unpivot(
-            _rewrite(node.input, child_need),
+            child,
             node.index,
             node.on,
             node.variable_name,
@@ -232,17 +296,20 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
         )
     if isinstance(node, Sample):
         # Sample preserves the schema; its child needs exactly what's needed above.
-        return Sample(_rewrite(node.input, set(need)), node.fraction, node.seed, node.n)
+        child = _rewrite(node.input, set(need))
+        return node if child is node.input else Sample(child, node.fraction, node.seed, node.n)
     if isinstance(node, Limit):
-        return Limit(_rewrite(node.input, set(need)), node.n, node.offset)
+        child = _rewrite(node.input, set(need))
+        return node if child is node.input else Limit(child, node.n, node.offset)
     if isinstance(node, Distinct):
         # Distinct uses every column, so its child needs them all.
-        return Distinct(_rewrite(node.input, set(node.input.available_columns())))
+        child = _rewrite(node.input, set(node.input.available_columns()))
+        return node if child is node.input else Distinct(child)
     if isinstance(node, Union):
-        return Union(
-            tuple(_rewrite(i, set(i.available_columns())) for i in node.inputs),
-            node.distinct,
-        )
+        inputs = tuple(_rewrite(i, set(i.available_columns())) for i in node.inputs)
+        if all(a is b for a, b in zip(inputs, node.inputs, strict=True)):
+            return node
+        return Union(inputs, node.distinct)
     if isinstance(node, Join):
         # Always retain the key output columns (named after the left keys) so the
         # join keeps ≥1 column and the keys stay available.
@@ -252,9 +319,13 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
         )
         left_need = set(node.left_keys) | {s.name for s in new_output if s.side == "left"}
         right_need = set(node.right_keys) | {s.name for s in new_output if s.side == "right"}
+        left = _rewrite(node.left, left_need)
+        right = _rewrite(node.right, right_need)
+        if left is node.left and right is node.right and len(new_output) == len(node.output):
+            return node
         return Join(
-            _rewrite(node.left, left_need),
-            _rewrite(node.right, right_need),
+            left,
+            right,
             node.left_keys,
             node.right_keys,
             node.join_type,
@@ -273,9 +344,13 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
             *node.right_by,
             *(s.name for s in node.output if s.side == "right"),
         }
+        left = _rewrite(node.left, left_need)
+        right = _rewrite(node.right, right_need)
+        if left is node.left and right is node.right:
+            return node
         return AsofJoin(
-            _rewrite(node.left, left_need),
-            _rewrite(node.right, right_need),
+            left,
+            right,
             node.left_on,
             node.right_on,
             node.left_by,
@@ -292,14 +367,9 @@ def required_columns_per_source(plan: LogicalPlan) -> dict[int, list[str]]:
     A scan with an empty requirement still reads one column so row counts are
     preserved (e.g. ``count(*)`` needs rows but no values).
     """
-    required: dict[int, set[str]] = {}
+    required: dict[int, list[str]] = {}
     _visit(plan, set(plan.available_columns()), required)
-
-    out: dict[int, list[str]] = {}
-    for source_id, cols in required.items():
-        # Preserve a stable, schema-ordered projection.
-        out[source_id] = sorted(cols)
-    return out
+    return required
 
 
 def required_predicates_per_source(plan: LogicalPlan) -> dict[int, dict]:
@@ -348,14 +418,18 @@ def _children(node: LogicalPlan) -> tuple[LogicalPlan, ...]:
     return (inp,) if inp is not None else ()
 
 
-def _visit(node: LogicalPlan, need: set[str], acc: dict[int, set[str]]) -> None:
+def _visit(node: LogicalPlan, need: set[str], acc: dict[int, list[str]]) -> None:
     if isinstance(node, Scan):
         available = node.schema.names
         keep = [c for c in available if c in need]
-        if not keep:
-            # Read one column to preserve cardinality (count(*), etc.).
+        if not keep and available:
+            # Read one column to preserve cardinality (count(*), etc.). A schemaless
+            # (0-column) scan — e.g. an empty in-memory source — keeps none.
             keep = [available[0]]
-        acc.setdefault(node.source_id, set()).update(keep)
+        # Accumulate in the scan's schema order (never alphabetical): the projection
+        # is applied to the source as-is, so its order is the output column order.
+        cols = acc.setdefault(node.source_id, [])
+        cols.extend(c for c in keep if c not in cols)
 
     elif isinstance(node, Filter):
         _visit(node.input, need | referenced_columns(node.predicate), acc)
@@ -417,6 +491,9 @@ def _visit(node: LogicalPlan, need: set[str], acc: dict[int, set[str]]) -> None:
                 (left_need if col.side == "left" else right_need).add(col.name)
         _visit(node.left, left_need, acc)
         _visit(node.right, right_need, acc)
+
+    elif isinstance(node, RowId):
+        _visit(node.input, need - {node.alias}, acc)
 
     elif isinstance(node, Unnest):
         _visit(node.input, _unnest_child_need(node, need), acc)

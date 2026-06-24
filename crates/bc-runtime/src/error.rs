@@ -22,6 +22,9 @@ pub enum RuntimeError {
     #[error("window function {func} requires order keys")]
     WindowRequiresOrder { func: String },
 
+    #[error("malformed spilled partial: expected {expected} columns, got {got}")]
+    MalformedPartial { expected: usize, got: usize },
+
     #[error("spill i/o error: {0}")]
     Io(#[from] std::io::Error),
 

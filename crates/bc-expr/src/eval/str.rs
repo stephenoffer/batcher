@@ -232,6 +232,34 @@ pub(crate) fn eval_str(
                 .collect::<Int64Array>(),
         ),
         StrFunc::Hex => Arc::new(map_str(s, hex_encode)),
+        StrFunc::Md5 => {
+            use md5::{Digest, Md5};
+            Arc::new(map_str(s, |v| {
+                hex_lower(Md5::digest(v.as_bytes()).as_slice())
+            }))
+        }
+        StrFunc::Sha1 => {
+            use sha1::{Digest, Sha1};
+            Arc::new(map_str(s, |v| {
+                hex_lower(Sha1::digest(v.as_bytes()).as_slice())
+            }))
+        }
+        StrFunc::Sha256 => {
+            use sha2::{Digest, Sha256};
+            Arc::new(map_str(s, |v| {
+                hex_lower(Sha256::digest(v.as_bytes()).as_slice())
+            }))
+        }
+        StrFunc::Crc32 => Arc::new(
+            s.iter()
+                .map(|o| o.map(|v| crc32fast::hash(v.as_bytes()) as i64))
+                .collect::<Int64Array>(),
+        ),
+        StrFunc::XxHash64 => Arc::new(
+            s.iter()
+                .map(|o| o.map(|v| xxhash64(v.as_bytes()) as i64))
+                .collect::<Int64Array>(),
+        ),
         StrFunc::Base64 => {
             use base64::Engine as _;
             Arc::new(map_str(s, |v| {
@@ -303,8 +331,150 @@ pub(crate) fn eval_str(
             }
             Arc::new(builder.finish())
         }
+        StrFunc::SubstringIndex => {
+            let delim = require_pattern(pattern, func)?;
+            let count = start.unwrap_or(0);
+            Arc::new(map_str(s, |v| substring_index(v, delim, count)))
+        }
+        StrFunc::Overlay => {
+            let rep = replacement.ok_or_else(|| ExprError::MissingArgument {
+                func: format!("{func:?}"),
+                arg: "replacement",
+            })?;
+            let pos = start.unwrap_or(1);
+            Arc::new(map_str(s, |v| overlay(v, rep, pos, length)))
+        }
+        StrFunc::RegexpExtractAll => {
+            use arrow::array::{ListBuilder, StringBuilder};
+            let re = compile_regex(pattern, func)?;
+            let mut builder = ListBuilder::new(StringBuilder::new());
+            for o in s.iter() {
+                match o {
+                    Some(v) => {
+                        for m in re.find_iter(v) {
+                            builder.values().append_value(m.as_str());
+                        }
+                        builder.append(true);
+                    }
+                    None => builder.append(false),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        StrFunc::RegexpCount => {
+            let re = compile_regex(pattern, func)?;
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| re.find_iter(v).count() as i64))
+                    .collect::<Int64Array>(),
+            )
+        }
+        StrFunc::Levenshtein => {
+            let target = require_pattern(pattern, func)?;
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| levenshtein(v, target) as i64))
+                    .collect::<Int64Array>(),
+            )
+        }
+        StrFunc::Soundex => Arc::new(map_str(s, soundex)),
     };
     Ok(out)
+}
+
+/// `substring_index(s, delim, count)` — the part of `s` before the `count`-th
+/// occurrence of `delim`. Positive `count` counts delimiters from the left,
+/// negative from the right; `0` yields the empty string (Spark semantics).
+fn substring_index(s: &str, delim: &str, count: i64) -> String {
+    if count == 0 || delim.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<&str> = s.split(delim).collect();
+    let n = parts.len() as i64;
+    if count > 0 {
+        let take = count.min(n) as usize;
+        parts[..take].join(delim)
+    } else {
+        let take = (-count).min(n) as usize;
+        parts[parts.len() - take..].join(delim)
+    }
+}
+
+/// SQL `OVERLAY` — replace `length` chars of `s` starting at 1-based `pos` with
+/// `rep`. When `length` is absent it defaults to the replacement's char length.
+/// `pos` and `length` are measured in Unicode scalar values.
+fn overlay(s: &str, rep: &str, pos: i64, length: Option<i64>) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    let start = (pos - 1).clamp(0, n) as usize;
+    let len = length.unwrap_or(rep.chars().count() as i64).max(0);
+    let end = ((start as i64) + len).clamp(0, n) as usize;
+    let mut out: String = chars[..start].iter().collect();
+    out.push_str(rep);
+    out.extend(chars[end..].iter());
+    out
+}
+
+/// Levenshtein edit distance between `a` and `b` (insert/delete/substitute = 1),
+/// over Unicode scalar values. Classic two-row dynamic-programming kernel.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// American Soundex — a 4-character phonetic key (first letter + 3 consonant
+/// digits), matching DuckDB's `soundex`. Non-alphabetic input yields "0000".
+fn soundex(v: &str) -> String {
+    fn code(c: char) -> Option<u8> {
+        match c.to_ascii_uppercase() {
+            'B' | 'F' | 'P' | 'V' => Some(b'1'),
+            'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => Some(b'2'),
+            'D' | 'T' => Some(b'3'),
+            'L' => Some(b'4'),
+            'M' | 'N' => Some(b'5'),
+            'R' => Some(b'6'),
+            _ => None,
+        }
+    }
+    let first = match v.chars().find(|c| c.is_ascii_alphabetic()) {
+        Some(c) => c.to_ascii_uppercase(),
+        None => return "0000".to_string(),
+    };
+    let mut out = vec![first as u8];
+    let mut last = code(first);
+    for c in v.chars().skip_while(|c| !c.is_ascii_alphabetic()).skip(1) {
+        if !c.is_ascii_alphabetic() {
+            continue;
+        }
+        let d = code(c);
+        // 'H'/'W' are transparent (don't reset the previous code); vowels reset it.
+        if matches!(c.to_ascii_uppercase(), 'H' | 'W') {
+            continue;
+        }
+        if let Some(dig) = d {
+            if Some(dig) != last {
+                out.push(dig);
+                if out.len() == 4 {
+                    break;
+                }
+            }
+        }
+        last = d;
+    }
+    while out.len() < 4 {
+        out.push(b'0');
+    }
+    String::from_utf8(out).unwrap()
 }
 
 /// Capitalize the first alphanumeric of each word, lowercasing the rest. A word
@@ -343,6 +513,17 @@ fn hex_encode(v: &str) -> String {
                 .unwrap_or('0')
                 .to_ascii_uppercase(),
         );
+    }
+    out
+}
+
+/// Lowercase hex of arbitrary bytes — the digest encoding DuckDB's `md5`/`sha1`/
+/// `sha256` emit (distinct from `hex_encode`, which uppercases UTF-8 text bytes).
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+        out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap_or('0'));
     }
     out
 }
@@ -454,6 +635,15 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// 64-bit xxHash of `bytes` with seed 0 — fast, deterministic, and stable across
+/// machines (the standard bucketing/sharding hash). Uses the portable `Hasher` API.
+fn xxhash64(bytes: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = twox_hash::XxHash64::with_seed(0);
+    h.write(bytes);
+    h.finish()
+}
+
 /// Navigate `text` (parsed as JSON) down the `$.a.b` path `keys`, returning the
 /// `Value` at that location (or `None` if the text isn't valid JSON or the path is
 /// absent). Shared by the typed `json_extract_*` extractors.
@@ -525,7 +715,33 @@ fn require_pattern(pattern: Option<&str>, func: StrFunc) -> Result<&str, ExprErr
 
 #[cfg(test)]
 mod tests {
-    use super::fnv1a64;
+    use super::{fnv1a64, hex_lower, xxhash64};
+
+    #[test]
+    fn crypto_hash_known_vectors() {
+        use md5::{Digest, Md5};
+        use sha2::Sha256;
+        // Published digests for "abc".
+        assert_eq!(
+            hex_lower(Md5::digest(b"abc").as_slice()),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+        assert_eq!(
+            hex_lower(Sha256::digest(b"abc").as_slice()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // crc32(IEEE) "abc" = 0x352441C2; empty = 0.
+        assert_eq!(crc32fast::hash(b"abc"), 0x3524_41c2);
+        assert_eq!(crc32fast::hash(b""), 0);
+    }
+
+    #[test]
+    fn xxhash64_known_vector_and_determinism() {
+        // xxHash64(seed 0) of the empty input is the canonical 0xEF46DB3751D8E999.
+        assert_eq!(xxhash64(b""), 0xEF46_DB37_51D8_E999);
+        assert_eq!(xxhash64(b"customer-42"), xxhash64(b"customer-42"));
+        assert_ne!(xxhash64(b"a"), xxhash64(b"b"));
+    }
 
     #[test]
     fn fnv1a64_known_vectors() {

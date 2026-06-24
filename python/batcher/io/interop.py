@@ -33,10 +33,13 @@ __all__ = [
     "from_arrow",
     "from_dask",
     "from_huggingface",
+    "from_items",
     "from_numpy",
     "from_pandas",
     "from_polars",
     "from_pydict",
+    "from_pylist",
+    "from_ray_dataset",
     "from_spark",
     "from_tf",
     "from_torch",
@@ -78,6 +81,28 @@ def from_arrow(table_or_batches: pa.Table | pa.RecordBatch | list[pa.RecordBatch
 def from_pydict(data: dict[str, Any]) -> Source:
     """Build a `Source` from a column-oriented ``{name: values}`` dict."""
     return _source_from_table(pa.table(data))
+
+
+def from_pylist(rows: list[dict[str, Any]]) -> Source:
+    """Build a `Source` from a row-oriented list of ``{column: value}`` dicts.
+
+    The row-major counterpart to `from_pydict` — the natural shape for JSON records or
+    API responses. Missing keys become nulls; the union of keys is the schema.
+    """
+    return _source_from_table(pa.Table.from_pylist(rows))
+
+
+def from_items(items: list[Any], *, column: str = "item") -> Source:
+    """Build a `Source` from a list of items, one row per item (the Ray Data shape).
+
+    Dict items expand to columns (like `from_pylist`); scalar/other items become a
+    single `column`. ``from_items([1, 2, 3])`` → one ``item`` column;
+    ``from_items([{"a": 1}, {"a": 2}])`` → an ``a`` column.
+    """
+    rows = list(items)
+    if rows and all(isinstance(r, dict) for r in rows):
+        return _source_from_table(pa.Table.from_pylist(rows))
+    return _source_from_table(pa.table({column: rows}))
 
 
 def from_numpy(ndarray: Any, *, column: str = "data") -> Source:
@@ -215,6 +240,32 @@ def from_dask(ddf: Any) -> Source:
         for part in ddf.to_delayed():
             table = pa.Table.from_pandas(part.compute(), schema=schema)
             yield from table.to_batches()
+
+    return IteratorSource(_factory, schema)
+
+
+def from_ray_dataset(ray_dataset: Any) -> Source:
+    """Build a streaming `Source` from a Ray Dataset, one Arrow block per batch.
+
+    Ray is the migration on-ramp here: the dataset's Arrow blocks are iterated lazily
+    into the engine (bounded memory), not collected to the driver. Ray stays a
+    scheduling/transfer detail — bulk data does not round-trip the Ray object store.
+    """
+    try:
+        import ray  # noqa: F401
+    except ImportError as exc:
+        raise _missing("ray", "ray") from exc
+
+    schema: pa.Schema | None = None
+    for block in ray_dataset.iter_batches(batch_format="pyarrow"):
+        schema = block.schema
+        break
+    if schema is None:  # empty dataset — fall back to Ray's reported schema
+        schema = ray_dataset.schema().base_schema
+
+    def _factory() -> Iterator[pa.RecordBatch]:
+        for block in ray_dataset.iter_batches(batch_format="pyarrow"):
+            yield from block.to_batches()
 
     return IteratorSource(_factory, schema)
 

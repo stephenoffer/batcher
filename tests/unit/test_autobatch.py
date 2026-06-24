@@ -73,10 +73,10 @@ def test_large_model_gets_whole_gpu():
     assert recommend_gpu_fraction(14.0, 24.0) == 1.0
 
 
-def test_cuda_overhead_reduces_density():
-    many = max_actors_per_gpu(0.1, 24.0, cuda_overhead_gb=0.0)
-    fewer = max_actors_per_gpu(0.1, 24.0, cuda_overhead_gb=2.0)
-    assert fewer < many  # per-process CUDA context cuts how many fit
+def test_context_overhead_reduces_density():
+    many = max_actors_per_gpu(0.1, 24.0, context_overhead_gb=0.0)
+    fewer = max_actors_per_gpu(0.1, 24.0, context_overhead_gb=2.0)
+    assert fewer < many  # per-process device context cuts how many fit
 
 
 def test_packing_always_at_least_one_and_bounded():

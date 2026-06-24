@@ -50,5 +50,5 @@ class GroupBy:
             Projection(alias, expr) for alias, expr in self._named.items()
         )
         specs = tuple(AggregateSpec(alias, agg) for alias, agg in named.items())
-        plan = Aggregate(self._source._plan, group_keys, specs)
+        plan = Aggregate(self._source._plan, group_keys, specs, watermark=self._source._watermark)
         return self._source._derive(plan)

@@ -15,6 +15,7 @@ window-functions
 expressions
 sql
 writing-data
+streaming
 cloud-storage
 best-practices
 troubleshooting

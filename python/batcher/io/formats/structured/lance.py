@@ -25,7 +25,13 @@ from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.manifest import WrittenFile
 from batcher.io.splits import Split
 
-__all__ = ["LanceFragmentSplit", "LanceSink", "LanceSource"]
+__all__ = [
+    "LanceFragmentSplit",
+    "LanceSink",
+    "LanceSource",
+    "lance_create_vector_index",
+    "lance_vector_search",
+]
 
 
 def _require_lance() -> Any:
@@ -35,6 +41,57 @@ def _require_lance() -> Any:
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
         raise BackendError("Lance requires pylance: pip install 'batcher-engine[lance]'") from exc
     return lance
+
+
+def lance_vector_search(
+    uri: str,
+    query: Any,
+    *,
+    column: str = "embedding",
+    k: int = 10,
+    columns: list[str] | None = None,
+    filter: str | None = None,
+    nprobes: int | None = None,
+    refine_factor: int | None = None,
+) -> pa.Table:
+    """Approximate-nearest-neighbor search over a Lance vector column.
+
+    Returns the `k` rows nearest to `query` (a 1-D vector), with a ``_distance``
+    column, using the column's ANN index when one exists (else a brute-force scan).
+    `filter` is a SQL predicate applied alongside the search (pre/post-filtering is
+    Lance's choice); `nprobes`/`refine_factor` trade recall for latency.
+    """
+    import numpy as np
+
+    lance = _require_lance()
+    nearest: dict[str, Any] = {"column": column, "q": np.asarray(query, dtype=np.float32), "k": k}
+    if nprobes is not None:
+        nearest["nprobes"] = nprobes
+    if refine_factor is not None:
+        nearest["refine_factor"] = refine_factor
+    dataset = lance.LanceDataset(uri)
+    return dataset.to_table(columns=columns, nearest=nearest, filter=filter)
+
+
+def lance_create_vector_index(
+    uri: str,
+    column: str,
+    *,
+    index_type: str = "IVF_PQ",
+    metric: str = "L2",
+    replace: bool = True,
+    **index_kwargs: Any,
+) -> None:
+    """Build an ANN index on a Lance vector `column` (IVF_PQ by default).
+
+    `index_kwargs` (e.g. ``num_partitions``, ``num_sub_vectors``) pass through to
+    Lance's ``create_index``; pass them to tune the index to the dataset size.
+    """
+    lance = _require_lance()
+    dataset = lance.LanceDataset(uri)
+    dataset.create_index(
+        column, index_type=index_type, metric=metric, replace=replace, **index_kwargs
+    )
 
 
 # Per-process cache: uri -> (dataset, {fragment_id: fragment}). A worker opens a

@@ -107,7 +107,7 @@ def test_construction_validation() -> None:
 
 
 def test_require_module_missing_raises_actionable() -> None:
-    with pytest.raises(BackendError, match=r"batcher\[sql\]"):
+    with pytest.raises(BackendError, match=r"\[sql\]"):
         require_module("definitely_not_a_real_module_xyz", extra="sql")
 
 
@@ -137,7 +137,7 @@ def test_missing_backend_raises_for_each_connector(make_source, extra, monkeypat
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _block)
-    with pytest.raises(BackendError, match=rf"batcher\[{extra}\]"):
+    with pytest.raises(BackendError, match=rf"\[{extra}\]"):
         make_source()
 
 

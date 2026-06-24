@@ -60,6 +60,31 @@ def test_mode_grouped_matches_duckdb(duck):
     assert_same(out, duck.sql("SELECT g, mode(v) m FROM t GROUP BY g"))
 
 
+def test_mode_grouped_spilled_matches_duckdb(duck):
+    # The bounded out-of-core mode (forced via a tight memory cap) must match the
+    # in-memory result. A hot key with many repeats has a clear unique mode (no
+    # frequency tie), so the result is unambiguous vs DuckDB even under spill.
+    import numpy as np
+    import pyarrow.compute as pc
+
+    from batcher.config import Config, MemoryConfig, config_context
+    from conftest import assert_same
+
+    rng = np.random.default_rng(11)
+    n = 20000
+    k = np.concatenate([np.zeros(15000, "int64"), rng.integers(1, 50, n - 15000).astype("int64")])
+    # Value 7 dominates the hot key 0 (60% of its rows); cold keys get random values.
+    v = np.where((k == 0) & (rng.random(n) < 0.6), 7, rng.integers(100, 100000, n)).astype("int64")
+    tbl = pa.table({"k": k, "v": v})
+    duck.register("m", tbl)
+    cap = Config().replace(memory=MemoryConfig(max_memory_bytes=1 << 14))
+    with config_context(cap):
+        out = bt.from_arrow(tbl).group_by("k").agg(mo=col("v").mode()).collect()
+    # Compare only the hot key (its mode is unambiguous); cold keys may tie.
+    out_hot = out.filter(pc.equal(out["k"], 0))
+    assert_same(out_hot, duck.sql("SELECT k, mode(v) mo FROM m WHERE k = 0 GROUP BY k"))
+
+
 def test_arg_min_max_grouped_matches_duckdb(duck):
     from conftest import assert_same
 

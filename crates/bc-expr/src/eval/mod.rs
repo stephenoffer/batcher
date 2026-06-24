@@ -6,8 +6,14 @@
 //! unchanged — each function moved here verbatim.
 
 pub(crate) mod binary;
+pub(crate) mod cast;
 pub(crate) mod date;
-pub(crate) mod image;
+mod dispatch;
+pub(crate) mod generate;
 pub(crate) mod list;
+pub(crate) mod list_ops;
+pub(crate) mod map;
 pub(crate) mod math;
+pub(crate) mod media;
 pub(crate) mod str;
+pub(crate) mod timezone;

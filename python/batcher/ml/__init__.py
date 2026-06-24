@@ -8,7 +8,7 @@ whole Arrow batches.
 from __future__ import annotations
 
 from batcher.ml.converters import to_numpy_batches, to_tf_dataset, to_torch_iterable
-from batcher.ml.embed import EncoderFactory, embed
+from batcher.ml.embed import EncoderFactory, build_vector_index, embed, vector_search
 from batcher.ml.inference import InferencePool, Worker, WorkerFactory
 from batcher.ml.llm import Engine, EngineFactory, http_engine, llm_generate, vllm_engine
 from batcher.ml.loader import (
@@ -37,6 +37,7 @@ __all__ = [
     "Stage",
     "Worker",
     "WorkerFactory",
+    "build_vector_index",
     "elastic_shard",
     "embed",
     "epoch_order",
@@ -57,5 +58,6 @@ __all__ = [
     "torchserve_client",
     "triton_client",
     "usable_length",
+    "vector_search",
     "vllm_engine",
 ]

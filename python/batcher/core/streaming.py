@@ -13,6 +13,7 @@ it makes no optimization decisions.
 
 from __future__ import annotations
 
+import datetime
 import json
 from collections.abc import Iterator
 
@@ -22,6 +23,77 @@ from batcher.config import active_config
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import Aggregate, Distinct, Limit, Projection, Sort
+
+
+def _rebatch(result: pa.RecordBatch, batch_size: int | None) -> Iterator[pa.RecordBatch]:
+    """Yield `result` whole, or sliced into `batch_size`-row chunks."""
+    if batch_size is None:
+        yield result
+    else:
+        for off in range(0, result.num_rows, batch_size):
+            yield result.slice(off, batch_size)
+
+
+class _AggFold:
+    """Running partial-aggregate state folded across micro-batches.
+
+    Each pushed source batch is run through the breaker-free input pipeline, then
+    `partial`-aggregated and `combine`d into one running state (bounded by the group
+    count, not the input size) entirely in Rust. `finalize()` materializes the
+    current result. This is the shared kernel under both the one-shot streaming
+    aggregate driver and the long-running streaming-query engine's complete/update
+    output modes — the running state is the same Arrow `RecordBatch` the engine
+    snapshots for checkpoint recovery.
+    """
+
+    __slots__ = ("_aggregates_json", "_group_keys_json", "_input_ir", "_nat", "_running")
+
+    def __init__(self, agg: Aggregate) -> None:
+        import batcher._native as nat
+
+        self._nat = nat
+        self._group_keys_json = json.dumps(
+            [{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys]
+        )
+        self._aggregates_json = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+        self._input_ir = json.dumps(agg.input.to_ir())  # scans source 0
+        self._running: pa.RecordBatch | None = None
+
+    def push(self, batch: pa.RecordBatch) -> int:
+        """Fold one source batch into the running state; return rows consumed."""
+        if batch.num_rows == 0:
+            return 0
+        rows = self._nat.execute_plan(
+            self._input_ir, [[batch]], active_config().engine_config_json()
+        )
+        if not rows or sum(b.num_rows for b in rows) == 0:
+            return 0
+        partial = self._nat.partial_aggregate(self._group_keys_json, self._aggregates_json, rows)
+        self._running = (
+            partial
+            if self._running is None
+            else self._nat.combine(
+                self._group_keys_json, self._aggregates_json, [self._running, partial]
+            )
+        )
+        return batch.num_rows
+
+    def finalize(self) -> pa.RecordBatch | None:
+        """Materialize the current aggregate result, or None if no groups yet."""
+        if self._running is None:
+            return None
+        result = self._nat.combine_finalize(
+            self._group_keys_json, self._aggregates_json, [self._running]
+        )
+        return result if result.num_rows else None
+
+    def state(self) -> pa.RecordBatch | None:
+        """The running partial state, for a checkpoint snapshot (None if empty)."""
+        return self._running
+
+    def restore(self, state: pa.RecordBatch) -> None:
+        """Seed the running partial state from a checkpoint snapshot."""
+        self._running = state
 
 
 def stream_aggregate(
@@ -34,38 +106,166 @@ def stream_aggregate(
     and combined into the running state. Yields the finalized result once the source
     is exhausted (one logical result, optionally rebatched by `batch_size`).
     """
-    import batcher._native as nat
-
-    group_keys_json = json.dumps(
-        [{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys]
-    )
-    aggregates_json = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
-    input_ir = json.dumps(agg.input.to_ir())  # scans source 0
-
-    running: pa.RecordBatch | None = None
+    fold = _AggFold(agg)
     for batch in source.iter_batches(None):
-        if batch.num_rows == 0:
-            continue
-        rows = nat.execute_plan(input_ir, [[batch]], active_config().engine_config_json())
-        if not rows or sum(b.num_rows for b in rows) == 0:
-            continue
-        partial = nat.partial_aggregate(group_keys_json, aggregates_json, rows)
-        running = (
-            partial
-            if running is None
-            else nat.combine(group_keys_json, aggregates_json, [running, partial])
-        )
+        fold.push(batch)
+    result = fold.finalize()
+    if result is not None:
+        yield from _rebatch(result, batch_size)
 
-    if running is None:
-        return  # empty source → no groups → no rows
-    result = nat.combine_finalize(group_keys_json, aggregates_json, [running])
-    if result.num_rows == 0:
+
+_EPOCH = datetime.datetime(1970, 1, 1)
+
+
+def _td(micros: int) -> datetime.timedelta:
+    """A timedelta of `micros` microseconds (added to `_EPOCH` to build a literal)."""
+    return datetime.timedelta(microseconds=micros)
+
+
+def _window_key(agg: Aggregate) -> tuple[str, int] | None:
+    """The (alias, width_micros) of the `window_start` group key, or None."""
+    from batcher.plan.expr_ir.func_nodes import WindowStart
+
+    for key in agg.group_keys:
+        if isinstance(key.expr, WindowStart):
+            return key.alias, key.expr.width_micros
+    return None
+
+
+def _scan_filter_ir(predicate) -> str:
+    """A `filter(scan source 0, predicate)` plan as JSON IR."""
+    return json.dumps(
+        {"op": "filter", "input": {"op": "scan", "source_id": 0}, "predicate": predicate.to_ir()}
+    )
+
+
+class _WindowedAggFold:
+    """Watermark-bounded windowed aggregation: fold, evict closed windows, emit.
+
+    Holds one running partial state keyed by `window_start` plus a scalar watermark
+    (`max event time minus lateness`). Per micro-batch it drops late rows, advances the
+    watermark, folds the survivors, then **evicts** every window whose end is at or
+    below the watermark — emitting those finalized rows and dropping them from state,
+    so memory is bounded by the number of *open* windows (the Flink/Spark bound). All
+    row-touching work (late filter, eviction split, max event time) runs in Rust /
+    Arrow kernels; this only advances a scalar and orchestrates.
+    """
+
+    __slots__ = (
+        "_ag",
+        "_gk",
+        "_input_ir",
+        "_lateness",
+        "_nat",
+        "_running",
+        "_time_col",
+        "_w_alias",
+        "_width",
+        "_wm",
+    )
+
+    def __init__(self, agg: Aggregate, w_alias: str, width: int) -> None:
+        import batcher._native as nat
+
+        self._nat = nat
+        self._gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys])
+        self._ag = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+        self._input_ir = json.dumps(agg.input.to_ir())
+        self._w_alias = w_alias
+        self._width = width
+        self._time_col = agg.watermark.time_col
+        self._lateness = agg.watermark.lateness_micros
+        self._running: pa.RecordBatch | None = None
+        self._wm: int | None = None
+
+    def _advance_watermark(self, batch: pa.RecordBatch) -> None:
+        import pyarrow.compute as pc
+
+        col = batch.column(self._time_col)
+        hi = pc.max(col)
+        if not hi.is_valid:
+            return
+        micros = pc.cast(hi, pa.int64()).as_py()
+        candidate = micros - self._lateness
+        self._wm = candidate if self._wm is None else max(self._wm, candidate)
+
+    def push(self, batch: pa.RecordBatch) -> list[pa.RecordBatch]:
+        from batcher.plan.expr_ir import col, lit
+
+        if batch.num_rows == 0:
+            return []
+        cfg = active_config().engine_config_json()
+        # Drop rows below the current watermark (late records) in Rust.
+        if self._wm is not None:
+            kept = self._nat.execute_plan(
+                _scan_filter_ir(col(self._time_col) >= lit(_EPOCH + _td(self._wm))), [[batch]], cfg
+            )
+        else:
+            kept = [batch]
+        self._advance_watermark(batch)
+        for b in kept:
+            if b.num_rows == 0:
+                continue
+            rows = self._nat.execute_plan(self._input_ir, [[b]], cfg)
+            if rows and sum(r.num_rows for r in rows):
+                partial = self._nat.partial_aggregate(self._gk, self._ag, rows)
+                self._running = (
+                    partial
+                    if self._running is None
+                    else self._nat.combine(self._gk, self._ag, [self._running, partial])
+                )
+        return self._evict(cfg)
+
+    def _evict(self, cfg: str) -> list[pa.RecordBatch]:
+        from batcher.plan.expr_ir import col, lit
+
+        if self._running is None or self._wm is None:
+            return []
+        thr = _EPOCH + _td(self._wm - self._width)  # window_start ≤ thr ⟺ window closed
+        wk = col(self._w_alias)
+        closed = [
+            b
+            for b in self._nat.execute_plan(_scan_filter_ir(wk <= lit(thr)), [[self._running]], cfg)
+            if b.num_rows
+        ]
+        open_ = [
+            b
+            for b in self._nat.execute_plan(
+                _scan_filter_ir(wk.is_null() | (wk > lit(thr))), [[self._running]], cfg
+            )
+            if b.num_rows
+        ]
+        self._running = self._nat.combine(self._gk, self._ag, open_) if open_ else None
+        if not closed:
+            return []
+        result = self._nat.combine_finalize(self._gk, self._ag, closed)
+        return [result] if result.num_rows else []
+
+    def flush(self) -> pa.RecordBatch | None:
+        """Finalize and emit every remaining (open) window — the end-of-stream flush."""
+        if self._running is None:
+            return None
+        result = self._nat.combine_finalize(self._gk, self._ag, [self._running])
+        self._running = None
+        return result if result.num_rows else None
+
+
+def stream_windowed_aggregate(
+    agg: Aggregate, source: Source, batch_size: int | None = None
+) -> Iterator[pa.RecordBatch]:
+    """Windowed aggregation over a stream, emitting each window as the watermark
+    closes it and flushing the rest at end-of-stream (bounded state)."""
+    key = _window_key(agg)
+    if key is None or agg.watermark is None:  # not a watermarked windowed agg
+        yield from stream_aggregate(agg, source, batch_size)
         return
-    if batch_size is None:
-        yield result
-    else:
-        for off in range(0, result.num_rows, batch_size):
-            yield result.slice(off, batch_size)
+    fold = _WindowedAggFold(agg, key[0], key[1])
+    for batch in source.iter_batches(None):
+        for result in fold.push(batch):
+            yield from _rebatch(result, batch_size)
+    final = fold.flush()
+    if final is not None:
+        yield from _rebatch(final, batch_size)
 
 
 def stream_distinct(

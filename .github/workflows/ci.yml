@@ -1,0 +1,71 @@
+name: CI
+
+# Runs the project quality gate (the `just test` sequence plus the lint gates) on
+# every push and pull request. Mirrors the local gate documented in CLAUDE.md:
+# `just check` → `just test-rust` → `just build` → `just test-py`, with the ruff,
+# layer-independence, and structure linters. Heavy optional backends
+# (ray/torch/tensorflow/gpu) are not installed, so tests that require them skip via
+# `importorskip`; the deterministic core suite (unit/differential/property/io/docs)
+# is what gates here, the same subset as `just cov-gate`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Install engine + dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+
+      - name: Rust check + clippy
+        run: |
+          just check
+          cargo clippy --workspace --exclude bc-py -- -D warnings
+
+      - name: Rust tests
+        run: just test-rust
+
+      - name: Python lint (ruff)
+        run: just lint-py
+
+      - name: Layer independence
+        run: just lint-layers
+
+      - name: Structure limits
+        run: just lint-structure
+
+      - name: Build engine into the environment
+        run: just build
+
+      - name: Python tests + coverage gate
+        run: just cov-gate

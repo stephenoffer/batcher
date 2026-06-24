@@ -122,9 +122,11 @@ table = ds.to_arrow()                                 # Batcher -> pyarrow.Table
 | Source | In | Out |
 |--------|----|----|
 | Arrow | `bt.from_arrow(t)` | `ds.to_arrow()` |
+| Python dict / rows | `bt.from_pydict(d)` / `bt.from_pylist(rows)` | `ds.to_pydict()` / `ds.to_pylist()` |
 | pandas | `bt.from_pandas(df)` | `ds.to_pandas()` |
 | Polars | `bt.from_polars(df)` | `ds.to_polars()` |
 | NumPy | `bt.from_numpy(arr)` | — |
+| Ray Data | `bt.from_ray_dataset(ds)` | — |
 | Spark | `bt.from_spark(df)` | — |
 | Dask | `bt.from_dask(ddf)` | — |
 | HuggingFace | `bt.from_huggingface(ds)` | — |

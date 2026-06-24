@@ -29,6 +29,11 @@ dependencies = [
     # Carbonite reads live memory pressure (available RAM) to size its envelope and
     # decide when to spill. Optional at runtime — it degrades to os.sysconf totals.
     "psutil>=5.9",
+    # The SQL frontend (`bt.sql`, `Session`, `Dataset.sql`) parses queries with
+    # sqlglot. It is the engine's own parser, not an optional oracle backend, so it
+    # is a core dependency — a documented headline feature must not fail on a clean
+    # install. Pure-Python and dependency-light.
+    "sqlglot>=23",
 ]
 
 [project.urls]
@@ -49,6 +54,8 @@ cloud = ["fsspec", "s3fs", "gcsfs"]
 # ML / GPU data plane.
 torch = ["torch>=2.2"]
 tensorflow = ["tensorflow>=2.15"]
+# Text embeddings via sentence-transformers (ds.ml.embed_text).
+st = ["sentence-transformers>=2.2"]
 # LLM batch inference operator (ds.ml.llm / batcher.ml.vllm_engine); needs a GPU.
 vllm = ["vllm>=0.6"]
 # Model-serving batch adapters (batcher.ml.serving.triton_client).
@@ -128,6 +135,8 @@ docs = [
     "myst-parser>=2",
     "furo>=2024.0.0",
     "sphinx-autodoc-typehints>=2",
+    "sphinx-design>=0.6",
+    "sphinx-copybutton>=0.5",
 ]
 all = [
     "batcher-engine[ray,polars,duckdb,redis,cloud,torch,tensorflow]",

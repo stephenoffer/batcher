@@ -197,5 +197,5 @@ def test_kafka_deferred_dependency_raises_backend_error():
     try:
         import confluent_kafka  # noqa: F401
     except ImportError:
-        with pytest.raises(BackendError, match="batcher\\[kafka\\]"):
+        with pytest.raises(BackendError, match="\\[kafka\\]"):
             src._client()

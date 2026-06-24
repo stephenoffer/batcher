@@ -13,6 +13,7 @@ from batcher.plan.expr_ir import AggExpr, Expr
 from batcher.plan.ir_tags import Op
 from batcher.plan.logical.base import LogicalPlan, _validate_refs
 from batcher.plan.logical.relational import Projection
+from batcher.plan.streaming import Watermark
 
 __all__ = ["Aggregate", "AggregateSpec", "Sort", "SortKeySpec"]
 
@@ -32,6 +33,9 @@ class Aggregate(LogicalPlan):
     input: LogicalPlan
     group_keys: tuple[Projection, ...]
     aggregates: tuple[AggregateSpec, ...]
+    # Driver-only event-time watermark (set via `Dataset.with_watermark` ahead of the
+    # group-by); bounds streaming windowed-aggregation state. Never serialized to IR.
+    watermark: Watermark | None = None
 
     def __post_init__(self) -> None:
         available = set(self.input.available_columns())

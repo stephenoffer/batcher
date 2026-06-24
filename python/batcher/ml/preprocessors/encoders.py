@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
     from batcher.api.dataset import Dataset
 
-__all__ = ["LabelEncoder", "OneHotEncoder", "OrdinalEncoder"]
+__all__ = ["LabelEncoder", "MultiHotEncoder", "OneHotEncoder", "OrdinalEncoder"]
 
 
 def _ordinal_expr(column: str, categories: list[Any], unknown_value: int) -> Expr:
@@ -123,3 +123,41 @@ class OneHotEncoder(Preprocessor):
             for cat in cats:
                 indicators[f"{c}_{cat}"] = when(col(c) == cat).then(1).otherwise(0)
         return ds.select(*keep, **indicators)
+
+
+class MultiHotEncoder(Preprocessor):
+    """Multi-hot encode a **list** column into one 0/1 indicator column per category
+    (the multi-label counterpart of `OneHotEncoder`).
+
+    `fit` learns the distinct elements across all the column's lists (explode +
+    distinct); `transform` emits ``{column}_{category}`` columns, each 1 where that
+    category appears in the row's list (via ``.list.contains``), 0 otherwise. Useful
+    for tag/label sets. Pass `categories` to fix the vocabulary and skip `fit`.
+
+    Args:
+        column: the list column to encode (kept alongside the indicators).
+        categories: an explicit category vocabulary; learned from the data if None.
+    """
+
+    __slots__ = ("categories_", "column")
+
+    def __init__(self, column: str, *, categories: Sequence[Any] | None = None) -> None:
+        self.column = column
+        self.categories_: list[Any] | None = list(categories) if categories is not None else None
+        self._fitted = categories is not None
+
+    def fit(self, ds: Dataset) -> MultiHotEncoder:
+        if self.categories_ is None:
+            exploded = ds.select(self.column).explode(self.column)
+            self.categories_ = distinct_values(exploded, self.column)
+        self._fitted = True
+        return self
+
+    def transform(self, ds: Dataset) -> Dataset:
+        self._require_fitted()
+        assert self.categories_ is not None
+        indicators = {
+            f"{self.column}_{cat}": col(self.column).list.contains(cat).cast("int64")
+            for cat in self.categories_
+        }
+        return ds.with_columns(**indicators)

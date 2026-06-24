@@ -41,6 +41,42 @@ def _render(template: str | None, column: str, batch: pa.RecordBatch) -> list[st
     return [template.format(**row) for row in rows]
 
 
+def _build_requests(
+    template: str | None, prompt_column: str, image_column: str | None, batch: pa.RecordBatch
+) -> list:
+    """Per-row engine requests: plain prompt strings, or ``{prompt, image}`` dicts when
+    an `image_column` is given (the vision-language path)."""
+    prompts = _render(template, prompt_column, batch)
+    if image_column is None:
+        return prompts
+    images = _decode_image_inputs(batch.column(image_column))
+    return [{"prompt": p, "image": img} for p, img in zip(prompts, images, strict=True)]
+
+
+def _decode_image_inputs(column: pa.Array) -> list:
+    """A list of PIL images for a column of raw image bytes or decoded pixel tensors.
+
+    Bytes → ``PIL.Image.open``; a fixed-shape-tensor ``(H, W, 3)`` → ``Image.fromarray``.
+    Null rows yield ``None`` (the model sees a text-only request for that row)."""
+    import io as _io
+
+    from batcher.io.formats.ml.tensor import is_tensor_column
+
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - optional extra
+        from batcher._internal.errors import BackendError
+
+        msg = "vision LLM input needs Pillow: pip install 'batcher-engine[image]'"
+        raise BackendError(msg) from exc
+
+    if is_tensor_column(column):
+        if hasattr(column, "combine_chunks"):
+            column = column.combine_chunks()
+        return [Image.fromarray(row) for row in column.to_numpy_ndarray()]
+    return [None if b is None else Image.open(_io.BytesIO(b)) for b in column.to_pylist()]
+
+
 def llm_generate(
     batches: Iterable[pa.RecordBatch],
     engine_factory: EngineFactory,
@@ -48,6 +84,7 @@ def llm_generate(
     prompt_column: str,
     output_column: str = "response",
     template: str | None = None,
+    image_column: str | None = None,
     parse_json: bool = False,
     num_workers: int = 2,
     target_batch_rows: int = 256,
@@ -62,6 +99,10 @@ def llm_generate(
             builds prompts from any columns).
         output_column: name of the appended generated column.
         template: optional ``str.format`` template over the row's columns.
+        image_column: optional image column (raw bytes, or a decoded ``(H, W, 3)``
+            tensor) for **vision-language** models. Each request becomes
+            ``{"prompt": text, "image": PIL.Image}``; the engine must be vision-capable
+            (`vllm_engine` on a multimodal model handles it).
         parse_json: parse each output as JSON into a struct column (guided/structured
             decoding); on a parse error the row's value is null.
         num_workers / target_batch_rows: forwarded to `InferencePool` (no latency
@@ -76,8 +117,8 @@ def llm_generate(
         engine = engine_factory()  # built once per worker
 
         def worker(batch: pa.RecordBatch) -> pa.RecordBatch:
-            prompts = _render(template, prompt_column, batch)
-            outputs = list(engine(prompts))
+            requests = _build_requests(template, prompt_column, image_column, batch)
+            outputs = list(engine(requests))
             if parse_json:
                 col = pa.array([_safe_json(o) for o in outputs])
             else:
@@ -135,13 +176,28 @@ def vllm_engine(
         params = SamplingParams(**sampling_kwargs)
         lora = _lora_request(lora_path)
 
-        def engine(prompts: list[str]) -> list[str]:
-            outputs = llm.generate(prompts, params, lora_request=lora)
+        def engine(prompts: list) -> list[str]:
+            # A request is a plain string, or a {"prompt", "image"} dict for a
+            # vision-language model — translated to vLLM's multi_modal_data form.
+            requests = [_vllm_request(p) for p in prompts]
+            outputs = llm.generate(requests, params, lora_request=lora)
             return [o.outputs[0].text for o in outputs]
 
         return engine
 
     return factory
+
+
+def _vllm_request(prompt: object) -> object:
+    """Translate a request to vLLM input: a string passes through; a ``{prompt, image}``
+    dict becomes ``{"prompt": ..., "multi_modal_data": {"image": ...}}``."""
+    if not isinstance(prompt, dict):
+        return prompt
+    request: dict = {"prompt": prompt["prompt"]}
+    image = prompt.get("image")
+    if image is not None:
+        request["multi_modal_data"] = {"image": image}
+    return request
 
 
 def _guided_decoding(guided_json: dict | None, guided_regex: str | None) -> object | None:

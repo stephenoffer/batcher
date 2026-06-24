@@ -138,6 +138,60 @@ class DatasetML:
             )
         )
 
+    def map(
+        self,
+        fn: Callable,
+        *,
+        batch_size: int | None = None,
+        output_columns: list[str] | None = None,
+        num_workers: int = 1,
+        concurrency: int | tuple[int, int] | None = None,
+    ) -> Dataset:
+        """Apply a per-row Python function ``fn(row_dict) -> row_dict`` (Ray Data
+        ``map``).
+
+        Each row is passed to `fn` as a ``{column: value}`` dict **inside the worker**
+        (never the driver), so the hot-path rule holds; the per-row cost is yours.
+        Prefer the vectorized `map_batches` (whole Arrow batch) when you can express
+        the work over columns — it is far faster. `output_columns` declares the result
+        schema. Returns a new lazy `Dataset`.
+        """
+        from batcher.api.dataset.callbacks import _RowMap
+
+        return self.map_batches(
+            _RowMap(fn),
+            batch_size=batch_size,
+            output_columns=output_columns,
+            num_workers=num_workers,
+            concurrency=concurrency,
+        )
+
+    def flat_map(
+        self,
+        fn: Callable,
+        *,
+        batch_size: int | None = None,
+        output_columns: list[str] | None = None,
+        num_workers: int = 1,
+        concurrency: int | tuple[int, int] | None = None,
+    ) -> Dataset:
+        """Apply a per-row function ``fn(row_dict) -> iterable[row_dict]`` and flatten
+        the results (Ray Data ``flat_map``) — a one-to-many row transform.
+
+        Like `map`, `fn` runs per row inside the worker. Each call returns zero or more
+        output rows (dicts), all concatenated. `output_columns` declares the result
+        schema. Returns a new lazy `Dataset`.
+        """
+        from batcher.api.dataset.callbacks import _RowFlatMap
+
+        return self.map_batches(
+            _RowFlatMap(fn),
+            batch_size=batch_size,
+            output_columns=output_columns,
+            num_workers=num_workers,
+            concurrency=concurrency,
+        )
+
     def infer(
         self,
         model: Callable | type,
@@ -218,6 +272,7 @@ class DatasetML:
         collate_fn: object = None,
         prefetch_batches: int = 1,
         pin_memory: bool = False,
+        zero_copy: bool = False,
         local_shuffle_buffer_size: int | None = None,
         seed: int = 0,
     ):
@@ -226,10 +281,11 @@ class DatasetML:
         The bounded-memory training-iteration path (Ray Data's ``iter_torch_batches``):
         consumes `iter_batches()` incrementally with `device` transfer (``"auto"``
         picks the best accelerator — CUDA/ROCm/Intel/Apple — or CPU), optional
-        `pin_memory` for fast host→device copies, background `prefetch_batches`, a
-        `local_shuffle_buffer_size` window, and a custom `collate_fn`. For a
-        deterministic, balanced, resumable *distributed* split over a bounded corpus
-        use `stream_loader`. Requires `torch`. See `batcher.ml.iter_torch_batches`.
+        `pin_memory` for fast host→device copies, `zero_copy` DLPack views for
+        read-only inference, background `prefetch_batches`, a `local_shuffle_buffer_size`
+        window, and a custom `collate_fn`. For a deterministic, balanced, resumable
+        *distributed* split over a bounded corpus use `stream_loader`. Requires `torch`.
+        See `batcher.ml.iter_torch_batches`.
         """
         from batcher.ml.loader import iter_torch_batches
 
@@ -241,6 +297,7 @@ class DatasetML:
             collate_fn=collate_fn,
             prefetch_batches=prefetch_batches,
             pin_memory=pin_memory,
+            zero_copy=zero_copy,
             local_shuffle_buffer_size=local_shuffle_buffer_size,
             seed=seed,
         )
@@ -271,4 +328,88 @@ class DatasetML:
             batch_format=batch_format,
             accelerator_type=accelerator_type,
             model_memory_gb=model_memory_gb,
+        )
+
+    def embed_text(
+        self,
+        text_column: str,
+        model: str,
+        *,
+        output_column: str = "embedding",
+        num_gpus: float = 0.0,
+        concurrency: int | tuple[int, int] | None = None,
+        batch_size: int | None = None,
+    ) -> Dataset:
+        """Embed `text_column` with a sentence-transformers `model` → a tensor column.
+
+        The provider-pluggable, distributed, GPU-aware text-embedding path (cf. Daft's
+        ``embed_text``): the model loads once per worker and runs over GPU actor pools
+        via `map_batches`. `num_gpus`/`concurrency` schedule it across the cluster.
+        Needs ``sentence-transformers`` (``batcher-engine[st]``).
+        """
+        from batcher.ml.embed import sentence_transformer_encoder
+
+        encoder = sentence_transformer_encoder(model, text_column, output_column=output_column)
+        cols = [*self._ds.columns, output_column] if output_column not in self._ds.columns else None
+        return self.map_batches(
+            encoder,
+            output_columns=cols,
+            num_gpus=num_gpus,
+            concurrency=concurrency,
+            batch_size=batch_size,
+        )
+
+    def download(
+        self,
+        url_column: str,
+        *,
+        output_column: str = "bytes",
+        max_concurrency: int = 16,
+        on_error: str = "raise",
+    ) -> Dataset:
+        """Fetch the bytes at each URL/path into ``output_column`` (the multimodal
+        ingestion entry point — URL table → bytes → decode → model).
+
+        Reads ``s3://``/``gs://``/``az://``/``http(s)://``/local paths through the shared
+        filesystem resolver, fetching each batch's rows concurrently and parallelizing
+        across the cluster (a `map_batches` stage). ``on_error="null"`` makes a failed
+        fetch a null instead of raising. See `batcher.ml.download_dataset`.
+        """
+        from batcher.ml.decode import download_dataset
+
+        return download_dataset(
+            self._ds,
+            url_column=url_column,
+            output_column=output_column,
+            max_concurrency=max_concurrency,
+            on_error=on_error,
+        )
+
+    def upload(
+        self,
+        data_column: str,
+        directory: str,
+        *,
+        output_column: str = "path",
+        name_column: str | None = None,
+        extension: str = "",
+        max_concurrency: int = 16,
+    ) -> Dataset:
+        """Write each row's bytes to a file under `directory`, appending the path.
+
+        The counterpart to `download` — write transformed media back to
+        ``s3://``/``gs://``/``az://``/local storage, parallelized across the cluster.
+        Names come from `name_column` (+ `extension`) or a content hash. See
+        `batcher.ml.decode.upload_dataset`.
+        """
+        from batcher.ml.decode import upload_dataset
+
+        return upload_dataset(
+            self._ds,
+            data_column=data_column,
+            directory=directory,
+            output_column=output_column,
+            name_column=name_column,
+            extension=extension,
+            max_concurrency=max_concurrency,
         )

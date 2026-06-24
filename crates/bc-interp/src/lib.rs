@@ -144,6 +144,19 @@ fn exec_seq(
             Ok(out)
         }
 
+        RelOp::RowId {
+            input,
+            alias,
+            offset,
+        } => {
+            let batches = exec_seq(input, sources, m, ids)?;
+            let rows_in = count_rows(&batches);
+            let t0 = Instant::now();
+            let out = ops::add_row_ids(&batches, alias, *offset)?;
+            record_op(m, op_id, "row_id", rows_in, &out, t0, false);
+            Ok(out)
+        }
+
         RelOp::Unpivot {
             input,
             index,
