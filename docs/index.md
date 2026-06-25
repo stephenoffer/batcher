@@ -17,75 +17,55 @@
 </div>
 ```
 
-Data work has splintered into a tool per job: one for SQL, another for DataFrames,
-a third for streaming, more for images and models. Each new tool is another system
-to run and another seam to leak. Batcher's goal is to collapse that stack into one
-engine — covering every kind of data and every AI workload, from a quick query on a
-laptop to a petabyte job on a cluster, with the same code throughout.
+Data work has splintered into a tool per job: one for SQL, another for DataFrames, a
+third for streaming, more for images and models. Each one is another system to run
+and another seam to leak. Batcher collapses that stack into a single engine.
 
-## Any data
+![One engine: any source — Parquet, media, Kafka, lakehouse — flows into Batcher and back out to any workload: SQL and ETL, batch inference, embeddings, and training data.](_static/diagrams/hub.png)
+
+## Any data, any workload
+
+The same engine reads a Parquet table, a folder of images, or a Kafka stream, and the
+same pipeline can clean it, query it, or feed it to a model.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
 
 :::{grid-item-card} {octicon}`table;1.1em` Structured
-Tables from Parquet, CSV, JSON, and the lakehouse formats (Delta, Iceberg, Hudi).
-Filter, join, and aggregate them with SQL or DataFrames, and write the results back.
+Parquet, CSV, JSON, and the lakehouse formats (Delta, Iceberg, Hudi) — filtered,
+joined, and aggregated with SQL or DataFrames.
 :::
 
 :::{grid-item-card} {octicon}`file;1.1em` Unstructured
-Text, logs, and documents. Read whole files or lines, parse and extract fields, and
-turn messy input into clean columns at scale.
+Text, logs, and documents read whole or by the line, then parsed into clean columns
+at scale.
 :::
 
 :::{grid-item-card} {octicon}`image;1.1em` Multimodal
-Images, audio, and video, decoded straight into tensors — so the same pipeline that
-cleans a table can feed a model, with no separate loader to wire up.
+Images, audio, and video decoded straight into tensors, so one pipeline can clean a
+table and feed a model.
 :::
 
 :::{grid-item-card} {octicon}`search;1.1em` Vectors & embeddings
-List and tensor columns are first-class, with the vector operations that back
-embeddings, similarity search, and RAG feature pipelines.
+First-class list and tensor columns with the vector ops behind embeddings, similarity
+search, and RAG.
 :::
 ::::
 
-## Any AI workload
+## Write it your way
 
-One engine carries a job from raw data to a served model, instead of handing it
-between systems:
-
-- **Analytics & ETL** — clean, join, and aggregate, then write to files or a lakehouse.
-- **Batch inference** — run a model over Arrow batches with the `.ml` accessor; the
-  scheduler places the work on GPUs and across workers.
-- **Embeddings & RAG** — embed text or images and build the vector tables search needs.
-- **Training data** — shuffle, batch, and stream examples straight into your trainer.
-
-## Three ways to express your logic
-
-Write a transformation as a DataFrame or as SQL — both build the same plan and run on
-the same engine, so you can mix them freely.
+Express a transformation as a DataFrame, as SQL, or as composable column expressions.
+All three build the same plan and run on the same engine, so you can mix them freely.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
 ```python
 import batcher as bt
 
-sales = bt.from_pydict(
-    {
-        "category": ["a", "b", "a", "b", "a"],
-        "price": [10.0, 20.0, 30.0, 40.0, 50.0],
-        "qty": [1, 2, 3, 4, 5],
-    }
-)
-
-revenue = (
-    sales.with_columns(total=bt.col("price") * bt.col("qty"))
-    .group_by("category")
-    .agg(revenue=bt.col("total").sum())
-    .sort("revenue", descending=True)
-)
-print(revenue.to_pydict())
-# {'category': ['a', 'b'], 'revenue': [350.0, 200.0]}
+sales = bt.from_pydict({"cat": ["a", "b", "a"], "amt": [10.0, 20.0, 30.0]})
+revenue = sales.group_by("cat").agg(total=bt.col("amt").sum())
+print(revenue.sort("total", descending=True).to_pydict())
+# {'cat': ['a', 'b'], 'total': [40.0, 20.0]}
 ```
 :::
 
@@ -93,73 +73,31 @@ print(revenue.to_pydict())
 ```python
 import batcher as bt
 
-sales = bt.from_pydict(
-    {
-        "category": ["a", "b", "a", "b", "a"],
-        "price": [10.0, 20.0, 30.0, 40.0, 50.0],
-        "qty": [1, 2, 3, 4, 5],
-    }
-)
-
-revenue = bt.sql(
-    "SELECT category, SUM(price * qty) AS revenue "
-    "FROM sales GROUP BY category ORDER BY revenue DESC",
-    sales=sales,
-)
-print(revenue.to_pydict())
-# {'category': ['a', 'b'], 'revenue': [350.0, 200.0]}
+sales = bt.from_pydict({"cat": ["a", "b", "a"], "amt": [10.0, 20.0, 30.0]})
+revenue = bt.sql("SELECT cat, SUM(amt) AS total FROM sales GROUP BY cat", sales=sales)
+print(revenue.sort("total", descending=True).to_pydict())
+# {'cat': ['a', 'b'], 'total': [40.0, 20.0]}
 ```
 :::
-::::
 
-Underneath both is the **expression API**: column logic as composable values you
-build once and reuse. Arithmetic, comparisons, conditionals, and typed accessors
-(`.str`, `.dt`, `.list`, `.struct`) all build the same `Expr`, evaluated in Rust.
-
+:::{tab-item} Expressions
 ```python
 import batcher as bt
 
 ds = bt.from_pydict({"price": [10.0, 20.0, 30.0], "qty": [1, 2, 3]})
-
-revenue = bt.col("price") * bt.col("qty")          # an expression, not a result
+revenue = bt.col("price") * bt.col("qty")            # a value you build once
 tier = bt.when(revenue > 40).then(bt.lit("high")).otherwise(bt.lit("low"))
-
 print(ds.select(revenue=revenue, tier=tier).to_pydict())
 # {'revenue': [10.0, 40.0, 90.0], 'tier': ['low', 'low', 'high']}
 ```
+:::
+::::
 
-The typed accessors give every column type its own vocabulary:
+Expressions carry typed accessors for every column kind — `.str`, `.dt`, `.list`,
+`.struct` — so the column language is the same whether you reach for it from a
+DataFrame or from SQL.
 
-```python
-# docs: skip
-clean = bt.col("email").str.lower().str.trim()      # string ops
-year = bt.col("signup_ts").dt.year()                # datetime parts
-has_tag = bt.col("tags").list.contains("ai")        # list / array ops
-```
-
-## Batch, micro-batch, or continuous — change one line
-
-Batch is just the bounded case of streaming, so the pipeline you wrote for a file
-runs on a live stream untouched. You choose *how* it runs with one argument:
-
-```python
-# docs: skip
-pipeline = bt.read.kafka(topic="events").filter(bt.col("status") == "active")
-
-# Batch: process what's there now, then stop (the default).
-pipeline.write.parquet("out/")
-
-# Micro-batch: a new batch every 5 seconds.
-pipeline.write.parquet("out/", trigger=bt.Trigger.processing_time("5s"))
-
-# Continuous: low-latency, always on.
-pipeline.write.parquet("out/", trigger=bt.Trigger.continuous("1s"))
-```
-
-Same operators, same results — only the cadence changes. Watermarks, event-time
-windows, and exactly-once checkpoints come along for the streaming cases.
-
-## Reads from anywhere
+## Run it anywhere, at any cadence
 
 The source is the only thing that changes between a laptop and production:
 
@@ -168,16 +106,28 @@ The source is the only thing that changes between a laptop and production:
 bt.read("data/*.parquet")                  # local files
 bt.read("s3://bucket/events/*.parquet")    # object storage
 bt.read.images("s3://photos/**/*.jpg")     # multimodal
-bt.read.delta("s3://lake/events")          # lakehouse tables
 bt.read.kafka(topic="events")              # streams
 ```
+
+And because batch is just the bounded case of streaming, the same pipeline runs as a
+one-shot job, a micro-batch, or a continuous stream — you change one argument:
+
+```python
+# docs: skip
+pipeline.write.parquet("out/")                                       # batch (default)
+pipeline.write.parquet("out/", trigger=bt.Trigger.processing_time("5s"))  # micro-batch
+pipeline.write.parquet("out/", trigger=bt.Trigger.continuous("1s"))       # continuous
+```
+
+Same operators, same results — only the cadence changes, with watermarks, event-time
+windows, and exactly-once checkpoints handled for the streaming cases.
 
 ## It tunes itself
 
 You don't size batches, pick join strategies, or guess partition counts. Batcher
-measures the data as it flows and re-plans the rest of the query on real numbers, so
-a query that starts on a bad estimate corrects itself instead of stalling — the kind
-of mid-flight adaptation a plan-once optimizer can't do. The
+measures the data as it flows and re-plans the rest of the query on real numbers, so a
+query that starts on a bad estimate corrects itself instead of stalling — the kind of
+mid-flight adaptation a plan-once optimizer can't do. The
 [architecture guide](architecture/index.md) covers how, if you're curious.
 
 ## How it compares

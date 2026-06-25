@@ -221,6 +221,31 @@ def _mergeable() -> str:
 """
 
 
+@diagram("hub")
+def _hub() -> str:
+    return f"""
+  rankdir=LR; nodesep=0.2; ranksep=1.2;
+  node [width=2.05];
+  i1 [label="Parquet \u00b7 CSV \u00b7 JSON", fillcolor="{BLUE_BG}", color="{BLUE_EDGE}"];
+  i2 [label="Images \u00b7 Audio \u00b7 Video", fillcolor="{BLUE_BG}", color="{BLUE_EDGE}"];
+  i3 [label="Kafka \u00b7 live streams", fillcolor="{BLUE_BG}", color="{BLUE_EDGE}"];
+  i4 [label="Delta \u00b7 Iceberg \u00b7 Hudi", fillcolor="{BLUE_BG}", color="{BLUE_EDGE}"];
+  bc [label="Batcher\none adaptive engine", style="rounded,filled,bold",
+      fillcolor="{BLUE_EDGE}", color="{BLUE_EDGE}", fontcolor="white",
+      fontsize=15, width=2.3, height=1.1, penwidth=2];
+  o1 [label="SQL & ETL", fillcolor="{ORANGE_BG}", color="{ORANGE_EDGE}"];
+  o2 [label="Batch inference", fillcolor="{ORANGE_BG}", color="{ORANGE_EDGE}"];
+  o3 [label="Embeddings & RAG", fillcolor="{ORANGE_BG}", color="{ORANGE_EDGE}"];
+  o4 [label="Training data", fillcolor="{ORANGE_BG}", color="{ORANGE_EDGE}"];
+  {{ rank=same; i1; i2; i3; i4; }}
+  {{ rank=same; o1; o2; o3; o4; }}
+  edge [color="{BLUE_EDGE}"];
+  i1 -> bc; i2 -> bc; i3 -> bc; i4 -> bc;
+  edge [color="{ORANGE_EDGE}"];
+  bc -> o1; bc -> o2; bc -> o3; bc -> o4;
+"""
+
+
 def main() -> int:
     dot = shutil.which("dot")
     if not dot:
