@@ -121,7 +121,6 @@ GB/s-per-node figure until the benchmark harness produces one.
 kyber
 carbonite
 execution
-extending
 testing-strategy
 ```
 
