@@ -359,6 +359,12 @@ class MapBatches(LogicalPlan):
     # node) and VRAM-pack the GPU fraction; lets Kyber's cost model scale the
     # inference cost by model size. 0.0 = unknown (no budgeting).
     model_memory_gb: float = 0.0
+    # Run the per-batch calls across `num_workers` *processes* instead of threads, so a
+    # CPU-bound pure-Python `fn` (which the GIL would serialize across threads) uses
+    # multiple cores on a single node. Opt-in; the local executor falls back to threads
+    # when the `fn` is not process-safe (a factory/class, a GPU `fn`, or a non-pyarrow
+    # `batch_format`). No effect on the distributed path (Ray actors already isolate).
+    multiprocessing: bool = False
 
     def to_ir(self) -> dict[str, Any]:
         raise NotImplementedError("map_batches is executed in Python, not lowered to the engine IR")

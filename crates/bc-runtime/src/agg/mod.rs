@@ -36,6 +36,7 @@ mod distinct;
 mod hll;
 mod median;
 mod qsketch;
+mod radix;
 pub mod spill;
 mod stats;
 mod var;
@@ -49,6 +50,7 @@ use median::{
     merge_median,
 };
 use qsketch::{approx_quantile_state, finalize_approx_quantile, merge_approx_quantile};
+use radix::assign_groups_radix;
 use stats::{
     covar_state, finalize_corr, finalize_covar, finalize_kurtosis, finalize_skewness, moment_state,
 };
@@ -401,94 +403,6 @@ where
 /// dispatch) is pure overhead on a small input.
 const RADIX_PARALLEL_THRESHOLD: usize = 200_000;
 
-/// Parallel `assign_groups` via hash-radix partitioning — for the large concatenated
-/// input `combine` builds on a high-cardinality group-by/distinct, where the serial
-/// single-thread grouping dominates.
-///
-/// Each row's group is fixed by its key encoding, so all rows of a group hash equal
-/// and land in the same partition; partitions are then grouped independently across
-/// threads with **no cross-partition merge**. The result is identical to the serial
-/// path (group *order* differs, which callers already treat as unspecified, like any
-/// hash aggregate).
-fn assign_groups_radix(
-    group_keys: &[ArrayRef],
-    num_rows: usize,
-    partitions: usize,
-) -> Result<(Vec<u32>, usize, Vec<ArrayRef>), RuntimeError> {
-    use rayon::prelude::*;
-
-    let fields: Vec<SortField> = group_keys
-        .iter()
-        .map(|a| SortField::new(a.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields)?;
-    let rows = converter.convert_columns(group_keys)?;
-    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-
-    // Hash every row once (vectorized), then bin row indices by `hash % partitions`.
-    let hashes: Vec<u64> = (0..num_rows)
-        .into_par_iter()
-        .map(|i| state.hash_one(rows.row(i)))
-        .collect();
-    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); partitions];
-    for (i, &h) in hashes.iter().enumerate() {
-        buckets[(h % partitions as u64) as usize].push(i as u32);
-    }
-
-    // Group each partition independently in parallel (rows sharing a key are all here),
-    // reusing the precomputed hashes. Returns (local group id per bucket row, reps).
-    let grouped: Vec<(Vec<u32>, Vec<u32>)> = buckets
-        .par_iter()
-        .map(|bucket| {
-            let mut table: HashTable<u32> = HashTable::with_capacity(bucket.len());
-            let mut reps: Vec<u32> = Vec::new();
-            let mut local: Vec<u32> = Vec::with_capacity(bucket.len());
-            for &i in bucket {
-                let row_i = rows.row(i as usize);
-                let gid = match table.entry(
-                    hashes[i as usize],
-                    |&g| rows.row(reps[g as usize] as usize) == row_i,
-                    |&g| hashes[reps[g as usize] as usize],
-                ) {
-                    Entry::Occupied(e) => *e.get(),
-                    Entry::Vacant(e) => {
-                        let gid = reps.len() as u32;
-                        reps.push(i);
-                        e.insert(gid);
-                        gid
-                    }
-                };
-                local.push(gid);
-            }
-            (local, reps)
-        })
-        .collect();
-
-    // Prefix-sum partition group counts → global offsets, then scatter global ids back
-    // into original row order.
-    let mut offsets = Vec::with_capacity(partitions + 1);
-    offsets.push(0u32);
-    for (_, reps) in &grouped {
-        offsets.push(offsets.last().unwrap() + reps.len() as u32);
-    }
-    let num_groups = *offsets.last().unwrap() as usize;
-
-    let mut group_ids = vec![0u32; num_rows];
-    for (p, (local, _)) in grouped.iter().enumerate() {
-        let off = offsets[p];
-        for (k, &i) in buckets[p].iter().enumerate() {
-            group_ids[i as usize] = off + local[k];
-        }
-    }
-
-    // Group columns = each group's representative row, in (partition, local) order.
-    let rep_rows = grouped
-        .iter()
-        .flat_map(|(_, reps)| reps.iter().map(|&r| rows.row(r as usize)));
-    let group_columns = converter.convert_rows(rep_rows)?;
-    Ok((group_ids, num_groups, group_columns))
-}
-
 /// Produce the partial-state columns for one aggregate in a single scan.
 fn accumulate(
     func: AggFunc,
@@ -606,15 +520,25 @@ fn accumulate(
 }
 
 /// Step 2: merge partial results (across partitions) into one partial result.
-/// `combine([p]) ≡ p`; combining is associative for all supported functions.
+/// `combine([p]) ≡ p`; combining is associative for all supported functions. Uses
+/// the default radix threshold; the executor calls [`combine_with`] to tune it.
 pub fn combine(parts: &[Partial], funcs: &[AggFunc]) -> Result<Partial, RuntimeError> {
+    combine_with(parts, funcs, RADIX_PARALLEL_THRESHOLD)
+}
+
+/// [`combine`] with a caller-supplied radix-parallel threshold (performance-only —
+/// above it the large regroup runs parallel hash-radix, below it serial; the result
+/// is identical, group order being unspecified for a hash aggregate either way).
+pub fn combine_with(
+    parts: &[Partial],
+    funcs: &[AggFunc],
+    radix_parallel_threshold: usize,
+) -> Result<Partial, RuntimeError> {
     assert!(!parts.is_empty(), "combine requires at least one partial");
 
-    // A single partial is already grouped — distinct keys, one state row each — so
-    // re-folding it is identity for every associative reducer (`combine([p]) ≡ p`,
-    // per this module's contract). Skip the concat + re-encode + re-group entirely;
-    // this is the common single-morsel small-query path (ArrayRefs are Arc, so the
-    // clone is a refcount bump, not a data copy).
+    // A single partial is already grouped (`combine([p]) ≡ p`), so re-folding it is
+    // identity for every associative reducer — skip the concat + re-encode + re-group
+    // (the common single-morsel small-query path; the clone is an Arc refcount bump).
     if parts.len() == 1 {
         let p = &parts[0];
         return Ok(Partial {
@@ -649,7 +573,7 @@ pub fn combine(parts: &[Partial], funcs: &[AggFunc]) -> Result<Partial, RuntimeE
     // concatenation; parallelize it via hash-radix when it's big enough to amortize.
     // The serial path stays for global aggregates (no key columns) and small inputs.
     let (group_ids, num_groups, merged_group_columns) =
-        if total_rows > RADIX_PARALLEL_THRESHOLD && !group_concat.is_empty() {
+        if total_rows > radix_parallel_threshold && !group_concat.is_empty() {
             let partitions = rayon::current_num_threads().clamp(2, 64);
             assign_groups_radix(&group_concat, total_rows, partitions)?
         } else {

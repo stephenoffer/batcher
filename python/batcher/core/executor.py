@@ -54,8 +54,25 @@ def record_exec_metrics(sink: FeedbackSink | None, metrics_json: str, batch_size
                 batch_size=batch_size,
                 backend=op.get("backend", "interp"),
                 algorithm="spill" if op.get("spilled") else "",
+                cpu_utilization=_cpu_utilization(
+                    op.get("cpu_ns", 0), op.get("elapsed_ns", 0), op.get("threads", 1)
+                ),
             )
         )
+
+
+def _cpu_utilization(cpu_ns: float, elapsed_ns: float, threads: int) -> float:
+    """Mean fraction of allocated cores kept busy, clamped to [0, 1].
+
+    `cpu_ns` is CPU-time summed across all worker threads during the operator;
+    dividing by ``elapsed_ns x threads`` (the engine's *actual* live thread count,
+    not a guessed host core count — which is wrong under a cgroup CPU quota) gives
+    the per-core busy fraction. 0.0 when the engine reported no CPU time (older
+    build), no wall time, or no thread count.
+    """
+    if cpu_ns <= 0 or elapsed_ns <= 0 or threads <= 0:
+        return 0.0
+    return min(1.0, cpu_ns / (elapsed_ns * threads))
 
 
 class LocalExecutor:
@@ -75,14 +92,15 @@ class LocalExecutor:
         import batcher._native as _native
 
         cfg = active_config()
+        # Ship Kyber's per-operator spill budgets alongside the plan so the engine
+        # budgets each stateful operator individually (not one global cap for all).
+        engine_cfg = cfg.engine_config_json_with(plan.op_budgets())
         # Collect per-operator metrics only when there is a sink to consume them;
         # the plain entry point avoids the (tiny) JSON serialization otherwise.
         if self._feedback is None:
-            return _native.execute_plan(plan.to_json(), sources, cfg.engine_config_json())
+            return _native.execute_plan(plan.to_json(), sources, engine_cfg)
 
-        out, metrics_json = _native.execute_plan_metered(
-            plan.to_json(), sources, cfg.engine_config_json()
-        )
+        out, metrics_json = _native.execute_plan_metered(plan.to_json(), sources, engine_cfg)
         record_exec_metrics(self._feedback, metrics_json, cfg.execution.morsel_rows)
         return out
 
@@ -114,7 +132,7 @@ def execute_local_metered(
 
     cfg = active_config()
     out, metrics_json = _native.execute_plan_metered(
-        plan.to_json(), sources, cfg.engine_config_json()
+        plan.to_json(), sources, cfg.engine_config_json_with(plan.op_budgets())
     )
     try:
         ops = json.loads(metrics_json).get("ops", [])

@@ -222,6 +222,237 @@ def test_task_options_none_envelope_is_empty():
     assert task_options(None) == {}
 
 
+def test_task_options_carries_fractional_cpu():
+    # A CPU-light stage asks for <1 CPU so Ray packs more than one per core.
+    env = SchedulingEnvelope(num_cpus=0.5, memory_bytes=0, num_gpus=0.0, n_tasks=4, credits=4)
+    assert task_options(env) == {"num_cpus": 0.5}
+
+
+# --- Fractional CPU: per-operator share → envelope → clamp ----------------------
+
+
+def _cpu_op(op_id: int, kind: str, cpu: float) -> PhysicalOp:
+    return PhysicalOp(
+        op_id=OpId(op_id),
+        kind=kind,
+        backend="native",
+        algorithm="",
+        bounds=ResourceBounds(
+            m_max_bytes=0, c_max_credits=0, n_max_parallelism=0, c_cpu_shares=cpu
+        ),
+        inputs=(),
+    )
+
+
+def test_envelope_cpu_is_dominant_operator_share():
+    from batcher.carbonite.base import ResourceContext
+
+    cfg = active_config()
+    ctx = ResourceContext(config=cfg)
+    # A pure scan→filter plan asks for the CPU-light fraction (packs tighter).
+    light = _plan([_cpu_op(0, "Scan", 0.5), _cpu_op(1, "Filter", 0.5)])
+    env = DefaultSchedulingPolicy().envelope(
+        light, ctx, requested_workers=None, available_bytes=1 << 40
+    )
+    assert env.num_cpus == 0.5
+    # Add a breaker (full core) and the dominant share pulls back to 1.0.
+    heavy = _plan([_cpu_op(0, "Scan", 0.5), _cpu_op(1, "Aggregate", 1.0)])
+    env = DefaultSchedulingPolicy().envelope(
+        heavy, ctx, requested_workers=None, available_bytes=1 << 40
+    )
+    assert env.num_cpus == 1.0
+
+
+def test_kyber_annotates_cpu_light_with_fraction():
+    import batcher as bt
+    from batcher.kyber.cardinality import CardinalityEstimator
+    from batcher.kyber.optimizer import _annotate_ops
+
+    cfg = active_config()
+    ds = bt.from_pydict({"k": [1, 2], "v": [3, 4]}).filter(bt.col("v") > 0)
+    ops = _annotate_ops(ds._plan, CardinalityEstimator([]), cfg)
+    filt = next(op for op in ops if op.kind == "Filter")
+    scan = next(op for op in ops if op.kind == "Scan")
+    assert filt.bounds.c_cpu_shares == cfg.execution.cpu_share_io
+    assert scan.bounds.c_cpu_shares == cfg.execution.cpu_share_io
+
+
+def test_recommend_num_cpus_adapts_to_utilization():
+    from batcher.kyber.cpu_shares import recommend_num_cpus
+
+    # No measurement → keep the static prior.
+    assert recommend_num_cpus(None, 0.5) == 0.5
+    assert recommend_num_cpus(0.0, 0.5) == 0.5
+    # CPU-bound family → near a whole core (overrides a light prior).
+    assert recommend_num_cpus(0.95, 0.5) == 0.95
+    # IO-bound family → floored at cpu_share_min (never an unschedulable sliver).
+    assert recommend_num_cpus(0.05, 1.0) == active_config().execution.cpu_share_min
+    # Never exceeds a whole core.
+    assert recommend_num_cpus(1.5, 0.5) == active_config().execution.cpus_per_task
+
+
+def test_load_cpu_utilization_medians_by_kind():
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends import InProcessBackend
+    from batcher.plan.feedback import OperatorFeedback
+    from batcher.plan.ids import OpId
+
+    hub = MetadataHub(InProcessBackend())
+    n = active_config().optimizer.cost_calibration_min_samples
+    for _ in range(n):
+        hub.record(
+            OperatorFeedback(
+                op_id=OpId(0),
+                kind="filter",
+                n_actual=100,
+                t_op_ms=1.0,
+                m_peak_bytes=0,
+                selectivity=1.0,
+                batch_size=1,
+                cpu_utilization=0.9,
+            )
+        )
+    # An unmeasured (0.0) row must not pull the learned value down.
+    hub.record(
+        OperatorFeedback(
+            op_id=OpId(1),
+            kind="filter",
+            n_actual=1,
+            t_op_ms=1.0,
+            m_peak_bytes=0,
+            selectivity=1.0,
+            batch_size=1,
+            cpu_utilization=0.0,
+        )
+    )
+    from batcher.kyber.cpu_shares import load_cpu_utilization
+
+    util = load_cpu_utilization(hub)
+    assert util["filter"] == 0.9
+    # A kind with too few samples is absent (keeps its static prior).
+    assert "scan" not in util
+
+
+def test_annotate_ops_overrides_static_cpu_with_learned():
+    import batcher as bt
+    from batcher.kyber.cardinality import CardinalityEstimator
+    from batcher.kyber.optimizer import _annotate_ops
+
+    cfg = active_config()
+    ds = bt.from_pydict({"k": [1, 2], "v": [3, 4]}).filter(bt.col("v") > 0)
+    # Cold start: Filter keeps the CPU-light prior.
+    cold = _annotate_ops(ds._plan, CardinalityEstimator([]), cfg)
+    filt_cold = next(op for op in cold if op.kind == "Filter")
+    assert filt_cold.bounds.c_cpu_shares == cfg.execution.cpu_share_io
+    # Learned: a CPU-bound filter (regex-heavy) measured at 0.95 → near a whole core.
+    warm = _annotate_ops(ds._plan, CardinalityEstimator([]), cfg, {"filter": 0.95})
+    filt_warm = next(op for op in warm if op.kind == "Filter")
+    assert filt_warm.bounds.c_cpu_shares == 0.95
+
+
+def test_learned_cpu_flows_through_optimizer_into_envelope():
+    # The whole adaptive CPU loop, end to end through the *real* Optimizer and
+    # ResourceManager: recorded utilization → load_cpu_utilization (inside optimize)
+    # → _annotate_ops c_cpu_shares → envelope.num_cpus. Proves the class→IR-tag bridge
+    # and the wiring actually fire (not just the pieces in isolation).
+    import batcher as bt
+    from batcher.carbonite import ResourceManager
+    from batcher.kyber import optimize
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends import InProcessBackend
+    from batcher.plan.feedback import OperatorFeedback
+    from batcher.plan.ids import OpId
+
+    cfg = active_config()
+    hub = MetadataHub(InProcessBackend())
+    # A CPU-bound filter family, measured well above its static 0.5 prior.
+    for _ in range(cfg.optimizer.cost_calibration_min_samples):
+        hub.record(
+            OperatorFeedback(
+                op_id=OpId(0),
+                kind="filter",
+                n_actual=1,
+                t_op_ms=1.0,
+                m_peak_bytes=0,
+                selectivity=1.0,
+                batch_size=1,
+                cpu_utilization=0.9,
+            )
+        )
+    ds = bt.from_pydict({"k": [1, 2, 3], "v": [4, 5, 6]}).filter(bt.col("v") > 0)
+    phys = optimize(ds._plan, sources=ds._sources, hub=hub)
+    filt = next(op for op in phys.ops if op.kind == "Filter")
+    assert filt.bounds.c_cpu_shares == 0.9, "learned utilization overrode the static prior"
+    # And it reaches the per-task grant Carbonite hands the distributed executor.
+    env = ResourceManager().scheduling_envelope(phys)
+    assert env.num_cpus >= 0.9
+
+
+def test_record_exec_metrics_computes_cpu_utilization():
+    import json
+
+    from batcher.core import record_exec_metrics
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends import InProcessBackend
+
+    hub = MetadataHub(InProcessBackend())
+    elapsed = 1_000_000  # 1 ms wall
+    threads = 8  # the engine's reported live pool size — NOT a guessed host count
+    cpu = int(0.5 * elapsed * threads)  # half the allocated cores kept busy
+    doc = {
+        "ops": [
+            {
+                "op_id": 0,
+                "kind": "filter",
+                "rows_in": 10,
+                "rows_out": 5,
+                "elapsed_ns": elapsed,
+                "cpu_ns": cpu,
+                "threads": threads,
+                "peak_bytes": 0,
+                "spilled": False,
+                "backend": "interp",
+            }
+        ]
+    }
+    record_exec_metrics(hub, json.dumps(doc), batch_size=16384)
+    row = hub.op_stats_by_kind()["filter"][0]
+    assert abs(row["cpu_utilization"] - 0.5) < 1e-9
+    # A document without cpu_ns (older engine) records 0.0 (unmeasured), never crashes.
+    doc["ops"][0].pop("cpu_ns")
+    record_exec_metrics(hub, json.dumps(doc), batch_size=16384)
+    assert hub.op_stats_by_kind()["filter"][1]["cpu_utilization"] == 0.0
+
+
+# --- Fractional GPU rides the same float plumbing as CPU ------------------------
+
+
+def test_fractional_gpu_round_trips_through_options_and_bundle():
+    from batcher.dist.executors.ray_runtime import _bundle
+
+    env = SchedulingEnvelope(num_cpus=0.5, memory_bytes=0, num_gpus=0.25, n_tasks=2, credits=4)
+    # Ray scheduling kwargs carry the fractional GPU verbatim (so 4 actors pack a GPU).
+    assert task_options(env) == {"num_cpus": 0.5, "num_gpus": 0.25}
+    # The placement-group bundle reserves the same fractional GPU + CPU.
+    assert _bundle(env) == {"CPU": 0.5, "GPU": 0.25}
+
+
+def test_clamp_workers_packs_fractional_cpu(monkeypatch):
+    ray = pytest.importorskip("ray")
+    from batcher.dist.executors import ray_runtime
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        ray_runtime, "cluster_topology", lambda: {"nodes": 1, "cpus": 8.0, "gpus": 0.0}
+    )
+    # 0.5 CPU/task → 16 tasks fit on 8 cores; 1.0 reproduces today's count; 2.0 → 4.
+    assert ray_runtime.clamp_workers(16, 0.5) == 16
+    assert ray_runtime.clamp_workers(20, 0.5) == 16  # over-subscribed → clamp to 16
+    assert ray_runtime.clamp_workers(8, 1.0) == 8
+    assert ray_runtime.clamp_workers(10, 1.0) == 8  # the pre-existing 1-CPU behavior
+    assert ray_runtime.clamp_workers(8, 2.0) == 4
+
+
 def test_fault_options_from_config():
     """Task retries come from config; `retry_on_transient` toggles retry_exceptions."""
     from batcher.config import Config, DistributedConfig, config_context

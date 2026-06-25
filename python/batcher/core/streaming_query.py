@@ -215,7 +215,7 @@ class StreamingQueryEngine:
     # --- the loop ---------------------------------------------------------
     def _run(self) -> None:
         try:
-            self._loop()
+            self._run_resilient()
             self._emit_finalize()
         except BaseException as exc:
             self._error = exc
@@ -223,6 +223,66 @@ class StreamingQueryEngine:
             self._active = False
             with contextlib.suppress(Exception):
                 self._sink.close()
+
+    def _run_resilient(self) -> None:
+        """Run the micro-batch loop, restarting from the checkpoint on a transient fault.
+
+        A preempted worker or dropped connection raises a transient error mid-stream.
+        Rather than kill the query, restore the last *committed* checkpoint (rolling
+        back a half-applied micro-batch) and resume — the same exactly-once recovery a
+        manual restart gives, done in-process so a spot-cluster blip doesn't end a
+        long-running stream. Bounded by `recovery_max_attempts` *consecutive* restarts;
+        the budget resets the moment the stream makes progress, so a flaky cluster
+        self-heals while a persistently broken query still surfaces. With no checkpoint
+        there is no clean restore point, so a fault surfaces immediately (unchanged); a
+        non-transient error always surfaces.
+        """
+        restarts = 0
+        while True:
+            progress_mark = self._batches
+            try:
+                self._loop()
+                return
+            except self._restartable_errors() as exc:
+                if self._checkpoint is None or self._stop.is_set():
+                    raise
+                restarts = 0 if self._batches > progress_mark else restarts + 1
+                if restarts > self._max_consecutive_restarts():
+                    raise
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "streaming fault (%s); restart %d from checkpoint at batch %d",
+                    type(exc).__name__,
+                    restarts,
+                    self._batches,
+                )
+                self._recover()  # roll back to the last committed state, then replay
+
+    @staticmethod
+    def _max_consecutive_restarts() -> int:
+        """How many *consecutive* (no-progress) restarts before a stream surfaces the
+        fault — the profile-aware recompute budget (higher under `resilience="spot"`)."""
+        from batcher.config import active_config
+
+        return active_config().distributed.recovery_max_attempts
+
+    @staticmethod
+    def _restartable_errors() -> tuple[type[BaseException], ...]:
+        """Transient fault types worth a checkpoint restart (a lost worker / dropped
+        connection), not a logic error. Built lazily so `ray`/`_native` stay optional."""
+        from batcher._internal.errors import ResourceError
+
+        errs: tuple[type[BaseException], ...] = (ResourceError,)
+        with contextlib.suppress(Exception):
+            from batcher._native import RetryableShuffleError
+
+            errs = (*errs, RetryableShuffleError)
+        with contextlib.suppress(Exception):
+            import ray
+
+            errs = (*errs, ray.exceptions.RayActorError, ray.exceptions.RayTaskError)
+        return errs
 
     def _emit_finalize(self) -> None:
         """Flush any windows still open when the loop ends (the final emission)."""

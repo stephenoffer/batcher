@@ -357,13 +357,17 @@ class StatsEstimator:
     def _join_key_ndv(self, node: Join, left_rows: float, right_rows: float) -> float | None:
         """`max(ndv)` over the join's two key *sets*, if either is fully known.
 
-        For a composite key, a side's distinct-combination count is the product of
-        its per-key ndv (the standard independence assumption), capped at that
-        side's estimated rows — a learned ndv reflects the *unfiltered* source, but
-        a filtered input can't carry more distinct keys than it has rows. The classic
-        `|L|·|R| / max(ndv)` estimate then uses whichever side is fully measured
-        (max of the two when both are). Returns `None` when neither side's full key
-        set has learned distinct counts, so the caller keeps its `max(rows)` fallback.
+        For a composite key, a side's distinct-combination count combines the
+        per-key ndvs with **exponential backoff** (largest at full weight, each
+        subsequent one dampened) rather than a raw product. The result lies between
+        `max_k ndv[k]` (the perfectly-correlated / functional-dependence floor — a
+        composite key is at least as distinct as its most-distinct column) and the
+        full product (the independence ceiling), and is capped at the side's rows —
+        a learned ndv reflects the *unfiltered* source, but a filtered input can't
+        carry more distinct keys than it has rows. The classic `|L|·|R| / max(ndv)`
+        estimate then uses whichever side is fully measured (max of the two when
+        both are). Returns `None` when neither side's full key set has learned
+        distinct counts, so the caller keeps its `max(rows)` fallback.
         """
         if not node.left_keys or len(node.left_keys) != len(node.right_keys):
             return None
@@ -372,9 +376,16 @@ class StatsEstimator:
         def side_ndv(keys: list[str], rows: float) -> float | None:
             if not all(k in ndv and ndv[k] > 0 for k in keys):
                 return None
+            # Damped combination: real composite keys are usually correlated, so the
+            # independence product overshoots. Sort distinct counts descending and
+            # apply diminishing exponents — interpolating between max (correlated)
+            # and product (independent).
+            per_key = sorted((ndv[k] for k in keys), reverse=True)
             combined = 1.0
-            for k in keys:
-                combined *= ndv[k]
+            exponent = 1.0
+            for d in per_key:
+                combined *= d**exponent
+                exponent /= 2.0
             return min(combined, rows)
 
         candidates = [

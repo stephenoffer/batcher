@@ -8,6 +8,8 @@ combine), so it is tested directly at the source layer without the engine.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -181,3 +183,33 @@ def test_in_memory_source_whole_split():
     assert len(splits) == 1
     assert isinstance(splits[0], WholeSourceSplit)
     assert pa.Table.from_batches(splits[0].read()).num_rows == 3
+
+
+def test_fragment_index_lru_evicts_least_recently_used(monkeypatch):
+    """The fragment-index cache is a bounded LRU: a hit refreshes recency, and an
+    insert past the bound drops only the least-recently-used table — not the whole
+    cache (the old clear-all forced every live table to re-list)."""
+    from batcher.io import splits
+
+    monkeypatch.setattr(splits, "_FRAGMENT_INDEX_CACHE", splits.OrderedDict())
+    monkeypatch.setattr(splits, "_FRAGMENT_CACHE_MAX", 3)
+    builds: list[str] = []
+
+    def build(name):
+        def _b():
+            builds.append(name)
+            return SimpleNamespace(get_fragments=lambda: [])
+
+        return _b
+
+    for k in ("a", "b", "c"):
+        splits.fragment_index(k, build(k))
+    assert builds == ["a", "b", "c"]
+
+    splits.fragment_index("a", build("a"))  # hit → "a" becomes most-recently-used
+    splits.fragment_index("d", build("d"))  # insert past bound → evict LRU ("b")
+    assert builds == ["a", "b", "c", "d"]  # "a" hit did not rebuild
+    assert set(splits._FRAGMENT_INDEX_CACHE) == {"a", "c", "d"}  # "b" evicted, not all
+
+    splits.fragment_index("c", build("c"))  # still cached → no rebuild
+    assert builds == ["a", "b", "c", "d"]

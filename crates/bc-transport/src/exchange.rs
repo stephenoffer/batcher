@@ -34,14 +34,24 @@ pub enum FetchFault {
 pub fn classify(err: &TransportError) -> FetchFault {
     match err {
         TransportError::Transport(_) | TransportError::IdleTimeout(_) => FetchFault::Retryable,
-        TransportError::Status(s) if is_retryable_code(s.code()) => FetchFault::Retryable,
+        TransportError::Status(s) if is_retryable_status(s) => FetchFault::Retryable,
         TransportError::Flight(arrow_flight::error::FlightError::Tonic(s))
-            if is_retryable_code(s.code()) =>
+            if is_retryable_status(s) =>
         {
             FetchFault::Retryable
         }
         _ => FetchFault::Fatal,
     }
+}
+
+/// Whether a gRPC status means "the peer/connection is transiently gone".
+fn is_retryable_status(s: &tonic::Status) -> bool {
+    is_retryable_code(s.code())
+        // A broken HTTP/2 connection to a dead/killed peer does not always surface as
+        // `Unavailable`: tonic frequently reports it as `Unknown` carrying a
+        // "transport error" message. That is exactly the worker-loss case the recovery
+        // loop must retry (recompute + re-fetch), not a fatal protocol error.
+        || (s.code() == tonic::Code::Unknown && s.message().contains("transport error"))
 }
 
 /// gRPC status codes that mean "the peer/connection is transiently gone".
@@ -440,6 +450,14 @@ mod tests {
             classify(&TransportError::from(tonic::Status::cancelled("gone"))),
             FetchFault::Retryable
         );
+        // A broken connection to a killed worker surfaces as `Unknown` carrying a
+        // "transport error" message — the worker-loss case the recovery loop retries.
+        assert_eq!(
+            classify(&TransportError::from(tonic::Status::unknown(
+                "transport error"
+            ))),
+            FetchFault::Retryable
+        );
 
         // A decode/protocol/auth failure is fatal — a retry won't help.
         assert_eq!(
@@ -455,6 +473,13 @@ mod tests {
         // NotFound (an unpublished empty bucket) is not a fault to retry here.
         assert_eq!(
             classify(&TransportError::from(tonic::Status::not_found("no ticket"))),
+            FetchFault::Fatal
+        );
+        // A non-transport `Unknown` (a genuine server-side error) stays fatal.
+        assert_eq!(
+            classify(&TransportError::from(tonic::Status::unknown(
+                "internal model error"
+            ))),
             FetchFault::Fatal
         );
     }

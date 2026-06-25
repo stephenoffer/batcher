@@ -63,6 +63,45 @@ def _cgroup_limit_bytes() -> int | None:
     return None
 
 
+def _cgroup_current_bytes() -> int | None:
+    """The container's *current* memory usage from cgroup v2 (`memory.current`) or v1
+    (`memory.usage_in_bytes`), or `None` when not in a cgroup.
+
+    This is the figure the kernel OOM-killer watches — it counts *all* of the
+    process's anonymous memory, including the in-memory Flight shuffle store and
+    off-pool pyarrow buffers the engine's buffer pool does not track. Reading it is
+    what lets the monitor see the real pressure instead of only the pool's reservations.
+    """
+    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        try:
+            with open(path) as f:
+                raw = f.read().strip()
+        except OSError:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _process_rss_bytes() -> int | None:
+    """This process's resident set size (RSS) via `psutil`, or `None` without it.
+
+    RSS captures the engine's true footprint — the Flight `PartitionStore`, pyarrow
+    buffers, everything — not just the buffer pool's accounted reservations."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        return None
+
+
 def total_memory_bytes() -> int:
     """The memory ceiling: the min of host RAM and any cgroup/container limit.
 
@@ -110,8 +149,15 @@ class PressureMonitor:
     `MemoryConfig` (default 0.85 / 0.90).
     """
 
+    # Smoothing factor for the de-escalation hysteresis (weight on the newest reading).
+    # 0.5 relaxes the level over a few samples; escalation is never smoothed.
+    _EWMA_ALPHA = 0.5
+
     def __init__(self, config: Config | None = None) -> None:
         self._config = config or active_config()
+        # Exponentially-weighted history of the used fraction, for the asymmetric
+        # hysteresis in `level()`. `None` until the first reading.
+        self._ewma: float | None = None
 
     def snapshot(self) -> MemorySnapshot:
         """Take a current reading of total/available memory and budget usage."""
@@ -149,9 +195,22 @@ class PressureMonitor:
         `limit`) — not how full the whole machine is. When no pool has been created
         yet, falls back to the machine's used fraction so a standalone monitor still
         reports something sensible.
+
+        **Asymmetric hysteresis.** The level escalates *instantly* on the raw reading
+        (a real reservation is real pressure — never delay protective spill) but
+        de-escalates only as an EWMA of recent readings relaxes. Classifying on
+        ``max(raw, ewma)`` gives exactly that: on a rising edge ``raw > ewma`` so the
+        raw value drives the decision; on a falling edge ``raw < ewma`` so the lagging
+        average holds the level up for a few samples. This stops a transient spike
+        from flapping SPILL↔NORMAL and oscillating the shuffle's AIMD credit window,
+        without ever under-reacting to growing pressure. Stateful by design (it
+        updates the EWMA); it still never *acts*.
         """
         mem = self._config.memory
-        used = self._engine_used_fraction()
+        raw = self._engine_used_fraction()
+        prev = self._ewma if self._ewma is not None else raw
+        used = max(raw, prev)  # escalate on raw, de-escalate on the lagging average
+        self._ewma = self._EWMA_ALPHA * raw + (1.0 - self._EWMA_ALPHA) * prev
         if used >= mem.hard_limit:
             return PressureLevel.CRITICAL
         if used >= mem.soft_limit:
@@ -162,16 +221,30 @@ class PressureMonitor:
 
     @staticmethod
     def _engine_used_fraction() -> float:
-        """Fraction of the engine's buffer-pool envelope currently reserved.
+        """Fraction of the memory ceiling in use, by whichever measure is highest.
 
-        Falls back to the machine's used fraction when the pool isn't initialized.
+        Takes the MAX of the engine's reserved buffer-pool envelope and the process's
+        *actual* footprint (the cgroup's current usage, else RSS). Memory the pool does
+        not track — the in-memory Flight shuffle `PartitionStore`, off-pool pyarrow
+        buffers — therefore cannot let the monitor report NORMAL while the kernel
+        OOM-kills a shuffle-heavy worker. Over-reading only spills/throttles a little
+        early (safe); under-reading risks the OOM-kill this guards against. Falls back
+        to the machine's used fraction when neither a pool nor a live reading exists.
         """
         from batcher.carbonite.memory.pool import current_process_pool
 
+        candidates: list[float] = []
         pool = current_process_pool()
         if pool is not None and pool.limit > 0:
-            return pool.used / pool.limit
+            candidates.append(pool.used / pool.limit)
         total = total_memory_bytes()
+        if total:
+            footprint = _cgroup_current_bytes() or _process_rss_bytes()
+            if footprint is not None:
+                candidates.append(footprint / total)
+        if candidates:
+            return max(candidates)
+        # No pool and no process footprint reading — fall back to the machine fraction.
         if not total:
             return 1.0
         try:

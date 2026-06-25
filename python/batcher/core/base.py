@@ -44,6 +44,16 @@ class ExecutionContext:
     hub: MetadataHub
     num_workers: int | None = None
     transport: str = "auto"
+    # Whether the user opted this result into the process result cache
+    # (`Dataset.cache()`). Honored only by the single-node relational path; the
+    # conductor keys the cache by plan signature + input identity.
+    cache: bool = False
+    # Per-source `SourceStatistics` already collected by the conductor (e.g. the
+    # metadata-answer attempt for a `count()`/`is_empty()` that missed). When set, the
+    # relational path reuses it instead of re-reading every source's footer/manifest —
+    # so a single terminal op reads source statistics once, not per optimization pass.
+    # `None` means "not collected yet"; the path collects its own.
+    source_stats: list | None = None
 
 
 class Executor(Protocol):

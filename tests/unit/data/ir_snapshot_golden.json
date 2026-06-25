@@ -1,0 +1,620 @@
+{
+  "agg_binary": {
+    "alias": "r",
+    "func": "corr",
+    "input": {
+      "e": "col",
+      "name": "x"
+    },
+    "input2": {
+      "e": "col",
+      "name": "y"
+    }
+  },
+  "agg_param": {
+    "alias": "p50",
+    "func": "quantile",
+    "input": {
+      "e": "col",
+      "name": "x"
+    },
+    "param": 0.5
+  },
+  "agg_unary": {
+    "alias": "total",
+    "func": "sum",
+    "input": {
+      "e": "col",
+      "name": "x"
+    }
+  },
+  "aliased": {
+    "e": "col",
+    "name": "x"
+  },
+  "array": {
+    "e": "array",
+    "elements": [
+      {
+        "e": "lit",
+        "value": {
+          "int": 1
+        }
+      },
+      {
+        "e": "lit",
+        "value": {
+          "int": 2
+        }
+      }
+    ]
+  },
+  "audio": {
+    "e": "audio",
+    "fn": "decode",
+    "input": {
+      "e": "col",
+      "name": "clip"
+    }
+  },
+  "binary": {
+    "e": "binary",
+    "left": {
+      "e": "col",
+      "name": "x"
+    },
+    "op": "add",
+    "right": {
+      "e": "lit",
+      "value": {
+        "int": 1
+      }
+    }
+  },
+  "case": {
+    "branches": [
+      {
+        "then": {
+          "e": "lit",
+          "value": {
+            "int": 1
+          }
+        },
+        "when": {
+          "e": "binary",
+          "left": {
+            "e": "col",
+            "name": "x"
+          },
+          "op": "gt",
+          "right": {
+            "e": "lit",
+            "value": {
+              "int": 0
+            }
+          }
+        }
+      }
+    ],
+    "e": "case",
+    "otherwise": {
+      "e": "lit",
+      "value": {
+        "int": 0
+      }
+    }
+  },
+  "cast": {
+    "dtype": "int64",
+    "e": "cast",
+    "input": {
+      "e": "col",
+      "name": "x"
+    },
+    "try_cast": false
+  },
+  "cast_try": {
+    "dtype": "int64",
+    "e": "cast",
+    "input": {
+      "e": "col",
+      "name": "x"
+    },
+    "try_cast": true
+  },
+  "coalesce": {
+    "e": "coalesce",
+    "inputs": [
+      {
+        "e": "col",
+        "name": "x"
+      },
+      {
+        "e": "lit",
+        "value": {
+          "int": 0
+        }
+      }
+    ]
+  },
+  "col": {
+    "e": "col",
+    "name": "x"
+  },
+  "convert_timezone": {
+    "e": "convert_timezone",
+    "from_tz": "UTC",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "to_tz": "America/New_York"
+  },
+  "date_func": {
+    "e": "date",
+    "fn": "year",
+    "input": {
+      "e": "col",
+      "name": "d"
+    }
+  },
+  "date_offset_full": {
+    "days": 2,
+    "e": "date_offset",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "micros": 3,
+    "months": 1
+  },
+  "date_offset_partial": {
+    "days": 5,
+    "e": "date_offset",
+    "input": {
+      "e": "col",
+      "name": "d"
+    }
+  },
+  "date_trunc": {
+    "e": "date_trunc",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "unit": "month"
+  },
+  "greatest": {
+    "e": "greatest",
+    "inputs": [
+      {
+        "e": "col",
+        "name": "x"
+      },
+      {
+        "e": "col",
+        "name": "y"
+      }
+    ]
+  },
+  "image_simple": {
+    "e": "image",
+    "fn": "decode",
+    "input": {
+      "e": "col",
+      "name": "img"
+    }
+  },
+  "image_to_tensor": {
+    "e": "image",
+    "fn": "to_tensor",
+    "height": 224,
+    "input": {
+      "e": "col",
+      "name": "img"
+    },
+    "width": 224
+  },
+  "is_inf": {
+    "e": "is_inf",
+    "input": {
+      "e": "col",
+      "name": "x"
+    }
+  },
+  "is_nan": {
+    "e": "is_nan",
+    "input": {
+      "e": "col",
+      "name": "x"
+    }
+  },
+  "is_not_null": {
+    "e": "is_not_null",
+    "input": {
+      "e": "col",
+      "name": "x"
+    }
+  },
+  "is_null": {
+    "e": "is_null",
+    "input": {
+      "e": "col",
+      "name": "x"
+    }
+  },
+  "least": {
+    "e": "least",
+    "inputs": [
+      {
+        "e": "col",
+        "name": "x"
+      },
+      {
+        "e": "col",
+        "name": "y"
+      }
+    ]
+  },
+  "list_binary": {
+    "e": "list_binary",
+    "fn": "dot",
+    "left": {
+      "e": "col",
+      "name": "a"
+    },
+    "right": {
+      "e": "col",
+      "name": "b"
+    }
+  },
+  "list_contains": {
+    "e": "list_contains",
+    "input": {
+      "e": "col",
+      "name": "a"
+    },
+    "value": {
+      "int": 5
+    }
+  },
+  "list_filter": {
+    "e": "list_filter",
+    "input": {
+      "e": "col",
+      "name": "a"
+    },
+    "pred": {
+      "e": "binary",
+      "left": {
+        "e": "col",
+        "name": "x"
+      },
+      "op": "gt",
+      "right": {
+        "e": "lit",
+        "value": {
+          "int": 0
+        }
+      }
+    }
+  },
+  "list_func": {
+    "e": "list",
+    "fn": "sum",
+    "input": {
+      "e": "col",
+      "name": "a"
+    }
+  },
+  "list_get": {
+    "e": "list_get",
+    "index": -1,
+    "input": {
+      "e": "col",
+      "name": "a"
+    }
+  },
+  "list_join": {
+    "e": "list_join",
+    "input": {
+      "e": "col",
+      "name": "a"
+    },
+    "separator": ","
+  },
+  "list_position": {
+    "e": "list_position",
+    "input": {
+      "e": "col",
+      "name": "a"
+    },
+    "value": {
+      "int": 5
+    }
+  },
+  "list_set": {
+    "e": "list_set",
+    "fn": "array_intersect",
+    "left": {
+      "e": "col",
+      "name": "a"
+    },
+    "right": {
+      "e": "col",
+      "name": "b"
+    }
+  },
+  "list_slice_full": {
+    "e": "list_slice",
+    "input": {
+      "e": "col",
+      "name": "a"
+    },
+    "length": 2,
+    "offset": 1
+  },
+  "list_slice_min": {
+    "e": "list_slice",
+    "input": {
+      "e": "col",
+      "name": "a"
+    },
+    "offset": 1
+  },
+  "list_transform": {
+    "e": "list_transform",
+    "func": {
+      "e": "binary",
+      "left": {
+        "e": "col",
+        "name": "x"
+      },
+      "op": "multiply",
+      "right": {
+        "e": "lit",
+        "value": {
+          "int": 2
+        }
+      }
+    },
+    "input": {
+      "e": "col",
+      "name": "a"
+    }
+  },
+  "lit_bool": {
+    "e": "lit",
+    "value": {
+      "bool": true
+    }
+  },
+  "lit_date": {
+    "e": "lit",
+    "value": {
+      "date": 18701
+    }
+  },
+  "lit_datetime": {
+    "e": "lit",
+    "value": {
+      "timestamp": 1615815930000000
+    }
+  },
+  "lit_float": {
+    "e": "lit",
+    "value": {
+      "float": 1.5
+    }
+  },
+  "lit_int": {
+    "e": "lit",
+    "value": {
+      "int": 7
+    }
+  },
+  "lit_str": {
+    "e": "lit",
+    "value": {
+      "str": "hello"
+    }
+  },
+  "make_struct": {
+    "e": "make_struct",
+    "fields": [
+      {
+        "name": "a",
+        "value": {
+          "e": "col",
+          "name": "x"
+        }
+      },
+      {
+        "name": "b",
+        "value": {
+          "e": "lit",
+          "value": {
+            "int": 1
+          }
+        }
+      }
+    ]
+  },
+  "map_element_at": {
+    "e": "map",
+    "fn": "element_at",
+    "input": {
+      "e": "col",
+      "name": "m"
+    },
+    "key": {
+      "str": "k"
+    }
+  },
+  "map_simple": {
+    "e": "map",
+    "fn": "map_keys",
+    "input": {
+      "e": "col",
+      "name": "m"
+    }
+  },
+  "math": {
+    "e": "math",
+    "fn": "abs",
+    "input": {
+      "e": "col",
+      "name": "x"
+    }
+  },
+  "math2": {
+    "e": "math2",
+    "fn": "pow",
+    "left": {
+      "e": "col",
+      "name": "x"
+    },
+    "right": {
+      "e": "lit",
+      "value": {
+        "int": 2
+      }
+    }
+  },
+  "not": {
+    "e": "not",
+    "input": {
+      "e": "col",
+      "name": "b"
+    }
+  },
+  "nullif": {
+    "e": "nullif",
+    "left": {
+      "e": "col",
+      "name": "x"
+    },
+    "right": {
+      "e": "lit",
+      "value": {
+        "int": 0
+      }
+    }
+  },
+  "sequence": {
+    "e": "sequence",
+    "start": {
+      "e": "lit",
+      "value": {
+        "int": 1
+      }
+    },
+    "step": {
+      "e": "lit",
+      "value": {
+        "int": 2
+      }
+    },
+    "stop": {
+      "e": "lit",
+      "value": {
+        "int": 10
+      }
+    }
+  },
+  "str_contains": {
+    "e": "str",
+    "fn": "contains",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "pattern": "x"
+  },
+  "str_replace": {
+    "e": "str",
+    "fn": "replace",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "pattern": "a",
+    "replacement": "b"
+  },
+  "str_simple": {
+    "e": "str",
+    "fn": "upper",
+    "input": {
+      "e": "col",
+      "name": "s"
+    }
+  },
+  "str_substr": {
+    "e": "str",
+    "fn": "substr",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "length": 3,
+    "start": 1
+  },
+  "strftime": {
+    "e": "strftime",
+    "format": "%Y-%m-%d",
+    "input": {
+      "e": "col",
+      "name": "d"
+    }
+  },
+  "strptime": {
+    "e": "strptime",
+    "format": "%Y-%m-%d",
+    "input": {
+      "e": "col",
+      "name": "s"
+    }
+  },
+  "struct_field": {
+    "e": "struct_field",
+    "field": "field",
+    "input": {
+      "e": "col",
+      "name": "s"
+    }
+  },
+  "video": {
+    "e": "video",
+    "fn": "decode",
+    "input": {
+      "e": "col",
+      "name": "clip"
+    }
+  },
+  "window_buckets": {
+    "e": "window_buckets",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "slide_micros": 500,
+    "width_micros": 1000
+  },
+  "window_start_min": {
+    "e": "window_start",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "width_micros": 1000
+  },
+  "window_start_origin": {
+    "e": "window_start",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "origin_micros": 500,
+    "width_micros": 1000
+  }
+}

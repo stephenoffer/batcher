@@ -24,9 +24,18 @@ class JoinOutputCol:
     alias: str
 
 
+# The join semantics the engine understands — the `join_type` wire vocabulary,
+# mirroring `bc_ir`'s join kinds. The user-facing `how="outer"` is normalized to
+# `"full"` and `cross_join` lowers to an `"inner"` equi-join, so neither reaches a
+# node; this is the complete set a `Join` may carry.
+JOIN_TYPES = frozenset({"inner", "left", "right", "full", "semi", "anti"})
+
 # Physical join algorithms the engine understands. A planner hint, not a semantic
 # change — every strategy yields the same relation (see `bc_ir::JoinStrategy`).
 JOIN_STRATEGIES = frozenset({"hash", "broadcast", "sort_merge"})
+
+# The nearest-match directions an ASOF join may search in.
+ASOF_DIRECTIONS = frozenset({"backward", "forward"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +46,7 @@ class Join(LogicalPlan):
     right: LogicalPlan
     left_keys: tuple[str, ...]
     right_keys: tuple[str, ...]
-    join_type: str  # inner|left|right|full|semi|anti
+    join_type: str  # one of JOIN_TYPES (inner|left|right|full|semi|anti)
     output: tuple[JoinOutputCol, ...]
     # Physical algorithm chosen by Kyber's SELECTION phase. Defaults to "hash"
     # (shuffle hash join); "broadcast" replicates the small build side. Both
@@ -56,6 +65,8 @@ class Join(LogicalPlan):
                 raise PlanError(f"join right key {k!r} not in right columns {sorted(right_cols)}")
         if len(self.left_keys) != len(self.right_keys):
             raise PlanError("join requires the same number of left and right keys")
+        if self.join_type not in JOIN_TYPES:
+            raise PlanError(f"unknown join type {self.join_type!r}; expected {sorted(JOIN_TYPES)}")
         if self.strategy not in JOIN_STRATEGIES:
             raise PlanError(f"unknown join strategy {self.strategy!r}; expected {JOIN_STRATEGIES}")
 
@@ -128,8 +139,9 @@ class AsofJoin(LogicalPlan):
             raise PlanError(f"asof_join right_on {self.right_on!r} not in right columns")
         if len(self.left_by) != len(self.right_by):
             raise PlanError("asof_join requires the same number of left/right `by` keys")
-        if self.direction not in ("backward", "forward"):
-            raise PlanError(f"asof_join direction must be backward|forward, got {self.direction!r}")
+        if self.direction not in ASOF_DIRECTIONS:
+            allowed = sorted(ASOF_DIRECTIONS)
+            raise PlanError(f"asof_join direction must be one of {allowed}, got {self.direction!r}")
 
     def to_ir(self) -> dict[str, Any]:
         return {

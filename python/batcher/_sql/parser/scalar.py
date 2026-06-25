@@ -16,6 +16,7 @@ from batcher._sql.parser.literals import (
     _UNARY_STR,
     _apply_interval,
     _dtype_name,
+    _fold_const_arith,
     _like_to_regex,
     _literal,
     _temporal_literal,
@@ -142,6 +143,12 @@ def _scalar(tr, node) -> Expr:
     if isinstance(node, exp.DateDiff):
         return _date_diff(tr, node)
 
+    # Fold `literal <op> literal` arithmetic with exact decimal semantics before the
+    # generic binop path (so `0.06 + 0.01` is `0.07`, not IEEE `0.0699…`).
+    folded = _fold_const_arith(node)
+    if folded is not None:
+        return folded
+
     binop = _BINOPS.get(type(node))
     if binop is not None:
         return binop(tr._scalar(node.this), tr._scalar(node.expression))
@@ -208,7 +215,7 @@ def _scalar_function(tr, node):
     return None
 
 
-# Typed `Array*`/`SortArray` reduction nodes → `.arr` method name.
+# Typed `Array*`/`SortArray` reduction nodes → `.list` method name.
 _LIST_REDUCE = {
     "ArrayMin": "min",
     "ArrayMax": "max",
@@ -216,7 +223,7 @@ _LIST_REDUCE = {
     "ArrayDistinct": "unique",
     "SortArray": "sort",
 }
-# `list_*` functions that sqlglot parses as `Anonymous` → `.arr` method name.
+# `list_*` functions that sqlglot parses as `Anonymous` → `.list` method name.
 _LIST_ANON = {
     "list_sum": "sum",
     "list_avg": "mean",
@@ -231,30 +238,30 @@ _LIST_ANON = {
 
 
 def _list_function(tr, node):
-    """List/array operations dispatched to the `.arr` namespace, or None."""
+    """List/array operations dispatched to the `.list` namespace, or None."""
     from sqlglot import expressions as exp
 
     if isinstance(node, exp.ArraySize):  # array_length / len(list)
-        return tr._scalar(node.this).arr.len()
+        return tr._scalar(node.this).list.len()
     if isinstance(node, exp.ArrayContains):  # list_contains(a, v)
-        return tr._scalar(node.this).arr.contains(_raw_value(node.expression))
+        return tr._scalar(node.this).list.contains(_raw_value(node.expression))
     if isinstance(node, exp.Bracket):  # a[i] — sqlglot already 0-bases the index
         idxs = node.expressions
         if len(idxs) == 1 and not isinstance(idxs[0], exp.Slice):
-            return tr._scalar(node.this).arr.get(int(idxs[0].name))
+            return tr._scalar(node.this).list.get(int(idxs[0].name))
         return None  # slices (a[lo:hi]) not supported
     reduce = _LIST_REDUCE.get(type(node).__name__)
     if reduce is not None:
-        return getattr(tr._scalar(node.this).arr, reduce)()
+        return getattr(tr._scalar(node.this).list, reduce)()
     if isinstance(node, exp.Anonymous):
         method = _LIST_ANON.get(node.name.lower())
         if method is not None and node.expressions:
-            return getattr(tr._scalar(node.expressions[0]).arr, method)()
+            return getattr(tr._scalar(node.expressions[0]).list, method)()
     return None
 
 
 def _raw_value(node):
-    """The Python value of a literal node (for `.arr.contains`)."""
+    """The Python value of a literal node (for `.list.contains`)."""
     from sqlglot import expressions as exp
 
     if not isinstance(node, exp.Literal):
@@ -326,10 +333,18 @@ def _scalar_subquery(tr, select_node) -> Expr:
     # Detach from the outer AST so ancestor walks (e.g. _has_aggregate's
     # Subquery/Window checks) stay within the subquery's own scope.
     select_node = select_node.copy()
-    inner_ds = tr.statement(select_node)
-    if len(inner_ds.columns) != 1:
-        raise NotImplementedError("scalar subquery must project exactly one column")
-    table = inner_ds.collect()
+    # The subquery may itself aggregate, which resets the translator's aggregate
+    # bookkeeping (``_agg_map`` / ``_agg_n``). Save and restore it so the enclosing
+    # query's aggregate columns still resolve after the subquery is evaluated — e.g.
+    # ``HAVING sum(x) > (SELECT sum(x) * k FROM ...)`` (TPC-H Q11).
+    saved_agg_map, saved_agg_n = tr._agg_map, tr._agg_n
+    try:
+        inner_ds = tr.statement(select_node)
+        if len(inner_ds.columns) != 1:
+            raise NotImplementedError("scalar subquery must project exactly one column")
+        table = inner_ds.collect()
+    finally:
+        tr._agg_map, tr._agg_n = saved_agg_map, saved_agg_n
     if table.num_rows != 1:
         raise NotImplementedError(
             f"scalar subquery must return exactly one row, got {table.num_rows}"

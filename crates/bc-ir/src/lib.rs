@@ -26,7 +26,7 @@ pub use error::IrError;
 ///
 /// Boxed children keep the enum a thin tree; the JSON tag is `op`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RelOp {
     /// Read an input relation. `source_id` indexes into the input relations
     /// supplied alongside the plan (an in-memory table today; a file/stream
@@ -436,5 +436,40 @@ impl RelOp {
     /// Parse a plan from the JSON IR document emitted by the Python control plane.
     pub fn from_json(s: &str) -> Result<Self, IrError> {
         serde_json::from_str(s).map_err(IrError::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A well-formed node round-trips, and an *unknown* field is a hard parse error
+    /// rather than a silently-ignored key. `deny_unknown_fields` is the boundary
+    /// guard: a Python `to_ir()` that emits a stale/misspelled IR key (e.g. an
+    /// `offset` that should be `skip`) fails loudly at deserialization instead of
+    /// being dropped to its default and producing a silent wrong result.
+    #[test]
+    fn unknown_relop_field_is_rejected() {
+        assert!(RelOp::from_json(r#"{"op":"scan","source_id":0}"#).is_ok());
+        let drift = RelOp::from_json(r#"{"op":"scan","source_id":0,"bogus":1}"#);
+        assert!(
+            drift.is_err(),
+            "an unknown RelOp field must be rejected, not ignored"
+        );
+    }
+
+    /// The guard reaches `Expr` (the other half of the wire contract) too: an unknown
+    /// key inside a nested predicate expression is rejected.
+    #[test]
+    fn unknown_expr_field_is_rejected() {
+        let ok = r#"{"op":"filter","input":{"op":"scan","source_id":0},
+                     "predicate":{"e":"col","name":"a"}}"#;
+        assert!(RelOp::from_json(ok).is_ok());
+        let drift = r#"{"op":"filter","input":{"op":"scan","source_id":0},
+                       "predicate":{"e":"col","name":"a","bogus":true}}"#;
+        assert!(
+            RelOp::from_json(drift).is_err(),
+            "an unknown Expr field must be rejected"
+        );
     }
 }

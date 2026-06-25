@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
+use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, StringArray, UInt32Array};
 use arrow::compute::{cast, take};
 use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
@@ -73,11 +73,23 @@ pub fn partition_by_key_arrays(
             .collect()
     };
 
-    // Counting-sort partition: histogram → prefix-sum offsets → stable scatter into
-    // one contiguous index buffer. This avoids the per-bucket `Vec` reallocation the
-    // naive push-per-row layout incurs, and each bucket ends up a contiguous slice.
+    scatter_into_buckets(batch, &part_of, num_partitions)
+}
+
+/// Counting-sort scatter: given a per-row bucket id, gather each bucket's rows into
+/// its own `RecordBatch`. Histogram → prefix-sum offsets → stable scatter into one
+/// contiguous index buffer, so each bucket is a contiguous slice and we pay no
+/// per-bucket `Vec` reallocation. Shared by the hash and range partitioners — both
+/// differ only in *how* they compute the bucket id, not in how they materialize the
+/// buckets. Every `part_of[i]` must be `< num_partitions`.
+fn scatter_into_buckets(
+    batch: &RecordBatch,
+    part_of: &[u32],
+    num_partitions: usize,
+) -> Result<Vec<RecordBatch>, RuntimeError> {
+    let n = part_of.len();
     let mut offsets = vec![0u32; num_partitions + 1];
-    for &b in &part_of {
+    for &b in part_of {
         offsets[b as usize + 1] += 1;
     }
     for b in 0..num_partitions {
@@ -99,6 +111,76 @@ pub fn partition_by_key_arrays(
             )
         })
         .collect()
+}
+
+/// Range-partition `batch` into `n_buckets` globally-ordered buckets by the leading
+/// sort key at `key_index` and the ascending `boundaries`. Bucket `b` receives rows
+/// whose key falls in the `b`-th open interval of the boundaries
+/// (`searchsorted(boundaries, key, side="right")`), so equal keys never span a
+/// boundary and a concatenation of the per-bucket sorts is globally ordered. Nulls go
+/// to the front or back bucket to match single-node null ordering: `front` is the
+/// bucket the driver concatenates first (`n_buckets-1` for a descending sort, else
+/// `0`), and nulls land there when `nulls_first`, else at the opposite end.
+///
+/// This is the Rust counterpart of the hash [`partition_by_keys`] for the
+/// distributed-sort path. The key is compared as `f64` — bit-identical to the
+/// previous NumPy `searchsorted` over `to_numpy()` keys (the boundaries are
+/// `f64` quantiles), and `NaN` sorts last exactly as NumPy places it.
+pub fn range_partition_by_key(
+    batch: &RecordBatch,
+    key_index: usize,
+    boundaries: &[f64],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<RecordBatch>, RuntimeError> {
+    assert!(n_buckets >= 1);
+    if n_buckets == 1 {
+        return Ok(vec![batch.clone()]);
+    }
+    let front = if descending { n_buckets - 1 } else { 0 };
+    let null_bucket = if nulls_first {
+        front
+    } else {
+        n_buckets - 1 - front
+    } as u32;
+
+    // Compare the key in f64 (the boundaries are f64 quantiles), matching the prior
+    // `kc.to_numpy()` + `np.searchsorted` path bit-for-bit. Guard non-numeric keys:
+    // Arrow would happily parse a string like "12" to 12.0, which would disagree with
+    // the single-node *lexical* string sort — exactly what the old `to_numpy()` on a
+    // string column refused to do.
+    let key_col = batch.column(key_index);
+    if !key_col.data_type().is_numeric() {
+        return Err(RuntimeError::NonNumericRangeKey {
+            dtype: key_col.data_type().to_string(),
+        });
+    }
+    let key = cast(key_col, &DataType::Float64)?;
+    let key = key.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+        RuntimeError::NonNumericRangeKey {
+            dtype: key_col.data_type().to_string(),
+        }
+    })?;
+
+    let part_of: Vec<u32> = (0..batch.num_rows())
+        .map(|i| {
+            if key.is_null(i) {
+                null_bucket
+            } else {
+                let v = key.value(i);
+                // NumPy orders NaN last, so a NaN key lands in the highest bucket.
+                let id = if v.is_nan() {
+                    boundaries.len()
+                } else {
+                    boundaries.partition_point(|&b| b <= v)
+                };
+                id as u32
+            }
+        })
+        .collect();
+
+    scatter_into_buckets(batch, &part_of, n_buckets)
 }
 
 /// Skew-aware partitioning for a **single-key** distributed join: a *hot* key's
@@ -268,6 +350,118 @@ mod tests {
             // Stable: keys within a bucket stay in ascending (original) order.
             assert!(col.values().windows(2).all(|w| w[0] < w[1]));
         }
+    }
+
+    /// The bucket id each row of a key column lands in, mirroring the reference
+    /// `np.searchsorted(boundaries, key, side="right")` + null routing, for the
+    /// equal-keys / nulls / descending / nulls_first cases.
+    fn ids(
+        keys: Vec<Option<i64>>,
+        boundaries: &[f64],
+        n_buckets: usize,
+        nulls_first: bool,
+        descending: bool,
+    ) -> Vec<usize> {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(Int64Array::from(keys.clone())) as ArrayRef,
+        )])
+        .unwrap();
+        let buckets =
+            range_partition_by_key(&batch, 0, boundaries, n_buckets, nulls_first, descending)
+                .unwrap();
+        // Reconstruct each original row's bucket from the per-bucket key values.
+        let mut out = vec![usize::MAX; keys.len()];
+        for (b, part) in buckets.iter().enumerate() {
+            let col = part
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for r in 0..part.num_rows() {
+                let val = if col.is_null(r) {
+                    None
+                } else {
+                    Some(col.value(r))
+                };
+                // First not-yet-assigned matching row (stable scatter preserves order).
+                let pos = keys
+                    .iter()
+                    .enumerate()
+                    .find(|(i, k)| out[*i] == usize::MAX && **k == val)
+                    .map(|(i, _)| i)
+                    .unwrap();
+                out[pos] = b;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn range_buckets_match_searchsorted_right() {
+        // boundaries [10, 20] → 3 buckets; equal-to-boundary goes to the higher bucket
+        // (side="right"), so 10→bucket1, 20→bucket2, and equal keys never split.
+        let got = ids(
+            vec![Some(5), Some(10), Some(15), Some(20), Some(25), Some(10)],
+            &[10.0, 20.0],
+            3,
+            false,
+            false,
+        );
+        assert_eq!(got, vec![0, 1, 1, 2, 2, 1]);
+    }
+
+    #[test]
+    fn range_nulls_route_to_the_correct_end() {
+        // Ascending: front bucket is 0. nulls_first → nulls in bucket 0; else top bucket.
+        assert_eq!(
+            ids(vec![None, Some(5), Some(25)], &[10.0, 20.0], 3, true, false),
+            vec![0, 0, 2]
+        );
+        assert_eq!(
+            ids(
+                vec![None, Some(5), Some(25)],
+                &[10.0, 20.0],
+                3,
+                false,
+                false
+            ),
+            vec![2, 0, 2]
+        );
+        // Descending: front bucket is n-1. nulls_first → nulls in the top bucket; the
+        // driver concatenates high→low so that places them first overall.
+        assert_eq!(
+            ids(vec![None, Some(5)], &[10.0, 20.0], 3, true, true),
+            vec![2, 0]
+        );
+        assert_eq!(
+            ids(vec![None, Some(5)], &[10.0, 20.0], 3, false, true),
+            vec![0, 0]
+        );
+    }
+
+    #[test]
+    fn range_empty_boundaries_single_bucket_of_non_nulls() {
+        // No boundaries (e.g. a single reducer or an all-null sample) → every non-null
+        // key in bucket 0, nulls at the configured end.
+        assert_eq!(
+            ids(vec![Some(3), Some(99), None], &[], 2, false, false),
+            vec![0, 0, 1]
+        );
+        // n_buckets == 1 returns the batch unchanged → all rows in bucket 0.
+        assert_eq!(ids(vec![Some(3), None], &[], 1, false, false), vec![0, 0]);
+    }
+
+    #[test]
+    fn range_partition_rejects_non_numeric_key() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(StringArray::from(vec!["12", "3"])) as ArrayRef,
+        )])
+        .unwrap();
+        // A string key must error, not be parsed to a float (which would disagree with
+        // the single-node lexical string sort).
+        assert!(range_partition_by_key(&batch, 0, &[5.0], 2, false, false).is_err());
     }
 
     /// Count inner-join output pairs between a probe and a build batch on column 0

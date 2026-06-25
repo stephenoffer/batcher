@@ -36,8 +36,9 @@ def sentence_transformer_encoder(
 
     Drops into ``ds.ml.map_batches`` / ``ds.ml.embed`` (instantiate-once-per-worker), so
     text embedding runs **distributed and GPU-aware** — the provider-pluggable
-    ``embed_text`` form (cf. Daft's ``embed_text``). The embedding is appended as a
-    fixed-shape-tensor column. Needs ``sentence-transformers`` (``batcher-engine[st]``).
+    model-id form of ``ds.ml.embed`` (cf. Daft's ``embed_text``). The embedding is
+    appended as a fixed-shape-tensor column. Needs ``sentence-transformers``
+    (``batcher-engine[st]``).
     """
 
     class _STEncoder:
@@ -47,7 +48,7 @@ def sentence_transformer_encoder(
             except ImportError as exc:  # pragma: no cover - optional extra
                 from batcher._internal.errors import BackendError
 
-                msg = "embed_text needs: pip install 'batcher-engine[st]'"
+                msg = "ds.ml.embed(<model id>) needs: pip install 'batcher-engine[st]'"
                 raise BackendError(msg) from exc
             self._model = SentenceTransformer(model, device=device)
 

@@ -67,6 +67,9 @@ def _select(tr, node) -> Dataset:
     # AST rewrites done up front so the normal aggregate path handles them.
     node = node.transform(_bool_agg_to_filter)
     node = node.transform(_filter_to_case)
+    # A self-join (same table aliased twice) is rewritten so the alias-blind column
+    # resolver sees distinct, uniquely-named columns.
+    tr._rewrite_self_joins(node)
     # Inline `WINDOW w AS (...)` definitions into the `OVER w` references.
     tr._inline_named_windows(node)
 
@@ -221,6 +224,10 @@ def _join_on(tr, ds: Dataset, right: Dataset, on, how: str) -> Dataset:
         )
     left_keys = [lk for lk, _ in eq_pairs]
     right_keys = [rk for _, rk in eq_pairs]
+    # An ON residual on an outer join can't be a post-join filter — that would drop
+    # the null-extended rows. Pre-filter the nullable side instead (or reject).
+    if extra is not None and how != "inner":
+        ds, right, extra = _outer_join_residual(tr, ds, right, extra, how)
     if extra is not None:
         _reject_ambiguous_residual(extra, ds, right, set(left_keys) | set(right_keys))
     if left_keys == right_keys:
@@ -230,6 +237,32 @@ def _join_on(tr, ds: Dataset, right: Dataset, on, how: str) -> Dataset:
     if extra is not None:
         ds = ds.filter(tr._scalar(extra))
     return ds
+
+
+def _outer_join_residual(tr, left: Dataset, right: Dataset, extra, how: str):
+    """Resolve a non-equi ON residual on an outer join by pre-filtering the nullable side.
+
+    In ``A LEFT JOIN B ON A.k = B.k AND <residual>``, the residual filters which B
+    rows are eligible to match — it is *not* a predicate on the result (B columns are
+    null where nothing matched, and those left rows must survive). When the residual
+    references only the null-extended side, applying it to that side before the join
+    is exactly correct. A residual touching the preserved side, or a FULL join (both
+    sides preserved), cannot be expressed this way and is rejected rather than
+    silently mis-answered. Returns ``(left, right, remaining_residual_or_None)``.
+    """
+    from sqlglot import expressions as exp
+
+    refs = {c.name for c in extra.find_all(exp.Column)}
+    left_cols, right_cols = set(left.columns), set(right.columns)
+    if how == "left" and refs <= right_cols and not (refs & left_cols):
+        return left, right.filter(tr._scalar(extra)), None
+    if how == "right" and refs <= left_cols and not (refs & right_cols):
+        return left.filter(tr._scalar(extra)), right, None
+    raise NotImplementedError(
+        f"{how} join with a non-equi ON condition that references the preserved side "
+        f"(or a FULL join) is not supported; the engine join is equi-only — move the "
+        f"condition to a WHERE clause or pre-filter the table"
+    )
 
 
 def _reject_ambiguous_residual(extra, left: Dataset, right: Dataset, keys: set[str]) -> None:

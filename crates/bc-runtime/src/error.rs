@@ -25,6 +25,9 @@ pub enum RuntimeError {
     #[error("malformed spilled partial: expected {expected} columns, got {got}")]
     MalformedPartial { expected: usize, got: usize },
 
+    #[error("range-partition key must be a numeric column, got {dtype}")]
+    NonNumericRangeKey { dtype: String },
+
     #[error("spill i/o error: {0}")]
     Io(#[from] std::io::Error),
 

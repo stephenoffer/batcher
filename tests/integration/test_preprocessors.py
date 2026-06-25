@@ -14,7 +14,6 @@ import pytest
 
 import batcher as bt
 from batcher.ml.preprocessors import (
-    Chain,
     Concatenator,
     LabelEncoder,
     MaxAbsScaler,
@@ -128,10 +127,14 @@ def test_concatenator_builds_list_column():
     assert out.column("f").to_pylist() == [[1.0, 3.0], [2.0, 4.0]]
 
 
-def test_chain_imputer_then_scaler():
+def test_sequenced_imputer_then_scaler():
+    # Compose by sequencing: fit each step on the prior step's output, then reuse
+    # the same fitted objects on any split.
     ds = bt.from_pydict({"x": [1.0, None, 3.0, None]})
-    pipe = Chain([SimpleImputer(["x"], strategy="constant", fill_value=0.0), StandardScaler(["x"])])
-    got = _col(pipe.fit_transform(ds), "x")
+    imputer = SimpleImputer(["x"], strategy="constant", fill_value=0.0)
+    scaler = StandardScaler(["x"])
+    imputed = imputer.fit_transform(ds)
+    got = _col(scaler.fit_transform(imputed), "x")
     filled = np.array([1.0, 0.0, 3.0, 0.0])
     assert np.allclose(got, (filled - filled.mean()) / filled.std())
 

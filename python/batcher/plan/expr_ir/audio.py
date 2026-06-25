@@ -8,28 +8,23 @@ audio decode off the per-row Python ``map_batches`` path into the native data pl
 
 from __future__ import annotations
 
-from typing import Any
-
 from batcher.plan.expr_ir.core import Expr
+from batcher.plan.expr_ir.node_base import IRNode, child, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
 
 __all__ = ["AudioFunc", "_AudioNamespace"]
 
 
-class AudioFunc(Expr):
+@expr_node
+class AudioFunc(IRNode):
     """An audio decode op over a binary (audio-bytes) sub-expression (via `.audio`).
 
     `decode` reads each clip's metadata; `to_waveform` decodes to a mono signal.
     """
 
-    __slots__ = ("fn", "input")
-
-    def __init__(self, fn: str, input: Expr) -> None:
-        self.fn = fn
-        self.input = input
-
-    def to_ir(self) -> dict[str, Any]:
-        return {"e": ExprTag.AUDIO, "fn": self.fn, "input": self.input.to_ir()}
+    tag = ExprTag.AUDIO
+    fn: str = scalar()
+    input: Expr = child()
 
 
 class _AudioNamespace:

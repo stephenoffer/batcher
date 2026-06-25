@@ -142,14 +142,13 @@ print(out.to_pydict())
 | `bt.col(name)` | reference a column |
 | `bt.lit(value)` | a constant |
 | `bt.when(c).then(v)...otherwise(d)` | SQL CASE |
-| `bt.coalesce(*exprs)` | first non-null |
+| `bt.coalesce(*exprs)` | first non-null per row (also the SQL `IFNULL` case) |
 | `bt.nullif(a, b)` | null when `a == b` |
 | `bt.greatest(*exprs)` / `bt.least(*exprs)` | row-wise extreme |
 | `bt.array(*exprs)` | build a list column |
 | `bt.atan2(y, x)` | two-argument arctangent |
 | `bt.count()` | COUNT(*) aggregate |
 | `bt.iff(condition, if_true, if_false)` | `if_true` where `condition` is true, else `if_false` (DuckDB `IFF`) |
-| `bt.ifnull(value, fallback)` | `value` unless it is NULL, then `fallback` |
 | `bt.nanvl(value, fallback)` | `value` unless it is NaN, then `fallback` (Spark `nanvl`) |
 | `bt.concat(*exprs)` | concatenate values into one string |
 | `bt.concat_ws(separator, *exprs)` | concatenate values with `separator` between them |
@@ -166,8 +165,8 @@ print(out.to_pydict())
 | `bt.corr(x, y)` | Pearson correlation (aggregate) |
 | `bt.covar_pop(x, y)` / `bt.covar_samp(x, y)` | population / sample covariance (aggregate) |
 | `bt.nth_value(expr, n)` | the `n`-th value of the ordered partition (window) |
-| `bt.now()` / `bt.current_timestamp()` | current timestamp, bound at plan-build time |
-| `bt.current_date()` / `bt.today()` | today's date, bound at plan-build time |
+| `bt.current_timestamp()` | current timestamp, bound at plan-build time |
+| `bt.current_date()` | today's date, bound at plan-build time |
 | `bt.date_part(part, expr)` | extract a calendar field (`year`/`month`/`dow`/…) |
 | `bt.date_add(expr, days)` | add a whole number of `days` to a date/time column (Spark `date_add`) |
 | `bt.date_sub(expr, days)` | subtract a whole number of `days` from a date/time column (Spark `date_sub`) |
@@ -176,7 +175,6 @@ print(out.to_pydict())
 
 | Call | Returns |
 | --- | --- |
-| `bt.catalog` | a process-local registry of named tables for SQL and cross-query reuse (`.register`, `.table`) |
 | `bt.date_range(start, end, *, interval_days=1, name="date")` | a one-column Dataset of dates (inclusive ISO `YYYY-MM-DD`) — the date-dimension generator |
 | `bt.compact(path, *, target_size_mb=128.0, num_files=None, by=None, format=None, **opts)` | rewrite many small files at `path` into fewer larger ones in place; returns a `WriteManifest` |
 | `bt.engine_version()` | the version reported by the compiled Rust engine (`str`) |
@@ -214,14 +212,13 @@ print(out.to_pydict())
 | --- | --- |
 | `.str` | casing, trim, search, slice, pad, encode (`upper`, `contains`, `like`, `ilike`, `substr`, `split`, `regexp_replace`, ...) |
 | `.dt` | calendar parts (`year`, `month`, `day`, `hour`, `dayname`, `quarter`, `truncate`, ...) |
-| `.list` (alias `.arr`) | list reductions and reshaping (`len`, `sum`, `sort`, `get`, `join`, `contains`, ...) |
+| `.list` | list reductions and reshaping (`len`, `sum`, `sort`, `get`, `join`, `contains`, ...) plus vector ops for retrieval/RAG (`cosine_similarity`, `cosine_distance`, `l2_distance`, `dot`, `normalize`) |
 | `.struct` | `field(name)` |
-| `.map` | Arrow `Map` columns: `keys()`, `values()`, `get(key)` / `element_at(key)` |
+| `.map` | Arrow `Map` columns: `keys()`, `values()`, `get(key)` |
 | `.json` | `extract_string(path)` |
 | `.image` | `decode()`, `to_tensor(width, height)`, `resize(width, height)` |
 | `.audio` | native WAV/FLAC decode: `decode()` (metadata struct), `to_waveform()` (mono `List<Float32>`) |
 | `.video` | native FFmpeg decode: `decode()` (metadata struct) — needs the `video` engine build feature |
-| `.embedding` | vector ops for retrieval/RAG (`cosine_similarity`, `cosine_distance`, `l2_distance`, `dot`, `normalize`) |
 
 ## SQL
 

@@ -128,6 +128,9 @@ class _Translator:
     def _reject_correlated(self, select_node) -> None:
         subquery._reject_correlated(select_node)
 
+    def _rewrite_self_joins(self, select_node) -> None:
+        subquery._rewrite_self_joins(self, select_node)
+
     # --- grouping / aggregation (grouping.py) ------------------------------
     def _grouping_sets_union(self, node, group) -> Dataset:
         return grouping._grouping_sets_union(self, node, group)

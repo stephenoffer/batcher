@@ -124,9 +124,9 @@ print(out.to_pydict())
 
 {py:obj}`bt.Session <batcher.Session>` is the DuckDB-connection / SparkSession
 analogue: a context that holds a table catalog, registered Python functions, and a
-dialect. The module-level `bt.sql` and `bt.catalog` delegate to a shared default
-session, so the global spelling keeps working; build a `Session` to isolate a
-workload or pick a non-default dialect.
+dialect. The module-level `bt.sql` and `bt.register_function` delegate to a shared
+default session, so the global zero-setup spelling keeps working; build a `Session`
+to register named tables, isolate a workload, or pick a non-default dialect.
 
 ```python
 s = bt.Session()

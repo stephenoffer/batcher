@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import functools
 import json
 import os
 from collections.abc import Iterator
@@ -39,6 +40,38 @@ __all__ = [
     "config_context",
     "set_config",
 ]
+
+# Wire-contract key order for the Rust engine-config payload (`bc_ir::EngineConfig`).
+# Single source of truth: both the dict builder and the memoized serializer key off
+# this tuple, so the JSON shape can never drift between the two code paths.
+_ENGINE_CONFIG_FIELDS = (
+    "morsel_rows",
+    "morsel_bytes",
+    "parallelism",
+    "memory_budget_bytes",
+    "spill_dir",
+    "fuse_linear",
+    # Performance-threshold knobs (mirror `bc_arrow::RuntimeTuning`).
+    "bloom_fp_rate",
+    "bloom_min_build_rows",
+    "window_parallel_row_threshold",
+    "radix_parallel_threshold",
+    "sort_merge_fanin",
+    "skew_bucket_factor",
+    "skew_min_bucket_rows",
+    "skew_min_bucket_bytes",
+)
+
+
+@functools.lru_cache(maxsize=128)
+def _engine_config_json(values: tuple[object, ...]) -> str:
+    """Memoized engine-config serialization, keyed by its (hashable) value tuple.
+
+    The base payload depends only on a handful of frozen knobs, but it is serialized
+    on every native call and every streaming micro-batch. Caching by value collapses
+    that to one `json.dumps` per distinct configuration.
+    """
+    return json.dumps(dict(zip(_ENGINE_CONFIG_FIELDS, values, strict=True)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +120,50 @@ class ExecutionConfig:
     # still requests this many cores, so an IO-bound stage never asks for an
     # unschedulable sliver of a CPU (mirrors the GPU fraction's 0.25 floor).
     cpu_share_min: float = 0.25
+    # Adaptive morsel sizing: shrink the per-morsel (rows, bytes) target under memory
+    # pressure so the streaming working set stays bounded when memory is tight — the
+    # "size blocks to memory" lever. Result-invariant (a morsel only batches data, it
+    # never changes the output), so a query's result is identical whether this is on or
+    # off. On by default: when memory is NOT under pressure the configured
+    # `morsel_rows`/`morsel_bytes` target is used unchanged (so the small-query fast path
+    # and single-node==distributed equivalence are byte-identical); the target only
+    # shrinks once the live `PressureMonitor` reports ELEVATED or worse. Set to False to
+    # pin the static target regardless of pressure.
+    adaptive_morsel_sizing: bool = True
+    # Fuse runs of linear, per-morsel streaming operators (Filter/Project) into a single
+    # pass over the input's morsels in the parallel executor, instead of one rayon
+    # dispatch + intermediate buffer per operator. Result-invariant (same rows, same
+    # order — verified against the sequential oracle and the full DuckDB differential
+    # suite); shipped to Rust as `EngineConfig.fuse_linear`. On by default — it only
+    # engages on a chain of ≥2 fusable ops (so single-op and breaker-only plans are
+    # untouched) and is a measured win on linear pipelines with no regression elsewhere.
+    # Set to False to pin the staged operator-at-a-time path.
+    fuse_linear: bool = True
+    # --- Performance-threshold knobs (power-user perf tuning) --------------------
+    # These mirror `bc_arrow::RuntimeTuning` / `bc_ir::EngineConfig` and tune *how*
+    # the parallel executor runs an operator (parallel-vs-serial thresholds, the
+    # probe bloom, merge fan-in, skew detection). They are performance-only: a query
+    # produces the identical result at any setting. Each default equals the Rust
+    # const it replaced, so leaving them untouched is bit-identical to the old engine.
+    # Reach for these only to tune a known hot path; most users never set them.
+    #
+    # False-positive rate for the hash-join probe-side bloom pre-filter.
+    bloom_fp_rate: float = 0.01
+    # Build-row floor above which the probe bloom pays for itself.
+    bloom_min_build_rows: int = 1 << 16
+    # Window row count above which per-partition sorts run across cores.
+    window_parallel_row_threshold: int = 1 << 15
+    # Concatenated-input row count above which aggregate `combine` regroups via
+    # parallel hash-radix partitioning.
+    radix_parallel_threshold: int = 200_000
+    # Maximum runs merged per pass in the external (spilling) sort's k-way merge.
+    sort_merge_fanin: int = 16
+    # A join bucket is "hot" when it exceeds this multiple of the average bucket.
+    skew_bucket_factor: int = 4
+    # Absolute row floor below which a join bucket is never treated as skewed.
+    skew_min_bucket_rows: int = 4 * 16_384
+    # Absolute byte floor below which a join bucket is never treated as skewed.
+    skew_min_bucket_bytes: int = 4 * (1 << 20)
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,13 +184,20 @@ class MemoryConfig:
 
     soft_limit: float = 0.85  # throttle at 85% of the envelope
     hard_limit: float = 0.90  # spill at 90%
-    # Hard memory cap in bytes for the buffer pool / spill decision. None derives it
-    # from system RAM; set it to honor a container/cgroup limit the OS won't report.
-    # Setting it also opts the in-memory engine into out-of-core spilling: the budget
-    # shipped to the data plane is this cap × `hard_limit` (see `engine_config_json`),
-    # and the Rust runtime memory pool spills stateful operators that exceed it
-    # instead of letting the process OOM.
+    # Hard memory cap in bytes for the buffer pool / spill decision. `None` (the
+    # default) is *auto-sensed*: the `api` layer fills it once at the terminal-op
+    # boundary from the live memory envelope (host RAM, honoring a container/cgroup
+    # limit) and freezes it for the query — so a zero-config query spills stateful
+    # operators out of core (budget = cap × `hard_limit`, shipped to the data plane)
+    # instead of OOMing. Set it explicitly to pin a cap the OS won't report; set
+    # `unbounded_memory` to opt out of auto-sensing and stay fully in-memory.
     max_memory_bytes: int | None = None
+    # Opt out of the auto-sensed spill budget: keep the in-memory fast path with no
+    # out-of-core spilling in the data-plane engine (the pre-auto-tuning behavior).
+    # The data-plane spill budget is then 0 (unbounded) regardless of `max_memory_bytes`;
+    # a `max_memory_bytes` still set continues to bound the control-plane admission
+    # envelope. For power users who would rather a query fail fast than spill to disk.
+    unbounded_memory: bool = False
     # Fallback total RAM (bytes) assumed when neither `max_memory_bytes` is set nor
     # the OS reports a usable figure. One home for what was a copy-pasted literal.
     default_total_bytes: int = 8 << 30  # 8 GiB
@@ -133,6 +217,34 @@ class MemoryConfig:
     # sub-buckets and reduced one at a time — so a *skewed* key set that overflows one
     # bucket degrades gracefully out-of-core instead of OOMing the reduce.
     spill_bucket_max_bytes: int = 128 << 20  # 128 MiB (compressed)
+    # Byte budget for the process-wide result cache (`Dataset.cache()`): the *storage*
+    # half of the memory envelope. The cache holds materialized Arrow results LRU and
+    # evicts to stay within this, yielding the RAM back to execution under pressure, so
+    # caching never grows the process without bound. Opt-in per dataset, so this only
+    # bounds what an explicitly-cached plan may retain.
+    result_cache_max_bytes: int = 256 << 20  # 256 MiB
+    # Cap on one streaming operator's in-memory state (windowed-aggregate partials,
+    # watermark-dedup keys, stream-join buffers). That state is bounded by the
+    # watermark *advancing*; a stalled watermark (an event-time gap, or one stream
+    # going quiet) lets it grow without bound. Exceeding this raises a clear
+    # `ResourceError` — a stalled-watermark / huge-key-space signal — instead of a
+    # silent OOM. `0` derives it from the hard memory budget (see
+    # `streaming_state_budget_bytes`); a positive value overrides.
+    streaming_state_max_bytes: int = 0
+
+    def streaming_state_budget_bytes(self) -> int:
+        """The effective per-operator streaming-state cap in bytes.
+
+        The explicit `streaming_state_max_bytes` when set, else the hard memory budget
+        (`max_memory_bytes` or `default_total_bytes`, scaled by `hard_limit`) so the
+        cap scales with the configured envelope rather than a fixed magic number.
+        """
+        if self.streaming_state_max_bytes > 0:
+            return self.streaming_state_max_bytes
+        base = (
+            self.max_memory_bytes if self.max_memory_bytes is not None else self.default_total_bytes
+        )
+        return int(base * self.hard_limit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,6 +425,12 @@ class MetadataConfig:
     the backend (in-process, SQLite, Redis, object storage) and how quickly old
     observations decay, so plans keep improving as a query is re-run.
 
+    The default `in_process` backend keeps learned stats for the life of the process
+    (plans improve within a session) but discards them on exit. To carry learning
+    across restarts, set `backend="sqlite"` — with no `uri` it persists to a per-user
+    file (``$BATCHER_HOME`` or ``~/.batcher/metadata.db``), so cross-run learning is a
+    single line with no path to manage.
+
     Examples:
         .. doctest::
 
@@ -322,6 +440,9 @@ class MetadataConfig:
     """
 
     backend: str = "in_process"  # "in_process" | "sqlite" | "redis" | "object_storage"
+    # Backend location. None means the backend's default — for `sqlite`, a persistent
+    # per-user file (see `metadata.backends.default_sqlite_uri`); pass `":memory:"` for
+    # an ephemeral SQLite store.
     uri: str | None = None
     decay_per_day: float = 0.1  # confidence half-life ~ a week
 
@@ -433,6 +554,44 @@ class DistributedConfig:
     # appropriate on a trusted/isolated cluster network. Also read from the
     # `BATCHER_SHUFFLE_TOKEN` env var so it can be injected without a config file.
     shuffle_token: str | None = None
+    # Same-node shared-memory shuffle transfer. When on, a mapper mirrors each bucket to
+    # a memory-mapped Arrow IPC file (Linux tmpfs `/dev/shm` when available, else a temp
+    # dir) and a same-node reducer in another process reads it via mmap — no gRPC, no
+    # loopback TCP (the plasma-class same-node fast path). Off by default: no shm writes,
+    # behavior unchanged. Best-effort and result-preserving — a shm miss falls back to
+    # Flight, which is bit-identical — so single-node==distributed holds either way.
+    shared_memory_transfer: bool = False
+    # Locality-aware reducer placement. When on, a reducer whose bucket is concentrated
+    # on one node is hosted on an actor on that node, so the bulk of its fetches become
+    # same-node (shared-memory/direct) hits instead of network transfers. Result-
+    # preserving (placement never changes the output, only where bytes travel), so it is
+    # safe; off by default keeps the plain round-robin placement. Pays off on a
+    # multi-node cluster with a skewed/co-partitioned shuffle; a no-op for an evenly
+    # spread bucket (no node dominates) and on a single node (everything is same-node).
+    locality_aware_scheduling: bool = False
+    # Persistent shuffle-actor fleet for the adaptive Flight path. When on, an adaptive
+    # multi-stage query reserves ONE placement group + worker fleet for the whole query
+    # and reuses it across breaker stages: a stage's intermediate stays partitioned on
+    # the workers (a `FlightMaterializedSource`) instead of being collected to the
+    # driver, and the next stage's mappers read their bucket in place. This removes the
+    # per-stage placement-group churn (which would otherwise deadlock — a new stage's
+    # gang reservation contending with the prior stage's still-held bundles) and the
+    # driver funnel. Off by default: with it off the Flight path collects between stages
+    # exactly as before, so single-node==distributed stays bit-identical. Result is
+    # unchanged either way (the mergeable algebra guarantees it); this only changes
+    # where the bytes live between stages.
+    persistent_fleet: bool = False
+    # Named fault-tolerance profile. ``"default"`` keeps the conservative budgets above
+    # (tuned for a stable on-demand cluster — minimal retries, no keepalive, no
+    # straggler speculation). ``"spot"`` hardens them as a bundle for a churning
+    # spot-node cluster where preemption is continuous: more actor restarts and
+    # recompute attempts to ride out repeated loss, HTTP/2 keepalive on to notice a
+    # dropped peer fast, and one speculative backup so a degraded-but-alive node cannot
+    # stall a barrier. The profile is applied *below* any value set explicitly, so
+    # precedence is `explicit override > profile > default` — pin an individual knob to
+    # override just that one while keeping the rest of the profile. Resolved once at
+    # every config entry point (see `batcher.config.profiles`).
+    resilience: str = "default"
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,12 +642,17 @@ class Config:
         Core ships this string alongside the plan IR on every native execution.
 
         `memory_budget_bytes` is the soft cap that makes the in-memory engine spill
-        stateful operators out of core. It is positive only when the user has set
-        `memory.max_memory_bytes` (the explicit spill-decision cap), scaled by
-        `memory.hard_limit`; otherwise it is `0` (unbounded — the engine stays fully
-        in-memory, so the default fast path is unchanged).
+        stateful operators out of core: `memory.max_memory_bytes` scaled by
+        `memory.hard_limit`. `max_memory_bytes` is auto-sensed by the `api` resolver
+        for a zero-config query (so the default path *does* get a budget and spills),
+        and is `0` (unbounded — stay fully in-memory) only when the user set
+        `memory.unbounded_memory` or a caller bypassed the resolver.
+
+        The result is memoized by the knob values: a frozen `Config` re-serializes
+        the same string on every native call (and every streaming micro-batch), so
+        the `json.dumps` runs once per distinct value tuple rather than per call.
         """
-        return json.dumps(self._engine_config_dict())
+        return _engine_config_json(self._engine_config_values())
 
     def engine_config_json_with(self, op_budgets: dict[int, int]) -> str:
         """`engine_config_json` plus Kyber's per-operator spill budgets.
@@ -502,20 +666,34 @@ class Config:
         callers with no `PhysicalOp` DAG (streaming, UDFs, distributed workers) are
         unaffected.
         """
+        if not op_budgets:
+            return self.engine_config_json()
         cfg = self._engine_config_dict()
-        if op_budgets:
-            cfg["op_budgets"] = {str(op_id): budget for op_id, budget in op_budgets.items()}
+        cfg["op_budgets"] = {str(op_id): budget for op_id, budget in op_budgets.items()}
         return json.dumps(cfg)
+
+    def _engine_config_values(self) -> tuple[object, ...]:
+        """The Rust-relevant execution knobs as a hashable tuple (the cache key)."""
+        return (
+            self.execution.morsel_rows,
+            self.execution.morsel_bytes,
+            self.execution.parallelism,
+            self._rust_memory_budget_bytes(),
+            self.memory.spill_dir,
+            self.execution.fuse_linear,
+            self.execution.bloom_fp_rate,
+            self.execution.bloom_min_build_rows,
+            self.execution.window_parallel_row_threshold,
+            self.execution.radix_parallel_threshold,
+            self.execution.sort_merge_fanin,
+            self.execution.skew_bucket_factor,
+            self.execution.skew_min_bucket_rows,
+            self.execution.skew_min_bucket_bytes,
+        )
 
     def _engine_config_dict(self) -> dict[str, object]:
         """The Rust-relevant execution knobs as a plain dict (shared serialization)."""
-        return {
-            "morsel_rows": self.execution.morsel_rows,
-            "morsel_bytes": self.execution.morsel_bytes,
-            "parallelism": self.execution.parallelism,
-            "memory_budget_bytes": self._rust_memory_budget_bytes(),
-            "spill_dir": self.memory.spill_dir,
-        }
+        return dict(zip(_ENGINE_CONFIG_FIELDS, self._engine_config_values(), strict=True))
 
     def validate(self) -> Config:
         """Validate the configuration, raising `ConfigError` on a bad value.
@@ -534,14 +712,20 @@ class Config:
     def _rust_memory_budget_bytes(self) -> int:
         """The per-operator spill budget shipped to the data plane (bytes).
 
-        Derived statically from `MemoryConfig` so `config` stays neutral (no live
-        sensing here — the Rust runtime pool is the adaptive backstop). `0` means
-        unbounded: opt into spilling by setting `memory.max_memory_bytes`.
+        Derived statically from `MemoryConfig` so `config` stays neutral — it never
+        senses (the `api` auto-tuning resolver fills `max_memory_bytes` from the live
+        envelope before execution; see `api._autotune`). `0` means unbounded (stay
+        fully in-memory): returned when the user opted out via `unbounded_memory`, or
+        when `max_memory_bytes` is still unset because a caller bypassed the resolver
+        (an ad-hoc `Config`), in which case the safe pre-auto-tuning behavior holds.
         """
-        cap = self.memory.max_memory_bytes
+        mem = self.memory
+        if mem.unbounded_memory:
+            return 0
+        cap = mem.max_memory_bytes
         if cap is None or cap <= 0:
             return 0
-        return int(cap * self.memory.hard_limit)
+        return int(cap * mem.hard_limit)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None, base: Config | None = None) -> Config:
@@ -551,7 +735,7 @@ class Config:
         ``BATCHER_OPTIMIZER_CARDINALITY_EQ_SELECTIVITY``.
         """
         env = os.environ if environ is None else environ
-        return _overlay_env(base if base is not None else cls(), "BATCHER", env).validate()
+        return _resolved(_overlay_env(base if base is not None else cls(), "BATCHER", env))
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str], base: Config | None = None) -> Config:
@@ -561,7 +745,7 @@ class Config:
         ``{"execution": {"morsel_rows": 4096}, "optimizer": {"cardinality": {...}}}``.
         """
         data = json.loads(Path(path).read_text())
-        return _overlay_dict(base if base is not None else cls(), data).validate()
+        return _resolved(_overlay_dict(base if base is not None else cls(), data))
 
 
 def _coerce(raw: str, to: type) -> object:
@@ -604,6 +788,15 @@ def _overlay_dict(obj: Config, data: dict[str, object]) -> Config:
     return replace(obj, **updates) if updates else obj
 
 
+def _resolved(cfg: Config) -> Config:
+    """Apply the active resilience profile, then validate — the single resolution
+    chokepoint every config entry point shares so the profile and range checks run in
+    lockstep regardless of how the config was built."""
+    from batcher.config.profiles import apply_resilience_profile
+
+    return apply_resilience_profile(cfg).validate()
+
+
 # Active-config plumbing -------------------------------------------------------
 
 
@@ -644,7 +837,7 @@ def set_config(config: Config) -> None:
             4096
             >>> set_config(Config())  # restore defaults
     """
-    _active.set(config.validate())
+    _active.set(_resolved(config))
 
 
 @contextlib.contextmanager
@@ -664,8 +857,9 @@ def config_context(config: Config) -> Iterator[Config]:
             >>> active_config().execution.morsel_rows
             16384
     """
-    token = _active.set(config.validate())
+    resolved = _resolved(config)
+    token = _active.set(resolved)
     try:
-        yield config
+        yield resolved
     finally:
         _active.reset(token)

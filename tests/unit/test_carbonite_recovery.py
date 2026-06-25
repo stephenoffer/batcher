@@ -49,6 +49,26 @@ def test_exhausts_attempts_and_raises():
     assert calls["n"] == 2  # tried exactly max_attempts times
 
 
+def test_backoff_is_jittered_and_bounded(monkeypatch):
+    # Equal jitter: each sleep stays within [half, full] of the exponential ceiling
+    # (so a correlated preemption wave decorrelates) and is never zero.
+    slept: list[float] = []
+    monkeypatch.setattr("time.sleep", slept.append)
+
+    healed = {"n": 0}
+
+    def attempt():
+        healed["n"] += 1
+        return ("done", set()) if healed["n"] >= 3 else (None, {1})
+
+    rec = ShuffleRecovery(RecoveryPolicy(max_attempts=4, backoff_base_s=1.0))
+    rec.run(attempt, lambda failed: None)
+    # Two recomputes ⇒ two backoff sleeps (round 0 ceiling=1.0, round 1 ceiling=2.0).
+    assert len(slept) == 2
+    assert 0.5 <= slept[0] <= 1.0  # equal jitter of ceiling 1.0
+    assert 1.0 <= slept[1] <= 2.0  # equal jitter of ceiling 2.0
+
+
 def test_lineage_reincarnate_bumps_epoch_immutably():
     lin = ShuffleLineage(stage=0, src_partition=3)
     assert lin.epoch == 0

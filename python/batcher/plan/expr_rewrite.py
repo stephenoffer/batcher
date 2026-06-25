@@ -223,7 +223,7 @@ def _map_agg(spec: AggregateSpec, rule: ExprRule) -> AggregateSpec:
         return spec
     # Carry the second input (arg_min/arg_max ordering key) through the rewrite too.
     input2 = rule(spec.agg.input2) if spec.agg.input2 is not None else None
-    rebuilt = AggExpr(spec.agg.func, rule(spec.agg.input), spec.agg.param, input2=input2)
+    rebuilt = AggExpr(spec.agg.func, rule(spec.agg.input), param=spec.agg.param, input2=input2)
     return dataclasses.replace(spec, agg=rebuilt)
 
 

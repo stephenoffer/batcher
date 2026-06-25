@@ -31,7 +31,6 @@ KNOWN_UNDOCUMENTED: dict[str, str] = {
     "__version__": "package version string, not an API symbol",
     # Streaming surface (in-flight); documentation pending.
     "OutputMode": "streaming output mode enum; docs pending",
-    "read_memory": "in-memory streaming source; docs pending",
 }
 
 
@@ -50,7 +49,6 @@ def _public_names() -> set[str]:
     # Accessor-namespace methods (the .str/.dt/.list/.struct/.json surface).
     from batcher.plan.expr_ir.namespaces import (
         _DtNamespace,
-        _EmbeddingNamespace,
         _JsonNamespace,
         _ListNamespace,
         _MapNamespace,
@@ -64,7 +62,6 @@ def _public_names() -> set[str]:
         _ListNamespace,
         _StructNamespace,
         _JsonNamespace,
-        _EmbeddingNamespace,
         _MapNamespace,
     ):
         names |= {n for n in vars(ns) if not n.startswith("_") and callable(vars(ns)[n])}

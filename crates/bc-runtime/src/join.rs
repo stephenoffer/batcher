@@ -17,11 +17,55 @@
 use arrow::array::{Array, ArrayRef, UInt32Array};
 use arrow::buffer::NullBuffer;
 use arrow::row::{OwnedRow, RowConverter, SortField};
+use bc_sketches::BloomFilter;
 use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 use indexmap::IndexMap;
 
 use crate::error::RuntimeError;
+
+/// False-positive rate for the probe-side runtime bloom (see [`use_probe_bloom_with`]).
+/// At 1% a bloom costs ~1.2 bytes/key — far less than the ~9 bytes/entry chained
+/// hash table — so it stays cache-resident after the table spills.
+const BLOOM_FP_RATE: f64 = 0.01;
+
+/// Build-row floor above which a probe-side bloom pre-filter pays for itself.
+///
+/// For a small build side the chained hash table is cache-resident and a probe
+/// lookup is already cheap, so a bloom only adds work. Above this size the table
+/// spills L2/L3 and a probe lookup becomes a random cache miss the compact bloom
+/// can skip for non-matching keys. ~64K build rows ≈ a ~600 KB hash table, past
+/// typical L2. Tunable; the conservative side never regresses the small-join case.
+const BLOOM_MIN_BUILD_ROWS: usize = 1 << 16;
+
+/// Whether a probe-side bloom pre-filter pays for a hash join of these sizes.
+///
+/// Engage only when the build side is large enough to spill cache *and* the probe
+/// side is at least as large, so the per-probe-row saving on non-matching keys
+/// amortizes the one-pass cost of building the bloom over the build side. The bloom
+/// has no false negatives, so it can only ever skip a provably-empty chain — the
+/// join result is identical whether it is used or not.
+///
+/// `min_build_rows` is the build-row floor (the default [`BLOOM_MIN_BUILD_ROWS`], or
+/// the control plane's tuning).
+fn use_probe_bloom_with(build_rows: usize, probe_rows: usize, min_build_rows: usize) -> bool {
+    build_rows >= min_build_rows && probe_rows >= build_rows
+}
+
+/// Extra resident bytes a hash-join build side costs *beyond* its Arrow columns.
+///
+/// The build phase allocates a chained hash table over the right side — a
+/// `HashTable<u32>` of ~`rows` entries (hashbrown holds them at a 7/8 load factor,
+/// one control byte each), a `next: Vec<u32>` chain, and a per-row null mask — none
+/// of which `RecordBatch::get_array_memory_size` (columns only) counts. On narrow
+/// keys that hidden overhead is 2–10× the column bytes, so an admission estimate
+/// based on columns alone undercounts the resident build table and can OOM before
+/// spilling. This is a tight, measured estimate (not worst case) so it never spills
+/// an in-memory join that would actually have fit.
+pub fn estimate_build_bytes(rows: usize) -> usize {
+    // heads (u32 slot + control byte at the load factor) + next (u32) + null mask (1B).
+    rows.saturating_mul(2 * std::mem::size_of::<u32>() + 4)
+}
 
 /// Join flavors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +91,52 @@ pub struct JoinIndices {
 ///
 /// The hash table is built on the **right** side and probed with the **left**,
 /// so left-outer/semi/anti stream the left side; right/full additionally emit
-/// right rows that never matched.
+/// right rows that never matched. A probe-side bloom pre-filter is engaged
+/// automatically for selective large joins ([`use_probe_bloom_with`]).
 pub fn hash_join_indices(
     left_keys: &[ArrayRef],
     right_keys: &[ArrayRef],
     join_type: JoinType,
+) -> Result<JoinIndices, RuntimeError> {
+    hash_join_indices_with(
+        left_keys,
+        right_keys,
+        join_type,
+        BLOOM_FP_RATE,
+        BLOOM_MIN_BUILD_ROWS,
+    )
+}
+
+/// [`hash_join_indices`] with the probe-bloom knobs supplied by the caller.
+///
+/// `bloom_fp_rate` and `bloom_min_build_rows` are performance-only: the bloom has
+/// no false negatives, so it can only skip a provably-empty chain — the produced
+/// [`JoinIndices`] relation is identical for any setting. The parallel executor
+/// threads these from the control plane's tuning.
+pub fn hash_join_indices_with(
+    left_keys: &[ArrayRef],
+    right_keys: &[ArrayRef],
+    join_type: JoinType,
+    bloom_fp_rate: f64,
+    bloom_min_build_rows: usize,
+) -> Result<JoinIndices, RuntimeError> {
+    let left_rows = left_keys.first().map_or(0, |a| a.len());
+    let right_rows = right_keys.first().map_or(0, |a| a.len());
+    let use_bloom = use_probe_bloom_with(right_rows, left_rows, bloom_min_build_rows);
+    hash_join_indices_impl(left_keys, right_keys, join_type, use_bloom, bloom_fp_rate)
+}
+
+/// The hash-join index builder, with the probe-side bloom pre-filter made explicit.
+///
+/// `use_bloom` is decided by [`use_probe_bloom_with`] on the public path; tests drive it
+/// both ways to prove the bloom is a pure performance short-circuit (the produced
+/// [`JoinIndices`] relation is identical with the filter on or off).
+pub(crate) fn hash_join_indices_impl(
+    left_keys: &[ArrayRef],
+    right_keys: &[ArrayRef],
+    join_type: JoinType,
+    use_bloom: bool,
+    bloom_fp_rate: f64,
 ) -> Result<JoinIndices, RuntimeError> {
     let left_rows = left_keys.first().map_or(0, |a| a.len());
     let right_rows = right_keys.first().map_or(0, |a| a.len());
@@ -77,12 +162,18 @@ pub fn hash_join_indices(
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
     let mut heads: HashTable<u32> = HashTable::with_capacity(right_rows);
     let mut next: Vec<u32> = vec![u32::MAX; right_rows];
+    // Probe-side bloom over the build keys (when it pays — see `use_probe_bloom_with`).
+    // Built in the same pass that hashes each build row, so it adds no extra hashing.
+    let mut bloom = use_bloom.then(|| BloomFilter::with_params(right_rows as u64, bloom_fp_rate));
     for (i, &is_null) in right_null.iter().enumerate() {
         if is_null {
             continue;
         }
         let row_i = right_encoded.row(i);
         let hash = state.hash_one(row_i);
+        if let Some(b) = bloom.as_mut() {
+            b.add_hash(hash);
+        }
         match heads.entry(
             hash,
             |&h| right_encoded.row(h as usize) == row_i,
@@ -117,9 +208,15 @@ pub fn hash_join_indices(
         } else {
             let row_i = left_encoded.row(i);
             let hash = state.hash_one(row_i);
-            heads
-                .find(hash, |&h| right_encoded.row(h as usize) == row_i)
-                .copied()
+            // A bloom miss is definitive (no false negatives): the key is not on the
+            // build side, so the chain is provably empty — skip the hash-table lookup.
+            if bloom.as_ref().is_some_and(|b| !b.contains_hash(hash)) {
+                None
+            } else {
+                heads
+                    .find(hash, |&h| right_encoded.row(h as usize) == row_i)
+                    .copied()
+            }
         };
 
         match join_type {
@@ -579,6 +676,80 @@ mod tests {
                 "sort-merge disagrees with hash for {jt:?}"
             );
         }
+    }
+
+    /// The probe-side bloom is a pure performance short-circuit: forcing it on must
+    /// produce the identical join relation as forcing it off, for every join type,
+    /// across duplicate and null keys. This is the seq-oracle invariant for the
+    /// runtime filter — a bloom can only ever skip a provably-empty chain.
+    #[test]
+    fn bloom_matches_no_bloom_oracle() {
+        let left: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
+            Some(2),
+            Some(1),
+            Some(2),
+            None,
+            Some(3),
+            Some(2),
+            Some(7),
+        ]))];
+        let right: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
+            Some(2),
+            Some(3),
+            Some(2),
+            Some(4),
+            None,
+        ]))];
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let with = hash_join_indices_impl(&left, &right, jt, true, BLOOM_FP_RATE).unwrap();
+            let without = hash_join_indices_impl(&left, &right, jt, false, BLOOM_FP_RATE).unwrap();
+            assert_eq!(
+                sorted_pairs(&with),
+                sorted_pairs(&without),
+                "bloom-on disagrees with bloom-off for {jt:?}"
+            );
+        }
+    }
+
+    /// With a build side that shares no key with most of the probe side, the bloom
+    /// path prunes the bulk of probe rows yet still yields the exact inner join — the
+    /// case the filter is built for (many provable misses).
+    #[test]
+    fn bloom_prunes_disjoint_keys_correctly() {
+        let left: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(
+            (0..1_000i64).collect::<Vec<_>>(),
+        ))];
+        let right: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![10, 20, 999, 5000]))];
+        let with =
+            hash_join_indices_impl(&left, &right, JoinType::Inner, true, BLOOM_FP_RATE).unwrap();
+        let without =
+            hash_join_indices_impl(&left, &right, JoinType::Inner, false, BLOOM_FP_RATE).unwrap();
+        assert_eq!(sorted_pairs(&with), sorted_pairs(&without));
+        // 10, 20, 999 are in [0,1000); 5000 is not — three matches.
+        assert_eq!(with.left.len(), 3);
+    }
+
+    #[test]
+    fn probe_bloom_gate_is_conservative() {
+        // Tiny / balanced joins skip the bloom; a large selective probe engages it.
+        assert!(!use_probe_bloom_with(10, 10, BLOOM_MIN_BUILD_ROWS));
+        assert!(!use_probe_bloom_with(
+            BLOOM_MIN_BUILD_ROWS,
+            BLOOM_MIN_BUILD_ROWS - 1,
+            BLOOM_MIN_BUILD_ROWS
+        ));
+        assert!(use_probe_bloom_with(
+            BLOOM_MIN_BUILD_ROWS,
+            BLOOM_MIN_BUILD_ROWS * 4,
+            BLOOM_MIN_BUILD_ROWS
+        ));
     }
 
     #[test]

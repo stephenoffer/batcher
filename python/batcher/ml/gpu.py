@@ -34,6 +34,7 @@ __all__ = [
     "recommend_num_gpus",
     "record_gpu_utilization",
     "sample_gpu_utilization",
+    "sample_gpu_vram_fraction",
     "torch_device",
     "vram_context_overhead",
 ]
@@ -114,6 +115,37 @@ def gpu_vram_gb() -> float | None:
 
         if torch.cuda.is_available():
             return torch.cuda.get_device_properties(0).total_memory / (1 << 30)
+    except Exception:
+        pass
+    return None
+
+
+def sample_gpu_vram_fraction() -> float | None:
+    """Fraction (0..1) of accelerator-0 VRAM in use, or `None` without a GPU.
+
+    Feeds the throughput autobatcher's VRAM cap so it shrinks (or refuses to grow) the
+    batch *before* an out-of-memory rather than catching one after the fact. Tries the
+    vendor SMI (NVML — counts every process on the device) then torch's reserved
+    memory; returns `None` on a GPU-less host, where the guard is simply inert."""
+    try:
+        import pynvml  # type: ignore[import-not-found]
+
+        pynvml.nvmlInit()
+        try:
+            if pynvml.nvmlDeviceGetCount() == 0:
+                return None
+            info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0))
+            return info.used / info.total if info.total else None
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            total = torch.cuda.get_device_properties(0).total_memory
+            return torch.cuda.memory_reserved(0) / total if total else None
     except Exception:
         pass
     return None

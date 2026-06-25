@@ -75,8 +75,12 @@ Stateful operators (aggregation, join, distinct, window, top-N) MUST be mergeabl
 
 - Add the `LogicalPlan` node in `python/batcher/plan/logical.py` with a `to_ir()`
   returning `{"op": "<tag>", ...}` whose tag and field names **exactly match** the
-  Rust `serde` definition from step 1. (For expressions, extend
-  `python/batcher/plan/expr_ir.py`.)
+  Rust `serde` definition from step 1. (For a scalar **expression** node, extend
+  `plan/expr_ir/`: subclass the declarative `IRNode` (`node_base.py`) — set `tag`
+  and declare fields with `child`/`children`/`scalar`/`literal`; the generic
+  `to_ir` is generated. Add its tag to `plan/ir_tags.py::ExprTag`, its `fn` name to
+  the family vocabulary in `plan/expr_ir/fn_names.py`, and a representative to
+  `tests/unit/test_ir_snapshot.py`. See the `add-expression-or-function` skill.)
 - Add the fluent, lazy, immutable method to `python/batcher/api/dataset.py`
   (returns a new `Dataset`; expression-first; one obvious way to do it). Curate
   `__all__`, type hints, a docstring, and typed errors (`PlanError`) for bad input.

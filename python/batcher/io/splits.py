@@ -14,6 +14,7 @@ source.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -35,11 +36,11 @@ __all__ = [
 ]
 
 
-# Per-process cache of ``key -> (dataset, {fragment_path: fragment})``. A worker
+# Per-process LRU of ``key -> (dataset, {fragment_path: fragment})``. A worker
 # lists/opens a dataset ONCE and reuses the path→fragment index across all the
 # splits it reads, instead of re-listing the whole dataset on every read (which
 # would be O(files^2) over a per-file-split read — catastrophic at scale).
-_FRAGMENT_INDEX_CACHE: dict[Any, tuple[Any, dict[str, Any]]] = {}
+_FRAGMENT_INDEX_CACHE: OrderedDict[Any, tuple[Any, dict[str, Any]]] = OrderedDict()
 _FRAGMENT_CACHE_MAX = 8
 
 
@@ -48,17 +49,22 @@ def fragment_index(key: Any, build_dataset: Any) -> tuple[Any, dict[str, Any]]:
 
     `build_dataset` is a zero-arg callable returning a `pyarrow.dataset.Dataset`.
     The index is cached per process so each worker lists the dataset a single time
-    regardless of how many of its fragments it reads. A small bound caps memory if
-    a worker touches many distinct tables.
+    regardless of how many of its fragments it reads. The cache is a bounded **LRU**:
+    a hit marks the entry most-recently-used, and an insert past the bound evicts only
+    the least-recently-used entry — so a worker cycling through more than
+    `_FRAGMENT_CACHE_MAX` tables keeps its hot ones resident instead of dropping the
+    whole cache (the old clear-all forced an O(files) re-list of every live table).
     """
     cached = _FRAGMENT_INDEX_CACHE.get(key)
-    if cached is None:
-        dataset = build_dataset()
-        index = {frag.path: frag for frag in dataset.get_fragments()}
-        if len(_FRAGMENT_INDEX_CACHE) >= _FRAGMENT_CACHE_MAX:
-            _FRAGMENT_INDEX_CACHE.clear()
-        cached = (dataset, index)
-        _FRAGMENT_INDEX_CACHE[key] = cached
+    if cached is not None:
+        _FRAGMENT_INDEX_CACHE.move_to_end(key)  # most-recently-used
+        return cached
+    dataset = build_dataset()
+    index = {frag.path: frag for frag in dataset.get_fragments()}
+    cached = (dataset, index)
+    _FRAGMENT_INDEX_CACHE[key] = cached  # appended as most-recently-used
+    while len(_FRAGMENT_INDEX_CACHE) > _FRAGMENT_CACHE_MAX:
+        _FRAGMENT_INDEX_CACHE.popitem(last=False)  # evict least-recently-used
     return cached
 
 

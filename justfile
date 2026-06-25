@@ -88,17 +88,34 @@ docs:
 diagrams:
     python docs/_static/diagrams/render.py
 
-# Run the operator-mix benchmark vs DuckDB/Polars (optional row count argument).
-bench rows="":
-    python benchmarks/run.py {{rows}}
+# Run TPC-H vs the single-node lineup (batcher, duckdb, polars, pyarrow). Pass extra
+# flags through, e.g. `just bench --scale 10` or `just bench --engines batcher,duckdb,spark`.
+bench args="":
+    python benchmarks/run.py --benchmark tpch {{args}}
 
-# Run the TPC-H subset benchmark (optional --sf scale-factor argument).
+# Run the full TPC-H 22-query suite (alias of `bench` for discoverability).
 bench-tpch args="":
-    python benchmarks/run.py --dataset tpch {{args}}
+    python benchmarks/run.py --benchmark tpch {{args}}
 
-# Run both datasets (operator mix + TPC-H).
-bench-all:
-    python benchmarks/run.py --dataset all
+# Run the ClickBench 43-query single-table analytics suite.
+bench-clickbench args="":
+    python benchmarks/run.py --benchmark clickbench {{args}}
+
+# Run the TPC-DS subset suite.
+bench-tpcds args="":
+    python benchmarks/run.py --benchmark tpcds {{args}}
+
+# Run the operator-mix (single relational ops; includes PyArrow + Ray Data).
+bench-ops args="":
+    python benchmarks/run.py --benchmark operators {{args}}
+
+# Run the multi-node lineup (batcher, ray, daft) across every dataset.
+bench-multi args="":
+    python benchmarks/run.py --benchmark all --tier multi {{args}}
+
+# Run every dataset on the default single-node lineup.
+bench-all args="":
+    python benchmarks/run.py --benchmark all {{args}}
 
 # List every registered benchmark without running anything.
 bench-list:
@@ -106,4 +123,8 @@ bench-list:
 
 # Run the distributed single-node == many-partition equivalence benchmark.
 bench-dist args="":
-    python benchmarks/distributed.py {{args}}
+    python benchmarks/run.py --benchmark distributed {{args}}
+
+# Run a standalone aux benchmark by name (distributed | optimizer | shuffle).
+bench-aux which:
+    python benchmarks/run.py --benchmark {{which}}

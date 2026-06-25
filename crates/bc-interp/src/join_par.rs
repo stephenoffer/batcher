@@ -25,36 +25,46 @@ use crate::error::InterpError;
 use crate::ops;
 use crate::par::SpillOptions;
 
-/// Grace hash join: the build (right) side exceeds the budget, so partition both
-/// sides by key to disk and join one bucket at a time — only one build table is
-/// resident. Bucket count is sized so each bucket's build side ≈ one budget.
-pub(crate) fn spilling_hash_join(
-    left: &RecordBatch,
-    right: &RecordBatch,
+/// Grace hash join, streamed: the build (right) side exceeds the budget, so
+/// partition both sides by key to disk **one input batch at a time** and join one
+/// bucket at a time — only one input batch (plus its `p` shards) and one build
+/// bucket are ever resident.
+///
+/// Unlike a partition-an-already-materialized-batch grace join, this never
+/// concatenates the full build side into one `RecordBatch` first, so a build far
+/// larger than memory spills instead of OOMing at the materialize step. Bucket count
+/// is sized from the build batches' total bytes (no materialization) so each
+/// bucket's build side ≈ one budget. Equal keys co-partition (fixed-seed
+/// partitioner), so the union of per-bucket joins is the full join for every join
+/// type — the result is the same multiset the in-memory path produces.
+///
+/// Empty input is handled exactly as the in-memory path: a side with no batches
+/// makes every bucket read empty, which `materialize` reports as `EmptyJoinInput`
+/// (empty joins are shortcut upstream and never reach this spill path).
+pub(crate) fn spilling_hash_join_streaming(
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
     left_keys: &[String],
     right_keys: &[String],
     join_type: bc_ir::JoinType,
     output: &[bc_ir::JoinOutputCol],
     sp: &SpillOptions,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    let li = ops::key_indices(left, left_keys)?;
-    let ri = ops::key_indices(right, right_keys)?;
-    // Enough partitions that each bucket's build side ≈ one budget.
-    let p = right
-        .get_array_memory_size()
-        .div_ceil(sp.memory_budget_bytes.max(1))
-        .max(2);
-    let lb = shuffle::partition_by_keys(left, &li, p)?;
-    let rb = shuffle::partition_by_keys(right, &ri, p)?;
+    // Enough partitions that each bucket's build side ≈ one budget — sized from the
+    // build batches' total size without materializing them.
+    let build_bytes: usize = right_batches
+        .iter()
+        .map(|b| b.get_array_memory_size())
+        .sum();
+    let p = build_bytes.div_ceil(sp.memory_budget_bytes.max(1)).max(2);
 
     let mut lstore = DiskSpillStore::new(sp.dir.join("join-left"), p)?;
     let mut rstore = DiskSpillStore::new(sp.dir.join("join-right"), p)?;
-    for i in 0..p {
-        lstore.append(i, &lb[i])?;
-        rstore.append(i, &rb[i])?;
-    }
-    drop(lb);
-    drop(rb);
+    // Stream each input batch through the key-partitioner into its `p` shards; only
+    // one input batch and its shards are resident at a time, so neither side is ever
+    // fully materialized in memory.
+    partition_batches_to_store(left_batches, left_keys, p, &mut lstore)?;
+    partition_batches_to_store(right_batches, right_keys, p, &mut rstore)?;
 
     let mut out = Vec::with_capacity(p);
     for i in 0..p {
@@ -71,6 +81,25 @@ pub(crate) fn spilling_hash_join(
         )?);
     }
     Ok(out)
+}
+
+/// Hash-partition each input batch by `keys` into `p` shards and append every shard
+/// to its partition in `store` — one batch resident at a time (the bounded-memory
+/// half of the streaming grace join).
+fn partition_batches_to_store(
+    batches: &[RecordBatch],
+    keys: &[String],
+    p: usize,
+    store: &mut DiskSpillStore,
+) -> Result<(), InterpError> {
+    for b in batches {
+        let idx = ops::key_indices(b, keys)?;
+        let shards = shuffle::partition_by_keys(b, &idx, p)?;
+        for (i, shard) in shards.iter().enumerate() {
+            store.append(i, shard)?;
+        }
+    }
+    Ok(())
 }
 
 /// Grace ASOF join: when an ASOF join with `by` keys is too large to hold both
@@ -184,26 +213,46 @@ pub(crate) fn broadcast_join(
         .collect()
 }
 
-/// A bucket is "skewed" when it holds far more probe rows than the average bucket
-/// (a hot key concentrating there) and is large enough that spreading it pays off.
+// A bucket is "skewed" when it holds far more probe rows than the average bucket
+// (a hot key concentrating there) and is large enough that spreading it pays off.
+// The live thresholds now flow in from `bc_arrow::RuntimeTuning` (default ==
+// these values); the executor passes `opts.tuning.skew_*`. These consts remain as
+// the canonical defaults the in-crate tests pin against — they equal
+// `RuntimeTuning::default().skew_*`.
+#[cfg(test)]
 const SKEW_BUCKET_FACTOR: usize = 4;
+#[cfg(test)]
 pub(crate) const SKEW_MIN_BUCKET_ROWS: usize = 4 * bc_arrow::DEFAULT_MORSEL_ROWS;
 /// Byte floor mirroring [`SKEW_MIN_BUCKET_ROWS`]. A bucket whose *bytes* dwarf the
 /// average is a straggler even at a modest row count — wide rows (large strings,
 /// blobs, embeddings) concentrate work the row-only test cannot see (65 k wide rows
 /// look identical to 65 k narrow ones by row count).
+#[cfg(test)]
 pub(crate) const SKEW_MIN_BUCKET_BYTES: usize = 4 * bc_arrow::DEFAULT_MORSEL_BYTES;
 
-pub(crate) fn is_skewed_bucket(bucket_rows: usize, avg_rows: usize) -> bool {
-    bucket_rows >= SKEW_MIN_BUCKET_ROWS && bucket_rows > SKEW_BUCKET_FACTOR * avg_rows.max(1)
+/// `min_bucket_rows`/`bucket_factor` are performance-only (the default consts, or
+/// the control plane's tuning): skew salting is result-invisible, so they change
+/// only *which* buckets get spread across workers, never the relation.
+pub(crate) fn is_skewed_bucket(
+    bucket_rows: usize,
+    avg_rows: usize,
+    bucket_factor: usize,
+    min_bucket_rows: usize,
+) -> bool {
+    bucket_rows >= min_bucket_rows && bucket_rows > bucket_factor * avg_rows.max(1)
 }
 
 /// Byte-aware companion to [`is_skewed_bucket`]: the same factor test on Arrow
 /// bytes. The driving side of a bucket is hot if it is skewed by *either* rows or
 /// bytes, so a hot key of wide rows triggers the same spread-the-bucket mitigation
 /// that a hot key of many narrow rows already does.
-pub(crate) fn is_skewed_bucket_bytes(bucket_bytes: usize, avg_bytes: usize) -> bool {
-    bucket_bytes >= SKEW_MIN_BUCKET_BYTES && bucket_bytes > SKEW_BUCKET_FACTOR * avg_bytes.max(1)
+pub(crate) fn is_skewed_bucket_bytes(
+    bucket_bytes: usize,
+    avg_bytes: usize,
+    bucket_factor: usize,
+    min_bucket_bytes: usize,
+) -> bool {
+    bucket_bytes >= min_bucket_bytes && bucket_bytes > bucket_factor * avg_bytes.max(1)
 }
 
 /// Skew salting (spreading a hot bucket's probe rows across worker chunks against
@@ -250,7 +299,7 @@ mod tests {
         let rows = 1_000;
         let avg_rows = 250;
         assert!(
-            !is_skewed_bucket(rows, avg_rows),
+            !is_skewed_bucket(rows, avg_rows, SKEW_BUCKET_FACTOR, SKEW_MIN_BUCKET_ROWS),
             "row test must not trip here"
         );
 
@@ -258,7 +307,12 @@ mod tests {
         let bucket_bytes = SKEW_MIN_BUCKET_BYTES + 1;
         let avg_bytes = bucket_bytes / 8;
         assert!(
-            is_skewed_bucket_bytes(bucket_bytes, avg_bytes),
+            is_skewed_bucket_bytes(
+                bucket_bytes,
+                avg_bytes,
+                SKEW_BUCKET_FACTOR,
+                SKEW_MIN_BUCKET_BYTES
+            ),
             "byte test must detect a wide-row hot bucket"
         );
     }
@@ -268,10 +322,17 @@ mod tests {
     #[test]
     fn byte_skew_requires_the_floor() {
         let small = SKEW_MIN_BUCKET_BYTES / 2;
-        assert!(!is_skewed_bucket_bytes(small, small / 8));
+        assert!(!is_skewed_bucket_bytes(
+            small,
+            small / 8,
+            SKEW_BUCKET_FACTOR,
+            SKEW_MIN_BUCKET_BYTES
+        ));
         // And a large bucket only modestly above average is not hot either.
         assert!(!is_skewed_bucket_bytes(
             SKEW_MIN_BUCKET_BYTES,
+            SKEW_MIN_BUCKET_BYTES,
+            SKEW_BUCKET_FACTOR,
             SKEW_MIN_BUCKET_BYTES
         ));
     }

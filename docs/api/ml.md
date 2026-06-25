@@ -5,9 +5,8 @@ ML work attaches to a `Dataset` through the `.ml` accessor:
 | Method | Use |
 | --- | --- |
 | `ds.ml.map_batches(fn, ...)` | Apply an arbitrary function to each Arrow batch. |
-| `ds.ml.infer(model, ...)` | Run batch inference with a model callable. |
-| `ds.ml.embed(model, ...)` | Generate embeddings with a model callable. |
-| `ds.ml.embed_text(col, model, ...)` | Embed text with a sentence-transformers model. |
+| `ds.ml.infer(model, ...)` | Run batch inference — a model id + `column`, or a model callable. |
+| `ds.ml.embed(model, ...)` | Generate embeddings — a model id + `column`, or a model callable. |
 | `ds.ml.download(url_col, ...)` | Fetch bytes at each URL/path into a column. |
 | `ds.ml.upload(data_col, dir, ...)` | Write a bytes column out to object storage. |
 | `ds.ml.iter_torch_batches(...)` | Stream the dataset to PyTorch as tensor batches. |
@@ -109,15 +108,26 @@ converts only around the call; the engine boundary stays Arrow. See
 ## infer and embed
 
 `ds.ml.infer(model, ...)` and `ds.ml.embed(model, ...)` are the inference-shaped
-calls. `model` is a callable (typically a class that loads weights once per
-worker) applied to each batch; `infer` appends predictions and `embed` appends
-vectors. Both take `batch_size`, `output_columns`, `num_gpus`, and `concurrency`.
+calls. The quickest form is a **model identifier** plus the `column` to run on: the
+model loads once per worker and the result is appended (a prediction for `infer`, a
+vector for `embed`). `infer` resolves a HuggingFace `transformers` pipeline; `embed`
+resolves a `sentence-transformers` model.
+
+```python
+# docs: skip
+scored = ds.ml.infer("distilbert-base-uncased-finetuned-sst-2-english", column="text")
+vectors = ds.ml.embed("sentence-transformers/all-MiniLM-L6-v2", column="text")
+```
+
+For full control — a custom model, a non-text modality, or your own batching — pass a
+callable or a class that loads weights once per worker, and declare the result schema
+with `output_columns`. Both forms take `batch_size`, `num_gpus`, and `concurrency`.
 Real models need GPUs, so these are not run here.
 
 ```python
 # docs: skip
-scored = ds.ml.infer(Classifier(), batch_size=512, num_gpus=1, concurrency=4)
-vectors = ds.ml.embed(Embedder(), batch_size=256, num_gpus=1, concurrency=2)
+scored = ds.ml.infer(Classifier(), output_columns=[...], batch_size=512, num_gpus=1, concurrency=4)
+vectors = ds.ml.embed(Embedder(), output_columns=[...], batch_size=256, num_gpus=1, concurrency=2)
 ```
 
 See [Inference](../ml/inference.md) for the inference workflow and
@@ -128,9 +138,9 @@ See [Inference](../ml/inference.md) for the inference workflow and
 Operators that are not `Dataset` methods live in `batcher.ml` — the standalone
 `embed` / `llm_generate` functions, the [preprocessors](../ml/preprocessors.md),
 the [serving adapters](../ml/serving.md), [vector search](../ml/multimodal.md), and
-the [LLM engines](../ml/llm.md). A model passed to `map_batches`/`infer` still
-receives the whole batch and picks its own columns (no `input_columns=` keyword);
-`embed_text` is the exception that takes a `text_column`.
+the [LLM engines](../ml/llm.md). A *callable* model passed to `map_batches`/`infer`
+receives the whole batch and picks its own columns (no `input_columns=` keyword); the
+model-identifier form of `infer`/`embed` instead takes the `column` to run on.
 
 ## Next steps
 

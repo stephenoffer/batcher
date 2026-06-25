@@ -97,3 +97,33 @@ def test_pressure_monitor_reports_sane_memory():
     assert snap.total > 0
     assert 0 <= snap.available <= snap.total
     assert 0.0 <= snap.used_fraction <= 1.0
+
+
+def test_pressure_level_escalates_instantly_on_a_spike(monkeypatch):
+    """Escalation is never smoothed: a rising reading drives the level immediately, so
+    protective spill is never delayed by the hysteresis."""
+    from batcher.carbonite.memory.pressure import PressureLevel
+
+    mon = PressureMonitor()  # default soft 0.85 / hard 0.90
+    readings = iter([0.10, 0.95])
+    monkeypatch.setattr(mon, "_engine_used_fraction", lambda: next(readings))
+    assert mon.level() == PressureLevel.NORMAL  # 0.10
+    assert mon.level() == PressureLevel.CRITICAL  # 0.95 → instant, no smoothing
+
+
+def test_pressure_level_hysteresis_damps_flapping_near_threshold(monkeypatch):
+    """Readings oscillating across the soft line would flap SPILL↔ELEVATED every
+    sample; the de-escalation hysteresis holds the level through the brief dips so the
+    shuffle's AIMD credit window doesn't oscillate."""
+    from batcher.carbonite.memory.pressure import PressureLevel
+
+    mon = PressureMonitor()  # soft 0.85
+    readings = iter([0.84, 0.87, 0.84, 0.87, 0.84])  # alternate just under/over soft
+    monkeypatch.setattr(mon, "_engine_used_fraction", lambda: next(readings))
+    levels = [mon.level() for _ in range(5)]
+    # Once SPILL is reached, the 0.84 dips are held at SPILL by the lagging average
+    # (ewma stays ≈0.85+) instead of dropping to ELEVATED — no per-sample flapping.
+    assert levels[1] == PressureLevel.SPILL  # 0.87
+    assert levels[2] == PressureLevel.SPILL  # 0.84 dip, held by ewma
+    assert levels[3] == PressureLevel.SPILL  # 0.87
+    assert levels[4] == PressureLevel.SPILL  # 0.84 dip, still held

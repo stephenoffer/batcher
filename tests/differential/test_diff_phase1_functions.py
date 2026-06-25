@@ -2,7 +2,7 @@
 
 The new operators (`//`, `^`, `<<`, `>>`, `[]`, unary `-`/`abs`/`round`/`floor`/
 `ceil`/`trunc`) and free functions (`concat`/`concat_ws`/`format_string`/`iff`/
-`nanvl`/`ifnull`/`log`) all desugar to existing IR; here we prove they match DuckDB
+`nanvl`/`coalesce`/`log`) all desugar to existing IR; here we prove they match DuckDB
 on real data, including the null/negative edges where the desugaring is subtle.
 """
 
@@ -14,7 +14,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from batcher import col, concat, concat_ws, format_string, iff, ifnull, lit, log, nanvl
+from batcher import coalesce, col, concat, concat_ws, format_string, iff, lit, log, nanvl
 
 pytestmark = pytest.mark.differential
 
@@ -145,11 +145,11 @@ def test_nanvl_matches_duckdb(duck):
     assert_same(out, duck.sql("SELECT CASE WHEN isnan(x) THEN 0.0 ELSE x END AS r FROM t"))
 
 
-def test_ifnull_matches_duckdb(duck):
+def test_coalesce_matches_duckdb_ifnull(duck):
     from conftest import assert_same
 
     duck.register("t", _nums())
-    out = bt.from_arrow(_nums()).select(r=ifnull(col("a"), lit(0))).collect()
+    out = bt.from_arrow(_nums()).select(r=coalesce(col("a"), lit(0))).collect()
     assert_same(out, duck.sql("SELECT ifnull(a, 0) AS r FROM t"))
 
 

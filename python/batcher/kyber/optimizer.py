@@ -26,6 +26,7 @@ from batcher.config import Config, active_config
 from batcher.kyber.calibration import calibrate
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.cost import CostModel
+from batcher.kyber.cpu_shares import class_ir_tag, load_cpu_utilization, recommend_num_cpus
 from batcher.kyber.learning import load_learned_stats
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
@@ -50,22 +51,55 @@ __all__ = ["Optimizer", "optimize", "optimize_traced"]
 # The tunables (row footprint, morsel size, unknown-size threshold) live in `Config`.
 _BREAKER_KINDS = frozenset({"Aggregate", "Sort", "Distinct", "Join"})
 
+# CPU-light, IO/decode-bound streaming operators: one task running these waits on IO
+# more than it saturates a core, so it asks for a fractional CPU share (`cpu_share_io`)
+# and the cluster packs more than one per core. Breakers (hash/sort) and anything not
+# listed here keep the full `cpus_per_task` share — an unknown op never under-requests.
+_CPU_LIGHT_KINDS = frozenset(
+    {"Scan", "Filter", "Project", "Limit", "Sample", "RowId", "Union", "Unnest", "Unpivot"}
+)
+
+
+def _cpu_share(
+    kind: str, cpu_light: float, cpu_heavy: float, learned_cpu: dict[str, float], config: Config
+) -> float:
+    """Per-task CPU share for an operator of `kind`.
+
+    The static per-kind prior (a CPU-light streaming op asks for a fraction; breakers
+    and unknown ops keep the full share) is overridden by the measured CPU utilization
+    of this operator family when a prior run recorded one — so `num_cpus` adapts to
+    how CPU-bound the operator actually is.
+    """
+    base = cpu_light if kind in _CPU_LIGHT_KINDS else cpu_heavy
+    tag = class_ir_tag(kind)
+    return recommend_num_cpus(learned_cpu.get(tag) if tag else None, base, config)
+
 
 def _annotate_ops(
-    plan: LogicalPlan, estimator: CardinalityEstimator, config: Config
+    plan: LogicalPlan,
+    estimator: CardinalityEstimator,
+    config: Config,
+    cpu_util: dict[str, float] | None = None,
 ) -> tuple[PhysicalOp, ...]:
     """Tag each operator with its estimated rows + memory envelope for Carbonite.
 
     Kyber measures; Carbonite protects: these per-operator `ResourceBounds` are what
     the admission policy checks a plan's feasibility against, without either layer
     importing the other (the bounds travel on the `PhysicalPlan`).
+
+    `cpu_util` is the learned per-kind CPU utilization (from prior runs); when a kind
+    has a measurement it overrides the static CPU-share prior, so the per-task
+    `num_cpus` request adapts to how CPU-bound each operator family actually is.
     """
+    learned_cpu = cpu_util or {}
     row_bytes = config.optimizer.row_bytes
     morsel_rows = config.execution.morsel_rows
     morsel_bytes = max(1, config.execution.morsel_bytes)
     target_rows = max(1, config.optimizer.target_rows_per_task)
     fc = config.flow_control
     credit_ceiling = max(1, fc.default_credits * fc.credit_ceiling_factor)
+    cpu_heavy = config.execution.cpus_per_task
+    cpu_light = config.execution.cpu_share_io
     # At/above this, a cardinality is a placeholder (unknown source size), not a real
     # estimate — such operators are left unbudgeted so a guess never fails a real query.
     unknown_rows = config.optimizer.cardinality.unknown_rows
@@ -103,6 +137,7 @@ def _annotate_ops(
                 c_max = max(1, min(credit_ceiling, math.ceil(partition_bytes / morsel_bytes)))
             else:
                 c_max = 0  # no estimate → Carbonite supplies the default window
+            c_cpu = _cpu_share(kind, cpu_light, cpu_heavy, learned_cpu, config)
             ops.append(
                 PhysicalOp(
                     op_id=OpId(i),
@@ -110,7 +145,10 @@ def _annotate_ops(
                     backend="native",
                     algorithm="",
                     bounds=ResourceBounds(
-                        m_max_bytes=mem, c_max_credits=c_max, n_max_parallelism=n_par
+                        m_max_bytes=mem,
+                        c_max_credits=c_max,
+                        n_max_parallelism=n_par,
+                        c_cpu_shares=c_cpu,
                     ),
                     inputs=(),
                     properties=PlanProperties(est_rows=rows),
@@ -139,7 +177,7 @@ def _applicable(rules: list[Rule], present: frozenset[type]) -> list[Rule]:
 
 def _run_phase(
     plan: LogicalPlan, rules: list[Rule], ctx: OptimizerContext, max_iterations: int
-) -> LogicalPlan:
+) -> tuple[LogicalPlan, dict | None]:
     """Run one phase's rules, up to `max_iterations` (1 = once, >1 = to fixpoint).
 
     Fixpoint is detected by **object identity first**: `transform_up` shares structure
@@ -153,11 +191,17 @@ def _run_phase(
 
     `_present` (the node-type set for rule indexing) is likewise computed once and
     refreshed only after an iteration that actually changed the plan.
+
+    Also returns the lowered IR of the returned plan **when this phase computed it**
+    (during fixpoint change-detection), else `None` meaning "the plan is unchanged —
+    reuse the caller's last IR". This lets the final lowering reuse the IR the
+    fixpoint loop already built instead of serializing the plan a second time.
     """
     if not rules:
-        return plan
+        return plan, None
     present = _present(plan)
     current_ir = None  # lazily computed, only on the identity-says-changed path
+    changed = False
     for _ in range(max_iterations):
         updated = _apply_rules(plan, _applicable(rules, present), ctx)
         if updated is plan:  # structural sharing → confirmed fixpoint, O(1)
@@ -168,7 +212,10 @@ def _run_phase(
         if updated_ir == current_ir:  # equal-but-new tree (an unconditional rebuilder)
             break
         plan, current_ir, present = updated, updated_ir, _present(updated)
-    return plan
+        changed = True
+    # `current_ir` tracks the latest plan's IR, so when the phase changed the plan it
+    # is exactly the returned plan's IR; on a no-op phase we computed nothing new.
+    return plan, (current_ir if changed else None)
 
 
 def _present(plan: LogicalPlan) -> frozenset[type]:
@@ -265,13 +312,22 @@ class Optimizer:
             cost_model=cost_model,
         )
 
-    def _run(self, logical: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
+    def _run(self, logical: LogicalPlan, ctx: OptimizerContext) -> tuple[LogicalPlan, dict | None]:
+        """Run every phase; return the optimized plan and its IR if a phase computed it.
+
+        The IR is `None` only when *no* phase changed the plan (every phase was a
+        no-op), in which case the caller lowers once with `plan.to_ir()`. Otherwise
+        the last phase that changed the plan already built the final plan's IR.
+        """
         plan = logical
+        last_ir: dict | None = None
         fixpoint = self._config.optimizer.fixpoint_iterations
         for phase in Phase:  # IntEnum iterates in declared (ascending) order
             max_iter = fixpoint if phase in _FIXPOINT_PHASES else 1
-            plan = _run_phase(plan, self._by_phase[phase], ctx, max_iter)
-        return plan
+            plan, ir = _run_phase(plan, self._by_phase[phase], ctx, max_iter)
+            if ir is not None:  # a no-op phase leaves the plan (and its IR) unchanged
+                last_ir = ir
+        return plan, last_ir
 
     def optimize(self, logical: LogicalPlan) -> PhysicalPlan:
         return self.optimize_traced(logical)[0]
@@ -283,11 +339,16 @@ class Optimizer:
         phase recorded on `ctx.notes` — what the adaptive executor reports per stage.
         """
         ctx = self._context()
-        plan = self._run(logical, ctx)
+        plan, ir = self._run(logical, ctx)
         phys = PhysicalPlan(
-            ir=plan.to_ir(),
+            ir=ir if ir is not None else plan.to_ir(),
             output_schema=None,
-            ops=_annotate_ops(plan, ctx.estimator, ctx.config),
+            ops=_annotate_ops(
+                plan,
+                ctx.estimator,
+                ctx.config,
+                load_cpu_utilization(self._hub, self._config),
+            ),
             source_projections=required_columns_per_source(plan),
             source_predicates=required_predicates_per_source(plan),
         )
@@ -300,7 +361,7 @@ class Optimizer:
         limits, drop redundant distincts, zone-map pruning) before estimating it
         with an exact-first estimator of its own.
         """
-        return self._run(logical, self._context())
+        return self._run(logical, self._context())[0]
 
     def logical_stats(self, logical: LogicalPlan) -> tuple[LogicalPlan, RelStats]:
         """Run the logical rewrite phases and estimate the root's `RelStats`.
@@ -310,13 +371,13 @@ class Optimizer:
         the plan before estimation.
         """
         ctx = self._context()
-        plan = self._run(logical, ctx)
+        plan, _ir = self._run(logical, ctx)
         return plan, ctx.estimator.estimate(plan)
 
     def explain(self, logical: LogicalPlan) -> str:
         """A human-readable view of the optimized plan and its cardinality decisions."""
         ctx = self._context()
-        plan = self._run(logical, ctx)
+        plan, _ir = self._run(logical, ctx)
         decisions: list[BuildSideDecision] = ctx.notes.get("build_side_decisions", [])
         lines = _format_plan(plan, ctx.estimator)
         if decisions:

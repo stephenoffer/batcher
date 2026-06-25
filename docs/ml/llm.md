@@ -68,23 +68,24 @@ captions = llm_generate(batches, engine, prompt_column="instruction", image_colu
 
 ## Text embeddings
 
-`ds.ml.embed_text` embeds a text column with a sentence-transformers model, loaded
-once per worker and scheduled across GPU actors — the retrieval-pipeline companion to
-[vector search](multimodal.md). It appends one fixed-width vector column (named by
-`output_column`) and keeps the dataset lazy. `num_gpus` reserves accelerator fraction
-per worker, `concurrency` sets the worker count (or an autoscaling `(min, max)` range),
-and `batch_size` controls how many texts go through the model at once. Needs
-`batcher-engine[st]`.
+`ds.ml.embed` with a sentence-transformers model id embeds a text `column`, loading
+the model once per worker and scheduling it across GPU actors — the retrieval-pipeline
+companion to [vector search](multimodal.md). It appends one fixed-width vector column
+(named by `output_column`) and keeps the dataset lazy. `num_gpus` reserves accelerator
+fraction per worker, `concurrency` sets the worker count (or an autoscaling
+`(min, max)` range), and `batch_size` controls how many texts go through the model at
+once. Needs `batcher-engine[st]`.
 
 ```python
 # docs: skip
 import batcher as bt
 
 ds = bt.read.parquet("s3://bucket/docs.parquet")
-vectors = ds.ml.embed_text("text", "sentence-transformers/all-MiniLM-L6-v2", num_gpus=1)
+vectors = ds.ml.embed("sentence-transformers/all-MiniLM-L6-v2", column="text", num_gpus=1)
 vectors.write.lance("s3://bucket/vectors.lance")
 ```
 
-For a model Batcher does not wrap directly, `ds.ml.embed` takes any load-once callable
-or class that maps a batch to vectors, and `ds.ml.infer` does the same for general
-model scoring — both accept `concurrency`, `num_gpus`, and `batch_size` the same way.
+For a model Batcher does not wrap directly, `ds.ml.embed` also takes any load-once
+callable or class that maps a batch to vectors, and `ds.ml.infer` does the same for
+general model scoring — both accept `concurrency`, `num_gpus`, and `batch_size` the
+same way.

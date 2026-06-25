@@ -75,10 +75,11 @@ def engine_version() -> str:
     return _native.__engine_version__
 
 
-# The process-global default SQL session. `bt.catalog` exposes it (so the
-# established `bt.catalog.register/table/drop/clear/list` surface keeps working),
-# and the module-level `sql` / `register_function` below delegate to it.
-catalog = Session()
+# The process-global default SQL session, backing the module-level `sql` /
+# `register_function` below. It is intentionally private: `bt.sql(...)` is the one
+# obvious entry point for the default catalog, and `bt.Session` is the public handle
+# for an isolated one.
+_catalog = Session()
 
 
 def sql(query: str, *, dialect: str | None = None, **tables: Any) -> Dataset:
@@ -90,11 +91,10 @@ def sql(query: str, *, dialect: str | None = None, **tables: Any) -> Dataset:
     `Dataset` you can keep building on (``.filter``, ``.with_columns``, another
     ``sql``) before a terminal operation runs the whole plan.
 
-    Unqualified names that are not passed here resolve from the `bt.catalog`
-    registry, so ``bt.catalog.register("t", ds)`` lets later ``bt.sql("... FROM t")``
-    calls omit the binding. Functions registered with `bt.register_function` are
-    callable from the query. ``CREATE TABLE/VIEW AS`` and ``DROP TABLE`` register and
-    unregister tables in `bt.catalog`. For an isolated catalog use `bt.Session`.
+    Names not passed here resolve from the default catalog, which ``CREATE
+    TABLE/VIEW AS`` populates and ``DROP TABLE`` clears, so a later ``bt.sql("...
+    FROM t")`` can omit the binding. Functions registered with `bt.register_function`
+    are callable from the query. For an isolated catalog use `bt.Session`.
 
     Args:
         query: A SQL statement. Table names refer to the bound keywords.
@@ -117,23 +117,23 @@ def sql(query: str, *, dialect: str | None = None, **tables: Any) -> Dataset:
             >>> out.to_pydict()
             {'region': ['e', 'w'], 'total': [20, 40]}
     """
-    session = catalog if dialect is None else catalog._with_dialect(dialect)
+    session = _catalog if dialect is None else _catalog._with_dialect(dialect)
     return session._run(query, tables)
 
 
 def register_function(name: str, fn: Callable, **options: Any) -> None:
     """Register a Python function callable from `bt.sql` (the default session).
 
-    Sugar for ``bt.catalog.register_function``; see `Session.register_function` for
-    the call forms (scalar ``SELECT f(x)`` vs table ``SELECT * FROM f(t)``) and
-    options.
+    Registers on the default catalog; see `Session.register_function` for the call
+    forms (scalar ``SELECT f(x)`` vs table ``SELECT * FROM f(t)``) and options. For an
+    isolated registry use `bt.Session`.
 
     Args:
         name: The SQL name the function is called by.
         fn: The Python callable.
         **options: Forwarded to `Session.register_function`.
     """
-    catalog.register_function(name, fn, **options)
+    _catalog.register_function(name, fn, **options)
 
 
 def _scan(source: Source) -> Dataset:

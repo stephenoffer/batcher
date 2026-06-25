@@ -47,6 +47,34 @@ def _next_name() -> str:
         return f"query-{_COUNTER}"
 
 
+def _warn_if_checkpoint_not_durable(location: str) -> None:
+    """Under ``resilience="spot"``, warn when the checkpoint location looks node-local.
+
+    A streaming query's exactly-once recovery lives in its `checkpoint_location`. On a
+    spot/preemptible cluster a reclaimed node takes a node-local checkpoint with it, so
+    a restart cannot resume — defeating the durability the checkpoint exists for. A
+    durable location (object storage, or a shared mount) survives the node. Only a
+    warning, not an error: a bare path may legitimately be a shared filesystem, which
+    we cannot tell apart from node-local storage."""
+    import re
+    import warnings
+
+    from batcher.config import active_config
+
+    if active_config().distributed.resilience != "spot":
+        return
+    has_scheme = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", location)
+    node_local = has_scheme is None or location.lower().startswith("file://")
+    if node_local:
+        warnings.warn(
+            f"streaming checkpoint_location {location!r} looks node-local; on a "
+            "spot/preemptible cluster a reclaimed node loses the checkpoint and its "
+            "exactly-once recovery. Use a durable location (s3://, gs://, hdfs://, or a "
+            "shared mount that survives node loss).",
+            stacklevel=3,
+        )
+
+
 def active_streams() -> list[StreamingQuery]:
     """All currently-active streaming queries (the `bt.streams` accessor)."""
     with _LOCK:
@@ -177,6 +205,7 @@ def start_streaming_query(
     if checkpoint is not None:
         from batcher.io.formats.streaming.checkpoint import CheckpointStore
 
+        _warn_if_checkpoint_not_durable(checkpoint)
         store = CheckpointStore(checkpoint)
 
     run_batch = _build_run_batch(plan, sources) if _is_stateless(plan) else None

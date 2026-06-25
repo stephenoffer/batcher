@@ -25,6 +25,11 @@ dashmap = { workspace = true }
 async-stream = "0.3"
 # Error type. thiserror is the workspace's chosen error-derive crate.
 thiserror = { workspace = true }
+# Memory-mapped files for the same-node, cross-process SHARED_MEMORY transfer path:
+# a mapper writes a bucket as Arrow IPC to a tmpfs/temp file, a same-node reducer in
+# another process mmaps and reads it — no gRPC, no loopback TCP (the plasma-class
+# same-node fast path). Linux prefers /dev/shm; a regular temp file works elsewhere.
+memmap2 = "0.9"
 
 [lints]
 workspace = true

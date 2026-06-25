@@ -85,7 +85,7 @@ def test_sort_merge_join_strategy_vs_duckdb(duck, monkeypatch):
     from conftest import assert_same
 
     # No broadcast, and any join qualifies as sort-merge → exercise the SMJ path.
-    monkeypatch.setattr(selection, "BROADCAST_MAX_BYTES", -1)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)
     monkeypatch.setattr(selection, "SORT_MERGE_MIN_ROWS", 0.0)
 
     emp, dept = _tables(duck)

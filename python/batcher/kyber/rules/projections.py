@@ -89,7 +89,7 @@ def projection_inlining_into_agg(node: Aggregate, _ctx: OptimizerContext) -> Log
             new_aggs.append(spec)
             continue
         input2 = subst(spec.agg.input2) if spec.agg.input2 is not None else None
-        agg = AggExpr(spec.agg.func, subst(spec.agg.input), spec.agg.param, input2=input2)
+        agg = AggExpr(spec.agg.func, subst(spec.agg.input), param=spec.agg.param, input2=input2)
         new_aggs.append(dataclasses.replace(spec, agg=agg))
     return Aggregate(proj.input, new_keys, tuple(new_aggs))
 

@@ -9,41 +9,38 @@ import batcher as bt
 from batcher._internal.errors import PlanError
 
 
-@pytest.fixture(autouse=True)
-def _clear_catalog():
-    bt.catalog.clear()
-    yield
-    bt.catalog.clear()
-
-
-def test_catalog_register_and_table():
+def test_session_register_and_table():
+    sess = bt.Session()
     ds = bt.from_arrow(pa.table({"id": [1, 2, 3]}))
-    bt.catalog.register("nums", ds)
-    assert bt.catalog.list() == ["nums"]
-    assert bt.catalog.table("nums").collect().num_rows == 3
+    sess.register("nums", ds)
+    assert sess.list() == ["nums"]
+    assert sess.table("nums").collect().num_rows == 3
 
 
-def test_catalog_missing_raises():
+def test_session_missing_raises():
     with pytest.raises(PlanError, match="no table"):
-        bt.catalog.table("absent")
+        bt.Session().table("absent")
 
 
-def test_catalog_resolves_in_sql():
-    bt.catalog.register("customers", bt.from_arrow(pa.table({"id": [1, 2], "name": ["a", "b"]})))
-    out = bt.sql("SELECT name FROM customers WHERE id = 1").collect()
+def test_session_resolves_in_sql():
+    sess = bt.Session()
+    sess.register("customers", bt.from_arrow(pa.table({"id": [1, 2], "name": ["a", "b"]})))
+    out = sess.sql("SELECT name FROM customers WHERE id = 1").collect()
     assert out.to_pydict() == {"name": ["a"]}
 
 
-def test_catalog_explicit_table_overrides_registry():
-    bt.catalog.register("t", bt.from_arrow(pa.table({"v": [1]})))
-    out = bt.sql("SELECT * FROM t", t=bt.from_arrow(pa.table({"v": [99]}))).collect()
+def test_session_explicit_table_overrides_registry():
+    sess = bt.Session()
+    sess.register("t", bt.from_arrow(pa.table({"v": [1]})))
+    out = sess.sql("SELECT * FROM t", t=bt.from_arrow(pa.table({"v": [99]}))).collect()
     assert out.to_pydict() == {"v": [99]}
 
 
-def test_catalog_drop():
-    bt.catalog.register("t", bt.from_arrow(pa.table({"v": [1]})))
-    bt.catalog.drop("t")
-    assert bt.catalog.list() == []
+def test_session_drop():
+    sess = bt.Session()
+    sess.register("t", bt.from_arrow(pa.table({"v": [1]})))
+    sess.drop("t")
+    assert sess.list() == []
 
 
 def test_profile_reports_per_column_stats():

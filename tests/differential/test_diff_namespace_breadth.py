@@ -96,8 +96,8 @@ def test_list_first_last_negative_get():
     out = (
         bt.from_arrow(t)
         .select(
-            f=col("xs").list.first(),
-            l=col("xs").list.last(),
+            f=col("xs").list.get(0),
+            l=col("xs").list.get(-1),
             penultimate=col("xs").list.get(-2),
         )
         .to_pydict()

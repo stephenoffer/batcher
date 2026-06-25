@@ -49,3 +49,33 @@ def test_auto_num_partitions_falls_back_when_unknown(monkeypatch):
     monkeypatch.setattr("batcher.kyber.cardinality.CardinalityEstimator", _Boom)
     plan, sources = _scan_over(100)
     assert auto_num_partitions(plan, sources, hub=None) == DEFAULT_PARTITIONS
+
+
+def test_resolve_auto_config_fills_memory_budget():
+    # An unset memory cap (the default) is auto-sensed and frozen, so the data-plane
+    # spill budget becomes positive — a zero-config query spills instead of OOMing.
+    from batcher.api.orchestration import resolve_auto_config
+
+    base = Config()
+    assert base.memory.max_memory_bytes is None
+    assert base._rust_memory_budget_bytes() == 0  # unresolved → unbounded fallback
+    resolved = resolve_auto_config(base)
+    assert resolved.memory.max_memory_bytes is not None
+    assert resolved._rust_memory_budget_bytes() > 0
+
+
+def test_resolve_auto_config_honors_explicit_cap_and_unbounded():
+    import dataclasses
+
+    from batcher.api.orchestration import resolve_auto_config
+
+    base = Config()
+    # An explicit cap is returned untouched (user override wins).
+    cap = base.replace(memory=dataclasses.replace(base.memory, max_memory_bytes=1 << 30))
+    assert resolve_auto_config(cap) is cap
+    assert cap._rust_memory_budget_bytes() == int((1 << 30) * cap.memory.hard_limit)
+    # The unbounded opt-out is a no-op for the resolver and keeps the budget at 0
+    # (the pre-auto-tuning in-memory behavior).
+    ub = base.replace(memory=dataclasses.replace(base.memory, unbounded_memory=True))
+    assert resolve_auto_config(ub) is ub
+    assert ub._rust_memory_budget_bytes() == 0

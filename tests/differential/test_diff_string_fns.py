@@ -1,6 +1,6 @@
 """Coverage for the Phase 2 string functions.
 
-`instr`/`regexp_extract_all`/`levenshtein` are checked against DuckDB; the
+`position`/`regexp_extract_all`/`levenshtein` are checked against DuckDB; the
 Spark-only ones (`substring_index`, `overlay`, `regexp_count`) and `soundex`
 (a DuckDB extension, not built in) are pinned to fixtures.
 """
@@ -20,11 +20,11 @@ def _strs():
     return pa.table({"s": pa.array(["a.b.c.d", "hello", "smith", "robert", None])})
 
 
-def test_instr_matches_duckdb(duck):
+def test_position_matches_duckdb(duck):
     from conftest import assert_same
 
     duck.register("t", _strs())
-    out = bt.from_arrow(_strs()).select(r=col("s").str.instr(".")).collect()
+    out = bt.from_arrow(_strs()).select(r=col("s").str.position(".")).collect()
     assert_same(out, duck.sql("SELECT instr(s, '.') AS r FROM t"))
 
 

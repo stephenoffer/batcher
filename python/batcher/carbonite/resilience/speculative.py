@@ -103,7 +103,11 @@ def gather_with_backups(
     pending = list(refs)
 
     while len(result_of) < n:
-        done, pending = ray.wait(pending, num_returns=1, timeout=poll_seconds)
+        # Drain *all* currently-ready refs per wake (not one): a burst of completions
+        # is collected in a single iteration instead of one Python wakeup each. The
+        # `poll_seconds` timeout still bounds the wake, so the straggler-backup cadence
+        # below is unchanged (it re-evaluates at most once per poll window).
+        done, pending = ray.wait(pending, num_returns=len(pending), timeout=poll_seconds)
         now = time.monotonic()
         for r in done:
             i = ref_to_idx[r]

@@ -330,24 +330,6 @@ class _StrNamespace:
         """
         return StrFunc("position", self._e, pattern=pattern)
 
-    def instr(self, substring: str) -> StrFunc:
-        """Find the 1-based index of ``substring``, or 0 if absent (Spark ``instr``).
-
-        Identical to :meth:`position`; returns Int64.
-
-        Args:
-            substring: The literal substring to locate.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["hello"]})
-                >>> ds.select(bt.col("s").str.instr("lo").alias("r")).to_pydict()
-                {'r': [4]}
-        """
-        return StrFunc("position", self._e, pattern=substring)
-
     def substring_index(self, delimiter: str, count: int) -> StrFunc:
         """Return the substring before the ``count``-th occurrence of ``delimiter``.
 

@@ -59,12 +59,13 @@ def test_preprocessor_fit_aggregate_distributed_equals_single_node():
 
 
 def test_preprocessor_transform_distributed_equals_single_node():
-    from batcher.ml.preprocessors import Chain, SimpleImputer, StandardScaler
+    from batcher.ml.preprocessors import SimpleImputer, StandardScaler
 
     ds = bt.from_pydict({"id": list(range(200)), "x": [float(i % 7) for i in range(200)]})
-    pipe = Chain([SimpleImputer(["x"], strategy="mean"), StandardScaler(["x"])])
-    fitted = pipe.fit(ds)  # fit once (deterministic statistics)
-    single, dist = _both(fitted.transform(ds), "id")
+    # Sequence the steps: fit each on the prior step's output (deterministic stats).
+    imputer = SimpleImputer(["x"], strategy="mean").fit(ds)
+    scaler = StandardScaler(["x"]).fit(imputer.transform(ds))
+    single, dist = _both(scaler.transform(imputer.transform(ds)), "id")
     assert single == dist
 
 

@@ -9,28 +9,23 @@ falls back, so the tiers cannot diverge.
 
 from __future__ import annotations
 
-from typing import Any
-
 from batcher.plan.expr_ir.core import Expr
+from batcher.plan.expr_ir.node_base import IRNode, child, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
 
 __all__ = ["VideoFunc", "_VideoNamespace"]
 
 
-class VideoFunc(Expr):
+@expr_node
+class VideoFunc(IRNode):
     """A video decode op over a binary (video-bytes) sub-expression (via `.video`).
 
     `decode` reads each clip's metadata. Requires the engine's ``video`` feature.
     """
 
-    __slots__ = ("fn", "input")
-
-    def __init__(self, fn: str, input: Expr) -> None:
-        self.fn = fn
-        self.input = input
-
-    def to_ir(self) -> dict[str, Any]:
-        return {"e": ExprTag.VIDEO, "fn": self.fn, "input": self.input.to_ir()}
+    tag = ExprTag.VIDEO
+    fn: str = scalar()
+    input: Expr = child()
 
 
 class _VideoNamespace:

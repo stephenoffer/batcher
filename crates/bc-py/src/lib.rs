@@ -20,7 +20,10 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 mod bloom;
+mod errors;
 mod process;
+mod shuffle;
+use errors::transport_to_pyerr;
 use process::{shared_memory_pool, shared_runtime};
 
 /// The widened type the engine's Int64/Float64 kernels operate on, or `None` to
@@ -74,11 +77,11 @@ pub(crate) fn unwrap_batches(batches: Vec<PyArrowType<RecordBatch>>) -> Vec<Reco
     batches.into_iter().map(|b| normalize_batch(&b.0)).collect()
 }
 
-fn parse_group_keys(json: &str) -> PyResult<Vec<ProjectionItem>> {
+pub(crate) fn parse_group_keys(json: &str) -> PyResult<Vec<ProjectionItem>> {
     serde_json::from_str(json).map_err(to_pyerr)
 }
 
-fn parse_aggregates(json: &str) -> PyResult<Vec<AggregateItem>> {
+pub(crate) fn parse_aggregates(json: &str) -> PyResult<Vec<AggregateItem>> {
     serde_json::from_str(json).map_err(to_pyerr)
 }
 
@@ -452,53 +455,6 @@ fn reservoir_sample(
     Ok(PyArrowType(sampled))
 }
 
-/// Hash-shuffle batches into `num_partitions` buckets by the given key columns.
-#[pyfunction]
-fn partition_batches(
-    batches: Vec<PyArrowType<RecordBatch>>,
-    key_indices: Vec<usize>,
-    num_partitions: usize,
-) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
-    let parts =
-        bc_interp::dist::partition_batches(&unwrap_batches(batches), &key_indices, num_partitions)
-            .map_err(to_pyerr)?;
-    Ok(parts
-        .into_iter()
-        .map(|bucket| bucket.into_iter().map(PyArrowType).collect())
-        .collect())
-}
-
-/// Skew-aware shuffle for a single-key distributed join: a hot key's rows are
-/// salted across reducers instead of overloading one. `hot_keys` are the hot values
-/// rendered as strings (matching `heavy_hitters`); `replicate=false` is the probe
-/// side (one salted bucket per hot row), `replicate=true` the build side (every hot
-/// row to all salted buckets). Cold keys hash identically to `partition_batches`, so
-/// the joined relation is unchanged — only the hot key's work fans across reducers.
-#[pyfunction]
-fn salted_partition_batches(
-    batches: Vec<PyArrowType<RecordBatch>>,
-    key_indices: Vec<usize>,
-    num_partitions: usize,
-    hot_keys: Vec<String>,
-    salt_count: u32,
-    replicate: bool,
-) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
-    let hot: std::collections::HashSet<String> = hot_keys.into_iter().collect();
-    let parts = bc_interp::dist::salted_partition_batches(
-        &unwrap_batches(batches),
-        &key_indices,
-        num_partitions,
-        &hot,
-        salt_count,
-        replicate,
-    )
-    .map_err(to_pyerr)?;
-    Ok(parts
-        .into_iter()
-        .map(|bucket| bucket.into_iter().map(PyArrowType).collect())
-        .collect())
-}
-
 /// A process-wide memory accounting pool (Carbonite's reserve-before-allocate
 /// enforcement primitive, from `bc-resource`). Carbonite sets the limit from its
 /// memory envelope and reserves/releases against it so the engine spills instead
@@ -565,7 +521,7 @@ impl MemoryPool {
 /// own `ServerHandle` keeps this server's serve task alive for the object's life.
 #[pyclass]
 struct FlightShuffleServer {
-    exchange: bc_transport::ShuffleExchange,
+    pub(crate) exchange: bc_transport::ShuffleExchange,
     addr: String,
 }
 
@@ -642,6 +598,39 @@ impl FlightShuffleServer {
         Ok(batches.map(|bs| bs.into_iter().map(PyArrowType).collect()))
     }
 
+    /// Mirror `ticket`'s `batches` to a same-node shared-memory file (Arrow IPC over a
+    /// memory map) under this server's advertised address, so a reducer in *another*
+    /// process on the same host can read them with no gRPC/loopback hop. Best-effort:
+    /// a write error is swallowed (the reducer falls back to Flight).
+    fn publish_shared(&self, py: Python<'_>, ticket: &str, batches: Vec<PyArrowType<RecordBatch>>) {
+        let batches: Vec<RecordBatch> = batches.iter().map(|b| normalize_batch(&b.0)).collect();
+        let addr = self.addr.clone();
+        py.allow_threads(|| {
+            let _ = bc_transport::publish_shared(&addr, ticket, &batches);
+        });
+    }
+
+    /// Read a partition a same-node peer published under `(source_addr, ticket)` from
+    /// shared memory (mmap), or `None` if absent (an empty bucket, an un-shm'd peer, or
+    /// shm off) so the caller falls back to Flight.
+    fn shm_fetch(
+        &self,
+        py: Python<'_>,
+        source_addr: &str,
+        ticket: &str,
+    ) -> PyResult<Option<Vec<PyArrowType<RecordBatch>>>> {
+        let batches = py
+            .allow_threads(|| bc_transport::fetch_shared(source_addr, ticket))
+            .map_err(to_pyerr)?;
+        Ok(batches.map(|bs| bs.into_iter().map(PyArrowType).collect()))
+    }
+
+    /// Remove every shared-memory file this server published (plan teardown).
+    fn clear_shared(&self, py: Python<'_>) {
+        let addr = self.addr.clone();
+        py.allow_threads(|| bc_transport::clear_shared(&addr));
+    }
+
     /// Evict one published partition (its reducers have fetched it), freeing it.
     fn release(&self, py: Python<'_>, ticket: &str) -> PyResult<()> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
@@ -685,7 +674,7 @@ fn flight_fetch(
 ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
     let batches = py
         .allow_threads(|| bc_transport::fetch_blocking_with_credits(addr, ticket, credits, token))
-        .map_err(to_pyerr)?;
+        .map_err(transport_to_pyerr)?;
     Ok(batches.into_iter().map(PyArrowType).collect())
 }
 
@@ -700,6 +689,13 @@ fn set_flight_transport_config(idle_timeout_ms: u64, keepalive_ms: u64) {
     bc_transport::set_transport_timeouts(idle_timeout_ms, keepalive_ms);
 }
 
+/// Whether a same-node shared-memory transfer directory is usable on this host (so the
+/// control plane can avoid selecting SHARED_MEMORY where it would never work).
+#[pyfunction]
+fn shm_available() -> bool {
+    bc_transport::shm_available()
+}
+
 /// A pooled, persistent shuffle consumer.
 ///
 /// Holds a `ClientPool` for its lifetime, so a reducer's many `fetch`es reuse gRPC
@@ -709,7 +705,7 @@ fn set_flight_transport_config(idle_timeout_ms: u64, keepalive_ms: u64) {
 /// costs O(peers) connections. Driven by the process-wide [`shared_runtime`].
 #[pyclass]
 struct ShuffleClient {
-    pool: std::sync::Arc<bc_transport::ClientPool>,
+    pub(crate) pool: std::sync::Arc<bc_transport::ClientPool>,
 }
 
 #[pymethods]
@@ -736,7 +732,7 @@ impl ShuffleClient {
             .allow_threads(|| {
                 shared_runtime().block_on(self.pool.fetch_secured(addr, &t, credits, token))
             })
-            .map_err(to_pyerr)?;
+            .map_err(transport_to_pyerr)?;
         Ok(batches.into_iter().map(PyArrowType).collect())
     }
 
@@ -755,8 +751,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(partial_aggregate, m)?)?;
     m.add_function(wrap_pyfunction!(combine, m)?)?;
     m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;
-    m.add_function(wrap_pyfunction!(partition_batches, m)?)?;
-    m.add_function(wrap_pyfunction!(salted_partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::range_partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::salted_partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::gather_combine, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::gather_concat, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::build_key_bloom, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::merge_blooms, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::bloom_filter_batches, m)?)?;
@@ -770,7 +769,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FlightShuffleServer>()?;
     m.add_function(wrap_pyfunction!(flight_fetch, m)?)?;
     m.add_function(wrap_pyfunction!(set_flight_transport_config, m)?)?;
+    m.add_function(wrap_pyfunction!(shm_available, m)?)?;
     m.add_class::<ShuffleClient>()?;
     m.add_class::<MemoryPool>()?;
+    // Classified shuffle-fetch exceptions: the control plane catches `Retryable` as
+    // worker loss (recompute + retry) and lets `Fatal` propagate (fail fast).
+    errors::register(m)?;
     Ok(())
 }

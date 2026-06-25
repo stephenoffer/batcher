@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import ConfigError
+from batcher.config.profiles import RESILIENCE_PROFILES
 
 if TYPE_CHECKING:
     from batcher.config.config import Config
@@ -52,6 +53,8 @@ def validate_config(cfg: Config) -> None:
     _check(e.morsel_rows > 0, f"execution.morsel_rows must be positive, got {e.morsel_rows}")
     _check(e.morsel_bytes > 0, f"execution.morsel_bytes must be positive, got {e.morsel_bytes}")
     _check(e.cpus_per_task > 0, f"execution.cpus_per_task must be positive, got {e.cpus_per_task}")
+    _check(e.cpu_share_io > 0, f"execution.cpu_share_io must be positive, got {e.cpu_share_io}")
+    _check(e.cpu_share_min > 0, f"execution.cpu_share_min must be positive, got {e.cpu_share_min}")
 
     # Distributed fault tolerance: non-negative budgets, >= 1 attempt, positive timeouts.
     _check(
@@ -89,6 +92,11 @@ def validate_config(cfg: Config) -> None:
     _check(
         d.speculation_max_backups >= 0,
         f"distributed.speculation_max_backups must be >= 0, got {d.speculation_max_backups}",
+    )
+    _check(
+        d.resilience in RESILIENCE_PROFILES,
+        f"distributed.resilience must be one of {sorted(RESILIENCE_PROFILES)}, "
+        f"got {d.resilience!r}",
     )
     _check(
         d.skew_join_salt >= 0, f"distributed.skew_join_salt must be >= 0, got {d.skew_join_salt}"

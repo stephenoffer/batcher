@@ -38,6 +38,7 @@ BANNED_FILENAMES = {"utils.py", "helpers.py", "common.py", "misc.py"}
 
 # Roots whose subtree is governed (and the depth origin for each).
 PY_ROOT = Path("python/batcher")
+BENCH_ROOT = Path("benchmarks")  # the benchmark harness holds to the same structure bar
 CRATE_SRC_GLOB = "crates/*/src"
 
 # Fluent builders / namespace accessors: breadth is the sanctioned Polars pattern
@@ -81,6 +82,12 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # fallback the broadcast path depends on. Splitting the broadcast path into a
     # sibling forces a base<->fallback import cycle with `_shuffle_join`.
     "python/batcher/dist/executors/join.py": "distributed-join strategy hub; broadcast/shuffle split forces an import cycle",
+    # Cost-based join reordering: the rule driver plus three cost-DP rebuilders
+    # (exhaustive subset DP, connected-subset DP for large sparse graphs, greedy) that
+    # share the same edge/leaf/schema scaffolding (`_join_plans`/`_final_projection`).
+    # `kyber/rules/` is already at the 12-file directory cap, so the DP builders can't
+    # move to a sibling module without breaching it — the dir-size invariant wins.
+    "python/batcher/kyber/rules/join_order.py": "join-reorder rule + cost-DP variants; rules/ at the 12-file dir cap",
     # The expression accessor namespaces: each is one bound family (`.str` / `.list`)
     # whose every public method carries a Google-style docstring with a runnable
     # `.. doctest::` example (python-quality.md). The examples — not the code — push
@@ -241,11 +248,12 @@ def main() -> int:
 
     os.chdir(repo)
 
-    if PY_ROOT.is_dir():
-        for p in PY_ROOT.rglob("*.py"):
-            if "__pycache__" not in p.parts:
-                check_python_file(p)
-        check_dirs(PY_ROOT, PY_ROOT.parent)
+    for root in (PY_ROOT, BENCH_ROOT):
+        if root.is_dir():
+            for p in root.rglob("*.py"):
+                if "__pycache__" not in p.parts:
+                    check_python_file(p)
+            check_dirs(root, root.parent)
 
     for src in sorted(Path().glob(CRATE_SRC_GLOB)):
         for p in src.rglob("*.rs"):

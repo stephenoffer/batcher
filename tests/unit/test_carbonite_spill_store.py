@@ -96,3 +96,22 @@ def test_cleanup_removes_local(tmp_path):
     store.spill([_batch(10)])
     store.cleanup()
     assert store.local_bytes == 0
+
+
+def test_lost_local_file_raises_retryable_resource_error(tmp_path):
+    # Phase 3c: an ephemeral/spot node's local NVMe can be reclaimed mid-query,
+    # vanishing the spilled partition. Reading it must surface a clear, retryable
+    # ResourceError (the distributed recovery path recomputes on it), not a cryptic
+    # OSError that crashes the query.
+    import os
+
+    from batcher._internal.errors import ResourceError
+
+    store = TieredSpillStore(str(tmp_path / "spill"))
+    handle = store.spill([_batch(50)])
+    os.remove(handle.path)  # simulate the disk being reclaimed
+
+    with pytest.raises(ResourceError, match="reclaimed"):
+        store.read(handle)
+    with pytest.raises(ResourceError, match="reclaimed"):
+        list(store.read_stream(handle))

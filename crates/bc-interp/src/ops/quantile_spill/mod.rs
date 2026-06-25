@@ -227,7 +227,13 @@ pub(crate) fn bounded_group_quantile(
         nulls_first: true,
     });
 
-    let Some(mut store) = external_sort_to_final_store(flat, &sort_keys, dir)? else {
+    let Some(mut store) = external_sort_to_final_store(
+        flat,
+        &sort_keys,
+        dir,
+        bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+    )?
+    else {
         return Ok((
             empty_key_columns(&schema, n_keys),
             Arc::new(Float64Array::from(Vec::<f64>::new())),
@@ -423,7 +429,13 @@ pub(crate) fn bounded_group_distinct(
         return Ok((Vec::new(), Arc::new(Int64Array::from(Vec::<i64>::new()))));
     };
     let sort_keys = native_value_sort_keys(n_keys);
-    let Some(mut store) = external_sort_to_final_store(flat, &sort_keys, dir)? else {
+    let Some(mut store) = external_sort_to_final_store(
+        flat,
+        &sort_keys,
+        dir,
+        bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+    )?
+    else {
         return Ok((
             empty_key_columns(&schema, n_keys),
             Arc::new(Int64Array::from(Vec::<i64>::new())),
@@ -533,7 +545,13 @@ pub(crate) fn bounded_group_mode(
         return Ok((Vec::new(), new_empty_array(&value_type)));
     };
     let sort_keys = native_value_sort_keys(n_keys);
-    let Some(mut store) = external_sort_to_final_store(flat, &sort_keys, dir)? else {
+    let Some(mut store) = external_sort_to_final_store(
+        flat,
+        &sort_keys,
+        dir,
+        bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+    )?
+    else {
         return Ok((
             empty_key_columns(&schema, n_keys),
             new_empty_array(&value_type),

@@ -30,10 +30,13 @@ use bc_runtime::window_frame;
 use crate::error::InterpError;
 
 mod joins;
+mod mixed_spill;
 mod morsel;
 mod quantile_spill;
+mod radix_sort;
 mod reshape;
-pub(crate) use joins::{asof_join_batches, join_batches, key_indices};
+pub(crate) use joins::{asof_join_batches, join_batches, join_batches_with, key_indices};
+pub(crate) use mixed_spill::try_bounded_mixed_spill;
 pub(crate) use morsel::{morselize, remorselize};
 pub(crate) use quantile_spill::{
     try_bounded_distinct_spill, try_bounded_histogram_spill, try_bounded_mode_spill,
@@ -263,7 +266,18 @@ pub(crate) fn sort_batch(
             descending: k.descending,
             nulls_first: k.nulls_first,
         };
-        sort_to_indices(&k.expr.eval(batch)?, Some(opts), limit)?
+        let vals = k.expr.eval(batch)?;
+        // Radix fast path for a *full* sort (no top-N partial sort to beat) on a
+        // fixed-width integer/temporal key: O(n) vs the comparison sort's O(n log n),
+        // producing the identical relation. Falls back for limits / other types.
+        let radix = limit
+            .is_none()
+            .then(|| radix_sort::radix_sort_indices(&vals, opts))
+            .flatten();
+        match radix {
+            Some(idx) => idx,
+            None => sort_to_indices(&vals, Some(opts), limit)?,
+        }
     } else {
         let sort_columns: Vec<SortColumn> = keys
             .iter()
@@ -291,17 +305,17 @@ pub(crate) fn sort_batch(
 
 /// Out-of-core sort: sort each input morsel into a run and spill it (dropping the
 /// input batch as we go), then merge the runs with a **bounded-fan-in, streaming**
-/// k-way merge. Peak memory is O(`FANIN` morsels) regardless of input size — only
-/// one batch per run in the active merge group is ever resident, and the output is
-/// streamed back to disk between passes rather than concatenated. The result equals
-/// a single in-memory `sort_batch` over the whole input (the merge is
-/// order-preserving). Disk spill uses the runtime's Arrow-IPC [`DiskSpillStore`].
+/// k-way merge. Peak memory is O(`sort_merge_fanin` morsels) regardless of input size
+/// — only one batch per run in the active merge group is resident, and the output is
+/// streamed back to disk between passes. The result equals a single in-memory
+/// `sort_batch` over the whole input. Disk spill uses Arrow-IPC [`DiskSpillStore`].
 pub(crate) fn external_merge_sort(
     parts: Vec<RecordBatch>,
     keys: &[SortKey],
     dir: &std::path::Path,
+    sort_merge_fanin: usize,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    let Some(mut store) = external_sort_to_final_store(parts, keys, dir)? else {
+    let Some(mut store) = external_sort_to_final_store(parts, keys, dir, sort_merge_fanin)? else {
         return Ok(Vec::new());
     };
     // The final run holds the globally sorted result; stream its morsels out.
@@ -326,6 +340,7 @@ pub(crate) fn external_sort_to_final_store(
     parts: Vec<RecordBatch>,
     keys: &[SortKey],
     dir: &std::path::Path,
+    sort_merge_fanin: usize,
 ) -> Result<Option<bc_runtime::agg::spill::DiskSpillStore>, InterpError> {
     use bc_runtime::agg::spill::{DiskSpillStore, SpillStore};
 
@@ -347,17 +362,18 @@ pub(crate) fn external_sort_to_final_store(
         return Ok(None);
     }
 
-    // Merge passes: each merges groups of <= FANIN runs into one larger (spilled) run,
-    // streaming so only one batch per run is resident. Repeats until a single run
-    // remains. Fan-in bounds the resident working set independent of the run count.
-    const FANIN: usize = 16;
+    // Merge passes: each merges groups of <= `fanin` runs into one larger (spilled)
+    // run, streaming so only one batch per run is resident. Repeats until a single run
+    // remains. Fan-in bounds the resident working set independent of the run count; it
+    // is a perf-only knob (default 16, or the control plane's tuning), not the result.
+    let fanin = sort_merge_fanin.max(2);
     while n_runs > 1 {
-        let n_groups = n_runs.div_ceil(FANIN);
+        let n_groups = n_runs.div_ceil(fanin);
         let mut next =
             DiskSpillStore::new(dir.to_path_buf(), n_groups).map_err(InterpError::from)?;
         for g in 0..n_groups {
-            let lo = g * FANIN;
-            let hi = (lo + FANIN).min(n_runs);
+            let lo = g * fanin;
+            let hi = (lo + fanin).min(n_runs);
             let mut readers = Vec::with_capacity(hi - lo);
             for i in lo..hi {
                 if let Some(r) = store.open_reader(i).map_err(InterpError::from)? {
@@ -566,16 +582,35 @@ fn eval_sort_keys(batch: &RecordBatch, keys: &[SortKey]) -> Result<Vec<ArrayRef>
         .collect()
 }
 
-/// Window over a single (already-materialized) batch: evaluate partition keys,
-/// order keys, and each function's optional input, run the runtime window kernel,
-/// and append the resulting columns (one per function) to the input batch. Input
-/// columns are preserved; the appended columns are named by each function alias.
+/// Window over a single (already-materialized) batch, at the default parallel-row
+/// threshold. Evaluates partition/order keys + each function input, runs the runtime
+/// window kernel, and appends one column per function (named by alias) to the input.
 pub(crate) fn window_batch(
     batch: &RecordBatch,
     partition_keys: &[bc_expr::Expr],
     order_keys: &[SortKey],
     functions: &[WindowFunc],
     rank_limit: Option<usize>,
+) -> Result<RecordBatch, InterpError> {
+    window_batch_with(
+        batch,
+        partition_keys,
+        order_keys,
+        functions,
+        rank_limit,
+        bc_arrow::RuntimeTuning::default().window_parallel_row_threshold,
+    )
+}
+
+/// [`window_batch`] with a caller-supplied parallel-row threshold (perf-only — it only
+/// decides whether per-partition sorts run across cores; the output is identical).
+pub(crate) fn window_batch_with(
+    batch: &RecordBatch,
+    partition_keys: &[bc_expr::Expr],
+    order_keys: &[SortKey],
+    functions: &[WindowFunc],
+    rank_limit: Option<usize>,
+    parallel_row_threshold: usize,
 ) -> Result<RecordBatch, InterpError> {
     let num_rows = batch.num_rows();
 
@@ -611,7 +646,13 @@ pub(crate) fn window_batch(
         });
     }
 
-    let cols = window::window(&part_arrays, &order_arrays, &calls, num_rows)?;
+    let cols = window::window_with(
+        &part_arrays,
+        &order_arrays,
+        &calls,
+        num_rows,
+        parallel_row_threshold,
+    )?;
 
     // input columns + one appended column per function alias.
     let in_schema = batch.schema();

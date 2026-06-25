@@ -6,18 +6,22 @@ it is distributed and spillable for free); `transform` is a lazy column rewrite.
 on the training set, then `transform` the training **and** validation sets with the
 same learned state.
 
+Compose several preprocessors by sequencing them: fit each on the previous step's
+output, then transform any split through the same fitted objects.
+
 ```python
-from batcher.ml.preprocessors import StandardScaler, Chain, SimpleImputer
+from batcher.ml.preprocessors import StandardScaler, SimpleImputer
 import batcher as bt
 
 train = bt.from_pydict({"age": [20.0, 30.0, 40.0, 50.0], "income": [1.0, 2.0, 3.0, 4.0]})
 
-pipe = Chain([SimpleImputer(["age"]), StandardScaler(["age", "income"])])
-train_scaled = pipe.fit_transform(train)
+imputer = SimpleImputer(["age"])
+scaler = StandardScaler(["age", "income"])
+train_scaled = scaler.fit_transform(imputer.fit_transform(train))
 print(train_scaled.collect().column_names)
 ```
 
-Because the fitted state lives on the object, the same pipeline transforms held-out
+Because the fitted state lives on each object, the same steps transform held-out
 data with the statistics learned on train:
 
 ```python
@@ -48,7 +52,6 @@ print(scaler.transform(test).collect().column("x").to_pylist())
 | `SimpleImputer` | mean / median / mode / constant | fill nulls |
 | `Concatenator` | — (stateless) | stack columns into one tensor column |
 | `Tokenizer` | — (stateless) | tokenize text with a user tokenizer |
-| `Chain` | each step in sequence | apply each step in sequence |
 
 All preprocessors share the `Preprocessor` base contract (`fit` / `transform` /
 `fit_transform`).

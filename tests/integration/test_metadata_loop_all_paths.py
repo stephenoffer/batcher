@@ -53,6 +53,22 @@ def test_adaptive_path_collects_metadata():
     assert abs(ndv.get("adk", 0) - 7) < 1  # learned from the fact scan
 
 
+def test_native_path_records_cpu_utilization():
+    # The CPU half of the adaptive loop: a real run measures per-operator CPU time
+    # (Rust `cpu_ns`) and transcribes it to a [0, 1] utilization on the hub, which
+    # Kyber later folds into each task's `num_cpus`. A CPU-heavy aggregate over
+    # enough rows registers measurable CPU time regardless of timer granularity.
+    hub = core.default_hub()
+    n = 1_000_000
+    t = pa.table({"cuk": [i % 17 for i in range(n)], "cuv": list(range(n))})
+    bt.from_arrow(t).group_by("cuk").agg(s=col("cuv").sum()).collect()
+    rows = [r for rs in hub.op_stats_by_kind().values() for r in rs]
+    assert rows, "operator feedback was recorded"
+    assert any(r.get("cpu_utilization", 0.0) > 0.0 for r in rows), (
+        "at least one operator registered measurable CPU utilization"
+    )
+
+
 def _op_stats_count(hub) -> int:
     return sum(len(v) for v in hub.op_stats_by_kind().values())
 

@@ -54,9 +54,8 @@ def test_list_n_unique():
     assert out["u"] == [3, 2, 0, None, 1]
 
 
-def test_list_arr_alias_and_float():
-    # `.arr` is an alias; floats work too.
+def test_list_float():
     ds = bt.from_arrow(pa.table({"a": pa.array([[1.5, 2.5], [10.0]], type=pa.list_(pa.float64()))}))
-    out = ds.select(s=col("a").arr.sum(), n=col("a").arr.len()).collect().to_pydict()
+    out = ds.select(s=col("a").list.sum(), n=col("a").list.len()).collect().to_pydict()
     assert out["s"] == [4.0, 10.0]
     assert out["n"] == [2, 1]

@@ -50,3 +50,54 @@ def test_sql_vs_duckdb(duck, tables, query):
     emp, dept = tables
     out = bt.sql(query, emp=emp, dept=dept).collect()
     assert_same(out, duck.sql(query))
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # comma self-join with a non-equi filter across the two aliases
+        "SELECT a.id AS aid, b.id AS bid FROM emp a, emp b "
+        "WHERE a.dept_id = b.dept_id AND a.id < b.id",
+        # explicit JOIN ON self-join
+        "SELECT a.id AS aid, b.id AS bid FROM emp a JOIN emp b "
+        "ON a.dept_id = b.dept_id AND a.id <> b.id",
+        # self-join with aggregation referencing both aliases
+        "SELECT a.dept_id AS d, COUNT(*) c, SUM(b.salary) s FROM emp a, emp b "
+        "WHERE a.dept_id = b.dept_id GROUP BY a.dept_id",
+        # a bare (unaliased) projection of a self-join column keeps its output name
+        "SELECT a.name FROM emp a, emp b WHERE a.id = b.id AND b.salary > 150",
+    ],
+)
+def test_self_join_vs_duckdb(duck, tables, query):
+    """Self-joins (same table aliased twice) are disambiguated and match DuckDB."""
+    from conftest import assert_same
+
+    emp, dept = tables
+    out = bt.sql(query, emp=emp, dept=dept).collect()
+    assert_same(out, duck.sql(query))
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # decimal literal arithmetic folds exactly (0.06 + 0.01 == 0.07), so the
+        # boundary rows are selected the same as DuckDB (TPC-H Q6 shape).
+        "SELECT COUNT(*) c FROM disc WHERE d BETWEEN 0.06 - 0.01 AND 0.06 + 0.01",
+        "SELECT SUM(d) s FROM disc WHERE d <= 0.05 + 0.02",
+        "SELECT COUNT(*) c FROM disc WHERE d > 0.1 - 0.03",
+        # integer arithmetic keeps integer semantics
+        "SELECT COUNT(*) c FROM disc WHERE q < 5 + 10",
+    ],
+)
+def test_decimal_literal_arithmetic_vs_duckdb(duck, query):
+    """SQL decimal literals fold with exact (Decimal) semantics, matching DuckDB."""
+    from conftest import assert_same
+
+    disc = pa.table(
+        {
+            "d": pa.array([0.04, 0.05, 0.06, 0.07, 0.08, 0.05, 0.06, 0.07], type=pa.float64()),
+            "q": pa.array([10, 12, 14, 16, 18, 11, 13, 15], type=pa.int64()),
+        }
+    )
+    duck.register("disc", disc)
+    assert_same(bt.sql(query, disc=disc).collect(), duck.sql(query))

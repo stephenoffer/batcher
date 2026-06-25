@@ -13,6 +13,8 @@
 //! optimized plan the same way (`kyber.optimizer._annotate_ops` over `plan.walk()`),
 //! so an `op_id` measured here lines up with the operator the planner annotated.
 
+use std::time::Instant;
+
 use serde::Serialize;
 
 /// One operator's measured execution facts.
@@ -31,6 +33,17 @@ pub struct OpMetric {
     /// Wall-clock nanoseconds spent in this operator's *own* work (excludes the
     /// time spent producing its children's inputs).
     pub elapsed_ns: u64,
+    /// CPU-time nanoseconds (user + system, summed across *all* worker threads)
+    /// consumed during this operator's own work. Divided by `elapsed_ns x threads`
+    /// it gives the per-core utilization the control plane learns from to size each
+    /// task's `num_cpus`. `0` when the platform can't report process CPU time.
+    pub cpu_ns: u64,
+    /// Worker threads this operator's pool actually ran across (rayon's live count;
+    /// `1` for the sequential oracle). The control plane uses this as the exact
+    /// denominator for per-core utilization instead of guessing the host core count —
+    /// which is wrong under a cgroup CPU quota (a container sees host cores but rayon
+    /// sizes to the quota), the common case in a Kubernetes deployment.
+    pub threads: u32,
     /// Bytes held by this operator's result (Arrow `get_array_memory_size`). A
     /// coarse proxy for peak working-set used to calibrate the memory cost axis.
     pub peak_bytes: u64,
@@ -80,5 +93,115 @@ impl IdGen {
         let id = self.next;
         self.next += 1;
         id
+    }
+}
+
+/// A paired wall + CPU stopwatch, captured at the start of an operator's own work.
+///
+/// `Copy` so it threads through the metric helpers exactly as the bare `Instant` it
+/// replaces did. `cpu_ns` is sampled against process-wide CPU time (`getrusage`):
+/// because the interpreter runs operators one at a time and fully joins each before
+/// recording it, the delta over an operator's window is that operator's CPU work
+/// across every rayon thread — the numerator of its per-core utilization.
+#[derive(Clone, Copy)]
+pub(crate) struct Stopwatch {
+    wall: Instant,
+    cpu_ns_start: u64,
+}
+
+impl Stopwatch {
+    /// Capture the wall and CPU clocks now (an operator's start).
+    pub(crate) fn start() -> Self {
+        Self {
+            wall: Instant::now(),
+            cpu_ns_start: process_cpu_ns(),
+        }
+    }
+
+    /// Wall-clock nanoseconds since [`start`](Self::start).
+    pub(crate) fn elapsed_ns(&self) -> u64 {
+        self.wall.elapsed().as_nanos() as u64
+    }
+
+    /// Process CPU-time nanoseconds consumed since [`start`](Self::start).
+    pub(crate) fn cpu_ns(&self) -> u64 {
+        process_cpu_ns().saturating_sub(self.cpu_ns_start)
+    }
+}
+
+/// Process-wide CPU time (user + system, all threads) in nanoseconds, or `0` when
+/// unavailable — the control plane treats `0` as "unmeasured" and keeps its prior.
+#[cfg(unix)]
+fn process_cpu_ns() -> u64 {
+    use std::mem::MaybeUninit;
+
+    let mut usage = MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` fully initializes the `rusage` out-param and returns 0 on
+    // success; the initialized value is read only on that success path.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return 0;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let tv_ns = |t: &libc::timeval| (t.tv_sec as u64) * 1_000_000_000 + (t.tv_usec as u64) * 1_000;
+    tv_ns(&usage.ru_utime) + tv_ns(&usage.ru_stime)
+}
+
+#[cfg(not(unix))]
+fn process_cpu_ns() -> u64 {
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CPU stopwatch registers measurable CPU time for a busy span (the signal
+    /// the adaptive CPU-share loop learns from). On a unix host CPU time advances;
+    /// elsewhere it reports 0 and the control plane treats that as "unmeasured".
+    #[test]
+    fn stopwatch_measures_cpu_and_wall_time() {
+        let sw = Stopwatch::start();
+        // CPU-bound busy work the optimizer can't elide (black_box the accumulator).
+        let mut acc: u64 = 0;
+        for i in 0..50_000_000u64 {
+            acc = acc.wrapping_add(i).wrapping_mul(2_654_435_761);
+        }
+        std::hint::black_box(acc);
+        assert!(sw.elapsed_ns() > 0, "wall time must advance");
+        if cfg!(unix) {
+            assert!(
+                sw.cpu_ns() > 0,
+                "a busy span must register CPU time on unix"
+            );
+        }
+    }
+
+    /// The serialized metrics document carries the `cpu_ns` key the control plane
+    /// reads (`core.record_exec_metrics`) — a guard on the wire contract.
+    #[test]
+    fn to_json_includes_cpu_ns() {
+        let mut m = ExecMetrics::default();
+        m.record(OpMetric {
+            op_id: 0,
+            kind: "scan",
+            rows_in: 1,
+            rows_out: 1,
+            elapsed_ns: 10,
+            cpu_ns: 7,
+            threads: 4,
+            peak_bytes: 0,
+            spilled: false,
+            backend: "interp",
+        });
+        let json = m.to_json();
+        assert!(
+            json.contains("\"cpu_ns\":7"),
+            "cpu_ns must serialize: {json}"
+        );
+        assert!(
+            json.contains("\"threads\":4"),
+            "threads must serialize: {json}"
+        );
     }
 }

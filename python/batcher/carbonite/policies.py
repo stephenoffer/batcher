@@ -226,8 +226,17 @@ class DefaultSchedulingPolicy:
             )
             memory_bytes = min(per_task, fair_share)
 
+        # Per-task CPU: the dominant operator's share (a task runs a whole plan
+        # partition, so its heaviest op sets the core need). A pure scan→filter→write
+        # plan asks <1 CPU and packs tighter; any breaker pulls it back to a full core.
+        # Falls back to the configured default for an unsized plan (no bounds).
+        num_cpus = max(
+            (op.bounds.c_cpu_shares for op in plan.ops),
+            default=cfg.execution.cpus_per_task,
+        )
+
         return SchedulingEnvelope(
-            num_cpus=cfg.execution.cpus_per_task,
+            num_cpus=num_cpus,
             memory_bytes=int(memory_bytes),
             num_gpus=0.0,
             n_tasks=n_tasks,

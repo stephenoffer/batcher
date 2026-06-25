@@ -231,3 +231,36 @@ def test_spill_global_window_streams_via_iter_batches():
     streamed = pa.Table.from_batches(list(q(bt.from_batches(factory, schema)).iter_batches()))
     in_memory = q(bt.from_arrow(table)).collect()
     assert _norm(streamed) == _norm(in_memory)
+
+
+def test_spill_global_value_list_matches_in_memory():
+    # A *global* (no GROUP BY) value-list aggregate must spill correctly: the mixed
+    # path (median + a constant-state aggregate) and the lone paths (n_unique, mode)
+    # all have an empty group-key set, which the bounded spill aligns without a group
+    # sort. Regression for the empty-group-key spill crash exposed by auto-budgeting.
+    factory, schema, table = _streaming_dataset()
+
+    def q(ds):
+        return ds.group_by().agg(
+            m=col("v").median(),
+            s=col("v").sum(),
+            d=col("v").n_unique(),
+            md=col("v").mode(),
+        )
+
+    spilled = q(bt.from_batches(factory, schema)).collect(spill=True, num_partitions=16)
+    in_memory = q(bt.from_arrow(table)).collect()
+    assert _norm(spilled) == _norm(in_memory)
+
+
+def test_spill_empty_group_by_matches_in_memory():
+    # An empty input (0 rows) has no working set, so it must take the in-memory path
+    # and yield zero groups even when spilling is requested — the grace path's
+    # concat-of-nothing crash is the regression this guards.
+    schema = pa.schema([("k", pa.int64()), ("v", pa.int64())])
+    empty = pa.table({"k": [], "v": []}, schema=schema)
+    spilled = (
+        bt.from_arrow(empty).group_by("k").agg(s=col("v").sum(), n=count()).collect(spill=True)
+    )
+    assert spilled.num_rows == 0
+    assert spilled.column_names == ["k", "s", "n"]

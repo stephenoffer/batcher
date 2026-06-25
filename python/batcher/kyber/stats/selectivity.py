@@ -1,11 +1,13 @@
 """Predicate selectivity — the fraction of rows a `Filter` keeps.
 
-Selinger-style structural estimation: conjunctions multiply, disjunctions use
-inclusion-exclusion (independence assumption), negation complements. A leaf
-`col = literal` uses `1/ndv` when the distinct count is known; `col < literal`
-interpolates the fraction below the literal from per-column quantile boundaries
-when known, else a Selinger range constant. These feed the row-count estimator;
-they are *estimates* and never carry `EXACT` provenance.
+Selinger-style structural estimation: conjunctions combine with **exponential
+backoff** (not a raw independence product, which badly underestimates the kept
+fraction on correlated predicates), disjunctions use inclusion-exclusion,
+negation complements. A leaf `col = literal` uses `1/ndv` when the distinct count
+is known; `col < literal` interpolates the fraction below the literal from
+per-column quantile boundaries when known, else a Selinger range constant. These
+feed the row-count estimator; they are *estimates* and never carry `EXACT`
+provenance.
 """
 
 from __future__ import annotations
@@ -30,11 +32,14 @@ def predicate_selectivity(
 ) -> float:
     """Estimate the fraction of rows a predicate keeps, from its structure.
 
-    Conjunctions multiply and disjunctions use inclusion-exclusion (assuming
-    independence, the standard Selinger model); negation complements. A leaf
-    `col = literal` uses `1/ndv` when the distinct count is known; `col < literal`
-    interpolates the fraction below the literal from per-column quantile boundaries
-    when known, else a Selinger range constant. Always clamped to `[0, 1]`.
+    Conjunctions combine with exponential backoff (the most selective conjunct at
+    full weight, each subsequent one dampened) — this lifts the estimate toward
+    reality on correlated predicates, where the naive independence product
+    underestimates the kept fraction. Disjunctions use inclusion-exclusion;
+    negation complements. A leaf `col = literal` uses `1/ndv` when the distinct
+    count is known; `col < literal` interpolates the fraction below the literal
+    from per-column quantile boundaries when known, else a Selinger range constant.
+    Always clamped to `[0, 1]`.
     """
     sel = _raw_predicate_selectivity(expr, ndv, cfg, quantiles or {})
     return min(1.0, max(0.0, sel))
@@ -46,9 +51,9 @@ def _raw_predicate_selectivity(
     if isinstance(expr, Binary):
         op = expr.op
         if op == "and":
-            return predicate_selectivity(expr.left, ndv, cfg, quantiles) * predicate_selectivity(
-                expr.right, ndv, cfg, quantiles
-            )
+            conjuncts = _flatten_and(expr)
+            sels = sorted(predicate_selectivity(c, ndv, cfg, quantiles) for c in conjuncts)
+            return _exponential_backoff(sels)
         if op == "or":
             a = predicate_selectivity(expr.left, ndv, cfg, quantiles)
             b = predicate_selectivity(expr.right, ndv, cfg, quantiles)
@@ -66,6 +71,43 @@ def _raw_predicate_selectivity(
     if isinstance(expr, IsNotNull):
         return 1.0 - cfg.null_selectivity
     return cfg.default_filter_selectivity
+
+
+def _flatten_and(expr: Binary) -> list[Expr]:
+    """Flatten a nested `a AND b AND c …` tree into its conjunct list.
+
+    Splits only on `and`, so each returned conjunct is itself estimated normally
+    (an `or`/`not`/comparison subtree is one conjunct). This lets the whole `AND`
+    combine with one exponential-backoff pass rather than a left-folded product.
+    """
+    out: list[Expr] = []
+    stack: list[Expr] = [expr]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, Binary) and node.op == "and":
+            stack.append(node.right)
+            stack.append(node.left)
+        else:
+            out.append(node)
+    return out
+
+
+def _exponential_backoff(sels: list[float]) -> float:
+    """Combine per-conjunct selectivities (sorted ascending) with diminishing
+    exponents: `s₁ · s₂^(1/2) · s₃^(1/4) · …`.
+
+    The most selective conjunct carries full weight; each subsequent one is
+    dampened, so the result sits between the pure independence product (a lower
+    bound, exact only when conjuncts are independent) and the most selective
+    conjunct alone (an upper bound, the perfectly-correlated case). This is the
+    standard correlation-robust estimator used by production optimizers.
+    """
+    combined = 1.0
+    exponent = 1.0
+    for s in sels:
+        combined *= s**exponent
+        exponent /= 2.0
+    return combined
 
 
 def _range_selectivity(

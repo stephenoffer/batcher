@@ -88,6 +88,50 @@ def test_distributed_infer_loads_model_once_per_actor():
     assert len({r["tag"] for r in rows}) <= 2
 
 
+def test_resident_inference_pool_keeps_the_model_across_runs():
+    # P3: inside a `resident_inference_pools()` scope, a pipeline run more than once
+    # reuses the SAME model-loaded actors instead of rebuilding the model — so the GPU
+    # stays fed across stages. Verified by the model's per-instance tag: the second run's
+    # tags are identical to the first's (same instances), and there are at most
+    # `concurrency` of them. Results stay correct.
+    from batcher.dist.executors.map import resident_inference_pools
+
+    n = 1000
+    ds = bt.from_pydict({"x": list(range(n))})
+
+    def infer():
+        return ds.ml.infer(
+            _TaggingModel, output_columns=["x", "y", "tag"], concurrency=2
+        ).collect(distributed=True, num_workers=4)
+
+    with resident_inference_pools():
+        r1 = infer().to_pylist()
+        r2 = infer().to_pylist()
+
+    tags1 = {r["tag"] for r in r1}
+    tags2 = {r["tag"] for r in r2}
+    assert tags1 == tags2  # the 2nd run reused the 1st's model-loaded actors
+    assert len(tags1) <= 2  # model built once per actor (a pool of 2)
+    assert len(r1) == n and all(r["y"] == r["x"] * 2 for r in r1)
+
+
+def test_resident_pool_off_rebuilds_per_run():
+    # Without the scope (the default), each run builds its own short-lived pool, so the
+    # two runs see *different* model instances — the contrast that proves residency is
+    # what kept them alive above.
+    n = 600
+    ds = bt.from_pydict({"x": list(range(n))})
+
+    def infer():
+        return ds.ml.infer(
+            _TaggingModel, output_columns=["x", "y", "tag"], concurrency=2
+        ).collect(distributed=True, num_workers=4)
+
+    tags1 = {r["tag"] for r in infer().to_pylist()}
+    tags2 = {r["tag"] for r in infer().to_pylist()}
+    assert tags1.isdisjoint(tags2)  # fresh models each run (no residency)
+
+
 def test_autoscaling_pool_correct_results():
     # concurrency=(min, max) runs the dynamic-autoscaling pool: it must still produce
     # every row exactly once, with the model built at most `max` times.

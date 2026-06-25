@@ -47,7 +47,13 @@ pub(crate) fn bounded_group_histogram(
         return Ok((Vec::new(), empty));
     };
     let sort_keys = native_value_sort_keys(n_keys);
-    let Some(mut store) = external_sort_to_final_store(flat, &sort_keys, dir)? else {
+    let Some(mut store) = external_sort_to_final_store(
+        flat,
+        &sort_keys,
+        dir,
+        bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+    )?
+    else {
         let empty = histogram_map(
             new_empty_array(&value_type),
             Vec::new(),

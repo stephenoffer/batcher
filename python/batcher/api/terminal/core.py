@@ -12,7 +12,8 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
-from batcher.api.orchestration import (
+from batcher.api.orchestration import with_auto_config
+from batcher.api.terminal.metadata_answer import (
     metadata_aggregate_table,
     metadata_count,
     metadata_is_empty,
@@ -59,6 +60,7 @@ def _resolve_distributed(distributed: bool | str) -> bool:
         return False
 
 
+@with_auto_config
 def _collect(
     plan: LogicalPlan,
     sources: list[Source],
@@ -67,8 +69,10 @@ def _collect(
     num_workers: int | None = None,
     spill: bool = False,
     num_partitions: int | None = None,
-    adaptive: bool = False,
+    adaptive: bool | str = "auto",
     transport: str = "auto",
+    cache: bool = False,
+    source_stats: list | None = None,
 ) -> pa.Table:
     """Execute the plan and materialize the result as a `pyarrow.Table`.
 
@@ -91,10 +95,29 @@ def _collect(
             "unbounded (streaming) source. Consume it with iter_batches() or write "
             "it to a sink instead."
         )
-    metadata = metadata_aggregate_table(plan, sources)
+    # Collect source statistics once when the metadata-aggregate attempt could use
+    # them (a keyless aggregate), so a *missed* attempt doesn't re-read every footer
+    # during execution. A non-aggregate collect skips this entirely (the attempt
+    # returns at its cheap structural guard). `count()`/`is_empty()` pass theirs in.
+    if source_stats is None:
+        from batcher.plan.logical import Aggregate
+
+        if isinstance(plan, Aggregate) and not plan.group_keys:
+            from batcher import core
+            from batcher.api.orchestration import collect_source_stats
+
+            source_stats = collect_source_stats(sources, core.default_hub())
+    metadata = metadata_aggregate_table(plan, sources, source_stats)
     if metadata is not None:
         return metadata
     distributed = _resolve_distributed(distributed)
+    # Resolve `adaptive="auto"` to a concrete decision before the fast-path checks
+    # below ("auto" is a truthy string). Join-less plans short-circuit to False without
+    # touching source stats, so the common path pays nothing.
+    from batcher import core
+    from batcher.api.adaptive import resolve_adaptive
+
+    adaptive = resolve_adaptive(adaptive, plan, sources, core.default_hub())
 
     # `head(n)` / `limit(n)` over a breaker-free pipeline reads the source only until
     # `n` rows are produced, then stops — no whole-source scan (Ray's `limit` does not
@@ -156,6 +179,8 @@ def _collect(
         hub=core.default_hub(),
         num_workers=num_workers,
         transport=transport,
+        cache=cache,
+        source_stats=source_stats,
     )
     return executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
 
@@ -165,6 +190,24 @@ def _explain(plan: LogicalPlan, sources: list[Source]) -> str:
     from batcher import core, kyber
 
     return kyber.Optimizer(sources=sources, hub=core.default_hub()).explain(plan)
+
+
+def _shared_source_stats(plan: LogicalPlan, sources: list[Source]) -> list | None:
+    """Source statistics to share across a metadata attempt and its execution fallback.
+
+    Collected once, only when a metadata answer may even be attempted (a bounded,
+    non-UDF plan) — exactly the case where the relational execution fallback would
+    also read them. Returns `None` otherwise, leaving each path to collect its own,
+    so an opaque UDF/streaming terminal pays nothing extra.
+    """
+    from batcher.api.terminal.metadata_answer import _metadata_answerable
+
+    if not _metadata_answerable(plan, sources):
+        return None
+    from batcher import core
+    from batcher.api.orchestration import collect_source_stats
+
+    return collect_source_stats(sources, core.default_hub())
 
 
 def _count(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> int:
@@ -177,10 +220,11 @@ def _count(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> int:
     plan shape, so its measured per-operator cardinalities feed the learning loop
     (e.g. a filter's selectivity) under the plan's own signature.
     """
-    answer = metadata_count(plan, sources)
+    source_stats = _shared_source_stats(plan, sources)
+    answer = metadata_count(plan, sources, source_stats)
     if answer is not None:
         return answer
-    return _collect(plan, sources, columns).num_rows
+    return _collect(plan, sources, columns, source_stats=source_stats).num_rows
 
 
 def _is_empty(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> bool:
@@ -191,10 +235,12 @@ def _is_empty(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> b
     """
     from batcher.plan.logical import Limit
 
-    answer = metadata_is_empty(plan, sources)
+    source_stats = _shared_source_stats(plan, sources)
+    answer = metadata_is_empty(plan, sources, source_stats)
     if answer is not None:
         return answer
-    return _collect(Limit(plan, 1), sources, columns).num_rows == 0
+    # The `limit(1)` probe runs over the same sources, so their stats still apply.
+    return _collect(Limit(plan, 1), sources, columns, source_stats=source_stats).num_rows == 0
 
 
 def _schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.Schema:
@@ -211,6 +257,7 @@ def _schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.
     return _collect(Limit(plan, 0), sources, columns).schema
 
 
+@with_auto_config
 def _stats(plan: LogicalPlan, sources: list[Source], columns: list[str]):
     """Execute (single-node) and return measured per-operator `RunStats`.
 
@@ -241,6 +288,7 @@ def _stats(plan: LogicalPlan, sources: list[Source], columns: list[str]):
     return RunStats.from_ops(ops, total_ms, table.num_rows)
 
 
+@with_auto_config
 def _write(
     plan: LogicalPlan,
     sources: list[Source],

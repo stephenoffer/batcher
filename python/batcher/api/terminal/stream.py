@@ -28,11 +28,40 @@ from batcher.plan.logical import LogicalPlan
 __all__ = ["_iter_batches", "_iter_streaming"]
 
 
+def _check_stream_state(table: pa.Table | None, label: str) -> None:
+    """Raise a clear `ResourceError` if a streaming operator's retained state has
+    outgrown the configured cap.
+
+    Watermark-bounded streaming state (dedup keys, stream-join buffers) is bounded by
+    the watermark *advancing*; a stalled or one-sided stream lets it grow without
+    bound. This turns that silent OOM into an actionable signal. A no-op for empty
+    state; the cap derives from `memory.streaming_state_max_bytes`.
+    """
+    if table is None or table.num_rows == 0:
+        return
+    from batcher.config import active_config
+
+    cap = active_config().memory.streaming_state_budget_bytes()
+    if table.nbytes > cap:
+        from batcher._internal.errors import ResourceError
+
+        raise ResourceError(
+            f"{label} streaming state reached {table.nbytes} bytes (cap {cap}): the "
+            "watermark is not advancing (a stalled or one-sided stream), so old rows "
+            "never evict. Advance event time, narrow the keys, or raise "
+            "memory.streaming_state_max_bytes."
+        )
+
+
 def _iter_batches(
     plan: LogicalPlan,
     sources: list[Source],
     columns: list[str],
     batch_size: int | None = None,
+    *,
+    distributed: bool = False,
+    num_workers: int | None = None,
+    transport: str = "auto",
 ) -> Iterator[pa.RecordBatch]:
     """Execute and yield the result as Arrow record batches.
 
@@ -41,7 +70,12 @@ def _iter_batches(
     one, or a top-level sort / join / window streamed from the out-of-core bucket
     pipeline); other plans materialize first. An unbounded source whose plan cannot
     stream raises `PlanError` instead of hanging on `_collect`.
+
+    When `distributed`, a top-level breaker (sort / join / aggregate / window) fans out
+    across Ray workers and its result streams back one reducer bucket at a time
+    (`_iter_distributed`), so the driver never holds the whole distributed result.
     """
+    from batcher.io.source import is_bounded
     from batcher.plan.logical import (
         Aggregate,
         Distinct,
@@ -51,6 +85,30 @@ def _iter_batches(
         WatermarkStreamJoin,
         is_streamable,
     )
+
+    # A distributed breaker streams its result off the workers one bucket at a time,
+    # bounding driver memory. A breaker-free pipeline already streams in bounded memory
+    # single-node, so it stays on that path even when `distributed` is requested.
+    if distributed and not is_streamable(plan) and all(is_bounded(s) for s in sources):
+        from batcher.api.terminal.distributed_stream import iter_distributed
+
+        yield from iter_distributed(plan, sources, columns, num_workers, transport, batch_size)
+        return
+
+    # A distributed breaker-free scan/filter/project over a SPLITTABLE source fans the
+    # read out across workers AND streams each worker's output back one partition at a
+    # time — parallel reads with the driver holding only one partition's result, the
+    # bounded-memory way to pull a huge distributed scan. In-memory sources (which would
+    # be shipped to workers) and `map_batches` pipelines stay on their existing paths.
+    if distributed and is_streamable(plan):
+        from batcher.api.terminal.distributed_stream import (
+            distributable_scan_source,
+            iter_distributed_scan,
+        )
+
+        if distributable_scan_source(plan, sources) is not None:
+            yield from iter_distributed_scan(plan, sources, num_workers, batch_size)
+            return
 
     # Stream-stream interval join: two streams, buffered + watermark-evicted.
     if isinstance(plan, WatermarkStreamJoin) and len(sources) == 2:
@@ -109,8 +167,6 @@ def _iter_batches(
 
             yield from stream_limit(plan, sources[0], batch_size)
             return
-
-    from batcher.io.source import is_bounded
 
     # Pipeline breakers (sort / join / window) over bounded sources stream their result
     # from the out-of-core bucket pipeline: the input is consumed to disk, then the
@@ -276,6 +332,7 @@ def _stream_watermark_dedup(
             if seen is not None and wm is not None:
                 keep = pc.greater_equal(pc.cast(seen.column(et), pa.int64()), wm)
                 seen = seen.filter(keep)
+            _check_stream_state(seen, "watermark-dedup")
             if new.num_rows:
                 rebatch = batch_size is not None
                 yield from (
@@ -359,6 +416,10 @@ def _stream_stream_join(
                 cand = hi - lateness
                 state[wk] = cand if state[wk] is None else max(state[wk], cand)
             evict()
+            # Either buffer grows unbounded if its opposite watermark stalls (a
+            # one-sided stream), so cap both after eviction.
+            _check_stream_state(state["bufL"], "stream-join")
+            _check_stream_state(state["bufR"], "stream-join")
         return out
 
     it_l, it_r = sources[0].iter_batches(None), sources[1].iter_batches(None)

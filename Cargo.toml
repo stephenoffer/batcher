@@ -44,6 +44,9 @@ smallvec = "1"
 indexmap = "2"
 hashbrown = "0.15"
 rayon = "1"
+# Per-operator CPU-time measurement (getrusage) — the measure half of the adaptive
+# CPU-share loop. Unix-only path; other targets report 0 (treated as "unmeasured").
+libc = "0.2"
 # Lock-striped concurrent map for the shuffle partition store + the consumer's
 # gRPC channel pool (reuse connections across fetches instead of reconnecting).
 dashmap = "6"

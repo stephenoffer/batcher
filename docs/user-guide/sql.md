@@ -8,7 +8,7 @@ SQL query, or feed a DataFrame pipeline into SQL.
 {py:obj}`bt.sql <batcher.sql>` reads DuckDB syntax by default; pass `dialect=` to
 read another sqlglot dialect. For a reusable catalog of tables and Python
 functions, build a {py:obj}`bt.Session <batcher.Session>` (the DuckDB-connection /
-SparkSession analogue) — `bt.sql` and `bt.catalog` are a shared default session.
+SparkSession analogue) — `bt.sql` and `bt.register_function` use a shared default session.
 
 ```python
 import batcher as bt

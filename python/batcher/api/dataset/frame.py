@@ -116,7 +116,7 @@ class Dataset:
             {'x': [2, 3]}
     """
 
-    __slots__ = ("_plan", "_repartition", "_sources", "_watermark")
+    __slots__ = ("_cache", "_plan", "_repartition", "_sources", "_watermark")
 
     def __init__(
         self,
@@ -124,6 +124,7 @@ class Dataset:
         sources: list[Source],
         repartition: RepartitionSpec | None = None,
         watermark: Watermark | None = None,
+        cache: bool = False,
     ) -> None:
         self._plan = plan
         self._sources = sources
@@ -133,6 +134,10 @@ class Dataset:
         # An event-time watermark set by `with_watermark`; carried through
         # breaker-free transforms so the next `group_by().agg()` can attach it.
         self._watermark = watermark
+        # Set by `cache()`: this dataset's collected result is stored in the process
+        # result cache. Deliberately *not* propagated by `_derive` — caching marks
+        # this exact result; a further transform is a new (uncached) result.
+        self._cache = cache
 
     # --- introspection -----------------------------------------------------
     @property
@@ -251,6 +256,36 @@ class Dataset:
         # Carry the watermark through breaker-free transforms so a `with_watermark`
         # before a `filter`/`select` still reaches the downstream `group_by().agg()`.
         return Dataset(plan, self._sources, watermark=self._watermark)
+
+    def cache(self) -> Dataset:
+        """Mark this dataset's result to be cached in memory after it is computed.
+
+        The first terminal op (``collect`` and friends) on the returned dataset
+        executes normally and stores its Arrow result in a process-wide,
+        memory-bounded LRU cache keyed by the plan and its inputs; later terminals on
+        an equivalent dataset return the cached result without re-executing. The cache
+        is bounded by ``memory.result_cache_max_bytes`` and yields its memory back to
+        running queries under pressure, so caching never grows the process without
+        bound. Like Spark/Polars ``cache``, it marks *this* result; a further
+        transform is a new, uncached result. Single-node relational results only.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> hot = bt.from_pydict({"k": [1, 1, 2], "v": [10, 20, 30]}).cache()
+                >>> hot.collect().num_rows  # computed once, then served from cache
+                3
+                >>> hot.collect().num_rows  # cache hit
+                3
+        """
+        return Dataset(
+            self._plan,
+            self._sources,
+            repartition=self._repartition,
+            watermark=self._watermark,
+            cache=True,
+        )
 
     def with_watermark(self, time_col: str, lateness: str) -> Dataset:
         """Declare an event-time watermark on `time_col` (Spark ``withWatermark``).
@@ -561,10 +596,10 @@ class Dataset:
         """Run a SQL query with this dataset bound to `table_name` (default ``self``).
 
         The Polars-style ``ds.sql("SELECT ... FROM self")``: a lazy `Dataset` that
-        composes with the rest of the API. Other tables registered in `bt.catalog`
-        (and functions from `bt.register_function`) resolve too, so the query can
-        join ``self`` against them. For multi-table SQL with several ad-hoc inputs,
-        use `bt.sql(query, a=ds1, b=ds2)`.
+        composes with the rest of the API. Tables and functions registered on the
+        default catalog (via `bt.register_function` or ``CREATE TABLE``) resolve too,
+        so the query can join ``self`` against them. For multi-table SQL with several
+        ad-hoc inputs, use `bt.sql(query, a=ds1, b=ds2)`.
 
         Args:
             query: A SQL statement referring to this dataset as `table_name`.
@@ -582,9 +617,9 @@ class Dataset:
                 >>> ds.sql("SELECT a, a * 2 AS d FROM self WHERE a > 1").to_pydict()
                 {'a': [2, 3], 'd': [4, 6]}
         """
-        from batcher.api.session import catalog
+        from batcher.api.session import _catalog
 
-        session = catalog if dialect is None else catalog._with_dialect(dialect)
+        session = _catalog if dialect is None else _catalog._with_dialect(dialect)
         return session._run(query, {table_name: self})
 
     def with_column(self, name: str, expr: Expr) -> Dataset:
@@ -1498,7 +1533,7 @@ class Dataset:
         num_workers: int | None = None,
         spill: bool = False,
         num_partitions: int | None = None,
-        adaptive: bool = False,
+        adaptive: bool | str = "auto",
         transport: str = "auto",
     ) -> pa.Table:
         """Execute the plan and materialize the result as a `pyarrow.Table`.
@@ -1507,7 +1542,10 @@ class Dataset:
         `distributed="auto"` uses Ray on a multi-node cluster, else single-node.
         Out-of-core spilling is automatic under memory pressure, with worker fan-out
         and partition count sized from the estimated data volume; `spill=True` forces
-        it and `num_partitions` overrides the bucket count. The result is identical
+        it and `num_partitions` overrides the bucket count. `adaptive="auto"` turns on
+        intra-query re-optimization only when a join's input size is a pure estimate
+        (so measured cardinality could change a build-side/join-order choice), and
+        stays one-shot otherwise; `True`/`False` force it. The result is identical
         whichever way it runs. Raises `PlanError` if the dataset is unbounded (a
         streaming source) — use `iter_batches()` / `write()`.
 
@@ -1529,6 +1567,7 @@ class Dataset:
             num_partitions=num_partitions,
             adaptive=adaptive,
             transport=transport,
+            cache=self._cache,
         )
 
     def explain(self) -> str:
@@ -1649,7 +1688,14 @@ class Dataset:
 
         return approx_quantile(_collect(self._plan, self._sources, self.columns), column, q)
 
-    def iter_batches(self, batch_size: int | None = None):
+    def iter_batches(
+        self,
+        batch_size: int | None = None,
+        *,
+        distributed: bool | str = False,
+        num_workers: int | None = None,
+        transport: str = "auto",
+    ):
         """Execute and yield the result as Arrow record batches.
 
         The execution mode is automatic: a breaker-free pipeline (filter / project /
@@ -1660,6 +1706,11 @@ class Dataset:
         source is unbounded and the plan cannot stream, a `PlanError` is raised
         rather than hanging. `batch_size` rebatches the output.
 
+        With `distributed` (``True`` or ``"auto"`` on a multi-node cluster), a
+        top-level breaker fans out across Ray workers and its result streams back one
+        reducer bucket at a time, so the driver never holds the whole distributed
+        result — the bounded-memory way to pull a large distributed output.
+
         Examples:
             .. doctest::
 
@@ -1668,7 +1719,17 @@ class Dataset:
                 >>> sum(batch.num_rows for batch in ds.iter_batches())
                 3
         """
-        yield from _iter_batches(self._plan, self._sources, self.columns, batch_size=batch_size)
+        from batcher.api.terminal.core import _resolve_distributed
+
+        yield from _iter_batches(
+            self._plan,
+            self._sources,
+            self.columns,
+            batch_size=batch_size,
+            distributed=_resolve_distributed(distributed),
+            num_workers=num_workers,
+            transport=transport,
+        )
 
     @property
     def write(self) -> Writer:

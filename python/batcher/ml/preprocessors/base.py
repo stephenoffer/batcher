@@ -1,4 +1,4 @@
-"""The `Preprocessor` contract and `Chain` — sklearn-style fit/transform on a Dataset.
+"""The `Preprocessor` contract — sklearn-style fit/transform on a Dataset.
 
 A preprocessor learns state from a dataset (`fit`, which *executes* a small aggregate
 — the measure step, like `describe`) and then applies a **lazy** column rewrite
@@ -10,6 +10,9 @@ object, not a `Dataset` method.
 The win is that `fit` lowers to the existing relational aggregates (`mean`, `min`,
 `max`, `median`, `distinct`) and `transform` to ordinary `Expr` projections — so the
 whole path is mergeable, distributed, and spillable for free, with no per-row Python.
+Compose preprocessors by sequencing them: ``fit_transform`` the first on train, feed
+its output to the next, then ``transform`` the test set through the same fitted
+objects — the same chaining the `Dataset` builder already gives every other transform.
 """
 
 from __future__ import annotations
@@ -20,12 +23,10 @@ from typing import TYPE_CHECKING, Any
 from batcher._internal.errors import PlanError
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from batcher.api.dataset import Dataset
     from batcher.plan.expr_ir import Expr
 
-__all__ = ["Chain", "Preprocessor"]
+__all__ = ["Preprocessor"]
 
 
 def fit_aggregate(ds: Dataset, aggs: dict[str, Expr]) -> dict[str, Any]:
@@ -84,32 +85,3 @@ class Preprocessor(abc.ABC):
                 f"{type(self).__name__} must be fitted before transform(); "
                 "call fit(ds) or fit_transform(ds) first"
             )
-
-
-class Chain(Preprocessor):
-    """Compose preprocessors into one pipeline, applied left to right.
-
-    Each step is fitted on the output of the previous step (so a scaler downstream of
-    an imputer sees imputed values), mirroring scikit-learn's ``Pipeline``.
-    """
-
-    __slots__ = ("steps",)
-
-    def __init__(self, steps: Sequence[Preprocessor]) -> None:
-        self.steps = list(steps)
-        if not self.steps:
-            raise PlanError("Chain() requires at least one preprocessor")
-
-    def fit(self, ds: Dataset) -> Chain:
-        cur = ds
-        for step in self.steps:
-            cur = step.fit_transform(cur)
-        self._fitted = True
-        return self
-
-    def transform(self, ds: Dataset) -> Dataset:
-        self._require_fitted()
-        cur = ds
-        for step in self.steps:
-            cur = step.transform(cur)
-        return cur

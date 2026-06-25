@@ -1,4 +1,4 @@
-"""The `.list`/`.arr`, `.struct`, and `.json` accessor namespaces.
+"""The `.list`, `.struct`, `.json`, and `.map` accessor namespaces.
 
 Each method is a thin builder over a `bc-expr` list/struct/json node. The
 parameterless list reductions are generated from `_LIST_FUNCS` (data, not code).
@@ -119,8 +119,7 @@ class _MapNamespace:
     """Map-column accessors: ``col("m").map.keys()``, ``.values()``, ``.get(key)``.
 
     For an Arrow ``Map`` column (``map<K, V>``). `keys`/`values` return `List`
-    columns; `get(key)`/`element_at(key)` look up the value for a literal key (null
-    if absent).
+    columns; `get(key)` looks up the value for a literal key (null if absent).
     """
 
     __slots__ = ("_e",)
@@ -172,59 +171,6 @@ class _MapNamespace:
         """
         return MapFunc("element_at", self._e, key=key)
 
-    # SQL spelling of `get`.
-    element_at = get
-
-
-class _EmbeddingNamespace:
-    """Embedding-vector operations: ``col("v").embedding.cosine_distance(other)``, …
-
-    A Daft-style accessor for vector columns (fixed-size or variable lists). Thin
-    sugar over the same `ListBinary` vector kernels as `.list`, named for the
-    retrieval/RAG use case where similarity and distance are the natural verbs.
-    """
-
-    __slots__ = ("_e",)
-
-    def __init__(self, e: Expr) -> None:
-        self._e = e
-
-    def cosine_similarity(self, other: Any) -> ListBinary:
-        """Cosine similarity with another embedding column, in ``[-1, 1]`` (→ Float64).
-
-        Args:
-            other: The other embedding column (or an ``array(...)`` literal), paired
-                element-wise; both vectors must have the same length.
-        """
-        return ListBinary("cosine_similarity", self._e, _wrap(other))
-
-    def cosine_distance(self, other: Any) -> Expr:
-        """Cosine distance ``1 - cosine_similarity`` (→ Float64).
-
-        The common nearest-neighbour ranking metric for embeddings: 0 for identical
-        direction, 1 for orthogonal, 2 for opposite.
-
-        Args:
-            other: The other embedding column (or an ``array(...)`` literal).
-        """
-        return 1.0 - ListBinary("cosine_similarity", self._e, _wrap(other))
-
-    def l2_distance(self, other: Any) -> ListBinary:
-        """Euclidean (L2) distance to another embedding column (→ Float64).
-
-        Args:
-            other: The other embedding column (or an ``array(...)`` literal).
-        """
-        return ListBinary("l2_distance", self._e, _wrap(other))
-
-    def dot(self, other: Any) -> ListBinary:
-        """Dot product with another embedding column (→ Float64).
-
-        Args:
-            other: The other embedding column (or an ``array(...)`` literal).
-        """
-        return ListBinary("dot", self._e, _wrap(other))
-
 
 class _ListNamespace:
     """List/array reductions: ``col("a").list.len()``, ``.list.sum()``, …
@@ -256,36 +202,6 @@ class _ListNamespace:
                 {'r': [2, None, None]}
         """
         return ListGet(self._e, index)
-
-    def first(self) -> ListGet:
-        """The first element of each list; null for an empty or null list.
-
-        Shorthand for :meth:`get` at index ``0``.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"a": [[3, 1, 2], [], None]})
-                >>> ds.select(bt.col("a").list.first().alias("r")).to_pydict()
-                {'r': [3, None, None]}
-        """
-        return ListGet(self._e, 0)
-
-    def last(self) -> ListGet:
-        """The last element of each list; null for an empty or null list.
-
-        Shorthand for :meth:`get` at index ``-1``.
-
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> ds = bt.from_pydict({"a": [[3, 1, 2], [], None]})
-                >>> ds.select(bt.col("a").list.last().alias("r")).to_pydict()
-                {'r': [2, None, None]}
-        """
-        return ListGet(self._e, -1)
 
     def contains(self, value: int | float | bool | str) -> ListContains:
         """Test whether any element of each list equals ``value`` (→ Bool).
@@ -488,6 +404,26 @@ class _ListNamespace:
                 0.7071
         """
         return ListBinary("cosine_similarity", self._e, _wrap(other))
+
+    def cosine_distance(self, other: Any) -> Expr:
+        """Cosine distance ``1 - cosine_similarity`` to another vector column (→ Float64).
+
+        The common nearest-neighbour ranking metric for embeddings: 0 for identical
+        direction, 1 for orthogonal, 2 for opposite. Both vectors must have the same
+        length.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1.0, 1.0]], "b": [[1.0, 1.0]]})
+                >>> ds.select(bt.col("a").list.cosine_distance(bt.col("b")).alias("r")).to_pydict()
+                {'r': [0.0]}
+        """
+        return 1.0 - ListBinary("cosine_similarity", self._e, _wrap(other))
 
     def l2_distance(self, other: Any) -> ListBinary:
         """Euclidean (L2) distance to another vector column (→ Float64).

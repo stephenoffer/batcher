@@ -41,7 +41,7 @@ pub struct NamedExpr {
 /// Deserialized from the language-agnostic JSON IR emitted by the Python control
 /// plane, so the variant tags (`e`, `op`) are the stable wire contract.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "e", rename_all = "snake_case")]
+#[serde(tag = "e", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Expr {
     /// Reference to an input column by name.
     Col { name: String },

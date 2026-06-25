@@ -13,7 +13,10 @@ Arrow the whole way (zero-copy from the engine into the UDF and back).
 from __future__ import annotations
 
 import dataclasses
-from concurrent.futures import ThreadPoolExecutor
+import os
+import pickle
+import warnings
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Any
 
 import pyarrow as pa
@@ -116,21 +119,121 @@ def _apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordB
     if op.batch_size is not None:
         batches = pa.Table.from_batches(current).to_batches(max_chunksize=op.batch_size)
 
-    # Build the model once for this whole call (a class `fn` is a load-once factory).
-    fn = build_udf_callable(op.fn)
-    call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
-    if op.num_workers > 1 and len(batches) > 1:
-        # ThreadPoolExecutor.map keeps input order; concurrency only helps when `fn`
-        # releases the GIL (Rust/GPU/NumPy inference), which is the intended use.
-        with ThreadPoolExecutor(max_workers=op.num_workers) as pool:
-            results = list(pool.map(call, batches))
-    else:
-        results = [call(batch) for batch in batches]
+    strategy = _map_strategy(op, len(batches))
+    if strategy == "processes":
+        # Run the per-batch calls across processes so a CPU-bound pure-Python `fn`
+        # (which the GIL would serialize across threads) uses multiple cores. Any
+        # process failure (an `fn` that turns out not to be process-safe) falls back
+        # to threads — never a dropped batch.
+        try:
+            results = _apply_udf_processes(op, batches)
+        except Exception as exc:
+            warnings.warn(
+                f"map_batches multiprocessing failed ({exc!r}); falling back to threads",
+                stacklevel=2,
+            )
+            strategy = "threads"
+
+    if strategy != "processes":
+        # Build the model once for this whole call (a class `fn` is a load-once factory).
+        fn = build_udf_callable(op.fn)
+        call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
+        if strategy == "threads":
+            # ThreadPoolExecutor.map keeps input order; concurrency only helps when `fn`
+            # releases the GIL (Rust/GPU/NumPy inference), which is the intended use.
+            with ThreadPoolExecutor(max_workers=op.num_workers) as pool:
+                results = list(pool.map(call, batches))
+        else:
+            results = [call(batch) for batch in batches]
 
     out: list[pa.RecordBatch] = []
     for result in results:
         out.extend(_coerce_udf_result(result))
     return out
+
+
+def _map_strategy(op: MapBatches, n_batches: int) -> str:
+    """Pick how to run the per-batch calls: ``sequential``, ``threads``, or ``processes``.
+
+    Threads are the default (they overlap GIL-releasing inference and keep the loaded
+    model shared). Processes are opt-in (`op.multiprocessing`) and only for a
+    process-safe `fn`; every reject silently falls back to threads.
+    """
+    if n_batches <= 1 or op.num_workers <= 1:
+        return "sequential"
+    if op.multiprocessing and _process_safe(op):
+        return "processes"
+    return "threads"
+
+
+def _process_safe(op: MapBatches) -> bool:
+    """Whether `op.fn` can run in a process pool; warn-once and reject otherwise.
+
+    A factory/class would reload the model per child (and risk OOM); a non-pyarrow
+    `batch_format` needs an unpicklable closure; a GPU `fn` wants one CUDA context;
+    a lambda/closure `fn` cannot be pickled to a `spawn`ed child.
+    """
+    if isinstance(op.fn, type):
+        return _reject("a factory/class fn would reload per process")
+    if op.batch_format != "pyarrow":
+        return _reject("batch_format != 'pyarrow' is not supported with processes")
+    if op.num_gpus > 0:
+        return _reject("a GPU fn must keep a single process/CUDA context")
+    if not _is_picklable(op.fn):
+        return _reject("the fn is not picklable (a lambda or closure)")
+    return True
+
+
+_REJECTED: set[str] = set()
+
+
+def _reject(reason: str) -> bool:
+    """Warn once per distinct reason that processes were declined, then return False."""
+    if reason not in _REJECTED:
+        _REJECTED.add(reason)
+        warnings.warn(
+            f"map_batches multiprocessing not used ({reason}); using threads",
+            stacklevel=3,
+        )
+    return False
+
+
+def _is_picklable(obj: object) -> bool:
+    try:
+        pickle.dumps(obj)
+        return True
+    except Exception:
+        return False
+
+
+# Per-child built callable, set once by the pool initializer so the (possibly heavy)
+# `fn` is sent and built once per worker rather than re-pickled per batch.
+_WORKER_CALL: object = None
+
+
+def _udf_worker_init(fn: object) -> None:
+    """Pool initializer: build the per-batch callable once in this child process."""
+    global _WORKER_CALL
+    _WORKER_CALL = build_udf_callable(fn)
+
+
+def _udf_worker(batch: pa.RecordBatch) -> object:
+    """Apply the child's pre-built callable to one batch (pyarrow in, arrowable out)."""
+    return _WORKER_CALL(batch)  # type: ignore[operator]
+
+
+def _apply_udf_processes(op: MapBatches, batches: list[pa.RecordBatch]) -> list[object]:
+    """Run the per-batch calls across processes, preserving input order.
+
+    Process count is budgeted against cores — never more processes than batches or
+    available CPUs — the single-node analog of a fractional-CPU task share. Batches
+    cross to/from children via pyarrow's pickle reducer (its Arrow IPC representation).
+    """
+    n_procs = max(1, min(op.num_workers, len(batches), os.cpu_count() or 1))
+    with ProcessPoolExecutor(
+        max_workers=n_procs, initializer=_udf_worker_init, initargs=(op.fn,)
+    ) as pool:
+        return list(pool.map(_udf_worker, batches))
 
 
 def _formatted(fn: Any, fmt: str) -> Any:
