@@ -11,6 +11,27 @@ The one concept to internalize: a `Dataset` is **lazy**. Transformations
 `to_pandas`, `write`, `count`, `iter_batches`). This is the Polars `LazyFrame`
 model, not the eager pandas one.
 
+## Coming from
+
+::::{grid} 1 3 3 3
+:gutter: 3
+
+:::{grid-item-card} {octicon}`table;1.1em` pandas
+The one shift is eager to **lazy**: operations build a plan and run on a terminal
+call. `assign` / `groupby` / `merge` become `with_columns` / `group_by().agg()` / `join`.
+:::
+
+:::{grid-item-card} {octicon}`code;1.1em` Polars
+You already know the `LazyFrame` model. Expressions, `group_by().agg()`, `.over(...)`,
+and the typed accessors carry over almost verbatim.
+:::
+
+:::{grid-item-card} {octicon}`server;1.1em` PySpark
+No `SparkSession` and no cluster to start — it runs in-process. The DataFrame verbs,
+save modes, and `MERGE INTO` all carry over.
+:::
+::::
+
 ## Reading and writing
 
 One callable namespace per direction. `bt.read(path)` infers the format; the typed

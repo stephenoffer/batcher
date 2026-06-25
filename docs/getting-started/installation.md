@@ -71,5 +71,18 @@ Once built, `import batcher` resolves the local `batcher._native` extension.
 
 ## Next steps
 
-- The [quickstart](quickstart.md) runs an end-to-end query.
-- The [concepts](concepts/index.md) page explains the lazy, immutable Dataset model.
+::::{grid} 1 2 2 2
+:gutter: 3
+
+:::{grid-item-card} {octicon}`rocket;1.1em` Quickstart
+:link: quickstart
+:link-type: doc
+Run an end-to-end query in a couple of minutes.
+:::
+
+:::{grid-item-card} {octicon}`light-bulb;1.1em` Core concepts
+:link: concepts/index
+:link-type: doc
+The lazy, immutable Dataset model that shapes the API.
+:::
+::::
