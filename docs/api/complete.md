@@ -37,7 +37,6 @@ example-first [area pages](index.md). Each top-level function links to its own p
    date_range
    read
    sql
-   catalog
    compact
    engine_version
    from_arrow
