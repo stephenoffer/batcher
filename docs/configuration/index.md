@@ -1,10 +1,11 @@
 # Configuration
 
-Batcher's runtime behavior is controlled by a single frozen `Config` object. It is
-an immutable dataclass made of typed sections, one per concern: `execution`,
-`memory`, `flow_control`, `optimizer`, `pid`, and `metadata`. There are no global
-mutable settings and no dict of loose keys; you build a `Config`, then make it
-active.
+Most of the time you don't configure Batcher at all — the defaults are tuned to
+saturate your cores and stay within memory on their own. When you do need to tune
+something (a memory limit, the thread count, how aggressively to spill), every knob
+lives on one `Config` object: a typed, immutable dataclass grouped by concern
+(`execution`, `memory`, `flow_control`, `optimizer`, `pid`, `metadata`). No global
+mutable state, no dict of loose keys — you build a `Config`, then make it active.
 
 ```python
 import batcher as bt

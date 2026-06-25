@@ -1,6 +1,8 @@
 # Internals
 
-This section provides deep technical documentation on Batcher's internal architecture and components.
+How Batcher works under the hood: the layered architecture and the components that
+turn your query into results. You don't need any of this to use Batcher — it's here
+for contributors and the curious.
 
 ## Architecture overview
 
@@ -119,6 +121,7 @@ GB/s-per-node figure until the benchmark harness produces one.
 kyber
 carbonite
 execution
+extending
 testing-strategy
 ```
 

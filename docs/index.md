@@ -2,12 +2,13 @@
 
 ```{raw} html
 <div class="bt-hero">
-  <p class="bt-hero-eyebrow">JIT &middot; Adaptive &middot; Arrow-native</p>
+  <p class="bt-hero-eyebrow">SQL &middot; DataFrames &middot; ML</p>
   <p class="bt-hero-tagline">One data engine, from your laptop to your cluster.</p>
   <p class="bt-hero-sub">
-    Batcher runs SQL, DataFrame, and ML workloads on one engine that tunes itself as
-    the query runs. Prototype on your laptop and ship the same code to a cluster &mdash;
-    sub-second on small data, bounded-memory at petabyte scale, no rewrite in between.
+    Batcher runs SQL, DataFrame, and ML workloads on a single engine that tunes itself
+    while the query runs. Prototype on a laptop, then ship the same code to a cluster.
+    It stays sub-second on small data and holds its memory at petabyte scale, with no
+    rewrite in between.
   </p>
   <p class="bt-hero-cta">
     <a class="bt-btn bt-btn-primary" href="getting-started/index.html">Get started</a>
@@ -28,27 +29,29 @@ estimate corrects itself mid-flight.
 :gutter: 3
 
 :::{grid-item-card} {octicon}`shield;1.1em` Bad estimates don't sink the query
-Other engines commit to a plan before seeing a row, then run it to the end — the
-classic cause of a stalled or out-of-memory job. Batcher re-plans mid-query on the
-row counts it just measured, so a bad guess corrects itself instead of failing.
+Other engines commit to a plan before seeing a row, then run it to the end even when
+the data turns out different. That's the usual reason a job stalls or runs out of
+memory. Batcher re-plans mid-query on the row counts it just measured, so a bad guess
+corrects itself instead of failing.
 :::
 
 :::{grid-item-card} {octicon}`server;1.1em` Scale without a rewrite
-Prototype on a sample, then point the same code at the full dataset on a cluster.
-Operators combine across cores and machines, so megabytes-to-petabytes is a
-deployment change — and memory stays bounded because every stage spills to disk.
+Prototype on a sample, then point the very same code at the full dataset on a
+cluster. Operators combine across cores and machines, so going from megabytes to
+petabytes is a deployment change. Memory stays bounded because every stage can spill
+to disk.
 :::
 
 :::{grid-item-card} {octicon}`zap;1.1em` Fast without hand-tuning
-Column math compiles to machine code and streams in cache-sized batches — small
-queries stay sub-second, large ones stay efficient. You never tune batch sizes or
-partition counts; the engine adapts them as it runs.
+Column math compiles to machine code and streams in cache-sized batches, so small
+queries stay sub-second and large ones stay efficient. You never tune batch sizes or
+partition counts; the engine adapts them while it runs.
 :::
 
 :::{grid-item-card} {octicon}`stack;1.1em` One engine, not a stack
-SQL, DataFrames, and ML inference run on one engine over the same Arrow data. No
-gluing a query tool to a dataframe library to a serving system — and no seams
-between them to leak.
+SQL, DataFrames, and ML inference all run on one engine over one copy of your Arrow
+data. No gluing a query tool to a dataframe library to a serving system, and no seams
+between them to spring a leak.
 :::
 ::::
 
@@ -114,11 +117,11 @@ ds.filter(bt.col("status") == "active").write.parquet("output/active.parquet")
 
 ## How it works
 
-That mix of Python ergonomics and native speed comes from a clean split.
-Python builds and optimizes the plan but never touches a row; every per-row operation
-runs in Rust over Apache Arrow. They meet at one typed boundary, which is also why a
-result is identical whether the query runs on one core or a hundred: there is a single
-engine underneath, not a fast local path bolted to a separate distributed one.
+You get Python's ergonomics and native speed from a clean split of labor. Python
+builds and optimizes the plan but never touches a row of your data; the per-row work
+all happens in Rust over Apache Arrow. And because there is one engine underneath,
+not a fast local mode bolted onto a separate distributed one, a result is identical
+whether the query ran on one core or a hundred.
 
 ![Batcher's two planes: a Python control plane hands a JSON IR plus Arrow batches to the Rust data plane.](_static/diagrams/two_planes.png)
 
