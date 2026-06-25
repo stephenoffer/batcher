@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 500">
+<defs>
+<linearGradient id="in" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f5f9ff"/><stop offset="1" stop-color="#dbeafe"/></linearGradient>
+<linearGradient id="out" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fffdf5"/><stop offset="1" stop-color="#fdecc8"/></linearGradient>
+<linearGradient id="core" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="0.5" stop-color="#2563eb"/><stop offset="1" stop-color="#4f46e5"/></linearGradient>
+<linearGradient id="flowin" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#93c5fd"/><stop offset="1" stop-color="#2563eb"/></linearGradient>
+<linearGradient id="flowout" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#fbbf24"/></linearGradient>
+<filter id="cardsh" x="-20%" y="-30%" width="140%" height="160%"><feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#1e293b" flood-opacity="0.16"/></filter>
+<filter id="glow" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="7" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+</defs>
+<g fill="none" stroke-width="3.5" stroke-linecap="round">
+<path d="M 288 65.0 C 408 65.0, 372.0 250.0, 492.0 250.0" stroke="url(#flowin)" opacity="0.85"/>
+<path d="M 708.0 250.0 C 828.0 250.0, 792 65.0, 912 65.0" stroke="url(#flowout)" opacity="0.85"/>
+<path d="M 288 187.0 C 408 187.0, 372.0 250.0, 492.0 250.0" stroke="url(#flowin)" opacity="0.85"/>
+<path d="M 708.0 250.0 C 828.0 250.0, 792 187.0, 912 187.0" stroke="url(#flowout)" opacity="0.85"/>
+<path d="M 288 309.0 C 408 309.0, 372.0 250.0, 492.0 250.0" stroke="url(#flowin)" opacity="0.85"/>
+<path d="M 708.0 250.0 C 828.0 250.0, 792 309.0, 912 309.0" stroke="url(#flowout)" opacity="0.85"/>
+<path d="M 288 431.0 C 408 431.0, 372.0 250.0, 492.0 250.0" stroke="url(#flowin)" opacity="0.85"/>
+<path d="M 708.0 250.0 C 828.0 250.0, 792 431.0, 912 431.0" stroke="url(#flowout)" opacity="0.85"/>
+</g>
+<text x="159.0" y="14" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" letter-spacing="2" fill="#2563eb">ANY SOURCE</text>
+<text x="600.0" y="14" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" letter-spacing="2" fill="#4f46e5">ONE ENGINE</text>
+<text x="1041.0" y="14" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" letter-spacing="2" fill="#d97706">ANY WORKLOAD</text>
+<g filter="url(#cardsh)"><rect x="30" y="28" width="258" height="74" rx="15" fill="url(#in)" stroke="#bfdbfe" stroke-width="1.5"/><rect x="30" y="42" width="5" height="46" rx="2.5" fill="#3b82f6"/></g><text x="163.0" y="72.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#1e293b">Parquet · CSV · JSON</text>
+<g filter="url(#cardsh)"><rect x="30" y="150" width="258" height="74" rx="15" fill="url(#in)" stroke="#bfdbfe" stroke-width="1.5"/><rect x="30" y="164" width="5" height="46" rx="2.5" fill="#3b82f6"/></g><text x="163.0" y="194.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#1e293b">Images · Audio · Video</text>
+<g filter="url(#cardsh)"><rect x="30" y="272" width="258" height="74" rx="15" fill="url(#in)" stroke="#bfdbfe" stroke-width="1.5"/><rect x="30" y="286" width="5" height="46" rx="2.5" fill="#3b82f6"/></g><text x="163.0" y="316.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#1e293b">Kafka · live streams</text>
+<g filter="url(#cardsh)"><rect x="30" y="394" width="258" height="74" rx="15" fill="url(#in)" stroke="#bfdbfe" stroke-width="1.5"/><rect x="30" y="408" width="5" height="46" rx="2.5" fill="#3b82f6"/></g><text x="163.0" y="438.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#1e293b">Delta · Iceberg · Hudi</text>
+<g filter="url(#cardsh)"><rect x="912" y="28" width="258" height="74" rx="15" fill="url(#out)" stroke="#fcd34d" stroke-width="1.5"/><rect x="912" y="42" width="5" height="46" rx="2.5" fill="#f59e0b"/></g><text x="1045.0" y="72.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#1e293b">SQL &amp; ETL</text>
+<g filter="url(#cardsh)"><rect x="912" y="150" width="258" height="74" rx="15" fill="url(#out)" stroke="#fcd34d" stroke-width="1.5"/><rect x="912" y="164" width="5" height="46" rx="2.5" fill="#f59e0b"/></g><text x="1045.0" y="194.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#1e293b">Batch inference</text>
+<g filter="url(#cardsh)"><rect x="912" y="272" width="258" height="74" rx="15" fill="url(#out)" stroke="#fcd34d" stroke-width="1.5"/><rect x="912" y="286" width="5" height="46" rx="2.5" fill="#f59e0b"/></g><text x="1045.0" y="316.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#1e293b">Embeddings &amp; RAG</text>
+<g filter="url(#cardsh)"><rect x="912" y="394" width="258" height="74" rx="15" fill="url(#out)" stroke="#fcd34d" stroke-width="1.5"/><rect x="912" y="408" width="5" height="46" rx="2.5" fill="#f59e0b"/></g><text x="1045.0" y="438.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="20" font-weight="600" fill="#1e293b">Training data</text>
+<g filter="url(#glow)"><rect x="492.0" y="172.0" width="216" height="156" rx="22" fill="url(#core)"/></g>
+<text x="600.0" y="244.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="34" font-weight="800" fill="#ffffff" letter-spacing="-0.5">Batcher</text>
+<text x="600.0" y="276.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="16" font-weight="500" fill="#dbeafe">one adaptive engine</text>
+</svg>

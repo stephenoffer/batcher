@@ -23,6 +23,34 @@ and another seam to leak. Batcher collapses that stack into a single engine.
 
 ![One engine: any source — Parquet, media, Kafka, lakehouse — flows into Batcher and back out to any workload: SQL and ETL, batch inference, embeddings, and training data.](_static/diagrams/hub.png)
 
+## Why Batcher
+
+The tools we reach for each stop somewhere, and the gaps between them are where the
+time goes:
+
+::::{grid} 1 3 3 3
+:gutter: 3
+
+:::{grid-item-card} {octicon}`git-branch;1.1em` Outgrow it, rewrite it
+A fast single-node engine hits a ceiling. Scaling out means porting the pipeline to a
+different system with different semantics.
+:::
+
+:::{grid-item-card} {octicon}`stack;1.1em` A tool per job
+SQL in one engine, DataFrames in another, separate loaders and servers for ML. Every
+hand-off between them is a place for data and effort to leak.
+:::
+
+:::{grid-item-card} {octicon}`gear;1.1em` Tuned by hand
+Batch sizes, partition counts, join order — guess wrong and the job stalls or runs out
+of memory, often only at scale.
+:::
+::::
+
+Batcher answers all three at once: the same code from a laptop to a cluster, one
+engine across SQL, DataFrames, and ML, and a plan that re-tunes itself as it runs — so
+you build the pipeline once and it keeps working as the data grows.
+
 ## Any data, any workload
 
 The same engine reads a Parquet table, a folder of images, or a Kafka stream, and the
@@ -54,8 +82,9 @@ search, and RAG.
 
 ## Write it your way
 
-Express a transformation as a DataFrame, as SQL, or as composable column expressions.
-All three build the same plan and run on the same engine, so you can mix them freely.
+Express a transformation as a DataFrame, as SQL, or as composable expressions — and
+run it as a batch job or a live stream. Every form builds the same plan and runs on
+the same engine, so you mix them freely.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
@@ -91,36 +120,103 @@ print(ds.select(revenue=revenue, tier=tier).to_pydict())
 # {'revenue': [10.0, 40.0, 90.0], 'tier': ['low', 'low', 'high']}
 ```
 :::
+
+:::{tab-item} Streaming
+```python
+# docs: skip
+import batcher as bt
+
+# the same group-by, now over an unbounded source
+clicks = bt.read.kafka(topic="clicks")
+counts = clicks.group_by("page").agg(n=bt.count())
+
+# batch (default) → micro-batch → continuous: change one argument
+counts.write.parquet("out/", trigger=bt.Trigger.processing_time("10s"))
+```
+:::
 ::::
 
 Expressions carry typed accessors for every column kind — `.str`, `.dt`, `.list`,
 `.struct` — so the column language is the same whether you reach for it from a
-DataFrame or from SQL.
+DataFrame, from SQL, or in a stream.
 
-## Run it anywhere, at any cadence
+## Explore the capabilities
 
-The source is the only thing that changes between a laptop and production:
+::::{grid} 1 2 3 3
+:gutter: 3
 
-```python
-# docs: skip
-bt.read("data/*.parquet")                  # local files
-bt.read("s3://bucket/events/*.parquet")    # object storage
-bt.read.images("s3://photos/**/*.jpg")     # multimodal
-bt.read.kafka(topic="events")              # streams
-```
+:::{grid-item-card} {octicon}`rocket;1.1em` Getting started
+:link: getting-started/index
+:link-type: doc
+Install and run your first pipeline.
+:::
 
-And because batch is just the bounded case of streaming, the same pipeline runs as a
-one-shot job, a micro-batch, or a continuous stream — you change one argument:
+:::{grid-item-card} {octicon}`download;1.1em` Reading data
+:link: user-guide/reading-data
+:link-type: doc
+Files, object storage, databases, and streams.
+:::
 
-```python
-# docs: skip
-pipeline.write.parquet("out/")                                       # batch (default)
-pipeline.write.parquet("out/", trigger=bt.Trigger.processing_time("5s"))  # micro-batch
-pipeline.write.parquet("out/", trigger=bt.Trigger.continuous("1s"))       # continuous
-```
+:::{grid-item-card} {octicon}`pencil;1.1em` Transformations
+:link: user-guide/transformations
+:link-type: doc
+Select, derive, reshape, and explode columns.
+:::
 
-Same operators, same results — only the cadence changes, with watermarks, event-time
-windows, and exactly-once checkpoints handled for the streaming cases.
+:::{grid-item-card} {octicon}`filter;1.1em` Filtering
+:link: user-guide/filtering
+:link-type: doc
+Predicates, null handling, and sampling.
+:::
+
+:::{grid-item-card} {octicon}`graph;1.1em` Aggregations
+:link: user-guide/aggregations
+:link-type: doc
+Group, summarize, pivot, and roll up.
+:::
+
+:::{grid-item-card} {octicon}`git-merge;1.1em` Joins
+:link: user-guide/joins
+:link-type: doc
+Inner, outer, semi, anti, and as-of joins.
+:::
+
+:::{grid-item-card} {octicon}`versions;1.1em` Window functions
+:link: user-guide/window-functions
+:link-type: doc
+Ranking, running totals, lag and lead.
+:::
+
+:::{grid-item-card} {octicon}`code;1.1em` Expressions
+:link: user-guide/expressions
+:link-type: doc
+The composable column language and its accessors.
+:::
+
+:::{grid-item-card} {octicon}`database;1.1em` SQL
+:link: user-guide/sql
+:link-type: doc
+Full SQL that lowers to the same engine.
+:::
+
+:::{grid-item-card} {octicon}`broadcast;1.1em` Streaming
+:link: user-guide/streaming
+:link-type: doc
+Watermarks, windows, and exactly-once output.
+:::
+
+:::{grid-item-card} {octicon}`beaker;1.1em` Machine learning
+:link: ml/index
+:link-type: doc
+Batch inference, embeddings, and training data.
+:::
+
+:::{grid-item-card} {octicon}`cloud;1.1em` Cloud & lakehouse
+:link: user-guide/cloud-storage
+:link-type: doc
+S3, GCS, Azure, and Delta / Iceberg / Hudi.
+:::
+::::
 
 ## It tunes itself
 
@@ -142,48 +238,6 @@ mid-flight adaptation a plan-once optimizer can't do. The
 Speed is measured correctness-first: the benchmark harness refuses to time a query
 whose result doesn't match DuckDB, and every operator is differential-tested against
 it. The numbers live in [`benchmarks/`](https://github.com/stephenoffer/batcher/tree/main/benchmarks).
-
-## Where to go next
-
-::::{grid} 1 2 2 3
-:gutter: 3
-
-:::{grid-item-card} {octicon}`rocket;1.1em` Getting started
-:link: getting-started/index
-:link-type: doc
-Install, run a first pipeline, and learn the lazy execution model.
-:::
-
-:::{grid-item-card} {octicon}`book;1.1em` Tutorials & examples
-:link: examples/index
-:link-type: doc
-Worked, end-to-end walkthroughs you can run as written.
-:::
-
-:::{grid-item-card} {octicon}`code;1.1em` User guide
-:link: user-guide/index
-:link-type: doc
-Task-oriented guides for every part of the Dataset API.
-:::
-
-:::{grid-item-card} {octicon}`list-unordered;1.1em` API reference
-:link: api/index
-:link-type: doc
-Every public class and function, generated from the docstrings.
-:::
-
-:::{grid-item-card} {octicon}`beaker;1.1em` Machine learning
-:link: ml/index
-:link-type: doc
-Batch inference, embeddings, and training-data loaders.
-:::
-
-:::{grid-item-card} {octicon}`gear;1.1em` Configuration
-:link: configuration/index
-:link-type: doc
-Memory, spill, parallelism, and the adaptive knobs.
-:::
-::::
 
 ```{toctree}
 :hidden:
