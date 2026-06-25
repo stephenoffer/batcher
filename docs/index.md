@@ -2,13 +2,12 @@
 
 ```{raw} html
 <div class="bt-hero">
-  <p class="bt-hero-eyebrow">SQL &middot; DataFrames &middot; ML</p>
-  <p class="bt-hero-tagline">One data engine, from your laptop to your cluster.</p>
+  <p class="bt-hero-eyebrow">Any data &middot; Any AI workload &middot; Batch &amp; streaming</p>
+  <p class="bt-hero-tagline">One engine for every kind of data, and every kind of AI.</p>
   <p class="bt-hero-sub">
-    Batcher runs SQL, DataFrame, and ML workloads on a single engine that tunes itself
-    while the query runs. Prototype on a laptop, then ship the same code to a cluster.
-    It stays sub-second on small data and holds its memory at petabyte scale, with no
-    rewrite in between.
+    Structured tables, unstructured text, images, audio, video. SQL, DataFrames, and
+    expressions. Batch jobs and live streams. Batcher runs all of it on a single
+    engine &mdash; from a laptop to a cluster &mdash; and tunes itself as the query runs.
   </p>
   <p class="bt-hero-cta">
     <a class="bt-btn bt-btn-primary" href="getting-started/index.html">Get started</a>
@@ -18,47 +17,53 @@
 </div>
 ```
 
-Most engines plan a query once, before they have seen a single row, then commit to
-that plan whatever the data turns out to be. Batcher measures the data as it flows
-and re-plans the rest of the query on real numbers, so a query that starts on a bad
-estimate corrects itself mid-flight.
+Data work has splintered into a tool per job: one for SQL, another for DataFrames,
+a third for streaming, more for images and models. Each new tool is another system
+to run and another seam to leak. Batcher's goal is to collapse that stack into one
+engine — covering every kind of data and every AI workload, from a quick query on a
+laptop to a petabyte job on a cluster, with the same code throughout.
 
-## What you get
+## Any data
 
 ::::{grid} 1 2 2 2
 :gutter: 3
 
-:::{grid-item-card} {octicon}`shield;1.1em` Bad estimates don't sink the query
-Other engines commit to a plan before seeing a row, then run it to the end even when
-the data turns out different. That's the usual reason a job stalls or runs out of
-memory. Batcher re-plans mid-query on the row counts it just measured, so a bad guess
-corrects itself instead of failing.
+:::{grid-item-card} {octicon}`table;1.1em` Structured
+Tables from Parquet, CSV, JSON, and the lakehouse formats (Delta, Iceberg, Hudi).
+Filter, join, and aggregate them with SQL or DataFrames, and write the results back.
 :::
 
-:::{grid-item-card} {octicon}`server;1.1em` Scale without a rewrite
-Prototype on a sample, then point the very same code at the full dataset on a
-cluster. Operators combine across cores and machines, so going from megabytes to
-petabytes is a deployment change. Memory stays bounded because every stage can spill
-to disk.
+:::{grid-item-card} {octicon}`file;1.1em` Unstructured
+Text, logs, and documents. Read whole files or lines, parse and extract fields, and
+turn messy input into clean columns at scale.
 :::
 
-:::{grid-item-card} {octicon}`zap;1.1em` Fast without hand-tuning
-Column math compiles to machine code and streams in cache-sized batches, so small
-queries stay sub-second and large ones stay efficient. You never tune batch sizes or
-partition counts; the engine adapts them while it runs.
+:::{grid-item-card} {octicon}`image;1.1em` Multimodal
+Images, audio, and video, decoded straight into tensors — so the same pipeline that
+cleans a table can feed a model, with no separate loader to wire up.
 :::
 
-:::{grid-item-card} {octicon}`stack;1.1em` One engine, not a stack
-SQL, DataFrames, and ML inference all run on one engine over one copy of your Arrow
-data. No gluing a query tool to a dataframe library to a serving system, and no seams
-between them to spring a leak.
+:::{grid-item-card} {octicon}`search;1.1em` Vectors & embeddings
+List and tensor columns are first-class, with the vector operations that back
+embeddings, similarity search, and RAG feature pipelines.
 :::
 ::::
 
-## The same query, two ways
+## Any AI workload
 
-Write it as a DataFrame pipeline or as SQL. Both build the same plan and run on the
-same engine.
+One engine carries a job from raw data to a served model, instead of handing it
+between systems:
+
+- **Analytics & ETL** — clean, join, and aggregate, then write to files or a lakehouse.
+- **Batch inference** — run a model over Arrow batches with the `.ml` accessor; the
+  scheduler places the work on GPUs and across workers.
+- **Embeddings & RAG** — embed text or images and build the vector tables search needs.
+- **Training data** — shuffle, batch, and stream examples straight into your trainer.
+
+## Three ways to express your logic
+
+Write a transformation as a DataFrame or as SQL — both build the same plan and run on
+the same engine, so you can mix them freely.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
@@ -107,34 +112,85 @@ print(revenue.to_pydict())
 :::
 ::::
 
-Files and object stores use the same API. Only the source changes.
+Underneath both is the **expression API**: column logic as composable values you
+build once and reuse. Arithmetic, comparisons, conditionals, and typed accessors
+(`.str`, `.dt`, `.list`, `.struct`) all build the same `Expr`, evaluated in Rust.
+
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"price": [10.0, 20.0, 30.0], "qty": [1, 2, 3]})
+
+revenue = bt.col("price") * bt.col("qty")          # an expression, not a result
+tier = bt.when(revenue > 40).then(bt.lit("high")).otherwise(bt.lit("low"))
+
+print(ds.select(revenue=revenue, tier=tier).to_pydict())
+# {'revenue': [10.0, 40.0, 90.0], 'tier': ['low', 'low', 'high']}
+```
+
+The typed accessors give every column type its own vocabulary:
 
 ```python
 # docs: skip
-ds = bt.read("s3://bucket/events.parquet")
-ds.filter(bt.col("status") == "active").write.parquet("output/active.parquet")
+clean = bt.col("email").str.lower().str.trim()      # string ops
+year = bt.col("signup_ts").dt.year()                # datetime parts
+has_tag = bt.col("tags").list.contains("ai")        # list / array ops
 ```
 
-## How it works
+## Batch, micro-batch, or continuous — change one line
 
-You get Python's ergonomics and native speed from a clean split of labor. Python
-builds and optimizes the plan but never touches a row of your data; the per-row work
-all happens in Rust over Apache Arrow. And because there is one engine underneath,
-not a fast local mode bolted onto a separate distributed one, a result is identical
-whether the query ran on one core or a hundred.
+Batch is just the bounded case of streaming, so the pipeline you wrote for a file
+runs on a live stream untouched. You choose *how* it runs with one argument:
 
-![Batcher's two planes: a Python control plane hands a JSON IR plus Arrow batches to the Rust data plane.](_static/diagrams/two_planes.png)
+```python
+# docs: skip
+pipeline = bt.read.kafka(topic="events").filter(bt.col("status") == "active")
+
+# Batch: process what's there now, then stop (the default).
+pipeline.write.parquet("out/")
+
+# Micro-batch: a new batch every 5 seconds.
+pipeline.write.parquet("out/", trigger=bt.Trigger.processing_time("5s"))
+
+# Continuous: low-latency, always on.
+pipeline.write.parquet("out/", trigger=bt.Trigger.continuous("1s"))
+```
+
+Same operators, same results — only the cadence changes. Watermarks, event-time
+windows, and exactly-once checkpoints come along for the streaming cases.
+
+## Reads from anywhere
+
+The source is the only thing that changes between a laptop and production:
+
+```python
+# docs: skip
+bt.read("data/*.parquet")                  # local files
+bt.read("s3://bucket/events/*.parquet")    # object storage
+bt.read.images("s3://photos/**/*.jpg")     # multimodal
+bt.read.delta("s3://lake/events")          # lakehouse tables
+bt.read.kafka(topic="events")              # streams
+```
+
+## It tunes itself
+
+You don't size batches, pick join strategies, or guess partition counts. Batcher
+measures the data as it flows and re-plans the rest of the query on real numbers, so
+a query that starts on a bad estimate corrects itself instead of stalling — the kind
+of mid-flight adaptation a plan-once optimizer can't do. The
+[architecture guide](architecture/index.md) covers how, if you're curious.
 
 ## How it compares
 
 | Reach for Batcher when | Because |
 | --- | --- |
 | You outgrow DuckDB's single node | the same query scales out, and re-optimizes mid-flight rather than planning once |
-| Polars is fast but stops at one machine | the mergeable algebra runs the same code on a cluster |
+| Polars is fast but stops at one machine | the same code runs from one core to a cluster |
 | Spark's overhead dominates small jobs | it runs in-process locally, with no cluster to spin up |
+| You're gluing a query tool to a loader to a model server | one engine spans all three over the same Arrow data |
 
 Speed is measured correctness-first: the benchmark harness refuses to time a query
-whose result does not match DuckDB, and every operator is differential-tested against
+whose result doesn't match DuckDB, and every operator is differential-tested against
 it. The numbers live in [`benchmarks/`](https://github.com/stephenoffer/batcher/tree/main/benchmarks).
 
 ## Where to go next
@@ -148,8 +204,8 @@ it. The numbers live in [`benchmarks/`](https://github.com/stephenoffer/batcher/
 Install, run a first pipeline, and learn the lazy execution model.
 :::
 
-:::{grid-item-card} {octicon}`book;1.1em` Tutorials
-:link: tutorials/index
+:::{grid-item-card} {octicon}`book;1.1em` Tutorials & examples
+:link: examples/index
 :link-type: doc
 Worked, end-to-end walkthroughs you can run as written.
 :::
