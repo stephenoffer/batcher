@@ -350,3 +350,34 @@ article img[src*="/diagrams/"] {
   @keyframes bt-grid-drift { to { background-position: 36px 36px; } }
   .bt-hero::after { animation: bt-grid-drift 22s linear infinite; }
 }
+
+/* ---- Competitive matrix ------------------------------------------------ */
+
+.bt-matrix {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 1.4rem 0 0.5rem;
+  border-radius: var(--bt-radius);
+  overflow: hidden;
+  border: 1px solid var(--color-background-border);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+  font-size: 0.92rem;
+}
+.bt-matrix th, .bt-matrix td {
+  padding: 0.55rem 0.7rem;
+  text-align: center;
+  border-bottom: 1px solid var(--color-background-border);
+}
+.bt-matrix tbody tr:last-child td { border-bottom: none; }
+.bt-matrix th:first-child, .bt-matrix td:first-child { text-align: left; font-weight: 600; }
+.bt-matrix thead th { background: var(--color-background-secondary); font-weight: 700; }
+/* highlight the Batcher column */
+.bt-matrix th:nth-child(2), .bt-matrix td:nth-child(2) { background: rgba(37, 99, 235, 0.07); }
+.bt-matrix thead th:nth-child(2) { color: var(--bt-blue); border-bottom: 2px solid var(--bt-blue); }
+.bt-matrix tbody tr:hover td { background: var(--color-background-hover); }
+.bt-matrix tbody tr:hover td:nth-child(2) { background: rgba(37, 99, 235, 0.13); }
+.bt-matrix .y { color: #16a34a; font-weight: 700; }
+.bt-matrix .p { color: var(--bt-amber); font-weight: 700; }
+.bt-matrix .n { color: var(--color-foreground-secondary); opacity: 0.45; }
+.bt-matrix-legend { font-size: 0.82rem; color: var(--color-foreground-secondary); margin: 0.3rem 0 0; }

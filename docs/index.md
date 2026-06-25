@@ -228,12 +228,33 @@ mid-flight adaptation a plan-once optimizer can't do. The
 
 ## How it compares
 
-| Reach for Batcher when | Because |
-| --- | --- |
-| You outgrow DuckDB's single node | the same query scales out, and re-optimizes mid-flight rather than planning once |
-| Polars is fast but stops at one machine | the same code runs from one core to a cluster |
-| Spark's overhead dominates small jobs | it runs in-process locally, with no cluster to spin up |
-| You're gluing a query tool to a loader to a model server | one engine spans all three over the same Arrow data |
+Each tool stops somewhere; Batcher's aim is the whole range on one engine.
+
+```{raw} html
+<table class="bt-matrix">
+<thead><tr><th>Capability</th>
+<th>Batcher</th>
+<th>DuckDB</th>
+<th>Polars</th>
+<th>Spark</th>
+<th>Ray&nbsp;Data</th>
+</tr></thead><tbody>
+<tr><td>Runs in-process, no cluster</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Sub-second small queries</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td></tr>
+<tr><td>Scales to a cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Same code, laptop to cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="p">~</span></td></tr>
+<tr><td>SQL</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
+<tr><td>DataFrame API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Composable expression API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Cost-based optimizer</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Adaptive re-optimization mid-query</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Streaming</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td></tr>
+<tr><td>ML / batch inference</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Multimodal (images, audio, video)</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Out-of-core spill</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
+</tbody></table>
+<p class="bt-matrix-legend"><span class="y">✓</span> built-in &nbsp; <span class="p">~</span> partial or via an add-on &nbsp; <span class="n">—</span> not supported. A capability view, not a benchmark.</p>
+```
 
 Speed is measured correctness-first: the benchmark harness refuses to time a query
 whose result doesn't match DuckDB, and every operator is differential-tested against
