@@ -24,3 +24,26 @@ tree that the engine evaluates.
 
 The one place user Python sees data is `map_batches`, which hands you a whole Arrow
 batch (not a row) so the work still happens in bulk, off the per-row path.
+
+## Conditionals and reuse
+
+Because an expression is a value, you build it once and reuse it — in `select`,
+`with_columns`, `filter`, or an aggregate. Conditionals read like SQL's `CASE WHEN`:
+
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"score": [91, 72, 55]})
+grade = bt.when(bt.col("score") >= 80).then(bt.lit("A")).otherwise(bt.lit("B"))
+print(ds.select(grade=grade).to_pydict())
+# {'grade': ['A', 'B', 'B']}
+```
+
+Every column type carries its own accessor, so the vocabulary matches the data:
+
+```python
+# docs: skip
+bt.col("email").str.lower()           # string ops
+bt.col("signup_ts").dt.year()         # datetime parts
+bt.col("tags").list.contains("ai")    # list / array ops
+```

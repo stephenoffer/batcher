@@ -181,46 +181,6 @@ def _carbonite_loop() -> str:
 """
 
 
-@diagram("lifecycle")
-def _lifecycle() -> str:
-    return f"""
-  rankdir=LR; nodesep=0.45;
-  src [label="bt.read(...) /\\nfrom_pydict(...)", fillcolor="{BLUE_BG}", color="{BLUE}"];
-  ops [label="filter · select\\ngroup_by · join", fillcolor="{BLUE_BG}", color="{BLUE}"];
-  plan [label="LogicalPlan\\n(nothing has run)", fillcolor="{GREY_BG}", color="{GREY}"];
-  term [label="collect() /\\nto_pydict() / write", fillcolor="{ORANGE_BG}", color="{ORANGE}"];
-  res [label="Arrow result", fillcolor="{ORANGE_BG}", color="{ORANGE}"];
-  src -> ops [label="lazy"];
-  ops -> plan [label="builds"];
-  plan -> term [label="terminal\\ntriggers run", color="{ORANGE_EDGE}", fontcolor="{ORANGE_EDGE}"];
-  term -> res;
-  {{ rank=same; note; plan; }}
-  note [shape=note, fillcolor="#fffbeb", color="{ORANGE}",
-        label="each op returns a NEW\\nDataset; nothing mutates"];
-  plan -> note [style=invis];
-"""
-
-
-@diagram("mergeable")
-def _mergeable() -> str:
-    return f"""
-  rankdir=LR; nodesep=0.3; ranksep=0.55;
-  node [width=1.5];
-  subgraph cluster_parts {{
-    label="partitions (cores / machines)"; labeljust="l"; fontsize=11;
-    style="rounded,dashed"; color="{GREY}"; margin=12;
-    pa [label="partial(p1)", fillcolor="{BLUE_BG}", color="{BLUE}"];
-    pb [label="partial(p2)", fillcolor="{BLUE_BG}", color="{BLUE}"];
-    pc [label="partial(p3)", fillcolor="{BLUE_BG}", color="{BLUE}"];
-  }}
-  comb [label="combine\\n(associative)", fillcolor="{ORANGE_BG}", color="{ORANGE}"];
-  fin [label="finalize", fillcolor="{ORANGE_BG}", color="{ORANGE}"];
-  out [label="result", fillcolor="{GREY_BG}", color="{GREY}"];
-  pa -> comb; pb -> comb; pc -> comb;
-  comb -> fin -> out;
-"""
-
-
 def main() -> int:
     dot = shutil.which("dot")
     if not dot:
