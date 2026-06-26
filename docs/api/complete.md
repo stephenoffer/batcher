@@ -114,21 +114,23 @@ Use these in `group_by(...).agg(...)` or `.over(...)` window frames.
    percent_rank
    cume_dist
    ntile
-   lag
-   lead
-   first_value
-   last_value
-   nth_value
-   window
-```
-
-## Configuration
-
-```{eval-rst}
-.. autosummary::
-   :toctree: generated
-   :nosignatures:
-
+   range
+   date_range
+   read
+   sql
+   compact
+   engine_version
+   from_arrow
+   from_batches
+   from_pydict
+   from_numpy
+   from_pandas
+   from_polars
+   from_spark
+   from_dask
+   from_huggingface
+   from_torch
+   from_tf
    set_config
    config_context
 ```

@@ -27,3 +27,12 @@ Passing `distributed=True` to `collect()` runs the same plan across workers; the
 output matches the single-node result above. There is no separate distributed
 operator to learn — going from a sample to petabytes is a deployment change, not a
 rewrite.
+
+The mergeable form is also what keeps memory bounded: each `partial` is small, and a
+partition that grows too large spills to disk rather than failing. Scaling out is then
+just a flag — the plan, and the result, are unchanged:
+
+```python
+# docs: skip
+counts.collect(distributed=True)   # same plan, many machines, identical result
+```

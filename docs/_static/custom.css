@@ -38,8 +38,9 @@ h1 {
   margin-bottom: 0.6rem;
 }
 h2 {
-  margin-top: 2.6rem;
-  padding-bottom: 0.3rem;
+  margin-top: 3.1rem;
+  font-size: 1.6rem;
+  padding-bottom: 0.4rem;
   border-bottom: 1px solid var(--color-background-border);
 }
 
@@ -144,12 +145,16 @@ article a.reference {
 
 .bt-hero-eyebrow {
   display: inline-block;
-  font-size: 0.76rem;
+  font-size: 0.74rem;
   font-weight: 700;
-  letter-spacing: 0.16em;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--bt-amber);
-  margin: 0 0 0.9rem;
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.32);
+  padding: 0.32rem 0.8rem;
+  border-radius: 999px;
+  margin: 0 0 1.15rem;
 }
 .bt-hero-tagline {
   font-size: 2.45rem;
@@ -167,6 +172,15 @@ article a.reference {
   color: rgba(248, 250, 252, 0.85);
 }
 .bt-hero-cta { margin: 0; }
+
+/* Lead: the mission statement directly after the hero reads larger and calmer. */
+.bt-hero + p {
+  font-size: 1.18rem;
+  line-height: 1.7;
+  color: var(--color-foreground-secondary);
+  max-width: 47rem;
+  margin-top: 1.5rem;
+}
 
 .bt-btn {
   display: inline-block;
@@ -203,10 +217,13 @@ article a.reference {
 }
 .sd-card .sd-card-body { padding: 1.35rem 1.45rem; }
 .sd-card .sd-card-title {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
   font-weight: 700;
   font-size: 1.05rem;
   letter-spacing: -0.01em;
-  margin-bottom: 0.55rem;
+  margin-bottom: 0.7rem;
 }
 /* Card body reads as supporting text under the strong title. */
 .sd-card .sd-card-body > p:not(.sd-card-title) {
@@ -216,10 +233,13 @@ article a.reference {
 }
 .sd-card .sd-card-title .sd-octicon,
 .sd-card-title svg.octicon {
+  flex: none;
   color: var(--bt-blue);
   fill: var(--bt-blue);
-  margin-right: 0.45rem;
-  vertical-align: -2px;
+  background: rgba(37, 99, 235, 0.10);
+  padding: 0.5rem;
+  border-radius: 10px;
+  box-sizing: content-box;
 }
 .sd-btn-primary {
   background-color: var(--bt-blue) !important;
@@ -319,4 +339,45 @@ article img[src*="/diagrams/"] {
   article .sd-row > .sd-col:nth-child(4) { animation-delay: 0.18s; }
   article .sd-row > .sd-col:nth-child(5) { animation-delay: 0.24s; }
   article .sd-row > .sd-col:nth-child(6) { animation-delay: 0.30s; }
+
+  /* Diagrams ease in as they enter. */
+  article img[src*="/diagrams/"] {
+    animation: bt-fade-up 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation-delay: 0.1s;
+  }
+
+  /* The hero's grid drifts slowly, one cell on a seamless loop — life, not noise. */
+  @keyframes bt-grid-drift { to { background-position: 36px 36px; } }
+  .bt-hero::after { animation: bt-grid-drift 22s linear infinite; }
 }
+
+/* ---- Competitive matrix ------------------------------------------------ */
+
+.bt-matrix {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 1.4rem 0 0.5rem;
+  border-radius: var(--bt-radius);
+  overflow: hidden;
+  border: 1px solid var(--color-background-border);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+  font-size: 0.92rem;
+}
+.bt-matrix th, .bt-matrix td {
+  padding: 0.55rem 0.7rem;
+  text-align: center;
+  border-bottom: 1px solid var(--color-background-border);
+}
+.bt-matrix tbody tr:last-child td { border-bottom: none; }
+.bt-matrix th:first-child, .bt-matrix td:first-child { text-align: left; font-weight: 600; }
+.bt-matrix thead th { background: var(--color-background-secondary); font-weight: 700; }
+/* highlight the Batcher column */
+.bt-matrix th:nth-child(2), .bt-matrix td:nth-child(2) { background: rgba(37, 99, 235, 0.07); }
+.bt-matrix thead th:nth-child(2) { color: var(--bt-blue); border-bottom: 2px solid var(--bt-blue); }
+.bt-matrix tbody tr:hover td { background: var(--color-background-hover); }
+.bt-matrix tbody tr:hover td:nth-child(2) { background: rgba(37, 99, 235, 0.13); }
+.bt-matrix .y { color: #16a34a; font-weight: 700; }
+.bt-matrix .p { color: var(--bt-amber); font-weight: 700; }
+.bt-matrix .n { color: var(--color-foreground-secondary); opacity: 0.45; }
+.bt-matrix-legend { font-size: 0.82rem; color: var(--color-foreground-secondary); margin: 0.3rem 0 0; }

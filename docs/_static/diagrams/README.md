@@ -1,28 +1,13 @@
-# Documentation diagrams
+# Diagrams
 
-The architecture diagrams used in the docs are generated from Graphviz, not drawn by
-hand, so they stay consistent and easy to update.
+The documentation diagrams are hand-authored **SVG** files in this directory (the
+editable source), rasterized to retina PNGs that the docs embed.
 
-- **`render.py`** is the single source of truth — it defines every diagram and a
-  shared style, then shells out to `dot` to render each `<name>.png` here.
-- **`*.png`** are committed so the Sphinx build (and the GitHub Pages workflow) needs
-  no Graphviz. The intermediate `*.dot` files are generated and git-ignored.
+- Edit the `*.svg` you want to change (brand palette: blue `#2563eb`, amber
+  `#f59e0b`, slate text `#1e293b`; gradient cards with soft shadows and labeled
+  flow arrows).
+- Regenerate the PNGs with `python render.py` (or `just diagrams`), which runs
+  `rsvg-convert` over every `*.svg` here.
 
-## Regenerating
-
-```bash
-brew install graphviz      # provides `dot` (one-time)
-just diagrams              # or: python docs/_static/diagrams/render.py
-```
-
-Then rebuild the docs (`just docs`) and commit the updated PNGs.
-
-## Adding or editing a diagram
-
-Edit `render.py`: add a `@diagram("name")` function returning a Graphviz body, or
-change an existing one. Reference it from a Markdown page with a relative path and
-descriptive alt text, e.g.
-
-```markdown
-![Alt text describing the diagram](../_static/diagrams/name.png)
-```
+Diagrams: `hub`, `lifecycle`, `mergeable`, `two_planes`, `layer_stack`,
+`data_flow`, `pipeline_breakers`, `carbonite_loop`.

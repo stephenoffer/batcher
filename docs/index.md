@@ -2,13 +2,12 @@
 
 ```{raw} html
 <div class="bt-hero">
-  <p class="bt-hero-eyebrow">SQL &middot; DataFrames &middot; ML</p>
-  <p class="bt-hero-tagline">One data engine, from your laptop to your cluster.</p>
+  <p class="bt-hero-eyebrow">Any data &middot; Any AI workload &middot; Batch &amp; streaming</p>
+  <p class="bt-hero-tagline">One engine for every kind of data, and every kind of AI.</p>
   <p class="bt-hero-sub">
-    Batcher runs SQL, DataFrame, and ML workloads on a single engine that tunes itself
-    while the query runs. Prototype on a laptop, then ship the same code to a cluster.
-    It stays sub-second on small data and holds its memory at petabyte scale, with no
-    rewrite in between.
+    Structured tables, unstructured text, images, audio, video. SQL, DataFrames, and
+    expressions. Batch jobs and live streams. Batcher runs all of it on a single
+    engine &mdash; from a laptop to a cluster &mdash; and tunes itself as the query runs.
   </p>
   <p class="bt-hero-cta">
     <a class="bt-btn bt-btn-primary" href="getting-started/index.html">Get started</a>
@@ -18,69 +17,84 @@
 </div>
 ```
 
-Most engines plan a query once, before they have seen a single row, then commit to
-that plan whatever the data turns out to be. Batcher measures the data as it flows
-and re-plans the rest of the query on real numbers, so a query that starts on a bad
-estimate corrects itself mid-flight.
+Data work has splintered into a tool per job: one for SQL, another for DataFrames, a
+third for streaming, more for images and models. Each one is another system to run
+and another seam to leak. Batcher collapses that stack into a single engine.
 
-## What you get
+![One engine: any source — Parquet, media, Kafka, lakehouse — flows into Batcher and back out to any workload: SQL and ETL, batch inference, embeddings, and training data.](_static/diagrams/hub.png)
+
+## Why Batcher
+
+The tools we reach for each stop somewhere, and the gaps between them are where the
+time goes:
+
+::::{grid} 1 3 3 3
+:gutter: 3
+
+:::{grid-item-card} {octicon}`git-branch;1.1em` Outgrow it, rewrite it
+A fast single-node engine hits a ceiling. Scaling out means porting the pipeline to a
+different system with different semantics.
+:::
+
+:::{grid-item-card} {octicon}`stack;1.1em` A tool per job
+SQL in one engine, DataFrames in another, separate loaders and servers for ML. Every
+hand-off between them is a place for data and effort to leak.
+:::
+
+:::{grid-item-card} {octicon}`gear;1.1em` Tuned by hand
+Batch sizes, partition counts, join order — guess wrong and the job stalls or runs out
+of memory, often only at scale.
+:::
+::::
+
+Batcher answers all three at once: the same code from a laptop to a cluster, one
+engine across SQL, DataFrames, and ML, and a plan that re-tunes itself as it runs — so
+you build the pipeline once and it keeps working as the data grows.
+
+## Any data, any workload
+
+The same engine reads a Parquet table, a folder of images, or a Kafka stream, and the
+same pipeline can clean it, query it, or feed it to a model.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
 
-:::{grid-item-card} {octicon}`shield;1.1em` Bad estimates don't sink the query
-Other engines commit to a plan before seeing a row, then run it to the end even when
-the data turns out different. That's the usual reason a job stalls or runs out of
-memory. Batcher re-plans mid-query on the row counts it just measured, so a bad guess
-corrects itself instead of failing.
+:::{grid-item-card} {octicon}`table;1.1em` Structured
+Parquet, CSV, JSON, and the lakehouse formats (Delta, Iceberg, Hudi) — filtered,
+joined, and aggregated with SQL or DataFrames.
 :::
 
-:::{grid-item-card} {octicon}`server;1.1em` Scale without a rewrite
-Prototype on a sample, then point the very same code at the full dataset on a
-cluster. Operators combine across cores and machines, so going from megabytes to
-petabytes is a deployment change. Memory stays bounded because every stage can spill
-to disk.
+:::{grid-item-card} {octicon}`file;1.1em` Unstructured
+Text, logs, and documents read whole or by the line, then parsed into clean columns
+at scale.
 :::
 
-:::{grid-item-card} {octicon}`zap;1.1em` Fast without hand-tuning
-Column math compiles to machine code and streams in cache-sized batches, so small
-queries stay sub-second and large ones stay efficient. You never tune batch sizes or
-partition counts; the engine adapts them while it runs.
+:::{grid-item-card} {octicon}`image;1.1em` Multimodal
+Images, audio, and video decoded straight into tensors, so one pipeline can clean a
+table and feed a model.
 :::
 
-:::{grid-item-card} {octicon}`stack;1.1em` One engine, not a stack
-SQL, DataFrames, and ML inference all run on one engine over one copy of your Arrow
-data. No gluing a query tool to a dataframe library to a serving system, and no seams
-between them to spring a leak.
+:::{grid-item-card} {octicon}`search;1.1em` Vectors & embeddings
+First-class list and tensor columns with the vector ops behind embeddings, similarity
+search, and RAG.
 :::
 ::::
 
-## The same query, two ways
+## Write it your way
 
-Write it as a DataFrame pipeline or as SQL. Both build the same plan and run on the
-same engine.
+Express a transformation as a DataFrame, as SQL, or as composable expressions — and
+run it as a batch job or a live stream. Every form builds the same plan and runs on
+the same engine, so you mix them freely.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
 ```python
 import batcher as bt
 
-sales = bt.from_pydict(
-    {
-        "category": ["a", "b", "a", "b", "a"],
-        "price": [10.0, 20.0, 30.0, 40.0, 50.0],
-        "qty": [1, 2, 3, 4, 5],
-    }
-)
-
-revenue = (
-    sales.with_columns(total=bt.col("price") * bt.col("qty"))
-    .group_by("category")
-    .agg(revenue=bt.col("total").sum())
-    .sort("revenue", descending=True)
-)
-print(revenue.to_pydict())
-# {'category': ['a', 'b'], 'revenue': [350.0, 200.0]}
+sales = bt.from_pydict({"cat": ["a", "b", "a"], "amt": [10.0, 20.0, 30.0]})
+revenue = sales.group_by("cat").agg(total=bt.col("amt").sum())
+print(revenue.sort("total", descending=True).to_pydict())
+# {'cat': ['a', 'b'], 'total': [40.0, 20.0]}
 ```
 :::
 
@@ -88,94 +102,119 @@ print(revenue.to_pydict())
 ```python
 import batcher as bt
 
-sales = bt.from_pydict(
-    {
-        "category": ["a", "b", "a", "b", "a"],
-        "price": [10.0, 20.0, 30.0, 40.0, 50.0],
-        "qty": [1, 2, 3, 4, 5],
-    }
-)
+sales = bt.from_pydict({"cat": ["a", "b", "a"], "amt": [10.0, 20.0, 30.0]})
+revenue = bt.sql("SELECT cat, SUM(amt) AS total FROM sales GROUP BY cat", sales=sales)
+print(revenue.sort("total", descending=True).to_pydict())
+# {'cat': ['a', 'b'], 'total': [40.0, 20.0]}
+```
+:::
 
-revenue = bt.sql(
-    "SELECT category, SUM(price * qty) AS revenue "
-    "FROM sales GROUP BY category ORDER BY revenue DESC",
-    sales=sales,
-)
-print(revenue.to_pydict())
-# {'category': ['a', 'b'], 'revenue': [350.0, 200.0]}
+:::{tab-item} Expressions
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"price": [10.0, 20.0, 30.0], "qty": [1, 2, 3]})
+revenue = bt.col("price") * bt.col("qty")            # a value you build once
+tier = bt.when(revenue > 40).then(bt.lit("high")).otherwise(bt.lit("low"))
+print(ds.select(revenue=revenue, tier=tier).to_pydict())
+# {'revenue': [10.0, 40.0, 90.0], 'tier': ['low', 'low', 'high']}
+```
+:::
+
+:::{tab-item} Streaming
+```python
+# docs: skip
+import batcher as bt
+
+# the same group-by, now over an unbounded source
+clicks = bt.read.kafka(topic="clicks")
+counts = clicks.group_by("page").agg(n=bt.count())
+
+# batch (default) → micro-batch → continuous: change one argument
+counts.write.parquet("out/", trigger=bt.Trigger.processing_time("10s"))
 ```
 :::
 ::::
 
-Files and object stores use the same API. Only the source changes.
+Expressions carry typed accessors for every column kind — `.str`, `.dt`, `.list`,
+`.struct` — so the column language is the same whether you reach for it from a
+DataFrame, from SQL, or in a stream.
 
-```python
-# docs: skip
-ds = bt.read("s3://bucket/events.parquet")
-ds.filter(bt.col("status") == "active").write.parquet("output/active.parquet")
-```
+## Explore the capabilities
 
-## How it works
-
-You get Python's ergonomics and native speed from a clean split of labor. Python
-builds and optimizes the plan but never touches a row of your data; the per-row work
-all happens in Rust over Apache Arrow. And because there is one engine underneath,
-not a fast local mode bolted onto a separate distributed one, a result is identical
-whether the query ran on one core or a hundred.
-
-![Batcher's two planes: a Python control plane hands a JSON IR plus Arrow batches to the Rust data plane.](_static/diagrams/two_planes.png)
-
-## How it compares
-
-| Reach for Batcher when | Because |
-| --- | --- |
-| You outgrow DuckDB's single node | the same query scales out, and re-optimizes mid-flight rather than planning once |
-| Polars is fast but stops at one machine | the mergeable algebra runs the same code on a cluster |
-| Spark's overhead dominates small jobs | it runs in-process locally, with no cluster to spin up |
-
-Speed is measured correctness-first: the benchmark harness refuses to time a query
-whose result does not match DuckDB, and every operator is differential-tested against
-it. The numbers live in [`benchmarks/`](https://github.com/stephenoffer/batcher/tree/main/benchmarks).
-
-## Where to go next
-
-::::{grid} 1 2 2 3
+::::{grid} 1 2 3 3
 :gutter: 3
 
 :::{grid-item-card} {octicon}`rocket;1.1em` Getting started
 :link: getting-started/index
 :link-type: doc
-Install, run a first pipeline, and learn the lazy execution model.
+Install and run your first pipeline.
 :::
 
-:::{grid-item-card} {octicon}`book;1.1em` Tutorials
-:link: tutorials/index
+:::{grid-item-card} {octicon}`download;1.1em` Reading data
+:link: user-guide/reading-data
 :link-type: doc
-Worked, end-to-end walkthroughs you can run as written.
+Files, object storage, databases, and streams.
 :::
 
-:::{grid-item-card} {octicon}`code;1.1em` User guide
-:link: user-guide/index
+:::{grid-item-card} {octicon}`pencil;1.1em` Transformations
+:link: user-guide/transformations
 :link-type: doc
-Task-oriented guides for every part of the Dataset API.
+Select, derive, reshape, and explode columns.
 :::
 
-:::{grid-item-card} {octicon}`list-unordered;1.1em` API reference
-:link: api/index
+:::{grid-item-card} {octicon}`filter;1.1em` Filtering
+:link: user-guide/filtering
 :link-type: doc
-Every public class and function, generated from the docstrings.
+Predicates, null handling, and sampling.
+:::
+
+:::{grid-item-card} {octicon}`graph;1.1em` Aggregations
+:link: user-guide/aggregations
+:link-type: doc
+Group, summarize, pivot, and roll up.
+:::
+
+:::{grid-item-card} {octicon}`git-merge;1.1em` Joins
+:link: user-guide/joins
+:link-type: doc
+Inner, outer, semi, anti, and as-of joins.
+:::
+
+:::{grid-item-card} {octicon}`versions;1.1em` Window functions
+:link: user-guide/window-functions
+:link-type: doc
+Ranking, running totals, lag and lead.
+:::
+
+:::{grid-item-card} {octicon}`code;1.1em` Expressions
+:link: user-guide/expressions
+:link-type: doc
+The composable column language and its accessors.
+:::
+
+:::{grid-item-card} {octicon}`database;1.1em` SQL
+:link: user-guide/sql
+:link-type: doc
+Full SQL that lowers to the same engine.
+:::
+
+:::{grid-item-card} {octicon}`broadcast;1.1em` Streaming
+:link: user-guide/streaming
+:link-type: doc
+Watermarks, windows, and exactly-once output.
 :::
 
 :::{grid-item-card} {octicon}`beaker;1.1em` Machine learning
 :link: ml/index
 :link-type: doc
-Batch inference, embeddings, and training-data loaders.
+Batch inference, embeddings, and training data.
 :::
 
-:::{grid-item-card} {octicon}`gear;1.1em` Configuration
-:link: configuration/index
+:::{grid-item-card} {octicon}`cloud;1.1em` Cloud & lakehouse
+:link: user-guide/cloud-storage
 :link-type: doc
-Memory, spill, parallelism, and the adaptive knobs.
+S3, GCS, Azure, and Delta / Iceberg / Hudi.
 :::
 
 :::{grid-item-card} {octicon}`arrow-switch;1.1em` Coming from pandas / Polars / Spark
@@ -184,6 +223,48 @@ Memory, spill, parallelism, and the adaptive knobs.
 Translate the API you already know, side by side.
 :::
 ::::
+
+## It tunes itself
+
+You don't size batches, pick join strategies, or guess partition counts. Batcher
+measures the data as it flows and re-plans the rest of the query on real numbers, so a
+query that starts on a bad estimate corrects itself instead of stalling — the kind of
+mid-flight adaptation a plan-once optimizer can't do. The
+[architecture guide](architecture/index.md) covers how, if you're curious.
+
+## How it compares
+
+Each tool stops somewhere; Batcher's aim is the whole range on one engine.
+
+```{raw} html
+<table class="bt-matrix">
+<thead><tr><th>Capability</th>
+<th>Batcher</th>
+<th>DuckDB</th>
+<th>Polars</th>
+<th>Spark</th>
+<th>Ray&nbsp;Data</th>
+</tr></thead><tbody>
+<tr><td>Runs in-process, no cluster</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Sub-second small queries</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td></tr>
+<tr><td>Scales to a cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Same code, laptop to cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="p">~</span></td></tr>
+<tr><td>SQL</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
+<tr><td>DataFrame API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Composable expression API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Cost-based optimizer</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Adaptive re-optimization mid-query</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Streaming</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td></tr>
+<tr><td>ML / batch inference</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Multimodal (images, audio, video)</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Out-of-core spill</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
+</tbody></table>
+<p class="bt-matrix-legend"><span class="y">✓</span> built-in &nbsp; <span class="p">~</span> partial or via an add-on &nbsp; <span class="n">—</span> not supported. A capability view, not a benchmark.</p>
+```
+
+Speed is measured correctness-first: the benchmark harness refuses to time a query
+whose result doesn't match DuckDB, and every operator is differential-tested against
+it. The numbers live in [`benchmarks/`](https://github.com/stephenoffer/batcher/tree/main/benchmarks).
 
 ```{toctree}
 :hidden:

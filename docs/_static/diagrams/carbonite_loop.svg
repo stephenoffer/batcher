@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 300">
+<defs>
+<linearGradient id="blue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f5f9ff"/><stop offset="1" stop-color="#dbeafe"/></linearGradient>
+<linearGradient id="amber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fffdf5"/><stop offset="1" stop-color="#fdecc8"/></linearGradient>
+<linearGradient id="grey" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fbfcfe"/><stop offset="1" stop-color="#eef2f7"/></linearGradient>
+<filter id="sh" x="-20%" y="-30%" width="140%" height="180%"><feDropShadow dx="0" dy="2.5" stdDeviation="4.5" flood-color="#1e293b" flood-opacity="0.15"/></filter>
+<marker id="arB" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#2563eb"/></marker>
+<marker id="arA" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#d97706"/></marker>
+<marker id="arG" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#94a3b8"/></marker>
+</defs>
+<g filter="url(#sh)"><rect x="30" y="64" width="196" height="84" rx="13" fill="url(#blue)" stroke="#bfdbfe" stroke-width="1.4"/><rect x="30" y="75" width="5" height="62" rx="2.5" fill="#3b82f6"/></g><text x="131.0" y="103.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="17" font-weight="700" fill="#1e293b">Kyber</text><text x="131.0" y="124.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12.5" fill="#5b6675">decides</text>
+<g filter="url(#sh)"><rect x="372" y="64" width="196" height="84" rx="13" fill="url(#amber)" stroke="#fcd34d" stroke-width="1.4"/><rect x="372" y="75" width="5" height="62" rx="2.5" fill="#f59e0b"/></g><text x="473.0" y="103.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="17" font-weight="700" fill="#1e293b">Carbonite</text><text x="473.0" y="124.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12.5" fill="#5b6675">protects</text>
+<g filter="url(#sh)"><rect x="714" y="64" width="196" height="84" rx="13" fill="url(#grey)" stroke="#cbd5e1" stroke-width="1.4"/><rect x="714" y="75" width="5" height="62" rx="2.5" fill="#94a3b8"/></g><text x="815.0" y="103.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="17" font-weight="700" fill="#334155">Core</text><text x="815.0" y="124.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12.5" fill="#5b6675">executes</text>
+<path d="M 226 106.0 L 372 106.0" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arB)"/><text x="299.0" y="94.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="600" fill="#2563eb">plan + cost</text>
+<path d="M 568 106.0 L 714 106.0" fill="none" stroke="#d97706" stroke-width="2.4" marker-end="url(#arA)"/><text x="641.0" y="94.0" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="12" font-weight="600" fill="#d97706">allocations</text>
+<path d="M 812.0 148 C 812.0 268, 128.0 268, 128.0 148" fill="none" stroke="#2563eb" stroke-width="2.4" stroke-dasharray="6 5" marker-end="url(#arB)"/>
+<rect x="334" y="231" width="272" height="20" rx="5" fill="#ffffff"/><text x="470.0" y="243" text-anchor="middle" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="600" fill="#2563eb">measured cardinalities · peak memory</text>
+</svg>

@@ -116,6 +116,24 @@ ds.filter(bt.col("status") == "active").write.parquet("output/active.parquet")
 
 ## Next steps
 
-- [Core concepts](concepts/index.md): the lazy, immutable execution model.
-- [Transformations](../user-guide/transformations.md) and
-  [Aggregations](../user-guide/aggregations.md) cover the operators in depth.
+::::{grid} 1 3 3 3
+:gutter: 3
+
+:::{grid-item-card} {octicon}`light-bulb;1.1em` Core concepts
+:link: concepts/index
+:link-type: doc
+The lazy, immutable execution model.
+:::
+
+:::{grid-item-card} {octicon}`code;1.1em` User guide
+:link: ../user-guide/index
+:link-type: doc
+Every operator, with runnable examples.
+:::
+
+:::{grid-item-card} {octicon}`book;1.1em` Tutorials & examples
+:link: ../examples/index
+:link-type: doc
+End-to-end walkthroughs you can run.
+:::
+::::
