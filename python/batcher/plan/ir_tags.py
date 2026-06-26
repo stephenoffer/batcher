@@ -60,6 +60,7 @@ class ExprTag:
     MATH: Final = "math"
     MATH2: Final = "math2"
     COALESCE: Final = "coalesce"
+    IN_LIST: Final = "in_list"
     NULLIF: Final = "nullif"
     GREATEST: Final = "greatest"
     LEAST: Final = "least"

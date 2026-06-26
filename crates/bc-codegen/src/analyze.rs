@@ -242,6 +242,7 @@ pub(crate) fn analyze(
         Expr::Audio { .. } => Err(CodegenError::Unsupported("audio function".into())),
         Expr::Video { .. } => Err(CodegenError::Unsupported("video function".into())),
         Expr::Coalesce { .. } => Err(CodegenError::Unsupported("coalesce".into())),
+        Expr::InList { .. } => Err(CodegenError::Unsupported("in_list".into())),
         Expr::Array { .. } => Err(CodegenError::Unsupported("array literal".into())),
         Expr::Sequence { .. } => Err(CodegenError::Unsupported("sequence".into())),
         Expr::ListSet { .. } => Err(CodegenError::Unsupported("list set op".into())),

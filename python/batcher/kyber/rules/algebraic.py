@@ -13,11 +13,13 @@ cost — so they carry no risk of changing results, only of removing redundant w
 
 from __future__ import annotations
 
+import datetime as _dt
+
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase, RuleCategory
 from batcher.kyber.stats.selectivity import comparison_col_side
-from batcher.plan.expr_ir import Binary, Expr, Lit
+from batcher.plan.expr_ir import Binary, Col, Expr, InList, Lit
 from batcher.plan.expr_rewrite import (
     combine_conjuncts,
     combine_disjuncts,
@@ -42,6 +44,7 @@ __all__ = [
     "constant_propagation",
     "eliminate_sort_before_aggregate",
     "factor_common_conjuncts",
+    "fold_in_list",
     "merge_adjacent_filters",
     "prune_true_filter",
     "push_distinct_into_union",
@@ -109,6 +112,104 @@ def _ir_key(expr: Expr):
     import json
 
     return json.dumps(expr.to_ir(), sort_keys=True)
+
+
+# Fold an OR-of-equals chain into `IN` once it has at least this many branches — below
+# it the chain is cheap (and JIT-compilable), above it the hash-set membership wins.
+_IN_LIST_MIN = 5
+
+
+@rule(name="fold_in_list", phase=Phase.NORMALIZE, matches=(Filter,))
+def fold_in_list(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """Fold `(x = a) OR (x = b) OR …` into `x IN (a, b, …)` (hash-set membership).
+
+    The SQL front end lowers an `IN (literal, …)` list to a chain of equality
+    disjuncts; for a long list that is an O(rows · k) scan of `k` comparisons per row.
+    This collapses each single-column run of equality disjuncts into one `InList`
+    (an O(rows) hash-set lookup, the `eval_in_list` kernel), which is also the form a
+    runtime join filter pushes the build side's key set as. Semantics are identical —
+    `x = a OR x = b` and `x IN (a, b)` share the same Kleene null behavior. Only
+    folds runs of ≥ `_IN_LIST_MIN` over int / string / date literals (the kernel's
+    supported types); shorter runs and other types stay as comparisons.
+    """
+    new_pred = _fold_or_chains(node.predicate)
+    if new_pred is node.predicate:
+        return None
+    return Filter(node.input, new_pred)
+
+
+def _fold_or_chains(expr: Expr) -> Expr:
+    """Recurse through `AND`/`OR`, folding each disjunction's single-column equality runs."""
+    if isinstance(expr, Binary) and expr.op == "and":
+        left, right = _fold_or_chains(expr.left), _fold_or_chains(expr.right)
+        return expr if left is expr.left and right is expr.right else Binary("and", left, right)
+    if isinstance(expr, Binary) and expr.op == "or":
+        return _fold_disjunction(expr)
+    return expr
+
+
+def _fold_disjunction(expr: Expr) -> Expr:
+    # Group the disjuncts that are `col = <supported literal>` by column (preserving a
+    # consistent literal type per column); fold any group of ≥ threshold into an InList.
+    by_col: dict[str, list] = {}
+    others: list[Expr] = []
+    order: list[str] = []
+    for d in split_disjuncts(expr):
+        pair = _eq_col_literal(d)
+        if pair is None:
+            others.append(_fold_or_chains(d))
+            continue
+        col, value = pair
+        if col not in by_col:
+            by_col[col] = []
+            order.append(col)
+        by_col[col].append(value)
+
+    folded: list[Expr] = []
+    changed = False
+    for col in order:
+        values = by_col[col]
+        if len(values) >= _IN_LIST_MIN and _one_supported_type(values):
+            folded.append(InList(Col(col), tuple(values)))
+            changed = True
+        else:
+            folded.extend(Binary("eq", Col(col), Lit(v)) for v in values)
+    if not changed:
+        return expr
+    return combine_disjuncts(folded + others)
+
+
+def _eq_col_literal(expr: Expr) -> tuple[str, object] | None:
+    """`(col == lit)` or `(lit == col)` over a foldable literal → `(col_name, value)`."""
+    if not (isinstance(expr, Binary) and expr.op == "eq"):
+        return None
+    left, right = expr.left, expr.right
+    if isinstance(left, Col) and isinstance(right, Lit) and _foldable(right.value):
+        return left.name, right.value
+    if isinstance(right, Col) and isinstance(left, Lit) and _foldable(left.value):
+        return right.name, left.value
+    return None
+
+
+def _foldable(value: object) -> bool:
+    """Whether a literal is a type the `InList` kernel supports — Int64 / Utf8 / Date32.
+
+    Excludes bool (an `int` subclass), float (NaN / precision make a set unsafe), and
+    `datetime` (a `date` subclass that lowers to Timestamp, not Date32)."""
+    if isinstance(value, (bool, _dt.datetime)):
+        return False
+    return isinstance(value, (int, str, _dt.date))
+
+
+def _one_supported_type(values: list) -> bool:
+    """All values share one supported kind (so the engine builds one typed set)."""
+
+    def kind(v: object) -> str:
+        if isinstance(v, _dt.date):
+            return "date"
+        return "int" if isinstance(v, int) else "str"
+
+    return len({kind(v) for v in values}) == 1
 
 
 @rule(name="push_distinct_into_union", phase=Phase.REWRITE, matches=(Distinct,))

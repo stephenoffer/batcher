@@ -14,6 +14,7 @@ from batcher.plan.expr_ir.core import (
     Cast,
     Coalesce,
     Expr,
+    InList,
     IsInf,
     IsNan,
     IsNotNull,
@@ -69,6 +70,7 @@ def referenced_columns(expr: Expr) -> set[str]:
         (
             Not,
             Cast,
+            InList,
             IsNull,
             IsNotNull,
             IsNan,
@@ -145,6 +147,8 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         return Not(remap_columns(expr.input, mapping))
     if isinstance(expr, Cast):
         return Cast(remap_columns(expr.input, mapping), expr.dtype, try_cast=expr.try_cast)
+    if isinstance(expr, InList):
+        return InList(remap_columns(expr.input, mapping), expr.values)
     if isinstance(expr, IsNull):
         return IsNull(remap_columns(expr.input, mapping))
     if isinstance(expr, IsNotNull):

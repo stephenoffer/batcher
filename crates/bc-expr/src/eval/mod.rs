@@ -10,6 +10,7 @@ pub(crate) mod cast;
 pub(crate) mod date;
 mod dispatch;
 pub(crate) mod generate;
+pub(crate) mod in_list;
 pub(crate) mod list;
 pub(crate) mod list_ops;
 pub(crate) mod map;

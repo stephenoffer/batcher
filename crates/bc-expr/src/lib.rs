@@ -144,6 +144,12 @@ pub enum Expr {
     /// First non-null among the sub-expressions, per row (SQL COALESCE).
     Coalesce { inputs: Vec<Expr> },
 
+    /// `input IN (lit, …)` — true where the value is in the literal set, false where
+    /// not, null where the input is null. Hash-set membership (`eval_in_list`), the
+    /// O(1)-per-row form of an `(x = l0) OR (x = l1) OR …` chain a runtime join filter
+    /// or the SQL `IN` list folds to.
+    InList { input: Box<Expr>, set: Vec<Literal> },
+
     /// An array literal `[e0, e1, …]` — each row becomes a `List` of the
     /// per-row element values (all elements coerced to a common type).
     Array { elements: Vec<Expr> },
