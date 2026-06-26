@@ -75,10 +75,11 @@ def engine_version() -> str:
     return _native.__engine_version__
 
 
-# The process-global default SQL session. `bt.catalog` exposes it (so the
-# established `bt.catalog.register/table/drop/clear/list` surface keeps working),
-# and the module-level `sql` / `register_function` below delegate to it.
-catalog = Session()
+# The process-global default SQL session, backing the module-level `sql` /
+# `register_function` below. It is intentionally private: `bt.sql(...)` is the one
+# obvious entry point for the default catalog, and `bt.Session` is the public handle
+# for an isolated one.
+_catalog = Session()
 
 
 def sql(query: str, *, dialect: str | None = None, **tables: Any) -> Dataset:
@@ -90,11 +91,10 @@ def sql(query: str, *, dialect: str | None = None, **tables: Any) -> Dataset:
     `Dataset` you can keep building on (``.filter``, ``.with_columns``, another
     ``sql``) before a terminal operation runs the whole plan.
 
-    Unqualified names that are not passed here resolve from the `bt.catalog`
-    registry, so ``bt.catalog.register("t", ds)`` lets later ``bt.sql("... FROM t")``
-    calls omit the binding. Functions registered with `bt.register_function` are
-    callable from the query. ``CREATE TABLE/VIEW AS`` and ``DROP TABLE`` register and
-    unregister tables in `bt.catalog`. For an isolated catalog use `bt.Session`.
+    Names not passed here resolve from the default catalog, which ``CREATE
+    TABLE/VIEW AS`` populates and ``DROP TABLE`` clears, so a later ``bt.sql("...
+    FROM t")`` can omit the binding. Functions registered with `bt.register_function`
+    are callable from the query. For an isolated catalog use `bt.Session`.
 
     Args:
         query: A SQL statement. Table names refer to the bound keywords.
@@ -117,23 +117,33 @@ def sql(query: str, *, dialect: str | None = None, **tables: Any) -> Dataset:
             >>> out.to_pydict()
             {'region': ['e', 'w'], 'total': [20, 40]}
     """
-    session = catalog if dialect is None else catalog._with_dialect(dialect)
+    session = _catalog if dialect is None else _catalog._with_dialect(dialect)
     return session._run(query, tables)
 
 
 def register_function(name: str, fn: Callable, **options: Any) -> None:
     """Register a Python function callable from `bt.sql` (the default session).
 
-    Sugar for ``bt.catalog.register_function``; see `Session.register_function` for
-    the call forms (scalar ``SELECT f(x)`` vs table ``SELECT * FROM f(t)``) and
-    options.
+    Registers on the default catalog; see `Session.register_function` for the call
+    forms (scalar ``SELECT f(x)`` vs table ``SELECT * FROM f(t)``) and options. For an
+    isolated registry use `bt.Session`.
 
     Args:
         name: The SQL name the function is called by.
         fn: The Python callable.
         **options: Forwarded to `Session.register_function`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> import pyarrow.compute as pc
+            >>> bt.register_function("dbl", lambda a: pc.multiply(a, 2), result_type="int64")
+            >>> t = bt.from_pydict({"x": [1, 2, 3]})
+            >>> bt.sql("SELECT dbl(x) AS y FROM t", t=t).to_pydict()
+            {'y': [2, 4, 6]}
     """
-    catalog.register_function(name, fn, **options)
+    _catalog.register_function(name, fn, **options)
 
 
 def _scan(source: Source) -> Dataset:
@@ -169,6 +179,13 @@ def read_table(format: str, *args: Any, **opts: Any) -> Dataset:
     ``read_table("delta", "s3://bucket/table", version=3)`` constructs the
     registered ``delta`` source. The typed ``read_*`` helpers wrap this for the
     common backends.
+
+    Examples:
+        .. code-block:: python
+
+            import batcher as bt
+
+            ds = bt.read.table("delta", "s3://bucket/table", version=3)
     """
     return _scan(SOURCES.get(format)(*args, **opts))
 
@@ -179,6 +196,15 @@ def read_memory(name: str) -> Dataset:
     The streaming `memory` sink accumulates each micro-batch under `name`; this
     snapshots the current contents as a `Dataset`. Raises `PlanError` if no query
     has written to `name`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> query = bt.from_pydict({"x": [1, 2, 3]}).write.memory("demo")
+            >>> _ = query.await_termination()
+            >>> bt.read_memory("demo").count()
+            3
     """
     from batcher._internal.errors import PlanError
     from batcher.io.formats.streaming.sinks import memory_table
@@ -275,6 +301,13 @@ def from_pylist(rows: list[dict[str, Any]]) -> Dataset:
 
     The row-major counterpart to `from_pydict` (e.g. JSON records); the union of keys
     is the schema and missing keys are null. ``bt.from_pylist([{"a": 1}, {"a": 2}])``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.from_pylist([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]).to_pydict()
+            {'a': [1, 2], 'b': ['x', 'y']}
     """
     return from_arrow(pa.Table.from_pylist(rows))
 
@@ -284,6 +317,13 @@ def from_items(items: list[Any], *, column: str = "item") -> Dataset:
 
     Dict items expand to columns (like `from_pylist`); scalar/other items become a
     single `column`. ``bt.from_items([1, 2, 3])`` / ``bt.from_items([{"a": 1}])``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.from_items([1, 2, 3]).to_pydict()
+            {'item': [1, 2, 3]}
     """
     return _scan(interop.from_items(items, column=column))
 
@@ -584,5 +624,14 @@ def from_ray_dataset(ray_dataset: Any) -> Dataset:
 
     The migration on-ramp from Ray Data: blocks stream lazily into the engine in
     bounded memory. Requires `ray`.
+
+    Examples:
+        .. code-block:: python
+
+            import ray
+            import batcher as bt
+
+            rds = ray.data.range(100)
+            ds = bt.from_ray_dataset(rds)
     """
     return _scan(interop.from_ray_dataset(ray_dataset))

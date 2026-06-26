@@ -38,10 +38,25 @@ def test_latency_controller_reads_config_gains():
         assert grown >= 100
 
 
+# The performance-threshold knobs (mirror bc_arrow::RuntimeTuning) that ride along
+# in every engine-config payload. Their defaults equal the Rust EngineConfig::default().
+_TUNING_DEFAULTS = {
+    "bloom_fp_rate": 0.01,
+    "bloom_min_build_rows": 1 << 16,
+    "window_parallel_row_threshold": 1 << 15,
+    "radix_parallel_threshold": 200_000,
+    "sort_merge_fanin": 16,
+    "skew_bucket_factor": 4,
+    "skew_min_bucket_rows": 4 * 16_384,
+    "skew_min_bucket_bytes": 4 * (1 << 20),
+}
+
+
 def test_engine_config_json_shape_and_defaults():
     """The wire contract with bc_ir::EngineConfig: morsel_rows + morsel_bytes +
-    parallelism + the spill envelope. By default the budget is 0 (unbounded — the
-    in-memory fast path is unchanged) and spill_dir is None."""
+    parallelism + the spill envelope + the performance-threshold knobs. By default the
+    budget is 0 (unbounded — the in-memory fast path is unchanged) and spill_dir is
+    None."""
     payload = json.loads(Config().engine_config_json())
     assert payload == {
         "morsel_rows": 16_384,
@@ -49,6 +64,10 @@ def test_engine_config_json_shape_and_defaults():
         "parallelism": 0,
         "memory_budget_bytes": 0,
         "spill_dir": None,
+        "spill_compression": "auto",
+        "fuse_linear": True,
+        "shrink_output_dtypes": False,
+        **_TUNING_DEFAULTS,
     }
 
     scoped = Config().replace(
@@ -61,7 +80,43 @@ def test_engine_config_json_shape_and_defaults():
         "parallelism": 3,
         "memory_budget_bytes": 0,
         "spill_dir": None,
+        "spill_compression": "auto",
+        "fuse_linear": True,
+        "shrink_output_dtypes": False,
+        **_TUNING_DEFAULTS,
     }
+
+
+def test_tuning_knobs_ship_and_are_overridable():
+    """The performance-threshold knobs serialize with their defaults and a non-default
+    value flows through to the wire payload (where the Rust data plane consumes it)."""
+    payload = json.loads(Config().engine_config_json())
+    for key, default in _TUNING_DEFAULTS.items():
+        assert payload[key] == default, key
+
+    scoped = Config().replace(
+        execution=ExecutionConfig(radix_parallel_threshold=50_000, bloom_fp_rate=0.05)
+    )
+    payload = json.loads(scoped.engine_config_json())
+    assert payload["radix_parallel_threshold"] == 50_000
+    assert payload["bloom_fp_rate"] == 0.05
+    # Untouched tuning knobs keep their defaults.
+    assert payload["sort_merge_fanin"] == _TUNING_DEFAULTS["sort_merge_fanin"]
+
+
+def test_engine_config_with_op_budgets_adds_string_keyed_map():
+    """`engine_config_json_with` adds the per-operator spill budgets as a
+    string-keyed object (serde_json parses the keys back to op ids); an empty map
+    reproduces the base wire shape exactly so callers with no PhysicalOp DAG are
+    unaffected."""
+    cfg = Config()
+    assert cfg.engine_config_json_with({}) == cfg.engine_config_json()
+
+    payload = json.loads(cfg.engine_config_json_with({0: 1_048_576, 3: 2_048}))
+    assert payload["op_budgets"] == {"0": 1_048_576, "3": 2_048}
+    # The base knobs still ride along unchanged.
+    assert payload["morsel_rows"] == 16_384
+    assert payload["memory_budget_bytes"] == 0
 
 
 def test_engine_config_ships_spill_budget_when_capped():

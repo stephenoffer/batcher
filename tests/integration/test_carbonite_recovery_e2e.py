@@ -65,6 +65,26 @@ def test_no_fault_is_unaffected():
     assert _norm(got) == _norm(expected)
 
 
+def test_aggregate_proactively_migrates_draining_worker(monkeypatch):
+    """A worker under a spot-preemption notice has its output migrated to a survivor
+    *before* it dies; the aggregate still equals single-node. Proactive, not reactive —
+    the loss never costs a recovery round (or an idle-timeout stall on a hung peer)."""
+    from batcher.dist import flight_aggregate
+    from batcher.dist.executors import ray_runtime
+
+    t = _data()
+    expected = bt.from_arrow(t).group_by("k").agg(s=col("v").sum(), n=count()).collect()
+
+    # Worker 1 reports a drain notice at the reduce barrier (it is NOT killed — the
+    # proactive path migrates its source onto a survivor, so the result is correct even
+    # though the worker stays alive serving its now-superseded epoch-0 bucket).
+    monkeypatch.setattr(ray_runtime, "draining_workers", lambda actors, workers: {1})
+
+    ds = bt.from_arrow(t).group_by("k").agg(s=col("v").sum(), n=count())
+    got = flight_aggregate.execute_aggregate_flight([], ds._plan, ds._sources, workers=4)
+    assert _norm(got) == _norm(expected)
+
+
 @pytest.mark.parametrize("killed", [{1}, {0, 2}])
 def test_window_survives_worker_loss(killed):
     """A lost worker's window row-bucket is recomputed from its source on a survivor;

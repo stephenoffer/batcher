@@ -170,6 +170,31 @@ pub fn partition_batches(
     Ok(parts.into_iter().map(|b| vec![b]).collect())
 }
 
+/// Range-shuffle `batches` into `n_buckets` globally-ordered buckets by the leading
+/// sort key at `key_index` and the ascending `boundaries` — the distributed-sort
+/// counterpart of the hash [`partition_batches`]. Bucket order is the sort order, so a
+/// reducer sorts its bucket and the driver concatenates buckets (reversed when
+/// `descending`) with no merge. Returns one (single-batch) relation per bucket.
+pub fn range_partition_batches(
+    batches: &[RecordBatch],
+    key_index: usize,
+    boundaries: &[f64],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<Vec<RecordBatch>>, InterpError> {
+    let combined = ops::materialize(batches)?;
+    let parts = shuffle::range_partition_by_key(
+        &combined,
+        key_index,
+        boundaries,
+        n_buckets,
+        nulls_first,
+        descending,
+    )?;
+    Ok(parts.into_iter().map(|b| vec![b]).collect())
+}
+
 /// Skew-aware shuffle for a single-key distributed join: like [`partition_batches`],
 /// but a *hot* key's rows are salted across reducers instead of overloading one.
 /// `replicate=false` (probe side) fans each hot row to one salted bucket;

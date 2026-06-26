@@ -38,6 +38,42 @@ def test_median_global(duck, t):
     assert_same(out, duck.sql("SELECT median(v) m FROM t"))
 
 
+def test_mixed_value_list_and_constant_state_aggregates(duck, t):
+    # A value-list aggregate (median) mixed with constant-state aggregates
+    # (sum/count) and another value-list (n_unique) — the shape that falls to the
+    # grace path. Must match DuckDB across columns.
+    from conftest import assert_same
+
+    out = (
+        bt.from_arrow(t)
+        .group_by("k")
+        .agg(m=col("v").median(), s=col("v").sum(), n=col("v").count(), nd=col("v").n_unique())
+        .collect()
+    )
+    assert_same(
+        out,
+        duck.sql(
+            "SELECT k, median(v) m, sum(v) s, count(v) n, count(DISTINCT v) nd FROM t GROUP BY k"
+        ),
+    )
+
+
+def test_mixed_aggregates_under_forced_spill(duck, t):
+    # Force the out-of-core path with a tiny memory budget and confirm a mixed
+    # value-list + constant-state aggregate still matches DuckDB — the end-to-end
+    # guard for the mixed-aggregate spill contract.
+    import dataclasses
+
+    from batcher.config import active_config, config_context
+    from conftest import assert_same
+
+    cfg = active_config()
+    spill_cfg = cfg.replace(memory=dataclasses.replace(cfg.memory, max_memory_bytes=4096))
+    with config_context(spill_cfg):
+        out = bt.from_arrow(t).group_by("k").agg(m=col("v").median(), s=col("v").sum()).collect()
+    assert_same(out, duck.sql("SELECT k, median(v) m, sum(v) s FROM t GROUP BY k"))
+
+
 def test_median_even_and_odd_counts(duck):
     from conftest import assert_same
 

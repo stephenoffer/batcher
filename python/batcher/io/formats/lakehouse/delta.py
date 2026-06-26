@@ -192,27 +192,50 @@ class DeltaSource:
 
         return to_pyarrow_expression(predicate)
 
+    def _has_deletion_vectors(self) -> bool:
+        """Whether the table uses deletion vectors (delta-rs's pyarrow reader raises)."""
+        try:
+            return "deletionVectors" in (self._table().protocol().reader_features or [])
+        except Exception:  # pragma: no cover - a protocol read failure is non-fatal here
+            return False
+
+    def _read_dv(self, projection: list[str] | None) -> list[pa.RecordBatch]:
+        """Read a deletion-vector table via DataFusion, which applies the deletes."""
+        from deltalake import QueryBuilder
+
+        cols = ", ".join(f'"{c}"' for c in projection) if projection else "*"
+        reader = QueryBuilder().register("t", self._table()).execute(f"select {cols} from t")
+        return pa.table(reader).to_batches()
+
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
-        dataset = self._table().to_pyarrow_dataset()
-        return dataset.to_table(columns=projection, filter=self._pa_filter(predicate)).to_batches()
+        return list(self.iter_batches(projection, predicate))
 
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
+        if self._has_deletion_vectors():
+            yield from self._read_dv(projection)
+            return
         dataset = self._table().to_pyarrow_dataset()
         yield from dataset.to_batches(columns=projection, filter=self._pa_filter(predicate))
 
     def row_count(self) -> int | None:
-        """Exact row count summed from the transaction log's add actions."""
+        """Exact row count from the add actions; `None` for DV tables (their physical
+        pre-delete counts overcount, so the engine counts the masked data instead)."""
+        if self._has_deletion_vectors():
+            return None
         import pyarrow.compute as pc
 
         col = self._add_actions().column("num_records")
         return int(pc.sum(col).as_py() or 0)
 
     def statistics(self) -> SourceStatistics | None:
-        """Exact row count + per-column bounds from the add-action stats, no scan."""
+        """Exact row count + per-column bounds from the add-action stats, no scan.
+        `None` for DV tables (those stats include deleted rows — unsound as EXACT)."""
+        if self._has_deletion_vectors():
+            return None
         from batcher.io.stats import delta_statistics
 
         try:
@@ -396,8 +419,12 @@ class DeltaSink:
         # Staged tables held for the driver-side commit (single-process path).
         self._pending: list[pa.Table] = []
 
-    def write(self, table: pa.Table, path: str) -> WrittenFile:
-        """Stage `table` for the transactional commit (no standalone file)."""
+    def write(self, table: pa.Table, path: str, *, resume: bool = False) -> WrittenFile:  # noqa: ARG002
+        """Stage `table` for the transactional commit (no standalone file).
+
+        `resume` is accepted for the common `FileSink.write` signature but ignored:
+        a Delta write is one atomic commit, not per-file idempotent shard writes.
+        """
         self._pending.append(table)
         return WrittenFile(path=path, rows=table.num_rows, bytes=0)
 

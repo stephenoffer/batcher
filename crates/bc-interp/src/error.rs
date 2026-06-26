@@ -15,6 +15,11 @@ pub enum InterpError {
     #[error("aggregation over empty input is not yet supported (no input schema)")]
     EmptyAggregateInput,
 
+    #[error(
+        "mixed-aggregate spill: sub-aggregate group sets disagree ({expected} vs {found} groups)"
+    )]
+    MixedAggregateGroupMismatch { expected: usize, found: usize },
+
     #[error("join over an empty input side is not yet supported (no input schema)")]
     EmptyJoinInput,
 

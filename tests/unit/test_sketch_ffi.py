@@ -68,3 +68,35 @@ def test_approx_quantile_terminal():
 def test_approx_quantile_non_numeric_is_none():
     ds = bt.from_pydict({"s": ["a", "b", "c"]})
     assert ds.approx_quantile("s", 0.5) is None
+
+
+def test_tdigest_partial_merge_is_mergeable():
+    # The partial/combine sketch FFI: build a TDigest per chunk, merge the serialized
+    # sketches, query — the basis for computing a quantile without collecting the column.
+    import batcher._native as nat
+    import numpy as np
+    import pyarrow as pa
+
+    rng = np.random.default_rng(0)
+    vals = rng.normal(100, 15, 60000)
+    chunks = pa.table({"x": vals}).to_batches(max_chunksize=2500)
+    sketches = [s for c in chunks if (s := nat.tdigest_partial("x", [c])) is not None]
+    assert len(sketches) > 1  # genuinely split across chunks
+    merged = nat.tdigest_quantile(sketches, 0.5)
+    assert abs(merged - float(np.median(vals))) < 1.0  # within sketch error of the truth
+    # No data → no sketch; empty sketch list → no answer.
+    assert nat.tdigest_partial("x", [pa.record_batch({"x": pa.array([], pa.float64())})]) is None
+    assert nat.tdigest_quantile([], 0.5) is None
+
+
+def test_approx_quantile_streams_multi_batch_source():
+    # A multi-batch source is consumed one batch at a time (no full-column collect) and
+    # still tracks the data.
+    import pyarrow as pa
+
+    def factory():
+        for i in range(10):
+            yield pa.record_batch({"v": list(range(i * 1000, (i + 1) * 1000))})
+
+    ds = bt.from_batches(factory, pa.schema([("v", pa.int64())]))
+    assert abs(ds.approx_quantile("v", 0.5) - 4999.5) < 200

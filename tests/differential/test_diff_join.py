@@ -85,7 +85,7 @@ def test_sort_merge_join_strategy_vs_duckdb(duck, monkeypatch):
     from conftest import assert_same
 
     # No broadcast, and any join qualifies as sort-merge → exercise the SMJ path.
-    monkeypatch.setattr(selection, "BROADCAST_MAX_BYTES", -1)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)
     monkeypatch.setattr(selection, "SORT_MERGE_MIN_ROWS", 0.0)
 
     emp, dept = _tables(duck)
@@ -102,3 +102,20 @@ def test_sort_merge_join_strategy_vs_duckdb(duck, monkeypatch):
     assert_same(semi, duck.sql("SELECT emp.* FROM emp SEMI JOIN dept USING (dept_id)"))
     anti = emp.join(dept, on="dept_id", how="anti").collect()
     assert_same(anti, duck.sql("SELECT emp.* FROM emp ANTI JOIN dept USING (dept_id)"))
+
+
+def test_sort_merge_presorted_inputs_vs_duckdb(duck, monkeypatch):
+    """Pre-sorted inputs picked for sort-merge (the engine's no-sort fast path) must
+    still match DuckDB for every join type — the W4 already-ordered case."""
+    from batcher.kyber.rules import selection
+    from conftest import assert_same
+
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)
+    monkeypatch.setattr(selection, "SORT_MERGE_MIN_ROWS", 0.0)
+
+    emp, dept = _tables(duck)
+    emp_s, dept_s = emp.sort("dept_id"), dept.sort("dept_id")
+    for how, sql in [("inner", "JOIN"), ("left", "LEFT JOIN"), ("right", "RIGHT JOIN")]:
+        out = emp_s.join(dept_s, on="dept_id", how=how).collect()
+        expected = duck.sql(f"SELECT * FROM emp {sql} dept USING (dept_id)")
+        assert_same(out, expected)

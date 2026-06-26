@@ -110,3 +110,10 @@ out = (
 Do not turn these on by default. Distribution adds scheduling and shuffle overhead
 that hurts small queries, and spill trades memory for disk I/O. Both earn their cost
 only at scale.
+
+## See also
+
+- [Performance and memory](performance.md): caching, spill, and the adaptive knobs.
+- [Data quality](data-quality.md): validate and enforce a contract on inputs.
+- [Distributed fault tolerance](../architecture/fault-tolerance.md): how the engine
+  recovers from node and task failures.

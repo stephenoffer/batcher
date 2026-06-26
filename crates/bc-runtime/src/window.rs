@@ -135,13 +135,34 @@ pub fn window(
     funcs: &[WindowCall],
     num_rows: usize,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
+    window_with(
+        partition_keys,
+        order_keys,
+        funcs,
+        num_rows,
+        PARALLEL_ROW_THRESHOLD,
+    )
+}
+
+/// [`window`] with the parallel-row threshold supplied by the caller.
+///
+/// `parallel_row_threshold` is a performance-only knob: above it the independent
+/// per-partition sorts run across cores, below it single-threaded. The output
+/// columns are identical regardless of the choice.
+pub fn window_with(
+    partition_keys: &[ArrayRef],
+    order_keys: &[(ArrayRef, SortOptions)],
+    funcs: &[WindowCall],
+    num_rows: usize,
+    parallel_row_threshold: usize,
+) -> Result<Vec<ArrayRef>, RuntimeError> {
     // Group row indices into partitions (first-seen order is irrelevant; we
     // scatter results back to original positions regardless).
     let partitions = assign_partitions(partition_keys, num_rows)?;
 
     // Order each partition once (shared by all ranking functions). The partitions
     // are independent, so for large inputs the sorts run across cores.
-    let ordered: Vec<Vec<usize>> = if num_rows >= PARALLEL_ROW_THRESHOLD && partitions.len() > 1 {
+    let ordered: Vec<Vec<usize>> = if num_rows >= parallel_row_threshold && partitions.len() > 1 {
         partitions
             .par_iter()
             .map(|p| order_partition(p, order_keys))

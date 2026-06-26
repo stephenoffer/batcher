@@ -81,6 +81,7 @@ class _DtNamespace:
     __slots__ = ("_e",)
 
     def __init__(self, e: Expr) -> None:
+        """Wrap the parent :class:`Expr` so its `.dt` methods can build on it."""
         self._e = e
 
     def truncate(self, unit: str) -> DateTrunc:

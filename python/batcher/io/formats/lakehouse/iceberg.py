@@ -281,7 +281,9 @@ class IcebergSink:
         self._mode = mode
         self._pending: list[pa.Table] = []
 
-    def write(self, table: pa.Table, path: str) -> WrittenFile:  # noqa: ARG002
+    def write(self, table: pa.Table, path: str, *, resume: bool = False) -> WrittenFile:  # noqa: ARG002
+        # `resume` matches the common `FileSink.write` signature; ignored because an
+        # Iceberg write is one atomic snapshot commit, not idempotent shard writes.
         self._pending.append(table)
         return WrittenFile(path=self._identifier, rows=table.num_rows, bytes=0)
 

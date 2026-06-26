@@ -152,3 +152,5 @@ print(buckets.to_pydict())
 - [Joins](joins.md): combine grouped results with other datasets.
 - [Window functions](window-functions.md): per-row aggregates that do not collapse
   rows.
+- [Performance and memory](performance.md): cache a reused rollup and spill large
+  aggregations.

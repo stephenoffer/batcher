@@ -131,13 +131,22 @@ sql
 reading-data
 writing-data
 cloud-storage
+lakehouse
 streaming
+```
+
+```{toctree}
+:hidden:
+:caption: Trust
+
+data-quality
 ```
 
 ```{toctree}
 :hidden:
 :caption: Operate
 
+performance
 best-practices
 troubleshooting
 ```

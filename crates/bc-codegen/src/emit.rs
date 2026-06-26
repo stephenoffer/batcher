@@ -8,59 +8,6 @@ use cranelift_frontend::FunctionBuilder;
 
 use crate::{libm_binary_symbol, libm_unary_symbol, ColumnSet, ScalarTy};
 
-/// Vector (SIMD) emitter for the pure-`F64` arithmetic subset. Produces an
-/// `F64X2` value holding lanes `[i, i+1]`, so a loop stepping `i` by 2 computes two
-/// rows per iteration. Only `Col` (F64), `Lit::Float`, and `Add`/`Sub`/`Mul`/`Div`
-/// reach here (`compile_simd`'s `simd_supported` guarantees it); these are exactly
-/// the ops whose IEEE result is per-lane identical to the scalar path, so the
-/// vectorized body stays bit-for-bit equal to the interpreter. A scalar remainder
-/// loop (the ordinary [`Codegen`]) handles the trailing odd row.
-pub(crate) struct SimdCodegen<'a, 'b> {
-    pub(crate) b: &'a mut FunctionBuilder<'b>,
-    pub(crate) cols: &'a ColumnSet,
-    pub(crate) col_ptrs: &'a [Value],
-    /// The vector loop index (the first of the two lanes); stepped by 2.
-    pub(crate) i: Value,
-}
-
-impl SimdCodegen<'_, '_> {
-    /// Emit the `F64X2` value of `expr` for lanes `[i, i+1]`.
-    pub(crate) fn emit(&mut self, expr: &bc_expr::Expr) -> Value {
-        use bc_expr::{BinaryOp, Expr, Literal};
-        match expr {
-            Expr::Col { name } => {
-                // Contiguous 16-byte (2×f64) load. Use unaligned (notrap-only) flags:
-                // the output buffer is only 8-byte aligned, so the engine never
-                // asserts 16-byte alignment for these vector accesses.
-                let idx = self.cols.index(name);
-                let base = self.col_ptrs[idx];
-                let off = self.b.ins().imul_imm(self.i, 8);
-                let addr = self.b.ins().iadd(base, off);
-                let flags = MemFlags::new().with_notrap();
-                self.b.ins().load(types::F64X2, flags, addr, 0)
-            }
-            Expr::Lit {
-                value: Literal::Float(x),
-            } => {
-                let s = self.b.ins().f64const(*x);
-                self.b.ins().splat(types::F64X2, s)
-            }
-            Expr::Binary { op, left, right } => {
-                let l = self.emit(left);
-                let r = self.emit(right);
-                match op {
-                    BinaryOp::Add => self.b.ins().fadd(l, r),
-                    BinaryOp::Sub => self.b.ins().fsub(l, r),
-                    BinaryOp::Mul => self.b.ins().fmul(l, r),
-                    BinaryOp::Div => self.b.ins().fdiv(l, r),
-                    _ => unreachable!("simd_supported admits only +,-,*,/"),
-                }
-            }
-            _ => unreachable!("simd_supported admits only Col(F64)/Lit::Float/arith"),
-        }
-    }
-}
-
 /// Per-element IR emitter. Recurses over the expression building Cranelift
 /// values; loads happen at the current loop index `i`.
 pub(crate) struct Codegen<'a, 'b> {
@@ -165,6 +112,16 @@ impl Codegen<'_, '_> {
                 let ty = self.cols.ty[name];
                 let idx = self.cols.index(name);
                 let base = self.col_ptrs[idx];
+                if ty == ScalarTy::Date32 {
+                    // Date32 is an i32 buffer (4-byte stride): load the day count and
+                    // sign-extend to i64 so it shares the i64 comparison path. Signed
+                    // extension preserves the i32 ordering Arrow's date comparison
+                    // uses, so the result is bit-for-bit identical to the interpreter.
+                    let off = self.b.ins().imul_imm(self.i, 4);
+                    let addr = self.b.ins().iadd(base, off);
+                    let v32 = self.b.ins().load(types::I32, MemFlags::trusted(), addr, 0);
+                    return (self.b.ins().sextend(types::I64, v32), ScalarTy::Date32);
+                }
                 let off = self.b.ins().imul_imm(self.i, 8);
                 let addr = self.b.ins().iadd(base, off);
                 let v = self.b.ins().load(ty.clif(), MemFlags::trusted(), addr, 0);
@@ -173,6 +130,10 @@ impl Codegen<'_, '_> {
             Expr::Lit { value } => match value {
                 Literal::Int(x) => (self.b.ins().iconst(types::I64, *x), ScalarTy::I64),
                 Literal::Float(x) => (self.b.ins().f64const(*x), ScalarTy::F64),
+                // A date literal is its i32 day count, widened to the i64 date operand.
+                Literal::Date(d) => (self.b.ins().iconst(types::I64, *d as i64), ScalarTy::Date32),
+                // A timestamp literal is its i64 microsecond instant.
+                Literal::Timestamp(t) => (self.b.ins().iconst(types::I64, *t), ScalarTy::TsUs),
                 _ => unreachable!("validated in analyze"),
             },
             Expr::Not { input } => {
@@ -263,7 +224,9 @@ impl Codegen<'_, '_> {
                             );
                             (self.b.ins().select(is_neg, neg, v), ScalarTy::I64)
                         }
-                        ScalarTy::Bool => unreachable!("validated in analyze"),
+                        ScalarTy::Bool | ScalarTy::Date32 | ScalarTy::TsUs => {
+                            unreachable!("validated in analyze")
+                        }
                     },
                     // floor/ceil/sqrt/trunc operate on f64; promote an int input to
                     // f64 first, exactly as the interpreter's `cast` does.

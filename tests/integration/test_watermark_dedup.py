@@ -68,3 +68,26 @@ def test_dedup_bounded_source_is_exact_distinct():
         .collect()
     )
     assert sorted(out.column("k").to_pylist()) == ["a", "b"]
+
+
+@pytest.mark.integration
+def test_dedup_state_cap_fails_loudly():
+    # A tiny `streaming_state_max_bytes` with a long lateness (watermark never evicts
+    # keys) makes the seen-key state exceed the cap, so dedup raises a clear
+    # ResourceError instead of growing unbounded.
+    import dataclasses
+
+    from batcher._internal.errors import ResourceError
+    from batcher.config import active_config, config_context
+
+    def batches():
+        yield _rb([("a", 0, 1), ("b", 1, 2)])
+        yield _rb([("c", 2, 3), ("d", 3, 4)])
+
+    ds = bt.from_batches(batches, _SCHEMA, bounded=False).drop_duplicates_within_watermark(
+        ["k"], event_time="ts", lateness="1h"
+    )
+    cfg = active_config()
+    tiny = cfg.replace(memory=dataclasses.replace(cfg.memory, streaming_state_max_bytes=1))
+    with config_context(tiny), pytest.raises(ResourceError, match="streaming state"):
+        list(ds.iter_batches())

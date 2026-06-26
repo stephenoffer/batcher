@@ -26,22 +26,17 @@ from batcher.plan.expr_ir import Binary, Col, Expr, referenced_columns, remap_co
 from batcher.plan.expr_rewrite import combine_conjuncts, split_conjuncts, substitute_columns
 from batcher.plan.logical import (
     Aggregate,
-    AsofJoin,
     Distinct,
     Filter,
     Join,
     Limit,
     LogicalPlan,
     Project,
-    RowId,
     Sample,
-    Scan,
     Sort,
-    Union,
-    Unnest,
-    Unpivot,
     Window,
 )
+from batcher.plan.visitor import transform_up
 
 __all__ = [
     "infer_join_predicates",
@@ -57,92 +52,25 @@ _INFERABLE_COMPARISONS = frozenset({"lt", "le", "gt", "ge", "eq", "ne"})
 
 
 def rewrite_predicate(plan: LogicalPlan) -> LogicalPlan:
-    """Push filters below joins where it is semantics-preserving."""
-    return _pp(plan)
+    """Push filters below joins where it is semantics-preserving.
 
+    The structural recursion — visit every node, rebuild only what changed, and
+    preserve object identity so the driver detects the fixpoint in O(1) — is the
+    shared `transform_up` walk. The only per-node logic is the one case that moves
+    work: a `Filter` sitting directly over a `Join`. Because nothing else is
+    rewritten, a filter is never sunk below a row-numbering, explode, sample, or
+    aggregate-output operator — the conservative, correctness-first behavior — without
+    needing a hand-written arm per node type.
+    """
 
-def _pp(node: LogicalPlan) -> LogicalPlan:
-    # Each branch returns `node` unchanged (preserving object identity, so the driver
-    # detects the fixpoint in O(1)) when recursion changed no child and no filter was
-    # pushed; only a real rewrite allocates a new node.
-    if isinstance(node, Scan):
-        return node
-    if isinstance(node, Filter):
-        child = _pp(node.input)
-        if isinstance(child, Join):
-            pushed = _push_into_join(node.predicate, child)
+    def push(node: LogicalPlan) -> LogicalPlan:
+        if isinstance(node, Filter) and isinstance(node.input, Join):
+            pushed = _push_into_join(node.predicate, node.input)
             if pushed is not None:
                 return pushed  # a conjunct moved below the join
-        return node if child is node.input else Filter(child, node.predicate)
-    if isinstance(node, Project):
-        child = _pp(node.input)
-        return node if child is node.input else Project(child, node.items)
-    if isinstance(node, Aggregate):
-        child = _pp(node.input)
-        return node if child is node.input else Aggregate(child, node.group_keys, node.aggregates)
-    if isinstance(node, Sort):
-        child = _pp(node.input)
-        return node if child is node.input else Sort(child, node.keys, node.limit)
-    if isinstance(node, Window):
-        child = _pp(node.input)
-        if child is node.input:
-            return node
-        return Window(child, node.partition_keys, node.order_keys, node.functions, node.rank_limit)
-    if isinstance(node, Limit):
-        child = _pp(node.input)
-        return node if child is node.input else Limit(child, node.n, node.offset)
-    if isinstance(node, Join):
-        left, right = _pp(node.left), _pp(node.right)
-        if left is node.left and right is node.right:
-            return node
-        return Join(left, right, node.left_keys, node.right_keys, node.join_type, node.output)
-    if isinstance(node, AsofJoin):
-        # Recurse into both inputs; an ASOF predicate above stays above (no split).
-        left, right = _pp(node.left), _pp(node.right)
-        if left is node.left and right is node.right:
-            return node
-        return AsofJoin(
-            left,
-            right,
-            node.left_on,
-            node.right_on,
-            node.left_by,
-            node.right_by,
-            node.direction,
-            node.output,
-        )
-    if isinstance(node, Distinct):
-        child = _pp(node.input)
-        return node if child is node.input else Distinct(child)
-    if isinstance(node, Union):
-        inputs = tuple(_pp(i) for i in node.inputs)
-        if all(a is b for a, b in zip(inputs, node.inputs, strict=True)):
-            return node
-        return Union(inputs, node.distinct)
-    if isinstance(node, RowId):
-        # A filter must NOT push below RowId: removing rows under it would change the
-        # row numbering. Stay above (recurse into the subtree only).
-        child = _pp(node.input)
-        return node if child is node.input else RowId(child, node.alias, node.offset)
-    if isinstance(node, Unnest):
-        # A filter above an Unnest stays above it: a predicate on the exploded
-        # column cannot exist below the explode, so we conservatively never push
-        # through (correctness over an extra optimization).
-        child = _pp(node.input)
-        return node if child is node.input else Unnest(child, node.column, node.alias)
-    if isinstance(node, Unpivot):
-        # A predicate above Unpivot references the reshaped variable/value columns,
-        # which don't exist below it — stay above (no push-through).
-        child = _pp(node.input)
-        if child is node.input:
-            return node
-        return Unpivot(child, node.index, node.on, node.variable_name, node.value_name)
-    if isinstance(node, Sample):
-        # Pushing a filter below Sample would change which rows are eligible (and so
-        # the sampled set). Keep it above — correctness over the extra pushdown.
-        child = _pp(node.input)
-        return node if child is node.input else Sample(child, node.fraction, node.seed, node.n)
-    raise TypeError(f"predicate pushdown: unhandled node {type(node).__name__}")
+        return node
+
+    return transform_up(plan, push)
 
 
 def _push_into_join(predicate: Expr, join: Join) -> LogicalPlan | None:

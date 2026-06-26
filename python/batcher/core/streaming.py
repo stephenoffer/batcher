@@ -153,6 +153,7 @@ class _WindowedAggFold:
 
     __slots__ = (
         "_ag",
+        "_cap",
         "_gk",
         "_input_ir",
         "_lateness",
@@ -177,6 +178,9 @@ class _WindowedAggFold:
         self._lateness = agg.watermark.lateness_micros
         self._running: pa.RecordBatch | None = None
         self._wm: int | None = None
+        # The retained open-window state is bounded by the watermark advancing; cap it
+        # so a stalled watermark fails loudly instead of OOMing (read once here).
+        self._cap = active_config().memory.streaming_state_budget_bytes()
 
     def _advance_watermark(self, batch: pa.RecordBatch) -> None:
         import pyarrow.compute as pc
@@ -214,7 +218,26 @@ class _WindowedAggFold:
                     if self._running is None
                     else self._nat.combine(self._gk, self._ag, [self._running, partial])
                 )
-        return self._evict(cfg)
+        out = self._evict(cfg)
+        # After eviction, what remains is the open-window state; if it has outgrown the
+        # cap the watermark is not closing windows (a stall), so fail clearly.
+        self._check_state_bounded()
+        return out
+
+    def _check_state_bounded(self) -> None:
+        if self._running is None:
+            return
+        size = self._running.nbytes
+        if size > self._cap:
+            from batcher._internal.errors import ResourceError
+
+            raise ResourceError(
+                f"windowed streaming aggregate state reached {size} bytes (cap "
+                f"{self._cap}): the watermark on '{self._time_col}' is not advancing, so "
+                "closed windows never evict (an event-time gap or an idle source), or the "
+                "key space is too large. Advance event time, narrow the keys, or raise "
+                "memory.streaming_state_max_bytes."
+            )
 
     def _evict(self, cfg: str) -> list[pa.RecordBatch]:
         from batcher.plan.expr_ir import col, lit

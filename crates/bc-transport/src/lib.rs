@@ -99,10 +99,12 @@ use crate::store::PartitionStore;
 
 mod exchange;
 mod handler;
+mod shared;
 mod store;
 mod ticket;
 
 pub use exchange::{classify, ClientPool, FetchFault, ShuffleExchange};
+pub use shared::{clear_shared, fetch_shared, publish_shared, shm_available};
 pub use ticket::ShuffleTicket;
 
 /// Default number of in-flight `RecordBatch` credits for a credit-bounded

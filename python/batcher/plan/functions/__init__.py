@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from batcher.plan.functions.aggregate import corr, count_if, covar_pop, covar_samp
 from batcher.plan.functions.collection import element, named_struct, sequence, struct
-from batcher.plan.functions.conditional import iff, ifnull, nanvl
+from batcher.plan.functions.conditional import iff, nanvl
 from batcher.plan.functions.math import gcd, hypot, lcm, log, width_bucket
 from batcher.plan.functions.string import concat, concat_ws, format_string
 from batcher.plan.functions.temporal import (
@@ -21,8 +21,6 @@ from batcher.plan.functions.temporal import (
     date_add,
     date_part,
     date_sub,
-    now,
-    today,
     window,
 )
 
@@ -43,15 +41,12 @@ __all__ = [
     "gcd",
     "hypot",
     "iff",
-    "ifnull",
     "lcm",
     "log",
     "named_struct",
     "nanvl",
-    "now",
     "sequence",
     "struct",
-    "today",
     "width_bucket",
     "window",
 ]

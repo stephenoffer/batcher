@@ -29,6 +29,7 @@ from batcher.plan.logical import (
     Sort,
     Union,
 )
+from batcher.plan.stats import Provenance
 
 __all__ = [
     "combine_limits",
@@ -36,11 +37,50 @@ __all__ = [
     "eliminate_sort_before_aggregate",
     "merge_adjacent_filters",
     "prune_true_filter",
+    "push_distinct_into_union",
     "push_filter_into_union",
     "push_limit_into_union",
     "push_limit_through_project",
     "remove_redundant_distinct",
 ]
+
+
+@rule(name="push_distinct_into_union", phase=Phase.REWRITE, matches=(Distinct,))
+def push_distinct_into_union(node: Distinct, ctx: OptimizerContext) -> LogicalPlan | None:
+    """`Distinct(Union-all(a, b, …))` → `Distinct(Union-all(…, Distinct(branch), …))`.
+
+    Deduplicating a branch *before* the union shrinks what the still-required outer
+    `Distinct` (and a distributed union shuffle) must carry, with no change to the result:
+    dedup of a concatenation equals dedup of the per-branch-deduped concatenation. A branch
+    is deduplicated early only when learned statistics show it genuinely has duplicates
+    (its distinct-row estimate is ≥10% below its row count), so the rule never adds a
+    speculative breaker — branches already producing distinct rows (`Distinct`/`Aggregate`)
+    and low-duplication branches are left untouched, and it does nothing if none qualify.
+    Only for `UNION ALL` (a `UNION`-distinct already deduplicates).
+    """
+    inner = node.input
+    if not isinstance(inner, Union) or inner.distinct:
+        return None
+    new_inputs = []
+    changed = False
+    for branch in inner.inputs:
+        if not isinstance(branch, Distinct | Aggregate) and _dedup_shrinks(ctx, branch):
+            new_inputs.append(Distinct(branch))
+            changed = True
+        else:
+            new_inputs.append(branch)
+    if not changed:
+        return None
+    return Distinct(Union(tuple(new_inputs), distinct=False))
+
+
+def _dedup_shrinks(ctx: OptimizerContext, branch: LogicalPlan) -> bool:
+    """Whether learned statistics show `branch` has enough duplicate rows that
+    deduplicating it early is worthwhile (≥10% fewer rows) — so `push_distinct_into_union`
+    only fires on real evidence, never a guess."""
+    rows = ctx.estimator.estimate(branch).rows
+    deduped = ctx.estimator.estimate(Distinct(branch))
+    return deduped.provenance == Provenance.LEARNED and deduped.rows <= rows * 0.9
 
 
 @rule(name="eliminate_sort_before_aggregate", phase=Phase.NORMALIZE, matches=(Aggregate,))

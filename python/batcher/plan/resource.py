@@ -16,16 +16,20 @@ __all__ = ["FeasibilityVerdict", "ResourceBounds", "SchedulingEnvelope"]
 
 @dataclass(frozen=True, slots=True)
 class ResourceBounds:
-    """R = (M_max, C_max, N_max) for one physical operator.
+    """R = (M_max, C_max, N_max, CPU) for one physical operator.
 
     * `m_max_bytes`     — peak memory envelope the operator may use.
     * `c_max_credits`   — max in-flight RecordBatch credits (flow-control bound).
     * `n_max_parallelism` — max concurrent morsels/workers for the operator.
+    * `c_cpu_shares`    — CPU shares one task running this operator needs. A
+      CPU-heavy breaker (hash/sort) saturates a core (`1.0`); a CPU-light,
+      IO/decode-bound streaming op asks for a fraction so more tasks pack per node.
     """
 
     m_max_bytes: int
     c_max_credits: int
     n_max_parallelism: int
+    c_cpu_shares: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)

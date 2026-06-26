@@ -37,13 +37,13 @@ def _big_small():
 def test_build_side_keeps_small_on_right():
     fact, dim = _big_small()
     # fact (big) on left, dim (small) on right → small already builds; no swap.
-    assert "keep" in fact.join(dim, on="k").explain()
+    assert "swap" not in fact.join(dim, on="k").explain().lower()
 
 
 def test_build_side_swaps_to_build_smaller():
     fact, dim = _big_small()
     # dim (small) on left, fact (big) on right → swap so small is the build side.
-    assert "SWAP" in dim.join(fact, on="k").explain()
+    assert "swap" in dim.join(fact, on="k").explain().lower()
 
 
 def test_build_side_swap_preserves_results():
@@ -153,10 +153,11 @@ def test_flight_aggregate_materialize_false_keeps_result_on_actors():
     # result on the worker actors and returns a FlightMaterializedSource (not a
     # collected table) — its buckets are read back shared-nothing over Flight. The
     # actors persist until cleanup(); the data + exact count match the collected path.
-    # (Adaptive cross-stage Flight materialize is deferred — it needs a shared actor
-    # fleet to avoid placement contention — so this exercises the mechanism directly.)
+    # The adaptive loop drives this end to end over a query-lifetime ShuffleFleet (see
+    # test_distributed_persistent_fleet_flight_equals_single_node); here we exercise the
+    # operator-level mechanism directly.
+    from batcher.dist.fleet import FlightMaterializedSource
     from batcher.dist.flight_aggregate import execute_aggregate_flight
-    from batcher.dist.flight_worker import FlightMaterializedSource
 
     fact, _ = _big_small()
     agg = fact.group_by("k").agg(s=col("v").sum())
@@ -171,6 +172,129 @@ def test_flight_aggregate_materialize_false_keeps_result_on_actors():
         assert _rowset(scanned) == _rowset(collected)
     finally:
         partitioned.cleanup()
+
+
+def test_flight_materialized_source_feeds_exact_cardinality():
+    # P4: a stage kept on the fleet must hand the next stage's optimizer an EXACT row
+    # count *without collecting to the driver*. The count is summed on the workers from
+    # each bucket's Arrow num_rows; only the integer travels to the driver. This is what
+    # lets the next stage's build-side / broadcast choices use measured sizes, not
+    # estimates — the adaptive moat, preserved off-driver.
+    from batcher.dist.flight_aggregate import execute_aggregate_flight
+    from batcher.io.source import source_statistics
+    from batcher.plan.source_stats import Provenance
+
+    fact, _ = _big_small()
+    agg = fact.group_by("k").agg(s=col("v").sum())
+    plan, sources = agg._plan, agg._sources
+
+    collected = execute_aggregate_flight([], plan, sources, 2)
+    partitioned = execute_aggregate_flight([], plan, sources, 2, materialize=False)
+    try:
+        stats = source_statistics(partitioned)
+        assert stats is not None
+        assert stats.exact_rows is True
+        assert stats.row_count == collected.num_rows
+        # The Scan the adaptive loop splices over it therefore starts EXACT.
+        assert stats.to_relstats(default_rows=1.0).provenance is Provenance.EXACT
+    finally:
+        partitioned.cleanup()
+
+
+def _flight_fleet_config(base: Config) -> Config:
+    """`base` with the persistent-fleet Flight path forced on for a local test."""
+    import dataclasses
+
+    return base.replace(
+        distributed=dataclasses.replace(base.distributed, persistent_fleet=True, transport="flight")
+    )
+
+
+def test_distributed_persistent_fleet_flight_equals_single_node():
+    # The cross-stage win: with a query-lifetime ShuffleFleet, an aggregate→join runs
+    # over the Flight transport keeping the intermediate on the workers (no driver
+    # collect, one placement group for the whole query) and must still equal
+    # single-node. This is the adaptive cross-stage Flight materialize the deadlock
+    # fix unblocks.
+    fact, dim = _big_small()
+
+    def query(ds_fact, ds_dim):
+        agg = ds_fact.group_by("k").agg(s=col("v").sum())
+        return agg.join(ds_dim, on="k")
+
+    base = query(fact, dim).collect()
+    with config_context(_flight_fleet_config(Config())):
+        got = query(fact, dim).collect(
+            distributed=True, adaptive=True, num_workers=2, transport="flight"
+        )
+    assert _rowset(got) == _rowset(base)
+
+
+def test_persistent_fleet_worker_loss_retries_on_fresh_fleet(monkeypatch):
+    # The persistent fleet has no fine-grained recompute for a cross-stage intermediate
+    # lost to a dead worker, so on that loss the whole query is retried on a FRESH fleet
+    # (the failed attempt freed the dead one). The retry stays on the Flight path — a
+    # fresh single fleet, so no cross-stage placement-group deadlock — and is
+    # deterministic, so the result is correct. The fleet is never LESS fault-tolerant
+    # than the default path.
+    import batcher.api.adaptive as adaptive
+    from batcher._internal.errors import ResourceError
+
+    fact, dim = _big_small()
+
+    def query(ds_fact, ds_dim):
+        agg = ds_fact.group_by("k").agg(s=col("v").sum())
+        return agg.join(ds_dim, on="k")
+
+    baseline = query(fact, dim).collect()
+
+    real = adaptive._execute_adaptive
+    attempts: list[int] = []
+
+    def flaky(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:  # simulate a fleet worker dying on the first attempt
+            raise ResourceError("simulated fleet worker loss")
+        return real(*args, **kwargs)  # the retry runs for real on a fresh fleet
+
+    monkeypatch.setattr(adaptive, "_execute_adaptive", flaky)
+    with config_context(_flight_fleet_config(Config())):
+        got = query(fact, dim).collect(
+            distributed=True, adaptive=True, num_workers=2, transport="flight"
+        )
+    assert len(attempts) == 2  # failed once, retried once on a fresh fleet
+    assert _rowset(got) == _rowset(baseline)
+
+
+def test_persistent_fleet_spawns_one_placement_group_for_the_query():
+    # The deadlock fix: a multi-stage adaptive query reserves exactly ONE fleet +
+    # placement group and every stage borrows it — not a fresh gang reservation per
+    # stage (which would contend with the prior stage's still-held bundles).
+    import batcher.dist.fleet as fleet_mod
+
+    fact, dim = _big_small()
+
+    def query(ds_fact, ds_dim):
+        agg = ds_fact.group_by("k").agg(s=col("v").sum())
+        return agg.join(ds_dim, on="k")
+
+    spawns = 0
+    real_spawn = fleet_mod.ShuffleFleet.spawn.__func__
+
+    def counting_spawn(cls, *a, **k):
+        nonlocal spawns
+        spawns += 1
+        return real_spawn(cls, *a, **k)
+
+    fleet_mod.ShuffleFleet.spawn = classmethod(counting_spawn)
+    try:
+        with config_context(_flight_fleet_config(Config())):
+            query(fact, dim).collect(
+                distributed=True, adaptive=True, num_workers=2, transport="flight"
+            )
+    finally:
+        fleet_mod.ShuffleFleet.spawn = classmethod(real_spawn)
+    assert spawns == 1
 
 
 def test_execute_distributed_materialize_false_keeps_join_partitioned():

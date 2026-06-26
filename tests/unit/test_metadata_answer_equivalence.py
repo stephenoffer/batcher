@@ -14,8 +14,8 @@ import pytest
 
 import batcher as bt
 from batcher import col, count
-from batcher.api.orchestration import metadata_count as _answer_count
 from batcher.api.terminal import _collect
+from batcher.api.terminal.metadata_answer import metadata_count as _answer_count
 
 
 @pytest.fixture

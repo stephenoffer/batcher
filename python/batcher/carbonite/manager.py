@@ -24,6 +24,7 @@ from batcher.carbonite.base import (
     SchedulingPolicy,
 )
 from batcher.carbonite.memory import OperatorMemoryEstimator, PressureMonitor, process_pool
+from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.carbonite.policies import (
     AIMDFlowControl,
     BudgetingAdmission,
@@ -35,6 +36,18 @@ from batcher.plan.physical import PhysicalPlan
 from batcher.plan.resource import FeasibilityVerdict, ResourceBounds, SchedulingEnvelope
 
 __all__ = ["ResourceManager"]
+
+# How far to shrink the morsel target at each pressure level (adaptive morsel sizing).
+# NORMAL keeps the configured target (no entry ⇒ factor 1.0); ELEVATED halves it;
+# SPILL/CRITICAL quarter it so the streaming working set stays tight while the engine
+# is already under pressure.
+_MORSEL_PRESSURE_FACTORS = {
+    PressureLevel.ELEVATED: 0.5,
+    PressureLevel.SPILL: 0.25,
+    PressureLevel.CRITICAL: 0.25,
+}
+_MIN_MORSEL_ROWS = 1024  # floor: a morsel never shrinks below a cache-efficient batch
+_MIN_MORSEL_BYTES = 64 * 1024  # 64 KiB floor (companion byte bound)
 
 
 class ResourceManager:
@@ -122,6 +135,37 @@ class ResourceManager:
         opt-in adaptive mode). Stateful — one controller per channel."""
         return AIMDFlowControl(self._config)
 
+    def recommend_morsel_target(self) -> tuple[int, int] | None:
+        """Scale the per-morsel ``(rows, bytes)`` target down under memory pressure.
+
+        Returns the recommended target, or ``None`` to keep the configured one (the
+        common, unpressured case). A morsel only *batches* data — it never changes the
+        result — so shrinking it is always safe; under pressure a smaller morsel just
+        keeps the streaming working set tighter so the engine stays in memory longer
+        before it must spill (the "size blocks to memory" lever). The reduction tracks
+        the live `PressureMonitor` level and is floored so a morsel never degrades into
+        an inefficiently tiny batch.
+        """
+        factor = _MORSEL_PRESSURE_FACTORS.get(self._pressure.level(), 1.0)
+        if factor >= 1.0:
+            return None
+        rows = max(_MIN_MORSEL_ROWS, int(self._config.execution.morsel_rows * factor))
+        nbytes = max(_MIN_MORSEL_BYTES, int(self._config.execution.morsel_bytes * factor))
+        return rows, nbytes
+
+    def recommended_config(self) -> Config | None:
+        """A `Config` with the pressure-scaled morsel target, or ``None`` to keep the
+        current one. The conductor activates it for the execution scope so the adapted
+        morsel reaches both the in-process engine and the shipped worker config."""
+        target = self.recommend_morsel_target()
+        if target is None:
+            return None
+        rows, nbytes = target
+        execution = dataclasses.replace(
+            self._config.execution, morsel_rows=rows, morsel_bytes=nbytes
+        )
+        return dataclasses.replace(self._config, execution=execution)
+
     def _peak_bytes(self, plan: PhysicalPlan) -> int:
         """The plan's estimated peak in-memory bytes, computed once per plan.
 
@@ -175,8 +219,21 @@ class ResourceManager:
         pool is already over budget and the caller should be on the spill path.
         The pool is sized to Carbonite's hard memory envelope — the same figure
         `should_spill` compares against, so the two decisions stay consistent.
+
+        Storage yields to execution: when the pool is tighter than the request, the
+        result cache drops *exactly* the deficit (lowest-value entries first) so its
+        RAM goes back to the running query rather than squeezing it — the
+        execution-evicts-storage half of Spark's unified memory model. Total process
+        RSS stays bounded by the envelope plus only the cache the query doesn't need.
         """
+        from batcher.carbonite.cache import current_result_cache
+
         pool = process_pool(self._hard_budget())
+        cache = current_result_cache()
+        if cache is not None:
+            deficit = m_bytes - pool.available
+            if deficit > 0:
+                cache.evict_to_free(deficit)
         with pool.reserve(m_bytes) as granted:
             yield granted
 

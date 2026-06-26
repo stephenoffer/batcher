@@ -19,6 +19,8 @@ import pyarrow as pa
 from batcher._native import FlightShuffleServer as _Server
 from batcher._native import ShuffleClient as _Client
 from batcher._native import flight_fetch as _fetch
+from batcher._native import gather_combine as _gather_combine
+from batcher._native import gather_concat as _gather_concat
 
 __all__ = ["FlightShuffleServer", "ShuffleClient", "ShuffleTicket", "fetch"]
 
@@ -67,6 +69,22 @@ class FlightShuffleServer:
         """
         return self._srv.local_fetch(str(ticket))
 
+    def publish_shared(self, ticket: ShuffleTicket, batches: list[pa.RecordBatch]) -> None:
+        """Mirror `ticket`'s batches to a same-node shared-memory file (Arrow IPC over
+        mmap) under this server's address, so a same-node reducer in another process
+        reads them without a gRPC/loopback hop. Best-effort (write errors are ignored)."""
+        self._srv.publish_shared(str(ticket), list(batches))
+
+    def shm_fetch(self, source_addr: str, ticket: ShuffleTicket) -> list[pa.RecordBatch] | None:
+        """Read a partition a same-node peer published under `(source_addr, ticket)` from
+        shared memory, or `None` if absent — the `SHARED_MEMORY` path. `None` means the
+        caller falls back to Flight (empty bucket / un-shm'd peer / shm off)."""
+        return self._srv.shm_fetch(source_addr, str(ticket))
+
+    def clear_shared(self) -> None:
+        """Remove every shared-memory file this server published (plan teardown)."""
+        self._srv.clear_shared()
+
     def max_inflight(self, ticket: ShuffleTicket) -> int | None:
         """Peak number of batches the producer ever had in flight for `ticket`.
 
@@ -91,6 +109,64 @@ class FlightShuffleServer:
     def partition_count(self) -> int:
         """Partitions currently retained (telemetry / leak tests)."""
         return self._srv.partition_count
+
+    def gather_combine(
+        self,
+        client: ShuffleClient,
+        group_keys_json: str,
+        aggregates_json: str,
+        sources: list[tuple[str, ShuffleTicket]],
+        fan_in: int,
+        finalize: bool,
+        credits: int | None = None,
+        token: str | None = None,
+    ) -> tuple[pa.RecordBatch | None, list[int]]:
+        """Concurrently fetch + `combine` the aggregate partials from every source.
+
+        Fetches every `(addr, ticket)` at once (bounded by `fan_in`), folding each into
+        one running partial in Rust — so peak memory is `fan_in` in-flight fetches plus
+        the running state, independent of the source count. Returns
+        `(payload, unreachable)`: `payload` is the finalized batch (or the merged
+        partial when `finalize` is false), or `None` when `unreachable` is non-empty
+        (those sources hit a retryable fault → the driver recomputes and retries) or
+        every bucket was empty. `combine` is associative, so the concurrent fold equals
+        a serial one.
+        """
+        src = [(addr, str(ticket)) for addr, ticket in sources]
+        if credits is None:
+            return _gather_combine(
+                self._srv, client._client, group_keys_json, aggregates_json, src, fan_in, finalize
+            )
+        return _gather_combine(
+            self._srv,
+            client._client,
+            group_keys_json,
+            aggregates_json,
+            src,
+            fan_in,
+            finalize,
+            credits,
+            token,
+        )
+
+    def gather_concat(
+        self,
+        client: ShuffleClient,
+        sources: list[tuple[str, ShuffleTicket]],
+        fan_in: int,
+        credits: int | None = None,
+        token: str | None = None,
+    ) -> tuple[list[pa.RecordBatch], list[int]]:
+        """Concurrently fetch every source's raw batches into one list (window/sort/join).
+
+        Like `gather_combine` but without a fold — the reducer needs the whole bucket
+        and re-orders it downstream. Returns `(batches, unreachable)`; a non-empty
+        `unreachable` leaves the batches partial (the driver recomputes and retries).
+        """
+        src = [(addr, str(ticket)) for addr, ticket in sources]
+        if credits is None:
+            return _gather_concat(self._srv, client._client, src, fan_in)
+        return _gather_concat(self._srv, client._client, src, fan_in, credits, token)
 
 
 class ShuffleClient:

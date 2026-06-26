@@ -123,3 +123,14 @@ class CSVSink(FileSink):
         import pyarrow.csv as pacsv
 
         pacsv.write_csv(table, fh)
+
+    def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
+        import pyarrow.csv as pacsv
+
+        return pacsv.CSVWriter(fh, schema)
+
+    def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
+        writer.write(batch)
+
+    def _close_stream_writer(self, writer: Any) -> None:
+        writer.close()

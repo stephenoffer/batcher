@@ -42,12 +42,24 @@ def _plan(*memories: int) -> PhysicalPlan:
 
 
 def test_infeasible_when_breaker_exceeds_envelope():
-    adm = BudgetingAdmission(available_bytes=1000, soft_limit=0.85)  # envelope = 850
-    verdict = adm.validate(_plan(100, 5000, 200), _ctx())  # dominant breaker = 5000
+    # Realistic byte sizes above the one-morsel floor (1 MiB): a 200 MB breaker cannot
+    # fit an 85 MB envelope, so it is infeasible with a spill-friendly counter-offer.
+    adm = BudgetingAdmission(available_bytes=100_000_000, soft_limit=0.85)  # envelope = 85 MB
+    verdict = adm.validate(_plan(1_000_000, 200_000_000, 2_000_000), _ctx())  # breaker = 200 MB
     assert not verdict.feasible
     assert verdict.binding_constraint == "memory"
     assert verdict.suggested_bounds is not None
-    assert verdict.suggested_bounds.m_max_bytes == 850
+    assert verdict.suggested_bounds.m_max_bytes == 85_000_000
+
+
+def test_sub_morsel_envelope_is_floored_feasible():
+    # The envelope can never be smaller than one morsel: the engine must hold at least a
+    # single morsel, and a streaming op's whole footprint is one morsel. So a breaker
+    # below the morsel floor stays feasible even under an absurdly tiny budget — the fix
+    # for a tiny/streaming plan being rejected as "infeasible with no out-of-core path".
+    adm = BudgetingAdmission(available_bytes=1000, soft_limit=0.85)  # raw envelope = 850
+    morsel = active_config().execution.morsel_bytes
+    assert adm.validate(_plan(100, morsel - 1, 200), _ctx()).feasible
 
 
 def test_feasible_when_within_envelope():

@@ -39,12 +39,46 @@ across GPUs.
 Process unbounded sources as micro-batches through the same operators.
 :::
 
+:::{grid-item-card} {octicon}`shield;1.1em` Data quality
+:link: ../user-guide/data-quality
+:link-type: doc
+Validate, quarantine, and enforce a data contract with the `ds.dq` accessor.
+:::
+
+:::{grid-item-card} {octicon}`stack;1.1em` Lakehouse and SCD
+:link: ../user-guide/lakehouse
+:link-type: doc
+Delta read/write/merge, time-travel, and slowly-changing-dimension history.
+:::
+
+:::{grid-item-card} {octicon}`pulse;1.1em` Performance and memory
+:link: ../user-guide/performance
+:link-type: doc
+Cache reused results, spill out of core, and read the query plan.
+:::
+
 :::{grid-item-card} {octicon}`beaker;1.1em` Synthetic data
 :link: ../tutorials/synthetic-data-generation
 :link-type: doc
 Build test datasets in memory with `bt.from_pydict` and expressions.
 :::
 ::::
+
+## Runnable scripts
+
+Every example above maps to a self-contained script in the
+[`examples/` directory](https://github.com/batcher/batcher/tree/main/examples) that
+builds its own in-memory data and asserts on its output — run any of them with
+`python examples/<name>.py`. Highlights by workload:
+
+- **ETL** — `data_quality.py`, `lakehouse_scd.py`, `feature_engineering.py`,
+  `timeseries.py`, `window_functions.py`
+- **ML** — `ml_inference.py`, `streaming_pipeline.py`
+- **Operations** — `performance_caching.py`, `spill.py`, `adaptive_optimization.py`,
+  `distributed.py`
+
+Pick the one closest to what you are building, or follow a
+[learning path](../learning-paths/index.md) for a role-ordered tour.
 
 ```{toctree}
 :hidden:

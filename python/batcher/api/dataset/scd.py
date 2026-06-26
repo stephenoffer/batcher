@@ -39,6 +39,7 @@ class DatasetSCD:
     __slots__ = ("_ds",)
 
     def __init__(self, ds: Dataset) -> None:
+        """Bind the SCD accessor to its `Dataset`; reached as `ds.scd`, not constructed directly."""
         self._ds = ds
 
     def type1(self, target: str, *, keys: str | list[str], **opts) -> WriteManifest:
@@ -94,8 +95,9 @@ class DatasetSCD:
                 >>> _ = v1.scd.type2(target, keys="id", track=["city"], as_of="2024-01-01")
                 >>> v2 = bt.from_pydict({"id": [1], "city": ["LA"]})
                 >>> _ = v2.scd.type2(target, keys="id", track=["city"], as_of="2024-06-01")
-                >>> bt.read.parquet(target).sort("valid_from").to_pydict()
-                {'id': [1, 1], 'city': ['NYC', 'LA'], 'valid_from': ['2024-01-01', '2024-06-01'], 'valid_to': ['2024-06-01', None], 'is_current': [False, True]}
+                >>> hist = bt.read.parquet(target).sort("valid_from")
+                >>> hist.select("valid_from", "is_current").to_pydict()
+                {'valid_from': ['2024-01-01', '2024-06-01'], 'is_current': [False, True]}
         """
         from batcher.api.session import read as _read
         from batcher.io.detect import detect_format

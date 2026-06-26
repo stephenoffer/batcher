@@ -15,13 +15,17 @@ __all__ = [
     "CommitError",
     "CompileError",
     "ConfigError",
+    "DataQualityError",
     "ExecutionError",
+    "FatalShuffleError",
     "FormatError",
     "IOError",
     "OptimizationError",
     "PerformanceWarning",
     "PlanError",
     "ResourceError",
+    "RetryableShuffleError",
+    "SchemaError",
     "TransportError",
 ]
 
@@ -109,3 +113,26 @@ class DataQualityError(BatcherError):
     def __init__(self, message: str, violations: dict[str, int] | None = None) -> None:
         super().__init__(message)
         self.violations = violations or {}
+
+
+# Classified shuffle-fetch exceptions. They originate at the PyO3 boundary
+# (`bc_py`), where the Rust transport's `classify()` verdict is preserved across the
+# FFI: a `Retryable` fault (an unreachable/idle/cancelled peer) means worker loss —
+# the reduce loop recomputes the source and retries — while a `Fatal` fault
+# (decode/protocol/auth) propagates and fails the query fast, rather than burning
+# recompute rounds on a fault a rerun cannot fix. They are re-exported here so the
+# control plane has one import site. The pure-Python shims keep this module
+# importable where the native extension is not built (config-only / unit-test
+# imports); the distributed path that raises them needs the native engine anyway.
+try:
+    from batcher._native import (
+        FatalShuffleError,
+        RetryableShuffleError,
+    )
+except ImportError:
+
+    class RetryableShuffleError(TransportError):  # type: ignore[no-redef]
+        """A shuffle fetch failed transiently (unreachable/idle peer) — recompute + retry."""
+
+    class FatalShuffleError(TransportError):  # type: ignore[no-redef]
+        """A shuffle fetch failed fatally (decode/protocol/auth) — retrying cannot help."""

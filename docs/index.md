@@ -216,6 +216,12 @@ Batch inference, embeddings, and training data.
 :link-type: doc
 S3, GCS, Azure, and Delta / Iceberg / Hudi.
 :::
+
+:::{grid-item-card} {octicon}`arrow-switch;1.1em` Coming from pandas / Polars / Spark
+:link: migration/index
+:link-type: doc
+Translate the API you already know, side by side.
+:::
 ::::
 
 ## It tunes itself

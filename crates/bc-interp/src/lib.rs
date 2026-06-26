@@ -14,8 +14,6 @@
 //! Both are flying starts: execution begins immediately, so JIT compilation is
 //! never on the critical path.
 
-use std::time::Instant;
-
 use arrow::array::RecordBatch;
 use bc_ir::RelOp;
 
@@ -33,7 +31,7 @@ pub use par::{
     execute_parallel, execute_parallel_with, execute_parallel_with_metrics, ExecOptions,
 };
 
-use metrics::IdGen;
+use metrics::{IdGen, Stopwatch};
 
 /// Total rows across a set of morsels.
 pub(crate) fn count_rows(batches: &[RecordBatch]) -> u64 {
@@ -82,7 +80,7 @@ fn exec_seq(
     let op_id = ids.next();
     match plan {
         RelOp::Scan { source_id } => {
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let batches = sources
                 .get(*source_id)
                 .cloned()
@@ -96,7 +94,9 @@ fn exec_seq(
                 kind: "scan",
                 rows_in: rows,
                 rows_out: rows,
-                elapsed_ns: t0.elapsed().as_nanos() as u64,
+                elapsed_ns: t0.elapsed_ns(),
+                cpu_ns: t0.cpu_ns(),
+                threads: 1,
                 peak_bytes: batch_bytes(&batches),
                 spilled: false,
                 backend: "interp",
@@ -107,7 +107,7 @@ fn exec_seq(
         RelOp::Filter { input, predicate } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let out: Vec<RecordBatch> = batches
                 .iter()
                 .map(|b| ops::filter_batch(b, predicate))
@@ -119,7 +119,7 @@ fn exec_seq(
         RelOp::Project { input, exprs } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let out: Vec<RecordBatch> = batches
                 .iter()
                 .map(|b| ops::project_batch(b, exprs))
@@ -135,7 +135,7 @@ fn exec_seq(
         } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let out: Vec<RecordBatch> = batches
                 .iter()
                 .map(|b| ops::unnest_batch(b, column, alias))
@@ -151,7 +151,7 @@ fn exec_seq(
         } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let out = ops::add_row_ids(&batches, alias, *offset)?;
             record_op(m, op_id, "row_id", rows_in, &out, t0, false);
             Ok(out)
@@ -166,7 +166,7 @@ fn exec_seq(
         } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let out: Vec<RecordBatch> = batches
                 .iter()
                 .map(|b| ops::unpivot_batch(b, index, on, variable_name, value_name))
@@ -183,7 +183,7 @@ fn exec_seq(
         } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let out: Vec<RecordBatch> = match n {
                 // Fixed-count: keep the n smallest-hash rows (a breaker).
                 Some(k) => ops::sample_n_batches(&batches, *k, *seed)?,
@@ -203,7 +203,7 @@ fn exec_seq(
         } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let combined =
                 ops::materialize(&batches).map_err(|_| InterpError::EmptyAggregateInput)?;
             let funcs = ops::agg_funcs(aggregates);
@@ -222,7 +222,7 @@ fn exec_seq(
         RelOp::Sort { input, keys, limit } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let out = match ops::materialize(&batches) {
                 Ok(combined) => vec![ops::sort_batch(&combined, keys, *limit)?],
                 Err(_) => Vec::new(),
@@ -240,7 +240,7 @@ fn exec_seq(
         } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let out = match ops::materialize(&batches) {
                 Ok(combined) => vec![ops::window_batch(
                     &combined,
@@ -258,7 +258,7 @@ fn exec_seq(
         RelOp::Limit { input, n, offset } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let out = ops::limit(batches, *n, *offset);
             record_op(m, op_id, "limit", rows_in, &out, t0, false);
             Ok(out)
@@ -279,7 +279,7 @@ fn exec_seq(
             let left_batches = exec_seq(left, sources, m, ids)?;
             let right_batches = exec_seq(right, sources, m, ids)?;
             let rows_in = count_rows(&left_batches) + count_rows(&right_batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let left = ops::materialize(&left_batches)?;
             let right = ops::materialize(&right_batches)?;
             // The sequential reference is the oracle: always the plain hash join,
@@ -310,7 +310,7 @@ fn exec_seq(
             let left_batches = exec_seq(left, sources, m, ids)?;
             let right_batches = exec_seq(right, sources, m, ids)?;
             let rows_in = count_rows(&left_batches) + count_rows(&right_batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let left = ops::materialize(&left_batches)?;
             let right = ops::materialize(&right_batches)?;
             let out = vec![ops::asof_join_batches(
@@ -323,7 +323,7 @@ fn exec_seq(
         RelOp::Distinct { input } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let out = vec![distinct(&batches)?];
             record_op(m, op_id, "distinct", rows_in, &out, t0, false);
             Ok(out)
@@ -338,7 +338,7 @@ fn exec_seq(
                 all.extend(exec_seq(inp, sources, m, ids)?);
             }
             let rows_in = count_rows(&all);
-            let t0 = Instant::now();
+            let t0 = Stopwatch::start();
             let out = if *dedup { vec![distinct(&all)?] } else { all };
             record_op(m, op_id, "union", rows_in, &out, t0, false);
             Ok(out)
@@ -353,7 +353,7 @@ fn record_op(
     kind: &'static str,
     rows_in: u64,
     out: &[RecordBatch],
-    t0: Instant,
+    t0: Stopwatch,
     spilled: bool,
 ) {
     m.record(OpMetric {
@@ -361,7 +361,9 @@ fn record_op(
         kind,
         rows_in,
         rows_out: count_rows(out),
-        elapsed_ns: t0.elapsed().as_nanos() as u64,
+        elapsed_ns: t0.elapsed_ns(),
+        cpu_ns: t0.cpu_ns(),
+        threads: 1,
         peak_bytes: batch_bytes(out),
         spilled,
         backend: "interp",

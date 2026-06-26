@@ -46,6 +46,18 @@ __all__ = ["reorder_joins"]
 ColRef = tuple[int, str]
 
 
+def _needed_cols(
+    required: list[tuple[str, ColRef]], edges: list[tuple[ColRef, ColRef]]
+) -> set[ColRef]:
+    """Logical columns a rebuilt subtree must carry: the required output plus every
+    join-key endpoint (so projection-pushed-away columns are not re-introduced)."""
+    needed: set[ColRef] = {ref for _, ref in required}
+    for a, b in edges:
+        needed.add(a)
+        needed.add(b)
+    return needed
+
+
 def reorder_joins(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
     """Reorder maximal inner-join subtrees by estimated cost (top-down, once)."""
     if not ctx.sources:  # estimation needs source sizes; nothing to cost without them
@@ -81,9 +93,12 @@ def _try_reorder(top: Join, ctx: OptimizerContext, visit) -> LogicalPlan | None:
 
     # Reorder nested subtrees inside each leaf first, then rebuild this subtree.
     leaves = [visit(leaf) for leaf in leaves]
-    # Exact DP (considers bushy trees) for a tractable number of relations; greedy
-    # left-deep beyond that, so a large join graph still reorders cheaply.
-    dp = _rebuild_dp(leaves, edges, required, ctx)
+    # Bushy-tree DP: exhaustive up to `_MAX_EXHAUSTIVE_LEAVES`, connected-subset DP
+    # for larger sparse graphs, greedy fallback.
+    if len(leaves) <= _MAX_EXHAUSTIVE_LEAVES:
+        dp = _rebuild_dp(leaves, edges, required, ctx)
+    else:
+        dp = _rebuild_dphyp(leaves, edges, required, ctx)
     return dp if dp is not None else _rebuild_greedy(leaves, edges, required, ctx)
 
 
@@ -150,10 +165,7 @@ def _rebuild_greedy(
     # truly-unused columns would re-introduce them into join output lists after
     # projection pushdown already pruned them from the scans, leaving the join
     # output referencing a column its (pruned) input no longer provides.
-    needed: set[ColRef] = {ref for _, ref in required}
-    for a, b in edges:
-        needed.add(a)
-        needed.add(b)
+    needed = _needed_cols(required, edges)
 
     # Start from the smallest leaf, then repeatedly add the connected leaf that
     # yields the smallest estimated intermediate result.
@@ -190,9 +202,14 @@ def _rebuild_greedy(
     return _final_projection(current, schema, required)
 
 
-# Above this leaf count, the O(3^n) DP is skipped for the greedy heuristic so a
-# very large join graph still reorders in bounded time (the small-query mandate).
-_MAX_DP_LEAVES = 12
+# Exhaustive O(3ⁿ) subset DP up to `_MAX_EXHAUSTIVE_LEAVES`; the connected-subset DP
+# (`_rebuild_dphyp`) up to `_MAX_DP_LEAVES`; greedy beyond. `_MAX_DP_PAIRS` caps the
+# connected-subset DP's work so a dense large graph bails to greedy (small-query
+# mandate) instead of blowing up. Keeping the exhaustive DP for the small case leaves
+# its plans unchanged.
+_MAX_EXHAUSTIVE_LEAVES = 12
+_MAX_DP_LEAVES = 20
+_MAX_DP_PAIRS = 200_000
 
 
 def _rebuild_dp(
@@ -211,12 +228,9 @@ def _rebuild_dp(
     disconnected (a cross join, which this rule never introduces).
     """
     n = len(leaves)
-    if n > _MAX_DP_LEAVES:
+    if n > _MAX_EXHAUSTIVE_LEAVES:
         return None
-    needed: set[ColRef] = {ref for _, ref in required}
-    for a, b in edges:
-        needed.add(a)
-        needed.add(b)
+    needed = _needed_cols(required, edges)
     cost = ctx.costs()
 
     # best[subset] = (plan, schema, accumulated_cost). Base case: each singleton leaf.
@@ -245,6 +259,109 @@ def _rebuild_dp(
                 best[subset] = chosen
 
     full = best.get(frozenset(range(n)))
+    if full is None:
+        return None  # disconnected graph → would be a cross join; skip reorder
+    return _final_projection(full[0], full[1], required)
+
+
+def _rebuild_dphyp(
+    leaves: list[LogicalPlan],
+    edges: list[tuple[ColRef, ColRef]],
+    required: list[tuple[str, ColRef]],
+    ctx: OptimizerContext,
+) -> LogicalPlan | None:
+    """Cost-optimal bushy join order over **connected subgraphs only**, by size.
+
+    Where the exhaustive `_rebuild_dp` keeps a plan for *every* subset (O(3ⁿ), capping
+    near 12 leaves), this enumerates only the graph's connected subsets (a sparse
+    star/snowflake/chain has far fewer than 2ⁿ) smallest-first, so both halves of any
+    split are already final — the identical global optimum (the oracle test pins this)
+    at more tables. Bails to greedy (`None`) on a dense/too-large or disconnected graph.
+    """
+    n = len(leaves)
+    if n > _MAX_DP_LEAVES:
+        return None
+    needed = _needed_cols(required, edges)
+    cost = ctx.costs()
+
+    # Adjacency between leaf indices as bitmasks (edge endpoints carry their leaf id).
+    adj = [0] * n
+    for a, b in edges:
+        i, j = a[0], b[0]
+        if i != j:
+            adj[i] |= 1 << j
+            adj[j] |= 1 << i
+
+    def neighbors(mask: int) -> int:
+        nb = 0
+        m = mask
+        while m:
+            v = (m & -m).bit_length() - 1
+            nb |= adj[v]
+            m &= m - 1
+        return nb & ~mask
+
+    # All connected subsets, grown from singletons one neighbor at a time (so a
+    # sparse graph stays far under 2ⁿ — disconnected subsets are never created).
+    connected: set[int] = {1 << i for i in range(n)}
+    frontier = list(connected)
+    while frontier:
+        nxt: list[int] = []
+        for s in frontier:
+            ext = neighbors(s)
+            while ext:
+                bit = ext & -ext
+                ext &= ext - 1
+                t = s | bit
+                if t not in connected:
+                    connected.add(t)
+                    nxt.append(t)
+                    if len(connected) > _MAX_DP_PAIRS:
+                        return None  # too many connected subsets → defer to greedy
+        frontier = nxt
+
+    # dp[mask] = (plan, schema, accumulated_cost); base case = each singleton leaf.
+    dp: dict[int, tuple[LogicalPlan, list[tuple[str, ColRef]], float]] = {}
+    for i, leaf in enumerate(leaves):
+        schema = [(c, (i, c)) for c in leaf.available_columns() if (i, c) in needed]
+        dp[1 << i] = (leaf, schema, 0.0)
+
+    # Smallest-first so both halves of every split are already final. For each subset
+    # the cheapest split into two connected halves wins, min-element on the left to
+    # match the exhaustive DP's single orientation.
+    pairs = 0
+    for subset in sorted(connected, key=int.bit_count):
+        if subset.bit_count() < 2:
+            continue
+        pivot = subset & -subset  # lowest set bit = the subset's min element
+        rest = subset & ~pivot
+        chosen: tuple[LogicalPlan, list[tuple[str, ColRef]], float] | None = None
+        # Every submask of `rest` including empty (so `s1 = pivot` alone is tried) and
+        # excluding `rest` itself (`s2` empty); the left half always carries the pivot.
+        sub = rest
+        while True:
+            s2 = rest & ~sub
+            if s2 != 0:
+                s1 = pivot | sub
+                left = dp.get(s1)
+                right = dp.get(s2)
+                if left is not None and right is not None:  # both halves connected
+                    pairs += 1
+                    if pairs > _MAX_DP_PAIRS:
+                        return None
+                    built = _join_plans(left[0], left[1], right[0], right[1], edges)
+                    if built is not None:
+                        jplan, jschema = built
+                        total = left[2] + right[2] + cost.cost(jplan).total()
+                        if chosen is None or total < chosen[2]:
+                            chosen = (jplan, jschema, total)
+            if sub == 0:
+                break
+            sub = (sub - 1) & rest
+        if chosen is not None:
+            dp[subset] = chosen
+
+    full = dp.get((1 << n) - 1)
     if full is None:
         return None  # disconnected graph → would be a cross join; skip reorder
     return _final_projection(full[0], full[1], required)

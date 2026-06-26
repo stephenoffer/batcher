@@ -65,3 +65,42 @@ def test_morsel_size_does_not_change_result():
         return sorted(tuple(r.values()) for r in tbl.to_pylist())
 
     assert norm(base) == norm(tiny)
+
+
+def _norm(tbl: pa.Table) -> list[tuple]:
+    return sorted(tuple(r.values()) for r in tbl.to_pylist())
+
+
+def test_runtime_tuning_knobs_are_result_invariant():
+    """The performance-threshold knobs (radix/bloom/window/sort fan-in) change *how*
+    an operator runs, never the relation. A group-by + join + window + sort run with a
+    deliberately aggressive (low-threshold, high-fp, small-fanin) tuning must produce
+    the identical result to the default tuning."""
+    left = pa.table({"k": [i % 13 for i in range(400)], "v": list(range(400))})
+    right = pa.table({"k": list(range(13)), "label": [f"g{i}" for i in range(13)]})
+
+    def run() -> pa.Table:
+        ds = (
+            bt.from_arrow(left)
+            .join(bt.from_arrow(right), on="k")
+            .group_by("label")
+            .agg(total=col("v").sum(), n=count())
+        )
+        return ds.sort("label").collect()
+
+    base = run()
+    aggressive = bt.Config().replace(
+        execution=bt.ExecutionConfig(
+            # Force the parallel-radix combine, engage the bloom early, force window
+            # parallelism, and a small merge fan-in — all perf-only.
+            radix_parallel_threshold=1,
+            bloom_min_build_rows=1,
+            bloom_fp_rate=0.2,
+            window_parallel_row_threshold=1,
+            sort_merge_fanin=2,
+        )
+    )
+    with bt.config_context(aggressive):
+        tuned = run()
+
+    assert _norm(base) == _norm(tuned)

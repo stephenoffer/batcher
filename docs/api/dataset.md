@@ -74,6 +74,8 @@ Each method returns a new `Dataset`. They chain.
 | `.window(...)` | Per-row windowed columns (see below). |
 | `.group_by(*keys, **derived)` | Start a grouped aggregation (returns `GroupBy`). |
 | `.map_batches(fn, ...)` | Apply a Python function to whole Arrow batches. |
+| `.offload_blobs(column="bytes", ...)` | Move a large-payload column to a content-addressed store, leaving URI handles ([blob-by-reference](../ml/multimodal.md)). |
+| `.materialize_blobs(...)` | Read offloaded payloads back from their handles (inverse of `offload_blobs`). |
 | `.repartition(num_files=None, *, by=None, target_size_mb=None)` | Set how the next `write` lays out files (data unchanged). |
 
 ### filter

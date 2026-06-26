@@ -64,3 +64,12 @@ class Embedder:
     .write.parquet("output/embeddings.parquet")
 )
 ```
+
+## Runnable examples
+
+- `ml_inference.py` — a batch-inference pipeline with `ds.ml.map_batches` (runs as written).
+- `feature_engineering.py` — prepare model-ready features.
+- `streaming_pipeline.py` — a streaming inference pipeline shape (needs a broker to run).
+
+See also the [performance guide](../user-guide/performance.md) for caching feature
+tables and the [GPU guide](../ml/gpu.md) for accelerator placement.

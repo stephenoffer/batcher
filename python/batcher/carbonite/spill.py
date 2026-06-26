@@ -25,8 +25,29 @@ from enum import Enum
 import pyarrow as pa
 
 from batcher._internal.errors import IOError as BatcherIOError
+from batcher._internal.errors import ResourceError
 
 __all__ = ["SpillHandle", "SpillTier", "TieredSpillStore"]
+
+
+def _open_local_map(path: str) -> pa.MemoryMappedFile:
+    """Memory-map a local spill file, mapping a *missing* file to a retryable error.
+
+    A spot/preemptible node's local NVMe is ephemeral: it can be reclaimed mid-query,
+    vanishing the spilled partition. Reading it then fails with a cryptic `OSError`; we
+    surface a clear, **retryable** `ResourceError` instead so the distributed recovery
+    path recomputes the partition (the recovery loop already treats `ResourceError` as
+    worker/disk loss) rather than crashing the query. Set `memory.spill_remote_uri` for
+    a durable overflow tier that survives the node.
+    """
+    try:
+        return pa.memory_map(path, "r")
+    except OSError as exc:
+        raise ResourceError(
+            f"spilled partition is unreadable at {path!r} — its local disk was likely "
+            "reclaimed (an ephemeral/spot node). The partition must be recomputed; set "
+            "memory.spill_remote_uri for a durable overflow tier that survives node loss."
+        ) from exc
 
 
 class SpillTier(Enum):
@@ -59,10 +80,15 @@ def _ipc_options(compression: str | None) -> pa.ipc.IpcWriteOptions | None:
     """Arrow-IPC write options for the configured codec, or `None` if unavailable.
 
     Spilled data is transient, so a cheap-fast codec (LZ4) trades CPU for disk I/O
-    and footprint. Degrades silently to uncompressed if the codec isn't built into
-    this pyarrow, so spilling never fails on a missing optional codec.
+    and footprint. ``"auto"`` (the datatype-aware default) is uncompressed here: this
+    Python tier spills to fast local disk, where compressing numeric/string state
+    costs more CPU than the I/O it saves (the native Rust path's per-batch classifier
+    compresses only blob payloads, where it pays). Set ``"lz4"``/``"zstd"`` explicitly
+    to force compression on this tier (worthwhile for the slow remote-overflow path).
+    Degrades silently to uncompressed if the codec isn't built into this pyarrow, so
+    spilling never fails on a missing optional codec.
     """
-    if not compression:
+    if not compression or compression == "auto":
         return None
     try:
         return pa.ipc.IpcWriteOptions(compression=compression)
@@ -187,7 +213,7 @@ class TieredSpillStore:
     def read(self, handle: SpillHandle) -> list[pa.RecordBatch]:
         """Stream the partition referenced by `handle` back from its tier."""
         if handle.tier is SpillTier.LOCAL:
-            with pa.memory_map(handle.path, "r") as mm:
+            with _open_local_map(handle.path) as mm:
                 return pa.ipc.open_stream(mm).read_all().to_batches()
         with _fsspec_open(handle.path, "rb") as fh:
             reader = pa.ipc.open_stream(fh)
@@ -200,7 +226,7 @@ class TieredSpillStore:
         without first loading the entire bucket into memory.
         """
         if handle.tier is SpillTier.LOCAL:
-            with pa.memory_map(handle.path, "r") as mm:
+            with _open_local_map(handle.path) as mm:
                 yield from pa.ipc.open_stream(mm)
         else:
             with _fsspec_open(handle.path, "rb") as fh:

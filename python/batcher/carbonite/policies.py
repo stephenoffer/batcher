@@ -70,6 +70,15 @@ class BudgetingAdmission:
             pool = current_process_pool()
             if pool is not None:
                 envelope = max(0, envelope - pool.used)
+        # The envelope can never be smaller than one morsel: the engine must hold at
+        # least a single morsel to make any progress, and a *streaming* operator's whole
+        # footprint is one morsel (`min(morsel_rows·width, morsel_bytes)`). Flooring here
+        # keeps a streaming/tiny plan feasible under a sub-morsel budget (it would
+        # otherwise be rejected as infeasible with "no out-of-core path", since a
+        # streaming op has nothing to spill) — a no-op for any realistic budget, which is
+        # orders of magnitude larger than a morsel. A genuine breaker that materializes
+        # more than this floor still exceeds it and routes to the spill path.
+        envelope = max(envelope, ctx.config.execution.morsel_bytes)
         peak = max((op.bounds.m_max_bytes for op in plan.ops), default=0)
         if peak <= envelope:
             return FeasibilityVerdict(feasible=True)
@@ -226,8 +235,17 @@ class DefaultSchedulingPolicy:
             )
             memory_bytes = min(per_task, fair_share)
 
+        # Per-task CPU: the dominant operator's share (a task runs a whole plan
+        # partition, so its heaviest op sets the core need). A pure scan→filter→write
+        # plan asks <1 CPU and packs tighter; any breaker pulls it back to a full core.
+        # Falls back to the configured default for an unsized plan (no bounds).
+        num_cpus = max(
+            (op.bounds.c_cpu_shares for op in plan.ops),
+            default=cfg.execution.cpus_per_task,
+        )
+
         return SchedulingEnvelope(
-            num_cpus=cfg.execution.cpus_per_task,
+            num_cpus=num_cpus,
             memory_bytes=int(memory_bytes),
             num_gpus=0.0,
             n_tasks=n_tasks,

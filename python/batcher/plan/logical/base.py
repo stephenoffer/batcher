@@ -9,11 +9,14 @@ via `to_ir()`; types of derived columns are resolved by the engine.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr
 from batcher.plan.expr_ir import referenced_columns as _referenced_columns
+
+if TYPE_CHECKING:
+    from batcher.plan.schema import SchemaRef
 
 __all__ = ["LogicalPlan"]
 
@@ -39,6 +42,17 @@ class LogicalPlan:
 
     def available_columns(self) -> list[str]:  # pragma: no cover - overridden
         raise NotImplementedError
+
+    def available_schema(self) -> SchemaRef | None:
+        """The output schema (names **and** Arrow types), or ``None`` if not inferable.
+
+        A type-carrying companion to `available_columns()`: nodes that can compute
+        their output types from the scan-leaf schema plus per-expression inference
+        override this; anything uncertain returns ``None`` so callers fall back to a
+        zero-row execution. Pure analysis — it never touches the IR or runs the
+        engine. The default is ``None`` (unknown).
+        """
+        return None
 
     def _check(self, expr: Expr) -> None:
         """Raise `PlanError` if `expr` references a column not produced by input."""

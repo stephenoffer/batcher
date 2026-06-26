@@ -35,4 +35,5 @@ Kyber's passes, cost-based choices, and adaptive re-optimization.
 overview
 execution
 optimization
+fault-tolerance
 ```

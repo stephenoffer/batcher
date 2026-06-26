@@ -7,18 +7,14 @@
 //! executors differ only in *scheduling* (sequential vs rayon + hash-shuffle),
 //! never in operator semantics.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow::compute::SortOptions;
 use arrow::compute::{
-    concat_batches, filter_record_batch, interleave, lexsort_to_indices, sort_to_indices, take,
-    SortColumn,
+    concat_batches, filter_record_batch, lexsort_to_indices, sort_to_indices, take, SortColumn,
 };
-use arrow::datatypes::{Field, Schema, SchemaRef};
-use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
+use arrow::datatypes::{Field, Schema};
 use bc_ir::{
     AggFunc, AggregateItem, FrameBound, FrameUnits, ProjectionItem, SortKey, WindowFn, WindowFrame,
     WindowFunc,
@@ -29,11 +25,16 @@ use bc_runtime::window_frame;
 
 use crate::error::InterpError;
 
+mod external_sort;
 mod joins;
+mod mixed_spill;
 mod morsel;
 mod quantile_spill;
+mod radix_sort;
 mod reshape;
-pub(crate) use joins::{asof_join_batches, join_batches, key_indices};
+pub(crate) use external_sort::{external_merge_sort, external_sort_to_final_store};
+pub(crate) use joins::{asof_join_batches, join_batches, join_batches_with, key_indices};
+pub(crate) use mixed_spill::try_bounded_mixed_spill;
 pub(crate) use morsel::{morselize, remorselize};
 pub(crate) use quantile_spill::{
     try_bounded_distinct_spill, try_bounded_histogram_spill, try_bounded_mode_spill,
@@ -143,7 +144,64 @@ pub(crate) fn agg_funcs(aggregates: &[AggregateItem]) -> Vec<agg::AggFunc> {
     aggregates.iter().map(map_agg_func).collect()
 }
 
-/// Partition-local partial aggregation of one batch.
+/// Compile `expr` only if it is a *computed* expression worth JIT-ing. A bare
+/// `Col` is skipped: the interpreter evaluates it as a zero-copy `Arc` clone, while
+/// a compiled column would pay a compile cost and materialize a fresh buffer — a
+/// loss. Returns `None` (interpreter) for bare columns and anything outside the
+/// JIT subset; `Some` for compiled arithmetic/comparison/etc.
+fn try_compile_computed(expr: &bc_expr::Expr, sample: &RecordBatch) -> Jit {
+    match expr {
+        bc_expr::Expr::Col { .. } => None,
+        _ => try_compile(expr, sample),
+    }
+}
+
+/// Per-operator compiled expressions for an [`Aggregate`](bc_ir::RelOp::Aggregate):
+/// the group keys and each aggregate's value / ordering inputs. Compiled once from a
+/// sample batch and reused across every morsel's partial aggregation (the compile
+/// cost amortizes exactly as it does for Filter/Project). `CompiledExpr` is
+/// `Send + Sync`, so this is shared across rayon workers.
+pub(crate) struct AggJit {
+    group: Vec<Jit>,
+    input: Vec<Jit>,
+    input2: Vec<Jit>,
+}
+
+/// Compile the group-key and aggregate-input expressions once, using `sample` as a
+/// representative batch. Computed expressions (`GROUP BY a + b`, `SUM(price * qty)`)
+/// get the JIT fast path; bare columns and unsupported expressions stay on the
+/// interpreter (see [`try_compile_computed`]).
+pub(crate) fn compile_agg(
+    group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
+    sample: &RecordBatch,
+) -> AggJit {
+    AggJit {
+        group: group_keys
+            .iter()
+            .map(|k| try_compile_computed(&k.expr, sample))
+            .collect(),
+        input: aggregates
+            .iter()
+            .map(|a| {
+                a.input
+                    .as_ref()
+                    .and_then(|e| try_compile_computed(e, sample))
+            })
+            .collect(),
+        input2: aggregates
+            .iter()
+            .map(|a| {
+                a.input2
+                    .as_ref()
+                    .and_then(|e| try_compile_computed(e, sample))
+            })
+            .collect(),
+    }
+}
+
+/// Partition-local partial aggregation of one batch (interpreter only — the
+/// sequential oracle and callers without a compiled plan).
 pub(crate) fn eval_partial(
     batch: &RecordBatch,
     group_keys: &[ProjectionItem],
@@ -162,6 +220,35 @@ pub(crate) fn eval_partial(
         // The ordering key for arg_min/arg_max (the aggregate's second input).
         let key = match &item.input2 {
             Some(expr) => Some(expr.eval(batch)?),
+            None => None,
+        };
+        calls.push(AggCall::with_key(map_agg_func(item), values, key));
+    }
+    Ok(agg::partial(&group_arrays, &calls, batch.num_rows())?)
+}
+
+/// Partial aggregation using the per-operator compiled expressions ([`compile_agg`]).
+/// Identical result to [`eval_partial`] — the JIT is bit-for-bit with the
+/// interpreter and falls back per batch where it can't apply.
+pub(crate) fn eval_partial_jit(
+    batch: &RecordBatch,
+    group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
+    jit: &AggJit,
+) -> Result<agg::Partial, InterpError> {
+    let group_arrays: Vec<ArrayRef> = group_keys
+        .iter()
+        .zip(&jit.group)
+        .map(|(k, j)| eval_jit(j, &k.expr, batch))
+        .collect::<Result<_, _>>()?;
+    let mut calls = Vec::with_capacity(aggregates.len());
+    for (i, item) in aggregates.iter().enumerate() {
+        let values = match &item.input {
+            Some(expr) => Some(eval_jit(&jit.input[i], expr, batch)?),
+            None => None,
+        };
+        let key = match &item.input2 {
+            Some(expr) => Some(eval_jit(&jit.input2[i], expr, batch)?),
             None => None,
         };
         calls.push(AggCall::with_key(map_agg_func(item), values, key));
@@ -263,7 +350,18 @@ pub(crate) fn sort_batch(
             descending: k.descending,
             nulls_first: k.nulls_first,
         };
-        sort_to_indices(&k.expr.eval(batch)?, Some(opts), limit)?
+        let vals = k.expr.eval(batch)?;
+        // Radix fast path for a *full* sort (no top-N partial sort to beat) on a
+        // fixed-width integer/temporal key: O(n) vs the comparison sort's O(n log n),
+        // producing the identical relation. Falls back for limits / other types.
+        let radix = limit
+            .is_none()
+            .then(|| radix_sort::radix_sort_indices(&vals, opts))
+            .flatten();
+        match radix {
+            Some(idx) => idx,
+            None => sort_to_indices(&vals, Some(opts), limit)?,
+        }
     } else {
         let sort_columns: Vec<SortColumn> = keys
             .iter()
@@ -289,293 +387,35 @@ pub(crate) fn sort_batch(
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-/// Out-of-core sort: sort each input morsel into a run and spill it (dropping the
-/// input batch as we go), then merge the runs with a **bounded-fan-in, streaming**
-/// k-way merge. Peak memory is O(`FANIN` morsels) regardless of input size — only
-/// one batch per run in the active merge group is ever resident, and the output is
-/// streamed back to disk between passes rather than concatenated. The result equals
-/// a single in-memory `sort_batch` over the whole input (the merge is
-/// order-preserving). Disk spill uses the runtime's Arrow-IPC [`DiskSpillStore`].
-pub(crate) fn external_merge_sort(
-    parts: Vec<RecordBatch>,
-    keys: &[SortKey],
-    dir: &std::path::Path,
-) -> Result<Vec<RecordBatch>, InterpError> {
-    let Some(mut store) = external_sort_to_final_store(parts, keys, dir)? else {
-        return Ok(Vec::new());
-    };
-    // The final run holds the globally sorted result; stream its morsels out.
-    let mut out = Vec::new();
-    if let Some(reader) = store.open_reader(0).map_err(InterpError::from)? {
-        for batch in reader {
-            let batch = batch?;
-            if batch.num_rows() > 0 {
-                out.push(batch);
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Spill + bounded multi-pass merge, returning the final [`DiskSpillStore`] whose
-/// partition 0 holds the globally sorted run (or `None` for empty input). The store
-/// is returned so a caller can stream the sorted output via `open_reader(0)` more
-/// than once (e.g. the two-pass spilling quantile) without materializing it. Memory
-/// is bounded throughout (one batch per run in flight); see [`external_merge_sort`].
-pub(crate) fn external_sort_to_final_store(
-    parts: Vec<RecordBatch>,
-    keys: &[SortKey],
-    dir: &std::path::Path,
-) -> Result<Option<bc_runtime::agg::spill::DiskSpillStore>, InterpError> {
-    use bc_runtime::agg::spill::{DiskSpillStore, SpillStore};
-
-    // Pass 0: sort each input morsel into a run and spill it, dropping each input
-    // batch as it is consumed so the sorted runs never co-reside with the full input.
-    let mut store =
-        DiskSpillStore::new(dir.to_path_buf(), parts.len().max(1)).map_err(InterpError::from)?;
-    let mut n_runs = 0usize;
-    for b in parts.into_iter() {
-        if b.num_rows() == 0 {
-            continue;
-        }
-        let run = sort_batch(&b, keys, None)?;
-        store.append(n_runs, &run).map_err(InterpError::from)?;
-        n_runs += 1;
-        // `b` and `run` drop here — the input morsel's memory is released.
-    }
-    if n_runs == 0 {
-        return Ok(None);
-    }
-
-    // Merge passes: each merges groups of <= FANIN runs into one larger (spilled) run,
-    // streaming so only one batch per run is resident. Repeats until a single run
-    // remains. Fan-in bounds the resident working set independent of the run count.
-    const FANIN: usize = 16;
-    while n_runs > 1 {
-        let n_groups = n_runs.div_ceil(FANIN);
-        let mut next =
-            DiskSpillStore::new(dir.to_path_buf(), n_groups).map_err(InterpError::from)?;
-        for g in 0..n_groups {
-            let lo = g * FANIN;
-            let hi = (lo + FANIN).min(n_runs);
-            let mut readers = Vec::with_capacity(hi - lo);
-            for i in lo..hi {
-                if let Some(r) = store.open_reader(i).map_err(InterpError::from)? {
-                    readers.push(r);
-                }
-            }
-            stream_merge_group(readers, keys, &mut next, g)?;
-        }
-        store = next;
-        n_runs = n_groups;
-    }
-    Ok(Some(store))
-}
-
-/// A streaming reader over one spilled run's batches.
-type RunReader = arrow::ipc::reader::StreamReader<std::io::BufReader<std::fs::File>>;
-
-/// Build the key-row converter for a run group from a sample batch, baking each
-/// key's asc/desc/nulls options into the encoding so encoded rows compare in order.
-fn build_key_converter(batch: &RecordBatch, keys: &[SortKey]) -> Result<RowConverter, InterpError> {
-    let key_cols = eval_sort_keys(batch, keys)?;
-    let fields: Vec<SortField> = key_cols
-        .iter()
-        .zip(keys)
-        .map(|(arr, k)| {
-            SortField::new_with_options(
-                arr.data_type().clone(),
-                SortOptions {
-                    descending: k.descending,
-                    nulls_first: k.nulls_first,
-                },
-            )
-        })
-        .collect();
-    Ok(RowConverter::new(fields)?)
-}
-
-/// Advance reader `ri` to its next non-empty batch, encoding that batch's key rows.
-/// Sets `cur[ri]`/`cur_rows[ri]` to `None` when the reader is exhausted. Builds the
-/// shared `converter`/`schema` from the first batch seen across the group.
-#[allow(clippy::too_many_arguments)]
-fn load_next_run_batch(
-    ri: usize,
-    readers: &mut [RunReader],
-    cur: &mut [Option<RecordBatch>],
-    cur_rows: &mut [Option<Rows>],
-    idx: &mut [usize],
-    converter: &mut Option<RowConverter>,
-    schema: &mut Option<SchemaRef>,
-    keys: &[SortKey],
-) -> Result<(), InterpError> {
-    loop {
-        match readers[ri].next() {
-            Some(batch) => {
-                let batch = batch?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                if schema.is_none() {
-                    *schema = Some(batch.schema());
-                }
-                if converter.is_none() {
-                    *converter = Some(build_key_converter(&batch, keys)?);
-                }
-                let key_cols = eval_sort_keys(&batch, keys)?;
-                let rows = converter
-                    .as_ref()
-                    .expect("converter built above")
-                    .convert_columns(&key_cols)?;
-                cur[ri] = Some(batch);
-                cur_rows[ri] = Some(rows);
-                idx[ri] = 0;
-                return Ok(());
-            }
-            None => {
-                cur[ri] = None;
-                cur_rows[ri] = None;
-                return Ok(());
-            }
-        }
-    }
-}
-
-/// Flush the accumulated `(slot, row)` selections into one output batch via
-/// `interleave` and append it to `store`'s `out_partition`. Exhausted (`None`) slots
-/// get a type-correct empty placeholder; they are never indexed by `sel` because a
-/// flush always precedes loading a slot's next batch.
-fn flush_selection(
-    sel: &mut Vec<(usize, usize)>,
-    cur: &[Option<RecordBatch>],
-    schema: &SchemaRef,
-    store: &mut dyn bc_runtime::agg::spill::SpillStore,
-    out_partition: usize,
-) -> Result<(), InterpError> {
-    if sel.is_empty() {
-        return Ok(());
-    }
-    let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    for (c, field) in schema.fields().iter().enumerate() {
-        let owned: Vec<ArrayRef> = cur
-            .iter()
-            .map(|b| match b {
-                Some(batch) => batch.column(c).clone(),
-                None => arrow::array::new_empty_array(field.data_type()),
-            })
-            .collect();
-        let refs: Vec<&dyn Array> = owned.iter().map(|a| a.as_ref()).collect();
-        cols.push(interleave(&refs, sel)?);
-    }
-    let batch = RecordBatch::try_new(schema.clone(), cols)?;
-    store
-        .append(out_partition, &batch)
-        .map_err(InterpError::from)?;
-    sel.clear();
-    Ok(())
-}
-
-/// Streaming k-way merge of `readers` (each a sorted run) into `store`'s
-/// `out_partition`. Holds at most one batch per reader plus one output morsel of
-/// `(slot, row)` selections, so memory is bounded by the fan-in — not the run sizes.
-fn stream_merge_group(
-    mut readers: Vec<RunReader>,
-    keys: &[SortKey],
-    store: &mut dyn bc_runtime::agg::spill::SpillStore,
-    out_partition: usize,
-) -> Result<(), InterpError> {
-    let k = readers.len();
-    if k == 0 {
-        return Ok(());
-    }
-    let mut cur: Vec<Option<RecordBatch>> = (0..k).map(|_| None).collect();
-    let mut cur_rows: Vec<Option<Rows>> = (0..k).map(|_| None).collect();
-    let mut idx: Vec<usize> = vec![0; k];
-    let mut converter: Option<RowConverter> = None;
-    let mut schema: Option<SchemaRef> = None;
-    // Min-heap over the current head key of each live reader (owned, so it survives
-    // the reader advancing to its next batch).
-    let mut heap: BinaryHeap<Reverse<(OwnedRow, usize)>> = BinaryHeap::new();
-
-    for ri in 0..k {
-        load_next_run_batch(
-            ri,
-            &mut readers,
-            &mut cur,
-            &mut cur_rows,
-            &mut idx,
-            &mut converter,
-            &mut schema,
-            keys,
-        )?;
-        if let Some(rows) = &cur_rows[ri] {
-            heap.push(Reverse((rows.row(0).owned(), ri)));
-        }
-    }
-    // The output schema is fixed once the first batch is seen; `schema` (the Option)
-    // stays threaded through later `load_next_run_batch` calls (a no-op once set).
-    let Some(out_schema) = schema.clone() else {
-        return Ok(()); // every reader was empty
-    };
-
-    let target = bc_arrow::DEFAULT_MORSEL_ROWS;
-    let mut sel: Vec<(usize, usize)> = Vec::with_capacity(target);
-
-    while let Some(Reverse((_key, ri))) = heap.pop() {
-        sel.push((ri, idx[ri]));
-        idx[ri] += 1;
-        let n = cur[ri].as_ref().map_or(0, |b| b.num_rows());
-        if idx[ri] < n {
-            heap.push(Reverse((
-                cur_rows[ri]
-                    .as_ref()
-                    .expect("live cursor")
-                    .row(idx[ri])
-                    .owned(),
-                ri,
-            )));
-        } else {
-            // Reader `ri` exhausted its current batch. The pending selections still
-            // reference the current batches, so flush before swapping `ri`'s batch.
-            flush_selection(&mut sel, &cur, &out_schema, store, out_partition)?;
-            load_next_run_batch(
-                ri,
-                &mut readers,
-                &mut cur,
-                &mut cur_rows,
-                &mut idx,
-                &mut converter,
-                &mut schema,
-                keys,
-            )?;
-            if let Some(rows) = &cur_rows[ri] {
-                heap.push(Reverse((rows.row(0).owned(), ri)));
-            }
-        }
-        if sel.len() >= target {
-            flush_selection(&mut sel, &cur, &out_schema, store, out_partition)?;
-        }
-    }
-    flush_selection(&mut sel, &cur, &out_schema, store, out_partition)
-}
-
-/// Evaluate the sort-key expressions of `batch` into their key columns.
-fn eval_sort_keys(batch: &RecordBatch, keys: &[SortKey]) -> Result<Vec<ArrayRef>, InterpError> {
-    keys.iter()
-        .map(|k| k.expr.eval(batch).map_err(InterpError::from))
-        .collect()
-}
-
-/// Window over a single (already-materialized) batch: evaluate partition keys,
-/// order keys, and each function's optional input, run the runtime window kernel,
-/// and append the resulting columns (one per function) to the input batch. Input
-/// columns are preserved; the appended columns are named by each function alias.
+/// Window over a single (already-materialized) batch, at the default parallel-row
+/// threshold. Evaluates partition/order keys + each function input, runs the runtime
+/// window kernel, and appends one column per function (named by alias) to the input.
 pub(crate) fn window_batch(
     batch: &RecordBatch,
     partition_keys: &[bc_expr::Expr],
     order_keys: &[SortKey],
     functions: &[WindowFunc],
     rank_limit: Option<usize>,
+) -> Result<RecordBatch, InterpError> {
+    window_batch_with(
+        batch,
+        partition_keys,
+        order_keys,
+        functions,
+        rank_limit,
+        bc_arrow::RuntimeTuning::default().window_parallel_row_threshold,
+    )
+}
+
+/// [`window_batch`] with a caller-supplied parallel-row threshold (perf-only — it only
+/// decides whether per-partition sorts run across cores; the output is identical).
+pub(crate) fn window_batch_with(
+    batch: &RecordBatch,
+    partition_keys: &[bc_expr::Expr],
+    order_keys: &[SortKey],
+    functions: &[WindowFunc],
+    rank_limit: Option<usize>,
+    parallel_row_threshold: usize,
 ) -> Result<RecordBatch, InterpError> {
     let num_rows = batch.num_rows();
 
@@ -611,7 +451,13 @@ pub(crate) fn window_batch(
         });
     }
 
-    let cols = window::window(&part_arrays, &order_arrays, &calls, num_rows)?;
+    let cols = window::window_with(
+        &part_arrays,
+        &order_arrays,
+        &calls,
+        num_rows,
+        parallel_row_threshold,
+    )?;
 
     // input columns + one appended column per function alias.
     let in_schema = batch.schema();

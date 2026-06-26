@@ -9,11 +9,11 @@ partition invariant from the engine contract, measured.
 
 Run:
     source .venv/bin/activate
-    python3 benchmarks/distributed.py           # default ~2M rows, 8 partitions
-    python3 benchmarks/distributed.py 5000000 16
+    python3 benchmarks/distributed.py           # TPC-H scale 1, 8 partitions
+    python3 benchmarks/distributed.py 10 16     # scale 10, 16 partitions
 
-Requires the optional ``ray`` extra. Without it the benchmark exits cleanly with
-a skip message rather than failing.
+Reads the public TPC-H tables (``sources.py`` — no data is generated). Requires the
+optional ``ray`` extra; without it the benchmark exits cleanly with a skip message.
 """
 
 from __future__ import annotations
@@ -22,8 +22,9 @@ import sys
 import time
 
 import batcher as bt
+import engines as engines_mod
 from batcher import col, count
-from contexts import SyntheticContext
+from context import Context
 from harness import bench, results_match
 
 try:
@@ -33,44 +34,53 @@ try:
 except ImportError:
     HAVE_RAY = False
 
-DEFAULT_SCALE = 2_000_000
+DEFAULT_SCALE = 1.0
 
 
-def build_plans(ctx: SyntheticContext):
+def build_plans(ctx: Context):
     """Return (name, plan) pairs; each plan is a non-collected Dataset.
 
     These mirror the mergeable operators (aggregate, join, distinct) the
-    distributed path composes from ``partial / combine / finalize``.
+    distributed path composes from ``partial / combine / finalize``, over the real
+    TPC-H ``lineitem`` ⋈ ``orders`` tables.
     """
+    lineitem = ctx.handle("lineitem", "batcher")
+    # orders keyed to lineitem so the equi-join is on a shared column name.
+    orders = ctx.handle("orders", "batcher").rename({"o_orderkey": "l_orderkey"})
     return [
-        ("groupby-agg", ctx.bf.group_by("k1").agg(s=col("price").sum(), n=count())),
-        ("groupby-2key", ctx.bf.group_by("k1", "k2").agg(s=col("qty").sum(), n=count())),
+        (
+            "groupby-agg",
+            lineitem.group_by("l_returnflag").agg(s=col("l_extendedprice").sum(), n=count()),
+        ),
+        (
+            "groupby-2key",
+            lineitem.group_by("l_returnflag", "l_linestatus").agg(
+                s=col("l_quantity").sum(), n=count()
+            ),
+        ),
         (
             "join+groupby",
-            ctx.bf.join(ctx.bd, on="dim_key", how="inner")
-            .group_by("region")
-            .agg(s=col("price").sum(), n=count()),
+            lineitem.join(orders, on="l_orderkey", how="inner")
+            .group_by("o_orderpriority")
+            .agg(s=col("l_extendedprice").sum(), n=count()),
         ),
-        ("distinct", ctx.bf.select("k1", "k2").distinct()),
+        ("distinct", lineitem.select("l_returnflag", "l_linestatus").distinct()),
     ]
 
 
-def main() -> int:
+def run(scale: float = DEFAULT_SCALE, num_partitions: int = 8, runs: int = 3) -> int:
+    """Run the single-node vs many-partition equivalence + timing benchmark."""
     if not HAVE_RAY:
         print("ray is not installed; skipping distributed benchmark.")
         print("Install the optional extra with:  uv pip install -e '.[ray]'")
         return 0
 
-    scale = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_SCALE
-    num_partitions = int(sys.argv[2]) if len(sys.argv) > 2 else 8
-    runs = 3
-
     print(f"Batcher distributed benchmark  (engine {bt.engine_version()})")
-    print(f"scale = {scale:,} rows, num_partitions = {num_partitions}, best-of-{runs}\n")
+    print(f"TPC-H scale = {scale}, num_partitions = {num_partitions}, best-of-{runs}\n")
 
     t0 = time.perf_counter()
-    ctx = SyntheticContext.build(scale)
-    print(f"generated data in {time.perf_counter() - t0:.2f}s\n")
+    ctx = Context.build("tpch", scale, engines_mod.resolve(["batcher"]))
+    print(f"loaded data in {time.perf_counter() - t0:.2f}s\n")
 
     rows = []
     any_mismatch = False
@@ -114,6 +124,12 @@ def main() -> int:
         return 1
     print("Distributed results match single-node on every query.")
     return 0
+
+
+def main() -> int:
+    scale = float(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_SCALE
+    num_partitions = int(sys.argv[2]) if len(sys.argv) > 2 else 8
+    return run(scale, num_partitions)
 
 
 if __name__ == "__main__":

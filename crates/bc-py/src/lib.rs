@@ -8,79 +8,27 @@
 //! pyarrow batches. Conversion is zero-copy via the Arrow C Data Interface, so a
 //! `RecordBatch` crosses the boundary without serialization.
 
-use std::sync::Arc;
-
 use arrow::array::{Array, RecordBatch};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::DataType;
 use arrow_pyarrow::PyArrowType;
-use bc_ir::{AggregateItem, EngineConfig, ProjectionItem, RelOp};
+use bc_ir::{EngineConfig, RelOp};
 use bc_sketches::Mergeable; // brings `.merge()` into scope for ColumnStats
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 mod bloom;
+mod errors;
+mod normalize;
 mod process;
+mod shuffle;
+mod tracing_init;
+use errors::transport_to_pyerr;
+use normalize::{
+    narrow_output, normalize_batch, original_narrow_types, parse_aggregates, parse_group_keys,
+    supported_cast_dtypes, unwrap_batches,
+};
 use process::{shared_memory_pool, shared_runtime};
-
-/// The widened type the engine's Int64/Float64 kernels operate on, or `None` to
-/// leave a column as-is. Real-world data is full of narrow numerics (Int32 ids,
-/// Float32 features, unsigned counts); normalizing them once at the boundary lets
-/// every operator stay on the two well-tested numeric paths.
-fn widen_to(dt: &DataType) -> Option<DataType> {
-    use DataType::*;
-    match dt {
-        Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32 | UInt64 => Some(Int64),
-        Float16 | Float32 => Some(Float64),
-        _ => None,
-    }
-}
-
-/// Upcast narrow numeric columns of one batch to Int64/Float64. Non-numeric and
-/// already-wide columns are passed through untouched (a cheap `Arc` clone).
-fn normalize_batch(batch: &RecordBatch) -> RecordBatch {
-    let schema = batch.schema();
-    let mut changed = false;
-    let mut fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for (i, field) in schema.fields().iter().enumerate() {
-        let col = batch.column(i);
-        match widen_to(col.data_type()) {
-            Some(target) => match cast(col, &target) {
-                Ok(arr) => {
-                    changed = true;
-                    fields.push(Field::new(field.name(), target, field.is_nullable()));
-                    columns.push(arr);
-                }
-                Err(_) => {
-                    fields.push(field.as_ref().clone());
-                    columns.push(col.clone());
-                }
-            },
-            None => {
-                fields.push(field.as_ref().clone());
-                columns.push(col.clone());
-            }
-        }
-    }
-    if !changed {
-        return batch.clone();
-    }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap_or_else(|_| batch.clone())
-}
-
-/// Unwrap a Python list of pyarrow batches into normalized Arrow record batches.
-pub(crate) fn unwrap_batches(batches: Vec<PyArrowType<RecordBatch>>) -> Vec<RecordBatch> {
-    batches.into_iter().map(|b| normalize_batch(&b.0)).collect()
-}
-
-fn parse_group_keys(json: &str) -> PyResult<Vec<ProjectionItem>> {
-    serde_json::from_str(json).map_err(to_pyerr)
-}
-
-fn parse_aggregates(json: &str) -> PyResult<Vec<AggregateItem>> {
-    serde_json::from_str(json).map_err(to_pyerr)
-}
 
 /// Execute a plan against in-memory input relations, returning the result morsels.
 ///
@@ -105,10 +53,11 @@ fn execute_plan(
     sources: Vec<Vec<PyArrowType<RecordBatch>>>,
     engine_config: &str,
 ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
-    let (plan, sources, opts) = prepare_exec(plan_json, sources, engine_config)?;
+    let (plan, sources, opts, narrow) = prepare_exec(plan_json, sources, engine_config)?;
     let out = py
         .allow_threads(|| bc_interp::execute_parallel_with(&plan, &sources, &opts))
         .map_err(to_pyerr)?;
+    let out = narrow_output(out, &narrow);
     Ok(out.into_iter().map(PyArrowType).collect())
 }
 
@@ -127,10 +76,11 @@ fn execute_plan_metered(
     sources: Vec<Vec<PyArrowType<RecordBatch>>>,
     engine_config: &str,
 ) -> PyResult<(Vec<PyArrowType<RecordBatch>>, String)> {
-    let (plan, sources, opts) = prepare_exec(plan_json, sources, engine_config)?;
+    let (plan, sources, opts, narrow) = prepare_exec(plan_json, sources, engine_config)?;
     let (out, metrics) = py
         .allow_threads(|| bc_interp::execute_parallel_with_metrics(&plan, &sources, &opts))
         .map_err(to_pyerr)?;
+    let out = narrow_output(out, &narrow);
     Ok((
         out.into_iter().map(PyArrowType).collect(),
         metrics.to_json(),
@@ -139,11 +89,18 @@ fn execute_plan_metered(
 
 /// Shared setup for the execute entry points: parse the plan + engine config and
 /// normalize the input morsels (narrow numeric types → Int64/Float64) once.
+type ExecSetup = (
+    RelOp,
+    Vec<Vec<RecordBatch>>,
+    bc_interp::ExecOptions,
+    std::collections::HashMap<String, DataType>,
+);
+
 fn prepare_exec(
     plan_json: &str,
     sources: Vec<Vec<PyArrowType<RecordBatch>>>,
     engine_config: &str,
-) -> PyResult<(RelOp, Vec<Vec<RecordBatch>>, bc_interp::ExecOptions)> {
+) -> PyResult<ExecSetup> {
     let plan = RelOp::from_json(plan_json).map_err(to_pyerr)?;
     let cfg = EngineConfig::from_json(engine_config).map_err(to_pyerr)?;
     let mut opts = bc_interp::ExecOptions::default().with_engine_config(&cfg);
@@ -155,14 +112,21 @@ fn prepare_exec(
     }
     let sources: Vec<Vec<RecordBatch>> = sources
         .into_iter()
-        .map(|relation| {
-            relation
-                .into_iter()
-                .map(|b| normalize_batch(&b.0))
-                .collect()
-        })
+        .map(|relation| relation.into_iter().map(|b| b.0).collect())
         .collect();
-    Ok((plan, sources, opts))
+    // Record pre-widening source widths *before* normalization (which widens them
+    // away), and only when output re-narrowing is requested; an empty map makes
+    // `narrow_output` a no-op (the default fast path).
+    let narrow = if cfg.shrink_output_dtypes {
+        original_narrow_types(&sources)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let sources: Vec<Vec<RecordBatch>> = sources
+        .into_iter()
+        .map(|relation| relation.iter().map(normalize_batch).collect())
+        .collect();
+    Ok((plan, sources, opts, narrow))
 }
 
 /// Map any engine error into a Python exception. The error hierarchy mapping
@@ -368,6 +332,54 @@ fn tail_quantiles(
     Ok(out)
 }
 
+/// Build a TDigest over `column`'s numeric values across `batches` and return its
+/// serialized bytes — the *partial* step of a mergeable approximate quantile. Returns
+/// `None` when the column is missing, non-numeric, or has no valid values. Paired with
+/// `tdigest_quantile`: each partition (or streamed chunk) builds one sketch, the driver
+/// merges them, so an approximate quantile never collects the column to one place.
+#[pyfunction]
+fn tdigest_partial(
+    column: String,
+    batches: Vec<PyArrowType<RecordBatch>>,
+) -> PyResult<Option<Vec<u8>>> {
+    let mut digest = bc_sketches::TDigest::default();
+    let mut any = false;
+    for batch in &batches {
+        let b = &batch.0;
+        if let Some(col) = b.column_by_name(&column) {
+            let Ok(f) = cast(col, &DataType::Float64) else {
+                continue;
+            };
+            let Some(arr) = f.as_any().downcast_ref::<arrow::array::Float64Array>() else {
+                continue;
+            };
+            for i in 0..arr.len() {
+                if arr.is_valid(i) {
+                    digest.add(arr.value(i));
+                    any = true;
+                }
+            }
+        }
+    }
+    Ok(any.then(|| digest.to_bytes()))
+}
+
+/// Merge serialized TDigest `sketches` (from `tdigest_partial`) and return the value at
+/// quantile `q` — the *combine + finalize* step. `None` when no sketch carried data.
+#[pyfunction]
+fn tdigest_quantile(sketches: Vec<Vec<u8>>, q: f64) -> PyResult<Option<f64>> {
+    let mut merged: Option<bc_sketches::TDigest> = None;
+    for bytes in &sketches {
+        if let Some(d) = bc_sketches::TDigest::from_bytes(bytes) {
+            match merged.as_mut() {
+                Some(m) => m.merge(&d),
+                None => merged = Some(d),
+            }
+        }
+    }
+    Ok(merged.and_then(|mut m| m.quantile(q)))
+}
+
 /// Heavy hitters (the Misra-Gries `FrequentItems` sketch) per column: the values
 /// whose frequency exceeds `fraction` of the rows, with their estimated counts.
 /// Kyber consumes this for skew detection (a hot join key → salting). Values are
@@ -452,53 +464,6 @@ fn reservoir_sample(
     Ok(PyArrowType(sampled))
 }
 
-/// Hash-shuffle batches into `num_partitions` buckets by the given key columns.
-#[pyfunction]
-fn partition_batches(
-    batches: Vec<PyArrowType<RecordBatch>>,
-    key_indices: Vec<usize>,
-    num_partitions: usize,
-) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
-    let parts =
-        bc_interp::dist::partition_batches(&unwrap_batches(batches), &key_indices, num_partitions)
-            .map_err(to_pyerr)?;
-    Ok(parts
-        .into_iter()
-        .map(|bucket| bucket.into_iter().map(PyArrowType).collect())
-        .collect())
-}
-
-/// Skew-aware shuffle for a single-key distributed join: a hot key's rows are
-/// salted across reducers instead of overloading one. `hot_keys` are the hot values
-/// rendered as strings (matching `heavy_hitters`); `replicate=false` is the probe
-/// side (one salted bucket per hot row), `replicate=true` the build side (every hot
-/// row to all salted buckets). Cold keys hash identically to `partition_batches`, so
-/// the joined relation is unchanged — only the hot key's work fans across reducers.
-#[pyfunction]
-fn salted_partition_batches(
-    batches: Vec<PyArrowType<RecordBatch>>,
-    key_indices: Vec<usize>,
-    num_partitions: usize,
-    hot_keys: Vec<String>,
-    salt_count: u32,
-    replicate: bool,
-) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
-    let hot: std::collections::HashSet<String> = hot_keys.into_iter().collect();
-    let parts = bc_interp::dist::salted_partition_batches(
-        &unwrap_batches(batches),
-        &key_indices,
-        num_partitions,
-        &hot,
-        salt_count,
-        replicate,
-    )
-    .map_err(to_pyerr)?;
-    Ok(parts
-        .into_iter()
-        .map(|bucket| bucket.into_iter().map(PyArrowType).collect())
-        .collect())
-}
-
 /// A process-wide memory accounting pool (Carbonite's reserve-before-allocate
 /// enforcement primitive, from `bc-resource`). Carbonite sets the limit from its
 /// memory envelope and reserves/releases against it so the engine spills instead
@@ -565,7 +530,7 @@ impl MemoryPool {
 /// own `ServerHandle` keeps this server's serve task alive for the object's life.
 #[pyclass]
 struct FlightShuffleServer {
-    exchange: bc_transport::ShuffleExchange,
+    pub(crate) exchange: bc_transport::ShuffleExchange,
     addr: String,
 }
 
@@ -642,6 +607,39 @@ impl FlightShuffleServer {
         Ok(batches.map(|bs| bs.into_iter().map(PyArrowType).collect()))
     }
 
+    /// Mirror `ticket`'s `batches` to a same-node shared-memory file (Arrow IPC over a
+    /// memory map) under this server's advertised address, so a reducer in *another*
+    /// process on the same host can read them with no gRPC/loopback hop. Best-effort:
+    /// a write error is swallowed (the reducer falls back to Flight).
+    fn publish_shared(&self, py: Python<'_>, ticket: &str, batches: Vec<PyArrowType<RecordBatch>>) {
+        let batches: Vec<RecordBatch> = batches.iter().map(|b| normalize_batch(&b.0)).collect();
+        let addr = self.addr.clone();
+        py.allow_threads(|| {
+            let _ = bc_transport::publish_shared(&addr, ticket, &batches);
+        });
+    }
+
+    /// Read a partition a same-node peer published under `(source_addr, ticket)` from
+    /// shared memory (mmap), or `None` if absent (an empty bucket, an un-shm'd peer, or
+    /// shm off) so the caller falls back to Flight.
+    fn shm_fetch(
+        &self,
+        py: Python<'_>,
+        source_addr: &str,
+        ticket: &str,
+    ) -> PyResult<Option<Vec<PyArrowType<RecordBatch>>>> {
+        let batches = py
+            .allow_threads(|| bc_transport::fetch_shared(source_addr, ticket))
+            .map_err(to_pyerr)?;
+        Ok(batches.map(|bs| bs.into_iter().map(PyArrowType).collect()))
+    }
+
+    /// Remove every shared-memory file this server published (plan teardown).
+    fn clear_shared(&self, py: Python<'_>) {
+        let addr = self.addr.clone();
+        py.allow_threads(|| bc_transport::clear_shared(&addr));
+    }
+
     /// Evict one published partition (its reducers have fetched it), freeing it.
     fn release(&self, py: Python<'_>, ticket: &str) -> PyResult<()> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
@@ -685,7 +683,7 @@ fn flight_fetch(
 ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
     let batches = py
         .allow_threads(|| bc_transport::fetch_blocking_with_credits(addr, ticket, credits, token))
-        .map_err(to_pyerr)?;
+        .map_err(transport_to_pyerr)?;
     Ok(batches.into_iter().map(PyArrowType).collect())
 }
 
@@ -700,6 +698,13 @@ fn set_flight_transport_config(idle_timeout_ms: u64, keepalive_ms: u64) {
     bc_transport::set_transport_timeouts(idle_timeout_ms, keepalive_ms);
 }
 
+/// Whether a same-node shared-memory transfer directory is usable on this host (so the
+/// control plane can avoid selecting SHARED_MEMORY where it would never work).
+#[pyfunction]
+fn shm_available() -> bool {
+    bc_transport::shm_available()
+}
+
 /// A pooled, persistent shuffle consumer.
 ///
 /// Holds a `ClientPool` for its lifetime, so a reducer's many `fetch`es reuse gRPC
@@ -709,7 +714,7 @@ fn set_flight_transport_config(idle_timeout_ms: u64, keepalive_ms: u64) {
 /// costs O(peers) connections. Driven by the process-wide [`shared_runtime`].
 #[pyclass]
 struct ShuffleClient {
-    pool: std::sync::Arc<bc_transport::ClientPool>,
+    pub(crate) pool: std::sync::Arc<bc_transport::ClientPool>,
 }
 
 #[pymethods]
@@ -736,7 +741,7 @@ impl ShuffleClient {
             .allow_threads(|| {
                 shared_runtime().block_on(self.pool.fetch_secured(addr, &t, credits, token))
             })
-            .map_err(to_pyerr)?;
+            .map_err(transport_to_pyerr)?;
         Ok(batches.into_iter().map(PyArrowType).collect())
     }
 
@@ -750,13 +755,17 @@ impl ShuffleClient {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__engine_version__", env!("CARGO_PKG_VERSION"))?;
+    m.add_function(wrap_pyfunction!(tracing_init::init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_metered, m)?)?;
     m.add_function(wrap_pyfunction!(partial_aggregate, m)?)?;
     m.add_function(wrap_pyfunction!(combine, m)?)?;
     m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;
-    m.add_function(wrap_pyfunction!(partition_batches, m)?)?;
-    m.add_function(wrap_pyfunction!(salted_partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::range_partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::salted_partition_batches, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::gather_combine, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::gather_concat, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::build_key_bloom, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::merge_blooms, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::bloom_filter_batches, m)?)?;
@@ -765,12 +774,19 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(column_stats, m)?)?;
     m.add_function(wrap_pyfunction!(column_quantiles, m)?)?;
     m.add_function(wrap_pyfunction!(tail_quantiles, m)?)?;
+    m.add_function(wrap_pyfunction!(tdigest_partial, m)?)?;
+    m.add_function(wrap_pyfunction!(tdigest_quantile, m)?)?;
     m.add_function(wrap_pyfunction!(heavy_hitters, m)?)?;
     m.add_function(wrap_pyfunction!(reservoir_sample, m)?)?;
     m.add_class::<FlightShuffleServer>()?;
     m.add_function(wrap_pyfunction!(flight_fetch, m)?)?;
     m.add_function(wrap_pyfunction!(set_flight_transport_config, m)?)?;
+    m.add_function(wrap_pyfunction!(shm_available, m)?)?;
+    m.add_function(wrap_pyfunction!(supported_cast_dtypes, m)?)?;
     m.add_class::<ShuffleClient>()?;
     m.add_class::<MemoryPool>()?;
+    // Classified shuffle-fetch exceptions: the control plane catches `Retryable` as
+    // worker loss (recompute + retry) and lets `Fatal` propagate (fail fast).
+    errors::register(m)?;
     Ok(())
 }

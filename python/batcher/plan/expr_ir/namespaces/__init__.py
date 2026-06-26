@@ -29,7 +29,6 @@ from batcher.plan.expr_ir.func_nodes import (
     StructField,
 )
 from batcher.plan.expr_ir.namespaces.collections import (
-    _EmbeddingNamespace,
     _JsonNamespace,
     _ListNamespace,
     _MapNamespace,
@@ -58,7 +57,6 @@ __all__ = [
     "Strptime",
     "StructField",
     "_DtNamespace",
-    "_EmbeddingNamespace",
     "_JsonNamespace",
     "_ListNamespace",
     "_MapNamespace",

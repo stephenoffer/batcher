@@ -35,14 +35,12 @@ from batcher.plan.logical import (
 __all__ = ["BuildSideDecision", "adaptive_build_side", "build_side_rule"]
 
 
-# Below this many estimated *bytes* on the build (right) side, replicating it is
-# cheaper than shuffling the probe side, so we pick a broadcast join — "small
-# enough to fit in memory on every worker" (cf. Spark's 10 MB
-# autoBroadcastJoinThreshold). Byte-based, not row-based, so a few rows of wide
-# payloads (embeddings, blob handles) are *not* mistakenly broadcast while many
-# narrow rows still are. The choice only affects data movement, never the result,
-# so the cutoff is a performance knob, not a correctness one.
-BROADCAST_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB
+# The build-side broadcast byte threshold lives in `OptimizerConfig.broadcast_max_bytes`
+# (the single source of truth shared with the distributed executor's runtime guard):
+# below it, replicating the build side is cheaper than shuffling the probe side
+# (cf. Spark's autoBroadcastJoinThreshold). Byte-based, not row-based, so a few rows
+# of wide payloads (embeddings, blobs) aren't mistakenly broadcast. The choice only
+# affects data movement, never the result — a performance knob, not a correctness one.
 
 # When neither side is broadcast-small but both exceed this, prefer a sort-merge
 # join (no hash table over a huge build side). Also a performance knob — every
@@ -72,7 +70,18 @@ def adaptive_build_side(
     optimizer context (e.g. the adaptive re-optimization loop)."""
     decisions: list[BuildSideDecision] = []
     cost = cost_model or CostModel(estimator)
-    return _rewrite(plan, estimator, cost, decisions), decisions
+    return _rewrite(plan, estimator, cost, decisions, _broadcast_max_bytes()), decisions
+
+
+def _broadcast_max_bytes() -> int:
+    """Build-side broadcast threshold in bytes — `OptimizerConfig.broadcast_max_bytes`.
+
+    The single source of truth shared with the distributed executor's runtime guard;
+    a function (not an inlined read) so tests can patch the planner's threshold.
+    """
+    from batcher.config import active_config
+
+    return active_config().optimizer.broadcast_max_bytes
 
 
 def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
@@ -86,15 +95,22 @@ def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
 
 
 def _rewrite(
-    node: LogicalPlan, est: CardinalityEstimator, cost: CostModel, decisions: list
+    node: LogicalPlan,
+    est: CardinalityEstimator,
+    cost: CostModel,
+    decisions: list,
+    max_bytes: int,
 ) -> LogicalPlan:
     if isinstance(node, Scan):
         return node
     if isinstance(node, Union):
-        return Union(tuple(_rewrite(i, est, cost, decisions) for i in node.inputs), node.distinct)
+        return Union(
+            tuple(_rewrite(i, est, cost, decisions, max_bytes) for i in node.inputs),
+            node.distinct,
+        )
     if isinstance(node, Join):
-        left = _rewrite(node.left, est, cost, decisions)
-        right = _rewrite(node.right, est, cost, decisions)
+        left = _rewrite(node.left, est, cost, decisions, max_bytes)
+        right = _rewrite(node.right, est, cost, decisions, max_bytes)
         node = Join(
             left, right, node.left_keys, node.right_keys, node.join_type, node.output, node.strategy
         )
@@ -119,12 +135,18 @@ def _rewrite(
         # Size the build side in bytes (rows × measured per-row width), so wide
         # payloads aren't broadcast on a misleadingly small row count.
         build_bytes = build_rows * cost.row_bytes(node.right)
-        broadcast = build_bytes <= BROADCAST_MAX_BYTES
+        broadcast = build_bytes <= max_bytes
         if broadcast:
             node = dataclasses.replace(node, strategy="broadcast")
         elif l_est.rows >= SORT_MERGE_MIN_ROWS and r_est.rows >= SORT_MERGE_MIN_ROWS:
             # Two large inputs, neither small enough to broadcast: sort-merge avoids
             # building a hash table over a huge side (Spark's default large-join).
+            # NOTE: preferring sort-merge for *already-ordered* inputs was tried and
+            # reverted — benchmarking showed SMJ's RowConverter encoding overhead loses
+            # to the hash join even when its sort is skipped, so it was a regression.
+            # The engine's skip-sort fast-path (`bc-runtime` `sort_indices_if_unsorted`)
+            # still makes this size-driven SMJ cheaper when its inputs happen to arrive
+            # sorted; only the planner *preference* was withdrawn.
             node = dataclasses.replace(node, strategy="sort_merge")
         decisions.append(
             BuildSideDecision(
@@ -134,7 +156,9 @@ def _rewrite(
         return node
     # Single-input nodes: rewrite the child in place.
     if hasattr(node, "input"):
-        return dataclasses.replace(node, input=_rewrite(node.input, est, cost, decisions))
+        return dataclasses.replace(
+            node, input=_rewrite(node.input, est, cost, decisions, max_bytes)
+        )
     return node
 
 

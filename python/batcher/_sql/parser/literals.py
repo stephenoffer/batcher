@@ -116,6 +116,47 @@ def _literal(node) -> Expr:
     return lit(float(text) if ("." in text or "e" in text.lower()) else int(text))
 
 
+def _fold_const_arith(node) -> Expr | None:
+    """Constant-fold ``literal <op> literal`` arithmetic with exact decimal semantics.
+
+    SQL numeric literals are exact decimals, so ``0.06 + 0.01`` is ``0.07`` — not the
+    IEEE ``0.0699999…`` that folding two ``float`` literals yields. Folding through
+    ``Decimal`` (whenever a decimal literal is involved) makes boundary comparisons
+    like ``l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01`` (TPC-H Q6) agree with
+    DuckDB/Spark. Pure-integer arithmetic keeps its integer type. Returns the folded
+    ``lit``, or ``None`` when the node isn't foldable literal arithmetic.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    from sqlglot import expressions as exp
+
+    op = {exp.Add: "+", exp.Sub: "-", exp.Mul: "*", exp.Div: "/"}.get(type(node))
+    if op is None:
+        return None
+    a, b = node.this, node.expression
+    if not (isinstance(a, exp.Literal) and isinstance(b, exp.Literal)):
+        return None
+    if a.is_string or b.is_string:
+        return None
+    if not any(("." in x.this) or ("e" in x.this.lower()) for x in (a, b)):
+        return None  # pure-integer arithmetic keeps its integer type
+    try:
+        da, db = Decimal(a.this), Decimal(b.this)
+        if op == "+":
+            r = da + db
+        elif op == "-":
+            r = da - db
+        elif op == "*":
+            r = da * db
+        elif db == 0:
+            return None
+        else:
+            r = da / db
+    except InvalidOperation:
+        return None
+    return lit(float(r))
+
+
 def _apply_interval(date_expr: Expr, interval, *, subtract: bool) -> Expr:
     """`date +/- INTERVAL n <unit>` for a DATE operand.
 

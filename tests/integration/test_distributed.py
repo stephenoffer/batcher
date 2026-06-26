@@ -248,6 +248,27 @@ def test_distributed_join_matches_single_node(how):
     assert _rowset(single) == _rowset(distrib)
 
 
+def test_distributed_broadcast_runtime_guard_falls_back_to_shuffle(monkeypatch):
+    """The planner picks broadcast from an estimate, but the distributed executor's
+    runtime guard sees the materialized build side exceed the (tiny) configured
+    threshold and falls back to a shuffle join — same result, no driver OOM."""
+    import dataclasses
+
+    from batcher.config import active_config, config_context
+    from batcher.kyber.rules import selection
+
+    left, right = _join_data()
+    single = left.join(right, on="k").collect()
+    # Planner threshold huge → it marks the join broadcast; config threshold tiny →
+    # the executor's runtime guard rejects the actual build side and shuffles instead.
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: 1 << 40)
+    cfg = active_config()
+    guarded_cfg = cfg.replace(optimizer=dataclasses.replace(cfg.optimizer, broadcast_max_bytes=1))
+    with config_context(guarded_cfg):
+        guarded = left.join(right, on="k").collect(distributed=True, num_workers=4)
+    assert _rowset(guarded) == _rowset(single)
+
+
 @pytest.mark.parametrize("how", ["inner", "left", "semi", "anti"])
 def test_distributed_broadcast_equals_shuffle_and_single_node(how, monkeypatch):
     # Tiny right side → the planner marks the join broadcast, so the distributed
@@ -260,11 +281,96 @@ def test_distributed_broadcast_equals_shuffle_and_single_node(how, monkeypatch):
     single = left.join(right, on="k", how=how).collect()
     bcast = left.join(right, on="k", how=how).collect(distributed=True, num_workers=4)
 
-    monkeypatch.setattr(selection, "BROADCAST_MAX_BYTES", -1)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)
     shuffled = left.join(right, on="k", how=how).collect(distributed=True, num_workers=4)
 
     assert _rowset(bcast) == _rowset(single)
     assert _rowset(shuffled) == _rowset(single)
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_iter_batches_streams_result_off_driver(transport):
+    # iter_batches(distributed=True) runs the breaker with materialize=False so the
+    # result stays partitioned on the workers, then streams it back one reducer bucket
+    # at a time — the driver never holds the whole result. Rows must equal collect, and
+    # the result comes back in multiple buckets (not one collected table).
+    t = _data()
+    single = bt.from_arrow(t).group_by("k").agg(s=col("v").sum(), n=count()).collect()
+    batches = list(
+        bt.from_arrow(t)
+        .group_by("k")
+        .agg(s=col("v").sum(), n=count())
+        .iter_batches(distributed=True, num_workers=4, transport=transport)
+    )
+    got = pa.Table.from_batches(batches) if batches else single.slice(0, 0)
+    assert _rowset(got) == _rowset(single)
+    assert len(batches) >= 1  # streamed back per reducer bucket, not one driver table
+
+
+def test_distributed_iter_batches_join_equals_collect():
+    # The same streaming terminal for a distributed join (a multi-source breaker).
+    left, right = _join_data()
+    single = left.join(right, on="k").collect()
+    batches = list(left.join(right, on="k").iter_batches(distributed=True, num_workers=4))
+    got = pa.Table.from_batches(batches) if batches else single.slice(0, 0)
+    assert _rowset(got) == _rowset(single)
+
+
+def test_distributed_broadcast_join_correct_with_speculation_enabled():
+    # The broadcast join's probe barrier now goes through `gather_with_backups`, so a
+    # slow probe task can be backed up under speculation. The probe tasks are
+    # deterministic (a left chunk joined against the full broadcast right), so the
+    # result is identical to single-node whether or not a backup fires.
+    from batcher.config import DistributedConfig
+
+    left, right = _join_data()
+    single = left.join(right, on="k").collect()
+    scoped = bt.Config().replace(distributed=DistributedConfig(speculation_max_backups=2))
+    with bt.config_context(scoped):
+        distrib = left.join(right, on="k").collect(distributed=True, num_workers=4)
+    assert _rowset(distrib) == _rowset(single)
+
+
+def test_broadcast_join_streams_left_in_chunks(tmp_path):
+    """The broadcast probe streams its left side in byte-bounded chunks: with a tiny
+    chunk target a multi-batch left partition spans several chunks, yet the joined output
+    equals one direct join over the whole partition (bounded memory, same result)."""
+    import json
+
+    import batcher._native as nat
+
+    from batcher.config import active_config
+    from batcher.dist.executors.join import _join_reducer_ir, _stream_broadcast_join
+    from batcher.dist.shuffle_io import read_ipc
+
+    rng = np.random.default_rng(3)
+    left_batches = [
+        pa.record_batch(
+            {"k": rng.integers(0, 20, 500).astype("int64"), "lv": rng.integers(0, 9, 500)}
+        )
+        for _ in range(8)
+    ]
+    right_batch = pa.record_batch(
+        {"k": pa.array(range(20), type=pa.int64()), "label": [f"g{i}" for i in range(20)]}
+    )
+    join = (
+        bt.from_arrow(pa.Table.from_batches(left_batches))
+        .join(bt.from_arrow(pa.Table.from_batches([right_batch])), on="k")
+        ._plan
+    )
+    left_ir = json.dumps({"op": "scan", "source_id": 0})
+    join_ir = json.dumps(_join_reducer_ir(join))
+    cfg = active_config().engine_config_json()
+
+    # chunk_bytes=1 forces a chunk boundary after every batch — the eight left batches
+    # stream through as eight separate probe chunks against the resident right.
+    out_path = _stream_broadcast_join(
+        left_ir, iter(left_batches), join_ir, [right_batch], str(tmp_path / "out.arrow"), cfg, 1
+    )
+    streamed = pa.Table.from_batches(read_ipc(out_path))
+    direct = pa.Table.from_batches(nat.execute_plan(join_ir, [left_batches, [right_batch]], cfg))
+    assert _rowset(streamed) == _rowset(direct)
+    assert streamed.num_rows == direct.num_rows
 
 
 @pytest.mark.parametrize("how", ["inner", "left", "semi", "anti"])
@@ -273,11 +379,11 @@ def test_distributed_skew_join_salting_equals_single_node(how, monkeypatch):
     # hot key's probe rows fan across reducers while its build rows are replicated to
     # all of them, so the hot key never overloads one reducer. The result must still
     # equal single-node (salting only moves work between reducers, never the relation).
-    # Force the shuffle path (BROADCAST_MAX_BYTES=-1) so salting is actually exercised.
+    # Force the shuffle path (broadcast threshold = -1) so salting is actually exercised.
     from batcher.config import DistributedConfig
     from batcher.kyber.rules import selection
 
-    monkeypatch.setattr(selection, "BROADCAST_MAX_BYTES", -1)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)
 
     rng = np.random.default_rng(7)
     # Left: key 0 is hot (1000 rows ≈ 33%); keys 1..20 are cold (100 each).
@@ -343,7 +449,7 @@ def test_distributed_runtime_bloom_join_equals_single_node(how, monkeypatch):
     from batcher.config import DistributedConfig
     from batcher.kyber.rules import selection
 
-    monkeypatch.setattr(selection, "BROADCAST_MAX_BYTES", -1)  # force the shuffle path
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)  # force the shuffle path
 
     rng = np.random.default_rng(11)
     lk = rng.integers(0, 1000, 5000).astype("int64")
@@ -361,6 +467,47 @@ def test_distributed_runtime_bloom_join_equals_single_node(how, monkeypatch):
     scoped = bt.Config().replace(distributed=DistributedConfig(runtime_bloom_join=True))
     with bt.config_context(scoped):
         bloomed = left.join(right, on="k", how=how).collect(distributed=True, num_workers=4)
+
+    assert _rowset(single) == _rowset(bloomed)
+
+
+@pytest.mark.parametrize("how", ["inner", "semi"])
+def test_distributed_runtime_bloom_join_multikey_equals_single_node(how, monkeypatch):
+    # The runtime bloom prunes on the row-encoded *composite* key (k1, k2), not just a
+    # single column. The build side covers a small region of the (k1, k2) grid; the
+    # bloom drops probe rows outside it before the shuffle. Result must equal
+    # single-node — multi-key membership has no false negatives either.
+    from batcher.config import DistributedConfig
+    from batcher.kyber.rules import selection
+
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)  # force the shuffle path
+
+    rng = np.random.default_rng(7)
+    n = 5000
+    left_tbl = pa.table(
+        {
+            "k1": pa.array(rng.integers(0, 100, n).astype("int64")),
+            "k2": pa.array(rng.integers(0, 100, n).astype("int64")),
+            "lv": pa.array(rng.integers(0, 10, n).astype("int64")),
+        }
+    )
+    # Build side: only k1,k2 both < 10 → a 10×10 corner of the 100×100 probe grid.
+    bk = np.arange(10, dtype="int64")
+    g1, g2 = np.meshgrid(bk, bk)
+    right_tbl = pa.table(
+        {
+            "k1": pa.array(g1.ravel()),
+            "k2": pa.array(g2.ravel()),
+            "rv": pa.array(np.arange(g1.size, dtype="int64")),
+        }
+    )
+    left, right = bt.from_arrow(left_tbl), bt.from_arrow(right_tbl)
+
+    single = left.join(right, on=["k1", "k2"], how=how).collect()
+    scoped = bt.Config().replace(distributed=DistributedConfig(runtime_bloom_join=True))
+    with bt.config_context(scoped):
+        joined = left.join(right, on=["k1", "k2"], how=how)
+        bloomed = joined.collect(distributed=True, num_workers=4)
 
     assert _rowset(single) == _rowset(bloomed)
 
@@ -573,6 +720,115 @@ def test_flight_splittable_source_matches_single_node(tmp_path):
     single = q(bt.read.parquet(path)).collect(distributed=False)
     flight = q(bt.read.parquet(path)).collect(distributed=True, num_workers=4, transport="flight")
     assert _norm(single) == _norm(flight)
+
+
+def _spy_distributed_map(monkeypatch) -> list:
+    """Record each `_distributed_map` invocation (the parallel fan-out path)."""
+    import batcher.dist.executors.map as map_mod
+
+    calls: list = []
+    real = map_mod._distributed_map
+
+    def spy(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(map_mod, "_distributed_map", spy)
+    return calls
+
+
+def test_distributed_breaker_free_scan_fans_out_over_splits(tmp_path, monkeypatch):
+    # A breaker-free scan/filter/project over a SPLITTABLE source distributes: each
+    # worker reads its own row-groups in parallel (the distributed-scan case) instead of
+    # one node reading the whole source. Result must equal single-node, and the parallel
+    # path must actually be taken (`_distributed_map` invoked).
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(11)
+    n = 80_000
+    t = pa.table(
+        {
+            "k": rng.integers(0, 1000, n).astype("int64"),
+            "v": rng.integers(0, 100, n).astype("int64"),
+        }
+    )
+    path = str(tmp_path / "scan.parquet")
+    pq.write_table(t, path, row_group_size=10_000)  # 8 row-groups → splittable
+
+    def q(ds):
+        return ds.filter(col("v") >= 50).select("k", "v")
+
+    single = q(bt.read.parquet(path)).collect(distributed=False)
+    calls = _spy_distributed_map(monkeypatch)
+    distrib = q(bt.read.parquet(path)).collect(distributed=True, num_workers=4)
+    assert calls == [1]  # the breaker-free splittable scan fanned out, not single-node
+    assert _rowset(distrib) == _rowset(single)
+
+
+def test_distributed_breaker_free_in_memory_stays_single_node(monkeypatch):
+    # An in-memory source is NOT shipped to workers for a breaker-free pipeline — that
+    # would cost more than the parallel CPU saves — so it stays single-node. Result is
+    # still correct; only the routing differs.
+    t = _data()
+    calls = _spy_distributed_map(monkeypatch)
+    got = (
+        bt.from_arrow(t)
+        .filter(col("v") >= 50)
+        .select("k", "v")
+        .collect(distributed=True, num_workers=4)
+    )
+    assert calls == []  # in-memory stayed single-node (no fan-out)
+    single = bt.from_arrow(t).filter(col("v") >= 50).select("k", "v").collect()
+    assert _rowset(got) == _rowset(single)
+
+
+def test_distributed_iter_batches_scan_streams_off_driver(tmp_path):
+    # iter_batches(distributed=True) over a breaker-free splittable scan fans the read
+    # out across workers AND streams each worker's output back one partition at a time —
+    # the driver never holds the whole scan result. Rows must equal collect, and the
+    # result comes back in multiple partition-sized batches (not one collected table).
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(5)
+    n = 80_000
+    t = pa.table(
+        {
+            "k": rng.integers(0, 1000, n).astype("int64"),
+            "v": rng.integers(0, 100, n).astype("int64"),
+        }
+    )
+    path = str(tmp_path / "scan.parquet")
+    pq.write_table(t, path, row_group_size=10_000)  # 8 row-groups → splittable
+
+    def q(ds):
+        return ds.filter(col("v") >= 50).select("k", "v")
+
+    single = q(bt.read.parquet(path)).collect(distributed=False)
+    batches = list(q(bt.read.parquet(path)).iter_batches(distributed=True, num_workers=4))
+    got = pa.Table.from_batches(batches) if batches else single.slice(0, 0)
+    assert _rowset(got) == _rowset(single)
+    assert len(batches) >= 2  # streamed back per partition, not one driver table
+
+
+def test_locality_aware_scheduling_equals_single_node():
+    # Locality-aware reducer placement hosts each reducer where its bucket concentrates,
+    # so its fetches become same-node hits. It is RESULT-PRESERVING — which actor runs a
+    # reducer never changes the output — so the aggregate must equal single-node whether
+    # placement is on or off. (On a single-node test cluster the placement path is fully
+    # exercised: every bucket's data is on the one node, so affinity fires for each.)
+    from batcher.config import DistributedConfig
+
+    t = _data()
+    single = bt.from_arrow(t).group_by("k").agg(s=col("v").sum(), n=count()).collect()
+    scoped = bt.Config().replace(distributed=DistributedConfig(locality_aware_scheduling=True))
+    with bt.config_context(scoped):
+        distrib = (
+            bt.from_arrow(t)
+            .group_by("k")
+            .agg(s=col("v").sum(), n=count())
+            .collect(distributed=True, num_workers=4, transport="flight")
+        )
+    assert _norm(single) == _norm(distrib)
 
 
 def test_flight_distinct_matches_single_node():

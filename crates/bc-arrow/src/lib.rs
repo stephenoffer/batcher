@@ -9,11 +9,19 @@
 //! Keeping these re-exports in one place means the rest of the workspace pins a
 //! single arrow version through `bc_arrow::arrow` rather than depending on the
 //! crate directly, so an arrow bump is a one-line change here.
+//!
+//! It is also the single home for the data plane's performance-threshold defaults
+//! ([`RuntimeTuning`]): the lowest crate `bc-runtime` and `bc-interp` both see, so a
+//! shared tuning contract lives here, is mirrored into `bc_ir::EngineConfig`, and is
+//! shipped from the Python control plane.
 
 pub use arrow;
 pub use arrow::array::{Array, ArrayRef, RecordBatch};
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub use arrow::error::ArrowError;
+
+mod hardware;
+pub use hardware::{HardwareProfile, SimdOverride};
 
 /// A unit of data flow between operators: an Arrow `RecordBatch`.
 ///
@@ -62,6 +70,56 @@ pub fn fixed_width(dt: &DataType) -> Option<usize> {
     })
 }
 
+/// Map a cast dtype *name* (the JSON IR wire contract) to its Arrow `DataType`.
+///
+/// This is the single canonical name→type table for the whole engine. The dtype
+/// name on `bc_expr::Expr::Cast` is a raw string on the wire, so this set of
+/// accepted names *is* part of the IR contract with the Python control plane.
+/// `bc_expr::parse_dtype` and the `bc-codegen` cast classifier both delegate here
+/// so the vocabulary cannot drift between tiers; the Python `CAST_DTYPES` set is
+/// pinned to it by a parity test (`supported_cast_dtypes`).
+///
+/// Returns `None` for any unknown name (the caller raises the tier-appropriate
+/// error). Each accepted name and its alias map to the same type.
+pub fn dtype_from_name(name: &str) -> Option<DataType> {
+    use arrow::datatypes::TimeUnit;
+    Some(match name {
+        "int64" | "long" => DataType::Int64,
+        "int32" | "int" => DataType::Int32,
+        "float64" | "double" => DataType::Float64,
+        "float32" | "float" => DataType::Float32,
+        "bool" | "boolean" => DataType::Boolean,
+        "string" | "utf8" => DataType::Utf8,
+        "date" | "date32" => DataType::Date32,
+        "timestamp" | "datetime" => DataType::Timestamp(TimeUnit::Microsecond, None),
+        _ => return None,
+    })
+}
+
+/// Every cast dtype name `dtype_from_name` accepts, including aliases.
+///
+/// The single source of truth the FFI introspection helper (`bc-py`) exposes so
+/// the Python `CAST_DTYPES` set can be parity-tested against the live engine
+/// vocabulary rather than a snapshot that can rot.
+pub const CAST_DTYPE_NAMES: &[&str] = &[
+    "int64",
+    "long",
+    "int32",
+    "int",
+    "float64",
+    "double",
+    "float32",
+    "float",
+    "bool",
+    "boolean",
+    "string",
+    "utf8",
+    "date",
+    "date32",
+    "timestamp",
+    "datetime",
+];
+
 /// A morsel-size target with two independent bounds: a morsel is "full" when it
 /// reaches **either** `rows` or `bytes`.
 ///
@@ -102,6 +160,53 @@ impl Default for MorselTarget {
     }
 }
 
+/// Performance-threshold defaults for the data plane's hot paths — the single home
+/// for the tunables Kyber/Core may want to override per query.
+///
+/// These are **performance-only** knobs (parallel-vs-serial thresholds, the probe
+/// bloom, merge fan-in, skew detection): they change *how* an operator runs, never
+/// the relation it produces. Every field's [`Default`] equals the historical `const`
+/// it replaced, so absent any override behavior is bit-identical. This struct is
+/// mirrored field-for-field into `bc_ir::EngineConfig` and shipped from Python's
+/// `ExecutionConfig`; the parallel executor threads the live values into the
+/// `bc-runtime` `_with` overloads, while the sequential oracle and all existing
+/// callers stay on this default tuning.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeTuning {
+    /// False-positive rate for the hash-join probe-side bloom pre-filter.
+    pub bloom_fp_rate: f64,
+    /// Build-row floor above which the probe bloom pays for itself.
+    pub bloom_min_build_rows: usize,
+    /// Window row count above which per-partition sorts run across cores.
+    pub window_parallel_row_threshold: usize,
+    /// Concatenated-input row count above which `combine` regroups via parallel
+    /// hash-radix partitioning.
+    pub radix_parallel_threshold: usize,
+    /// Maximum runs merged per pass in the external (spilling) sort's k-way merge.
+    pub sort_merge_fanin: usize,
+    /// A join bucket is "hot" when it exceeds this multiple of the average bucket.
+    pub skew_bucket_factor: usize,
+    /// Absolute row floor below which a bucket is never treated as skewed.
+    pub skew_min_bucket_rows: usize,
+    /// Absolute byte floor below which a bucket is never treated as skewed.
+    pub skew_min_bucket_bytes: usize,
+}
+
+impl Default for RuntimeTuning {
+    fn default() -> Self {
+        Self {
+            bloom_fp_rate: 0.01,
+            bloom_min_build_rows: 1 << 16,
+            window_parallel_row_threshold: 1 << 15,
+            radix_parallel_threshold: 200_000,
+            sort_merge_fanin: 16,
+            skew_bucket_factor: 4,
+            skew_min_bucket_rows: 4 * DEFAULT_MORSEL_ROWS,
+            skew_min_bucket_bytes: 4 * DEFAULT_MORSEL_BYTES,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +238,28 @@ mod tests {
     }
 
     #[test]
+    fn dtype_from_name_covers_every_listed_name() {
+        // Every name in the published list must resolve, and the list must not
+        // contain a name the resolver rejects (the two stay in lockstep).
+        for name in CAST_DTYPE_NAMES {
+            assert!(
+                dtype_from_name(name).is_some(),
+                "CAST_DTYPE_NAMES lists `{name}` but dtype_from_name rejects it"
+            );
+        }
+        // Spot-check the alias pairs collapse to one type.
+        assert_eq!(dtype_from_name("long"), dtype_from_name("int64"));
+        assert_eq!(dtype_from_name("double"), dtype_from_name("float64"));
+        assert_eq!(dtype_from_name("utf8"), Some(DataType::Utf8));
+        assert_eq!(
+            dtype_from_name("datetime"),
+            Some(DataType::Timestamp(TimeUnit::Microsecond, None))
+        );
+        assert_eq!(dtype_from_name("decimal"), None);
+        assert_eq!(dtype_from_name(""), None);
+    }
+
+    #[test]
     fn fixed_width_variable_types_are_none() {
         assert_eq!(fixed_width(&DataType::Utf8), None);
         assert_eq!(fixed_width(&DataType::LargeUtf8), None);
@@ -140,6 +267,19 @@ mod tests {
         assert_eq!(fixed_width(&DataType::LargeBinary), None);
         let inner = Arc::new(Field::new("e", DataType::Int64, true));
         assert_eq!(fixed_width(&DataType::List(inner)), None);
+    }
+
+    #[test]
+    fn runtime_tuning_defaults_equal_the_literals() {
+        let t = RuntimeTuning::default();
+        assert_eq!(t.bloom_fp_rate, 0.01);
+        assert_eq!(t.bloom_min_build_rows, 1 << 16);
+        assert_eq!(t.window_parallel_row_threshold, 1 << 15);
+        assert_eq!(t.radix_parallel_threshold, 200_000);
+        assert_eq!(t.sort_merge_fanin, 16);
+        assert_eq!(t.skew_bucket_factor, 4);
+        assert_eq!(t.skew_min_bucket_rows, 4 * DEFAULT_MORSEL_ROWS);
+        assert_eq!(t.skew_min_bucket_bytes, 4 * DEFAULT_MORSEL_BYTES);
     }
 
     #[test]

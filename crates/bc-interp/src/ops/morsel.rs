@@ -23,7 +23,10 @@
 //! identical, no offset walk, zero added cost on the narrow-data fast path.
 
 use arrow::array::OffsetSizeTrait;
-use arrow::array::{Array, ArrayRef, GenericBinaryArray, GenericStringArray, RecordBatch};
+use arrow::array::{
+    Array, ArrayRef, GenericBinaryArray, GenericListArray, GenericStringArray, RecordBatch,
+    StructArray,
+};
 use arrow::datatypes::DataType;
 
 /// Split `batches` into morsels bounded by `target`'s row and byte limits.
@@ -153,14 +156,70 @@ fn add_column_bytes(costs: &mut [usize], col: &ArrayRef) {
         DataType::LargeUtf8 => add_string_bytes::<i64>(costs, col),
         DataType::Binary => add_binary_bytes::<i32>(costs, col),
         DataType::LargeBinary => add_binary_bytes::<i64>(costs, col),
-        // Nested / other variable-width: amortize the total bytes over the rows.
-        // Coarser than a per-row offset walk, but these are the rare cases and the
-        // result still tracks the column's real footprint.
-        _ => {
-            let per = (col.get_array_memory_size() / costs.len().max(1)).max(1);
-            for c in costs.iter_mut() {
-                *c += per;
-            }
+        // Variable-length list/struct: walk per-row so a few huge rows (decoded
+        // video frames, long `List<float32>` waveforms) are isolated into their own
+        // morsels instead of being smeared over a batch average.
+        DataType::List(_) => add_list_bytes::<i32>(costs, col),
+        DataType::LargeList(_) => add_list_bytes::<i64>(costs, col),
+        DataType::Struct(_) => add_struct_bytes(costs, col),
+        // Other variable-width (Map/Union/FixedSizeList-of-variable/…): amortize the
+        // total bytes over the rows. Coarser than a per-row walk, but these are the
+        // rare cases and the result still tracks the column's real footprint.
+        _ => add_amortized_bytes(costs, col),
+    }
+}
+
+/// Amortize a column's total Arrow footprint evenly over its rows — the fallback
+/// for variable-width types without a cheap per-row walk.
+fn add_amortized_bytes(costs: &mut [usize], col: &ArrayRef) {
+    let per = (col.get_array_memory_size() / costs.len().max(1)).max(1);
+    for c in costs.iter_mut() {
+        *c += per;
+    }
+}
+
+/// Add each row's list payload: `(elements in row) × child width + offset slot`,
+/// recursing into a variable-width child so a long list of wide elements is costed
+/// per row, not averaged.
+fn add_list_bytes<O: OffsetSizeTrait>(costs: &mut [usize], col: &ArrayRef) {
+    let a = col
+        .as_any()
+        .downcast_ref::<GenericListArray<O>>()
+        .expect("data type checked by caller");
+    let offsets = a.value_offsets();
+    let values = a.values();
+    let off_w = std::mem::size_of::<O>();
+    if let Some(w) = bc_arrow::fixed_width(values.data_type()) {
+        for (i, c) in costs.iter_mut().enumerate() {
+            let n = offsets[i + 1].as_usize() - offsets[i].as_usize();
+            *c += n * w + off_w;
+        }
+        return;
+    }
+    // Variable-width child: cost each child element once, then sum each row's slice.
+    let mut child_costs = vec![0usize; values.len()];
+    add_column_bytes(&mut child_costs, values);
+    for (i, c) in costs.iter_mut().enumerate() {
+        let lo = offsets[i].as_usize();
+        let hi = offsets[i + 1].as_usize();
+        *c += child_costs[lo..hi].iter().sum::<usize>() + off_w;
+    }
+}
+
+/// Add each row's struct payload by recursing into the fields. Each field array is
+/// row-aligned with the struct, so per-row field costs accumulate directly; a
+/// sliced/offset struct (children longer than the logical rows) falls back to
+/// amortization to stay correct.
+fn add_struct_bytes(costs: &mut [usize], col: &ArrayRef) {
+    let a = col
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("data type checked by caller");
+    for child in a.columns() {
+        if child.len() == costs.len() {
+            add_column_bytes(costs, child);
+        } else {
+            add_amortized_bytes(costs, child);
         }
     }
 }
@@ -236,6 +295,53 @@ mod tests {
             })
             .expect("giant value survives");
         assert_eq!(giant_morsel.num_rows(), 1, "giant cell must stand alone");
+    }
+
+    /// A `List<Float32>` batch with a few very long rows (e.g. decoded waveforms)
+    /// among many tiny ones is split per row, not by the batch average — the long
+    /// rows are isolated instead of smeared. Regression for the amortized fallback.
+    #[test]
+    fn long_list_rows_isolated_from_tiny_rows() {
+        use arrow::array::{Float32Array, ListArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::Field as ArrowField;
+
+        // 100 single-element rows, then one 8 000-element row, then 100 more tiny.
+        let mut values: Vec<f32> = Vec::new();
+        let mut offsets: Vec<i32> = vec![0];
+        for _ in 0..100 {
+            values.push(1.0);
+            offsets.push(values.len() as i32);
+        }
+        values.extend(std::iter::repeat_n(2.0, 8_000));
+        offsets.push(values.len() as i32);
+        for _ in 0..100 {
+            values.push(3.0);
+            offsets.push(values.len() as i32);
+        }
+        let child = Arc::new(Float32Array::from(values));
+        let field = Arc::new(ArrowField::new("item", DataType::Float32, false));
+        let list = ListArray::new(field, OffsetBuffer::new(offsets.into()), child, None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "w",
+            list.data_type().clone(),
+            false,
+        )]));
+        let b = RecordBatch::try_new(schema, vec![Arc::new(list) as ArrayRef]).unwrap();
+
+        // Budget ≈ 1 KiB; the 8 000-elem row (~32 KB) far exceeds it and must stand
+        // alone, while the tiny rows pack together.
+        let target = bc_arrow::MorselTarget::new(16_384, 1024);
+        let out = morselize(&[b], target);
+        assert_eq!(total_rows(&out), 201, "rows must be preserved exactly");
+        let big = out
+            .iter()
+            .find(|m| {
+                let l = m.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+                (0..l.len()).any(|i| l.value(i).len() == 8_000)
+            })
+            .expect("the long list row survives");
+        assert_eq!(big.num_rows(), 1, "the long list row must stand alone");
     }
 
     /// An all-fixed-width batch splits by the constant per-row width (O(1) path)

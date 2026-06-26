@@ -47,13 +47,90 @@ scored.write.parquet("output/scored.parquet")
 
 | Argument | Meaning |
 | --- | --- |
+| `column` | Input column to score, when `model` is a model id (a HuggingFace pipeline). |
+| `output_column` | Name of the appended prediction column (default `"prediction"`; `"embedding"` for `embed`). |
 | `batch_size` | Rows per batch handed to the model. Larger batches improve GPU utilization up to memory limits. |
 | `num_gpus` | GPUs reserved per worker. A fraction (for example `0.5`) packs several workers onto one device. |
-| `concurrency` | Number of parallel inference actors. |
+| `concurrency` | Size of the GPU actor pool: an `int`, or a `(min, max)` tuple for an autoscaling pool. |
+| `batch_format` | What the callable sees and returns: `"pyarrow"` (default), `"numpy"`, `"pandas"`, or `"torch"`. |
+| `accelerator_type` | Pin actors to a GPU model, e.g. `"NVIDIA_A100"` (a `ray.util.accelerators` name). |
+| `model_memory_gb` | The model's GB footprint, so the resource layer can budget host RAM and VRAM-pack small models. |
 | `output_columns` | Names of the columns the model adds, when they differ from the input. |
 
 `num_gpus` and `concurrency` together size the GPU actor pool. See
 [GPU scheduling](gpu.md).
+
+## The model-id shortcut
+
+When the model is a HuggingFace `transformers` pipeline, you can skip the wrapper
+class: pass the model id as a string and the `column` to score. The pipeline loads
+once per worker and its prediction is appended as `output_column`. `task` selects
+the pipeline kind when it cannot be inferred from the model. This path needs the
+`transformers` extra (`pip install 'batcher-engine[transformers]'`).
+
+```python
+# docs: skip
+import batcher as bt
+
+reviews = bt.read.parquet("data/reviews.parquet")  # has a "text" column
+scored = reviews.ml.infer(
+    "distilbert-base-uncased-finetuned-sst-2-english",
+    column="text",
+    output_column="sentiment",
+    task="sentiment-analysis",
+    batch_size=64,
+    num_gpus=1,
+    concurrency=(1, 4),  # autoscale the actor pool between 1 and 4 GPUs
+)
+```
+
+`ds.ml.embed("sentence-transformers/all-MiniLM-L6-v2", column="text")` is the same
+shortcut for embedding models, appending a vector column; it needs the `st` extra.
+
+## Batch formats and tensor columns
+
+By default the callable receives and returns a `pyarrow.RecordBatch` (zero-copy,
+no conversion). `batch_format` switches that to whatever the model code is written
+against, converting only around the call — the engine boundary stays Arrow:
+
+- `"numpy"` — a `{column: ndarray}` dict, the most natural shape for a NumPy or
+  pure-array model.
+- `"pandas"` — a `DataFrame`.
+- `"torch"` — a `{column: tensor}` dict over the numeric columns, ready to move to
+  a device.
+
+A tensor column (every row a same-shape N-d array, e.g. decoded images) arrives as
+a stacked `ndarray` under `"numpy"`/`"torch"`, so a `(batch, H, W, 3)` block feeds
+straight into a vision model. See [multimodal](multimodal.md) for building those
+columns.
+
+```python
+import batcher as bt
+import numpy as np
+
+ds = bt.from_pydict({"recency": [0.9, 0.1, 0.6], "frequency": [0.7, 0.2, 0.5]})
+
+
+def score(batch):  # batch is a {column: ndarray} dict
+    logit = 3.0 * batch["recency"] + 2.0 * batch["frequency"] - 2.5
+    batch["score"] = 1.0 / (1.0 + np.exp(-logit))
+    return batch
+
+
+out = ds.ml.map_batches(
+    score, batch_format="numpy", output_columns=["recency", "frequency", "score"]
+)
+print(out.to_pydict()["score"])
+# [0.8320183851339245, 0.14185106490048782, 0.5744425168116589]
+```
+
+## GPU placement
+
+Inference does not have to run on a GPU, but when it does the placement is declared
+on the same call: `num_gpus` reserves a device per actor and `concurrency` sizes the
+pool. Preprocessing stays on CPU workers while the model runs on GPU actors — the
+heterogeneous pipeline. The full mechanics, fractional packing, and how to keep the
+devices fed live in [GPU scheduling](gpu.md).
 
 ## Embeddings
 

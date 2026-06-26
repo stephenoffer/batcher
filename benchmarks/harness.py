@@ -20,19 +20,6 @@ from decimal import Decimal
 
 import pyarrow as pa
 
-
-def _ray_data_available() -> bool:
-    """Whether a real Ray Data comparison can run here (``ray.data`` needs pandas)."""
-    import importlib.util
-
-    return all(importlib.util.find_spec(m) is not None for m in ("ray", "pandas"))
-
-
-# Engines are always reported in this order. ``ray`` (Ray Data) joins the lineup
-# only when importable, so the head-to-head runs where Ray is installed and the
-# suite stays runnable (DuckDB/Polars) where it isn't.
-ENGINES = ("batcher", "duckdb", "polars") + (("ray",) if _ray_data_available() else ())
-
 # Absolute tolerance for float comparison (rounding differences between engines).
 FLOAT_ATOL = 1e-6
 FLOAT_RTOL = 1e-9
@@ -156,19 +143,21 @@ class CompareResult:
 def compare(
     name: str,
     fns: dict[str, Callable[[], pa.Table] | None],
+    engines: list[str],
     runs: int = 5,
 ) -> CompareResult:
     """Run each engine's query, verify equality, and record timings.
 
     ``fns`` maps engine name -> callable returning a ``pyarrow.Table`` (or
-    ``None`` to mark the case "n/a" for that engine). Correctness is checked
-    against the first engine that produced a result.
+    ``None`` to mark the case "n/a" for that engine). ``engines`` is the resolved
+    lineup (and report order). Correctness is checked against the first engine that
+    produced a result.
     """
     result = CompareResult(name=name)
     outputs: dict[str, pa.Table] = {}
 
     # First, execute each engine once to obtain a result (and catch failures).
-    for engine in ENGINES:
+    for engine in engines:
         fn = fns.get(engine)
         er = EngineResult()
         if fn is None:
@@ -241,31 +230,30 @@ def _fmt_ms(er: EngineResult) -> str:
     return f"{er.ms:.1f}"
 
 
-def print_table(results: list[CompareResult]) -> None:
-    """Print an aligned table: query | per-engine ms | ratios | status.
+def print_table(results: list[CompareResult], engines: list[str]) -> None:
+    """Print an aligned table: query | per-engine ms | batcher/<engine> ratios | status.
 
-    The ``ray_ms`` column and ``b/ray`` ratio appear only when Ray Data is in the
-    engine lineup (``ray`` + pandas installed), so the table stays compact elsewhere.
+    Columns are driven by ``engines`` (the resolved lineup), so the table adapts to
+    whatever single-node or multi-node engines were selected. A ``b/<engine>`` ratio
+    is shown for every comparator when Batcher is in the lineup.
     """
-    show_ray = "ray" in ENGINES
-    headers = ["query", "batcher_ms", "duckdb_ms", "polars_ms"]
-    if show_ray:
-        headers.append("ray_ms")
-    headers += ["b/duck"] + (["b/ray"] if show_ray else []) + ["status"]
+    has_batcher = "batcher" in engines
+    comparators = [e for e in engines if e != "batcher"]
+    headers = ["query"] + [f"{e}_ms" for e in engines]
+    if has_batcher:
+        headers += [f"b/{e}" for e in comparators]
+    headers += ["status"]
+
     rows = []
     for r in results:
-        b = r.engines.get("batcher", EngineResult())
-        d = r.engines.get("duckdb", EngineResult())
-        p = r.engines.get("polars", EngineResult())
-        ratio = f"{b.ms / d.ms:.2f}x" if b.ms and d.ms else "-"
-        row = [r.name, _fmt_ms(b), _fmt_ms(d), _fmt_ms(p)]
-        if show_ray:
-            ry = r.engines.get("ray", EngineResult())
-            ratio_ray = f"{b.ms / ry.ms:.2f}x" if b.ms and ry.ms else "-"
-            row += [_fmt_ms(ry), ratio, ratio_ray, r.status]
-        else:
-            row += [ratio, r.status]
-        rows.append(row)
+        cells = [r.name] + [_fmt_ms(r.engines.get(e, EngineResult())) for e in engines]
+        if has_batcher:
+            b = r.engines.get("batcher", EngineResult())
+            for e in comparators:
+                ce = r.engines.get(e, EngineResult())
+                cells.append(f"{b.ms / ce.ms:.2f}x" if b.ms and ce.ms else "-")
+        cells.append(r.status)
+        rows.append(cells)
 
     widths = [len(h) for h in headers]
     for row in rows:

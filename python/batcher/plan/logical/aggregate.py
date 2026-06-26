@@ -9,13 +9,57 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pyarrow as pa
+
 from batcher.plan.expr_ir import AggExpr, Expr
 from batcher.plan.ir_tags import Op
 from batcher.plan.logical.base import LogicalPlan, _validate_refs
 from batcher.plan.logical.relational import Projection
+from batcher.plan.schema import SchemaRef
 from batcher.plan.streaming import Watermark
+from batcher.plan.types import infer_type, widen
 
 __all__ = ["Aggregate", "AggregateSpec", "Sort", "SortKeySpec"]
+
+# Aggregate function → output-type category (the engine's result types).
+_AGG_INT = frozenset({"count", "count_distinct", "count_star", "approx_count_distinct"})
+_AGG_FLOAT = frozenset(
+    {
+        "mean",
+        "median",
+        "quantile",
+        "approx_quantile",
+        "stddev",
+        "var",
+        "corr",
+        "covar_pop",
+        "covar_samp",
+        "skewness",
+        "kurtosis",
+    }
+)
+_AGG_BOOL = frozenset({"bool_and", "bool_or"})
+_AGG_INPUT = frozenset({"min", "max", "mode", "arg_min", "arg_max"})  # preserve input type
+_AGG_WIDEN_INPUT = frozenset({"sum", "product", "bit_and", "bit_or", "bit_xor"})  # widen(input)
+
+
+def _agg_output_type(agg: AggExpr, input_schema: SchemaRef) -> pa.DataType | None:
+    """The Arrow type an aggregate produces, or ``None`` if not certain."""
+    func = agg.func
+    if func in _AGG_INT:
+        return pa.int64()
+    if func in _AGG_FLOAT:
+        return pa.float64()
+    if func in _AGG_BOOL:
+        return pa.bool_()
+    if func in _AGG_INPUT or func in _AGG_WIDEN_INPUT:
+        if agg.input is None:
+            return None
+        t = infer_type(agg.input, input_schema)
+        if t is None:
+            return None
+        return widen(t) if func in _AGG_WIDEN_INPUT else t
+    return None  # histogram, list_agg, … — leave to the engine
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +99,23 @@ class Aggregate(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return [k.alias for k in self.group_keys] + [s.alias for s in self.aggregates]
+
+    def available_schema(self) -> SchemaRef | None:
+        inp = self.input.available_schema()
+        if inp is None:
+            return None
+        fields: list[pa.Field] = []
+        for key in self.group_keys:
+            t = infer_type(key.expr, inp)
+            if t is None:
+                return None
+            fields.append(pa.field(key.alias, t))
+        for spec in self.aggregates:
+            t = _agg_output_type(spec.agg, inp)
+            if t is None:
+                return None
+            fields.append(pa.field(spec.alias, t))
+        return SchemaRef.from_arrow(pa.schema(fields))
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,3 +162,6 @@ class Sort(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return self.input.available_columns()
+
+    def available_schema(self) -> SchemaRef | None:
+        return self.input.available_schema()

@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pyarrow as pa
+
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr
 from batcher.plan.ir_tags import (
@@ -20,8 +22,28 @@ from batcher.plan.ir_tags import (
 )
 from batcher.plan.logical.aggregate import SortKeySpec
 from batcher.plan.logical.base import LogicalPlan, _validate_refs
+from batcher.plan.schema import SchemaRef
+from batcher.plan.types import infer_type, widen
 
 __all__ = ["Window", "WindowFrame", "WindowFuncSpec"]
+
+
+def _window_func_type(fn: WindowFuncSpec, input_schema: SchemaRef) -> pa.DataType | None:
+    """The Arrow type a window function appends, or ``None`` if not certain."""
+    if fn.func in WINDOW_RANKING or fn.func == "count":
+        return pa.int64()
+    if fn.func == "avg":
+        return pa.float64()
+    if fn.input is None:  # value/min/max/sum all need an input
+        return None
+    t = infer_type(fn.input, input_schema)
+    if t is None:
+        return None
+    if fn.func == "sum":
+        return widen(t)
+    if fn.func in WINDOW_VALUE or fn.func in {"min", "max"}:
+        return t
+    return None
 
 
 _FRAME_UNITS = ("rows", "range", "groups")
@@ -187,3 +209,15 @@ class Window(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return self.input.available_columns() + [fn.alias for fn in self.functions]
+
+    def available_schema(self) -> SchemaRef | None:
+        inp = self.input.available_schema()
+        if inp is None:
+            return None
+        fields: list[pa.Field] = list(inp.arrow)
+        for fn in self.functions:
+            t = _window_func_type(fn, inp)
+            if t is None:
+                return None
+            fields.append(pa.field(fn.alias, t))
+        return SchemaRef.from_arrow(pa.schema(fields))

@@ -15,7 +15,13 @@ import pyarrow as pa
 
 from batcher.config import active_config
 
-__all__ = ["column_statistics", "heavy_hitters", "tail_quantiles"]
+__all__ = [
+    "column_statistics",
+    "heavy_hitters",
+    "tail_quantiles",
+    "tdigest_partial",
+    "tdigest_quantile",
+]
 
 
 def column_statistics(
@@ -71,6 +77,33 @@ def tail_quantiles(
     except Exception:  # pragma: no cover - measurement must never break execution
         return {}
     return {c: v for c, v in out.items() if v}
+
+
+def tdigest_partial(batches: list[pa.RecordBatch], column: str) -> bytes | None:
+    """Build a serialized TDigest over `column` — the partial step of a mergeable
+    approximate quantile. None for a non-numeric/empty column. Paired with
+    `tdigest_quantile`, so a quantile streams chunk-by-chunk with no full collect."""
+    if not batches:
+        return None
+    try:
+        import batcher._native as _native
+
+        return _native.tdigest_partial(column, batches)
+    except Exception:  # pragma: no cover - measurement must never break execution
+        return None
+
+
+def tdigest_quantile(sketches: list[bytes], q: float) -> float | None:
+    """Merge serialized TDigest `sketches` and return the value at quantile `q` (the
+    combine+finalize step). None if no sketch carried data."""
+    if not sketches:
+        return None
+    try:
+        import batcher._native as _native
+
+        return _native.tdigest_quantile(list(sketches), float(q))
+    except Exception:  # pragma: no cover - measurement must never break execution
+        return None
 
 
 def heavy_hitters(

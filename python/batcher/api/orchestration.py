@@ -16,17 +16,22 @@ conductor is the one layer allowed to assemble them.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import math
-from typing import TYPE_CHECKING
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, TypeVar
 
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.api._join_helpers import _empty_schema
-from batcher.config import active_config
+from batcher.config import Config, active_config, config_context
 from batcher.io.source import Source, read_source
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from batcher.core import ExecutionContext
     from batcher.kyber.rules.selection import BuildSideDecision
     from batcher.metadata.hub import MetadataHub
@@ -38,40 +43,57 @@ __all__ = [
     "approx_quantile",
     "auto_num_partitions",
     "collect_source_stats",
-    "metadata_aggregate_table",
-    "metadata_count",
-    "metadata_is_empty",
     "partitions_from_physical",
     "persist_written_source_stats",
+    "resolve_auto_config",
     "run_relational",
-    "run_relational_metered",
+    "with_auto_config",
 ]
 
-
-# --- Metadata-first terminal resolution -------------------------------------
-# Answer a terminal from the sources' declared `SourceStatistics` (footers,
-# manifests, catalogs) before running the engine. Each consults Kyber's
-# answerability decision and returns None when not provable, so the caller
-# executes. A returned value is gated on `Provenance.EXACT`, hence identical to
-# the executed result — purely an optimisation.
+_R = TypeVar("_R")
 
 
-def _metadata_answerable(plan: LogicalPlan, sources: list[Source]) -> bool:
-    """Whether a metadata-only answer may even be *attempted* for this plan.
+def resolve_auto_config(config: Config | None = None) -> Config:
+    """Return `config` with auto-sensed tunables filled in (a no-op `config` if none).
 
-    These helpers are a pure optimization — `None` means "execute normally" — so they
-    must never be tried on a plan the stats machinery can't handle: an unbounded
-    (streaming) source has no finite answer, and a `map_batches`/UDF pipeline is
-    opaque to the IR (`to_ir` is intentionally unsupported), so propagating stats
-    through it would raise. Guarding here keeps `count()`/`is_empty()`/an aggregate
-    over an ML pipeline runnable instead of crashing in the fast path.
+    When `memory.max_memory_bytes` is unset and `memory.unbounded_memory` is off, a
+    concrete cap is sensed from the live envelope (host RAM / cgroup, via Carbonite's
+    `PressureMonitor`) and frozen in — driving both the data plane's spill budget and
+    the control plane's admission envelope, so a large query spills instead of OOMing
+    with zero config. An explicit cap or `unbounded_memory=True` is returned untouched
+    (the same object, so a caller can detect the no-op with ``is``).
     """
-    from batcher import core
-    from batcher.io.source import is_bounded
+    cfg = config if config is not None else active_config()
+    mem = cfg.memory
+    if mem.max_memory_bytes is not None or mem.unbounded_memory:
+        return cfg
+    # `api` may consult Carbonite (it is the conductor); `config` may not.
+    from batcher.carbonite.memory.pressure import PressureMonitor
 
-    if any(not is_bounded(s) for s in sources):
-        return False
-    return not core.has_map_batches(plan)
+    sensed = PressureMonitor(cfg).envelope_bytes()
+    if sensed <= 0:
+        return cfg  # could not sense — keep the safe unbounded fallback
+    return dataclasses.replace(cfg, memory=dataclasses.replace(mem, max_memory_bytes=sensed))
+
+
+def with_auto_config(fn: Callable[..., _R]) -> Callable[..., _R]:
+    """Decorate a terminal entry point to run under the auto-resolved config.
+
+    Fixes a query's sensed memory envelope once, at the materializing-terminal
+    boundary (collect / write / stats and what delegates to them) — not per stage,
+    where adaptive re-planning and the growing working set would drift it. A no-op
+    when the user pinned the memory config or sensing is unavailable.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: object, **kwargs: object) -> _R:
+        resolved = resolve_auto_config()
+        if resolved is active_config():
+            return fn(*args, **kwargs)
+        with config_context(resolved):
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def collect_source_stats(sources: list[Source], hub: MetadataHub | None) -> list:
@@ -154,69 +176,19 @@ def _build_bloom_index(table: pa.Table, cols: list[str]) -> dict[str, bytes]:
     return out
 
 
-def approx_quantile(table: pa.Table, column: str, q: float) -> float | None:
-    """Approximate quantile `q` of `column` from a TDigest over the result.
+def approx_quantile(batches: Iterable[pa.RecordBatch], column: str, q: float) -> float | None:
+    """Approximate quantile `q` of `column` from a streamed, merged TDigest.
 
-    Opt-in and explicitly approximate: tail-accurate (p99/p999) and far cheaper
-    than an exact sort, at the cost of a small, bounded error. Returns None if the
-    column is non-numeric or empty.
+    Opt-in and explicitly approximate: tail-accurate (p99/p999) and far cheaper than
+    an exact sort. Consumes `batches` one at a time — building a per-batch TDigest and
+    merging the (tiny) sketches — so the column is never held whole on the driver; the
+    caller projects to just `column` and streams it (single-node or distributed).
+    Returns None if the column is non-numeric or empty.
     """
     from batcher import core
 
-    vals = core.tail_quantiles(table.to_batches(), [column], (q,)).get(column)
-    return vals[0] if vals else None
-
-
-def metadata_count(plan: LogicalPlan, sources: list[Source]) -> int | None:
-    """The metadata-only result row count, or None if not provably exact."""
-    if not _metadata_answerable(plan, sources):
-        return None
-    from batcher import core, kyber
-
-    try:
-        source_stats = collect_source_stats(sources, core.default_hub())
-        return kyber.answer_count(plan, sources, source_stats, core.default_hub())
-    except Exception:  # the metadata shortcut must never break a runnable query
-        return None
-
-
-def metadata_is_empty(plan: LogicalPlan, sources: list[Source]) -> bool | None:
-    """Whether the result is empty from metadata, or None if not provably known."""
-    if not _metadata_answerable(plan, sources):
-        return None
-    from batcher import core, kyber
-
-    try:
-        source_stats = collect_source_stats(sources, core.default_hub())
-        return kyber.answer_is_empty(plan, sources, source_stats, core.default_hub())
-    except Exception:  # the metadata shortcut must never break a runnable query
-        return None
-
-
-def metadata_aggregate_table(plan: LogicalPlan, sources: list[Source]) -> pa.Table | None:
-    """One-row result of a global aggregate from metadata, or None to execute.
-
-    Returns a single-row Arrow table when the plan's root is a keyless aggregate
-    whose every output is exactly derivable from source statistics (e.g.
-    `count(*)`, `min`/`max` over footer bounds). The cheap structural guard runs
-    first so non-aggregate collects pay nothing.
-    """
-    from batcher.plan.logical import Aggregate
-
-    if not isinstance(plan, Aggregate) or plan.group_keys:
-        return None
-    if not _metadata_answerable(plan, sources):
-        return None
-    from batcher import core, kyber
-
-    try:
-        source_stats = collect_source_stats(sources, core.default_hub())
-        answer = kyber.answer_aggregate(plan, sources, source_stats, core.default_hub())
-    except Exception:  # the metadata shortcut must never break a runnable query
-        return None
-    if answer is None:
-        return None
-    return pa.table({alias: [value] for alias, value in answer.items()})
+    sketches = [sk for b in batches if (sk := core.tdigest_partial([b], column)) is not None]
+    return core.tdigest_quantile(sketches, q)
 
 
 # --- Zero-config sizing -----------------------------------------------------
@@ -301,18 +273,66 @@ def run_relational(
     scheduling envelope; the distributed executor makes its own shape/partition
     decisions, so the *logical* plan is shipped and single-node rewrites are not
     overlaid (the mergeable algebra guarantees the result equals single-node).
-    """
-    from batcher import carbonite, core, kyber
 
+    When `execution.adaptive_morsel_sizing` is on (the default) and memory is under
+    pressure, Carbonite's pressure-scaled morsel target is activated for the execution
+    scope (reaching both the in-process engine and the shipped worker config) — a
+    smaller streaming working set when memory is tight. Result-invariant, and a no-op
+    when memory is unpressured (the target is returned unchanged), so an unpressured
+    query stays byte-identical on every path.
+    """
+    import contextlib
+
+    from batcher import carbonite
+    from batcher.config import active_config, config_context
+
+    scope: contextlib.AbstractContextManager = contextlib.nullcontext()
+    if active_config().execution.adaptive_morsel_sizing:
+        adapted = carbonite.ResourceManager().recommended_config()
+        if adapted is not None:
+            scope = config_context(adapted)
+    with scope:
+        return _run_relational(plan, sources, ctx, distributed=distributed, materialize=materialize)
+
+
+def _run_relational(
+    plan: LogicalPlan,
+    sources: list[Source],
+    ctx: ExecutionContext,
+    *,
+    distributed: bool = False,
+    materialize: bool = True,
+) -> tuple[pa.Table | Source, list[BuildSideDecision]]:
+    """The Kyber → Carbonite → Core body, run under the (possibly adapted) config."""
+    from batcher import carbonite, core, kyber
+    from batcher._internal.logging import ensure_configured, get_logger
+
+    ensure_configured()
     # Per-source statistics (footer/manifest/catalog) let the optimizer's zone-map
-    # and null-driven rules prune predicates and skip files before execution.
-    source_stats = collect_source_stats(sources, ctx.hub)
+    # and null-driven rules prune predicates and skip files before execution. Reuse
+    # the conductor's already-collected stats when present (the metadata-answer
+    # attempt for a missed count()/is_empty() collected them), so a terminal op reads
+    # each source's footer once across both passes.
+    source_stats = (
+        ctx.source_stats if ctx.source_stats is not None else collect_source_stats(sources, ctx.hub)
+    )
     opt, decisions = kyber.optimize_traced(
         plan, sources=sources, hub=ctx.hub, source_stats=source_stats
     )
+    prof = ctx.profile
+    if prof is not None:
+        from batcher.api.terminal.profile import record_plan
+
+        record_plan(prof, opt, plan, distributed, decisions)
 
     rm = carbonite.ResourceManager()
     verdict = rm.validate(opt)
+    get_logger("api").debug("optimized %d ops; feasible=%s", len(opt.ops), verdict.feasible)
+    if prof is not None:
+        from batcher.api.terminal.profile import admission_decision, verdict_summary
+
+        prof.carbonite_summary = verdict_summary(verdict)
+        prof.decisions.append(admission_decision(verdict))
     # A memory-binding "infeasible" verdict is Carbonite's spill-friendly
     # counter-offer, not a hard stop: the plan won't fit memory, so route it
     # out-of-core (below) rather than failing. Any *other* binding constraint
@@ -325,6 +345,8 @@ def run_relational(
         from batcher import dist
 
         envelope = rm.scheduling_envelope(opt, ctx.num_workers)
+        # Profiling: collect the workers' map sub-plan metrics (their own profile section).
+        wm: list = []
         result = dist.execute_distributed(
             plan,
             sources,
@@ -333,7 +355,10 @@ def run_relational(
             envelope=envelope,
             hub=ctx.hub,
             materialize=materialize,
+            metrics_out=wm if prof is not None else None,
         )
+        if prof is not None:
+            prof.worker_metrics = wm
         # Core collects metadata on every path so later plans improve with use.
         _collect_source_metadata(ctx.hub, sources)
         return result, decisions
@@ -350,6 +375,10 @@ def run_relational(
         # Shard the out-of-core spill by data volume (Kyber's per-breaker fan-out),
         # not a blind constant, so a bigger group-by/join uses more, smaller buckets.
         partitions = partitions_from_physical(opt) or DEFAULT_PARTITIONS
+        if prof is not None:
+            from batcher.api.terminal.profile import record_spill
+
+            record_spill(prof, partitions)
         spilled = spill_collect(plan, sources, partitions)
         if spilled is not None:
             kyber.record_execution(ctx.hub, plan, spilled.num_rows)
@@ -384,7 +413,14 @@ def run_relational(
             if spilled is not None:
                 kyber.record_execution(ctx.hub, plan, spilled.num_rows)
                 return spilled, decisions
-        batches = core.execute_local(opt, resolved, feedback=ctx.hub)
+        # When profiling, take the metered path (still feeding the hub) so the per-operator
+        # `ExecMetrics` reach the conductor's `QueryProfile`; otherwise the plain path,
+        # which skips even the tiny metrics serialization — keeping an ordinary run intact.
+        if prof is not None:
+            batches, metric_ops = core.execute_local_metered(opt, resolved, feedback=ctx.hub)
+            prof.metric_ops = metric_ops
+        else:
+            batches = core.execute_local(opt, resolved, feedback=ctx.hub)
     table = pa.Table.from_batches(
         batches, schema=batches[0].schema if batches else _empty_schema(ctx.columns)
     )
@@ -396,34 +432,6 @@ def run_relational(
     _learn_column_stats(ctx.hub, resolved)
     kyber.record_selectivity(ctx.hub, plan, sources, table.num_rows)
     return table, decisions
-
-
-def run_relational_metered(
-    plan: LogicalPlan,
-    sources: list[Source],
-    ctx: ExecutionContext,
-) -> tuple[pa.Table, list[dict]]:
-    """Run a single-node relational plan and return ``(table, ops)`` where `ops` is
-    this run's raw per-operator `ExecMetrics` (for `Dataset.stats()`).
-
-    The in-memory single-node path of `run_relational`, surfaced metered: optimize
-    with Kyber, resolve sources with the pushed-down projection/predicate, and
-    execute via Core's metered entry point. Diagnostic-only — it does not spill or
-    distribute (those paths don't return a single per-operator metrics document), so
-    it reports the in-memory engine's measurements.
-    """
-    from batcher import core, kyber
-
-    opt = kyber.optimize(plan, sources=sources, hub=ctx.hub)
-    resolved = [
-        read_source(src, opt.source_projections.get(i), opt.source_predicates.get(i))
-        for i, src in enumerate(sources)
-    ]
-    batches, ops = core.execute_local_metered(opt, resolved)
-    table = pa.Table.from_batches(
-        batches, schema=batches[0].schema if batches else _empty_schema(ctx.columns)
-    )
-    return table, ops
 
 
 def _collect_source_metadata(hub, sources: list[Source]) -> None:
@@ -466,9 +474,11 @@ def _learn_column_stats(hub, resolved: list[list[pa.RecordBatch]]) -> None:
 
     try:
         known = set(kyber.load_learned_stats(hub).get(_NDV_KEY, {}))
+        min_frac = active_config().optimizer.cardinality.mcv_min_fraction
         ndv_all: dict[str, float] = {}
         quant_all: dict[str, dict[str, list[float]]] = {}
         bytes_all: dict[str, float] = {}
+        mcv_all: dict[str, dict[str, float]] = {}
         for batches in resolved:
             if not batches:
                 continue
@@ -479,7 +489,12 @@ def _learn_column_stats(hub, resolved: list[list[pa.RecordBatch]]) -> None:
             ndv_all.update(ndv)
             quant_all.update(quants)
             bytes_all.update(avg_bytes)
-        if ndv_all or quant_all or bytes_all:
-            kyber.record_column_stats(hub, ndv_all, quant_all, bytes_all)
+            # MCV: a skew value's measured frequency sharpens `col = value` past 1/ndv.
+            total = sum(b.num_rows for b in batches)
+            for col_name, hits in core.heavy_hitters(batches, cols, min_frac).items():
+                if total > 0 and hits:
+                    mcv_all[col_name] = {str(v): n / total for v, n in hits}
+        if ndv_all or quant_all or bytes_all or mcv_all:
+            kyber.record_column_stats(hub, ndv_all, quant_all, bytes_all, mcv_all)
     except Exception:  # pragma: no cover - learning must never break execution
         pass

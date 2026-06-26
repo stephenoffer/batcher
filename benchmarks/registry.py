@@ -41,6 +41,22 @@ EngineQueries = dict[str, Callable[[], "pa.Table"] | None]
 CaseBuilder = Callable[[Any], EngineQueries]
 
 
+def sql_case(query: str) -> CaseBuilder:
+    """A case builder that fans one SQL string out across every SQL-capable engine.
+
+    The context exposes ``sql_runners()`` — a mapping of engine name to a
+    pre-registered ``query -> pa.Table`` callable — so the standard suites
+    (TPC-H / TPC-DS / ClickBench) express each query exactly once. Engines without a
+    SQL surface (PyArrow, Ray Data) are simply absent from the mapping and show as
+    ``n/a``, never a wrong answer.
+    """
+
+    def build(ctx: Any) -> EngineQueries:
+        return {name: (lambda run=run: run(query)) for name, run in ctx.sql_runners().items()}
+
+    return build
+
+
 @dataclass(frozen=True)
 class Case:
     """One registered benchmark: a name, its family, its dataset, and its builder."""
@@ -113,7 +129,13 @@ class Suite:
 
         return register
 
+    def sql(self, name: str, query: str) -> None:
+        """Register a SQL benchmark — one query string, fanned across SQL engines."""
+        REGISTRY.add(
+            Case(family=self.family, name=name, dataset=self.dataset, build=sql_case(query))
+        )
 
-def suite(family: str, *, dataset: str = "synthetic") -> Suite:
-    """Open a registrar for ``family`` over ``dataset`` (see ``contexts.py``)."""
+
+def suite(family: str, *, dataset: str) -> Suite:
+    """Open a registrar for ``family`` over ``dataset`` (the benchmark, see ``context.py``)."""
     return Suite(family=family, dataset=dataset)

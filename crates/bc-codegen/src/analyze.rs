@@ -2,7 +2,7 @@
 //! scalar type each sub-expression evaluates to, recording referenced columns.
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::{libm_binary_symbol, libm_unary_symbol, CodegenError, ColumnSet, ScalarTy};
 
@@ -40,6 +40,13 @@ pub(crate) fn analyze(
             let ty = match arr.data_type() {
                 DataType::Int64 => ScalarTy::I64,
                 DataType::Float64 => ScalarTy::F64,
+                // Date32 is an i32 day count; the JIT supports it as a comparison-only
+                // operand (loaded + sign-extended to i64). Comparison against another
+                // Date32 is bit-identical to Arrow's date comparison.
+                DataType::Date32 => ScalarTy::Date32,
+                // tz-naive Timestamp(µs) is an i64 instant — comparison-only, like a
+                // date. Other units/timezones fall back (they'd need rescaling).
+                DataType::Timestamp(TimeUnit::Microsecond, None) => ScalarTy::TsUs,
                 other => {
                     return Err(CodegenError::Unsupported(format!(
                         "column `{name}` has unsupported type {other:?}"
@@ -59,9 +66,11 @@ pub(crate) fn analyze(
             Literal::Float(_) => Ok(ScalarTy::F64),
             Literal::Bool(_) => Err(CodegenError::Unsupported("bool literal".into())),
             Literal::Str(_) => Err(CodegenError::Unsupported("string literal".into())),
-            Literal::Timestamp(_) | Literal::Date(_) => {
-                Err(CodegenError::Unsupported("temporal literal".into()))
-            }
+            // A date literal is an i32 day count (`Date32`); a timestamp literal is an
+            // i64 microsecond instant (tz-naive `Timestamp(µs)`, per the interpreter's
+            // `Literal::to_array`). Each compares against a column of the same type.
+            Literal::Date(_) => Ok(ScalarTy::Date32),
+            Literal::Timestamp(_) => Ok(ScalarTy::TsUs),
         },
         Expr::Binary { op, left, right } => {
             let l = analyze(left, batch, cols)?;
@@ -82,6 +91,20 @@ pub(crate) fn analyze(
                 return Err(CodegenError::Unsupported(
                     "boolean operand to arithmetic/comparison".into(),
                 ));
+            }
+            // Temporal types (date / timestamp) are comparison-only, and only against
+            // the *same* temporal type (Arrow compares them by their integer value;
+            // mixing with a numeric, or a date with a timestamp, would need a coercion
+            // the JIT doesn't model). Anything else involving a temporal falls back.
+            let is_temporal = |t: ScalarTy| matches!(t, ScalarTy::Date32 | ScalarTy::TsUs);
+            if is_temporal(l) || is_temporal(r) {
+                return if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) && l == r {
+                    Ok(ScalarTy::Bool)
+                } else {
+                    Err(CodegenError::Unsupported(
+                        "temporal type supports comparison against the same type only".into(),
+                    ))
+                };
             }
             match op {
                 Add | Sub | Mul | Div | Mod => {
@@ -140,12 +163,14 @@ pub(crate) fn analyze(
                 return Err(CodegenError::Unsupported("try_cast".into()));
             }
             let inner = analyze(input, batch, cols)?;
-            // Classify the target dtype name to a JIT scalar type. Names mirror
-            // bc-expr's `parse_dtype`; anything outside Int64/Float64 (int32,
-            // bool, string, date, ...) is unsupported.
-            let target = match dtype.as_str() {
-                "int64" | "long" => ScalarTy::I64,
-                "float64" | "double" => ScalarTy::F64,
+            // Classify the target dtype name to a JIT scalar type. The name→type
+            // vocabulary is resolved by the canonical `bc_arrow::dtype_from_name`
+            // so aliases (`long`/`double`) never drift from the interpreter;
+            // anything outside Int64/Float64 (int32, bool, string, date, ...) is
+            // unsupported here and falls back to the interpreter.
+            let target = match bc_arrow::dtype_from_name(dtype) {
+                Some(DataType::Int64) => ScalarTy::I64,
+                Some(DataType::Float64) => ScalarTy::F64,
                 _ => {
                     return Err(CodegenError::Unsupported(format!(
                         "cast to dtype `{dtype}`"
@@ -187,6 +212,9 @@ pub(crate) fn analyze(
                 ScalarTy::Bool => {
                     return Err(CodegenError::Unsupported("case result is boolean".into()))
                 }
+                ScalarTy::Date32 | ScalarTy::TsUs => {
+                    return Err(CodegenError::Unsupported("case result is temporal".into()))
+                }
             };
             for branch in branches {
                 let when_ty = analyze(&branch.when, batch, cols)?;
@@ -200,6 +228,9 @@ pub(crate) fn analyze(
                     ScalarTy::F64 => result = ScalarTy::F64,
                     ScalarTy::Bool => {
                         return Err(CodegenError::Unsupported("case THEN is boolean".into()))
+                    }
+                    ScalarTy::Date32 | ScalarTy::TsUs => {
+                        return Err(CodegenError::Unsupported("case THEN is temporal".into()))
                     }
                 }
             }
@@ -221,9 +252,9 @@ pub(crate) fn analyze(
         Expr::Math { func, input } => {
             use bc_expr::MathFunc::*;
             let inner = analyze(input, batch, cols)?;
-            if inner == ScalarTy::Bool {
+            if matches!(inner, ScalarTy::Bool | ScalarTy::Date32 | ScalarTy::TsUs) {
                 return Err(CodegenError::Unsupported(
-                    "math function on boolean operand".into(),
+                    "math function on boolean/temporal operand".into(),
                 ));
             }
             match func {
@@ -259,9 +290,11 @@ pub(crate) fn analyze(
             }
             let lt = analyze(left, batch, cols)?;
             let rt = analyze(right, batch, cols)?;
-            if lt == ScalarTy::Bool || rt == ScalarTy::Bool {
+            if matches!(lt, ScalarTy::Bool | ScalarTy::Date32 | ScalarTy::TsUs)
+                || matches!(rt, ScalarTy::Bool | ScalarTy::Date32 | ScalarTy::TsUs)
+            {
                 return Err(CodegenError::Unsupported(
-                    "binary math function on boolean operand".into(),
+                    "binary math function on boolean/temporal operand".into(),
                 ));
             }
             Ok(ScalarTy::F64)

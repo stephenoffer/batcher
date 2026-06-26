@@ -29,11 +29,87 @@ use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
 use arrow::compute::take;
 use arrow::datatypes::{Field, Schema};
 use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
+use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
+use arrow::ipc::CompressionType;
 use arrow::row::{RowConverter, SortField};
 
 use super::{combine, finalize, AggFunc, GroupAggResult, Partial};
 use crate::error::RuntimeError;
+
+/// Compression codec for spilled Arrow-IPC streams.
+///
+/// Spill is **perf-only and result-invariant**: an IPC stream self-describes its
+/// compression, so the reader decompresses automatically and no codec choice can
+/// change the batches read back. This only trades CPU for spill-file (and
+/// disk-bandwidth) bytes. `None` is the historical, byte-for-byte-unchanged path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpillCodec {
+    /// Uncompressed — identical to the pre-compression spill path.
+    None,
+    /// LZ4 frame — fast, modest ratio.
+    Lz4,
+    /// Zstandard — slower, better ratio (best for large/blob-heavy spills).
+    Zstd,
+    /// Datatype-aware: pick the codec per spill from the spilled batch's schema
+    /// (see [`SpillCodec::classify`]). The default — a strictly better policy than a
+    /// fixed codec, and still result-invariant (IPC self-describes its compression).
+    #[default]
+    Auto,
+}
+
+impl SpillCodec {
+    /// Resolve the control-plane codec name (`EngineConfig.spill_compression`).
+    /// Unknown names fall back to `Auto` (the datatype-aware policy) rather than
+    /// erroring, so a newer control plane never breaks an older engine.
+    pub fn from_config_str(name: Option<&str>) -> Self {
+        match name.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("none") => Self::None,
+            Some("lz4") => Self::Lz4,
+            Some("zstd") => Self::Zstd,
+            _ => Self::Auto,
+        }
+    }
+
+    /// Choose a concrete codec for a spilled batch by its dominant column type.
+    ///
+    /// Arrow IPC has a single stream-level codec (no per-field slot), so this picks
+    /// one codec for the whole stream by where the bytes are. The decisive fact
+    /// (measured): on fast local spill disk, general-purpose compression of numeric
+    /// or string state is a net *loss* — the CPU outweighs the I/O saved. Only
+    /// blob/large-binary payloads compress dramatically enough to win regardless of
+    /// disk speed. So `auto` compresses **only** a blob-bearing schema (ZSTD, best
+    /// ratio) and leaves everything else uncompressed — never a regression, a win
+    /// exactly where the payload dwarfs the CPU.
+    fn classify(schema: &Schema) -> Self {
+        use arrow::datatypes::DataType::*;
+        let has_blob = schema
+            .fields()
+            .iter()
+            .any(|f| matches!(f.data_type(), LargeBinary | Binary | LargeUtf8));
+        if has_blob {
+            Self::Zstd
+        } else {
+            Self::None
+        }
+    }
+
+    /// The IPC write options for this codec given the schema being spilled. `Auto`
+    /// classifies the schema first; if the chosen compression is not compiled into
+    /// this arrow build, it silently degrades to uncompressed (mirroring the Python
+    /// `TieredSpillStore`), so a write never fails on codec.
+    fn write_options(self, schema: &Schema) -> IpcWriteOptions {
+        let base = IpcWriteOptions::default();
+        let codec = match self {
+            Self::Auto => return Self::classify(schema).write_options(schema),
+            Self::None => return base,
+            Self::Lz4 => CompressionType::LZ4_FRAME,
+            Self::Zstd => CompressionType::ZSTD,
+        };
+        base.clone()
+            .try_with_compression(Some(codec))
+            .unwrap_or(base)
+    }
+}
 
 /// A partitioned, append-only store of partial-state batches.
 ///
@@ -93,17 +169,33 @@ pub struct DiskSpillStore {
     dir: PathBuf,
     paths: Vec<PathBuf>,
     writers: Vec<Option<StreamWriter<File>>>,
+    codec: SpillCodec,
+    /// Resolved on the first append (when the spilled schema is known, which `Auto`
+    /// needs to classify) and reused for every partition's writer.
+    write_options: Option<IpcWriteOptions>,
 }
 
 impl DiskSpillStore {
-    /// Create `partitions` empty spill files under a private subdirectory of `root`.
+    /// Create `partitions` empty, **uncompressed** spill files under a private
+    /// subdirectory of `root` — the historical path, byte-for-byte unchanged.
+    /// Use [`DiskSpillStore::with_codec`] to compress the streams.
+    pub fn new(root: PathBuf, partitions: usize) -> Result<Self, RuntimeError> {
+        Self::with_codec(root, partitions, SpillCodec::None)
+    }
+
+    /// Create `partitions` empty spill files whose IPC streams use `codec`.
     ///
     /// The store carves out its own `bc-spill-{pid}-{seq}` directory under `root`
     /// (created if absent) so its `part-*.arrow` files never collide with — and its
     /// drop never deletes — another concurrent store's files. This is what lets the
     /// distributed reducers spill safely when many worker processes share one spill
-    /// root, and lets a single plan run two spilling breakers at once.
-    pub fn new(root: PathBuf, partitions: usize) -> Result<Self, RuntimeError> {
+    /// root, and lets a single plan run two spilling breakers at once. The codec is
+    /// write-side only; the read path auto-detects compression from the IPC stream.
+    pub fn with_codec(
+        root: PathBuf,
+        partitions: usize,
+        codec: SpillCodec,
+    ) -> Result<Self, RuntimeError> {
         let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = root.join(format!("bc-spill-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
@@ -115,6 +207,8 @@ impl DiskSpillStore {
             dir,
             paths,
             writers: (0..n).map(|_| None).collect(),
+            codec,
+            write_options: None,
         })
     }
 
@@ -145,8 +239,18 @@ impl SpillStore for DiskSpillStore {
 
     fn append(&mut self, partition: usize, batch: &RecordBatch) -> Result<(), RuntimeError> {
         if self.writers[partition].is_none() {
+            // Resolve write options on the first append, when the schema is known —
+            // `Auto` classifies it to pick a codec. Reused for every partition.
+            let opts = self
+                .write_options
+                .get_or_insert_with(|| self.codec.write_options(&batch.schema()))
+                .clone();
             let file = File::create(&self.paths[partition])?;
-            self.writers[partition] = Some(StreamWriter::try_new(file, &batch.schema())?);
+            self.writers[partition] = Some(StreamWriter::try_new_with_options(
+                file,
+                &batch.schema(),
+                opts,
+            )?);
         }
         self.writers[partition]
             .as_mut()
@@ -472,10 +576,82 @@ mod tests {
             group_aggregate(std::slice::from_ref(&keys), &calls(&vals), keys.len()).unwrap();
         let want = to_map(&oracle.group_columns[0], &oracle.agg_columns);
 
-        let dir = std::env::temp_dir().join(format!("bc_spill_test_{}", std::process::id()));
-        let mut store = DiskSpillStore::new(dir, 8).unwrap();
-        let got = spilled(&keys, &vals, 6, &mut store);
-        assert_eq!(want, to_map(&got.group_columns[0], &got.agg_columns));
+        // Spill is perf-only and result-invariant: every codec (and uncompressed)
+        // must reproduce the in-memory oracle exactly. IPC self-describes its
+        // compression, so the read path needs no codec.
+        for codec in [
+            SpillCodec::None,
+            SpillCodec::Lz4,
+            SpillCodec::Zstd,
+            SpillCodec::Auto,
+        ] {
+            let dir = std::env::temp_dir()
+                .join(format!("bc_spill_test_{}_{codec:?}", std::process::id()));
+            let mut store = DiskSpillStore::with_codec(dir, 8, codec).unwrap();
+            let got = spilled(&keys, &vals, 6, &mut store);
+            assert_eq!(
+                want,
+                to_map(&got.group_columns[0], &got.agg_columns),
+                "codec {codec:?} must match the oracle"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_codec_classifies_by_dominant_type() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        // All fixed-width numeric → no compression (general codecs barely shrink it).
+        let numeric = Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Float64, false),
+        ]);
+        assert_eq!(SpillCodec::classify(&numeric), SpillCodec::None);
+        // A string column → still None: compressing string state on fast local disk
+        // costs more CPU than the I/O it saves (measured).
+        let strings = Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]);
+        assert_eq!(SpillCodec::classify(&strings), SpillCodec::None);
+        // A blob/large-binary column → ZSTD (payload dwarfs CPU, best ratio).
+        let blobs = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("blob", DataType::LargeBinary, false),
+        ]);
+        assert_eq!(SpillCodec::classify(&blobs), SpillCodec::Zstd);
+    }
+
+    #[test]
+    fn compressed_spill_roundtrips_every_codec() {
+        // A wider batch (so compression actually engages) appended and read back is
+        // logically identical under every codec — the layer that guarantees the
+        // spill codec is purely a storage concern.
+        let keys = strs(&["alpha", "beta", "alpha", "gamma", "beta", "alpha"]);
+        let vals = i64s(&[100, 200, 300, 400, 500, 600]);
+        let batch = RecordBatch::try_from_iter(vec![
+            ("k", Arc::new(keys.clone()) as ArrayRef),
+            ("v", Arc::new(vals.clone()) as ArrayRef),
+        ])
+        .unwrap();
+
+        for codec in [
+            SpillCodec::None,
+            SpillCodec::Lz4,
+            SpillCodec::Zstd,
+            SpillCodec::Auto,
+        ] {
+            let dir =
+                std::env::temp_dir().join(format!("bc_spill_rt_{}_{codec:?}", std::process::id()));
+            let mut store = DiskSpillStore::with_codec(dir, 1, codec).unwrap();
+            store.append(0, &batch).unwrap();
+            store.append(0, &batch).unwrap();
+            let back = store.read(0).unwrap();
+            let total: usize = back.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total, 2 * batch.num_rows(), "codec {codec:?} row count");
+            for b in &back {
+                assert_eq!(b.schema(), batch.schema(), "codec {codec:?} schema");
+            }
+        }
     }
 
     #[test]

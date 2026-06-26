@@ -17,9 +17,54 @@
 //! pool itself is policy-free — it only accounts and admits.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use thiserror::Error;
+
+/// Default soft-pressure line as basis points of the limit (8000 = 80%). Above it
+/// the pool reports [`Pressure::Elevated`] so the executor can spill *proactively*
+/// instead of waiting for the hard cap to stall the process. Carbonite overrides it
+/// from its memory envelope via [`MemoryPool::set_soft_fraction`].
+const DEFAULT_SOFT_BPS: usize = 8000;
+
+/// Coarse memory-pressure level derived from `used / limit`. The one signal the
+/// executor's backpressure mechanisms (proactive spill, the morsel-admission gate,
+/// the distributed credit window) all read, so single-node and distributed throttle
+/// off the same envelope rather than each inventing a threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pressure {
+    /// Below the soft line — the fast path, no throttling.
+    Nominal,
+    /// At/above the soft line but below the hard cap — spill proactively / narrow
+    /// the in-flight window before the cap forces a stall.
+    Elevated,
+    /// At/above the hard cap — no headroom; a new reservation can only succeed after
+    /// something spills.
+    Critical,
+}
+
+/// A registered memory consumer that can spill some in-memory state to disk on
+/// demand, returning the bytes it freed.
+///
+/// This is the cooperative-spilling counterpart to reserve-before-allocate
+/// (Spark's `TaskMemoryManager` / `MemoryConsumer` model): when a reservation can't
+/// be granted, the pool asks the **largest *other* consumer** to spill rather than
+/// failing the requester — so a small operator no longer dies while a large
+/// neighbour (or a concurrent query) sits on the budget. A consumer that cannot
+/// spill simply does not register and is never asked.
+pub trait Spillable: Send + Sync {
+    /// Spill at least `target` bytes of in-memory state to disk if possible,
+    /// returning the bytes actually freed (`0` if it cannot spill right now).
+    ///
+    /// MUST only *release* memory, never reserve — the pool may call this while
+    /// resolving another reservation, so re-entering the pool from here would
+    /// deadlock or recurse. It is invoked outside the pool's registry lock.
+    fn spill(&self, target: usize) -> usize;
+
+    /// This consumer's current spillable footprint in bytes — the pool spills the
+    /// largest first, so this orders the victims.
+    fn spillable_bytes(&self) -> usize;
+}
 
 /// Error raised when a reservation cannot be satisfied within the pool's limit.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -48,13 +93,30 @@ pub type ResourceResult<T> = Result<T, ResourceError>;
 /// does not allocate them — so it is correct regardless of the underlying
 /// allocator. Construct with [`MemoryPool::new`] (returns an `Arc` so reservations
 /// can hold a cheap handle).
-#[derive(Debug)]
 pub struct MemoryPool {
     /// The admission cap. Atomic so an autoscaler / a differently-configured query
     /// can resize the envelope at runtime ([`MemoryPool::set_limit`]) without
     /// rebuilding the pool or disturbing the live `used` accounting.
     limit: AtomicUsize,
     used: AtomicUsize,
+    /// Soft-pressure line as basis points of `limit` (see [`Pressure`]).
+    soft_bps: AtomicUsize,
+    /// Registered [`Spillable`] consumers (held by `Weak` so a finished operator's
+    /// entry is harmless dead weight, swept lazily on the next slow-path entry). The
+    /// `Mutex` is taken only on the cooperative slow path / registration — never per
+    /// reservation — so the hot path stays lock-free.
+    consumers: Mutex<Vec<Weak<dyn Spillable>>>,
+}
+
+impl std::fmt::Debug for MemoryPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Weak<dyn Spillable>` isn't `Debug`; surface only the accounting state.
+        f.debug_struct("MemoryPool")
+            .field("limit", &self.limit())
+            .field("used", &self.used())
+            .field("pressure", &self.pressure())
+            .finish()
+    }
 }
 
 impl MemoryPool {
@@ -63,6 +125,8 @@ impl MemoryPool {
         Arc::new(Self {
             limit: AtomicUsize::new(limit),
             used: AtomicUsize::new(0),
+            soft_bps: AtomicUsize::new(DEFAULT_SOFT_BPS),
+            consumers: Mutex::new(Vec::new()),
         })
     }
 
@@ -146,6 +210,98 @@ impl MemoryPool {
         let mut r = self.reserve();
         r.try_grow(bytes)?;
         Ok(r)
+    }
+
+    /// Reserve `bytes`, asking registered consumers to spill when the pool is full.
+    ///
+    /// The cooperative path (Spark's model): on a plain-reserve miss, ask the
+    /// **largest** registered [`Spillable`] consumers to spill — largest first — and
+    /// retry, until the reservation fits or no consumer can free more. The
+    /// requesting operator is *not* in the registry yet (it reserves *before*
+    /// building the state it would later register), so every victim is a different
+    /// operator or a concurrent query — exactly what should yield first. A final
+    /// failure is returned so the caller can spill *itself* as the last resort.
+    ///
+    /// With no registered consumers this is exactly [`MemoryPool::try_reserve`], so
+    /// it is a safe drop-in everywhere the plain reserve was used.
+    pub fn try_reserve_cooperative(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> ResourceResult<MemoryReservation> {
+        if let Ok(r) = self.try_reserve(bytes) {
+            return Ok(r);
+        }
+        // Spill registered consumers, largest first, until it fits or a full pass
+        // frees nothing (guarantees termination — each round needs real progress).
+        loop {
+            let needed = bytes.saturating_sub(self.available());
+            if needed == 0 {
+                break;
+            }
+            let mut victims = self.live_consumers();
+            victims.sort_by_key(|c| std::cmp::Reverse(c.spillable_bytes()));
+            let mut freed_any = false;
+            for v in victims {
+                let need = bytes.saturating_sub(self.available());
+                if need == 0 {
+                    break;
+                }
+                // spill() runs outside the registry lock and only releases memory.
+                if v.spill(need) > 0 {
+                    freed_any = true;
+                }
+            }
+            if !freed_any {
+                break;
+            }
+        }
+        self.try_reserve(bytes)
+    }
+
+    /// Register a [`Spillable`] consumer so the cooperative path can ask it to spill.
+    /// Held weakly: when the operator's `Arc` drops, its slot becomes dead weight and
+    /// is swept on the next cooperative attempt — no explicit unregister needed.
+    pub fn register_consumer(&self, consumer: &Arc<dyn Spillable>) {
+        let mut guard = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|w| w.strong_count() > 0); // sweep dead entries
+        guard.push(Arc::downgrade(consumer));
+    }
+
+    /// Live registered consumers (upgraded from `Weak`); sweeps dead entries. Briefly
+    /// locks the registry, then releases it before any `spill` runs.
+    fn live_consumers(&self) -> Vec<Arc<dyn Spillable>> {
+        let mut guard = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|w| w.strong_count() > 0);
+        guard.iter().filter_map(Weak::upgrade).collect()
+    }
+
+    /// Set the soft-pressure line as a fraction of the limit (clamped to `[0, 1]`).
+    /// Carbonite drives this from its memory envelope so [`Pressure::Elevated`]
+    /// fires at the same soft line the control plane uses.
+    pub fn set_soft_fraction(&self, fraction: f64) {
+        let bps = (fraction.clamp(0.0, 1.0) * 10_000.0).round() as usize;
+        self.soft_bps.store(bps, Ordering::Release);
+    }
+
+    /// Current memory-pressure level (see [`Pressure`]). `Critical` at/above the hard
+    /// cap, `Elevated` at/above the soft line, else `Nominal`. A zero limit (unbounded
+    /// / unconfigured) is always `Nominal`.
+    pub fn pressure(&self) -> Pressure {
+        let limit = self.limit();
+        if limit == 0 {
+            return Pressure::Nominal;
+        }
+        let used = self.used();
+        if used >= limit {
+            return Pressure::Critical;
+        }
+        let soft =
+            (limit as u128 * self.soft_bps.load(Ordering::Acquire) as u128 / 10_000) as usize;
+        if used >= soft {
+            Pressure::Elevated
+        } else {
+            Pressure::Nominal
+        }
     }
 }
 
@@ -272,5 +428,117 @@ mod tests {
         assert!(r.try_grow(200).is_err());
         assert_eq!(r.size(), 900);
         assert_eq!(pool.used(), 900);
+    }
+
+    /// A test consumer holding `held` pool bytes that releases them on `spill`.
+    struct MockConsumer {
+        reservation: std::sync::Mutex<MemoryReservation>,
+        spill_calls: AtomicUsize,
+    }
+
+    impl MockConsumer {
+        fn new(pool: &Arc<MemoryPool>, held: usize) -> Arc<Self> {
+            // The reservation holds its own Arc to the pool, so the mock needs no
+            // separate pool handle.
+            let reservation = pool.try_reserve(held).unwrap();
+            Arc::new(Self {
+                reservation: std::sync::Mutex::new(reservation),
+                spill_calls: AtomicUsize::new(0),
+            })
+        }
+        fn spill_calls(&self) -> usize {
+            self.spill_calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl Spillable for MockConsumer {
+        fn spill(&self, target: usize) -> usize {
+            self.spill_calls.fetch_add(1, Ordering::AcqRel);
+            let mut r = self.reservation.lock().unwrap();
+            let freed = target.min(r.size());
+            r.shrink(freed); // releases to the pool — never reserves (the contract)
+            freed
+        }
+        fn spillable_bytes(&self) -> usize {
+            self.reservation.lock().unwrap().size()
+        }
+    }
+
+    #[test]
+    fn cooperative_reserve_spills_the_largest_other_consumer_first() {
+        let pool = MemoryPool::new(1000);
+        let small = MockConsumer::new(&pool, 200);
+        let large = MockConsumer::new(&pool, 700);
+        pool.register_consumer(&(Arc::clone(&small) as Arc<dyn Spillable>));
+        pool.register_consumer(&(Arc::clone(&large) as Arc<dyn Spillable>));
+        assert_eq!(pool.used(), 900); // only 100 free
+
+        // Need 400: the pool must spill the *larger* consumer to make room, and the
+        // small one should not be touched (its 200 + the 100 free isn't needed).
+        let r = pool.try_reserve_cooperative(400).unwrap();
+        assert_eq!(r.size(), 400);
+        assert!(
+            large.spill_calls() >= 1,
+            "largest consumer should have spilled"
+        );
+        assert_eq!(
+            small.spill_calls(),
+            0,
+            "smaller consumer should be left alone"
+        );
+    }
+
+    #[test]
+    fn cooperative_reserve_with_no_consumers_is_plain_reserve() {
+        let pool = MemoryPool::new(1000);
+        pool.try_reserve_bytes(800).unwrap();
+        // Nobody to spill → behaves exactly like try_reserve (fails over budget).
+        assert!(pool.try_reserve_cooperative(300).is_err());
+        assert_eq!(pool.used(), 800);
+        assert!(pool.try_reserve_cooperative(200).is_ok());
+    }
+
+    #[test]
+    fn cooperative_reserve_fails_when_consumers_cannot_free_enough() {
+        let pool = MemoryPool::new(1000);
+        let c = MockConsumer::new(&pool, 300);
+        pool.register_consumer(&(Arc::clone(&c) as Arc<dyn Spillable>));
+        pool.try_reserve_bytes(600).unwrap(); // 900 used, 100 free; 300 spillable
+                                              // Need 500: even after spilling all 300, only 400 is free → still fails, and
+                                              // the loop terminates (no infinite spin) rather than hanging.
+        assert!(pool.try_reserve_cooperative(500).is_err());
+        assert!(c.spill_calls() >= 1);
+    }
+
+    #[test]
+    fn dead_consumers_are_swept_and_never_asked() {
+        let pool = MemoryPool::new(1000);
+        {
+            let c = MockConsumer::new(&pool, 500);
+            pool.register_consumer(&(Arc::clone(&c) as Arc<dyn Spillable>));
+        } // c dropped here → its reservation released, its Weak entry now dead
+        assert_eq!(pool.used(), 0);
+        // The dead entry must not be upgraded/asked; this just reserves cleanly.
+        let r = pool.try_reserve_cooperative(800).unwrap();
+        assert_eq!(r.size(), 800);
+    }
+
+    #[test]
+    fn pressure_tracks_soft_and_hard_lines() {
+        let pool = MemoryPool::new(1000);
+        pool.set_soft_fraction(0.8);
+        assert_eq!(pool.pressure(), Pressure::Nominal);
+        pool.try_reserve_bytes(700).unwrap();
+        assert_eq!(pool.pressure(), Pressure::Nominal); // below 80%
+        pool.try_reserve_bytes(150).unwrap(); // 850 → at/above soft line
+        assert_eq!(pool.pressure(), Pressure::Elevated);
+        pool.try_reserve_bytes(150).unwrap(); // 1000 → at hard cap
+        assert_eq!(pool.pressure(), Pressure::Critical);
+    }
+
+    #[test]
+    fn zero_limit_pool_is_never_under_pressure() {
+        let pool = MemoryPool::new(0);
+        assert_eq!(pool.pressure(), Pressure::Nominal);
     }
 }

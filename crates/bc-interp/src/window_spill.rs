@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use arrow::array::{ArrayRef, RecordBatch};
-use bc_runtime::agg::spill::{DiskSpillStore, SpillStore};
+use bc_runtime::agg::spill::{DiskSpillStore, SpillCodec, SpillStore};
 use bc_runtime::shuffle;
 
 use crate::batch_bytes;
@@ -22,6 +22,7 @@ use crate::ops;
 /// Run a window operator under a memory envelope by grace-partitioning on the
 /// `PARTITION BY` keys. Caller guarantees `partition_keys` is non-empty (a single
 /// global partition cannot be split for ranking/running aggregates).
+#[allow(clippy::too_many_arguments)] // a window kernel legitimately needs all of these
 pub(crate) fn window_spilling(
     parts: &[RecordBatch],
     partition_keys: &[bc_expr::Expr],
@@ -30,11 +31,12 @@ pub(crate) fn window_spilling(
     rank_limit: Option<usize>,
     budget_bytes: usize,
     dir: &Path,
+    codec: SpillCodec,
 ) -> Result<Vec<RecordBatch>, InterpError> {
     let p = (batch_bytes(parts) as usize)
         .div_ceil(budget_bytes.max(1))
         .max(2);
-    let mut store = DiskSpillStore::new(dir.join("window"), p)?;
+    let mut store = DiskSpillStore::with_codec(dir.join("window"), p, codec)?;
     for batch in parts {
         let keys: Vec<ArrayRef> = partition_keys
             .iter()

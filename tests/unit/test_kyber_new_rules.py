@@ -228,3 +228,53 @@ def test_preagg_bails_when_right_not_unique():
     q = fact.join(dim_dup, on="k").group_by("r").agg(s=col("amt").sum())
     # Fan-out would multiply the partial sums → must not fire.
     assert pre_aggregation_through_join(q._plan, _preagg_ctx(q, {"k": 2.0})) is None
+
+
+# --- push_distinct_into_union (streaming dedup pushdown) -----------------------
+
+
+def _ctx(ds, ndv):
+    from batcher.config import active_config
+    from batcher.kyber.pass_base import OptimizerContext
+    from batcher.kyber.stats.estimator import StatsEstimator
+
+    est = StatsEstimator(ds._sources, learned={"__column_ndv__": ndv})
+    return OptimizerContext(config=active_config(), sources=ds._sources, hub=None, estimator=est)
+
+
+def test_push_distinct_into_union_dedups_only_the_duplicated_branch():
+    from batcher.kyber.rules.algebraic import push_distinct_into_union
+    from batcher.plan.logical import Distinct, Union
+
+    dup = bt.from_pydict({"k": [1, 1, 2, 2, 3, 3]})  # 6 rows, 3 distinct → dedup shrinks
+    uniq = bt.from_pydict({"k": [4, 5, 6]})  # 3 rows, 3 distinct → dedup is a no-op
+    q = dup.union(uniq).distinct()
+    out = push_distinct_into_union(q._plan, _ctx(q, {"k": 3.0}))
+    assert isinstance(out, Distinct) and isinstance(out.input, Union)
+    branches = out.input.inputs
+    assert isinstance(branches[0], Distinct)  # the duplicated branch is deduped early
+    assert not isinstance(branches[1], Distinct)  # the unique branch is left untouched
+
+
+def test_push_distinct_into_union_noop_without_duplication_evidence():
+    from batcher.kyber.rules.algebraic import push_distinct_into_union
+
+    a = bt.from_pydict({"k": [1, 2, 3]})
+    b = bt.from_pydict({"k": [4, 5, 6]})
+    q = a.union(b).distinct()
+    # No NDV evidence of duplicates → never adds a speculative breaker.
+    assert push_distinct_into_union(q._plan, _ctx(q, {})) is None
+
+
+def test_push_distinct_into_union_preserves_result():
+    from batcher.api.dataset.frame import Dataset
+    from batcher.kyber.rules.algebraic import push_distinct_into_union
+
+    dup = bt.from_pydict({"k": [1, 1, 2, 2, 3, 3]})
+    uniq = bt.from_pydict({"k": [3, 4, 5]})  # 3 overlaps across branches
+    q = dup.union(uniq).distinct()
+    rewritten = push_distinct_into_union(q._plan, _ctx(q, {"k": 3.0}))
+    assert rewritten is not None
+    before = sorted(q.collect().column("k").to_pylist())
+    after = sorted(Dataset(rewritten, q._sources).collect().column("k").to_pylist())
+    assert before == after == [1, 2, 3, 4, 5]

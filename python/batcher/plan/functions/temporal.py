@@ -1,10 +1,10 @@
 """Temporal free functions.
 
-`now`/`current_timestamp`/`current_date`/`today` bind the wall-clock **once, at
-plan-build time** to a literal (DuckDB statement-timestamp semantics) — so the value
-is fixed for the query and stays identical single-node and distributed, never a
-per-row clock read. `date_part`/`date_add`/`date_sub` dispatch onto the existing
-`.dt` accessor, so they add no engine surface.
+`current_timestamp`/`current_date` bind the wall-clock **once, at plan-build time**
+to a literal (SQL statement-timestamp semantics) — so the value is fixed for the
+query and stays identical single-node and distributed, never a per-row clock read.
+`date_part`/`date_add`/`date_sub` dispatch onto the existing `.dt` accessor, so they
+add no engine surface.
 """
 
 from __future__ import annotations
@@ -105,33 +105,12 @@ _PART_TO_DT = {
 }
 
 
-def now() -> Lit:
-    """Return the current timestamp as a literal, bound once at plan-build time.
-
-    DuckDB ``now()`` / statement-timestamp semantics: the wall-clock is read once
-    when the expression is constructed, so every row sees the same value and the
-    result is identical single-node and distributed. It is never a per-row clock read.
-
-    Returns:
-        A timestamp literal expression.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"x": [1, 2]})
-            >>> out = ds.with_columns(t=bt.now()).to_pydict()
-            >>> out["t"][0] == out["t"][1]  # same value for every row
-            True
-    """
-    return Lit(_dt.datetime.now())
-
-
 def current_timestamp() -> Lit:
     """Return the current timestamp as a literal, bound once at plan-build time.
 
-    SQL ``CURRENT_TIMESTAMP``; the spelling of :func:`now` with identical semantics
-    (read once at plan build, constant across rows and across nodes).
+    SQL ``CURRENT_TIMESTAMP``: the wall-clock is read once when the expression is
+    constructed, so every row sees the same value and the result is identical
+    single-node and distributed. It is never a per-row clock read.
 
     Returns:
         A timestamp literal expression.
@@ -163,26 +142,6 @@ def current_date() -> Lit:
             >>> import batcher as bt
             >>> ds = bt.from_pydict({"x": [1, 2]})
             >>> out = ds.with_columns(d=bt.current_date()).to_pydict()
-            >>> out["d"][0] == out["d"][1]  # same date for every row
-            True
-    """
-    return Lit(_dt.date.today())
-
-
-def today() -> Lit:
-    """Return today's date as a literal, bound once at plan-build time.
-
-    DuckDB ``today()``; the spelling of :func:`current_date` with identical semantics.
-
-    Returns:
-        A date literal expression.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"x": [1, 2]})
-            >>> out = ds.with_columns(d=bt.today()).to_pydict()
             >>> out["d"][0] == out["d"][1]  # same date for every row
             True
     """

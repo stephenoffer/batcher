@@ -147,7 +147,7 @@ def test_vector_search_roundtrip(tmp_path):
     assert out2.column("id")[0].as_py() == 142
 
 
-# --- url.download + embed_text -------------------------------------------------
+# --- url.download + model-id infer/embed ---------------------------------------
 def test_download_fetches_local_files(tmp_path):
     paths = []
     for i in range(4):
@@ -200,12 +200,28 @@ def test_download_rejects_bad_on_error():
         bt.from_pydict({"url": ["x"]}).ml.download("url", on_error="oops")
 
 
-def test_embed_text_builds_lazy_map_stage():
+def test_embed_model_id_builds_lazy_map_stage():
     from batcher.plan.logical import MapBatches
 
     # Building the plan must not require sentence-transformers (lazy load-once UDF).
     ds = bt.from_pydict({"text": ["hello", "world"]})
-    plan = ds.ml.embed_text("text", "all-MiniLM-L6-v2", num_gpus=0)._plan
+    plan = ds.ml.embed("all-MiniLM-L6-v2", column="text", num_gpus=0)._plan
+    assert isinstance(plan, MapBatches)
+
+
+def test_infer_model_id_requires_column():
+    from batcher._internal.errors import PlanError
+
+    with pytest.raises(PlanError, match="column="):
+        bt.from_pydict({"text": ["hi"]}).ml.infer("some-model-id")
+
+
+def test_infer_model_id_builds_lazy_map_stage():
+    from batcher.plan.logical import MapBatches
+
+    # Building the plan must not require transformers (lazy load-once UDF).
+    ds = bt.from_pydict({"text": ["great", "awful"]})
+    plan = ds.ml.infer("distilbert-sst2", column="text")._plan
     assert isinstance(plan, MapBatches)
 
 

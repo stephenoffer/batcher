@@ -15,6 +15,7 @@ nothing; the buffer pool, envelopes, AIMD, and spill logic land behind this seam
 
 from __future__ import annotations
 
+from batcher.carbonite.cache import CacheStore, current_result_cache, result_cache
 from batcher.carbonite.manager import ResourceManager
 
-__all__ = ["ResourceManager"]
+__all__ = ["CacheStore", "ResourceManager", "current_result_cache", "result_cache"]

@@ -104,3 +104,26 @@ def test_late_rows_are_dropped():
     out = pa.Table.from_batches(list(ds.iter_batches())).to_pydict()
     got = dict(zip(out["w"], out["total"], strict=True))
     assert got[_BASE] == 3  # 1 + 2, the late 100 dropped
+
+
+@pytest.mark.integration
+def test_windowed_state_cap_fails_loudly_instead_of_oom():
+    # A tiny `streaming_state_max_bytes`: the retained open-window state exceeds it, so
+    # the fold raises a clear ResourceError (the stalled-watermark / huge-key-space
+    # signal) instead of growing unbounded toward OOM.
+    import dataclasses
+
+    from batcher._internal.errors import ResourceError
+    from batcher.config import active_config, config_context
+
+    cfg = active_config()
+    tiny = cfg.replace(memory=dataclasses.replace(cfg.memory, streaming_state_max_bytes=1))
+    with config_context(tiny), pytest.raises(ResourceError, match="streaming aggregate state"):
+        list(_windowed(_stream()).iter_batches())
+
+
+@pytest.mark.integration
+def test_windowed_default_cap_does_not_break_normal_stream():
+    # The generous derived default cap never trips on a normally-advancing watermark.
+    streamed = pa.Table.from_batches(list(_windowed(_stream()).iter_batches()))
+    assert streamed.num_rows > 0

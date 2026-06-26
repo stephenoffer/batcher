@@ -171,7 +171,7 @@ Also available: `day`, `hour`, `minute`, `second`, `quarter`, `week`,
 
 ## List accessor: .list
 
-The `.list` namespace (aliased `.arr`) reduces and reshapes list-typed columns.
+The `.list` namespace reduces and reshapes list-typed columns.
 
 ```python
 lists = bt.from_pydict({"tags": [["x", "y"], ["z"], ["a", "b", "c"]]})

@@ -46,6 +46,7 @@ class Writer:
     __slots__ = ("_ds",)
 
     def __init__(self, ds: Dataset) -> None:
+        """Bind the write namespace to the `Dataset` whose result it writes."""
         self._ds = ds
 
     def __call__(
@@ -59,6 +60,7 @@ class Writer:
         num_workers: int | None = None,
         resume: bool = False,
         max_rows_per_file: int | None = None,
+        sort_by: list[str] | None = None,
         replace_where: Any = None,
         trigger: Trigger | None = None,
         output_mode: str = "append",
@@ -88,6 +90,12 @@ class Writer:
         key-matched — for a key-matched upsert (update/insert by join key) use
         `merge` instead.
 
+        ``sort_by=[cols]`` clusters the output: rows are sorted (ascending) before
+        writing, so each file / row-group's min/max bounds are tight and downstream
+        queries skip far more data via zonemaps and bloom filters — the engine-side
+        slice of liquid clustering (you choose the keys; there is no managed table
+        service). Bounded batch writes only.
+
         ``resume=True`` makes the write idempotent: output files already present
         (necessarily fully committed, since writes are atomic) are skipped, so a job
         re-run after a crash or spot preemption finishes only the unwritten shards —
@@ -104,6 +112,15 @@ class Writer:
         a file that now holds *different* rows, dropping or duplicating data. For
         those, write to a fresh path (no resume) or materialize a stable, keyed
         intermediate first.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> out = os.path.join(tempfile.mkdtemp(), "t.parquet")
+                >>> _ = bt.from_pydict({"x": [1, 2, 3]}).write(out)
+                >>> bt.read(out).count()
+                3
         """
         from batcher._internal.errors import PlanError
         from batcher.api.terminal import _write
@@ -115,11 +132,58 @@ class Writer:
             raise PlanError(f"write(): unknown mode {mode!r}; use one of {list(_SAVE_MODES)}")
         fmt = detect_format(path, format)
 
+        # `sort_by` clusters the output: sort rows (ascending) before writing so each
+        # file / row-group's min/max bounds are tight, maximizing downstream zonemap +
+        # bloom skipping (the engine-side slice of liquid clustering — no managed table
+        # service). Delegate to a sorted dataset so all the write logic below runs on it.
+        # A global sort is a bounded-batch notion; refuse it on an unbounded stream.
+        if sort_by is not None:
+            if trigger is not None or any(not is_bounded(s) for s in self._ds._sources):
+                raise PlanError(
+                    "write(sort_by=...) clusters a bounded batch write; it cannot sort an "
+                    "unbounded stream"
+                )
+            return self._ds.sort(*sort_by).write(
+                path,
+                format,
+                mode=mode,
+                partition_by=partition_by,
+                distributed=distributed,
+                num_workers=num_workers,
+                resume=resume,
+                max_rows_per_file=max_rows_per_file,
+                replace_where=replace_where,
+                output_mode=output_mode,
+                checkpoint=checkpoint,
+                query_name=query_name,
+                **opts,
+            )
+
         # Unified surface: a trigger or an unbounded source means this is a streaming
         # write — append micro-batches to `path` and return a StreamingQuery.
         if trigger is not None or any(not is_bounded(s) for s in self._ds._sources):
             sink = self._stream_sink_for(path, fmt, opts)
             return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
+
+        # Resume is exactly-once only on a deterministic plan: the same input must
+        # produce the same rows in the same part file on every run. A pipeline breaker
+        # (group_by, join, sort, distinct, window, union, limit) or its shuffle makes the
+        # row-to-file assignment vary between runs, so resuming could skip a file that now
+        # holds different rows, silently dropping or duplicating data. Refuse it up front.
+        # The ETL and batch-inference path (read, map_batches, filter, select, write) stays
+        # streamable, so it still resumes.
+        if resume:
+            from batcher.plan.logical import is_streamable
+
+            if not is_streamable(self._ds._plan):
+                raise PlanError(
+                    "write(resume=True) is exactly-once only on a deterministic plan "
+                    "(read → map_batches / filter / select → write). This plan contains a "
+                    "group_by / join / sort / distinct / window / union / limit, whose "
+                    "row→file assignment can vary between runs, so resuming risks dropping "
+                    "or duplicating rows. Write to a fresh path without resume, or "
+                    "materialize a stable keyed intermediate first."
+                )
 
         # `replace_where` = dynamic partition/range overwrite (Delta `replaceWhere` /
         # the backfill pattern): atomically replace only the rows matching the

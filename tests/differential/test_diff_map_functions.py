@@ -39,7 +39,7 @@ def test_map_keys_values_fixtures():
 def test_element_at_present_and_absent():
     out = (
         bt.from_arrow(_data())
-        .select(a=col("m").map.get("a"), c=col("m").map.element_at("c"))
+        .select(a=col("m").map.get("a"), c=col("m").map.get("c"))
         .collect()
         .to_pydict()
     )

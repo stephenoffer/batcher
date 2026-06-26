@@ -25,6 +25,33 @@ pub(crate) fn join_batches(
     output: &[JoinOutputCol],
     strategy: JoinStrategy,
 ) -> Result<RecordBatch, InterpError> {
+    join_batches_with(
+        left,
+        right,
+        left_keys,
+        right_keys,
+        join_type,
+        output,
+        strategy,
+        &bc_arrow::RuntimeTuning::default(),
+    )
+}
+
+/// [`join_batches`] with the probe-bloom tuning supplied by the caller. The bloom
+/// is a pure performance short-circuit (no false negatives), so the produced batch
+/// is identical for any setting; only the parallel executor threads non-default
+/// tuning here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn join_batches_with(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_keys: &[String],
+    right_keys: &[String],
+    join_type: JoinType,
+    output: &[JoinOutputCol],
+    strategy: JoinStrategy,
+    tuning: &bc_arrow::RuntimeTuning,
+) -> Result<RecordBatch, InterpError> {
     let left_key_cols = columns_by_name(left, left_keys)?;
     let right_key_cols = columns_by_name(right, right_keys)?;
     let rt = map_join_type(join_type);
@@ -35,7 +62,13 @@ pub(crate) fn join_batches(
         JoinStrategy::SortMerge => {
             join::sort_merge_join_indices(&left_key_cols, &right_key_cols, rt)?
         }
-        _ => join::hash_join_indices(&left_key_cols, &right_key_cols, rt)?,
+        _ => join::hash_join_indices_with(
+            &left_key_cols,
+            &right_key_cols,
+            rt,
+            tuning.bloom_fp_rate,
+            tuning.bloom_min_build_rows,
+        )?,
     };
     gather_join_output(left, right, &idx, output)
 }

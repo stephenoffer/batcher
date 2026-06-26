@@ -72,3 +72,12 @@ print(back.count())
 At scale, only the endpoints change: `bt.read("s3://bucket/raw/*.parquet")` in,
 `rollup.write.parquet("s3://bucket/curated/", partition_by=["region"])` out, and
 `collect(distributed=True)` to run it across a cluster — the transform is identical.
+
+## Next steps
+
+- [Data quality](../user-guide/data-quality.md): turn the cleaning step into an
+  enforced contract — validate, quarantine, or fail on bad rows.
+- [Lakehouse tables](../user-guide/lakehouse.md): write to Delta with merge/upsert
+  and slowly-changing dimensions instead of plain Parquet.
+- [Performance and memory](../user-guide/performance.md): cache and spill as the
+  data grows.

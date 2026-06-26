@@ -80,6 +80,65 @@ def test_clamp_workers_to_available_cpus(monkeypatch):
     assert ray_runtime.clamp_workers(1) == 1  # already fits
 
 
+def test_clamp_workers_waits_for_autoscale_then_uses_new_nodes(monkeypatch):
+    """On an autoscaling cluster (`autoscale_wait_s > 0`), a big job waits for the
+    nodes it asked for to arrive and then runs at the larger fan-out — instead of
+    clamping to the pre-scale size and leaving the new capacity for the next job."""
+    from batcher.dist.executors import ray_runtime
+
+    monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True}])
+    # The cluster grows 2 → 4 → 8 CPUs over successive polls (autoscaler provisioning).
+    cpus = iter([2.0, 2.0, 4.0, 8.0])
+    last = [8.0]
+
+    def _resources():
+        last[0] = next(cpus, last[0])  # grow over polls, then hold at the last value
+        return {"CPU": last[0]}
+
+    monkeypatch.setattr(ray, "cluster_resources", _resources)
+    cfg = Config().replace(
+        distributed=DistributedConfig(autoscale_wait_s=5.0, autoscale_poll_s=0.01)
+    )
+    with config_context(cfg):
+        assert ray_runtime.clamp_workers(8) == 8  # waited for the scale-up, then used it
+
+
+def test_autoscale_request_high_water_then_reclaims(monkeypatch):
+    """The autoscaler floor is the high-water mark over in-flight query scopes, and
+    resets to 0 only when the LAST scope ends — so concurrent queries compose (a scope
+    never lowers a sibling's floor) and a finished big query stops pinning the cluster
+    scaled up (the autoscaler can reclaim the idle nodes)."""
+    from batcher.dist.executors import ray_runtime as rr
+
+    applied: list[int] = []
+    monkeypatch.setattr(rr, "_apply_autoscale_floor", applied.append)
+    monkeypatch.setattr(rr, "_autoscale_active", 0)
+    monkeypatch.setattr(rr, "_autoscale_floor", 0)
+
+    rr.request_autoscale(100)  # scope A: scale to 100
+    rr.request_autoscale(50)  # scope B: max(100, 50) → still 100
+    assert applied == [100, 100]
+    rr.release_autoscale()  # A ends, B still in flight → floor unchanged (no reclaim)
+    assert applied == [100, 100]
+    rr.release_autoscale()  # last scope ends → reset to 0 so idle nodes are reclaimed
+    assert applied == [100, 100, 0]
+
+
+def test_clamp_workers_autoscale_times_out_and_clamps(monkeypatch):
+    """If the requested nodes never arrive (a fixed cluster, or the autoscaler is at
+    its max), the bounded wait elapses and the job clamps to what is actually there —
+    it never hangs on a scale-up that cannot happen."""
+    from batcher.dist.executors import ray_runtime
+
+    monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True}])
+    monkeypatch.setattr(ray, "cluster_resources", lambda: {"CPU": 2.0})  # never grows
+    cfg = Config().replace(
+        distributed=DistributedConfig(autoscale_wait_s=0.05, autoscale_poll_s=0.01)
+    )
+    with config_context(cfg):
+        assert ray_runtime.clamp_workers(8) == 2  # waited briefly, then clamped to 2
+
+
 def test_auto_distribute_resolution(monkeypatch):
     """distributed="auto" uses the cluster only when connected to a multi-node one;
     explicit True/False always win."""

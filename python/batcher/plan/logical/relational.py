@@ -10,11 +10,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pyarrow as pa
+
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr
 from batcher.plan.ir_tags import Op
 from batcher.plan.logical.base import LogicalPlan, _validate_refs
 from batcher.plan.schema import SchemaRef
+from batcher.plan.types import infer_type, promote, widen
 
 __all__ = [
     "Distinct",
@@ -45,6 +48,12 @@ class Scan(LogicalPlan):
     def available_columns(self) -> list[str]:
         return self.schema.names
 
+    def available_schema(self) -> SchemaRef | None:
+        # The FFI boundary widens narrow numerics on input, so the schema the
+        # engine actually produces from a scan is the widened source schema.
+        fields = [pa.field(f.name, widen(f.type)) for f in self.schema.arrow]
+        return SchemaRef.from_arrow(pa.schema(fields))
+
 
 @dataclass(frozen=True, slots=True)
 class Filter(LogicalPlan):
@@ -66,6 +75,9 @@ class Filter(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return self.input.available_columns()
+
+    def available_schema(self) -> SchemaRef | None:
+        return self.input.available_schema()
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +110,18 @@ class Project(LogicalPlan):
     def available_columns(self) -> list[str]:
         return [item.alias for item in self.items]
 
+    def available_schema(self) -> SchemaRef | None:
+        inp = self.input.available_schema()
+        if inp is None:
+            return None
+        fields: list[pa.Field] = []
+        for item in self.items:
+            t = infer_type(item.expr, inp)
+            if t is None:  # one uncertain column → fall back for the whole plan
+                return None
+            fields.append(pa.field(item.alias, t))
+        return SchemaRef.from_arrow(pa.schema(fields))
+
 
 @dataclass(frozen=True, slots=True)
 class Limit(LogicalPlan):
@@ -118,6 +142,9 @@ class Limit(LogicalPlan):
     def available_columns(self) -> list[str]:
         return self.input.available_columns()
 
+    def available_schema(self) -> SchemaRef | None:
+        return self.input.available_schema()
+
 
 @dataclass(frozen=True, slots=True)
 class Distinct(LogicalPlan):
@@ -130,6 +157,9 @@ class Distinct(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return self.input.available_columns()
+
+    def available_schema(self) -> SchemaRef | None:
+        return self.input.available_schema()
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +181,9 @@ class WatermarkDedup(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return self.input.available_columns()
+
+    def available_schema(self) -> SchemaRef | None:
+        return self.input.available_schema()
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +213,23 @@ class Union(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return self.inputs[0].available_columns()
+
+    def available_schema(self) -> SchemaRef | None:
+        schemas = [i.available_schema() for i in self.inputs]
+        if any(s is None for s in schemas):
+            return None
+        base = schemas[0]
+        names = base.names  # branches share column names (validated at build)
+        out_types: list[pa.DataType] = [base.field(n).type for n in names]
+        for s in schemas[1:]:
+            for idx, n in enumerate(names):
+                common = promote(out_types[idx], s.field(n).type)
+                if common is None:  # uncertain engine coercion → fall back
+                    return None
+                out_types[idx] = common
+        return SchemaRef.from_arrow(
+            pa.schema([pa.field(n, t) for n, t in zip(names, out_types, strict=True)])
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +264,23 @@ class Unnest(LogicalPlan):
     def available_columns(self) -> list[str]:
         return [self.alias if c == self.column else c for c in self.input.available_columns()]
 
+    def available_schema(self) -> SchemaRef | None:
+        inp = self.input.available_schema()
+        if inp is None:
+            return None
+        list_t = inp.field(self.column).type
+        if not (
+            pa.types.is_list(list_t)
+            or pa.types.is_large_list(list_t)
+            or pa.types.is_fixed_size_list(list_t)
+        ):
+            return None  # unnest of a non-list: leave it to the engine
+        fields = [
+            pa.field(self.alias, list_t.value_type) if f.name == self.column else f
+            for f in inp.arrow
+        ]
+        return SchemaRef.from_arrow(pa.schema(fields))
+
 
 @dataclass(frozen=True, slots=True)
 class RowId(LogicalPlan):
@@ -243,6 +310,13 @@ class RowId(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return [self.alias, *self.input.available_columns()]
+
+    def available_schema(self) -> SchemaRef | None:
+        inp = self.input.available_schema()
+        if inp is None:
+            return None
+        fields = [pa.field(self.alias, pa.int64()), *inp.arrow]
+        return SchemaRef.from_arrow(pa.schema(fields))
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +355,20 @@ class Unpivot(LogicalPlan):
     def available_columns(self) -> list[str]:
         return [*self.index, self.variable_name, self.value_name]
 
+    def available_schema(self) -> SchemaRef | None:
+        inp = self.input.available_schema()
+        if inp is None:
+            return None
+        value_t = inp.field(self.on[0]).type
+        for c in self.on[1:]:  # the melted columns share a (promotable) type
+            value_t = promote(value_t, inp.field(c).type)
+            if value_t is None:
+                return None
+        fields = [inp.field(c) for c in self.index]
+        fields.append(pa.field(self.variable_name, pa.string()))
+        fields.append(pa.field(self.value_name, value_t))
+        return SchemaRef.from_arrow(pa.schema(fields))
+
 
 @dataclass(frozen=True, slots=True)
 class Sample(LogicalPlan):
@@ -317,6 +405,9 @@ class Sample(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return self.input.available_columns()
+
+    def available_schema(self) -> SchemaRef | None:
+        return self.input.available_schema()
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +450,12 @@ class MapBatches(LogicalPlan):
     # node) and VRAM-pack the GPU fraction; lets Kyber's cost model scale the
     # inference cost by model size. 0.0 = unknown (no budgeting).
     model_memory_gb: float = 0.0
+    # Run the per-batch calls across `num_workers` *processes* instead of threads, so a
+    # CPU-bound pure-Python `fn` (which the GIL would serialize across threads) uses
+    # multiple cores on a single node. Opt-in; the local executor falls back to threads
+    # when the `fn` is not process-safe (a factory/class, a GPU `fn`, or a non-pyarrow
+    # `batch_format`). No effect on the distributed path (Ray actors already isolate).
+    multiprocessing: bool = False
 
     def to_ir(self) -> dict[str, Any]:
         raise NotImplementedError("map_batches is executed in Python, not lowered to the engine IR")

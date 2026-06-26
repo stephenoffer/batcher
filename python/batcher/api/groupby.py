@@ -43,6 +43,7 @@ class GroupBy:
     def __init__(
         self, source: Dataset, keys: tuple[str, ...], named: dict[str, Expr] | None = None
     ) -> None:
+        """Hold the source dataset and grouping keys until `agg` finishes the aggregation."""
         self._source = source
         self._keys = keys
         self._named = named or {}

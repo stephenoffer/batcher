@@ -14,7 +14,6 @@ from batcher.api.dataset import Dataset, GroupBy
 from batcher.api.functions import *  # noqa: F403  (governed by functions.__all__)
 from batcher.api.io_namespace import read
 from batcher.api.session import (
-    catalog,
     compact,
     date_range,
     engine_version,
@@ -49,7 +48,6 @@ __all__ = [
     "OutputMode",
     "Session",
     "Trigger",
-    "catalog",
     "compact",
     "date_range",
     "engine_version",

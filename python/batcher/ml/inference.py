@@ -20,19 +20,67 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from queue import Queue
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from batcher.config import active_config
 
 if TYPE_CHECKING:
     import pyarrow as pa
 
-__all__ = ["InferencePool", "Worker", "WorkerFactory"]
+__all__ = ["InferencePool", "Worker", "WorkerFactory", "transformers_pipeline_encoder"]
 
 # A worker transforms one whole batch (e.g. runs a model forward pass on its columns).
 Worker = Callable[["pa.RecordBatch"], "pa.RecordBatch"]
 # Builds a worker; called exactly once per pool slot so the model loads once.
 WorkerFactory = Callable[[], Worker]
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """Whether `exc` is a CUDA out-of-memory error, checked structurally so torch is
+    not a hard import (the name covers `torch.cuda.OutOfMemoryError`; the message
+    covers the older `RuntimeError: CUDA out of memory`)."""
+    if type(exc).__name__ == "OutOfMemoryError":
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+def _empty_cuda_cache() -> None:
+    """Best-effort release of cached CUDA blocks so a halved retry has room to run."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _run_with_oom_retry(worker: Worker, batch: pa.RecordBatch) -> tuple[pa.RecordBatch, float]:
+    """Run `worker(batch)`, surviving a CUDA OOM by halving and retrying.
+
+    A transient VRAM spike (a fragmented allocator, a co-tenant model) can OOM a batch
+    that would fit at half the size. Rather than fail the job, free the cache and run
+    the two halves independently, concatenating their per-row-independent inference
+    outputs — equivalent to the whole batch. Re-raises once a single row still OOMs (a
+    genuine over-allocation, not a too-large batch) or for any non-OOM error. Returns
+    `(output_batch, latency_ms)`; on a split, latency is the halves' sum.
+    """
+    start = time.perf_counter()
+    try:
+        out = worker(batch)
+        return out, (time.perf_counter() - start) * 1000.0
+    except Exception as exc:
+        if not _is_cuda_oom(exc) or batch.num_rows <= 1:
+            raise
+        _empty_cuda_cache()
+        mid = batch.num_rows // 2
+        left, left_ms = _run_with_oom_retry(worker, batch.slice(0, mid))
+        right, right_ms = _run_with_oom_retry(worker, batch.slice(mid))
+        import pyarrow as pa
+
+        merged = pa.Table.from_batches([left, right]).combine_chunks().to_batches()
+        out = merged[0] if merged else left
+        return out, left_ms + right_ms
 
 
 class _DynamicBatcher:
@@ -165,6 +213,13 @@ class InferencePool:
             else None
         )
         self._throughput_ctl = None
+        # Default the VRAM sampler so the throughput autobatcher's predictive cap is
+        # actually fed live data (it is otherwise inert — no caller wires one). The
+        # default returns None on a GPU-less host, so the guard stays a no-op there.
+        if vram_sampler is None and objective == "throughput":
+            from batcher.ml.gpu import sample_gpu_vram_fraction
+
+            vram_sampler = sample_gpu_vram_fraction
         self._vram_sampler = vram_sampler
         if objective == "throughput":
             from batcher.ml.autobatch import ThroughputController
@@ -201,9 +256,7 @@ class InferencePool:
         def dispatch(batch: pa.RecordBatch) -> tuple[pa.RecordBatch, float]:
             worker = workers.get()
             try:
-                start = time.perf_counter()
-                out = worker(batch)
-                return out, (time.perf_counter() - start) * 1000.0
+                return _run_with_oom_retry(worker, batch)
             finally:
                 workers.put(worker)
 
@@ -226,3 +279,51 @@ class InferencePool:
             if tail is not None:
                 pending.append(pool.submit(dispatch, tail))
             yield from drain(block=True)
+
+
+def transformers_pipeline_encoder(
+    model: str, column: str, *, output_column: str = "prediction", task: str | None = None
+) -> type:
+    """A load-once class UDF that runs a HuggingFace ``transformers`` pipeline.
+
+    The model-identifier path of `ds.ml.infer`: builds ``transformers.pipeline(task,
+    model=model)`` once per worker (the load-once GPU-inference pattern) and runs it
+    over each batch's `column`, appending the pipeline's primary output per row as
+    `output_column`. For a classification pipeline that is the predicted ``label``;
+    for text generation the ``generated_text``; otherwise the raw scalar output. Needs
+    ``transformers`` (``batcher-engine[transformers]``).
+    """
+
+    class _PipelineModel:
+        def __init__(self) -> None:
+            try:
+                from transformers import pipeline
+            except ImportError as exc:  # pragma: no cover - optional extra
+                from batcher._internal.errors import BackendError
+
+                msg = "ds.ml.infer(<model id>) needs: pip install 'batcher-engine[transformers]'"
+                raise BackendError(msg) from exc
+            self._pipe = pipeline(task, model=model)
+
+        def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+            import pyarrow as pa
+
+            results = self._pipe(batch.column(column).to_pylist())
+            out_col = pa.array([_primary_output(r) for r in results])
+            if output_column in batch.schema.names:
+                idx = batch.schema.get_field_index(output_column)
+                return batch.set_column(idx, output_column, out_col)
+            return batch.append_column(output_column, out_col)
+
+    return _PipelineModel
+
+
+def _primary_output(result: Any) -> Any:
+    """The single salient value of one pipeline result row (label / text / scalar)."""
+    if isinstance(result, list):  # token/aggregated pipelines nest a list per row
+        result = result[0] if result else None
+    if isinstance(result, dict):
+        for key in ("label", "generated_text", "summary_text", "translation_text", "answer"):
+            if key in result:
+                return result[key]
+    return result

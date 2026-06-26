@@ -124,3 +124,5 @@ print(people.columns)
 
 - [Transformations](transformations.md): reshape and derive columns.
 - [Filtering](filtering.md): select rows and remove duplicates.
+- [Lakehouse tables](lakehouse.md): read Delta/Iceberg tables and time-travel.
+- [Data quality](data-quality.md): validate inputs as they arrive.

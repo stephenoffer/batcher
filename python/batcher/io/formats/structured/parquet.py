@@ -380,3 +380,14 @@ class ParquetSink(FileSink):
         import pyarrow.parquet as pq
 
         pq.write_table(table, fh, compression=self.compression)
+
+    def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
+        import pyarrow.parquet as pq
+
+        return pq.ParquetWriter(fh, schema, compression=self.compression)
+
+    def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
+        writer.write_batch(batch)
+
+    def _close_stream_writer(self, writer: Any) -> None:
+        writer.close()

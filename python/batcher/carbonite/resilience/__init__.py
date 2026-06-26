@@ -9,6 +9,10 @@ sibling modules.
 from __future__ import annotations
 
 from batcher.carbonite.resilience.lineage import ShuffleLineage
+from batcher.carbonite.resilience.preemption import (
+    PreemptionMonitor,
+    preemption_monitor,
+)
 from batcher.carbonite.resilience.recovery import RecoveryPolicy, ShuffleRecovery
 from batcher.carbonite.resilience.speculative import (
     SpeculationPolicy,
@@ -17,10 +21,12 @@ from batcher.carbonite.resilience.speculative import (
 )
 
 __all__ = [
+    "PreemptionMonitor",
     "RecoveryPolicy",
     "ShuffleLineage",
     "ShuffleRecovery",
     "SpeculationPolicy",
     "gather_with_backups",
+    "preemption_monitor",
     "stragglers_to_backup",
 ]

@@ -38,6 +38,7 @@ BANNED_FILENAMES = {"utils.py", "helpers.py", "common.py", "misc.py"}
 
 # Roots whose subtree is governed (and the depth origin for each).
 PY_ROOT = Path("python/batcher")
+BENCH_ROOT = Path("benchmarks")  # the benchmark harness holds to the same structure bar
 CRATE_SRC_GLOB = "crates/*/src"
 
 # Fluent builders / namespace accessors: breadth is the sanctioned Polars pattern
@@ -81,6 +82,18 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # fallback the broadcast path depends on. Splitting the broadcast path into a
     # sibling forces a base<->fallback import cycle with `_shuffle_join`.
     "python/batcher/dist/executors/join.py": "distributed-join strategy hub; broadcast/shuffle split forces an import cycle",
+    # Cost-based join reordering: the rule driver plus three cost-DP rebuilders
+    # (exhaustive subset DP, connected-subset DP for large sparse graphs, greedy) that
+    # share the same edge/leaf/schema scaffolding (`_join_plans`/`_final_projection`).
+    # `kyber/rules/` is already at the 12-file directory cap, so the DP builders can't
+    # move to a sibling module without breaching it — the dir-size invariant wins.
+    "python/batcher/kyber/rules/join_order.py": "join-reorder rule + cost-DP variants; rules/ at the 12-file dir cap",
+    # The Delta connector is one cohesive lakehouse source+sink: read (incl.
+    # deletion-vector / merge-on-read masking), partitioned/atomic write, MERGE,
+    # change-data-feed, time-travel, and add-action statistics, all sharing the same
+    # `_table()` / add-action scaffolding. Splitting it into a subpackage is the proper
+    # fix but a separate refactor; the cohesive connector wins over the line cap here.
+    "python/batcher/io/formats/lakehouse/delta.py": "complete Delta source+sink connector (read/DV/write/MERGE/CDF/time-travel/stats)",
     # The expression accessor namespaces: each is one bound family (`.str` / `.list`)
     # whose every public method carries a Google-style docstring with a runnable
     # `.. doctest::` example (python-quality.md). The examples — not the code — push
@@ -98,6 +111,12 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # these over; they are one cohesive `bt.read` / `ds.write` façade.
     "python/batcher/api/io_namespace/reader.py": "bt.read façade; per-format examples push it over",
     "python/batcher/api/io_namespace/writer.py": "ds.write façade; per-format examples push it over",
+    # The `ds.ml` accessor: one bound ML/multimodal namespace (map_batches, infer,
+    # embed, the torch loaders, download/upload) whose every public method now carries
+    # a Google-style docstring — runnable for the in-memory transforms, illustrative
+    # for the model/loader paths. The examples, not the thin delegating bodies, push it
+    # over; the methods are one cohesive accessor bound as a unit.
+    "python/batcher/api/dataset/ml.py": "ds.ml accessor; per-method examples push it over",
 }
 
 fails: list[str] = []
@@ -241,11 +260,12 @@ def main() -> int:
 
     os.chdir(repo)
 
-    if PY_ROOT.is_dir():
-        for p in PY_ROOT.rglob("*.py"):
-            if "__pycache__" not in p.parts:
-                check_python_file(p)
-        check_dirs(PY_ROOT, PY_ROOT.parent)
+    for root in (PY_ROOT, BENCH_ROOT):
+        if root.is_dir():
+            for p in root.rglob("*.py"):
+                if "__pycache__" not in p.parts:
+                    check_python_file(p)
+            check_dirs(root, root.parent)
 
     for src in sorted(Path().glob(CRATE_SRC_GLOB)):
         for p in src.rglob("*.rs"):

@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import contextlib
 import fnmatch
+import hashlib
 import io
 import os
 import posixpath
+import threading
 import uuid
-from collections.abc import Iterator
+from collections import OrderedDict
+from collections.abc import Callable, Iterator
 from typing import IO, Any, Protocol, runtime_checkable
 
 import pyarrow as pa
@@ -120,14 +123,24 @@ class _ArrowFileSystem:
     sees its bucket-relative ones.
     """
 
-    __slots__ = ("_atomic_rename", "_fs", "_prefix", "_strip_query")
+    __slots__ = ("_atomic_rename", "_cacheable", "_fs", "_prefix", "_strip_query")
 
     def __init__(
-        self, fs: pafs.FileSystem, prefix: str, *, atomic_rename: bool, strip_query: bool = True
+        self,
+        fs: pafs.FileSystem,
+        prefix: str,
+        *,
+        atomic_rename: bool,
+        strip_query: bool = True,
+        cacheable: bool = False,
     ) -> None:
         self._fs = fs
         self._prefix = prefix
         self._atomic_rename = atomic_rename
+        # Remote object-store reads may be served from a local-SSD read-through cache
+        # (`FileBytesCache`, below) when one is configured; local backends never cache
+        # (the bytes are already local).
+        self._cacheable = cacheable
         # Native backends carry config in the URI query (e.g. ``?endpoint_override=``),
         # which pyarrow has already consumed — so it is dropped from the object path.
         # fsspec-backed URLs (e.g. presigned ``https://…?signature=…``) keep it: the
@@ -193,7 +206,38 @@ class _ArrowFileSystem:
         # A buffered wrapper over the pyarrow input file gives the full Python file
         # protocol (read/readline/seek) the byte-range split readers rely on, while
         # staying acceptable to every pyarrow reader.
-        return io.BufferedReader(self._fs.open_input_file(self._p(path)))  # type: ignore[arg-type]
+        in_path = self._p(path)
+        local = self._cached_local(in_path)
+        if local is not None:
+            return io.BufferedReader(open(local, "rb"))
+        return io.BufferedReader(self._fs.open_input_file(in_path))  # type: ignore[arg-type]
+
+    def _cached_local(self, in_path: str) -> str | None:
+        """The local-cache copy of a remote file, fetching it on a miss; `None` when
+        caching is off or unavailable. Best-effort — any failure falls back to a direct
+        remote read, so the cache never breaks a read.
+
+        The cache key folds in the file's size and mtime (one cheap HEAD/stat per open),
+        so overwriting the same remote path with new content is a miss, not a stale hit
+        — correctness over saving a metadata round-trip."""
+        if not self._cacheable:
+            return None
+        try:
+            cache = get_file_cache()
+            if cache is None:
+                return None
+            info = self._fs.get_file_info(in_path)
+            key = f"{in_path}\0{info.size}\0{info.mtime_ns}"
+            return cache.get_or_fetch(key, lambda dst: self._download(in_path, dst))
+        except Exception:  # pragma: no cover - a cache failure must not break reads
+            return None
+
+    def _download(self, in_path: str, dst: str) -> None:
+        """Stream a remote file to local `dst` (chunked, so a large file never fully
+        materializes in memory)."""
+        with self._fs.open_input_file(in_path) as src, open(dst, "wb") as out:
+            while chunk := src.read(1 << 20):
+                out.write(chunk)
 
     @contextlib.contextmanager
     def atomic_writer(self, path: str) -> Iterator[IO[Any]]:
@@ -283,7 +327,10 @@ def resolve_filesystem(path: str) -> FileSystem:
     base = path.split("?", 1)[0]
     prefix = base[: len(base) - len(in_path)]
     canonical = _SCHEME_ALIASES.get(scheme, scheme)
-    return _ArrowFileSystem(fs, prefix, atomic_rename=canonical not in _OBJECT_STORE_SCHEMES)
+    is_object_store = canonical in _OBJECT_STORE_SCHEMES
+    return _ArrowFileSystem(
+        fs, prefix, atomic_rename=not is_object_store, cacheable=is_object_store
+    )
 
 
 def _fsspec_backed(scheme: str, path: str) -> FileSystem:
@@ -308,3 +355,107 @@ def _fsspec_backed(scheme: str, path: str) -> FileSystem:
     return _ArrowFileSystem(
         fs, prefix, atomic_rename=protocol not in _OBJECT_STORE_SCHEMES, strip_query=False
     )
+
+
+# --- Local-SSD read-through file cache (the Disk-Cache analog) ----------------
+# A remote object-store read may be served from a local-SSD copy: the first read of
+# a remote file streams it here; later reads of the same file hit local disk, sparing
+# the object-store round-trip. It lives with the filesystem that opens files (not in
+# the `carbonite` subsystem) because `core`/`kyber` depend on `io`, so an io→carbonite
+# edge would transitively break their independence; the budget comes from config. The
+# cache is transparent and ephemeral — a miss just re-fetches, never a wrong result.
+
+
+class FileBytesCache:
+    """A byte-bounded, LRU local-disk cache of whole remote files.
+
+    Keyed by the remote path; the cached copy lives at ``<cache_dir>/<sha256(path)>``.
+    Thread-safe. Fetching happens outside the lock (it is slow I/O) into a unique temp
+    file that is atomically renamed into place, so concurrent readers never observe a
+    half-written file.
+    """
+
+    __slots__ = ("_dir", "_entries", "_lock", "_max_bytes", "_used")
+
+    def __init__(self, cache_dir: str, max_bytes: int) -> None:
+        """Create the cache rooted at `cache_dir`, bounded to `max_bytes` on disk."""
+        self._dir = cache_dir
+        self._max_bytes = max(0, int(max_bytes))
+        self._lock = threading.Lock()
+        # key → on-disk size; insertion/most-recent order drives LRU eviction.
+        self._entries: OrderedDict[str, int] = OrderedDict()
+        self._used = 0
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def get_or_fetch(self, remote_path: str, fetch: Callable[[str], None]) -> str:
+        """Return the local path of the cached copy of `remote_path`.
+
+        On a miss, `fetch(local_tmp_path)` is called to materialize the bytes (it must
+        write the full file to the given path); the result is then admitted under the
+        byte budget, evicting the least-recently-used entries if needed.
+        """
+        key = hashlib.sha256(remote_path.encode("utf-8")).hexdigest()
+        local = os.path.join(self._dir, key)
+        with self._lock:
+            if key in self._entries:
+                self._entries.move_to_end(key)  # mark most-recently-used
+                return local
+
+        # Miss: fetch outside the lock (slow remote I/O) to a unique temp, then rename.
+        tmp = f"{local}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        try:
+            fetch(tmp)
+            size = os.path.getsize(tmp)
+            os.replace(tmp, local)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+
+        with self._lock:
+            # A racing thread may have admitted the same key first; only one accounts
+            # for the bytes (the file content is identical, so the rename is harmless).
+            if key not in self._entries:
+                self._entries[key] = size
+                self._used += size
+                self._evict_locked()
+            else:
+                self._entries.move_to_end(key)
+        return local
+
+    def _evict_locked(self) -> None:
+        """Drop least-recently-used entries until within budget (caller holds lock)."""
+        while self._used > self._max_bytes and self._entries:
+            old_key, old_size = self._entries.popitem(last=False)
+            self._used -= old_size
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(self._dir, old_key))
+
+    @property
+    def used_bytes(self) -> int:
+        """Total bytes currently held on disk by the cache."""
+        with self._lock:
+            return self._used
+
+
+_CACHES: dict[str, FileBytesCache] = {}
+_CACHES_LOCK = threading.Lock()
+
+
+def get_file_cache() -> FileBytesCache | None:
+    """The process-wide file cache for the active config, or `None` when disabled.
+
+    Memoized per cache directory, so `config_context` overriding `file_cache_dir`
+    (e.g. in a test) yields a distinct cache without disturbing the default one.
+    """
+    from batcher.config import active_config
+
+    mem = active_config().memory
+    if not mem.file_cache_dir:
+        return None
+    with _CACHES_LOCK:
+        cache = _CACHES.get(mem.file_cache_dir)
+        if cache is None:
+            cache = FileBytesCache(mem.file_cache_dir, mem.file_cache_max_bytes)
+            _CACHES[mem.file_cache_dir] = cache
+        return cache

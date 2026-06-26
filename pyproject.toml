@@ -128,6 +128,14 @@ dev = [
     "numpy>=1.24",
     "scikit-learn>=1.3",
 ]
+# Competitive benchmarking lineup: the single-node and multi-node engines Batcher is
+# measured against (`benchmarks/`). DuckDB/Polars are also the correctness oracles;
+# PySpark and Daft are the heavier comparators, pulled in only here.
+bench = [
+    "batcher-engine[duckdb,polars,ray,pandas,cloud]",
+    "daft>=0.3",
+    "pyspark>=3.5",
+]
 # Documentation toolchain (Sphinx + MyST Markdown + Furo theme). Mirrors
 # docs/requirements.txt; `just docs` builds the site and runs the doctest blocks.
 docs = [

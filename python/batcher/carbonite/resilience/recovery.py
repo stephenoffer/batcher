@@ -33,7 +33,9 @@ class RecoveryPolicy:
     `max_attempts` bounds the recompute→retry cycles; a shuffle that still has
     unreachable inputs after that many rounds is treated as unrecoverable.
     `backoff_base_s` is the base of an exponential backoff slept between rounds, so
-    a flaky cluster is not retried in a tight loop (0 disables the sleep).
+    a flaky cluster is not retried in a tight loop (0 disables the sleep). The backoff
+    carries *equal jitter*, so a correlated preemption wave (many reducers losing
+    workers at once) does not retry in lockstep and stampede the survivors.
     """
 
     max_attempts: int = 3
@@ -72,11 +74,17 @@ class ShuffleRecovery:
             recompute(failed)
             self.recomputes += 1
             # Exponential backoff before the next round so a flaky network/cluster
-            # is not hammered in a tight recompute→retry loop.
+            # is not hammered in a tight recompute→retry loop. Equal jitter
+            # (`half + U[0, half]`) keeps at least half the backoff while decorrelating
+            # a correlated preemption wave's retries, so survivors aren't stampeded by
+            # every lost reducer retrying at the same instant.
             if self._policy.backoff_base_s > 0 and round_idx + 1 < self._policy.max_attempts:
+                import random
                 import time
 
-                time.sleep(self._policy.backoff_base_s * (2**round_idx))
+                ceiling = self._policy.backoff_base_s * (2**round_idx)
+                half = ceiling / 2.0
+                time.sleep(half + random.uniform(0.0, half))
         raise ResourceError(
             f"shuffle did not recover after {self._policy.max_attempts} attempts "
             f"(still unreachable: {failed})"

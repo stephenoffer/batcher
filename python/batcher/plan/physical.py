@@ -75,3 +75,18 @@ class PhysicalPlan:
     def to_json(self) -> str:
         """Serialize the relational IR for the engine."""
         return json.dumps(self.ir)
+
+    def op_budgets(self) -> dict[int, int]:
+        """Per-operator spill budgets (bytes) keyed by pre-order `op_id`.
+
+        Kyber sizes each stateful operator's peak memory envelope
+        (`ResourceBounds.m_max_bytes`); this surfaces those bounds as the side map
+        Core ships to the engine so the data plane budgets each operator
+        individually instead of applying one global `memory_budget_bytes` to every
+        operator. Only positively-sized operators are included — an absent entry
+        means "fall back to the global budget", which is exactly the behaviour for
+        unsized (streaming/unknown) operators that Kyber leaves at `m_max_bytes=0`.
+        """
+        return {
+            int(op.op_id): op.bounds.m_max_bytes for op in self.ops if op.bounds.m_max_bytes > 0
+        }

@@ -11,28 +11,49 @@ is a fact, not a guess.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from batcher.plan.profile import QueryProfile
 
 __all__ = ["OpStat", "RunStats"]
 
 
 @dataclass(frozen=True, slots=True)
 class OpStat:
-    """Measured metrics for one operator in an executed plan."""
+    """Measured metrics for one operator in an executed plan.
+
+    The measured fields (`rows_in`/`rows_out`/`elapsed_ms`/`result_bytes`/`spilled`/
+    `backend`) are joined to Kyber's planned `est_rows`/`provenance`, so each operator
+    carries both what was estimated and what happened (`est_error`). `result_bytes` is the
+    operator's *output* size, not peak working set — read `spilled` for memory pressure.
+    """
 
     op_id: int
     kind: str
     rows_in: int
     rows_out: int
     elapsed_ms: float
-    peak_bytes: int
+    result_bytes: int
     spilled: bool
     backend: str
+    est_rows: float = float("nan")
+    provenance: str = ""
+    cpu_util: float = 0.0
 
     @property
     def selectivity(self) -> float:
         """``rows_out / rows_in`` (1.0 when the operator had no input rows)."""
         return self.rows_out / self.rows_in if self.rows_in else 1.0
+
+    @property
+    def est_error(self) -> float:
+        """``rows_out / est_rows`` — how far the estimate missed (`nan` if unknown)."""
+        if math.isnan(self.est_rows) or self.est_rows <= 0:
+            return float("nan")
+        return self.rows_out / self.est_rows
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,23 +70,32 @@ class RunStats:
     rows: int
 
     @classmethod
-    def from_ops(cls, ops: list[dict], total_ms: float, rows: int) -> RunStats:
-        """Build from the engine's raw `ExecMetrics` op dicts (see
-        `core.execute_local_metered`)."""
+    def from_profile(cls, profile: QueryProfile) -> RunStats:
+        """Build from a `QueryProfile` — the measured operators with planned estimates joined.
+
+        Covers the single-node, out-of-core spill, and distributed paths uniformly (the
+        profile is assembled from whichever path actually ran). On a distributed run the
+        driver tree is unmeasured, so the measured `worker_ops` (the map sub-plan) carry
+        the per-operator detail — they are included so `stats()` is never empty there.
+        """
+        measured = [o for o in profile.ops if o.measured] + list(profile.worker_ops)
         parsed = tuple(
             OpStat(
-                op_id=int(o.get("op_id", 0)),
-                kind=str(o.get("kind", "")),
-                rows_in=int(o.get("rows_in", 0)),
-                rows_out=int(o.get("rows_out", 0)),
-                elapsed_ms=float(o.get("elapsed_ns", 0)) / 1e6,
-                peak_bytes=int(o.get("peak_bytes", 0)),
-                spilled=bool(o.get("spilled", False)),
-                backend=str(o.get("backend", "")),
+                op_id=o.op_id,
+                kind=o.kind,
+                rows_in=o.rows_in,
+                rows_out=o.rows_out,
+                elapsed_ms=o.elapsed_ms,
+                result_bytes=o.result_bytes,
+                spilled=o.spilled,
+                backend=o.backend,
+                est_rows=o.est_rows,
+                provenance=o.provenance,
+                cpu_util=o.cpu_util,
             )
-            for o in ops
+            for o in measured
         )
-        return cls(ops=parsed, total_ms=total_ms, rows=rows)
+        return cls(ops=parsed, total_ms=profile.total_ms, rows=profile.rows)
 
     @property
     def bottleneck(self) -> OpStat | None:
@@ -91,13 +121,13 @@ class RunStats:
     def __str__(self) -> str:
         header = (
             f"{'op':>3}  {'kind':<12}{'rows_in':>12}{'rows_out':>12}"
-            f"{'ms':>10}{'peak_kb':>12}  backend"
+            f"{'ms':>10}{'out_kb':>12}  backend"
         )
         lines = [header, "-" * len(header)]
         for o in self.ops:
             lines.append(
                 f"{o.op_id:>3}  {o.kind:<12}{o.rows_in:>12}{o.rows_out:>12}"
-                f"{o.elapsed_ms:>10.2f}{o.peak_bytes // 1024:>12}  "
+                f"{o.elapsed_ms:>10.2f}{o.result_bytes // 1024:>12}  "
                 f"{o.backend}{' [spill]' if o.spilled else ''}"
             )
         lines.append("-" * len(header))

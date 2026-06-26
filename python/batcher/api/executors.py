@@ -16,6 +16,8 @@ chain.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pyarrow as pa
 
 from batcher._internal.registry import Registry
@@ -58,7 +60,11 @@ class DistributedExecutor:
             )
             _collect_source_metadata(ctx.hub, sources)
             return table
-        return run_relational(plan, sources, ctx, distributed=True)[0]
+        # Relational distributed result — deterministic and identical to single-node,
+        # so it shares the same result cache (`Dataset.cache()`).
+        return _cached_or_run(
+            plan, sources, ctx, lambda: run_relational(plan, sources, ctx, distributed=True)[0]
+        )
 
 
 class UdfExecutor:
@@ -83,7 +89,61 @@ class LocalNativeExecutor:
     """Single-node native execution: Kyber → Carbonite → Core, with feedback."""
 
     def execute(self, plan: LogicalPlan, sources: list[Source], ctx: ExecutionContext) -> pa.Table:
-        return run_relational(plan, sources, ctx, distributed=False)[0]
+        return _cached_or_run(
+            plan, sources, ctx, lambda: run_relational(plan, sources, ctx, distributed=False)[0]
+        )
+
+
+def _cached_or_run(
+    plan: LogicalPlan,
+    sources: list[Source],
+    ctx: ExecutionContext,
+    run: Callable[[], pa.Table],
+) -> pa.Table:
+    """Serve `plan`'s result from the process result cache, else compute it via `run`
+    and store it — the shared `Dataset.cache()` path for the relational executors.
+
+    A no-op wrapper around `run()` unless `ctx.cache`. Only relational results are
+    cached (the UDF path is opaque to Kyber and may be non-deterministic, so it never
+    routes here); the key is shared across the single-node and distributed paths
+    (mergeable algebra makes their results identical), so a result cached one way is
+    served the other. An oversized result is simply not cached (the store's size guard).
+    """
+    if not ctx.cache:
+        return run()
+    import time
+
+    from batcher import carbonite
+
+    cache = carbonite.result_cache()
+    key = _result_cache_key(plan, sources)
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    started = time.perf_counter()
+    table = run()
+    cost = time.perf_counter() - started
+    # Pin the source objects as the entry's keep-alive: the key uses their object
+    # identity, so holding them alive makes a collision with a reused id impossible.
+    # `cost` (recompute seconds) lets eviction keep expensive results over cheap ones.
+    cache.put(key, table, keepalive=tuple(sources), cost=cost)
+    return table
+
+
+def _result_cache_key(plan: LogicalPlan, sources: list[Source]) -> str:
+    """A correctness-safe result-cache key: the plan signature plus each input's
+    object identity *and* declared identity.
+
+    Object identity (`id`) distinguishes inputs that share a shape — `Source.identity()`
+    is shape-based for in-memory data (``mem:schema:rows``), so two *different* in-memory
+    datasets with the same shape would otherwise collide and return each other's result.
+    The cache pins the source objects (keep-alive) for the entry's lifetime, so the
+    `id` cannot be reused by another object while the entry is live.
+    """
+    from batcher.kyber.signature import plan_signature
+
+    inputs = "|".join(f"{id(s)}:{s.identity()}" for s in sources)
+    return f"{plan_signature(plan)}|{inputs}"
 
 
 def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
@@ -133,8 +193,12 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
     num_gpus = recommend_num_gpus(load_gpu_utilization(hub, gpu_feedback_key(plan)), base_gpus)
 
     n_tasks = num_workers or (cfg.execution.parallelism or os.cpu_count() or 4)
+    # A CPU-only map stage (no GPU) is usually IO/decode-bound preprocessing — request
+    # a fractional CPU so more actors pack per node, mirroring the GPU-fraction packing
+    # above. A GPU stage keeps a full CPU (the GPU is the binding resource there).
+    num_cpus = cfg.execution.cpus_per_task if num_gpus > 0 else cfg.execution.cpu_share_io
     return SchedulingEnvelope(
-        num_cpus=cfg.execution.cpus_per_task,
+        num_cpus=num_cpus,
         memory_bytes=int(model_gb * 1.5 * (1 << 30)),
         num_gpus=num_gpus,
         n_tasks=max(1, n_tasks),
