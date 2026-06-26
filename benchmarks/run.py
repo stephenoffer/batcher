@@ -26,14 +26,26 @@ dispatches the standalone benchmarks (`--benchmark distributed | optimizer | shu
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import time
 
 import batcher as bt
 import engines as engines_mod
 import suites  # noqa: F401  (import registers every benchmark)
+from batcher.config import active_config, set_config
 from context import Context
 from harness import compare, print_table
 from registry import REGISTRY
+
+_SIZE_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+
+
+def _parse_size(text: str) -> int:
+    """Parse a byte size like ``64GB`` / ``16G`` / ``1048576`` into bytes."""
+    s = text.strip().upper().rstrip("B").rstrip("I")  # tolerate GB / GiB / G
+    unit = s[-1] if s and s[-1] in _SIZE_UNITS else ""
+    num = s[: -1 if unit else len(s)] or s
+    return int(float(num) * _SIZE_UNITS[unit])
 
 # Engine-comparison datasets (run through the correctness-gated compare()).
 BENCHMARKS = ("tpch", "tpcds", "clickbench", "operators")
@@ -72,8 +84,28 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--source", default=None, help="override the dataset's parquet base URI")
     p.add_argument("--family", default=None, help="run only this family (exact match)")
     p.add_argument("--only", default=None, help="run only cases whose name contains this substring")
+    p.add_argument(
+        "--memory-bytes",
+        default=None,
+        help="pin Batcher's memory cap (e.g. 64GB) to force the bounded-envelope spill "
+        "path instead of the auto-sensed host RAM — for exercising out-of-core at scale",
+    )
+    p.add_argument("--spill-dir", default=None, help="local scratch dir for spilled batches")
     p.add_argument("--list", action="store_true", help="list registered benchmarks and exit")
     return p.parse_args()
+
+
+def _apply_memory_config(args: argparse.Namespace) -> None:
+    """Pin Batcher's memory envelope / spill dir from the CLI, if given."""
+    if args.memory_bytes is None and args.spill_dir is None:
+        return
+    cfg = active_config()
+    overrides: dict[str, object] = {}
+    if args.memory_bytes is not None:
+        overrides["max_memory_bytes"] = _parse_size(args.memory_bytes)
+    if args.spill_dir is not None:
+        overrides["spill_dir"] = args.spill_dir
+    set_config(cfg.replace(memory=dataclasses.replace(cfg.memory, **overrides)))
 
 
 def _list_benchmarks() -> None:
@@ -131,6 +163,7 @@ def main() -> int:
     if args.benchmark in AUX:
         return _run_aux(args.benchmark, args)
 
+    _apply_memory_config(args)
     names = args.engines.split(",") if args.engines else engines_mod.default_names(args.tier)
     engines = engines_mod.resolve([n.strip() for n in names])
     print(f"Batcher benchmark suite  (engine {bt.engine_version()})")
