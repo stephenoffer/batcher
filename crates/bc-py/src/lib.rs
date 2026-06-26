@@ -8,82 +8,27 @@
 //! pyarrow batches. Conversion is zero-copy via the Arrow C Data Interface, so a
 //! `RecordBatch` crosses the boundary without serialization.
 
-use std::sync::Arc;
-
 use arrow::array::{Array, RecordBatch};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::DataType;
 use arrow_pyarrow::PyArrowType;
-use bc_ir::{AggregateItem, EngineConfig, ProjectionItem, RelOp};
+use bc_ir::{EngineConfig, RelOp};
 use bc_sketches::Mergeable; // brings `.merge()` into scope for ColumnStats
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 mod bloom;
 mod errors;
+mod normalize;
 mod process;
 mod shuffle;
+mod tracing_init;
 use errors::transport_to_pyerr;
+use normalize::{
+    narrow_output, normalize_batch, original_narrow_types, parse_aggregates, parse_group_keys,
+    supported_cast_dtypes, unwrap_batches,
+};
 use process::{shared_memory_pool, shared_runtime};
-
-/// The widened type the engine's Int64/Float64 kernels operate on, or `None` to
-/// leave a column as-is. Real-world data is full of narrow numerics (Int32 ids,
-/// Float32 features, unsigned counts); normalizing them once at the boundary lets
-/// every operator stay on the two well-tested numeric paths.
-fn widen_to(dt: &DataType) -> Option<DataType> {
-    use DataType::*;
-    match dt {
-        Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32 | UInt64 => Some(Int64),
-        Float16 | Float32 => Some(Float64),
-        _ => None,
-    }
-}
-
-/// Upcast narrow numeric columns of one batch to Int64/Float64. Non-numeric and
-/// already-wide columns are passed through untouched (a cheap `Arc` clone).
-fn normalize_batch(batch: &RecordBatch) -> RecordBatch {
-    let schema = batch.schema();
-    let mut changed = false;
-    let mut fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for (i, field) in schema.fields().iter().enumerate() {
-        let col = batch.column(i);
-        match widen_to(col.data_type()) {
-            Some(target) => match cast(col, &target) {
-                Ok(arr) => {
-                    changed = true;
-                    fields.push(Field::new(field.name(), target, field.is_nullable()));
-                    columns.push(arr);
-                }
-                Err(_) => {
-                    fields.push(field.as_ref().clone());
-                    columns.push(col.clone());
-                }
-            },
-            None => {
-                fields.push(field.as_ref().clone());
-                columns.push(col.clone());
-            }
-        }
-    }
-    if !changed {
-        return batch.clone();
-    }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap_or_else(|_| batch.clone())
-}
-
-/// Unwrap a Python list of pyarrow batches into normalized Arrow record batches.
-pub(crate) fn unwrap_batches(batches: Vec<PyArrowType<RecordBatch>>) -> Vec<RecordBatch> {
-    batches.into_iter().map(|b| normalize_batch(&b.0)).collect()
-}
-
-pub(crate) fn parse_group_keys(json: &str) -> PyResult<Vec<ProjectionItem>> {
-    serde_json::from_str(json).map_err(to_pyerr)
-}
-
-pub(crate) fn parse_aggregates(json: &str) -> PyResult<Vec<AggregateItem>> {
-    serde_json::from_str(json).map_err(to_pyerr)
-}
 
 /// Execute a plan against in-memory input relations, returning the result morsels.
 ///
@@ -108,10 +53,11 @@ fn execute_plan(
     sources: Vec<Vec<PyArrowType<RecordBatch>>>,
     engine_config: &str,
 ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
-    let (plan, sources, opts) = prepare_exec(plan_json, sources, engine_config)?;
+    let (plan, sources, opts, narrow) = prepare_exec(plan_json, sources, engine_config)?;
     let out = py
         .allow_threads(|| bc_interp::execute_parallel_with(&plan, &sources, &opts))
         .map_err(to_pyerr)?;
+    let out = narrow_output(out, &narrow);
     Ok(out.into_iter().map(PyArrowType).collect())
 }
 
@@ -130,10 +76,11 @@ fn execute_plan_metered(
     sources: Vec<Vec<PyArrowType<RecordBatch>>>,
     engine_config: &str,
 ) -> PyResult<(Vec<PyArrowType<RecordBatch>>, String)> {
-    let (plan, sources, opts) = prepare_exec(plan_json, sources, engine_config)?;
+    let (plan, sources, opts, narrow) = prepare_exec(plan_json, sources, engine_config)?;
     let (out, metrics) = py
         .allow_threads(|| bc_interp::execute_parallel_with_metrics(&plan, &sources, &opts))
         .map_err(to_pyerr)?;
+    let out = narrow_output(out, &narrow);
     Ok((
         out.into_iter().map(PyArrowType).collect(),
         metrics.to_json(),
@@ -142,11 +89,18 @@ fn execute_plan_metered(
 
 /// Shared setup for the execute entry points: parse the plan + engine config and
 /// normalize the input morsels (narrow numeric types → Int64/Float64) once.
+type ExecSetup = (
+    RelOp,
+    Vec<Vec<RecordBatch>>,
+    bc_interp::ExecOptions,
+    std::collections::HashMap<String, DataType>,
+);
+
 fn prepare_exec(
     plan_json: &str,
     sources: Vec<Vec<PyArrowType<RecordBatch>>>,
     engine_config: &str,
-) -> PyResult<(RelOp, Vec<Vec<RecordBatch>>, bc_interp::ExecOptions)> {
+) -> PyResult<ExecSetup> {
     let plan = RelOp::from_json(plan_json).map_err(to_pyerr)?;
     let cfg = EngineConfig::from_json(engine_config).map_err(to_pyerr)?;
     let mut opts = bc_interp::ExecOptions::default().with_engine_config(&cfg);
@@ -158,14 +112,21 @@ fn prepare_exec(
     }
     let sources: Vec<Vec<RecordBatch>> = sources
         .into_iter()
-        .map(|relation| {
-            relation
-                .into_iter()
-                .map(|b| normalize_batch(&b.0))
-                .collect()
-        })
+        .map(|relation| relation.into_iter().map(|b| b.0).collect())
         .collect();
-    Ok((plan, sources, opts))
+    // Record pre-widening source widths *before* normalization (which widens them
+    // away), and only when output re-narrowing is requested; an empty map makes
+    // `narrow_output` a no-op (the default fast path).
+    let narrow = if cfg.shrink_output_dtypes {
+        original_narrow_types(&sources)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let sources: Vec<Vec<RecordBatch>> = sources
+        .into_iter()
+        .map(|relation| relation.iter().map(normalize_batch).collect())
+        .collect();
+    Ok((plan, sources, opts, narrow))
 }
 
 /// Map any engine error into a Python exception. The error hierarchy mapping
@@ -369,6 +330,54 @@ fn tail_quantiles(
         );
     }
     Ok(out)
+}
+
+/// Build a TDigest over `column`'s numeric values across `batches` and return its
+/// serialized bytes — the *partial* step of a mergeable approximate quantile. Returns
+/// `None` when the column is missing, non-numeric, or has no valid values. Paired with
+/// `tdigest_quantile`: each partition (or streamed chunk) builds one sketch, the driver
+/// merges them, so an approximate quantile never collects the column to one place.
+#[pyfunction]
+fn tdigest_partial(
+    column: String,
+    batches: Vec<PyArrowType<RecordBatch>>,
+) -> PyResult<Option<Vec<u8>>> {
+    let mut digest = bc_sketches::TDigest::default();
+    let mut any = false;
+    for batch in &batches {
+        let b = &batch.0;
+        if let Some(col) = b.column_by_name(&column) {
+            let Ok(f) = cast(col, &DataType::Float64) else {
+                continue;
+            };
+            let Some(arr) = f.as_any().downcast_ref::<arrow::array::Float64Array>() else {
+                continue;
+            };
+            for i in 0..arr.len() {
+                if arr.is_valid(i) {
+                    digest.add(arr.value(i));
+                    any = true;
+                }
+            }
+        }
+    }
+    Ok(any.then(|| digest.to_bytes()))
+}
+
+/// Merge serialized TDigest `sketches` (from `tdigest_partial`) and return the value at
+/// quantile `q` — the *combine + finalize* step. `None` when no sketch carried data.
+#[pyfunction]
+fn tdigest_quantile(sketches: Vec<Vec<u8>>, q: f64) -> PyResult<Option<f64>> {
+    let mut merged: Option<bc_sketches::TDigest> = None;
+    for bytes in &sketches {
+        if let Some(d) = bc_sketches::TDigest::from_bytes(bytes) {
+            match merged.as_mut() {
+                Some(m) => m.merge(&d),
+                None => merged = Some(d),
+            }
+        }
+    }
+    Ok(merged.and_then(|mut m| m.quantile(q)))
 }
 
 /// Heavy hitters (the Misra-Gries `FrequentItems` sketch) per column: the values
@@ -746,6 +755,7 @@ impl ShuffleClient {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__engine_version__", env!("CARGO_PKG_VERSION"))?;
+    m.add_function(wrap_pyfunction!(tracing_init::init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_metered, m)?)?;
     m.add_function(wrap_pyfunction!(partial_aggregate, m)?)?;
@@ -764,12 +774,15 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(column_stats, m)?)?;
     m.add_function(wrap_pyfunction!(column_quantiles, m)?)?;
     m.add_function(wrap_pyfunction!(tail_quantiles, m)?)?;
+    m.add_function(wrap_pyfunction!(tdigest_partial, m)?)?;
+    m.add_function(wrap_pyfunction!(tdigest_quantile, m)?)?;
     m.add_function(wrap_pyfunction!(heavy_hitters, m)?)?;
     m.add_function(wrap_pyfunction!(reservoir_sample, m)?)?;
     m.add_class::<FlightShuffleServer>()?;
     m.add_function(wrap_pyfunction!(flight_fetch, m)?)?;
     m.add_function(wrap_pyfunction!(set_flight_transport_config, m)?)?;
     m.add_function(wrap_pyfunction!(shm_available, m)?)?;
+    m.add_function(wrap_pyfunction!(supported_cast_dtypes, m)?)?;
     m.add_class::<ShuffleClient>()?;
     m.add_class::<MemoryPool>()?;
     // Classified shuffle-fetch exceptions: the control plane catches `Retryable` as

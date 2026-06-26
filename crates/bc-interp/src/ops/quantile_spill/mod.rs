@@ -37,6 +37,8 @@ use arrow::datatypes::{DataType, Field, Float64Type, Schema};
 use arrow::row::{OwnedRow, RowConverter, SortField};
 use bc_ir::{ProjectionItem, SortKey};
 
+use bc_runtime::agg::spill::SpillCodec;
+
 use crate::error::InterpError;
 use crate::ops::external_sort_to_final_store;
 
@@ -55,12 +57,13 @@ pub(crate) fn try_bounded_quantile_spill(
     group_keys: &[ProjectionItem],
     aggregates: &[bc_ir::AggregateItem],
     spill_dir: &std::path::Path,
+    codec: SpillCodec,
 ) -> Result<Option<GroupedColumns>, InterpError> {
     let Some((value_expr, q)) = single_quantile(aggregates) else {
         return Ok(None);
     };
     let dir = spill_dir.join("agg-quantile");
-    let (gc, qc) = bounded_group_quantile(parts, group_keys, value_expr, q, &dir)?;
+    let (gc, qc) = bounded_group_quantile(parts, group_keys, value_expr, q, &dir, codec)?;
     Ok(Some((gc, vec![qc])))
 }
 
@@ -74,12 +77,13 @@ pub(crate) fn try_bounded_distinct_spill(
     group_keys: &[ProjectionItem],
     aggregates: &[bc_ir::AggregateItem],
     spill_dir: &std::path::Path,
+    codec: SpillCodec,
 ) -> Result<Option<GroupedColumns>, InterpError> {
     let Some(value_expr) = single_distinct(aggregates) else {
         return Ok(None);
     };
     let dir = spill_dir.join("agg-distinct");
-    let (gc, cc) = bounded_group_distinct(parts, group_keys, value_expr, &dir)?;
+    let (gc, cc) = bounded_group_distinct(parts, group_keys, value_expr, &dir, codec)?;
     Ok(Some((gc, vec![cc])))
 }
 
@@ -104,12 +108,13 @@ pub(crate) fn try_bounded_mode_spill(
     group_keys: &[ProjectionItem],
     aggregates: &[bc_ir::AggregateItem],
     spill_dir: &std::path::Path,
+    codec: SpillCodec,
 ) -> Result<Option<GroupedColumns>, InterpError> {
     let Some(value_expr) = single_mode(aggregates) else {
         return Ok(None);
     };
     let dir = spill_dir.join("agg-mode");
-    let (gc, mc) = bounded_group_mode(parts, group_keys, value_expr, &dir)?;
+    let (gc, mc) = bounded_group_mode(parts, group_keys, value_expr, &dir, codec)?;
     Ok(Some((gc, vec![mc])))
 }
 
@@ -134,12 +139,13 @@ pub(crate) fn try_bounded_histogram_spill(
     group_keys: &[ProjectionItem],
     aggregates: &[bc_ir::AggregateItem],
     spill_dir: &std::path::Path,
+    codec: SpillCodec,
 ) -> Result<Option<GroupedColumns>, InterpError> {
     let Some(value_expr) = single_histogram(aggregates) else {
         return Ok(None);
     };
     let dir = spill_dir.join("agg-histogram");
-    let (gc, mc) = histogram::bounded_group_histogram(parts, group_keys, value_expr, &dir)?;
+    let (gc, mc) = histogram::bounded_group_histogram(parts, group_keys, value_expr, &dir, codec)?;
     Ok(Some((gc, vec![mc])))
 }
 
@@ -179,6 +185,7 @@ pub(crate) fn bounded_group_quantile(
     value_expr: &bc_expr::Expr,
     q: f64,
     dir: &std::path::Path,
+    codec: SpillCodec,
 ) -> Result<(Vec<ArrayRef>, ArrayRef), InterpError> {
     let n_keys = group_keys.len();
 
@@ -232,6 +239,7 @@ pub(crate) fn bounded_group_quantile(
         &sort_keys,
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+        codec,
     )?
     else {
         return Ok((
@@ -421,6 +429,7 @@ pub(crate) fn bounded_group_distinct(
     group_keys: &[ProjectionItem],
     value_expr: &bc_expr::Expr,
     dir: &std::path::Path,
+    codec: SpillCodec,
 ) -> Result<(Vec<ArrayRef>, ArrayRef), InterpError> {
     let n_keys = group_keys.len();
 
@@ -434,6 +443,7 @@ pub(crate) fn bounded_group_distinct(
         &sort_keys,
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+        codec,
     )?
     else {
         return Ok((
@@ -529,6 +539,7 @@ pub(crate) fn bounded_group_mode(
     group_keys: &[ProjectionItem],
     value_expr: &bc_expr::Expr,
     dir: &std::path::Path,
+    codec: SpillCodec,
 ) -> Result<(Vec<ArrayRef>, ArrayRef), InterpError> {
     use arrow::array::{new_empty_array, new_null_array};
 
@@ -550,6 +561,7 @@ pub(crate) fn bounded_group_mode(
         &sort_keys,
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+        codec,
     )?
     else {
         return Ok((

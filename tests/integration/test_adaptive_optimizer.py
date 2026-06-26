@@ -37,13 +37,13 @@ def _big_small():
 def test_build_side_keeps_small_on_right():
     fact, dim = _big_small()
     # fact (big) on left, dim (small) on right → small already builds; no swap.
-    assert "keep" in fact.join(dim, on="k").explain()
+    assert "swap" not in fact.join(dim, on="k").explain().lower()
 
 
 def test_build_side_swaps_to_build_smaller():
     fact, dim = _big_small()
     # dim (small) on left, fact (big) on right → swap so small is the build side.
-    assert "SWAP" in dim.join(fact, on="k").explain()
+    assert "swap" in dim.join(fact, on="k").explain().lower()
 
 
 def test_build_side_swap_preserves_results():

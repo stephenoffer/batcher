@@ -22,9 +22,15 @@ from batcher.core.executor import (
     record_exec_metrics,
 )
 from batcher.core.runtime import default_hub, reset_default_hub
-from batcher.core.stats import column_statistics, heavy_hitters, tail_quantiles
+from batcher.core.stats import (
+    column_statistics,
+    heavy_hitters,
+    tail_quantiles,
+    tdigest_partial,
+    tdigest_quantile,
+)
 from batcher.core.streaming_query import StreamingQueryEngine, make_processor
-from batcher.core.udf import execute_with_udfs, has_map_batches
+from batcher.core.udf import execute_with_udfs, has_map_batches, prebuild_factories
 
 __all__ = [
     "ExecutionContext",
@@ -39,7 +45,10 @@ __all__ = [
     "has_map_batches",
     "heavy_hitters",
     "make_processor",
+    "prebuild_factories",
     "record_exec_metrics",
     "reset_default_hub",
     "tail_quantiles",
+    "tdigest_partial",
+    "tdigest_quantile",
 ]

@@ -58,8 +58,8 @@ pub(crate) fn spilling_hash_join_streaming(
         .sum();
     let p = build_bytes.div_ceil(sp.memory_budget_bytes.max(1)).max(2);
 
-    let mut lstore = DiskSpillStore::new(sp.dir.join("join-left"), p)?;
-    let mut rstore = DiskSpillStore::new(sp.dir.join("join-right"), p)?;
+    let mut lstore = DiskSpillStore::with_codec(sp.dir.join("join-left"), p, sp.codec)?;
+    let mut rstore = DiskSpillStore::with_codec(sp.dir.join("join-right"), p, sp.codec)?;
     // Stream each input batch through the key-partitioner into its `p` shards; only
     // one input batch and its shards are resident at a time, so neither side is ever
     // fully materialized in memory.
@@ -131,8 +131,8 @@ pub(crate) fn spilling_asof_join(
     let lb = shuffle::partition_by_keys(left, &li, p)?;
     let rb = shuffle::partition_by_keys(right, &ri, p)?;
 
-    let mut lstore = DiskSpillStore::new(sp.dir.join("asof-left"), p)?;
-    let mut rstore = DiskSpillStore::new(sp.dir.join("asof-right"), p)?;
+    let mut lstore = DiskSpillStore::with_codec(sp.dir.join("asof-left"), p, sp.codec)?;
+    let mut rstore = DiskSpillStore::with_codec(sp.dir.join("asof-right"), p, sp.codec)?;
     for i in 0..p {
         lstore.append(i, &lb[i])?;
         rstore.append(i, &rb[i])?;

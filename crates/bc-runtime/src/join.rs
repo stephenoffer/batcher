@@ -16,7 +16,7 @@
 
 use arrow::array::{Array, ArrayRef, UInt32Array};
 use arrow::buffer::NullBuffer;
-use arrow::row::{OwnedRow, RowConverter, SortField};
+use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
 use bc_sketches::BloomFilter;
 use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
@@ -273,6 +273,21 @@ pub(crate) fn hash_join_indices_impl(
     })
 }
 
+/// Sort `idx` into ascending encoded-key order, skipping the sort when the indices
+/// already arrive that way (one O(n) pass). Pre-sorted input — time-series, an
+/// upstream `Sort`, sorted lakehouse files — then merges without the O(n log n) sort,
+/// which is what makes sort-merge the right pick for already-ordered inputs.
+/// Result-identical: the merge consumes ascending keys either way, and equal-key
+/// group order does not affect the unordered join relation.
+fn sort_indices_if_unsorted(idx: &mut [u32], enc: &Rows) {
+    let already = idx
+        .windows(2)
+        .all(|w| enc.row(w[0] as usize) <= enc.row(w[1] as usize));
+    if !already {
+        idx.sort_by(|&a, &b| enc.row(a as usize).cmp(&enc.row(b as usize)));
+    }
+}
+
 /// Sort-merge join: sort both sides by key, then merge. Produces the **same
 /// [`JoinIndices`] relation** as [`hash_join_indices`] for every join type (output
 /// order differs — these are unordered relations). The win is no hash table: both
@@ -307,8 +322,12 @@ pub fn sort_merge_join_indices(
     let mut r: Vec<u32> = (0..n_right as u32)
         .filter(|&i| !right_null[i as usize])
         .collect();
-    l.sort_by(|&a, &b| left_enc.row(a as usize).cmp(&left_enc.row(b as usize)));
-    r.sort_by(|&a, &b| right_enc.row(a as usize).cmp(&right_enc.row(b as usize)));
+    // Skip the O(n log n) sort on a side that already arrives in ascending key order
+    // (pre-sorted lakehouse / time-series input, or an upstream `Sort`): a one-pass
+    // check is O(n). The merge only needs ascending keys — equal-key group order is
+    // irrelevant to the unordered result — so the as-is order is bit-equivalent.
+    sort_indices_if_unsorted(&mut l, &left_enc);
+    sort_indices_if_unsorted(&mut r, &right_enc);
 
     // Left/Full/Anti preserve unmatched left rows; Right/Full preserve unmatched
     // right rows (Semi emits only *matched* left rows, once each).
@@ -674,6 +693,42 @@ mod tests {
                 sorted_pairs(&hash),
                 sorted_pairs(&smj),
                 "sort-merge disagrees with hash for {jt:?}"
+            );
+        }
+    }
+
+    /// Already-ascending keys on both sides exercise the no-sort fast path
+    /// (`sort_indices_if_unsorted` skips the sort); the result must still equal the
+    /// hash oracle for every join type, across duplicate keys.
+    #[test]
+    fn sort_merge_presorted_fast_path_matches_oracle() {
+        let left: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
+            Some(1),
+            Some(2),
+            Some(2),
+            Some(3),
+            Some(5),
+        ]))];
+        let right: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
+            Some(2),
+            Some(2),
+            Some(4),
+            Some(5),
+        ]))];
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let hash = hash_join_indices(&left, &right, jt).unwrap();
+            let smj = sort_merge_join_indices(&left, &right, jt).unwrap();
+            assert_eq!(
+                sorted_pairs(&hash),
+                sorted_pairs(&smj),
+                "presorted sort-merge disagrees with hash for {jt:?}"
             );
         }
     }

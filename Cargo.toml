@@ -14,8 +14,11 @@ authors = ["Batcher contributors"]
 # Arrow is the in-memory columnar contract across the whole engine.
 # Default features bring the compute kernels (arith/cmp/boolean/select) the
 # interpreter is built on; `ffi` adds the C Data Interface for zero-copy Python views;
-# `ipc` is the on-disk batch format the runtime spills through under memory pressure.
-arrow = { version = "56", features = ["ffi", "prettyprint", "ipc"] }
+# `ipc` is the on-disk batch format the runtime spills through under memory pressure;
+# `ipc_compression` (LZ4_FRAME + ZSTD) lets the spill writer compress those IPC
+# streams — without it the write-side codec is a no-op and compressed streams cannot
+# be read back.
+arrow = { version = "56", features = ["ffi", "prettyprint", "ipc", "ipc_compression"] }
 
 # PyO3 boundary — abi3 so one wheel covers all CPython >= 3.10.
 # Pinned to 0.25 to match arrow-pyarrow 56 (avoids a duplicate pyo3 in the graph).
@@ -40,6 +43,14 @@ bc-transport = { path = "crates/bc-transport" }
 # Shared utility deps.
 thiserror = "2"
 ahash = "0.8"
+
+# Structured logging/tracing for the data plane. `tracing` is a pure-Rust facade with
+# near-zero cost when no subscriber is installed (the default) and a cheap level check
+# otherwise; only `bc-py` installs a subscriber (`init_tracing`), driven by the Python
+# `ObservabilityConfig`. Adding `tracing` to a pure-Rust crate does NOT violate the
+# bc-py-only-PyO3 rule — `tracing-subscriber` (the install side) lives only in bc-py.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 smallvec = "1"
 indexmap = "2"
 hashbrown = "0.15"

@@ -80,10 +80,15 @@ def _ipc_options(compression: str | None) -> pa.ipc.IpcWriteOptions | None:
     """Arrow-IPC write options for the configured codec, or `None` if unavailable.
 
     Spilled data is transient, so a cheap-fast codec (LZ4) trades CPU for disk I/O
-    and footprint. Degrades silently to uncompressed if the codec isn't built into
-    this pyarrow, so spilling never fails on a missing optional codec.
+    and footprint. ``"auto"`` (the datatype-aware default) is uncompressed here: this
+    Python tier spills to fast local disk, where compressing numeric/string state
+    costs more CPU than the I/O it saves (the native Rust path's per-batch classifier
+    compresses only blob payloads, where it pays). Set ``"lz4"``/``"zstd"`` explicitly
+    to force compression on this tier (worthwhile for the slow remote-overflow path).
+    Degrades silently to uncompressed if the codec isn't built into this pyarrow, so
+    spilling never fails on a missing optional codec.
     """
-    if not compression:
+    if not compression or compression == "auto":
         return None
     try:
         return pa.ipc.IpcWriteOptions(compression=compression)

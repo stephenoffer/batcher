@@ -51,3 +51,13 @@ cfg = Config.from_env(
 print((cfg.execution.parallelism, cfg.memory.soft_limit))
 # (16, 0.7)
 ```
+
+## Runnable examples
+
+- `performance_caching.py` — cache a reused result and spill under a tiny budget.
+- `spill.py` — out-of-core execution under a bounded memory budget.
+- `adaptive_optimization.py` — intra-query re-optimization, result-identical.
+- `distributed.py` — single-node vs. cluster, identical results (needs the `[ray]` extra).
+
+See also [performance and memory](../user-guide/performance.md) and
+[distributed fault tolerance](../architecture/fault-tolerance.md).

@@ -64,17 +64,22 @@
 //!
 //! Each `colK` points at the raw values buffer of the K-th referenced column
 //! (`PrimitiveArray::values()`, i.e. `&[i64]` or `&[f64]`), in stable
-//! first-seen order. `out` points at a freshly allocated buffer of `n` elements:
-//! `i64` for integer arithmetic, `f64` for float arithmetic, and `u8` (0/1) for
-//! comparisons, which is then copied into the result Arrow array. The loop body
-//! reads `colK[i]`, evaluates the expression, and stores to `out[i]`.
+//! first-seen order. `out` points at a freshly allocated output buffer: `n` `i64`s
+//! for integer arithmetic, `n` `f64`s for float arithmetic, or — for a boolean
+//! result — a packed Arrow bitmask of `ceil(n/8)` zero-initialized bytes the loop
+//! OR-s one bit per row into (LSB-first), so the result `BooleanArray` wraps it
+//! with no per-element repack. The loop body reads `colK[i]`, evaluates the
+//! expression, and writes row `i` of `out`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, PrimitiveArray, RecordBatch};
-use arrow::buffer::ScalarBuffer;
-use arrow::datatypes::{ArrowPrimitiveType, DataType, Float64Type, Int64Type};
+use arrow::array::{
+    ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, PrimitiveArray, RecordBatch,
+    TimestampMicrosecondArray,
+};
+use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Float64Type, Int64Type, TimeUnit};
 
 use cranelift_codegen::ir::{types, Type};
 use cranelift_jit::JITModule;
@@ -85,6 +90,7 @@ use crate::compile::{compile, compile_simd};
 mod analyze;
 mod compile;
 mod emit;
+mod simd;
 
 /// Errors surfaced by the JIT backend. `Unsupported` is the signal for the
 /// caller to fall back to the interpreter; the rest are genuine failures.
@@ -109,6 +115,19 @@ pub(crate) enum ScalarTy {
     I64,
     F64,
     Bool,
+    /// A `Date32` column or date literal: physically an `i32` day count, loaded and
+    /// sign-extended to `i64` and usable **only** as a comparison operand (against
+    /// another `Date32`). Arrow compares `Date32` by its `i32` value and signed
+    /// extension preserves that ordering, so the JIT comparison is bit-for-bit
+    /// identical to the interpreter. Arithmetic/math/cast on dates, and a bare date
+    /// result, fall back to the interpreter (`analyze` rejects them).
+    Date32,
+    /// A tz-naive `Timestamp(Microsecond)` column or timestamp literal: an `i64`
+    /// microsecond instant. Like [`ScalarTy::Date32`] it is comparison-only (against
+    /// another `TsUs`); Arrow compares instants by their i64 value, so the JIT i64
+    /// comparison is bit-for-bit identical. Other units/timezones, arithmetic, and a
+    /// bare result fall back to the interpreter.
+    TsUs,
 }
 
 impl ScalarTy {
@@ -117,6 +136,8 @@ impl ScalarTy {
             ScalarTy::I64 => types::I64,
             ScalarTy::F64 => types::F64,
             ScalarTy::Bool => types::I8,
+            // A loaded date / timestamp instant lives in an i64 register.
+            ScalarTy::Date32 | ScalarTy::TsUs => types::I64,
         }
     }
 }
@@ -200,24 +221,87 @@ fn kleene_supported(expr: &bc_expr::Expr) -> bool {
     }
 }
 
-/// True if `expr` is the pure-`F64` arithmetic subset the vector (`compile_simd`)
-/// path handles: every leaf is an `F64` column or a float literal, every interior
-/// node is `+`/`-`/`*`/`/`. These are exactly the ops whose `F64X2` lanes are IEEE-
-/// identical to the scalar path (so parity holds), and whose result is `F64` — no
-/// comparisons (boolean output), no `Mod` (libcall), no int/cast lanes, no libm.
-fn simd_supported(expr: &bc_expr::Expr, cols: &ColumnSet) -> bool {
+/// The lane (scalar) type `expr` evaluates to in the vector (`compile_simd`) path,
+/// or `None` if any node is outside the vectorizable subset. This is the gate the
+/// dispatch in [`compile_expr`] consults: `Some(_)` means every node lowers to a
+/// 128-bit `F64X2`/`I64X2` op whose per-lane result is bit-for-bit identical to the
+/// scalar [`Codegen`](crate::emit::Codegen), so vectorizing preserves parity with
+/// the interpreter oracle.
+///
+/// Admitted: `Col`(`I64`/`F64`) / `Lit`(`Int`/`Float`) leaves; integer `+`/`-`/`*`
+/// and float `+`/`-`/`*`/`/` (with `i64 -> f64` promotion); comparisons over numeric
+/// operands (a boolean lane mask); `Not` of a boolean; and exact numeric `Cast`
+/// (`i64 -> f64` or a no-op). Everything else — `And`/`Or` (the Kleene ABI owns
+/// nullable compound predicates), integer `Div`/`Mod`, float `Mod`, `Math`/`Math2`,
+/// `Case`, temporal operands — returns `None` and stays on the scalar path.
+fn simd_ty(expr: &bc_expr::Expr, cols: &ColumnSet) -> Option<ScalarTy> {
+    use arrow::datatypes::DataType;
     use bc_expr::{BinaryOp, Expr, Literal};
     match expr {
-        Expr::Col { name } => cols.ty.get(name) == Some(&ScalarTy::F64),
+        Expr::Col { name } => match cols.ty.get(name)? {
+            // Only numeric columns vectorize; temporal operands stay scalar.
+            ScalarTy::I64 => Some(ScalarTy::I64),
+            ScalarTy::F64 => Some(ScalarTy::F64),
+            _ => None,
+        },
+        Expr::Lit {
+            value: Literal::Int(_),
+        } => Some(ScalarTy::I64),
         Expr::Lit {
             value: Literal::Float(_),
-        } => true,
-        Expr::Binary {
-            op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
-            left,
-            right,
-        } => simd_supported(left, cols) && simd_supported(right, cols),
-        _ => false,
+        } => Some(ScalarTy::F64),
+        Expr::Lit { .. } => None,
+        Expr::Not { input } => (simd_ty(input, cols)? == ScalarTy::Bool).then_some(ScalarTy::Bool),
+        Expr::Cast {
+            input,
+            dtype,
+            try_cast,
+        } => {
+            if *try_cast {
+                return None;
+            }
+            let inner = simd_ty(input, cols)?;
+            // Mirror `analyze`: only exact `i64 -> f64` and same-type no-ops; the
+            // name vocabulary is the canonical `bc_arrow::dtype_from_name`.
+            match (inner, bc_arrow::dtype_from_name(dtype)) {
+                (ScalarTy::I64, Some(DataType::Float64)) => Some(ScalarTy::F64),
+                (ScalarTy::I64, Some(DataType::Int64)) => Some(ScalarTy::I64),
+                (ScalarTy::F64, Some(DataType::Float64)) => Some(ScalarTy::F64),
+                _ => None,
+            }
+        }
+        Expr::Binary { op, left, right } => {
+            let l = simd_ty(left, cols)?;
+            let r = simd_ty(right, cols)?;
+            // Boolean operands only flow into `Not` (handled above); arithmetic and
+            // comparison operands must be numeric.
+            if l == ScalarTy::Bool || r == ScalarTy::Bool {
+                return None;
+            }
+            let promote_f64 = l == ScalarTy::F64 || r == ScalarTy::F64;
+            match op {
+                // Integer `+`/`-`/`*` (wrap) and float `+`/`-`/`*`/`/` (IEEE) are
+                // per-lane identical to the scalar path.
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => Some(if promote_f64 {
+                    ScalarTy::F64
+                } else {
+                    ScalarTy::I64
+                }),
+                // Integer `/` (scalarized `sdiv`, can trap) is excluded; float `/`
+                // is fine.
+                BinaryOp::Div => promote_f64.then_some(ScalarTy::F64),
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge => Some(ScalarTy::Bool),
+                // `Mod` (libcall / scalarized `srem`), `And`/`Or` (Kleene),
+                // bitwise, concat, date arithmetic: not vectorized.
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -283,19 +367,57 @@ unsafe impl Sync for CompiledExpr {}
 /// JIT-compile `expr`, using `batch` only as a representative for column types.
 /// Returns [`CodegenError::Unsupported`] for anything outside the supported
 /// subset (the caller then uses the interpreter).
+///
+/// Uses the detected host [`HardwareProfile`](bc_arrow::HardwareProfile) to pick the
+/// SIMD width/unroll; use [`compile_expr_with`] to override it (a benchmark pinning a
+/// width, or a config disabling SIMD).
 pub fn compile_expr(
     expr: &bc_expr::Expr,
     batch: &RecordBatch,
 ) -> Result<CompiledExpr, CodegenError> {
+    compile_expr_with(expr, batch, bc_arrow::SimdOverride::default())
+}
+
+/// [`compile_expr`] with an explicit [`SimdOverride`](bc_arrow::SimdOverride) — pin a
+/// vector width/unroll or force the scalar path. The override is host-independent
+/// policy; the actual capabilities come from the local `HardwareProfile::resolved`.
+pub fn compile_expr_with(
+    expr: &bc_expr::Expr,
+    batch: &RecordBatch,
+    over: bc_arrow::SimdOverride,
+) -> Result<CompiledExpr, CodegenError> {
     let mut cols = ColumnSet::default();
     let result_ty = analyze(expr, batch, &mut cols)?;
+    // A bare temporal result (e.g. `SELECT date_col`) is a comparison-only operand
+    // type, not a storable JIT output; fall back to the interpreter (a trivial column
+    // clone). `analyze` only yields a temporal type for `Col`/`Lit`; comparisons
+    // collapse it to `Bool`, so any leftover here is exactly that bare-column case.
+    if matches!(result_ty, ScalarTy::Date32 | ScalarTy::TsUs) {
+        return Err(CodegenError::Unsupported("temporal result".into()));
+    }
     let kleene = needs_kleene(expr);
-    // The vector path is a drop-in for the scalar F64 value path (same ABI, same
-    // null-propagating masking in `eval`), so it needs no flag — only a different
-    // compiled body. Used for the pure-F64 arithmetic subset.
-    let simd = !kleene && result_ty == ScalarTy::F64 && simd_supported(expr, &cols);
+    // Resolve the SIMD plan from the host profile + policy override. `force_scalar`
+    // (or a non-numeric host) collapses to 1 lane, disabling the vector path.
+    let profile = bc_arrow::HardwareProfile::resolved(over);
+    // The vector path is a drop-in for the scalar value path (same value-only ABI,
+    // same null-propagating masking in `eval`), so it needs no flag — only a
+    // different compiled body. It covers the `simd_ty` subset (numeric arithmetic,
+    // comparisons, `Not`, exact casts); `simd_ty` never admits `And`/`Or`, so it is
+    // mutually exclusive with the Kleene path. If a vector op fails to legalize on
+    // this host (e.g. a wide width the ISA lacks), fall back to the *scalar JIT* (not
+    // the interpreter) so the no-regression guarantee holds.
+    let simd = !kleene && profile.simd_lanes_f64 >= 2 && simd_ty(expr, &cols).is_some();
     let compiled = if simd {
-        compile_simd(expr, &cols)?
+        match compile_simd(
+            expr,
+            &cols,
+            result_ty,
+            profile.simd_lanes_f64,
+            profile.simd_unroll,
+        ) {
+            Ok(c) => c,
+            Err(_) => compile(expr, &cols, result_ty, kleene)?,
+        }
     } else {
         compile(expr, &cols, result_ty, kleene)?
     };
@@ -353,6 +475,22 @@ impl CompiledExpr {
                     .unwrap()
                     .values()
                     .as_ptr() as *const u8,
+                // Date32 is an i32 day-count buffer; the generated code loads it at a
+                // 4-byte stride and sign-extends to i64 (see `emit_typed`'s Col arm).
+                DataType::Date32 => arr
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .unwrap()
+                    .values()
+                    .as_ptr() as *const u8,
+                // tz-naive Timestamp(µs) is an i64 instant buffer, loaded like an i64.
+                DataType::Timestamp(TimeUnit::Microsecond, None) => {
+                    arr.as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap()
+                        .values()
+                        .as_ptr() as *const u8
+                }
                 other => {
                     return Err(CodegenError::Unsupported(format!(
                         "column `{name}` has type {other:?}"
@@ -379,15 +517,21 @@ impl CompiledExpr {
                 Ok(Arc::new(finish_primitive::<Float64Type>(out, validity)))
             }
             ScalarTy::Bool => {
-                let mut out = vec![0u8; n];
+                // The generated code writes a packed Arrow bitmask directly (one bit
+                // per row, LSB-first), so the value buffer becomes the BooleanArray's
+                // bits with no per-element repack — the previous `Vec<u8> ->
+                // Vec<bool> -> BooleanArray` round-trip dominated boolean output and
+                // lost to the interpreter's native compare kernel. Zero-initialized
+                // so the trailing bits past `n` (and never-written bytes) are false.
+                let mut out = vec![0u8; n.div_ceil(8)];
                 run(p, nargs, n, &col_ptrs, out.as_mut_ptr());
-                let bools = out.into_iter().map(|b| b != 0);
-                Ok(Arc::new(match validity {
-                    None => BooleanArray::from(bools.collect::<Vec<bool>>()),
-                    Some(valid) => {
-                        BooleanArray::from_iter(bools.zip(valid).map(|(b, ok)| ok.then_some(b)))
-                    }
-                }))
+                let values = BooleanBuffer::new(Buffer::from_vec(out), 0, n);
+                let nulls = validity.map(NullBuffer::from);
+                Ok(Arc::new(BooleanArray::new(values, nulls)))
+            }
+            // Guarded in `compile_expr`: a temporal result never reaches here.
+            ScalarTy::Date32 | ScalarTy::TsUs => {
+                Err(CodegenError::Unsupported("temporal result".into()))
             }
         }
     }
@@ -418,6 +562,22 @@ impl CompiledExpr {
                     .unwrap()
                     .values()
                     .as_ptr() as *const u8,
+                // Date32 is an i32 day-count buffer; the generated code loads it at a
+                // 4-byte stride and sign-extends to i64 (see `emit_typed`'s Col arm).
+                DataType::Date32 => arr
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .unwrap()
+                    .values()
+                    .as_ptr() as *const u8,
+                // tz-naive Timestamp(µs) is an i64 instant buffer, loaded like an i64.
+                DataType::Timestamp(TimeUnit::Microsecond, None) => {
+                    arr.as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap()
+                        .values()
+                        .as_ptr() as *const u8
+                }
                 other => {
                     return Err(CodegenError::Unsupported(format!(
                         "column `{name}` has type {other:?}"
@@ -678,6 +838,186 @@ mod tests {
         );
         // Exact array equality (bit-for-bit for f64, since identical ops).
         assert_eq!(&jit, &oracle, "value mismatch for {expr:?}");
+    }
+
+    fn lit_date(v: i32) -> Expr {
+        Expr::Lit {
+            value: Literal::Date(v),
+        }
+    }
+
+    /// Date32 comparison JIT must equal the interpreter (Arrow compares dates by
+    /// their i32 day value): column-vs-literal, column-vs-column, the compound-AND
+    /// range filter (Kleene ABI), and the nullable null-propagating path.
+    #[test]
+    fn differential_date32_comparison() {
+        use arrow::array::Date32Array;
+        use arrow::datatypes::{Field, Schema};
+
+        let n = 96usize;
+        let mut rng = Rng(0xDA7E_5EED);
+        let d1: Vec<i32> = (0..n).map(|_| (rng.next_u64() % 20_000) as i32).collect();
+        let d2: Vec<i32> = (0..n).map(|_| (rng.next_u64() % 20_000) as i32).collect();
+        // Nullable date: every 5th slot is null (exercises validity masking).
+        let dn: Vec<Option<i32>> = (0..n)
+            .map(|i| (i % 5 != 0).then(|| (rng.next_u64() % 20_000) as i32))
+            .collect();
+        let schema = Schema::new(vec![
+            Field::new("d1", DataType::Date32, false),
+            Field::new("d2", DataType::Date32, false),
+            Field::new("dn", DataType::Date32, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Date32Array::from(d1)),
+                Arc::new(Date32Array::from(d2)),
+                Arc::new(Date32Array::from(dn)),
+            ],
+        )
+        .unwrap();
+
+        let mid = lit_date(10_000);
+        for op in [
+            BinaryOp::Eq,
+            BinaryOp::Ne,
+            BinaryOp::Lt,
+            BinaryOp::Le,
+            BinaryOp::Gt,
+            BinaryOp::Ge,
+        ] {
+            assert_parity(&bin(op, col("d1"), mid.clone()), &batch); // col vs literal
+            assert_parity(&bin(op, mid.clone(), col("d1")), &batch); // literal on left
+            assert_parity(&bin(op, col("d1"), col("d2")), &batch); // col vs col
+        }
+
+        // BETWEEN-style range filter: compound AND compiles via the Kleene ABI.
+        let lo = lit_date(3_000);
+        let hi = lit_date(15_000);
+        let range = |c: &str| {
+            bin(
+                BinaryOp::And,
+                bin(BinaryOp::Ge, col(c), lo.clone()),
+                bin(BinaryOp::Le, col(c), hi.clone()),
+            )
+        };
+        assert_parity(&range("d1"), &batch);
+
+        // Nullable date: null-propagating comparison and Kleene compound over nulls.
+        assert_parity(&bin(BinaryOp::Ge, col("dn"), mid.clone()), &batch);
+        assert_parity(&range("dn"), &batch);
+    }
+
+    /// Date32 is comparison-only against another Date32; everything else must fall
+    /// back to the interpreter (not compile to a diverging result).
+    #[test]
+    fn date32_unsupported_exprs_fall_back() {
+        use arrow::array::Date32Array;
+        use arrow::datatypes::{Field, Schema};
+
+        let schema = Schema::new(vec![
+            Field::new("d", DataType::Date32, false),
+            Field::new("a", DataType::Int64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Date32Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+
+        // Bare date projection is not a storable JIT result.
+        assert!(compile_expr(&col("d"), &batch).is_err());
+        // Date arithmetic / math is interpreter-only.
+        assert!(compile_expr(&bin(BinaryOp::Add, col("d"), lit_date(1)), &batch).is_err());
+        // Date-vs-numeric comparison would need a coercion the JIT doesn't model.
+        assert!(compile_expr(&bin(BinaryOp::Lt, col("d"), col("a")), &batch).is_err());
+        assert!(compile_expr(&bin(BinaryOp::Gt, col("a"), lit_date(5)), &batch).is_err());
+    }
+
+    fn lit_ts(v: i64) -> Expr {
+        Expr::Lit {
+            value: Literal::Timestamp(v),
+        }
+    }
+
+    /// tz-naive Timestamp(µs) comparison JIT must equal the interpreter (Arrow
+    /// compares instants by their i64 value): column-vs-literal, column-vs-column,
+    /// the compound-AND range filter (Kleene ABI), and the nullable path.
+    #[test]
+    fn differential_timestamp_us_comparison() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::{Field, Schema, TimeUnit};
+
+        let n = 96usize;
+        let mut rng = Rng(0x715E_57A3);
+        let t1: Vec<i64> = (0..n)
+            .map(|_| rng.next_u64() as i64 % 1_700_000_000_000_000)
+            .collect();
+        let t2: Vec<i64> = (0..n)
+            .map(|_| rng.next_u64() as i64 % 1_700_000_000_000_000)
+            .collect();
+        let tn: Vec<Option<i64>> = (0..n)
+            .map(|i| (i % 5 != 0).then(|| rng.next_u64() as i64 % 1_700_000_000_000_000))
+            .collect();
+        let ts = || DataType::Timestamp(TimeUnit::Microsecond, None);
+        let schema = Schema::new(vec![
+            Field::new("t1", ts(), false),
+            Field::new("t2", ts(), false),
+            Field::new("tn", ts(), true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(t1)),
+                Arc::new(TimestampMicrosecondArray::from(t2)),
+                Arc::new(TimestampMicrosecondArray::from(tn)),
+            ],
+        )
+        .unwrap();
+
+        let mid = lit_ts(850_000_000_000_000);
+        for op in [
+            BinaryOp::Eq,
+            BinaryOp::Ne,
+            BinaryOp::Lt,
+            BinaryOp::Le,
+            BinaryOp::Gt,
+            BinaryOp::Ge,
+        ] {
+            assert_parity(&bin(op, col("t1"), mid.clone()), &batch);
+            assert_parity(&bin(op, mid.clone(), col("t1")), &batch);
+            assert_parity(&bin(op, col("t1"), col("t2")), &batch);
+        }
+        let lo = lit_ts(100_000_000_000_000);
+        let hi = lit_ts(1_500_000_000_000_000);
+        let range = |c: &str| {
+            bin(
+                BinaryOp::And,
+                bin(BinaryOp::Ge, col(c), lo.clone()),
+                bin(BinaryOp::Le, col(c), hi.clone()),
+            )
+        };
+        assert_parity(&range("t1"), &batch);
+        assert_parity(&bin(BinaryOp::Ge, col("tn"), mid.clone()), &batch);
+        assert_parity(&range("tn"), &batch);
+
+        // A non-microsecond timestamp column is not in the supported subset: the JIT
+        // must fall back rather than compare across units.
+        use arrow::array::TimestampNanosecondArray;
+        let ns_schema = Schema::new(vec![Field::new(
+            "tns",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]);
+        let ns_batch = RecordBatch::try_new(
+            Arc::new(ns_schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![1i64, 2, 3]))],
+        )
+        .unwrap();
+        assert!(compile_expr(&bin(BinaryOp::Lt, col("tns"), lit_ts(2)), &ns_batch).is_err());
     }
 
     #[test]
@@ -1454,6 +1794,12 @@ mod tests {
         // Each is total over `make_batch` data (no div/mod, sqrt/ln only over
         // `abs(..)` so no NaN) — keeping JIT and interpreter bit-for-bit equal.
         let cases: Vec<(&str, Expr)> = vec![
+            // standalone integer comparison (the vectorized filter win): a > b
+            ("a > b (i64 cmp)", bin(BinaryOp::Gt, col("a"), col("b"))),
+            // standalone integer arithmetic (vectorized projection): a + b
+            ("a + b (i64 arith)", bin(BinaryOp::Add, col("a"), col("b"))),
+            // float comparison with the total-order NaN algebra: c < a
+            ("c < a (f64 cmp)", bin(BinaryOp::Lt, col("c"), col("a"))),
             // simple: (a - b) * c
             (
                 "(a - b) * c",
@@ -1826,7 +2172,7 @@ mod tests {
         for e in &exprs {
             let mut cols = ColumnSet::default();
             analyze(e, &sample, &mut cols).unwrap();
-            assert!(simd_supported(e, &cols), "expected SIMD path for {e:?}");
+            assert!(simd_ty(e, &cols).is_some(), "expected SIMD path for {e:?}");
         }
         // Parity at even AND odd sizes — odd exercises the scalar remainder loop.
         for &n in &[1usize, 2, 3, 7, 8, 64, 129] {
@@ -2102,5 +2448,313 @@ mod tests {
             compile_and_eval(&e, &batch),
             Err(CodegenError::UnknownColumn(_))
         ));
+    }
+
+    /// Assert `expr` takes the vector path (else the SIMD-specific tests would
+    /// silently validate the scalar path instead).
+    fn assert_simd(expr: &Expr, sample: &RecordBatch) {
+        let mut cols = ColumnSet::default();
+        analyze(expr, sample, &mut cols).expect("analyzes");
+        assert!(
+            simd_ty(expr, &cols).is_some(),
+            "expected SIMD path for {expr:?}"
+        );
+    }
+
+    #[test]
+    fn simd_integer_comparison_and_not_parity_across_sizes() {
+        let cast_f = |e: Expr| Expr::Cast {
+            input: Box::new(e),
+            dtype: "float64".into(),
+            try_cast: false,
+        };
+        let exprs = [
+            // integer arithmetic -> I64X2 lanes
+            bin(BinaryOp::Add, col("a"), col("b")),
+            bin(BinaryOp::Mul, col("a"), lit_i(3)),
+            bin(
+                BinaryOp::Sub,
+                bin(BinaryOp::Add, col("a"), col("b")),
+                col("a"),
+            ),
+            // integer comparisons -> boolean lane mask (the filter win)
+            bin(BinaryOp::Gt, col("a"), col("b")),
+            bin(BinaryOp::Eq, col("a"), col("b")),
+            bin(BinaryOp::Le, col("a"), lit_i(5)),
+            bin(BinaryOp::Ne, col("a"), lit_i(0)),
+            // float comparisons -> boolean lane mask (total-order NaN algebra)
+            bin(BinaryOp::Lt, col("c"), lit_f(0.0)),
+            bin(BinaryOp::Ge, col("c"), col("c")),
+            // mixed int/float comparison -> i64 lane promoted to f64 then fcmp
+            bin(BinaryOp::Gt, col("a"), col("c")),
+            bin(
+                BinaryOp::Le,
+                bin(BinaryOp::Mul, col("a"), lit_f(1.5)),
+                col("c"),
+            ),
+            // NOT of a comparison -> bnot on the canonical mask
+            Expr::Not {
+                input: Box::new(bin(BinaryOp::Gt, col("a"), col("b"))),
+            },
+            // cast i64 -> f64 inside arithmetic / comparison
+            bin(BinaryOp::Add, cast_f(col("a")), col("c")),
+            bin(BinaryOp::Gt, cast_f(col("a")), col("c")),
+        ];
+        let sample = make_batch(8, 1);
+        for e in &exprs {
+            assert_simd(e, &sample);
+        }
+        // Parity at even AND odd sizes — odd exercises the scalar remainder loop,
+        // n=0 the empty case, n=1 a pure-remainder run.
+        for &n in &[0usize, 1, 2, 3, 7, 8, 64, 129] {
+            let batch = make_batch(n, 0x5145D ^ n as u64);
+            for e in &exprs {
+                assert_parity(e, &batch);
+            }
+        }
+    }
+
+    #[test]
+    fn simd_comparison_nan_total_order_parity() {
+        // The vector float comparison must reproduce the interpreter's total-order
+        // NaN semantics (NaN == NaN, NaN sorts above every non-NaN), not bare IEEE.
+        // The fuzzer never produces NaN, so this pins the NaN lanes on the SIMD path.
+        let nan = f64::NAN;
+        // 5 rows (odd) so both the vector loop and the scalar remainder see a NaN.
+        let a = vec![1.0, nan, 3.0, nan, nan];
+        let b = vec![2.0, 2.0, nan, nan, 5.0];
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Float64, false),
+            Field::new("b", DataType::Float64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Float64Array::from(a)),
+                Arc::new(Float64Array::from(b)),
+            ],
+        )
+        .unwrap();
+        for op in [
+            BinaryOp::Eq,
+            BinaryOp::Ne,
+            BinaryOp::Lt,
+            BinaryOp::Le,
+            BinaryOp::Gt,
+            BinaryOp::Ge,
+        ] {
+            let e = bin(op, col("a"), col("b"));
+            assert_simd(&e, &batch);
+            assert_parity(&e, &batch);
+        }
+    }
+
+    #[test]
+    fn simd_nullable_comparison_and_arith_parity() {
+        // Comparisons / integer arithmetic / NOT are null-propagating, so the vector
+        // path runs over the raw buffers and `eval` masks the output — matching the
+        // interpreter bit-for-bit (nulls included). `assert_parity` drives the JIT
+        // eval, so a pass proves the SIMD path produced the masked result.
+        let batch = nullable_batch();
+        let cases = [
+            bin(BinaryOp::Gt, col("a"), lit_i(0)),
+            bin(BinaryOp::Add, col("a"), col("b")),
+            bin(BinaryOp::Lt, col("c"), lit_f(1.0)),
+            bin(BinaryOp::Gt, col("a"), col("c")), // mixed promotion, nullable
+            Expr::Not {
+                input: Box::new(bin(BinaryOp::Ge, col("a"), col("b"))),
+            },
+        ];
+        let sample = make_batch(8, 2);
+        for e in &cases {
+            assert_simd(e, &sample);
+            assert!(
+                is_null_propagating(e),
+                "expected null-propagating for {e:?}"
+            );
+            assert_parity(e, &batch);
+        }
+    }
+
+    /// Differential fuzzer for the extended SIMD subset: random trees of integer /
+    /// float arithmetic, comparisons, `Not`, and casts (NO `And`/`Or`, so every tree
+    /// stays on the vector path) over nullable columns. Asserts each tree takes the
+    /// SIMD path AND is bit-for-bit equal to the interpreter, exercising the vector
+    /// lanes, the scalar remainder (odd sizes), and the null mask.
+    #[test]
+    fn simd_fuzz_extended_nullable() {
+        fn make_nullable(n: usize, seed: u64) -> RecordBatch {
+            let mut rng = Rng(seed);
+            let a: Vec<Option<i64>> = (0..n)
+                .map(|_| (rng.next_u64() % 4 != 0).then(|| rng.i64_small()))
+                .collect();
+            let b: Vec<Option<i64>> = (0..n)
+                .map(|_| (rng.next_u64() % 4 != 0).then(|| rng.i64_small()))
+                .collect();
+            let c: Vec<Option<f64>> = (0..n)
+                .map(|_| (rng.next_u64() % 4 != 0).then(|| rng.f64_small()))
+                .collect();
+            let schema = Schema::new(vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Int64, true),
+                Field::new("c", DataType::Float64, true),
+            ]);
+            RecordBatch::try_new(
+                Arc::new(schema),
+                vec![
+                    Arc::new(Int64Array::from(a)),
+                    Arc::new(Int64Array::from(b)),
+                    Arc::new(Float64Array::from(c)),
+                ],
+            )
+            .unwrap()
+        }
+        // Numeric subtree: columns/literals + Add/Sub/Mul (no Div/Mod -> no inf/NaN
+        // from division, so `assert_eq!` never spuriously differs).
+        fn gen_num(rng: &mut Rng, depth: u32) -> Expr {
+            if depth == 0 || rng.next_u64() % 3 == 0 {
+                return match rng.next_u64() % 5 {
+                    0 => col("a"),
+                    1 => col("b"),
+                    2 => col("c"),
+                    3 => lit_i(rng.i64_small()),
+                    _ => lit_f(rng.f64_small()),
+                };
+            }
+            let op = match rng.next_u64() % 3 {
+                0 => BinaryOp::Add,
+                1 => BinaryOp::Sub,
+                _ => BinaryOp::Mul,
+            };
+            bin(op, gen_num(rng, depth - 1), gen_num(rng, depth - 1))
+        }
+        // Boolean subtree: comparisons + Not (NO And/Or, to stay vectorizable).
+        fn gen_bool(rng: &mut Rng, depth: u32) -> Expr {
+            if depth == 0 || rng.next_u64() % 2 == 0 {
+                let op = match rng.next_u64() % 6 {
+                    0 => BinaryOp::Eq,
+                    1 => BinaryOp::Ne,
+                    2 => BinaryOp::Lt,
+                    3 => BinaryOp::Le,
+                    4 => BinaryOp::Gt,
+                    _ => BinaryOp::Ge,
+                };
+                let d = depth.saturating_sub(1);
+                return bin(op, gen_num(rng, d), gen_num(rng, d));
+            }
+            Expr::Not {
+                input: Box::new(gen_bool(rng, depth - 1)),
+            }
+        }
+        let mut master = Rng(0x51AB_FACE_1234_0001);
+        let batches = [
+            make_nullable(129, 0x9001),
+            make_nullable(130, 0x9002),
+            make_nullable(63, 0x9003),
+        ];
+        let sample = make_batch(8, 7);
+        for it in 0..2000 {
+            let mut rng = Rng(master.next_u64() | 1);
+            // Half boolean trees (comparison/Not), half numeric arithmetic.
+            let expr = if rng.next_u64() % 2 == 0 {
+                gen_bool(&mut rng, 4)
+            } else {
+                gen_num(&mut rng, 4)
+            };
+            assert_simd(&expr, &sample);
+            assert_parity(&expr, &batches[it % batches.len()]);
+        }
+    }
+
+    /// The multiversion oracle: the same expression compiled at every SIMD
+    /// width/unroll must be bit-for-bit identical to the interpreter. This is the
+    /// safety net for the runtime-multiversioned width (A3) — wider IR vectors are
+    /// legalized by Cranelift (split into 128-bit ops where the host lacks AVX), so
+    /// this exercises the *correctness* of every width on any host even when the
+    /// native instructions aren't available. Covers odd/empty/tail sizes across all
+    /// of arithmetic, comparison, mixed promotion, `Not`, and cast.
+    #[test]
+    fn simd_multiversion_parity() {
+        use bc_arrow::SimdOverride;
+        let cast_f = |e: Expr| Expr::Cast {
+            input: Box::new(e),
+            dtype: "float64".into(),
+            try_cast: false,
+        };
+        let exprs = [
+            bin(BinaryOp::Add, col("a"), col("b")),
+            bin(
+                BinaryOp::Mul,
+                bin(BinaryOp::Sub, col("a"), col("b")),
+                col("c"),
+            ),
+            bin(BinaryOp::Gt, col("a"), col("b")),
+            bin(BinaryOp::Lt, col("c"), lit_f(0.0)),
+            bin(
+                BinaryOp::Le,
+                bin(BinaryOp::Mul, col("a"), lit_f(1.5)),
+                col("c"),
+            ),
+            Expr::Not {
+                input: Box::new(bin(BinaryOp::Gt, col("a"), col("b"))),
+            },
+            bin(BinaryOp::Add, cast_f(col("a")), col("c")),
+        ];
+        // (lanes, unroll) — 2/4/8 lanes and 1/2/4 unroll, all parity-checked.
+        let combos = [(2, 1), (2, 2), (2, 4), (4, 1), (4, 2), (8, 1)];
+        for &(lanes, unroll) in &combos {
+            let over = SimdOverride {
+                lanes,
+                unroll,
+                force_scalar: false,
+            };
+            // Sizes that straddle every step boundary (empty, sub-step, exact, tail).
+            for &n in &[0usize, 1, 2, 3, 5, 7, 8, 15, 16, 17, 31, 33, 64, 129] {
+                let batch = make_batch(n, 0x5114D ^ ((lanes * 100 + unroll) as u64) ^ n as u64);
+                for e in &exprs {
+                    let jit = compile_expr_with(e, &batch, over)
+                        .expect("compiles")
+                        .eval(&batch)
+                        .expect("jit eval");
+                    let oracle = e.eval(&batch).expect("interp eval");
+                    assert_eq!(
+                        jit.data_type(),
+                        oracle.data_type(),
+                        "dtype mismatch lanes={lanes} unroll={unroll} n={n} for {e:?}"
+                    );
+                    assert_eq!(
+                        &jit, &oracle,
+                        "value mismatch lanes={lanes} unroll={unroll} n={n} for {e:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn simd_force_scalar_still_matches_oracle() {
+        use bc_arrow::SimdOverride;
+        // force_scalar collapses to the scalar JIT; results must still match.
+        let over = SimdOverride {
+            lanes: 0,
+            unroll: 0,
+            force_scalar: true,
+        };
+        let exprs = [
+            bin(BinaryOp::Gt, col("a"), col("b")),
+            bin(BinaryOp::Add, col("a"), col("b")),
+            bin(BinaryOp::Lt, col("c"), col("a")),
+        ];
+        for &n in &[0usize, 1, 3, 8, 129] {
+            let batch = make_batch(n, 0xF0F0 ^ n as u64);
+            for e in &exprs {
+                let jit = compile_expr_with(e, &batch, over)
+                    .expect("compiles")
+                    .eval(&batch)
+                    .expect("jit eval");
+                let oracle = e.eval(&batch).expect("interp eval");
+                assert_eq!(&jit, &oracle, "force_scalar mismatch n={n} for {e:?}");
+            }
+        }
     }
 }

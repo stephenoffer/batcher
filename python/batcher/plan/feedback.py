@@ -13,7 +13,21 @@ from typing import Protocol, runtime_checkable
 
 from batcher.plan.ids import OpId
 
-__all__ = ["FeedbackSink", "OperatorFeedback"]
+__all__ = ["FeedbackSink", "OperatorFeedback", "cpu_utilization"]
+
+
+def cpu_utilization(cpu_ns: float, elapsed_ns: float, threads: int) -> float:
+    """Mean fraction of allocated cores kept busy, clamped to [0, 1].
+
+    `cpu_ns` is CPU-time summed across all worker threads during the operator;
+    dividing by ``elapsed_ns x threads`` (the engine's *actual* live thread count,
+    not a guessed host core count — which is wrong under a cgroup CPU quota) gives
+    the per-core busy fraction. 0.0 when the engine reported no CPU time (older
+    build), no wall time, or no thread count.
+    """
+    if cpu_ns <= 0 or elapsed_ns <= 0 or threads <= 0:
+        return 0.0
+    return min(1.0, cpu_ns / (elapsed_ns * threads))
 
 
 @dataclass(frozen=True, slots=True)

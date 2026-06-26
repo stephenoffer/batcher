@@ -245,9 +245,12 @@ def _iter_streaming(
     # opaque UDF), mirroring collect(); the relational path is optimized so the
     # source projection (and predicate, for capable sources) is pushed down.
     if core.has_map_batches(plan):
+        # Build the (class) UDFs once so a load-once inference model loads a single time
+        # and is reused across every streamed batch, not rebuilt per batch.
+        resident = core.prebuild_factories(plan)
 
         def run(batch):
-            return core.execute_with_udfs(plan, [InMemorySource([batch])])
+            return core.execute_with_udfs(resident, [InMemorySource([batch])])
 
         projection = None
         predicate = None

@@ -33,6 +33,7 @@ class _StructNamespace:
     __slots__ = ("_e",)
 
     def __init__(self, e: Expr) -> None:
+        """Wrap the parent :class:`Expr` so its `.struct` methods can build on it."""
         self._e = e
 
     def field(self, name: str) -> StructField:
@@ -61,6 +62,7 @@ class _JsonNamespace:
     __slots__ = ("_e",)
 
     def __init__(self, e: Expr) -> None:
+        """Wrap the parent :class:`Expr` so its `.json` methods can build on it."""
         self._e = e
 
     def extract_string(self, path: str) -> StrFunc:
@@ -103,6 +105,14 @@ class _JsonNamespace:
 
         Args:
             path: A JSONPath, e.g. ``"$.price"``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"p": 3.5}', "{}"]})
+                >>> ds.select(bt.col("j").json.extract_float("$.p").alias("r")).to_pydict()
+                {'r': [3.5, None]}
         """
         return StrFunc("json_extract_float", self._e, pattern=path)
 
@@ -111,6 +121,14 @@ class _JsonNamespace:
 
         Args:
             path: A JSONPath, e.g. ``"$.active"``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"active": true}', "{}"]})
+                >>> ds.select(bt.col("j").json.extract_bool("$.active").alias("r")).to_pydict()
+                {'r': [True, None]}
         """
         return StrFunc("json_extract_bool", self._e, pattern=path)
 
@@ -125,6 +143,7 @@ class _MapNamespace:
     __slots__ = ("_e",)
 
     def __init__(self, e: Expr) -> None:
+        """Wrap the parent :class:`Expr` so its `.map` methods can build on it."""
         self._e = e
 
     def keys(self) -> MapFunc:
@@ -147,6 +166,17 @@ class _MapNamespace:
         """Return each row's map values as a ``List`` column (DuckDB ``map_values``).
 
         Keys and values stay positionally aligned with :meth:`keys`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow as pa
+                >>> col = pa.array([[("a", 1), ("b", 2)], [("c", 3)]],
+                ...                type=pa.map_(pa.string(), pa.int64()))
+                >>> ds = bt.from_arrow(pa.table({"m": col}))
+                >>> ds.select(bt.col("m").map.values().alias("v")).to_pydict()
+                {'v': [[1, 2], [3]]}
         """
         return MapFunc("map_values", self._e)
 
@@ -182,6 +212,7 @@ class _ListNamespace:
     __slots__ = ("_e",)
 
     def __init__(self, e: Expr) -> None:
+        """Wrap the parent :class:`Expr` so its `.list` methods can build on it."""
         self._e = e
 
     def get(self, index: int) -> ListGet:
@@ -419,9 +450,9 @@ class _ListNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"a": [[1.0, 1.0]], "b": [[1.0, 1.0]]})
+                >>> ds = bt.from_pydict({"a": [[1.0, 0.0]], "b": [[0.0, 1.0]]})
                 >>> ds.select(bt.col("a").list.cosine_distance(bt.col("b")).alias("r")).to_pydict()
-                {'r': [0.0]}
+                {'r': [1.0]}
         """
         return 1.0 - ListBinary("cosine_similarity", self._e, _wrap(other))
 

@@ -56,6 +56,41 @@ def test_wide_fact_filtered_by_narrow_dim_range():
     assert out.left.predicate.to_ir() == ((bt_col("k") >= 10) & (bt_col("k") <= 20)).to_ir()
 
 
+def test_multi_key_pushes_a_conjunct_per_narrowing_key():
+    # Composite-key join (k1, k2): fact wide on both, dim narrow on both → the fact
+    # side gets `k1 BETWEEN .. AND k2 BETWEEN ..` (one conjunct per key).
+    left = _scan(0, ["k1", "k2", "amt"])  # fact
+    right = _scan(1, ["k1", "k2", "region"])  # dim
+    output = (
+        JoinOutputCol("left", "k1", "k1"),
+        JoinOutputCol("left", "amt", "amt"),
+        JoinOutputCol("right", "region", "region"),
+    )
+    join = Join(left, right, ("k1", "k2"), ("k1", "k2"), "inner", output)
+    fact_ss = SourceStatistics(row_count=1000, columns={"k1": _col(0, 1000), "k2": _col(0, 500)})
+    dim_ss = SourceStatistics(row_count=10, columns={"k1": _col(10, 20), "k2": _col(5, 7)})
+    out = runtime_join_filter(join, _ctx(fact_ss, dim_ss))
+    assert isinstance(out, Join)
+    assert isinstance(out.left, Filter)
+    expected = (
+        (bt_col("k1") >= 10) & (bt_col("k1") <= 20) & ((bt_col("k2") >= 5) & (bt_col("k2") <= 7))
+    )
+    assert out.left.predicate.to_ir() == expected.to_ir()
+
+
+def test_multi_key_only_pushes_the_narrowing_key():
+    # Only k2 narrows; k1 ranges are identical → just the k2 conjunct is pushed.
+    left = _scan(0, ["k1", "k2"])
+    right = _scan(1, ["k1", "k2"])
+    output = (JoinOutputCol("left", "k1", "k1"), JoinOutputCol("right", "k2", "k2"))
+    join = Join(left, right, ("k1", "k2"), ("k1", "k2"), "inner", output)
+    fact_ss = SourceStatistics(row_count=1000, columns={"k1": _col(0, 100), "k2": _col(0, 500)})
+    dim_ss = SourceStatistics(row_count=10, columns={"k1": _col(0, 100), "k2": _col(5, 7)})
+    out = runtime_join_filter(join, _ctx(fact_ss, dim_ss))
+    assert isinstance(out, Join) and isinstance(out.left, Filter)
+    assert out.left.predicate.to_ir() == ((bt_col("k2") >= 5) & (bt_col("k2") <= 7)).to_ir()
+
+
 def test_no_fire_when_ranges_not_narrowing():
     # Identical ranges → neither side prunes the other.
     same = SourceStatistics(row_count=100, columns={"k": _col(0, 100)})

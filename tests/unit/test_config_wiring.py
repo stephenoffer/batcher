@@ -64,7 +64,9 @@ def test_engine_config_json_shape_and_defaults():
         "parallelism": 0,
         "memory_budget_bytes": 0,
         "spill_dir": None,
+        "spill_compression": "auto",
         "fuse_linear": True,
+        "shrink_output_dtypes": False,
         **_TUNING_DEFAULTS,
     }
 
@@ -78,7 +80,9 @@ def test_engine_config_json_shape_and_defaults():
         "parallelism": 3,
         "memory_budget_bytes": 0,
         "spill_dir": None,
+        "spill_compression": "auto",
         "fuse_linear": True,
+        "shrink_output_dtypes": False,
         **_TUNING_DEFAULTS,
     }
 

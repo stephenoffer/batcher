@@ -8,9 +8,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pyarrow as pa
+
 from batcher._internal.errors import PlanError
 from batcher.plan.ir_tags import Op
 from batcher.plan.logical.base import LogicalPlan
+from batcher.plan.schema import SchemaRef
 
 __all__ = ["AsofJoin", "Join", "JoinOutputCol", "WatermarkStreamJoin"]
 
@@ -22,6 +25,28 @@ class JoinOutputCol:
     side: str  # "left" | "right"
     name: str
     alias: str
+
+
+def _join_output_schema(
+    left: LogicalPlan, right: LogicalPlan, output: tuple[JoinOutputCol, ...]
+) -> SchemaRef | None:
+    """Assemble a join's output schema from each side's inferred schema.
+
+    Each output column takes its type from its source side (an outer join only
+    relaxes nullability, not the value type), so the type carries through. Returns
+    ``None`` if either side's schema is not inferable.
+    """
+    left_schema = left.available_schema()
+    right_schema = right.available_schema()
+    if left_schema is None or right_schema is None:
+        return None
+    fields: list[pa.Field] = []
+    for o in output:
+        src = left_schema if o.side == "left" else right_schema
+        if not src.has(o.name):
+            return None
+        fields.append(pa.field(o.alias, src.field(o.name).type))
+    return SchemaRef.from_arrow(pa.schema(fields))
 
 
 # The join semantics the engine understands — the `join_type` wire vocabulary,
@@ -85,6 +110,9 @@ class Join(LogicalPlan):
     def available_columns(self) -> list[str]:
         return [o.alias for o in self.output]
 
+    def available_schema(self) -> SchemaRef | None:
+        return _join_output_schema(self.left, self.right, self.output)
+
 
 @dataclass(frozen=True, slots=True)
 class WatermarkStreamJoin(LogicalPlan):
@@ -109,6 +137,9 @@ class WatermarkStreamJoin(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return [o.alias for o in self.output]
+
+    def available_schema(self) -> SchemaRef | None:
+        return _join_output_schema(self.left, self.right, self.output)
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,3 +189,6 @@ class AsofJoin(LogicalPlan):
 
     def available_columns(self) -> list[str]:
         return [o.alias for o in self.output]
+
+    def available_schema(self) -> SchemaRef | None:
+        return _join_output_schema(self.left, self.right, self.output)

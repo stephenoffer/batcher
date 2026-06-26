@@ -100,9 +100,9 @@ def test_resident_inference_pool_keeps_the_model_across_runs():
     ds = bt.from_pydict({"x": list(range(n))})
 
     def infer():
-        return ds.ml.infer(
-            _TaggingModel, output_columns=["x", "y", "tag"], concurrency=2
-        ).collect(distributed=True, num_workers=4)
+        return ds.ml.infer(_TaggingModel, output_columns=["x", "y", "tag"], concurrency=2).collect(
+            distributed=True, num_workers=4
+        )
 
     with resident_inference_pools():
         r1 = infer().to_pylist()
@@ -123,9 +123,9 @@ def test_resident_pool_off_rebuilds_per_run():
     ds = bt.from_pydict({"x": list(range(n))})
 
     def infer():
-        return ds.ml.infer(
-            _TaggingModel, output_columns=["x", "y", "tag"], concurrency=2
-        ).collect(distributed=True, num_workers=4)
+        return ds.ml.infer(_TaggingModel, output_columns=["x", "y", "tag"], concurrency=2).collect(
+            distributed=True, num_workers=4
+        )
 
     tags1 = {r["tag"] for r in infer().to_pylist()}
     tags2 = {r["tag"] for r in infer().to_pylist()}

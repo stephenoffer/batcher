@@ -17,10 +17,14 @@ per-row work runs in Rust.
 8. [Window functions](../user-guide/window-functions.md): ranking and rolling
    aggregates.
 9. [Writing data](../user-guide/writing-data.md): output formats and partitioning.
-10. [Cloud storage](../user-guide/cloud-storage.md): object-store paths.
-11. [Best practices](../user-guide/best-practices.md) and
+10. [Lakehouse tables](../user-guide/lakehouse.md): Delta read/write/merge and SCD.
+11. [Data quality](../user-guide/data-quality.md): validate, quarantine, and enforce
+    a contract.
+12. [Cloud storage](../user-guide/cloud-storage.md): object-store paths.
+13. [Performance and memory](../user-guide/performance.md): caching and spill.
+14. [Best practices](../user-guide/best-practices.md) and
     [troubleshooting](../user-guide/troubleshooting.md).
-12. [Dataset API reference](../api/dataset.md).
+15. [Dataset API reference](../api/dataset.md).
 
 ## Example: transform and aggregate
 
@@ -55,3 +59,13 @@ joined = facts.join(dim, on="region", how="inner").sort("amount")
 print(joined.to_pydict())
 # {'region': ['west', 'east', 'west'], 'amount': [1, 2, 3], 'label': ['W', 'E', 'W']}
 ```
+
+## Runnable examples
+
+These scripts build their own data and run directly with `python examples/<name>.py`:
+
+- `quickstart.py`, `transformations_aggregations_joins.py` — the pipeline core.
+- `data_quality.py` — validate and quarantine against a contract.
+- `lakehouse_scd.py` — a Delta round-trip and SCD type-2 history.
+- `timeseries.py`, `window_functions.py` — time buckets and rolling aggregates.
+- `spill.py` — out-of-core execution under a bounded budget.

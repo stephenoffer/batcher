@@ -70,6 +70,15 @@ class BudgetingAdmission:
             pool = current_process_pool()
             if pool is not None:
                 envelope = max(0, envelope - pool.used)
+        # The envelope can never be smaller than one morsel: the engine must hold at
+        # least a single morsel to make any progress, and a *streaming* operator's whole
+        # footprint is one morsel (`min(morsel_rows·width, morsel_bytes)`). Flooring here
+        # keeps a streaming/tiny plan feasible under a sub-morsel budget (it would
+        # otherwise be rejected as infeasible with "no out-of-core path", since a
+        # streaming op has nothing to spill) — a no-op for any realistic budget, which is
+        # orders of magnitude larger than a morsel. A genuine breaker that materializes
+        # more than this floor still exceeds it and routes to the spill path.
+        envelope = max(envelope, ctx.config.execution.morsel_bytes)
         peak = max((op.bounds.m_max_bytes for op in plan.ops), default=0)
         if peak <= envelope:
             return FeasibilityVerdict(feasible=True)

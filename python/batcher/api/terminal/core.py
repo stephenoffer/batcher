@@ -110,6 +110,12 @@ def _collect(
     metadata = metadata_aggregate_table(plan, sources, source_stats)
     if metadata is not None:
         return metadata
+    # Opt-in: offload large-payload columns out of line around breakers (the blobs ride
+    # through as tiny handles). Inserted before execution routing so the resulting
+    # `map_batches` stages take the same mixed-executor path as an explicit offload.
+    from batcher.api.terminal.blob_offload import maybe_insert_blob_offload
+
+    plan = maybe_insert_blob_offload(plan)
     distributed = _resolve_distributed(distributed)
     # Resolve `adaptive="auto"` to a concrete decision before the fast-path checks
     # below ("auto" is a truthy string). Join-less plans short-circuit to False without
@@ -171,8 +177,11 @@ def _collect(
 
     # Imported here (not at module load) to keep the layer-import contract
     # simple and avoid importing the engine for pure-Python tooling.
+    import time
+
     from batcher import core
     from batcher.api import executors
+    from batcher.api.terminal.event_log import event_log_collector, write_event_log
 
     ctx = core.ExecutionContext(
         columns=columns,
@@ -181,15 +190,28 @@ def _collect(
         transport=transport,
         cache=cache,
         source_stats=source_stats,
+        profile=event_log_collector(),
     )
-    return executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
+    t0 = time.perf_counter()
+    table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
+    write_event_log(ctx.profile, total_ms=(time.perf_counter() - t0) * 1000.0, rows=table.num_rows)
+    return table
 
 
-def _explain(plan: LogicalPlan, sources: list[Source]) -> str:
-    """Return a human-readable optimized plan with cardinality estimates."""
-    from batcher import core, kyber
+@with_auto_config
+def _explain(
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    *,
+    analyze: bool = False,
+    fmt: str = "text",
+) -> str:
+    """Render the plan as a tree (planned, or measured when `analyze`); `with_auto_config`
+    so an analyzed run profiles under the same sensed config `collect()`/`stats()` use."""
+    from batcher.api.terminal.profile import explain
 
-    return kyber.Optimizer(sources=sources, hub=core.default_hub()).explain(plan)
+    return explain(plan, sources, columns, analyze=analyze, fmt=fmt)
 
 
 def _shared_source_stats(plan: LogicalPlan, sources: list[Source]) -> list | None:
@@ -246,46 +268,65 @@ def _is_empty(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> b
 def _schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.Schema:
     """The output Arrow schema without scanning rows.
 
-    A bare scan returns its source schema directly; any other plan resolves
-    derived column types via a zero-row execution (`limit(0)`), which the engine
-    answers without materializing data.
+    A bare scan returns its source schema directly. Otherwise the plan's
+    type-carrying `available_schema()` analysis answers without touching the engine
+    when it can infer every output type; anything it leaves uncertain falls back to
+    a zero-row execution (`limit(0)`), which the engine answers without
+    materializing data.
     """
     from batcher.plan.logical import Limit, Scan
 
     if isinstance(plan, Scan) and len(sources) == 1:
         return sources[0].schema()
+    inferred = plan.available_schema()
+    if inferred is not None:
+        return inferred.arrow
     return _collect(Limit(plan, 0), sources, columns).schema
 
 
 @with_auto_config
 def _stats(plan: LogicalPlan, sources: list[Source], columns: list[str]):
-    """Execute (single-node) and return measured per-operator `RunStats`.
+    """Execute through the real path (single-node/spill/distributed) and return `RunStats`.
 
-    Raises `PlanError` for an unbounded source, and `BackendError` for a
-    `map_batches`/ML pipeline (the opaque UDF path emits no per-operator metrics —
-    run `stats()` on the relational portion instead).
+    Raises `PlanError` for an unbounded source and `BackendError` for a `map_batches`/ML
+    pipeline (the opaque UDF path emits no per-operator metrics).
     """
-    import time
-
-    from batcher import core
-    from batcher.api.orchestration import run_relational_metered
     from batcher.api.stats import RunStats
-    from batcher.io.source import is_bounded
+    from batcher.api.terminal.profile import run_profiled
 
-    if any(not is_bounded(s) for s in sources):
-        from batcher._internal.errors import PlanError
+    profile = run_profiled(plan, sources, columns)
+    return RunStats.from_profile(profile)
 
-        raise PlanError("stats() materializes the result, but the dataset has an unbounded source.")
-    if core.has_map_batches(plan):
-        raise BackendError(
-            "stats() is not yet available for map_batches/ML pipelines (the opaque UDF "
-            "path emits no per-operator metrics); call it on the relational portion."
-        )
-    ctx = core.ExecutionContext(columns=columns, hub=core.default_hub())
-    t0 = time.perf_counter()
-    table, ops = run_relational_metered(plan, sources, ctx)
-    total_ms = (time.perf_counter() - t0) * 1000.0
-    return RunStats.from_ops(ops, total_ms, table.num_rows)
+
+def _streaming_write_eligible(
+    plan: LogicalPlan,
+    sources: list[Source],
+    distributed: bool,
+    partition_by: list[str] | None,
+    max_rows_per_file: int | None,
+    num_files: int | None,
+    target_bytes_per_file: int | None,
+) -> bool:
+    """Whether `_write` can stream the result to one file instead of collecting it.
+
+    Eligible when a single-node, breaker-free plan reads a *lazy* source (file /
+    iterator) into a plain single-file write: the batches stream straight to the sink,
+    bounding driver memory to one batch. A fully-resident in-memory source gains
+    nothing (its data is already in RAM), so it keeps the collect path — which also
+    persists per-column sketch statistics (a full pass the streaming path can't do)
+    for a later read. Partitioning or a per-file row/file/byte layout also needs the
+    whole table first, so those stay on the collect path too.
+    """
+    from batcher.io.source import InMemorySource, MaterializedSource
+    from batcher.plan.logical import is_streamable
+
+    if distributed or partition_by:
+        return False
+    if max_rows_per_file is not None or num_files is not None or target_bytes_per_file is not None:
+        return False
+    if not is_streamable(plan):
+        return False
+    return not all(isinstance(s, InMemorySource | MaterializedSource) for s in sources)
 
 
 @with_auto_config
@@ -358,6 +399,30 @@ def _write(
             "materialize (sort / join / window / multi-source). Restructure to a "
             "streamable shape, or consume it with iter_batches()."
         )
+
+    # Streaming single-node write: a breaker-free plan over a lazy source
+    # (read→filter→project→write) streams batch-by-batch into one file, so the driver
+    # holds one batch — never the whole result.
+    if _streaming_write_eligible(
+        plan,
+        sources,
+        distributed,
+        partition_by,
+        max_rows_per_file,
+        num_files,
+        target_bytes_per_file,
+    ):
+        from batcher.api.terminal.stream import _iter_batches
+
+        written = sink.write_stream(
+            _iter_batches(plan, sources, columns),
+            path,
+            schema=_schema(plan, sources, columns),
+            resume=resume,
+        )
+        manifest = WriteManifest((written,))
+        sink.commit(manifest, path)
+        return manifest
 
     table = _collect(plan, sources, columns, distributed=distributed, num_workers=num_workers)
     # Resolve a `repartition` layout to a per-file row cap now that the size is known

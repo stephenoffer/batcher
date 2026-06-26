@@ -9,9 +9,10 @@ covers one capability with runnable examples.
 [joins](joins.md), [window functions](window-functions.md), [SQL](sql.md).
 **Move data** — get it in and out: [reading data](reading-data.md),
 [writing data](writing-data.md), [cloud storage](cloud-storage.md),
-[streaming](streaming.md).
-**Operate** — run it well: [best practices](best-practices.md),
-[troubleshooting](troubleshooting.md).
+[lakehouse tables](lakehouse.md), [streaming](streaming.md).
+**Trust** — keep data correct: [data quality](data-quality.md).
+**Operate** — run it well: [performance and memory](performance.md),
+[best practices](best-practices.md), [troubleshooting](troubleshooting.md).
 
 ```{toctree}
 :hidden:
@@ -39,13 +40,22 @@ sql
 reading-data
 writing-data
 cloud-storage
+lakehouse
 streaming
+```
+
+```{toctree}
+:hidden:
+:caption: Trust
+
+data-quality
 ```
 
 ```{toctree}
 :hidden:
 :caption: Operate
 
+performance
 best-practices
 troubleshooting
 ```

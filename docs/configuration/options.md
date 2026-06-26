@@ -28,6 +28,28 @@ How work is sized and parallelized.
 | `morsel_bytes` | `1048576` (1 MiB) | Byte budget per morsel. A morsel splits at whichever bound (rows or bytes) trips first, so wide/variable-width data stays memory-bounded. Shipped to the data plane. |
 | `split_bytes` | `134217728` (128 MiB) | Target byte size of one file split, so source readers never materialize a whole large file at once. |
 | `cpus_per_task` | `1.0` | CPU shares requested per distributed Ray task. A heavy native op can ask for more. |
+| `cpu_share_io` | `0.5` | CPU shares a CPU-light / IO-bound distributed stage (scan, filter, project, write) requests; below `1.0` so such tasks pack more than one per core. A cold-start prior — once a query runs, Kyber overrides it with each operator's measured CPU utilization. Distributed path only. |
+| `cpu_share_min` | `0.25` | Floor for the adaptive per-task CPU share, so an IO-bound stage never asks for an unschedulable sliver of a core. |
+| `adaptive_morsel_sizing` | `True` | Shrink the per-morsel (rows, bytes) target under memory pressure so the streaming working set stays bounded. Result-invariant; the static target is used unchanged until the pressure monitor reports elevated. Set `False` to pin the static target. |
+| `fuse_linear` | `True` | Fuse chains of linear streaming operators (filter/project) into one pass over the input morsels instead of a dispatch and buffer per operator. Result-invariant; engages only on a chain of two or more fusable ops. |
+| `shrink_output_dtypes` | `False` | Re-narrow a pass-through output column back to its source numeric width (e.g. `Int32` ids widened on input), halving its footprint. Lossless but data-dependent, so off by default — with it off, output types match `Dataset.schema` exactly. |
+
+The remaining execution fields are **power-user performance thresholds**: they tune
+*how* the parallel executor runs an operator and are result-invariant (a query produces
+the identical result at any setting). Each default equals the Rust constant it replaced,
+so leaving them untouched is bit-identical to the engine's tuned baseline. Reach for them
+only to tune a known hot path.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `bloom_fp_rate` | `0.01` | False-positive rate for the hash-join probe-side bloom pre-filter. |
+| `bloom_min_build_rows` | `65536` | Build-row floor above which the probe bloom pays for itself. |
+| `window_parallel_row_threshold` | `32768` | Window row count above which per-partition sorts run across cores. |
+| `radix_parallel_threshold` | `200000` | Concatenated-input row count above which aggregate `combine` regroups via parallel hash-radix partitioning. |
+| `sort_merge_fanin` | `16` | Maximum runs merged per pass in the external (spilling) sort's k-way merge. |
+| `skew_bucket_factor` | `4` | A join bucket is "hot" when it exceeds this multiple of the average bucket. |
+| `skew_min_bucket_rows` | `65536` | Absolute row floor below which a join bucket is never treated as skewed. |
+| `skew_min_bucket_bytes` | `4194304` (4 MiB) | Absolute byte floor below which a join bucket is never treated as skewed. |
 
 ## memory
 
@@ -51,6 +73,9 @@ overhead). See the **OOM-resilient** profile in [profiles](profiles.md).
 | `spill_local_budget_bytes` | `None` | Local spill-tier capacity before overflowing to `spill_remote_uri`. |
 | `spill_compression` | `"lz4"` | Arrow-IPC codec for spilled batches (`"lz4"`/`"zstd"`/`None`). |
 | `spill_bucket_max_bytes` | `134217728` (128 MiB) | A spilled aggregate bucket larger than this is re-partitioned (grace recursion) so a skewed key set degrades gracefully instead of OOMing the reduce. |
+| `unbounded_memory` | `False` | Opt out of the auto-sensed spill budget and keep the fully in-memory fast path (no out-of-core spilling) — for power users who would rather a query fail fast than spill to disk. |
+| `result_cache_max_bytes` | `268435456` (256 MiB) | Byte budget for the process-wide result cache backing [`Dataset.cache()`](../user-guide/performance.md). Cached Arrow results are held LRU and evicted to stay within this, so caching never grows the process without bound. |
+| `streaming_state_max_bytes` | `0` | Cap on one streaming operator's in-memory state (window partials, dedup keys, join buffers). Exceeding it raises a clear `ResourceError` (a stalled-watermark signal) instead of OOMing. `0` derives the cap from the hard memory budget. |
 
 ## flow_control
 
@@ -84,6 +109,9 @@ nests three sub-sections: `cardinality`, `cost_coeffs`, and `cost_weights`.
 | `cost_calibration_min_samples` | `20` | Minimum measured samples before a cost coefficient is calibrated from runtime. |
 | `cost_calibration_clamp` | `10.0` | A calibrated coefficient stays within this factor of its default, so noise cannot produce a degenerate model. |
 | `quantile_probs` | `(0.0, 0.25, 0.5, 0.75, 1.0)` | Quantile grid collected for histogram-based selectivity. |
+| `build_bloom_index` | `False` | On write, build a per-column membership bloom index so a later read can data-skip an equality / `IN` predicate whose value is absent. Opt-in (~1.2 MB per million rows per column). |
+| `target_bytes_per_task` | `268435456` (256 MiB) | Target bytes per distributed task; partition counts take the max of the row- and byte-derived fan-out, so a few wide rows (videos, embeddings) still shard finely enough to fit memory. |
+| `broadcast_max_bytes` | `10485760` (10 MiB) | Build-side byte threshold below which a join is broadcast (replicated to every worker) rather than shuffled — Spark's `autoBroadcastJoinThreshold`. The runtime guard falls back to a shuffle if the materialized build side exceeds it. |
 | `cardinality` | `CardinalityConfig()` | Selinger-style fallback selectivities (sub-section below). |
 | `cost_coeffs` | `CostCoefficients()` | Per-unit operator costs (sub-section below). |
 | `cost_weights` | `CostWeights()` | Relative weight of CPU, IO, and network when collapsing cost to a scalar (sub-section below). |
@@ -169,6 +197,11 @@ cluster** profile in [profiles](profiles.md).
 | `shared_filesystem` | `False` | True when every worker shares a filesystem at the same path, so the disk shuffle is safe cluster-wide. |
 | `dashboard` | `False` | Show the Ray dashboard. |
 | `adaptive_credits` | `False` | Opt-in AIMD shuffle credits: the window adapts to observed memory backpressure instead of the static grant. |
+| `runtime_bloom_join` | `False` | Build a bloom from the join build side and push it to the probe side to drop non-matching rows before they shuffle — cutting network volume for selective fact ⋈ dimension joins. Opt-in; inner / semi single-key joins only. |
+| `shared_memory_transfer` | `False` | Same-node shared-memory shuffle: a mapper mirrors each bucket to a memory-mapped Arrow-IPC file (Linux `/dev/shm` when available) that a same-node reducer reads via mmap — no gRPC. Best-effort; a miss falls back to Flight. |
+| `locality_aware_scheduling` | `False` | Host a reducer whose bucket concentrates on one node on that node, turning the bulk of its fetches into same-node hits. Result-preserving; pays off on a multi-node cluster with a skewed / co-partitioned shuffle. |
+| `persistent_fleet` | `False` | Reserve one placement group and worker fleet for a whole adaptive multi-stage query, keeping each stage's intermediate partitioned on the workers instead of collecting to the driver. Removes per-stage placement churn and the driver funnel. |
+| `resilience` | `"default"` | Named fault-tolerance profile. `"default"` keeps the conservative budgets below; `"spot"` hardens them as a bundle (more restarts / recompute, keepalive on, one speculative backup) for a churning spot-node cluster. Explicit knobs override the profile. See [fault tolerance](../architecture/fault-tolerance.md). |
 
 ### Fault tolerance
 

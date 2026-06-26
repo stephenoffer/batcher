@@ -15,6 +15,7 @@ __all__ = [
     "CommitError",
     "CompileError",
     "ConfigError",
+    "DataQualityError",
     "ExecutionError",
     "FatalShuffleError",
     "FormatError",
@@ -24,6 +25,7 @@ __all__ = [
     "PlanError",
     "ResourceError",
     "RetryableShuffleError",
+    "SchemaError",
     "TransportError",
 ]
 

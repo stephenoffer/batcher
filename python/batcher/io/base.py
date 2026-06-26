@@ -220,6 +220,66 @@ class FileSink(ABC):
             self._write_file(table, fh)
         return WrittenFile(path=path, rows=table.num_rows, bytes=_safe_size(fs, path))
 
+    def write_stream(
+        self,
+        batches: Iterator[pa.RecordBatch],
+        path: str,
+        *,
+        schema: pa.Schema | None = None,
+        resume: bool = False,
+    ) -> WrittenFile:
+        """Stream `batches` into one file at `path`, holding a single batch at a time.
+
+        The bounded-memory counterpart of `write`: a breaker-free `read→transform→
+        write` pipeline never materializes the whole result on the driver. Formats with
+        an incremental writer (Parquet/CSV/Arrow append row-groups via
+        `_open_stream_writer`) stream truly; the rest fall back to buffering one table,
+        so any format stays correct. Atomic and `resume`-safe like `write`; `schema`
+        only writes a valid empty file when the stream yields nothing.
+        """
+        from itertools import chain
+
+        fs = resolve_filesystem(path)
+        if resume and fs.exists(path):
+            # Atomic writes ⇒ an existing file is a complete one; skip the redone work.
+            # The exact row count needs a footer read, so it is best-effort here.
+            return WrittenFile(path=path, rows=0, bytes=_safe_size(fs, path))
+        it = iter(batches)
+        first = next(it, None)
+        rows = 0
+        with fs.atomic_writer(path) as fh:
+            if first is None:
+                empty = schema.empty_table() if schema is not None else pa.table({})
+                self._write_file(empty, fh)
+            elif (writer := self._open_stream_writer(fh, first.schema)) is None:
+                table = pa.Table.from_batches(list(chain([first], it)))
+                self._write_file(table, fh)
+                rows = table.num_rows
+            else:
+                for batch in chain([first], it):
+                    if batch.num_rows:
+                        self._write_batch(writer, batch)
+                        rows += batch.num_rows
+                self._close_stream_writer(writer)
+        return WrittenFile(path=path, rows=rows, bytes=_safe_size(fs, path))
+
+    def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any | None:  # noqa: ARG002 (extension-point args used by overrides)
+        """Open an incremental writer over `fh`, or None to buffer (the default).
+
+        Formats that can append a batch at a time (Parquet/CSV/Arrow) return a writer
+        object driven by `_write_batch`/`_close_stream_writer`; the default None makes
+        `write_stream` buffer one table — correct, just not bounded-memory.
+        """
+        return None
+
+    def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
+        """Append one batch to an open incremental `writer` (see `_open_stream_writer`)."""
+        raise NotImplementedError
+
+    def _close_stream_writer(self, writer: Any) -> None:
+        """Flush and close an incremental `writer` (see `_open_stream_writer`)."""
+        raise NotImplementedError
+
     def write_partitioned(
         self,
         table: pa.Table,

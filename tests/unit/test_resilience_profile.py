@@ -40,6 +40,7 @@ def test_spot_profile_hardens_the_budgets():
     assert d.recovery_backoff_base_s > 0
     assert d.flight_keepalive_s is not None  # keepalive on
     assert d.speculation_max_backups >= 1  # one straggler backup
+    assert d.fleet_max_attempts > DistributedConfig().fleet_max_attempts  # more fleet retries
 
 
 def test_explicit_override_wins_over_profile():
@@ -111,3 +112,37 @@ def test_monitor_drain_hook_exception_never_escapes():
     mon.on_drain(boom)
     mon.trigger()  # must not raise
     assert mon.is_draining() is True
+
+
+def test_detect_spot_environment_from_flag(monkeypatch):
+    from batcher.config.profiles import detect_spot_environment
+
+    monkeypatch.delenv("BATCHER_SPOT", raising=False)
+    assert detect_spot_environment() is False
+    monkeypatch.setenv("BATCHER_SPOT", "1")
+    assert detect_spot_environment() is True
+
+
+def test_detect_spot_environment_from_lifecycle(monkeypatch):
+    from batcher.config.profiles import detect_spot_environment
+
+    monkeypatch.delenv("BATCHER_SPOT", raising=False)
+    monkeypatch.setenv("INSTANCE_LIFECYCLE", "spot")
+    assert detect_spot_environment() is True
+
+
+def test_spot_env_auto_applies_profile(monkeypatch):
+    # On a detected spot node, a config with the default profile auto-upgrades to "spot"
+    # (stronger retries) without the user choosing it.
+
+    from batcher.config import Config
+    from batcher.config.config import _resolved
+
+    monkeypatch.setenv("BATCHER_SPOT", "1")
+    resolved = _resolved(Config())
+    assert resolved.distributed.resilience == "spot"
+    assert resolved.distributed.actor_max_restarts == 4  # the spot profile value
+
+    # Off a spot node, the default profile stands.
+    monkeypatch.delenv("BATCHER_SPOT", raising=False)
+    assert _resolved(Config()).distributed.resilience == "default"

@@ -29,8 +29,6 @@ _DOCS = Path(__file__).resolve().parents[2] / "docs"
 KNOWN_UNDOCUMENTED: dict[str, str] = {
     # Not user-facing API names.
     "__version__": "package version string, not an API symbol",
-    # Streaming surface (in-flight); documentation pending.
-    "OutputMode": "streaming output mode enum; docs pending",
 }
 
 

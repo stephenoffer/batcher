@@ -77,6 +77,7 @@ def gather_with_backups(
     relaunch: Callable[[int], Any],
     policy: SpeculationPolicy | None = None,
     poll_seconds: float = 0.5,
+    on_failure: Callable[[int, Any, Exception], Any] | None = None,
 ) -> list[Any]:
     """Gather `len(refs)` Ray results, launching backups for stragglers.
 
@@ -84,6 +85,15 @@ def gather_with_backups(
     to `ray.get(refs)` when `policy.max_backups == 0` (the default). `relaunch(i)`
     must re-issue task *i* and return a new `ObjectRef` whose result is equivalent
     (the task is deterministic). Backup losers are cancelled best-effort.
+
+    `on_failure(i, ref, exc)`, when given, turns a task *error* (e.g. a dead actor)
+    into slot `i`'s result instead of re-raising — so a barrier that must recover from
+    a *lost* task (the shuffle reduce path) can speculate on stragglers AND classify a
+    death in one pass. It is called only once **every** live copy of slot `i` has
+    failed, with the last-failed `ref` so the caller can attribute the loss to the
+    right host (a dying *backup* never finalizes a slot whose original is still
+    running). `None` (the default) re-raises on the first error — the pure-straggler
+    behavior for tasks that do not fail.
     """
     import time
 
@@ -101,6 +111,9 @@ def gather_with_backups(
     finished_times: dict[int, float] = {}
     backed_up: set[int] = set()
     pending = list(refs)
+    # Live copies (original + backups) per slot — consulted only on the failure-tolerant
+    # path so a slot is finalized as failed *only* when every copy has died.
+    alive: dict[int, set] = {i: {refs[i]} for i in range(n)} if on_failure is not None else {}
 
     while len(result_of) < n:
         # Drain *all* currently-ready refs per wake (not one): a burst of completions
@@ -111,9 +124,18 @@ def gather_with_backups(
         now = time.monotonic()
         for r in done:
             i = ref_to_idx[r]
-            if i not in result_of:  # first copy to finish wins
-                result_of[i] = ray.get(r)
+            if i in result_of:  # slot already won by another copy
+                continue
+            try:
+                result_of[i] = ray.get(r)  # first copy to finish wins
                 finished_times[i] = now - started[i]
+            except Exception as exc:
+                if on_failure is None:
+                    raise
+                alive[i].discard(r)
+                if not alive[i]:  # every copy of this slot has now failed
+                    result_of[i] = on_failure(i, r, exc)
+                    finished_times[i] = now - started[i]
         if policy.max_backups > 0 and len(result_of) < n:
             elapsed = {i: now - started[i] for i in range(n) if i not in result_of}
             in_flight = len(backed_up) - sum(1 for i in backed_up if i in result_of)
@@ -123,6 +145,8 @@ def gather_with_backups(
                     in_flight += 1
                     backup = relaunch(i)
                     ref_to_idx[backup] = i
+                    if on_failure is not None:
+                        alive[i].add(backup)
                     pending.append(backup)
 
     import contextlib

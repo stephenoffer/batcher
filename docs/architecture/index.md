@@ -9,4 +9,5 @@ construction, optimization, and execution.
 overview
 execution
 optimization
+fault-tolerance
 ```

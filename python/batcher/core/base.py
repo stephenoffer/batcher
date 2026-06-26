@@ -25,19 +25,24 @@ if TYPE_CHECKING:
     from batcher.io.source import Source
     from batcher.metadata import MetadataHub
     from batcher.plan.logical import LogicalPlan
+    from batcher.plan.profile import ProfileCollector
 
 __all__ = ["ExecutionContext", "Executor"]
 
 
 @dataclass(frozen=True, slots=True)
 class ExecutionContext:
-    """Read-only inputs an `Executor` needs, beyond the plan and its sources.
+    """Inputs an `Executor` needs, beyond the plan and its sources.
 
     Carries exactly what the existing execution functions take as side inputs:
     the output column names (to build an empty-result schema), the process
     MetadataHub (the feedback sink the local path records into and Kyber learns
     from), and the distributed knobs (`num_workers`, `transport`). A strategy uses
     only the fields it needs; the rest are inert.
+
+    The dataclass is frozen — but `profile`, when present, is a *mutable output sink*
+    the execution writes its planned/measured facts into (the reference is fixed; its
+    contents are not). Everything else is read-only input.
     """
 
     columns: list[str]
@@ -54,6 +59,11 @@ class ExecutionContext:
     # so a single terminal op reads source statistics once, not per optimization pass.
     # `None` means "not collected yet"; the path collects its own.
     source_stats: list | None = None
+    # An optional profiling sink. When set, the relational path records its planned
+    # estimates, admission verdict, and measured per-operator metrics into it, so the
+    # conductor can assemble a `QueryProfile` (for `explain(analyze=True)`, `stats()`,
+    # and the per-query event log). `None` for an ordinary run — zero overhead.
+    profile: ProfileCollector | None = None
 
 
 class Executor(Protocol):

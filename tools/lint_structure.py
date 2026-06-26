@@ -88,6 +88,12 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # `kyber/rules/` is already at the 12-file directory cap, so the DP builders can't
     # move to a sibling module without breaching it — the dir-size invariant wins.
     "python/batcher/kyber/rules/join_order.py": "join-reorder rule + cost-DP variants; rules/ at the 12-file dir cap",
+    # The Delta connector is one cohesive lakehouse source+sink: read (incl.
+    # deletion-vector / merge-on-read masking), partitioned/atomic write, MERGE,
+    # change-data-feed, time-travel, and add-action statistics, all sharing the same
+    # `_table()` / add-action scaffolding. Splitting it into a subpackage is the proper
+    # fix but a separate refactor; the cohesive connector wins over the line cap here.
+    "python/batcher/io/formats/lakehouse/delta.py": "complete Delta source+sink connector (read/DV/write/MERGE/CDF/time-travel/stats)",
     # The expression accessor namespaces: each is one bound family (`.str` / `.list`)
     # whose every public method carries a Google-style docstring with a runnable
     # `.. doctest::` example (python-quality.md). The examples — not the code — push
@@ -105,6 +111,12 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # these over; they are one cohesive `bt.read` / `ds.write` façade.
     "python/batcher/api/io_namespace/reader.py": "bt.read façade; per-format examples push it over",
     "python/batcher/api/io_namespace/writer.py": "ds.write façade; per-format examples push it over",
+    # The `ds.ml` accessor: one bound ML/multimodal namespace (map_batches, infer,
+    # embed, the torch loaders, download/upload) whose every public method now carries
+    # a Google-style docstring — runnable for the in-memory transforms, illustrative
+    # for the model/loader paths. The examples, not the thin delegating bodies, push it
+    # over; the methods are one cohesive accessor bound as a unit.
+    "python/batcher/api/dataset/ml.py": "ds.ml accessor; per-method examples push it over",
 }
 
 fails: list[str] = []

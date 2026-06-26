@@ -331,6 +331,48 @@ def test_distributed_broadcast_join_correct_with_speculation_enabled():
     assert _rowset(distrib) == _rowset(single)
 
 
+def test_broadcast_join_streams_left_in_chunks(tmp_path):
+    """The broadcast probe streams its left side in byte-bounded chunks: with a tiny
+    chunk target a multi-batch left partition spans several chunks, yet the joined output
+    equals one direct join over the whole partition (bounded memory, same result)."""
+    import json
+
+    import batcher._native as nat
+
+    from batcher.config import active_config
+    from batcher.dist.executors.join import _join_reducer_ir, _stream_broadcast_join
+    from batcher.dist.shuffle_io import read_ipc
+
+    rng = np.random.default_rng(3)
+    left_batches = [
+        pa.record_batch(
+            {"k": rng.integers(0, 20, 500).astype("int64"), "lv": rng.integers(0, 9, 500)}
+        )
+        for _ in range(8)
+    ]
+    right_batch = pa.record_batch(
+        {"k": pa.array(range(20), type=pa.int64()), "label": [f"g{i}" for i in range(20)]}
+    )
+    join = (
+        bt.from_arrow(pa.Table.from_batches(left_batches))
+        .join(bt.from_arrow(pa.Table.from_batches([right_batch])), on="k")
+        ._plan
+    )
+    left_ir = json.dumps({"op": "scan", "source_id": 0})
+    join_ir = json.dumps(_join_reducer_ir(join))
+    cfg = active_config().engine_config_json()
+
+    # chunk_bytes=1 forces a chunk boundary after every batch — the eight left batches
+    # stream through as eight separate probe chunks against the resident right.
+    out_path = _stream_broadcast_join(
+        left_ir, iter(left_batches), join_ir, [right_batch], str(tmp_path / "out.arrow"), cfg, 1
+    )
+    streamed = pa.Table.from_batches(read_ipc(out_path))
+    direct = pa.Table.from_batches(nat.execute_plan(join_ir, [left_batches, [right_batch]], cfg))
+    assert _rowset(streamed) == _rowset(direct)
+    assert streamed.num_rows == direct.num_rows
+
+
 @pytest.mark.parametrize("how", ["inner", "left", "semi", "anti"])
 def test_distributed_skew_join_salting_equals_single_node(how, monkeypatch):
     # A skewed join: key 0 dominates the left (probe) side. With skew salting on, the

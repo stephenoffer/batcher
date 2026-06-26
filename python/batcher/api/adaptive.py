@@ -42,12 +42,6 @@ __all__ = ["AdaptiveResult", "execute_adaptive", "resolve_adaptive"]
 
 _BREAKERS = (Aggregate, Sort, Distinct, Window, Limit, Join, Union)
 
-# How many times to (re-)attempt a persistent-fleet query on a fresh fleet before
-# giving up on worker loss. Bounded so a *persistent* failure (e.g. a real cluster
-# shrink) surfaces instead of looping; the first attempt plus one retry covers a
-# transient preemption.
-_FLEET_MAX_ATTEMPTS = 2
-
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class AdaptiveResult:
@@ -155,10 +149,15 @@ def execute_adaptive(
             transport=transport,
         )
 
-    import logging
+    from batcher._internal.logging import get_logger
 
+    log = get_logger("api")
+    # Bounded so a *persistent* failure (e.g. a real cluster shrink) surfaces instead of
+    # looping; config-driven so a churning spot cluster (the `spot` profile) can ride out
+    # more preemptions than the conservative default of 2.
+    max_attempts = active_config().distributed.fleet_max_attempts
     last: BaseException | None = None
-    for attempt in range(_FLEET_MAX_ATTEMPTS):
+    for attempt in range(max_attempts):
         try:
             return _execute_adaptive(
                 plan,
@@ -172,11 +171,11 @@ def execute_adaptive(
             # The fleet lost a worker holding a cross-stage intermediate. The failed
             # attempt already freed the dead fleet (its `finally`); retry on a fresh one.
             last = exc
-            logging.getLogger(__name__).warning(
+            log.warning(
                 "persistent-fleet worker loss (%s); retry %d/%d on a fresh fleet",
                 type(exc).__name__,
                 attempt + 1,
-                _FLEET_MAX_ATTEMPTS,
+                max_attempts,
             )
     raise last  # exhausted retries — surface the last worker-loss error
 

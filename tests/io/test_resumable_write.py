@@ -65,3 +65,28 @@ def test_without_resume_rewrites(tmp_path):
     bt.from_arrow(pa.table({"v": [9, 9]})).write.parquet(path)
     assert first == 3
     assert pq.read_table(path).column("v").to_pylist() == [9, 9]  # overwritten
+
+
+def test_resume_rejects_nondeterministic_plan(tmp_path):
+    # Resume identifies done work by file position, so it is only exactly-once on a
+    # deterministic plan. A group_by/join/sort can place different rows in the same
+    # part file between runs — resuming it risks dropping/duplicating data, so the
+    # write must refuse up front rather than silently corrupt the output.
+    import pytest
+
+    from batcher import col
+    from batcher._internal.errors import PlanError
+
+    agg = _ds().group_by("g").agg(s=col("v").sum())
+    with pytest.raises(PlanError, match="resume=True"):
+        agg.write.parquet(str(tmp_path / "agg"), resume=True)
+
+
+def test_resume_allows_deterministic_etl_plan(tmp_path):
+    # The streamable ETL path (read → filter/select/map_batches → write) keeps a stable
+    # row→file assignment, so resume stays allowed.
+    from batcher import col
+
+    path = str(tmp_path / "etl")
+    manifest = _ds().filter(col("v") > 15).select("g", "v").write.parquet(path, resume=True)
+    assert manifest.num_files >= 1

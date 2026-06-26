@@ -141,6 +141,12 @@ def _rewrite(
         elif l_est.rows >= SORT_MERGE_MIN_ROWS and r_est.rows >= SORT_MERGE_MIN_ROWS:
             # Two large inputs, neither small enough to broadcast: sort-merge avoids
             # building a hash table over a huge side (Spark's default large-join).
+            # NOTE: preferring sort-merge for *already-ordered* inputs was tried and
+            # reverted — benchmarking showed SMJ's RowConverter encoding overhead loses
+            # to the hash join even when its sort is skipped, so it was a regression.
+            # The engine's skip-sort fast-path (`bc-runtime` `sort_indices_if_unsorted`)
+            # still makes this size-driven SMJ cheaper when its inputs happen to arrive
+            # sorted; only the planner *preference* was withdrawn.
             node = dataclasses.replace(node, strategy="sort_merge")
         decisions.append(
             BuildSideDecision(

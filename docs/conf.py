@@ -41,6 +41,16 @@ extensions = [
     "sphinx_copybutton",  # one-click copy on code blocks
 ]
 
+# Doctests run real queries; turn the per-query event log off so the docs build doesn't
+# write JSON files into the builder's ~/.batcher/logs (tests/conftest.py does the same for
+# pytest, but that fixture doesn't apply to the Sphinx doctest builder).
+doctest_global_setup = """
+import dataclasses
+from batcher.config import active_config, set_config
+_c = active_config()
+set_config(_c.replace(observability=dataclasses.replace(_c.observability, event_log=False)))
+"""
+
 # MyST: enable the directives the landing/marketing pages use (card grids etc.).
 myst_enable_extensions = ["colon_fence", "deflist", "tasklist", "attrs_inline"]
 

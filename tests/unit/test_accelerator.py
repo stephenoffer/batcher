@@ -9,7 +9,9 @@ from __future__ import annotations
 import pytest
 
 from batcher.ml.gpu import (
+    _UTILIZATION,
     detect_backend,
+    gpu_feedback_key,
     max_actors_per_gpu,
     recommend_gpu_fraction,
     sample_gpu_utilization,
@@ -19,7 +21,7 @@ from batcher.ml.gpu import (
 
 
 def test_detect_backend_is_known_value():
-    assert detect_backend() in {"cuda", "rocm", "xpu", "mps", "cpu"}
+    assert detect_backend() in {"cuda", "rocm", "xpu", "mps", "tpu", "cpu"}
 
 
 def test_torch_device_maps_backend():
@@ -27,6 +29,7 @@ def test_torch_device_maps_backend():
     assert torch_device("rocm") == "cuda"  # HIP shims the CUDA device string
     assert torch_device("xpu") == "xpu"
     assert torch_device("mps") == "mps"
+    assert torch_device("tpu") == "xla"  # torch_xla device string
     assert torch_device("cpu") == "cpu"
 
 
@@ -35,6 +38,7 @@ def test_vram_overhead_per_vendor():
     assert vram_context_overhead("rocm") == 0.5
     assert vram_context_overhead("xpu") == 0.3
     assert vram_context_overhead("mps") == 0.0
+    assert vram_context_overhead("tpu") == 0.0
     assert vram_context_overhead("cpu") == 0.0
 
 
@@ -54,10 +58,41 @@ def test_recommend_gpu_fraction_floor():
     assert recommend_gpu_fraction(40.0, 48.0) == 1.0
 
 
-def test_sample_utilization_unsupported_backend_is_none():
+def test_sample_utilization_no_counter_backend_is_none():
+    # Apple MPS, Cloud TPU, and CPU expose no per-process utilization counter, so
+    # they have no registry probe and sampling is always None (loop is a no-op).
     assert sample_gpu_utilization("mps") is None
+    assert sample_gpu_utilization("tpu") is None
     assert sample_gpu_utilization("cpu") is None
-    assert sample_gpu_utilization("xpu") is None
+
+
+def test_utilization_registry_covers_counter_backends():
+    # NVIDIA/AMD/Intel have a counter (a registry probe); MPS/TPU/CPU do not.
+    assert set(_UTILIZATION) == {"cuda", "rocm", "xpu"}
+
+
+def test_xpu_utilization_degrades_to_none_without_intel_gpu():
+    # The Intel probe must never raise on a host without an Intel GPU — it returns
+    # None (or, on a real Intel GPU, a fraction in [0, 1]).
+    util = sample_gpu_utilization("xpu")
+    assert util is None or 0.0 <= util <= 1.0
+
+
+def test_gpu_feedback_key_is_accelerator_type_aware():
+    import batcher as bt
+
+    def model(batch):
+        return batch
+
+    a100 = bt.from_pydict({"x": [1, 2, 3]}).ml.map_batches(model, accelerator_type="A100")
+    t4 = bt.from_pydict({"x": [1, 2, 3]}).ml.map_batches(model, accelerator_type="T4")
+    plain = bt.from_pydict({"x": [1, 2, 3]}).ml.map_batches(model)
+
+    assert "@A100" in gpu_feedback_key(a100._plan)
+    # The same UDF on a different device class gets a distinct key (no cross-class
+    # replay of learned utilization), while an unpinned stage keeps its bare key.
+    assert gpu_feedback_key(a100._plan) != gpu_feedback_key(t4._plan)
+    assert "@" not in gpu_feedback_key(plain._plan)
 
 
 def test_triton_dtype_covers_modern_dtypes():

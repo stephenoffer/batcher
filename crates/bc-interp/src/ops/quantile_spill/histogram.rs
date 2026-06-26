@@ -27,6 +27,7 @@ pub(crate) fn bounded_group_histogram(
     group_keys: &[ProjectionItem],
     value_expr: &bc_expr::Expr,
     dir: &std::path::Path,
+    codec: bc_runtime::agg::spill::SpillCodec,
 ) -> Result<(Vec<ArrayRef>, ArrayRef), InterpError> {
     use arrow::array::new_empty_array;
 
@@ -52,6 +53,7 @@ pub(crate) fn bounded_group_histogram(
         &sort_keys,
         dir,
         bc_arrow::RuntimeTuning::default().sort_merge_fanin,
+        codec,
     )?
     else {
         let empty = histogram_map(

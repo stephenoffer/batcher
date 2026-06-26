@@ -29,6 +29,7 @@ _NAMESPACE = "kyber.stats"
 _NDV_KEY = "__column_ndv__"
 _QUANTILES_KEY = "__column_quantiles__"
 _AVG_BYTES_KEY = "__column_avg_bytes__"
+_MCV_KEY = "__column_mcv__"
 
 
 def _smooth(prior: float, observed: float, n_obs: int) -> float:
@@ -126,17 +127,21 @@ def record_column_stats(
     ndv: dict[str, float],
     quantiles: dict[str, dict[str, list[float]]],
     avg_bytes: dict[str, float] | None = None,
+    mcv: dict[str, dict[str, float]] | None = None,
 ) -> None:
-    """Record measured per-column distinct counts, quantile boundaries, and widths.
+    """Record measured per-column distinct counts, quantile boundaries, widths, and
+    most-common-values.
 
     These feed the `CardinalityEstimator`'s `__column_ndv__` (equality/join
-    selectivity), `__column_quantiles__` (range selectivity), and
-    `__column_avg_bytes__` (byte-true memory/broadcast sizing), so a query that has
-    seen a column's data once plans better on every subsequent run. Best-effort;
-    never raises. Core measures (`core.column_statistics`); Kyber persists/consumes.
+    selectivity), `__column_quantiles__` (range selectivity), `__column_avg_bytes__`
+    (byte-true memory/broadcast sizing), and `__column_mcv__` (skew-aware equality
+    selectivity), so a query that has seen a column's data once plans better on every
+    subsequent run. Best-effort; never raises. Core measures
+    (`core.column_statistics` / `core.heavy_hitters`); Kyber persists/consumes.
     """
     avg_bytes = avg_bytes or {}
-    if hub is None or (not ndv and not quantiles and not avg_bytes):
+    mcv = mcv or {}
+    if hub is None or (not ndv and not quantiles and not avg_bytes and not mcv):
         return
     try:
         # Each reserved column key is its own backend entry, updated independently
@@ -154,5 +159,9 @@ def record_column_stats(
             col_w = dict(hub.get_keyed_param(_NAMESPACE, _AVG_BYTES_KEY) or {})
             col_w.update(avg_bytes)
             hub.put_keyed_param(_NAMESPACE, _AVG_BYTES_KEY, col_w)
+        if mcv:
+            col_mcv = dict(hub.get_keyed_param(_NAMESPACE, _MCV_KEY) or {})
+            col_mcv.update(mcv)
+            hub.put_keyed_param(_NAMESPACE, _MCV_KEY, col_mcv)
     except Exception:  # pragma: no cover - learning must never break execution
         pass

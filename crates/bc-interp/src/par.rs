@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arrow::array::{Array, RecordBatch};
 use bc_ir::{EngineConfig, RelOp};
 use bc_resource::{MemoryPool, MemoryReservation};
-use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore};
+use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore, SpillCodec};
 use bc_runtime::{agg, shuffle};
 use rayon::prelude::*;
 
@@ -144,6 +144,7 @@ impl ExecOptions {
                     .as_ref()
                     .map(PathBuf::from)
                     .unwrap_or_else(std::env::temp_dir),
+                codec: SpillCodec::from_config_str(cfg.spill_compression.as_deref()),
             });
         }
         if !cfg.op_budgets.is_empty() {
@@ -175,12 +176,17 @@ impl ExecOptions {
 }
 
 /// Memory envelope + scratch location for spilling stateful operators.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SpillOptions {
     /// Soft cap on bytes of in-memory operator state before grace partitioning.
     pub memory_budget_bytes: usize,
     /// Directory for spill files (one IPC file per hash partition).
     pub dir: PathBuf,
+    /// Compression codec for the spilled IPC streams. Perf-only and
+    /// result-invariant (IPC self-describes its compression). Default `None`
+    /// (uncompressed) keeps the historical bytes; set from
+    /// `EngineConfig.spill_compression`.
+    pub codec: SpillCodec,
 }
 
 impl SpillOptions {
@@ -193,6 +199,7 @@ impl SpillOptions {
         Self {
             memory_budget_bytes: budget,
             dir: self.dir.clone(),
+            codec: self.codec,
         }
     }
 }
@@ -272,6 +279,12 @@ pub fn execute_parallel_with_metrics(
 ) -> Result<(Vec<RecordBatch>, ExecMetrics), InterpError> {
     let mut m = ExecMetrics::default();
     let mut ids = IdGen::new();
+    tracing::debug!(
+        target: "batcher.engine",
+        sources = sources.len(),
+        parallelism = opts.parallelism,
+        "executing plan (metered)"
+    );
     // `parallelism == 0` uses rayon's global pool (all cores); a positive value
     // runs the whole plan inside a scoped pool of that width, so the control
     // plane's `EngineConfig.parallelism` bounds the worker count (and the
@@ -309,15 +322,63 @@ fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpError> {
     if let Some(pool) = guard.get(&width) {
         return Ok(Arc::clone(pool));
     }
+    let mut builder = rayon::ThreadPoolBuilder::new().num_threads(width);
+    // Experimental, opt-in CPU pinning (`BATCHER_PIN_THREADS=1`): pin each worker to a
+    // distinct core for cache/NUMA locality on a big exclusive box. Result-invariant
+    // (scheduling only), so the differential suite proves it changes nothing; off by
+    // default because pinning a process-shared pool can hurt concurrent queries.
+    if pin_threads_enabled() {
+        builder = builder.start_handler(pin_current_thread);
+    }
     let pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(width)
+        builder
             .build()
             .map_err(|_| InterpError::ThreadPool(width))?,
     );
     guard.insert(width, Arc::clone(&pool));
     Ok(pool)
 }
+
+/// Whether worker-thread CPU pinning is enabled — read once from the
+/// `BATCHER_PIN_THREADS` environment variable (`1`/`true`). Experimental and
+/// perf-only: pinning helps cache/NUMA locality on a dedicated many-core box but can
+/// hurt when concurrent queries share the process-wide pool, so it stays opt-in
+/// pending benchmark validation on target hardware. It never changes results.
+fn pin_threads_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("BATCHER_PIN_THREADS").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+/// Pin the calling rayon worker (logical index `idx`) to a CPU core, round-robin over
+/// the available cores. Linux-only — hard affinity via `sched_setaffinity`; a no-op on
+/// other platforms (macOS exposes only advisory affinity hints), so pinning is
+/// best-effort and never errors out of execution.
+#[cfg(target_os = "linux")]
+fn pin_current_thread(idx: usize) {
+    let n = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1);
+    let core = idx % n;
+    // SAFETY: a zeroed `cpu_set_t` is a valid empty set; `CPU_SET` sets one valid
+    // core index (`< n`), and `sched_setaffinity(0, ...)` targets the current thread
+    // with a correctly-sized set. A failure (e.g. restricted cgroup) is ignored —
+    // pinning is best-effort and never affects correctness.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core, &mut set);
+        let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
+/// No-op on non-Linux platforms (hard CPU affinity is unavailable / advisory-only).
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread(_idx: usize) {}
 
 /// Backend tag for an expression operator from its compiled-JIT outcomes: `"jit"`
 /// when every sub-expression compiled, `"interp"` when none did, `"interp+jit"`
@@ -488,9 +549,13 @@ fn exec(
             let rows_in = count_rows(&parts);
             let t0 = Stopwatch::start();
             let funcs = ops::agg_funcs(aggregates);
+            // Compile computed group keys / aggregate inputs once (e.g.
+            // `SUM(price * qty)`); reused across every morsel's partial, amortizing
+            // the compile cost exactly like Filter/Project. `parts` is non-empty here.
+            let agg_jit = ops::compile_agg(group_keys, aggregates, &parts[0]);
             let partials: Vec<agg::Partial> = parts
                 .par_iter()
-                .map(|b| ops::eval_partial(b, group_keys, aggregates))
+                .map(|b| ops::eval_partial_jit(b, group_keys, aggregates, &agg_jit))
                 .collect::<Result<_, InterpError>>()?;
 
             // Spill once the partial state exceeds the per-operator budget *or* the
@@ -516,36 +581,47 @@ fn exec(
                     let sp = &global
                         .with_budget(opts.op_budget(op_id).unwrap_or(global.memory_budget_bytes));
                     spilled = true;
+                    tracing::info!(
+                        target: "batcher.engine",
+                        op_id,
+                        budget_bytes = sp.memory_budget_bytes,
+                        "aggregate spilling to disk (out-of-core, bounded memory)"
+                    );
                     // A lone median/quantile, n_unique, or mode spills out-of-core with
                     // bounded memory (their per-group value list can exceed memory on a
                     // hot key); a *mix* of such a value-list aggregate with constant-state
                     // ones (`median(x), sum(y)`) is bounded compositionally by
                     // `try_bounded_mixed_spill`; every other shape uses the in-memory
                     // grace path. At most one dispatch does work — the rest return `None`.
-                    let bounded =
-                        ops::try_bounded_quantile_spill(&parts, group_keys, aggregates, &sp.dir)?
-                            .or(ops::try_bounded_distinct_spill(
-                                &parts, group_keys, aggregates, &sp.dir,
-                            )?)
-                            .or(ops::try_bounded_mode_spill(
-                                &parts, group_keys, aggregates, &sp.dir,
-                            )?)
-                            .or(ops::try_bounded_histogram_spill(
-                                &parts, group_keys, aggregates, &sp.dir,
-                            )?)
-                            .or(ops::try_bounded_mixed_spill(
-                                &parts,
-                                group_keys,
-                                aggregates,
-                                &sp.dir,
-                                sp.memory_budget_bytes,
-                            )?);
+                    let bounded = ops::try_bounded_quantile_spill(
+                        &parts, group_keys, aggregates, &sp.dir, sp.codec,
+                    )?
+                    .or(ops::try_bounded_distinct_spill(
+                        &parts, group_keys, aggregates, &sp.dir, sp.codec,
+                    )?)
+                    .or(ops::try_bounded_mode_spill(
+                        &parts, group_keys, aggregates, &sp.dir, sp.codec,
+                    )?)
+                    .or(ops::try_bounded_histogram_spill(
+                        &parts, group_keys, aggregates, &sp.dir, sp.codec,
+                    )?)
+                    .or(ops::try_bounded_mixed_spill(
+                        &parts,
+                        group_keys,
+                        aggregates,
+                        &sp.dir,
+                        sp.memory_budget_bytes,
+                        sp.codec,
+                    )?);
                     match bounded {
                         Some((gc, ac)) => (gc, ac),
                         None => {
                             let p = grace_partitions(&partials, sp.memory_budget_bytes);
-                            let mut store =
-                                DiskSpillStore::new(sp.dir.join(format!("agg-{p}p")), p)?;
+                            let mut store = DiskSpillStore::with_codec(
+                                sp.dir.join(format!("agg-{p}p")),
+                                p,
+                                sp.codec,
+                            )?;
                             let res = combine_finalize_spilling(partials, &funcs, &mut store)?;
                             (res.group_columns, res.agg_columns)
                         }
@@ -608,6 +684,7 @@ fn exec(
                                 keys,
                                 &sp.dir.join("sort"),
                                 opts.tuning.sort_merge_fanin,
+                                sp.codec,
                             )?
                         }
                         Admit::InMemory(_reservation) => {
@@ -651,6 +728,7 @@ fn exec(
                         *rank_limit,
                         budget,
                         &global.dir,
+                        global.codec,
                     )?;
                     (out, true)
                 }
@@ -1227,7 +1305,7 @@ fn distinct(
             let sp = &global.with_budget(budget);
             let p = grace_partitions(&partials, sp.memory_budget_bytes);
             let dir = sp.dir.join(format!("distinct-{p}p"));
-            let mut store = DiskSpillStore::new(dir, p)?;
+            let mut store = DiskSpillStore::with_codec(dir, p, sp.codec)?;
             // No aggregates: `&[]` makes this a pure dedup over the group columns.
             let res = combine_finalize_spilling(partials, &[], &mut store)?;
             (res.group_columns, true)
@@ -1644,6 +1722,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1, // force the bounded out-of-core path
                 dir,
+                codec: SpillCodec::None,
             }),
             morsel_rows: 8, // many morsels → many spilled runs
             ..ExecOptions::default()
@@ -1744,6 +1823,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1, // force the out-of-core path
                 dir,
+                codec: SpillCodec::None,
             }),
             morsel_rows: 8, // many morsels → many spilled runs
             ..ExecOptions::default()
@@ -1832,6 +1912,7 @@ mod tests {
                     agg_spill: Some(SpillOptions {
                         memory_budget_bytes: 1, // force the out-of-core path
                         dir,
+                        codec: SpillCodec::None,
                     }),
                     morsel_rows: 8,
                     ..ExecOptions::default()
@@ -1872,7 +1953,7 @@ mod tests {
         // median + sum → engages the bounded mixed path.
         let mixed = [agg(AggFunc::Median, "m"), agg(AggFunc::Sum, "s")];
         assert!(
-            ops::try_bounded_mixed_spill(&parts, &gk, &mixed, &dir, 1)
+            ops::try_bounded_mixed_spill(&parts, &gk, &mixed, &dir, 1, SpillCodec::None)
                 .unwrap()
                 .is_some(),
             "median+sum should engage the bounded mixed path"
@@ -1881,7 +1962,7 @@ mod tests {
         // all constant-state → abstains (grace already bounds per-group accumulators).
         let cs_only = [agg(AggFunc::Sum, "s"), agg(AggFunc::Max, "mx")];
         assert!(
-            ops::try_bounded_mixed_spill(&parts, &gk, &cs_only, &dir, 1)
+            ops::try_bounded_mixed_spill(&parts, &gk, &cs_only, &dir, 1, SpillCodec::None)
                 .unwrap()
                 .is_none(),
             "all-constant-state should fall through to grace"
@@ -1890,7 +1971,7 @@ mod tests {
         // a lone aggregate → abstains (the single-aggregate paths own it).
         let lone = [agg(AggFunc::Median, "m")];
         assert!(
-            ops::try_bounded_mixed_spill(&parts, &gk, &lone, &dir, 1)
+            ops::try_bounded_mixed_spill(&parts, &gk, &lone, &dir, 1, SpillCodec::None)
                 .unwrap()
                 .is_none(),
             "a lone aggregate is not the mixed path's job"
@@ -1947,6 +2028,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1, // force the bounded out-of-core path
                 dir,
+                codec: SpillCodec::None,
             }),
             morsel_rows: 8, // many morsels → many spilled runs
             ..ExecOptions::default()
@@ -2022,6 +2104,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1, // force the bounded out-of-core path
                 dir,
+                codec: SpillCodec::None,
             }),
             morsel_rows: 4, // many morsels → many spilled runs (runs span batches)
             ..ExecOptions::default()
@@ -2102,6 +2185,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1,
                 dir,
+                codec: SpillCodec::None,
             }),
             morsel_rows: 4,
             ..ExecOptions::default()
@@ -2166,6 +2250,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1,
                 dir,
+                codec: SpillCodec::None,
             }),
             morsel_rows: 7,
             ..ExecOptions::default()
@@ -2421,6 +2506,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1,
                 dir,
+                codec: SpillCodec::None,
             }),
             ..ExecOptions::default()
         };
@@ -2568,6 +2654,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1,
                 dir,
+                codec: SpillCodec::None,
             }),
             ..ExecOptions::default()
         };
@@ -2595,6 +2682,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1,
                 dir,
+                codec: SpillCodec::None,
             }),
             ..ExecOptions::default()
         };
@@ -2731,6 +2819,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1, // force grace partitioning
                 dir,
+                codec: SpillCodec::None,
             }),
             ..ExecOptions::default()
         };
@@ -2764,6 +2853,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1, // any real input exceeds this
                 dir: std::env::temp_dir(),
+                codec: SpillCodec::None,
             }),
             ..ExecOptions::default()
         };
@@ -2803,6 +2893,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1, // force the external-sort branch
                 dir,
+                codec: SpillCodec::None,
             }),
             morsel_rows: 2, // tiny morsels → multiple sorted runs to merge
             ..ExecOptions::default()
@@ -2845,6 +2936,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1, // force the external-sort branch
                 dir,
+                codec: SpillCodec::None,
             }),
             morsel_rows: 1, // one row per morsel → 60 runs → multi-pass merge
             ..ExecOptions::default()
@@ -2922,6 +3014,7 @@ mod tests {
                 agg_spill: Some(SpillOptions {
                     memory_budget_bytes: 1, // force grace partitioning
                     dir,
+                    codec: SpillCodec::None,
                 }),
                 ..ExecOptions::default()
             };
@@ -2971,6 +3064,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1 << 30,
                 dir,
+                codec: SpillCodec::None,
             }),
             pool: Some(Arc::clone(&pool)),
             ..ExecOptions::default()
@@ -3055,6 +3149,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1,
                 dir,
+                codec: SpillCodec::None,
             }),
             ..ExecOptions::default()
         };
@@ -3345,6 +3440,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1 << 30, // static check would say "in memory"
                 dir,
+                codec: SpillCodec::None,
             }),
             pool: Some(Arc::clone(&pool)),
             ..ExecOptions::default()
@@ -3373,6 +3469,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1 << 30,
                 dir,
+                codec: SpillCodec::None,
             }),
             pool: Some(Arc::clone(&pool)),
             ..ExecOptions::default()
@@ -3412,6 +3509,7 @@ mod tests {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1 << 30,
                 dir,
+                codec: SpillCodec::None,
             }),
             pool: Some(Arc::clone(&pool)),
             ..ExecOptions::default()

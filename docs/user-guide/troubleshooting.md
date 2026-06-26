@@ -125,3 +125,12 @@ because they add overhead that only pays off at scale.
 # docs: skip
 out = ds.group_by("x").agg(total=bt.col("y").sum()).collect(spill=True)
 ```
+
+## See also
+
+- [Performance and memory](performance.md): caching, spill tuning, and reading a
+  query plan.
+- [Distributed fault tolerance](../architecture/fault-tolerance.md): diagnosing
+  task, shuffle, and node failures.
+- [Configuration options](../configuration/options.md): every tunable and its
+  default.

@@ -19,6 +19,29 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _disable_event_log():
+    """Turn the per-query event log off for the suite (env is import-time, so use config).
+
+    The event log is on by default in production, but writing a JSON document per query
+    to ``~/.batcher/logs`` would pollute the developer's home directory and add file I/O
+    to every test. Disabling it keeps the suite fast and hermetic; a test that exercises
+    the event log explicitly re-enables it against ``tmp_path``. No-op where the engine
+    config can't be imported.
+    """
+    try:
+        import dataclasses
+
+        from batcher.config import active_config, set_config
+    except Exception:
+        yield
+        return
+    prev = active_config()
+    set_config(prev.replace(observability=dataclasses.replace(prev.observability, event_log=False)))
+    yield
+    set_config(prev)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_metadata_hub():
     """Reset the process-wide MetadataHub around every test for deterministic order.
 

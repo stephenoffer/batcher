@@ -26,7 +26,26 @@ from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 from batcher.plan.schema import SchemaRef
 from batcher.plan.visitor import children, with_children
 
-__all__ = ["build_udf_callable", "execute_with_udfs", "has_map_batches"]
+__all__ = ["build_udf_callable", "execute_with_udfs", "has_map_batches", "prebuild_factories"]
+
+
+def prebuild_factories(node: LogicalPlan) -> LogicalPlan:
+    """Instantiate every class (factory) `map_batches` UDF in a linear plan once,
+    returning an equivalent plan whose `fn`s are the built callables.
+
+    The model loads a single time here instead of once per `execute_with_udfs` call —
+    so a long-lived caller (a distributed inference actor, a streaming micro-batch loop)
+    reuses one loaded model across many batches. A non-class `fn` is already the
+    callable and is left as is; `build_udf_callable` is idempotent on a built instance.
+    """
+    if isinstance(node, MapBatches):
+        return dataclasses.replace(
+            node, fn=build_udf_callable(node.fn), input=prebuild_factories(node.input)
+        )
+    child = getattr(node, "input", None)
+    if child is not None:
+        return dataclasses.replace(node, input=prebuild_factories(child))
+    return node
 
 
 def build_udf_callable(fn: object) -> object:
@@ -118,6 +137,13 @@ def _apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordB
     batches = current
     if op.batch_size is not None:
         batches = pa.Table.from_batches(current).to_batches(max_chunksize=op.batch_size)
+    elif op.num_gpus > 0 or isinstance(op.fn, type):
+        # Auto batch sizing: an inference stage (a GPU stage, or a load-once class `fn`)
+        # with no explicit `batch_size` hill-climbs the size online toward the
+        # VRAM-capped throughput plateau — so the user never hand-tunes it (a hand-set
+        # or unset `batch_size` is Ray Data's #1 OOM cause). A plain-function transform
+        # keeps the engine morsel size (no warm-up penalty for cheap work).
+        return _apply_udf_autobatch(op, batches)
 
     strategy = _map_strategy(op, len(batches))
     if strategy == "processes":
@@ -150,6 +176,34 @@ def _apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordB
     for result in results:
         out.extend(_coerce_udf_result(result))
     return out
+
+
+def _apply_udf_autobatch(op: MapBatches, batches: list[pa.RecordBatch]) -> list[pa.RecordBatch]:
+    """Run the inference `fn` with online batch-size auto-tuning (zero-config inference).
+
+    Routes through a throughput `InferencePool`: it re-chunks the input dynamically and
+    hill-climbs the batch size toward the VRAM-capped throughput plateau (`ml.autobatch`),
+    surviving a CUDA OOM by halving the batch — so the user never hand-tunes `batch_size`.
+    Input order is preserved (a relation-level no-op vs a fixed size), and the model is
+    built once and shared across the `num_workers` dispatch slots (a GPU stage resolves to
+    one). The seed is conservative (climbs up); a future VRAM-aware seed sharpens the start.
+    """
+    from batcher.ml.inference import InferencePool
+
+    fn = build_udf_callable(op.fn)
+    call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
+
+    def worker(batch: pa.RecordBatch) -> pa.RecordBatch:
+        coerced = _coerce_udf_result(call(batch))
+        if not coerced:
+            return batch.slice(0, 0)
+        merged = pa.Table.from_batches(coerced).combine_chunks().to_batches()
+        return merged[0] if merged else coerced[0]
+
+    pool = InferencePool(
+        lambda: worker, num_workers=op.num_workers, target_batch_rows=256, objective="throughput"
+    )
+    return list(pool.run(iter(batches)))
 
 
 def _map_strategy(op: MapBatches, n_batches: int) -> str:

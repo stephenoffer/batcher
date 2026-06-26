@@ -311,7 +311,9 @@ class StatsEstimator:
         learned = self._learned.get(self._sig(node), {}).get("selectivity")
         if learned is not None:
             return learned
-        return predicate_selectivity(node.predicate, self._ndv, self._cfg, self._quantiles)
+        return predicate_selectivity(
+            node.predicate, self._ndv, self._cfg, self._quantiles, self._mcv
+        )
 
     def _has_learned(self, node: LogicalPlan) -> bool:
         return "selectivity" in self._learned.get(self._sig(node), {})
@@ -328,6 +330,13 @@ class StatsEstimator:
         (`{col: {"probs": [...], "values": [...]}}`, both ascending), used for
         histogram-based range selectivity. Empty until the metadata loop fills it."""
         return self._learned.get("__column_quantiles__", {})
+
+    @property
+    def _mcv(self) -> dict[str, dict[str, float]]:
+        """Learned per-column most-common-values (`{col: {str(value): frequency}}`),
+        used to sharpen equality selectivity on skewed columns to the value's measured
+        frequency. Empty until the metadata loop fills it."""
+        return self._learned.get("__column_mcv__", {})
 
     @property
     def _avg_bytes(self) -> dict[str, float]:

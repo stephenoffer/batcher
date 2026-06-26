@@ -128,3 +128,14 @@ class ArrowIPCSink(FileSink):
         options = ipc.IpcWriteOptions(compression=self.compression)
         with ipc.new_file(fh, table.schema, options=options) as writer:
             writer.write_table(table)
+
+    def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
+        ipc = _require_ipc()
+        options = ipc.IpcWriteOptions(compression=self.compression)
+        return ipc.new_file(fh, schema, options=options)
+
+    def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
+        writer.write_batch(batch)
+
+    def _close_stream_writer(self, writer: Any) -> None:
+        writer.close()

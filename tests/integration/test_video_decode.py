@@ -61,3 +61,21 @@ def test_video_decode_metadata_or_graceful_error(tmp_path):
         "fps": 10.0,
     }
     assert out[1] is None  # null bytes → null struct
+
+
+def test_video_dataset_decodes_per_row_without_whole_batch_materialization():
+    # The Python `video_dataset` path decodes one clip at a time (no `.to_pylist()`).
+    # Null rows skip the PyAV decode and become all-zero frames, so this exercises the
+    # per-row iteration + fixed-shape tensor output without needing PyAV installed.
+    import numpy as np
+
+    from batcher.ml.decode import video_dataset
+
+    ds = bt.from_pydict({"bytes": [None, None]})
+    out = video_dataset(ds, size=(8, 8), num_frames=2).collect()
+    frames = out.column("frames")
+    assert out.num_rows == 2
+    # Fixed-shape tensor: each row is (num_frames, H, W, 3) = (2, 8, 8, 3) of zeros.
+    arr = np.asarray(frames.to_pylist())
+    assert arr.shape == (2, 2 * 8 * 8 * 3)
+    assert not arr.any()  # undecodable/null clips → all-zero frames

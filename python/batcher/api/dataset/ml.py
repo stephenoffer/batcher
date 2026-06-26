@@ -64,6 +64,7 @@ class DatasetML:
     __slots__ = ("_ds",)
 
     def __init__(self, ds: Dataset) -> None:
+        """Bind the ML accessor to its `Dataset`; reached as `ds.ml`, not constructed directly."""
         self._ds = ds
 
     def map_batches(
@@ -72,7 +73,7 @@ class DatasetML:
         *,
         batch_size: int | None = None,
         output_columns: list[str] | None = None,
-        num_workers: int = 1,
+        num_workers: int | str = "auto",
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
         batch_format: str = "pyarrow",
@@ -95,16 +96,15 @@ class DatasetML:
         around the call; the engine boundary stays Arrow. A `pyarrow`/`numpy` `fn`
         may also return a Table or column dict.
 
-        `batch_size` rebatches before calling `fn` (e.g. to a model's GPU batch
-        size). `output_columns` declares the result schema. `num_workers > 1` runs
-        the per-batch calls concurrently within a worker (overlapping GIL-releasing
-        inference); set `multiprocessing=True` to run those `num_workers` calls across
-        *processes* on a single node, so a CPU-bound pure-Python `fn` the GIL would
-        serialize across threads uses multiple cores (the local path falls back to
-        threads for a class/factory `fn`, a GPU `fn`, or a non-pyarrow `batch_format`).
-        `num_gpus` reserves GPUs per distributed worker; `concurrency`
-        sizes the distributed actor pool — an `int` for a fixed pool, or a
-        ``(min, max)`` tuple to autoscale the pool to the workload within those bounds.
+        `batch_size` rebatches before calling `fn` (e.g. to a model's GPU batch size).
+        `output_columns` declares the result schema. `num_workers` (default ``"auto"``:
+        all local cores for a CPU stage, one model/CUDA context for a GPU stage) runs the
+        per-batch calls concurrently within a worker — parallel by default, not
+        single-threaded; an explicit int wins. `multiprocessing=True` runs them across
+        *processes* (a CPU-bound pure-Python `fn`); it falls back to threads for a
+        class/factory or GPU `fn` or a non-pyarrow `batch_format`. `num_gpus` reserves
+        GPUs per distributed worker; `concurrency` sizes the distributed actor pool
+        (default ``"auto"``: one actor per GPU) — an `int`, or a ``(min, max)`` tuple.
         `accelerator_type` pins GPU actors to a model (a `ray.util.accelerators` name
         like ``"NVIDIA_A100"``). `model_memory_gb` (the model's GB footprint) lets the
         resource layer budget host RAM per worker (OOM protection) and VRAM-pack small
@@ -133,8 +133,20 @@ class DatasetML:
 
         Raises:
             PlanError: if `batch_format` or `concurrency` is invalid.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow.compute as pc
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> def add_ten(batch):
+                ...     return batch.set_column(0, "x", pc.add(batch.column("x"), 10))
+                >>> ds.ml.map_batches(add_ten).to_pydict()
+                {'x': [11, 12, 13]}
         """
         from batcher.ml.batch_format import FORMATS
+        from batcher.ml.gpu import resolve_num_workers
 
         if batch_format not in FORMATS:
             from batcher._internal.errors import PlanError
@@ -149,7 +161,7 @@ class DatasetML:
                 fn,
                 batch_size,
                 cols,
-                num_workers=max(1, num_workers),
+                num_workers=resolve_num_workers(num_workers, num_gpus),
                 num_gpus=num_gpus,
                 concurrency=concurrency,
                 batch_format=batch_format,
@@ -165,7 +177,7 @@ class DatasetML:
         *,
         batch_size: int | None = None,
         output_columns: list[str] | None = None,
-        num_workers: int = 1,
+        num_workers: int | str = "auto",
         concurrency: int | tuple[int, int] | None = None,
     ) -> Dataset:
         """Apply a per-row Python function ``fn(row_dict) -> row_dict`` (Ray Data
@@ -176,6 +188,14 @@ class DatasetML:
         Prefer the vectorized `map_batches` (whole Arrow batch) when you can express
         the work over columns — it is far faster. `output_columns` declares the result
         schema. Returns a new lazy `Dataset`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.ml.map(lambda row: {"x": row["x"] * 10}).to_pydict()
+                {'x': [10, 20, 30]}
         """
         from batcher.api.dataset.callbacks import _RowMap
 
@@ -193,7 +213,7 @@ class DatasetML:
         *,
         batch_size: int | None = None,
         output_columns: list[str] | None = None,
-        num_workers: int = 1,
+        num_workers: int | str = "auto",
         concurrency: int | tuple[int, int] | None = None,
     ) -> Dataset:
         """Apply a per-row function ``fn(row_dict) -> iterable[row_dict]`` and flatten
@@ -202,6 +222,14 @@ class DatasetML:
         Like `map`, `fn` runs per row inside the worker. Each call returns zero or more
         output rows (dicts), all concatenated. `output_columns` declares the result
         schema. Returns a new lazy `Dataset`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.ml.flat_map(lambda row: [{"x": row["x"]}, {"x": row["x"]}]).to_pydict()
+                {'x': [1, 1, 2, 2, 3, 3]}
         """
         from batcher.api.dataset.callbacks import _RowFlatMap
 
@@ -315,6 +343,19 @@ class DatasetML:
         cluster (pass `global_consumed` from a checkpoint) with no repeated or skipped
         samples. Disable any framework auto-sharding — this is the single shard
         authority. Requires `torch`. See `batcher.ml.stream_loader`.
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+                from torch.utils.data import DataLoader
+
+                ds = bt.read.parquet("s3://bucket/train/*.parquet")
+                iterable = ds.ml.stream_loader(
+                    batch_size=256, world_size=8, rank=rank, columns=["image", "label"]
+                )
+                for batch in DataLoader(iterable, batch_size=None):
+                    train_step(batch["image"], batch["label"])
         """
         from batcher.ml.loader import stream_loader
 
@@ -354,6 +395,15 @@ class DatasetML:
         window, and a custom `collate_fn`. For a deterministic, balanced, resumable
         *distributed* split over a bounded corpus use `stream_loader`. Requires `torch`.
         See `batcher.ml.iter_torch_batches`.
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                ds = bt.read.parquet("s3://bucket/train/*.parquet")
+                for batch in ds.ml.iter_torch_batches(batch_size=256, device="auto"):
+                    train_step(batch["image"], batch["label"])
         """
         from batcher.ml.loader import iter_torch_batches
 
@@ -459,6 +509,14 @@ class DatasetML:
         filesystem resolver, fetching each batch's rows concurrently and parallelizing
         across the cluster (a `map_batches` stage). ``on_error="null"`` makes a failed
         fetch a null instead of raising. See `batcher.ml.download_dataset`.
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                urls = bt.from_pydict({"url": ["s3://bucket/cat.jpg", "s3://bucket/dog.jpg"]})
+                images = urls.ml.download("url", output_column="bytes")
         """
         from batcher.ml.decode import download_dataset
 
@@ -486,6 +544,16 @@ class DatasetML:
         ``s3://``/``gs://``/``az://``/local storage, parallelized across the cluster.
         Names come from `name_column` (+ `extension`) or a content hash. See
         `batcher.ml.decode.upload_dataset`.
+
+        Examples:
+            .. code-block:: python
+
+                import batcher as bt
+
+                thumbs = ds.ml.map_batches(make_thumbnails)  # bytes in "thumb"
+                written = thumbs.ml.upload(
+                    "thumb", "s3://bucket/thumbs", extension=".jpg"
+                )
         """
         from batcher.ml.decode import upload_dataset
 

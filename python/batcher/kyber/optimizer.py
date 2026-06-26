@@ -107,7 +107,8 @@ def _annotate_ops(
     try:
         nodes = list(walk(plan))
         for i, node in enumerate(nodes):
-            rows = estimator.estimate(node).rows
+            est = estimator.estimate(node)
+            rows = est.rows
             kind = type(node).__name__
             known = 0.0 <= rows < unknown_rows
             # Byte-true width: learned per-column widths when measured, else the flat
@@ -151,7 +152,7 @@ def _annotate_ops(
                         c_cpu_shares=c_cpu,
                     ),
                     inputs=(),
-                    properties=PlanProperties(est_rows=rows),
+                    properties=PlanProperties(est_rows=rows, provenance=est.provenance),
                 )
             )
     except Exception:

@@ -197,11 +197,20 @@ def audio_dataset(
 ) -> Dataset:
     """Decode an audio-bytes column into a ``list<float32>`` waveform column.
 
-    Uses `soundfile` (``batcher-engine[audio]``). Waveforms are variable length, so the
-    output is a list column (one waveform per row); `sample_rate` (when given)
-    resamples via `librosa` if available, else the native rate is kept.
+    The common mono, native-sample-rate case decodes in the native data plane
+    (Rust ``symphonia`` via ``col(...).audio.to_waveform()``) — no per-row Python.
+    An explicit `sample_rate` (resample) or ``mono=False`` falls back to the
+    `soundfile`/`librosa` Python path (``batcher-engine[audio]``). Waveforms are
+    variable length, so the output is a ``list<float32>`` column (one per row).
     """
+    # Native path: mono channel-average at the source rate is exactly what the
+    # Rust `to_waveform` produces, so the bytes never cross into Python per-row.
+    if sample_rate is None and mono:
+        from batcher.plan.expr_ir import col
 
+        return ds.with_columns(**{output_column: col(source_column).audio.to_waveform()})
+
+    # Fallback: explicit resample or multi-channel needs the Python decoder.
     def _decode(batch: Any) -> Any:
         import numpy as np
         import pyarrow as pa
@@ -229,7 +238,9 @@ def video_dataset(
 
     Samples `num_frames` evenly-spaced frames and resizes each to `size` via `PyAV`
     (``batcher-engine[video]``). Fixed frame count and size make the result a fixed-shape
-    tensor, ready for a video model; undecodable rows become all-zero frames.
+    tensor, ready for a video model; undecodable rows become all-zero frames. Clips are
+    decoded one row at a time (no whole-batch ``to_pylist`` materialization), so only the
+    current clip's bytes are ever resident — keep ``batch_size`` small for GB clips.
     """
     from batcher.io.formats.ml.tensor import as_tensor_column
 
@@ -241,8 +252,13 @@ def video_dataset(
         import numpy as np
         import pyarrow as pa
 
+        src = batch.column(source_column)
         flat = np.zeros((batch.num_rows, per_row), dtype=np.uint8)
-        for i, b in enumerate(batch.column(source_column).to_pylist()):
+        for i in range(batch.num_rows):
+            # Materialize ONE clip's bytes at a time (released next iteration), instead
+            # of `.to_pylist()` holding every clip in the batch at once.
+            scalar = src[i]
+            b = scalar.as_py() if scalar.is_valid else None
             frames = None if b is None else _decode_video_bytes(b, num_frames, height, width)
             if frames is not None:
                 flat[i] = frames.reshape(-1)

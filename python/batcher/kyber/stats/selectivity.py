@@ -29,6 +29,7 @@ def predicate_selectivity(
     ndv: dict[str, float],
     cfg: CardinalityConfig,
     quantiles: dict[str, Any] | None = None,
+    mcv: dict[str, dict[str, float]] | None = None,
 ) -> float:
     """Estimate the fraction of rows a predicate keeps, from its structure.
 
@@ -36,36 +37,41 @@ def predicate_selectivity(
     full weight, each subsequent one dampened) — this lifts the estimate toward
     reality on correlated predicates, where the naive independence product
     underestimates the kept fraction. Disjunctions use inclusion-exclusion;
-    negation complements. A leaf `col = literal` uses `1/ndv` when the distinct
-    count is known; `col < literal` interpolates the fraction below the literal
-    from per-column quantile boundaries when known, else a Selinger range constant.
-    Always clamped to `[0, 1]`.
+    negation complements. A leaf `col = literal` uses the literal's measured
+    most-common-value frequency when it is a known skew value, else `1/ndv` when the
+    distinct count is known; `col < literal` interpolates the fraction below the
+    literal from per-column quantile boundaries when known, else a Selinger range
+    constant. Always clamped to `[0, 1]`.
     """
-    sel = _raw_predicate_selectivity(expr, ndv, cfg, quantiles or {})
+    sel = _raw_predicate_selectivity(expr, ndv, cfg, quantiles or {}, mcv or {})
     return min(1.0, max(0.0, sel))
 
 
 def _raw_predicate_selectivity(
-    expr: Expr, ndv: dict[str, float], cfg: CardinalityConfig, quantiles: dict[str, Any]
+    expr: Expr,
+    ndv: dict[str, float],
+    cfg: CardinalityConfig,
+    quantiles: dict[str, Any],
+    mcv: dict[str, dict[str, float]],
 ) -> float:
     if isinstance(expr, Binary):
         op = expr.op
         if op == "and":
             conjuncts = _flatten_and(expr)
-            sels = sorted(predicate_selectivity(c, ndv, cfg, quantiles) for c in conjuncts)
+            sels = sorted(predicate_selectivity(c, ndv, cfg, quantiles, mcv) for c in conjuncts)
             return _exponential_backoff(sels)
         if op == "or":
-            a = predicate_selectivity(expr.left, ndv, cfg, quantiles)
-            b = predicate_selectivity(expr.right, ndv, cfg, quantiles)
+            a = predicate_selectivity(expr.left, ndv, cfg, quantiles, mcv)
+            b = predicate_selectivity(expr.right, ndv, cfg, quantiles, mcv)
             return a + b - a * b
         if op == "eq":
-            return _equality_selectivity(expr, ndv, cfg)
+            return _equality_selectivity(expr, ndv, cfg, mcv)
         if op == "ne":
-            return 1.0 - _equality_selectivity(expr, ndv, cfg)
+            return 1.0 - _equality_selectivity(expr, ndv, cfg, mcv)
         if op in _COMPARISONS:
             return _range_selectivity(expr, op, cfg, quantiles)
     if isinstance(expr, Not):
-        return 1.0 - predicate_selectivity(expr.input, ndv, cfg, quantiles)
+        return 1.0 - predicate_selectivity(expr.input, ndv, cfg, quantiles, mcv)
     if isinstance(expr, IsNull):
         return cfg.null_selectivity
     if isinstance(expr, IsNotNull):
@@ -162,9 +168,27 @@ def _fraction_below(x: float, probs: list[float], values: list[float]) -> float 
     return None
 
 
-def _equality_selectivity(expr: Binary, ndv: dict[str, float], cfg: CardinalityConfig) -> float:
-    """`col = literal` keeps ~`1/ndv(col)` of rows when the distinct count is
-    known (uniformity assumption), else a small default."""
+def _equality_selectivity(
+    expr: Binary,
+    ndv: dict[str, float],
+    cfg: CardinalityConfig,
+    mcv: dict[str, dict[str, float]],
+) -> float:
+    """`col = literal` selectivity.
+
+    When the literal is a known most-common-value, use its *measured* frequency —
+    far sharper than the uniform `1/ndv` on a skewed column, which is exactly where
+    `1/ndv` is most wrong. Otherwise keep `~1/ndv(col)` when the distinct count is
+    known (uniformity assumption), else a small default.
+    """
+    side = comparison_col_side(expr)
+    if side is not None:
+        col, value, _ = side
+        col_mcv = mcv.get(col)
+        if col_mcv is not None:
+            freq = col_mcv.get(str(value))
+            if freq is not None:
+                return freq
     col = _column_of_comparison(expr)
     if col is not None and col in ndv and ndv[col] > 0:
         return 1.0 / ndv[col]

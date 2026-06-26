@@ -19,7 +19,36 @@ import dataclasses
 
 from batcher.config.config import Config, DistributedConfig
 
-__all__ = ["RESILIENCE_PROFILES", "apply_resilience_profile"]
+__all__ = ["RESILIENCE_PROFILES", "apply_resilience_profile", "detect_spot_environment"]
+
+# Env vars whose presence marks a preemptible/spot node. The first group is an explicit
+# opt-in (set by the launcher/Dockerfile); the second is a node-lifecycle hint some
+# orchestrators surface. Detection is env-var only — never a metadata-service network
+# call on a hot path — so a deployment with no signal sets `BATCHER_SPOT=1` (or passes
+# `resilience="spot"`). Truthy means spot.
+_SPOT_TRUE = frozenset({"1", "true", "yes", "on", "spot", "preemptible", "preempt"})
+_SPOT_FLAG_VARS = ("BATCHER_SPOT", "RAY_SPOT")
+_SPOT_LIFECYCLE_VARS = ("RAY_NODE_TYPE_NAME", "NODE_LIFECYCLE", "INSTANCE_LIFECYCLE")
+
+
+def detect_spot_environment() -> bool:
+    """Best-effort detection of a preemptible/spot environment from cheap local signals.
+
+    True when an explicit spot flag env var is truthy, or a node-lifecycle env var names
+    a spot/preemptible instance. No network call (the cloud metadata service is avoided
+    on the hot path). When detected and the user has not chosen a resilience profile, the
+    config layer auto-selects ``"spot"`` so a job rides out preemption without tuning —
+    while ``recovery_max_attempts`` etc. already give every job baseline recovery.
+    """
+    import os
+
+    if any(os.environ.get(v, "").strip().lower() in _SPOT_TRUE for v in _SPOT_FLAG_VARS):
+        return True
+    return any(
+        "spot" in os.environ.get(v, "").lower() or "preempt" in os.environ.get(v, "").lower()
+        for v in _SPOT_LIFECYCLE_VARS
+    )
+
 
 # The set of valid `DistributedConfig.resilience` values (validated in
 # `config.validation`). ``"default"`` is the identity profile.
@@ -39,6 +68,7 @@ _SPOT_DISTRIBUTED: dict[str, object] = {
     "recovery_backoff_base_s": 1.0,
     "flight_keepalive_s": 20.0,
     "speculation_max_backups": 1,
+    "fleet_max_attempts": 6,
 }
 
 

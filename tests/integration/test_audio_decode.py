@@ -51,3 +51,27 @@ def test_audio_to_waveform():
     out = ds.select(w=col("a").audio.to_waveform()).collect().to_pydict()["w"]
     assert [round(x, 3) for x in out[0]] == [0.0, 0.5, -0.5]
     assert out[1] is None  # undecodable bytes → null list
+
+
+def test_audio_dataset_helper_takes_native_path():
+    # The default (mono, native rate) `audio_dataset` must decode in the data plane
+    # — no per-row Python `map_batches` — and match the native expression's output.
+    from batcher.core.udf import has_map_batches
+    from batcher.ml.decode import audio_dataset
+
+    ds = bt.from_pydict({"bytes": [_wav(8000, [0, 16384, -16384]), None]})
+    decoded = audio_dataset(ds)
+    assert not has_map_batches(decoded._plan), "default audio_dataset must not use map_batches"
+    out = decoded.collect().to_pydict()["waveform"]
+    assert [round(x, 3) for x in out[0]] == [0.0, 0.5, -0.5]
+    assert out[1] is None
+
+
+def test_audio_dataset_resample_falls_back_to_python():
+    # An explicit sample_rate needs librosa resampling — the Python fallback path.
+    from batcher.core.udf import has_map_batches
+    from batcher.ml.decode import audio_dataset
+
+    ds = bt.from_pydict({"bytes": [_wav(8000, [0, 16384, -16384])]})
+    decoded = audio_dataset(ds, sample_rate=16000)
+    assert has_map_batches(decoded._plan), "resample must use the Python fallback"

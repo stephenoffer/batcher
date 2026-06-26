@@ -90,6 +90,18 @@ def validate_config(cfg: Config) -> None:
         f"distributed.placement_timeout_s must be positive, got {d.placement_timeout_s}",
     )
     _check(
+        d.autoscale_wait_s >= 0,
+        f"distributed.autoscale_wait_s must be >= 0, got {d.autoscale_wait_s}",
+    )
+    _check(
+        d.autoscale_poll_s > 0,
+        f"distributed.autoscale_poll_s must be positive, got {d.autoscale_poll_s}",
+    )
+    _check(
+        d.fleet_max_attempts >= 1,
+        f"distributed.fleet_max_attempts must be >= 1, got {d.fleet_max_attempts}",
+    )
+    _check(
         d.speculation_max_backups >= 0,
         f"distributed.speculation_max_backups must be >= 0, got {d.speculation_max_backups}",
     )

@@ -54,3 +54,12 @@ counts = bt.sql(
 print(counts.to_pydict())
 # {'category': ['a', 'b', 'c'], 'n': [3, 2, 1]}
 ```
+
+## Runnable examples
+
+Run any of these directly with `python examples/<name>.py`:
+
+- `feature_engineering.py` — scaling, bucketing, encoding, and imputation with expressions.
+- `timeseries.py` — date-part extraction, resampling, and period-over-period change.
+- `window_functions.py` — ranking and rolling aggregates with `.over(...)`.
+- `sql.py` — the same questions in SQL, composed with the DataFrame API.

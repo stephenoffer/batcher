@@ -27,6 +27,7 @@ class _StrNamespace:
     __slots__ = ("_e",)
 
     def __init__(self, e: Expr) -> None:
+        """Wrap the parent :class:`Expr` so its `.str` methods can build on it."""
         self._e = e
 
     def len(self) -> StrFunc:

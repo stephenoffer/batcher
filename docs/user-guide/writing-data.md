@@ -82,3 +82,10 @@ manifest = ds.write("s3://bucket/events", fmt="parquet", distributed=True, num_w
 The distributed path uses the same mergeable execution as a single-node write, so
 the output is identical in content. Distribution changes only how the work is
 scheduled.
+
+## Next steps
+
+- [Lakehouse tables](lakehouse.md): transactional Delta writes, merge/upsert, and
+  slowly-changing dimensions.
+- [Data quality](data-quality.md): validate and quarantine before you write.
+- [Cloud storage](cloud-storage.md): write to object stores.

@@ -26,7 +26,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
 use arrow::compute::{lexsort_to_indices, take, SortColumn, SortOptions};
 use bc_ir::{AggFunc, AggregateItem, ProjectionItem};
 use bc_runtime::agg;
-use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore};
+use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore, SpillCodec};
 
 use super::quantile_spill::{bounded_group_distinct, bounded_group_mode, bounded_group_quantile};
 use super::{agg_funcs, eval_partial};
@@ -60,6 +60,7 @@ pub(crate) fn try_bounded_mixed_spill(
     aggregates: &[AggregateItem],
     spill_dir: &Path,
     budget_bytes: usize,
+    codec: SpillCodec,
 ) -> Result<Option<GroupedColumns>, InterpError> {
     if aggregates.len() < 2 {
         return Ok(None); // a lone aggregate is handled by the single-aggregate paths
@@ -87,13 +88,17 @@ pub(crate) fn try_bounded_mixed_spill(
         };
         let dir = spill_dir.join(format!("mixed-vl-{i}"));
         let (gc, col) = match a.func {
-            AggFunc::Median => bounded_group_quantile(parts, group_keys, value_expr, 0.5, &dir)?,
+            AggFunc::Median => {
+                bounded_group_quantile(parts, group_keys, value_expr, 0.5, &dir, codec)?
+            }
             AggFunc::Quantile => {
                 let q = a.param.unwrap_or(0.5);
-                bounded_group_quantile(parts, group_keys, value_expr, q, &dir)?
+                bounded_group_quantile(parts, group_keys, value_expr, q, &dir, codec)?
             }
-            AggFunc::CountDistinct => bounded_group_distinct(parts, group_keys, value_expr, &dir)?,
-            AggFunc::Mode => bounded_group_mode(parts, group_keys, value_expr, &dir)?,
+            AggFunc::CountDistinct => {
+                bounded_group_distinct(parts, group_keys, value_expr, &dir, codec)?
+            }
+            AggFunc::Mode => bounded_group_mode(parts, group_keys, value_expr, &dir, codec)?,
             _ => unreachable!("bounded_value_list gate"),
         };
         results.push((vec![i], gc, vec![col]));
@@ -114,7 +119,7 @@ pub(crate) fn try_bounded_mixed_spill(
             .map(|b| eval_partial(b, group_keys, &cs_aggs))
             .collect::<Result<_, _>>()?;
         let p = cs_partitions(&partials, budget_bytes);
-        let mut store = DiskSpillStore::new(spill_dir.join("mixed-cs"), p)?;
+        let mut store = DiskSpillStore::with_codec(spill_dir.join("mixed-cs"), p, codec)?;
         let res = combine_finalize_spilling(partials, &funcs, &mut store)?;
         results.push((cs_idx, res.group_columns, res.agg_columns));
     }

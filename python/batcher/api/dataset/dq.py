@@ -65,14 +65,28 @@ class ValidationReport:
 
     @property
     def ok(self) -> bool:
-        """True when no constraint has any violating row."""
+        """True when no constraint has any violating row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.dq.in_range("x", 0, 10).validate().ok
+                True
+                >>> bad = bt.from_pydict({"x": [1, 2, -3]})
+                >>> bad.dq.in_range("x", 0, 10).validate().ok
+                False
+        """
         return all(v == 0 for v in self.violations.values())
 
     @property
     def total_violations(self) -> int:
+        """Total number of violating rows summed across every constraint."""
         return sum(self.violations.values())
 
     def __str__(self) -> str:
+        """Render ``ValidationReport(ok)`` or the per-constraint violation counts."""
         if self.ok:
             return "ValidationReport(ok)"
         bad = ", ".join(f"{k}={v}" for k, v in self.violations.items() if v)
@@ -89,6 +103,7 @@ class DatasetDQ:
     __slots__ = ("_constraints", "_ds")
 
     def __init__(self, ds: Dataset, constraints: tuple[Constraint, ...] = ()) -> None:
+        """Bind the data-quality accessor to its `Dataset`; reached as `ds.dq`, not direct."""
         self._ds = ds
         self._constraints = constraints
 

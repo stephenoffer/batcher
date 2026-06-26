@@ -14,15 +14,15 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import logging
 from typing import Any
 
+from batcher._internal.logging import get_logger
 from batcher.metadata.store import MetadataBackend
 from batcher.plan.feedback import OperatorFeedback
 
 __all__ = ["MetadataHub"]
 
-_log = logging.getLogger("batcher.metadata")
+_log = get_logger("metadata")
 
 # Logical tables.
 _OP_STATS = "op_stats"

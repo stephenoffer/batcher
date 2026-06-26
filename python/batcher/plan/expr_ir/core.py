@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Union
 
 from batcher._internal.errors import PlanError
 from batcher.plan.ir_tags import ExprTag
+from batcher.plan.types import CAST_DTYPES
 
 if TYPE_CHECKING:
     from batcher.plan.expr_ir.image import _ImageNamespace
@@ -36,30 +37,6 @@ if TYPE_CHECKING:
 
 # A value that can be promoted to an expression: another Expr or a Python scalar.
 IntoExpr = Union["Expr", int, float, bool, str]
-
-# The Arrow type names `cast` accepts, mirroring the engine's `parse_dtype`
-# (bc-expr). Kept here so a bad dtype fails at plan-build time with a clear message
-# instead of surfacing as an opaque error from the Rust FFI mid-execution.
-CAST_DTYPES: frozenset[str] = frozenset(
-    {
-        "int64",
-        "long",
-        "int32",
-        "int",
-        "float64",
-        "double",
-        "float32",
-        "float",
-        "bool",
-        "boolean",
-        "string",
-        "utf8",
-        "date",
-        "date32",
-        "timestamp",
-        "datetime",
-    }
-)
 
 
 def _wrap(value: IntoExpr) -> Expr:
@@ -97,21 +74,27 @@ class Expr:
 
     # --- comparison operators (yield boolean expressions) ------------------
     def __gt__(self, other: IntoExpr) -> Expr:
+        """Element-wise greater-than (``a > b``), yielding a boolean expression."""
         return Binary("gt", self, _wrap(other))
 
     def __ge__(self, other: IntoExpr) -> Expr:
+        """Element-wise greater-than-or-equal (``a >= b``), yielding a boolean expression."""
         return Binary("ge", self, _wrap(other))
 
     def __lt__(self, other: IntoExpr) -> Expr:
+        """Element-wise less-than (``a < b``), yielding a boolean expression."""
         return Binary("lt", self, _wrap(other))
 
     def __le__(self, other: IntoExpr) -> Expr:
+        """Element-wise less-than-or-equal (``a <= b``), yielding a boolean expression."""
         return Binary("le", self, _wrap(other))
 
     def __eq__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+        """Element-wise equality (``a == b``), yielding a boolean expression (not a Python bool)."""
         return Binary("eq", self, _wrap(other))
 
     def __ne__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
+        """Element-wise inequality (``a != b``), yielding a boolean expression."""
         return Binary("ne", self, _wrap(other))
 
     # Expr is used for plan building, not as a dict key; make that explicit.
@@ -119,34 +102,44 @@ class Expr:
 
     # --- arithmetic operators ---------------------------------------------
     def __add__(self, other: IntoExpr) -> Expr:
+        """Element-wise addition (``a + b``); also the string-concat operator on Utf8."""
         return Binary("add", self, _wrap(other))
 
     def __sub__(self, other: IntoExpr) -> Expr:
+        """Element-wise subtraction (``a - b``)."""
         return Binary("sub", self, _wrap(other))
 
     def __mul__(self, other: IntoExpr) -> Expr:
+        """Element-wise multiplication (``a * b``)."""
         return Binary("mul", self, _wrap(other))
 
     def __truediv__(self, other: IntoExpr) -> Expr:
+        """Element-wise true division (``a / b``, → Float64); ``//`` is :meth:`__floordiv__`."""
         return Binary("div", self, _wrap(other))
 
     def __mod__(self, other: IntoExpr) -> Expr:
+        """Element-wise modulo / remainder (``a % b``)."""
         return Binary("mod", self, _wrap(other))
 
     # reflected forms so `2 * col("x")` works
     def __radd__(self, other: IntoExpr) -> Expr:
+        """Reflected addition so ``scalar + expr`` works (also string concat on Utf8)."""
         return Binary("add", _wrap(other), self)
 
     def __rsub__(self, other: IntoExpr) -> Expr:
+        """Reflected subtraction so ``scalar - expr`` works."""
         return Binary("sub", _wrap(other), self)
 
     def __rmul__(self, other: IntoExpr) -> Expr:
+        """Reflected multiplication so ``scalar * expr`` works."""
         return Binary("mul", _wrap(other), self)
 
     def __rtruediv__(self, other: IntoExpr) -> Expr:
+        """Reflected true division so ``scalar / expr`` works (→ Float64)."""
         return Binary("div", _wrap(other), self)
 
     def __rmod__(self, other: IntoExpr) -> Expr:
+        """Reflected modulo so ``scalar % expr`` works."""
         return Binary("mod", _wrap(other), self)
 
     def __floordiv__(self, other: IntoExpr) -> Expr:
@@ -157,6 +150,7 @@ class Expr:
         return MathExpr("floor", Binary("div", self.cast("float64"), _wrap(other)))
 
     def __rfloordiv__(self, other: IntoExpr) -> Expr:
+        """Reflected floor division so ``scalar // expr`` works; see :meth:`__floordiv__`."""
         return MathExpr("floor", Binary("div", _wrap(other).cast("float64"), self))
 
     # --- unary arithmetic operators ----------------------------------------
@@ -203,19 +197,24 @@ class Expr:
 
     # --- boolean operators (bitwise spelling, like Polars/pandas) ----------
     def __and__(self, other: IntoExpr) -> Expr:
+        """Boolean AND of two predicates (``a & b``), following SQL three-valued logic."""
         return Binary("and", self, _wrap(other))
 
     def __or__(self, other: IntoExpr) -> Expr:
+        """Boolean OR of two predicates (``a | b``), following SQL three-valued logic."""
         return Binary("or", self, _wrap(other))
 
     # reflected forms so `True & col("x")` / `lit_on_left | col(...)` work
     def __rand__(self, other: IntoExpr) -> Expr:
+        """Reflected boolean AND so ``scalar & expr`` works."""
         return Binary("and", _wrap(other), self)
 
     def __ror__(self, other: IntoExpr) -> Expr:
+        """Reflected boolean OR so ``scalar | expr`` works."""
         return Binary("or", _wrap(other), self)
 
     def __invert__(self) -> Expr:
+        """Boolean NOT of a predicate (``~a``), following SQL three-valued logic."""
         return Not(self)
 
     def __xor__(self, other: IntoExpr) -> Expr:
@@ -232,6 +231,7 @@ class Expr:
         return Binary("shift_right", self, _wrap(other))
 
     def __rxor__(self, other: IntoExpr) -> Expr:
+        """Reflected bitwise XOR so ``scalar ^ expr`` works (operands cast to Int64)."""
         return Binary("bit_xor", _wrap(other), self)
 
     def __getitem__(self, key: int | slice | str) -> Expr:
@@ -604,9 +604,11 @@ class Expr:
         return Math2Expr("pow", self, _wrap(exponent))
 
     def __pow__(self, other: IntoExpr) -> Math2Expr:
+        """Exponentiation (``a ** b``, → Float64); the operator spelling of :meth:`pow`."""
         return Math2Expr("pow", self, _wrap(other))
 
     def __rpow__(self, other: IntoExpr) -> Math2Expr:
+        """Reflected exponentiation so ``scalar ** expr`` works (→ Float64)."""
         return Math2Expr("pow", _wrap(other), self)
 
     def floor(self) -> MathExpr:
@@ -1732,9 +1734,11 @@ class Lit(Expr):
     __slots__ = ("value",)
 
     def __init__(self, value: int | float | bool | str) -> None:
+        """Wrap a Python scalar (or date/datetime) as a literal expression node."""
         self.value = value
 
     def to_ir(self) -> dict[str, Any]:
+        """Lower this literal to its JSON IR dict (the Rust wire contract)."""
         import datetime as _dt
 
         v = self.value
@@ -1837,10 +1841,12 @@ class Aliased(Expr):
     __slots__ = ("inner", "name")
 
     def __init__(self, inner: Expr, name: str) -> None:
+        """Wrap an expression with an output name (built by :meth:`Expr.alias`)."""
         self.inner = inner
         self.name = name
 
     def to_ir(self) -> dict[str, Any]:
+        """Lower to the wrapped expression's JSON IR (the alias is transparent in the IR)."""
         return self.inner.to_ir()
 
 
@@ -1869,6 +1875,7 @@ class AggExpr:
         input2: Expr | None = None,
         param: float | None = None,
     ) -> None:
+        """Construct an aggregate over an optional input, plus an optional `input2` or `param`."""
         self.func = func
         self.input = input
         # The second input expression — the ordering key for arg_min/arg_max or the
@@ -1878,6 +1885,7 @@ class AggExpr:
         self.param = param
 
     def to_ir(self, alias: str) -> dict[str, Any]:
+        """Lower this aggregate to its JSON ``AggregateItem`` dict, bound to `alias`."""
         item: dict[str, Any] = {"func": self.func, "alias": alias}
         if self.input is not None:
             item["input"] = self.input.to_ir()
@@ -1900,6 +1908,15 @@ class AggExpr:
         a running aggregate; `frame` sets an explicit ``ROWS`` window. Used inside
         `with_columns`, which lowers it to the relational `Window` operator. Only the
         aggregate functions (`sum`/`mean`/`min`/`max`/`count`) support `over`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "v": [1, 2, 10]})
+                >>> w = bt.col("v").sum().over(partition_by=["g"])
+                >>> ds.with_columns(total=w).sort("v").to_pydict()
+                {'g': ['a', 'a', 'b'], 'v': [1, 2, 10], 'total': [3, 3, 10]}
         """
         from batcher.plan.expr_ir.nodes import WindowExpr
 

@@ -132,6 +132,16 @@ def register_function(name: str, fn: Callable, **options: Any) -> None:
         name: The SQL name the function is called by.
         fn: The Python callable.
         **options: Forwarded to `Session.register_function`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> import pyarrow.compute as pc
+            >>> bt.register_function("dbl", lambda a: pc.multiply(a, 2), result_type="int64")
+            >>> t = bt.from_pydict({"x": [1, 2, 3]})
+            >>> bt.sql("SELECT dbl(x) AS y FROM t", t=t).to_pydict()
+            {'y': [2, 4, 6]}
     """
     _catalog.register_function(name, fn, **options)
 
@@ -169,6 +179,13 @@ def read_table(format: str, *args: Any, **opts: Any) -> Dataset:
     ``read_table("delta", "s3://bucket/table", version=3)`` constructs the
     registered ``delta`` source. The typed ``read_*`` helpers wrap this for the
     common backends.
+
+    Examples:
+        .. code-block:: python
+
+            import batcher as bt
+
+            ds = bt.read.table("delta", "s3://bucket/table", version=3)
     """
     return _scan(SOURCES.get(format)(*args, **opts))
 
@@ -179,6 +196,15 @@ def read_memory(name: str) -> Dataset:
     The streaming `memory` sink accumulates each micro-batch under `name`; this
     snapshots the current contents as a `Dataset`. Raises `PlanError` if no query
     has written to `name`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> query = bt.from_pydict({"x": [1, 2, 3]}).write.memory("demo")
+            >>> _ = query.await_termination()
+            >>> bt.read_memory("demo").count()
+            3
     """
     from batcher._internal.errors import PlanError
     from batcher.io.formats.streaming.sinks import memory_table
@@ -275,6 +301,13 @@ def from_pylist(rows: list[dict[str, Any]]) -> Dataset:
 
     The row-major counterpart to `from_pydict` (e.g. JSON records); the union of keys
     is the schema and missing keys are null. ``bt.from_pylist([{"a": 1}, {"a": 2}])``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.from_pylist([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]).to_pydict()
+            {'a': [1, 2], 'b': ['x', 'y']}
     """
     return from_arrow(pa.Table.from_pylist(rows))
 
@@ -284,6 +317,13 @@ def from_items(items: list[Any], *, column: str = "item") -> Dataset:
 
     Dict items expand to columns (like `from_pylist`); scalar/other items become a
     single `column`. ``bt.from_items([1, 2, 3])`` / ``bt.from_items([{"a": 1}])``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.from_items([1, 2, 3]).to_pydict()
+            {'item': [1, 2, 3]}
     """
     return _scan(interop.from_items(items, column=column))
 
@@ -584,5 +624,14 @@ def from_ray_dataset(ray_dataset: Any) -> Dataset:
 
     The migration on-ramp from Ray Data: blocks stream lazily into the engine in
     bounded memory. Requires `ray`.
+
+    Examples:
+        .. code-block:: python
+
+            import ray
+            import batcher as bt
+
+            rds = ray.data.range(100)
+            ds = bt.from_ray_dataset(rds)
     """
     return _scan(interop.from_ray_dataset(ray_dataset))

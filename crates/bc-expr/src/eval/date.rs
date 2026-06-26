@@ -387,20 +387,12 @@ pub(crate) fn eval_date_offset(
 }
 
 /// Map a type name (the wire contract) to an Arrow `DataType`.
+///
+/// Thin wrapper over the canonical [`bc_arrow::dtype_from_name`] table — the
+/// single home for the name↔type vocabulary across every tier — surfacing the
+/// `bc-expr` error on an unknown name.
 pub(crate) fn parse_dtype(name: &str) -> Result<DataType, ExprError> {
-    Ok(match name {
-        "int64" | "long" => DataType::Int64,
-        "int32" | "int" => DataType::Int32,
-        "float64" | "double" => DataType::Float64,
-        "float32" | "float" => DataType::Float32,
-        "bool" | "boolean" => DataType::Boolean,
-        "string" | "utf8" => DataType::Utf8,
-        "date" | "date32" => DataType::Date32,
-        "timestamp" | "datetime" => {
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
-        }
-        other => return Err(ExprError::UnknownType(other.to_string())),
-    })
+    bc_arrow::dtype_from_name(name).ok_or_else(|| ExprError::UnknownType(name.to_string()))
 }
 
 /// Add `months[i]` calendar months to each Date32/Timestamp `dates[i]` (negative

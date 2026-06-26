@@ -68,6 +68,29 @@ def test_learned_ndv_sharpens_equality():
     assert _rows(ds, learned={"__column_ndv__": {"x": 50}}) == 100 * (1.0 / 50.0)
 
 
+def test_mcv_sharpens_equality_on_skew_value():
+    # A heavy value (60% of rows) — far from the uniform 1/ndv. The measured MCV
+    # frequency is used directly, so `x == 5` keeps 60% of rows, not 1/ndv.
+    ds = bt.from_pydict({"x": list(range(100))}).filter(col("x") == lit(5))
+    learned = {"__column_mcv__": {"x": {"5": 0.6}}, "__column_ndv__": {"x": 50}}
+    assert abs(_rows(ds, learned=learned) - 60.0) < 1e-9
+
+
+def test_mcv_only_applies_to_listed_value_else_falls_to_ndv():
+    # `x == 7` is not a most-common-value, so it keeps the uniform 1/ndv (not an MCV
+    # frequency); only the listed value 5 uses its measured frequency.
+    learned = {"__column_mcv__": {"x": {"5": 0.6}}, "__column_ndv__": {"x": 50}}
+    unlisted = bt.from_pydict({"x": list(range(100))}).filter(col("x") == lit(7))
+    assert abs(_rows(unlisted, learned=learned) - 100 * (1.0 / 50.0)) < 1e-9
+
+
+def test_mcv_complements_under_not_equal():
+    # `x != 5` keeps the complement of the heavy value's frequency: 1 - 0.6 = 0.4.
+    ds = bt.from_pydict({"x": list(range(100))}).filter(col("x") != lit(5))
+    learned = {"__column_mcv__": {"x": {"5": 0.6}}}
+    assert abs(_rows(ds, learned=learned) - 40.0) < 1e-9
+
+
 def test_composite_join_key_ndv_is_damped():
     # A two-column join key with learned per-column ndvs 100 and 50. The classic
     # independence product would treat the key as 100*50 = 5000 distinct, but real

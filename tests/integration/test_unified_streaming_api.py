@@ -34,8 +34,14 @@ def test_public_surface_is_present():
     for name in ("Trigger", "OutputMode", "window", "streams", "read_memory"):
         assert hasattr(bt, name), f"bt.{name} missing"
     ds = _ds()
-    for m in ("with_watermark", "session_window", "drop_duplicates_within_watermark",
-              "join_stream", "iter_batches", "is_streaming"):
+    for m in (
+        "with_watermark",
+        "session_window",
+        "drop_duplicates_within_watermark",
+        "join_stream",
+        "iter_batches",
+        "is_streaming",
+    ):
         assert hasattr(ds, m), f"Dataset.{m} missing"
     for s in ("console", "memory", "for_each_batch", "for_each", "delta", "parquet"):
         assert hasattr(ds.write, s), f"ds.write.{s} missing"
@@ -75,9 +81,9 @@ def test_dedup_runs_on_bounded_source():
 
 def test_join_stream_runs_on_bounded_source():
     right = bt.from_pydict({"k": ["a"], "ts2": [_BASE + dt.timedelta(minutes=20)], "rv": [9]})
-    out = _ds().join_stream(
-        right, on="k", left_time="ts", right_time="ts2", within="1h"
-    ).to_pydict()
+    out = (
+        _ds().join_stream(right, on="k", left_time="ts", right_time="ts2", within="1h").to_pydict()
+    )
     assert out["rv"] == [9]  # the a@0 row joins a@20 within 1h
 
 

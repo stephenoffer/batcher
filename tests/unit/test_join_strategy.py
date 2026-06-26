@@ -130,3 +130,26 @@ def test_medium_sides_stay_hash():
     plan, est = _plan_with_sizes(left_rows=medium, right_rows=medium)
     out, _decisions = adaptive_build_side(plan, est)
     assert out.strategy == "hash"
+
+
+def test_already_sorted_medium_sides_stay_hash():
+    # Two medium inputs (over the broadcast budget, under the 1M-row sort-merge floor)
+    # that already arrive ordered on the join key still pick HASH, not sort-merge:
+    # benchmarking showed SMJ's RowConverter encoding loses to hash even when its sort
+    # is skipped, so preferring SMJ for sorted inputs was a regression and reverted.
+    from batcher.plan.expr_ir import Col
+    from batcher.plan.logical import Sort, SortKeySpec
+
+    left = Sort(_scan(0, ["k"]), (SortKeySpec(Col("k")),))
+    right = Sort(_scan(1, ["k", "v"]), (SortKeySpec(Col("k")),))
+    join = Join(
+        left=left,
+        right=right,
+        left_keys=("k",),
+        right_keys=("k",),
+        join_type="inner",
+        output=(JoinOutputCol("left", "k", "k"), JoinOutputCol("right", "v", "v")),
+    )
+    est = CardinalityEstimator([_Source(500_000), _Source(500_000)], None)
+    out, _decisions = adaptive_build_side(join, est)
+    assert out.strategy == "hash"

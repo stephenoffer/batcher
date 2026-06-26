@@ -60,6 +60,46 @@ def test_spill_partition_count_invariant(num_partitions):
     assert _norm(spilled) == _norm(in_memory)
 
 
+@pytest.mark.parametrize("group", ["k", None])
+def test_streaming_partial_aggregate_matches_whole_partition(group):
+    """The map-side streaming fold (per-chunk partial → combine) equals one partial over
+    the whole partition — the mergeable invariant that lets the map side aggregate a
+    partition without ever materializing it (the #1 distributed memory peak)."""
+    import json
+
+    import batcher._native as nat
+
+    from batcher.config import active_config
+    from batcher.dist.executor import _relabel_single_source
+    from batcher.dist.executors.partition_io import streaming_partial_aggregate
+
+    rng = np.random.default_rng(5)
+    batches = [
+        pa.record_batch(
+            {
+                "k": rng.integers(0, 50, 2000).astype("int64"),
+                "v": rng.integers(0, 100, 2000).astype("int64"),
+            }
+        )
+        for _ in range(6)
+    ]
+    ds = bt.from_arrow(pa.Table.from_batches(batches))
+    grouped = ds.group_by(group) if group else ds.group_by()
+    agg = grouped.agg(s=col("v").sum(), n=count(), mx=col("v").max())._plan
+    gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys])
+    aj = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+    map_plan, _ = _relabel_single_source(agg.input)
+    map_ir = json.dumps(map_plan.to_ir())
+    cfg = active_config().engine_config_json()
+
+    # chunk_bytes=1 forces a fold per batch (six chunks); the finalized result must equal
+    # the single-node aggregate over the whole table.
+    partial = streaming_partial_aggregate(nat, map_ir, gk, aj, iter(batches), cfg, 1)
+    streamed = pa.Table.from_batches([nat.combine_finalize(gk, aj, [partial])])
+    single = grouped.agg(s=col("v").sum(), n=count(), mx=col("v").max()).collect()
+    assert _norm(streamed) == _norm(single)
+
+
 def test_spill_global_aggregate():
     factory, schema, table = _streaming_dataset()
     spilled = (
@@ -70,6 +110,28 @@ def test_spill_global_aggregate():
     )
     in_memory = bt.from_arrow(table).group_by().agg(s=col("v").sum(), n=count()).collect()
     assert spilled.to_pylist() == in_memory.to_pylist()
+
+
+@pytest.mark.parametrize("codec", ["lz4", "zstd", None])
+def test_spill_result_invariant_under_compression(codec):
+    # Spill compression is perf-only: the result must be identical whether the
+    # spilled IPC streams are uncompressed, LZ4, or ZSTD (the read path
+    # auto-detects). Covers value-list state (median) + constant state (sum) so the
+    # codec threads through every spill path.
+    from batcher.config import Config, MemoryConfig, config_context
+
+    factory, schema, table = _streaming_dataset()
+    agg = {"s": col("v").sum(), "m": col("v").median()}
+    cfg = Config().replace(memory=MemoryConfig(spill_compression=codec))
+    with config_context(cfg):
+        spilled = (
+            bt.from_batches(factory, schema)
+            .group_by("k")
+            .agg(**agg)
+            .collect(spill=True, num_partitions=8)
+        )
+    in_memory = bt.from_arrow(table).group_by("k").agg(**agg).collect()
+    assert _norm(spilled) == _norm(in_memory)
 
 
 def test_spill_with_stddev():
@@ -150,6 +212,79 @@ def test_spill_join_partition_invariant(num_partitions):
     )
     in_memory = bt.from_arrow(lt).join(bt.from_arrow(rt), on="k").collect()
     assert _norm(spilled) == _norm(in_memory)
+
+
+def _find_join(plan):
+    """The first `Join` node at or under `plan` (an outer join wraps it in a Project)."""
+    from batcher.plan.logical import Join
+
+    node = plan
+    while node is not None and not isinstance(node, Join):
+        node = getattr(node, "input", None)
+    return node
+
+
+@pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])
+def test_reduce_join_paths_spilling_matches_direct(tmp_path, how):
+    """The bounded-memory grace reducer (re-partition both buckets to disk, join one
+    sub-bucket pair at a time) equals a single in-memory join over the whole bucket —
+    under skew (one very hot key) and null keys, with each side split across mapper
+    files. This is the per-reducer spill that keeps a skewed shuffle join off OOM."""
+    import json
+
+    import batcher._native as nat
+
+    from batcher.config import active_config
+    from batcher.dist.executors.join import _join_reducer_ir
+    from batcher.dist.shuffle_io import write_ipc
+    from batcher.dist.spill_breakers import reduce_join_paths_spilling
+
+    rng = np.random.default_rng(7)
+    left_files, all_left = [], []
+    for m in range(3):  # three "mapper" contributions; key 3 is hot, file 1 has nulls
+        ks = np.concatenate([np.full(400, 3), rng.integers(0, 50, 200)]).astype("int64")
+        rng.shuffle(ks)
+        karr = pa.array(
+            [None if (m == 1 and i < 5) else int(k) for i, k in enumerate(ks)], type=pa.int64()
+        )
+        b = pa.record_batch({"k": karr, "v": rng.integers(0, 100, len(ks)).astype("int64")})
+        all_left.append(b)
+        left_files.append(write_ipc([b], str(tmp_path / f"l{m}.arrow")))
+    right_files, all_right = [], []
+    for m, (lo, hi) in enumerate([(0, 25), (25, 55)]):  # unique keys, two mapper files
+        b = pa.record_batch(
+            {
+                "k": pa.array(range(lo, hi), type=pa.int64()),
+                "name": [f"n{i}" for i in range(lo, hi)],
+            }
+        )
+        all_right.append(b)
+        right_files.append(write_ipc([b], str(tmp_path / f"r{m}.arrow")))
+
+    joined = bt.from_arrow(pa.Table.from_batches(all_left)).join(
+        bt.from_arrow(pa.Table.from_batches(all_right)), on="k", how=how
+    )
+    join = _find_join(joined._plan)
+    join_ir = json.dumps(_join_reducer_ir(join))
+    cfg = active_config().engine_config_json()
+
+    direct = nat.execute_plan(join_ir, [all_left, all_right], cfg)
+    graced = reduce_join_paths_spilling(
+        join_ir,
+        list(join.left_keys),
+        list(join.right_keys),
+        left_files,
+        right_files,
+        str(tmp_path),
+        4,
+        cfg,
+    )
+    # None-safe multiset comparison (outer/left joins null-extend, so rows hold None).
+    schema = (direct or graced)[0].schema
+    norm = lambda t: sorted(repr(r) for r in t.to_pylist())  # noqa: E731
+    assert norm(pa.Table.from_batches(graced, schema)) == norm(
+        pa.Table.from_batches(direct, schema)
+    )
 
 
 def _sort_dataset(n_batches=100, key_range=100000):

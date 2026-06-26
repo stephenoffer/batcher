@@ -31,7 +31,10 @@ dict of named NumPy arrays and returns a dict of named arrays. Batcher handles t
 columnar plumbing on both sides. Input columns are pulled from the Arrow batch and
 converted to NumPy in the order given by `input_columns`; output arrays come back keyed
 by name and are appended as new columns. The input batch passes through unchanged, so
-inference adds columns rather than replacing the row.
+inference adds columns rather than replacing the row. A tensor input column (every row
+a same-shape N-d array, like decoded images) keeps its `(N, *shape)` form across the
+boundary; a 1-D output array becomes a scalar column and a higher-rank output becomes a
+tensor column.
 
 ## Adapters
 
@@ -43,9 +46,42 @@ inference adds columns rather than replacing the row.
 | `serving_udf(connect, *, input_columns, output_columns=None)` | Build your own adapter from a zero-arg `connect()` returning a `ServingClient`. |
 
 Use `triton_client` for tensor inputs (decoded images, embeddings) — it sends binary
-tensors. `http_client` is for scalar/text features; JSON-encoding a tensor is slow and
-bloated, so it warns once if asked to. When `output_columns` is omitted in
-`serving_udf`, the server's response keys become the output column names.
+tensors, and maps NumPy dtypes (including `bf16` and the `fp8` variants modern
+transformers serve in) to Triton's KServe-v2 dtype vocabulary. `http_client` is for
+scalar/text features; JSON-encoding a tensor is slow and bloated, so it warns once if
+asked to. `torchserve_client` is `http_client` pointed at `/predictions/{model}`, so a
+TorchServe handler that accepts and returns `{column: [values...]}` works with no extra
+glue.
+
+## Writing your own adapter
+
+`serving_udf` builds an adapter from a `connect()` callable that returns anything
+implementing `ServingClient` — a `predict({col: ndarray}) -> {col: ndarray}` method.
+`connect()` runs once per worker, so do the client setup there and keep `predict` to
+the request itself. When `output_columns` is omitted, the keys of the returned dict
+become the output column names.
+
+```python
+# docs: skip
+from batcher.ml.serving import serving_udf
+
+
+class MyClient:
+    def __init__(self, endpoint):
+        self.session = open_session(endpoint)  # the expensive, once-per-worker setup
+
+    def predict(self, inputs):
+        logits = self.session.run(inputs["features"])
+        return {"logits": logits}
+
+
+udf = serving_udf(
+    lambda: MyClient("grpc://model-server:9000"),
+    input_columns=["features"],
+    output_columns=["logits"],
+)
+scored = ds.ml.map_batches(udf, concurrency=(2, 8))
+```
 
 ## Batching
 
@@ -66,11 +102,14 @@ retry. After `retries` attempts are exhausted the adapter raises `BackendError` 
 the endpoint and the last error. Triton and TorchServe adapters surface backend errors
 the same way. A failure propagates up through the stage; it is not silently dropped.
 
-## Online serving
+## From batch to online serving
 
-`serve_deployment` wraps the same load-once factory as a Ray Serve deployment that
-answers per-request calls, coalescing concurrent requests with Serve's batching — so a
-model proven in a batch pipeline serves online unchanged. Needs `batcher-engine[serve]`.
+The same load-once factory that backs a batch stage can stand up an online endpoint.
+`serve_deployment` wraps it as a Ray Serve deployment that answers per-request calls,
+coalescing concurrent requests with Serve's native batching — so a model proven in a
+batch pipeline serves online unchanged, with no second execution engine to maintain.
+The offline `map_batches` adapter and this online deployment share one `build` factory,
+so what you validate in batch is what runs at the endpoint. Needs `batcher-engine[serve]`.
 
 | Argument | Meaning |
 | --- | --- |
@@ -78,7 +117,14 @@ model proven in a batch pipeline serves online unchanged. Needs `batcher-engine[
 | `name` | Deployment name (default `"batcher-model"`). |
 | `max_batch_size` | Max requests coalesced into one predictor call (default 16). |
 | `batch_wait_timeout_s` | How long Serve waits to fill a batch before flushing (default 0.01s). |
-| `**deployment_options` | Forwarded to `@serve.deployment` (e.g. `num_replicas`, `ray_actor_options`). |
+| `**deployment_options` | Forwarded to `@serve.deployment` (e.g. `num_replicas`, `ray_actor_options`, `autoscaling_config`). |
+
+The `build` factory returns a *batched* predictor: it is handed the list of requests
+Serve coalesced (up to `max_batch_size`, or whatever arrived within
+`batch_wait_timeout_s`) and runs one forward pass for the whole list, so the GPU sees a
+real batch even under per-request traffic. Tune `max_batch_size` and
+`batch_wait_timeout_s` together — a larger batch and a longer wait trade a little
+latency for throughput.
 
 ```python
 # docs: skip
@@ -111,3 +157,8 @@ deployment = serve_deployment(
 )
 serve.run(deployment.bind())
 ```
+
+## Next steps
+
+- [Inference](inference.md): in-process batch inference and the `.ml` accessor.
+- [GPU scheduling](gpu.md): `num_gpus` and `concurrency` for GPU stages.

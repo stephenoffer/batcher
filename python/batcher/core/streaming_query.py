@@ -249,9 +249,9 @@ class StreamingQueryEngine:
                 restarts = 0 if self._batches > progress_mark else restarts + 1
                 if restarts > self._max_consecutive_restarts():
                     raise
-                import logging
+                from batcher._internal.logging import get_logger
 
-                logging.getLogger(__name__).warning(
+                get_logger("core").warning(
                     "streaming fault (%s); restart %d from checkpoint at batch %d",
                     type(exc).__name__,
                     restarts,

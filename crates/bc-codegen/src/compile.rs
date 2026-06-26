@@ -9,7 +9,8 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
-use crate::emit::{Codegen, SimdCodegen};
+use crate::emit::Codegen;
+use crate::simd::SimdCodegen;
 use crate::{CodegenError, ColumnSet, Compiled, ScalarTy};
 
 /// libm symbols for the single-arg math functions the JIT lowers via a libcall.
@@ -22,6 +23,24 @@ const LIBM_UNARY: &[&str] = &[
 
 /// libm symbols for the two-arg math functions the JIT lowers via a libcall.
 const LIBM_BINARY: &[&str] = &["pow", "atan2"];
+
+/// Emit a read-modify-write that packs one boolean (i8 `0`/`1` in `val`) into the
+/// Arrow bitmask at row `i`: `out[i >> 3] |= (val & 1) << (i & 7)`. The output
+/// buffer is zero-initialized by `eval`, and each loop is sequential, so OR-ing
+/// distinct bits into a shared byte is correct — including where the SIMD body and
+/// the scalar remainder both touch the trailing byte (the remainder's RMW observes
+/// the bits the vector body already set, because the vector loop runs to completion
+/// first).
+fn emit_bool_bit_store(b: &mut FunctionBuilder, out_ptr: Value, i: Value, val: Value) {
+    let byte_idx = b.ins().ushr_imm(i, 3); // i / 8
+    let addr = b.ins().iadd(out_ptr, byte_idx);
+    let bit = b.ins().band_imm(i, 7); // i % 8 (Arrow packs LSB-first)
+    let lo = b.ins().band_imm(val, 1); // defensively mask to 0/1
+    let shifted = b.ins().ishl(lo, bit);
+    let cur = b.ins().load(types::I8, MemFlags::trusted(), addr, 0);
+    let new = b.ins().bor(cur, shifted);
+    b.ins().store(MemFlags::trusted(), new, addr, 0);
+}
 
 /// Build and JIT-compile a function evaluating `expr` element-wise.
 ///
@@ -188,20 +207,28 @@ pub(crate) fn compile(
         } else {
             None
         };
-        // Store to out[i]; element width follows the result scalar type (1 byte
-        // for the u8 boolean ABI, 8 bytes for i64/f64). The store's type is
-        // inferred from `val`, which has scalar type `result_ty`.
-        let elem_bytes = match result_ty {
-            ScalarTy::Bool => 1i64,
-            ScalarTy::I64 | ScalarTy::F64 => 8i64,
-        };
-        let off = b.ins().imul_imm(i, elem_bytes);
-        let addr = b.ins().iadd(out_ptr, off);
-        b.ins().store(MemFlags::trusted(), val, addr, 0);
-        if let (Some(valid), Some(valid_ptr)) = (valid, valid_ptr) {
-            // Validity is i8, one byte per row.
-            let vaddr = b.ins().iadd(valid_ptr, i);
-            b.ins().store(MemFlags::trusted(), valid, vaddr, 0);
+        // Store the result. The value-only boolean path packs one bit per row into
+        // an Arrow bitmask (see `emit_bool_bit_store`) so `eval` wraps the buffer
+        // with no per-element repack — the dominant cost when the output is boolean.
+        // The Kleene path keeps the 1-byte `out`/`valid` ABI (`eval_kleene` reads
+        // bytes); i64/f64 store an 8-byte word.
+        if result_ty == ScalarTy::Bool && !kleene {
+            emit_bool_bit_store(&mut b, out_ptr, i, val);
+        } else {
+            let elem_bytes = match result_ty {
+                ScalarTy::Bool => 1i64,
+                // Temporal results are guarded out in `compile_expr`, so this width
+                // is never actually used for one; 8 keeps the match total.
+                ScalarTy::I64 | ScalarTy::F64 | ScalarTy::Date32 | ScalarTy::TsUs => 8i64,
+            };
+            let off = b.ins().imul_imm(i, elem_bytes);
+            let addr = b.ins().iadd(out_ptr, off);
+            b.ins().store(MemFlags::trusted(), val, addr, 0);
+            if let (Some(valid), Some(valid_ptr)) = (valid, valid_ptr) {
+                // Validity is i8, one byte per row.
+                let vaddr = b.ins().iadd(valid_ptr, i);
+                b.ins().store(MemFlags::trusted(), valid, vaddr, 0);
+            }
         }
         let one = b.ins().iconst(i_ty, 1);
         let next = b.ins().iadd(i, one);
@@ -236,18 +263,33 @@ pub(crate) fn compile(
     })
 }
 
-/// Build and JIT-compile a **vectorized** function for the pure-`F64` arithmetic
-/// subset (`simd_supported`). Same ABI as the scalar value path
-/// (`(n, cols, out)`, `F64` output), so it is a drop-in for it — `eval` and the
-/// null-mask handling are unchanged. Two rows per iteration via `F64X2` over a
-/// vector loop `[0, n & !1)`, then a one-row scalar remainder loop for an odd `n`.
-/// IEEE `+,-,*,/` are per-lane identical to the scalar ops, so the result stays
-/// bit-for-bit equal to the interpreter oracle.
+/// Build and JIT-compile a **vectorized** function for the `simd_ty` subset
+/// (numeric arithmetic, comparisons, `Not`, exact casts). Same value-only ABI as
+/// the scalar path (`(n, cols, out)`), so it is a drop-in for it — `eval` and the
+/// null-mask handling are unchanged.
+///
+/// `lanes` (2/4/8) is the f64/i64 vector width and `unroll` (≥ 1) the number of
+/// independent vector chains emitted per iteration (instruction-level parallelism),
+/// both chosen from the host [`HardwareProfile`](bc_arrow::HardwareProfile). The
+/// vector loop covers the largest multiple of `lanes*unroll` rows ≤ `n`, then a
+/// scalar remainder loop ([`Codegen`]) handles the tail one row at a time. The
+/// vector ops are per-lane identical to the scalar ops, so the result stays
+/// bit-for-bit equal to the interpreter oracle at any width/unroll.
+///
+/// `result_ty` selects how a row is stored: an `I64`/`F64` result is a `lanes*8`-byte
+/// vector store per chain; a `Bool` result's `I64xL` canonical mask is packed one bit
+/// per row into the Arrow bitmask (see [`emit_bool_bit_store`] for the tail).
 pub(crate) fn compile_simd(
     expr: &bc_expr::Expr,
     cols: &ColumnSet,
+    result_ty: ScalarTy,
+    lanes: usize,
+    unroll: usize,
 ) -> Result<Compiled, CodegenError> {
+    use crate::simd::vec_ty;
     use cranelift_codegen::ir::condcodes::IntCC;
+    debug_assert!(matches!(lanes, 2 | 4 | 8) && unroll >= 1);
+    let step = (lanes * unroll) as i64;
 
     let mut flag_builder = settings::builder();
     flag_builder
@@ -303,14 +345,21 @@ pub(crate) fn compile_simd(
                     .load(ptr_ty, MemFlags::trusted(), cols_base, k * ptr_bytes)
             })
             .collect();
-        // Unaligned vector flags: the output `Vec<f64>` is only 8-byte aligned.
+        // Unaligned vector flags: the output buffer is only 8-byte aligned, so the
+        // engine never asserts wider vector alignment for these stores.
         let vflags = MemFlags::new().with_notrap();
+        let bool_result = result_ty == ScalarTy::Bool;
+        // The vector mask's lane type when the result is boolean (`I64xL`).
+        let mask_ty = vec_ty(ScalarTy::I64, lanes);
 
-        // `main = n & !1` — the largest even count; the vector loop covers `[0, main)`.
+        // `main` = largest multiple of `step` ≤ n; the vector loop covers `[0, main)`.
+        // (`step` need not be a power of two — `unroll` can be any ≥ 1 — so compute it
+        // as `n - n % step` rather than a bit-mask.)
         let i_ty = types::I64;
-        let main = b.ins().band_imm(n, -2);
+        let rem = b.ins().urem_imm(n, step);
+        let main = b.ins().isub(n, rem);
 
-        // --- vector loop (two rows per iteration) ---
+        // --- vector loop (`unroll` chains of `lanes` rows per iteration) ---
         b.append_block_param(vheader, i_ty);
         let zero = b.ins().iconst(i_ty, 0);
         b.ins().jump(vheader, &[zero.into()]);
@@ -320,22 +369,58 @@ pub(crate) fn compile_simd(
         b.ins().brif(vcond, vbody, &[], rheader, &[main.into()]);
 
         b.switch_to_block(vbody);
-        let vval = {
-            let mut gen = SimdCodegen {
-                b: &mut b,
-                cols,
-                col_ptrs: &col_ptrs,
-                i: vi,
+        for c in 0..unroll {
+            // This chain covers rows `[base, base + lanes)`.
+            let base = if c == 0 {
+                vi
+            } else {
+                b.ins().iadd_imm(vi, (c * lanes) as i64)
             };
-            gen.emit(expr)
-        };
-        let voff = b.ins().imul_imm(vi, 8);
-        let vaddr = b.ins().iadd(out_ptr, voff);
-        b.ins().store(vflags, vval, vaddr, 0); // stores 2×f64 (16 bytes)
-        let vnext = b.ins().iadd_imm(vi, 2);
+            let vval = {
+                let mut gen = SimdCodegen {
+                    b: &mut b,
+                    cols,
+                    col_ptrs: &col_ptrs,
+                    i: base,
+                    lanes,
+                };
+                gen.emit(expr)
+            };
+            if bool_result {
+                // Pack this chain's `lanes` canonical-mask lanes (one bit each) into
+                // the Arrow bitmask byte `out[base >> 3]` via one RMW. `base` is a
+                // multiple of `lanes` and `lanes <= 8`, so all `lanes` bits fall in a
+                // single byte; the loop is sequential, so OR-ing distinct bits (across
+                // chains/iterations that share a byte, and with the scalar remainder)
+                // is correct over the zero-initialized buffer.
+                let one = b.ins().iconst(types::I64, 1);
+                let one_vec = b.ins().splat(mask_ty, one);
+                let bits = b.ins().band(vval, one_vec);
+                let bit0 = b.ins().band_imm(base, 7); // base % 8
+                let mut combined = b.ins().iconst(types::I8, 0);
+                for l in 0..lanes {
+                    let lane = b.ins().extractlane(bits, l as u8);
+                    let bl = b.ins().ireduce(types::I8, lane);
+                    let shift = b.ins().iadd_imm(bit0, l as i64);
+                    let sl = b.ins().ishl(bl, shift);
+                    combined = b.ins().bor(combined, sl);
+                }
+                let byte_idx = b.ins().ushr_imm(base, 3);
+                let baddr = b.ins().iadd(out_ptr, byte_idx);
+                let cur = b.ins().load(types::I8, MemFlags::trusted(), baddr, 0);
+                let new = b.ins().bor(cur, combined);
+                b.ins().store(MemFlags::trusted(), new, baddr, 0);
+            } else {
+                // I64/F64: a single `lanes*8`-byte vector store at row `base`.
+                let voff = b.ins().imul_imm(base, 8);
+                let vaddr = b.ins().iadd(out_ptr, voff);
+                b.ins().store(vflags, vval, vaddr, 0);
+            }
+        }
+        let vnext = b.ins().iadd_imm(vi, step);
         b.ins().jump(vheader, &[vnext.into()]);
 
-        // --- scalar remainder loop (the trailing odd row, if any) ---
+        // --- scalar remainder loop (the up-to-`step-1` tail rows) ---
         b.append_block_param(rheader, i_ty);
         b.switch_to_block(rheader);
         let ri = b.block_params(rheader)[0];
@@ -357,9 +442,16 @@ pub(crate) fn compile_simd(
             };
             gen.emit(expr)
         };
-        let roff = b.ins().imul_imm(ri, 8);
-        let raddr = b.ins().iadd(out_ptr, roff);
-        b.ins().store(MemFlags::trusted(), rval, raddr, 0);
+        // A boolean result packs the trailing row's bit into the same Arrow bitmask
+        // the vector body wrote (RMW preserves the bits already set); i64/f64 store
+        // an 8-byte word. The scalar `Codegen` returns an i8 0/1 for a comparison.
+        if result_ty == ScalarTy::Bool {
+            emit_bool_bit_store(&mut b, out_ptr, ri, rval);
+        } else {
+            let roff = b.ins().imul_imm(ri, 8);
+            let raddr = b.ins().iadd(out_ptr, roff);
+            b.ins().store(MemFlags::trusted(), rval, raddr, 0);
+        }
         let rnext = b.ins().iadd_imm(ri, 1);
         b.ins().jump(rheader, &[rnext.into()]);
 

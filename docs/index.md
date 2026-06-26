@@ -177,6 +177,12 @@ Batch inference, embeddings, and training-data loaders.
 :link-type: doc
 Memory, spill, parallelism, and the adaptive knobs.
 :::
+
+:::{grid-item-card} {octicon}`arrow-switch;1.1em` Coming from pandas / Polars / Spark
+:link: migration/index
+:link-type: doc
+Translate the API you already know, side by side.
+:::
 ::::
 
 ```{toctree}

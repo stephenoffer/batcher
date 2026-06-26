@@ -7,11 +7,19 @@ query with sqlglot and lowers it to the same plan IR the DataFrame API produces.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pyarrow as pa
 
 import batcher as bt
+from batcher.config import active_config, set_config
 
 from .base import Engine, SqlRunner
+
+# Measure pure engine performance: turn the per-query event log off so its small file
+# write (on by default for observability) doesn't add I/O noise to the benchmark timing.
+_cfg = active_config()
+set_config(_cfg.replace(observability=dataclasses.replace(_cfg.observability, event_log=False)))
 
 
 class BatcherEngine(Engine):

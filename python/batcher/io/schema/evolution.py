@@ -19,39 +19,26 @@ from dataclasses import dataclass
 import pyarrow as pa
 
 from batcher._internal.errors import SchemaError
+from batcher.plan.types import promote
 
 __all__ = ["SchemaDrift", "normalize_batch", "schema_drift", "unify_schemas"]
 
 
-def _is_int(t: pa.DataType) -> bool:
-    return pa.types.is_integer(t)
-
-
-def _is_float(t: pa.DataType) -> bool:
-    return pa.types.is_floating(t)
-
-
 def _promote(a: pa.DataType, b: pa.DataType, *, column: str) -> pa.DataType:
-    """The common supertype of `a` and `b` under a conservative, never-lossy lattice.
+    """The common supertype of `a` and `b`, raising a column-named `SchemaError`.
 
-    ``null`` adopts the other side; integers widen to ``int64``; floats widen to
-    ``float64``; an int/float mix promotes to ``float64``. Anything else that is not
-    already equal is incompatible and raises a `SchemaError` naming the column.
+    Thin wrapper over the neutral `plan.types.promote` lattice — `null` adopts the
+    other side, integers widen to ``int64``, floats to ``float64``, an int/float mix
+    to ``float64`` — turning the lattice's ``None`` (no non-lossy common type) into
+    the actionable cross-file error this module raises.
     """
-    if a.equals(b):
-        return a
-    if pa.types.is_null(a):
-        return b
-    if pa.types.is_null(b):
-        return a
-    if _is_int(a) and _is_int(b):
-        return pa.int64()
-    if (_is_float(a) or _is_int(a)) and (_is_float(b) or _is_int(b)):
-        return pa.float64()
-    raise SchemaError(
-        f"column {column!r} has incompatible types across files: {a} vs {b} "
-        "(no non-lossy common type). Cast explicitly or use schema_mode='latest'."
-    )
+    common = promote(a, b)
+    if common is None:
+        raise SchemaError(
+            f"column {column!r} has incompatible types across files: {a} vs {b} "
+            "(no non-lossy common type). Cast explicitly or use schema_mode='latest'."
+        )
+    return common
 
 
 def unify_schemas(schemas: list[pa.Schema], mode: str = "union") -> pa.Schema:

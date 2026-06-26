@@ -17,7 +17,7 @@ import json
 import pyarrow as pa
 
 from batcher.config import active_config
-from batcher.plan.feedback import FeedbackSink, OperatorFeedback
+from batcher.plan.feedback import FeedbackSink, OperatorFeedback, cpu_utilization
 from batcher.plan.ids import OpId
 from batcher.plan.physical import PhysicalPlan
 
@@ -40,6 +40,37 @@ def record_exec_metrics(sink: FeedbackSink | None, metrics_json: str, batch_size
         ops = json.loads(metrics_json).get("ops", [])
     except (ValueError, TypeError):
         return
+    _record_op_feedback(sink, ops, batch_size)
+
+
+_tracing_started = False
+
+
+def _ensure_native_tracing(native) -> None:
+    """Install the Rust data-plane tracing bridge once, at the configured level.
+
+    Core is the layer allowed to touch the native engine, so it (not the neutral logging
+    module) calls `init_tracing` — keeping `_native` out of `_internal` and the
+    layer-independence contract intact. A no-op after the first call and when logging is
+    unconfigured or the engine predates the bridge.
+    """
+    global _tracing_started
+    if _tracing_started:
+        return
+    from batcher._internal.logging import native_tracing_settings
+
+    settings = native_tracing_settings()
+    init = getattr(native, "init_tracing", None)
+    if settings is not None and init is not None:
+        import contextlib
+
+        with contextlib.suppress(Exception):  # tracing init must never break a query
+            init(*settings)
+        _tracing_started = True
+
+
+def _record_op_feedback(sink: FeedbackSink, ops: list[dict], batch_size: int) -> None:
+    """Build and record one `OperatorFeedback` per already-parsed `ExecMetrics` op."""
     for op in ops:
         rows_in = op.get("rows_in", 0)
         rows_out = op.get("rows_out", 0)
@@ -54,25 +85,11 @@ def record_exec_metrics(sink: FeedbackSink | None, metrics_json: str, batch_size
                 batch_size=batch_size,
                 backend=op.get("backend", "interp"),
                 algorithm="spill" if op.get("spilled") else "",
-                cpu_utilization=_cpu_utilization(
+                cpu_utilization=cpu_utilization(
                     op.get("cpu_ns", 0), op.get("elapsed_ns", 0), op.get("threads", 1)
                 ),
             )
         )
-
-
-def _cpu_utilization(cpu_ns: float, elapsed_ns: float, threads: int) -> float:
-    """Mean fraction of allocated cores kept busy, clamped to [0, 1].
-
-    `cpu_ns` is CPU-time summed across all worker threads during the operator;
-    dividing by ``elapsed_ns x threads`` (the engine's *actual* live thread count,
-    not a guessed host core count — which is wrong under a cgroup CPU quota) gives
-    the per-core busy fraction. 0.0 when the engine reported no CPU time (older
-    build), no wall time, or no thread count.
-    """
-    if cpu_ns <= 0 or elapsed_ns <= 0 or threads <= 0:
-        return 0.0
-    return min(1.0, cpu_ns / (elapsed_ns * threads))
 
 
 class LocalExecutor:
@@ -97,6 +114,7 @@ class LocalExecutor:
         engine_cfg = cfg.engine_config_json_with(plan.op_budgets())
         # Collect per-operator metrics only when there is a sink to consume them;
         # the plain entry point avoids the (tiny) JSON serialization otherwise.
+        _ensure_native_tracing(_native)
         if self._feedback is None:
             return _native.execute_plan(plan.to_json(), sources, engine_cfg)
 
@@ -117,16 +135,19 @@ def execute_local(
 def execute_local_metered(
     plan: PhysicalPlan,
     sources: list[list[pa.RecordBatch]],
+    feedback: FeedbackSink | None = None,
 ) -> tuple[list[pa.RecordBatch], list[dict]]:
     """Execute and return ``(batches, ops)`` where `ops` is *this run's* raw
     per-operator `ExecMetrics` (one dict per operator: ``op_id``, ``kind``,
     ``rows_in``, ``rows_out``, ``elapsed_ns``, ``peak_bytes``, ``spilled``,
-    ``backend``).
+    ``backend``, ``cpu_ns``, ``threads``).
 
     Core *measures*; this is the same metered native call the feedback loop uses,
     surfaced directly so the control plane can report measured per-operator stats
-    (`Dataset.stats()`). A malformed/empty metrics document yields an empty `ops`
-    list rather than raising.
+    (`Dataset.stats()` / `explain(analyze=True)`). When `feedback` is supplied the
+    same ops are also recorded into the sink, so a profiled run still feeds the
+    learning loop. A malformed/empty metrics document yields an empty `ops` list
+    rather than raising.
     """
     import batcher._native as _native
 
@@ -138,4 +159,6 @@ def execute_local_metered(
         ops = json.loads(metrics_json).get("ops", [])
     except (ValueError, TypeError):
         ops = []
+    if feedback is not None and ops:
+        _record_op_feedback(feedback, ops, cfg.execution.morsel_rows)
     return out, ops

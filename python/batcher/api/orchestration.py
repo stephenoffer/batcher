@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, TypeVar
 
 import pyarrow as pa
@@ -46,7 +47,6 @@ __all__ = [
     "persist_written_source_stats",
     "resolve_auto_config",
     "run_relational",
-    "run_relational_metered",
     "with_auto_config",
 ]
 
@@ -176,17 +176,19 @@ def _build_bloom_index(table: pa.Table, cols: list[str]) -> dict[str, bytes]:
     return out
 
 
-def approx_quantile(table: pa.Table, column: str, q: float) -> float | None:
-    """Approximate quantile `q` of `column` from a TDigest over the result.
+def approx_quantile(batches: Iterable[pa.RecordBatch], column: str, q: float) -> float | None:
+    """Approximate quantile `q` of `column` from a streamed, merged TDigest.
 
-    Opt-in and explicitly approximate: tail-accurate (p99/p999) and far cheaper
-    than an exact sort, at the cost of a small, bounded error. Returns None if the
-    column is non-numeric or empty.
+    Opt-in and explicitly approximate: tail-accurate (p99/p999) and far cheaper than
+    an exact sort. Consumes `batches` one at a time — building a per-batch TDigest and
+    merging the (tiny) sketches — so the column is never held whole on the driver; the
+    caller projects to just `column` and streams it (single-node or distributed).
+    Returns None if the column is non-numeric or empty.
     """
     from batcher import core
 
-    vals = core.tail_quantiles(table.to_batches(), [column], (q,)).get(column)
-    return vals[0] if vals else None
+    sketches = [sk for b in batches if (sk := core.tdigest_partial([b], column)) is not None]
+    return core.tdigest_quantile(sketches, q)
 
 
 # --- Zero-config sizing -----------------------------------------------------
@@ -303,7 +305,9 @@ def _run_relational(
 ) -> tuple[pa.Table | Source, list[BuildSideDecision]]:
     """The Kyber → Carbonite → Core body, run under the (possibly adapted) config."""
     from batcher import carbonite, core, kyber
+    from batcher._internal.logging import ensure_configured, get_logger
 
+    ensure_configured()
     # Per-source statistics (footer/manifest/catalog) let the optimizer's zone-map
     # and null-driven rules prune predicates and skip files before execution. Reuse
     # the conductor's already-collected stats when present (the metadata-answer
@@ -315,9 +319,20 @@ def _run_relational(
     opt, decisions = kyber.optimize_traced(
         plan, sources=sources, hub=ctx.hub, source_stats=source_stats
     )
+    prof = ctx.profile
+    if prof is not None:
+        from batcher.api.terminal.profile import record_plan
+
+        record_plan(prof, opt, plan, distributed, decisions)
 
     rm = carbonite.ResourceManager()
     verdict = rm.validate(opt)
+    get_logger("api").debug("optimized %d ops; feasible=%s", len(opt.ops), verdict.feasible)
+    if prof is not None:
+        from batcher.api.terminal.profile import admission_decision, verdict_summary
+
+        prof.carbonite_summary = verdict_summary(verdict)
+        prof.decisions.append(admission_decision(verdict))
     # A memory-binding "infeasible" verdict is Carbonite's spill-friendly
     # counter-offer, not a hard stop: the plan won't fit memory, so route it
     # out-of-core (below) rather than failing. Any *other* binding constraint
@@ -330,6 +345,8 @@ def _run_relational(
         from batcher import dist
 
         envelope = rm.scheduling_envelope(opt, ctx.num_workers)
+        # Profiling: collect the workers' map sub-plan metrics (their own profile section).
+        wm: list = []
         result = dist.execute_distributed(
             plan,
             sources,
@@ -338,7 +355,10 @@ def _run_relational(
             envelope=envelope,
             hub=ctx.hub,
             materialize=materialize,
+            metrics_out=wm if prof is not None else None,
         )
+        if prof is not None:
+            prof.worker_metrics = wm
         # Core collects metadata on every path so later plans improve with use.
         _collect_source_metadata(ctx.hub, sources)
         return result, decisions
@@ -355,6 +375,10 @@ def _run_relational(
         # Shard the out-of-core spill by data volume (Kyber's per-breaker fan-out),
         # not a blind constant, so a bigger group-by/join uses more, smaller buckets.
         partitions = partitions_from_physical(opt) or DEFAULT_PARTITIONS
+        if prof is not None:
+            from batcher.api.terminal.profile import record_spill
+
+            record_spill(prof, partitions)
         spilled = spill_collect(plan, sources, partitions)
         if spilled is not None:
             kyber.record_execution(ctx.hub, plan, spilled.num_rows)
@@ -389,7 +413,14 @@ def _run_relational(
             if spilled is not None:
                 kyber.record_execution(ctx.hub, plan, spilled.num_rows)
                 return spilled, decisions
-        batches = core.execute_local(opt, resolved, feedback=ctx.hub)
+        # When profiling, take the metered path (still feeding the hub) so the per-operator
+        # `ExecMetrics` reach the conductor's `QueryProfile`; otherwise the plain path,
+        # which skips even the tiny metrics serialization — keeping an ordinary run intact.
+        if prof is not None:
+            batches, metric_ops = core.execute_local_metered(opt, resolved, feedback=ctx.hub)
+            prof.metric_ops = metric_ops
+        else:
+            batches = core.execute_local(opt, resolved, feedback=ctx.hub)
     table = pa.Table.from_batches(
         batches, schema=batches[0].schema if batches else _empty_schema(ctx.columns)
     )
@@ -401,34 +432,6 @@ def _run_relational(
     _learn_column_stats(ctx.hub, resolved)
     kyber.record_selectivity(ctx.hub, plan, sources, table.num_rows)
     return table, decisions
-
-
-def run_relational_metered(
-    plan: LogicalPlan,
-    sources: list[Source],
-    ctx: ExecutionContext,
-) -> tuple[pa.Table, list[dict]]:
-    """Run a single-node relational plan and return ``(table, ops)`` where `ops` is
-    this run's raw per-operator `ExecMetrics` (for `Dataset.stats()`).
-
-    The in-memory single-node path of `run_relational`, surfaced metered: optimize
-    with Kyber, resolve sources with the pushed-down projection/predicate, and
-    execute via Core's metered entry point. Diagnostic-only — it does not spill or
-    distribute (those paths don't return a single per-operator metrics document), so
-    it reports the in-memory engine's measurements.
-    """
-    from batcher import core, kyber
-
-    opt = kyber.optimize(plan, sources=sources, hub=ctx.hub)
-    resolved = [
-        read_source(src, opt.source_projections.get(i), opt.source_predicates.get(i))
-        for i, src in enumerate(sources)
-    ]
-    batches, ops = core.execute_local_metered(opt, resolved)
-    table = pa.Table.from_batches(
-        batches, schema=batches[0].schema if batches else _empty_schema(ctx.columns)
-    )
-    return table, ops
 
 
 def _collect_source_metadata(hub, sources: list[Source]) -> None:
@@ -471,9 +474,11 @@ def _learn_column_stats(hub, resolved: list[list[pa.RecordBatch]]) -> None:
 
     try:
         known = set(kyber.load_learned_stats(hub).get(_NDV_KEY, {}))
+        min_frac = active_config().optimizer.cardinality.mcv_min_fraction
         ndv_all: dict[str, float] = {}
         quant_all: dict[str, dict[str, list[float]]] = {}
         bytes_all: dict[str, float] = {}
+        mcv_all: dict[str, dict[str, float]] = {}
         for batches in resolved:
             if not batches:
                 continue
@@ -484,7 +489,12 @@ def _learn_column_stats(hub, resolved: list[list[pa.RecordBatch]]) -> None:
             ndv_all.update(ndv)
             quant_all.update(quants)
             bytes_all.update(avg_bytes)
-        if ndv_all or quant_all or bytes_all:
-            kyber.record_column_stats(hub, ndv_all, quant_all, bytes_all)
+            # MCV: a skew value's measured frequency sharpens `col = value` past 1/ndv.
+            total = sum(b.num_rows for b in batches)
+            for col_name, hits in core.heavy_hitters(batches, cols, min_frac).items():
+                if total > 0 and hits:
+                    mcv_all[col_name] = {str(v): n / total for v, n in hits}
+        if ndv_all or quant_all or bytes_all or mcv_all:
+            kyber.record_column_stats(hub, ndv_all, quant_all, bytes_all, mcv_all)
     except Exception:  # pragma: no cover - learning must never break execution
         pass

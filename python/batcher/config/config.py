@@ -34,6 +34,7 @@ __all__ = [
     "FlowControlConfig",
     "MemoryConfig",
     "MetadataConfig",
+    "ObservabilityConfig",
     "OptimizerConfig",
     "PIDConfig",
     "active_config",
@@ -50,7 +51,9 @@ _ENGINE_CONFIG_FIELDS = (
     "parallelism",
     "memory_budget_bytes",
     "spill_dir",
+    "spill_compression",
     "fuse_linear",
+    "shrink_output_dtypes",
     # Performance-threshold knobs (mirror `bc_arrow::RuntimeTuning`).
     "bloom_fp_rate",
     "bloom_min_build_rows",
@@ -139,6 +142,25 @@ class ExecutionConfig:
     # untouched) and is a measured win on linear pipelines with no regression elsewhere.
     # Set to False to pin the staged operator-at-a-time path.
     fuse_linear: bool = True
+    # Re-narrow output columns to their source numeric width. The FFI widens narrow
+    # numerics (Int8/16/32, Float16/32) to Int64/Float64 once on input so every kernel
+    # stays on two well-tested paths; with this on, an output column that is a
+    # pass-through of a narrow *source* column (same name, type == the widened image)
+    # and whose values all fit is cast back to the source width — halving the footprint
+    # of Int32-id / Float32-feature columns that ride through unchanged. Lossless (a
+    # value that would overflow keeps the wide type) but data-dependent, so it is
+    # **off by default**: with it off, output types and the pre-execution
+    # `Dataset.schema` agree exactly. Shipped to Rust as
+    # `EngineConfig.shrink_output_dtypes`.
+    shrink_output_dtypes: bool = False
+    # Automatically offload a large-payload (`large_binary`) column out of line around
+    # a Sort, so the payload rides through the breaker as a tiny content-addressed URI
+    # handle instead of filling its buffers/spill files (read back right after). The
+    # explicit `Dataset.offload_blobs`/`materialize_blobs`, placed automatically and
+    # result-identically. Off by default: it trades blob bytes crossing the breaker for
+    # a content-store round-trip, a win only for genuinely large payloads. Control-plane
+    # only (rewrites the plan in `api`), so it is NOT part of the Rust engine config.
+    auto_offload_blobs: bool = False
     # --- Performance-threshold knobs (power-user perf tuning) --------------------
     # These mirror `bc_arrow::RuntimeTuning` / `bc_ir::EngineConfig` and tune *how*
     # the parallel executor runs an operator (parallel-vs-serial thresholds, the
@@ -206,12 +228,15 @@ class MemoryConfig:
     # `spill_remote_uri` (any fsspec URL: s3://, gs://, …) so a PB-scale spill does
     # not die when local disk fills. `spill_dir` overrides the local scratch dir
     # (default: a per-query tempdir). `spill_compression` is the Arrow-IPC codec for
-    # spilled batches ("lz4"/"zstd"/None); spilled data is transient, so a cheap-fast
-    # codec trades CPU for disk I/O and footprint at scale.
+    # spilled batches: "auto" (the default) picks per spill by the batch's dominant
+    # column type — ZSTD for blob/large-text payloads, none for all-numeric schemas,
+    # LZ4 for strings/mixed; "lz4"/"zstd"/None force one codec. Spilled data is
+    # transient, so this only trades CPU for disk I/O and footprint at scale
+    # (result-invariant — IPC self-describes its compression).
     spill_dir: str | None = None
     spill_remote_uri: str | None = None
     spill_local_budget_bytes: int | None = None
-    spill_compression: str | None = "lz4"
+    spill_compression: str | None = "auto"
     # Grace recursion trigger: when a single spilled aggregate bucket's on-disk size
     # exceeds this, it is re-partitioned (by a secondary hash of the group key) into
     # sub-buckets and reduced one at a time — so a *skewed* key set that overflows one
@@ -223,6 +248,13 @@ class MemoryConfig:
     # caching never grows the process without bound. Opt-in per dataset, so this only
     # bounds what an explicitly-cached plan may retain.
     result_cache_max_bytes: int = 256 << 20  # 256 MiB
+    # Local-SSD read-through cache for remote (S3/GCS/Azure) file bytes — the engine's
+    # Disk-Cache analog. `None` (default) disables it; set a directory to cache fetched
+    # remote files there, byte-bounded to `file_cache_max_bytes` with LRU eviction. It
+    # only accelerates re-reads of the same remote file — transparent, ephemeral, and
+    # result-invariant (a cache miss just re-fetches). Local paths are never cached.
+    file_cache_dir: str | None = None
+    file_cache_max_bytes: int = 8 << 30  # 8 GiB budget (used only when enabled)
     # Cap on one streaming operator's in-memory state (windowed-aggregate partials,
     # watermark-dedup keys, stream-join buffers). That state is bounded by the
     # watermark *advancing*; a stalled watermark (an event-time gap, or one stream
@@ -307,6 +339,10 @@ class CardinalityConfig:
     eq_selectivity: float = 0.1  # col = literal
     range_selectivity: float = 1.0 / 3.0  # col <|<=|>|>= literal
     null_selectivity: float = 0.05  # col IS NULL
+    # A value appearing in at least this fraction of a column's rows is recorded as a
+    # most-common-value (MCV), so `col = <that value>` uses its measured frequency
+    # instead of the uniform `1/ndv` — the skew case where `1/ndv` is most wrong.
+    mcv_min_fraction: float = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,6 +560,18 @@ class DistributedConfig:
     flight_idle_timeout_s: float = 60.0
     flight_keepalive_s: float | None = None
     placement_timeout_s: float = 60.0
+    # Bounded wait for the Ray autoscaler to grow the cluster before clamping a query's
+    # worker fan-out. When a query wants more workers than the cluster can schedule now,
+    # `clamp_workers` asks the autoscaler to scale up (`request_resources`) and then
+    # waits up to this many seconds — polling every `autoscale_poll_s` — for the new
+    # nodes to arrive, so a big job actually *uses* the scaled-up cluster instead of
+    # running under-provisioned and only the next job benefiting. Stops early the moment
+    # capacity covers the request. `0.0` (the default) keeps the non-blocking behavior
+    # (hint then clamp to current capacity) — set it (e.g. 180s, longer than node boot)
+    # on a genuine autoscaling cluster; leave it 0 on a fixed cluster so a query that
+    # over-asks never waits for scale-up that can't happen.
+    autoscale_wait_s: float = 0.0
+    autoscale_poll_s: float = 5.0
     # Skew-aware join salting for a huge x huge hot key. When a single join key is
     # dominated by a few "hot" values, those rows otherwise co-partition onto one
     # reducer and overload it (memory + the output explosion + a straggler). With
@@ -581,6 +629,22 @@ class DistributedConfig:
     # unchanged either way (the mergeable algebra guarantees it); this only changes
     # where the bytes live between stages.
     persistent_fleet: bool = False
+    # How many times to (re-)attempt a `persistent_fleet` adaptive query on a fresh fleet
+    # when a worker dies holding an *already-materialized* cross-stage intermediate (which
+    # has no fine-grained recompute, unlike an in-stage loss). The whole deterministic
+    # query re-runs on a fresh fleet of survivors, so the result is unchanged; more
+    # attempts ride out more preemptions before surfacing a persistent failure. The spot
+    # profile raises it for a churning cluster. Only consulted when `persistent_fleet` is on.
+    fleet_max_attempts: int = 2
+    # Streaming heterogeneous inference pipeline. When on, a linear `map_batches` chain
+    # that crosses a resource-class boundary (a CPU preprocess stage feeding a GPU /
+    # load-once inference stage) is split into per-stage actor pools that stream
+    # partitions stage→stage over Arrow Flight, so the CPU and GPU stages OVERLAP (the
+    # GPU runs partition k while the CPU prepares k+1) instead of one actor running the
+    # whole chain per partition. Off by default: with it off the chain runs
+    # embarrassingly parallel exactly as before, so single-node==distributed stays
+    # bit-identical. Result is unchanged either way — only the scheduling overlaps.
+    stream_inference: bool = False
     # Named fault-tolerance profile. ``"default"`` keeps the conservative budgets above
     # (tuned for a stable on-demand cluster — minimal retries, no keepalive, no
     # straggler speculation). ``"spot"`` hardens them as a bundle for a churning
@@ -592,6 +656,40 @@ class DistributedConfig:
     # override just that one while keeping the rest of the profile. Resolved once at
     # every config entry point (see `batcher.config.profiles`).
     resilience: str = "default"
+
+
+@dataclass(frozen=True, slots=True)
+class ObservabilityConfig:
+    """Logging and per-query event-log settings — how the engine reports what it did.
+
+    Controls the `batcher.*` logger hierarchy (console + optional rotating file) and the
+    structured per-query event log (one JSON document per query: the plan, the
+    Kyber/Carbonite decisions, and the measured per-operator profile). Env overrides use
+    the ``BATCHER_OBSERVABILITY_*`` prefix (e.g. ``BATCHER_OBSERVABILITY_LOG_LEVEL=DEBUG``,
+    ``BATCHER_OBSERVABILITY_EVENT_LOG=0`` to disable the event log).
+    """
+
+    # Threshold for the `batcher.*` loggers and the Rust data-plane tracing bridge:
+    # one of CRITICAL/ERROR/WARNING/INFO/DEBUG. WARNING by default — quiet unless asked.
+    log_level: str = "WARNING"
+    # Emit log records to stderr. On by default (at `log_level`); set False for a
+    # file-only setup.
+    console: bool = True
+    # Path to a rotating log file, or None for no file handler.
+    log_file: str | None = None
+    # Maximum bytes per log file before rotation, and how many rotated files to keep.
+    log_file_max_bytes: int = 10_000_000
+    log_file_backups: int = 3
+    # Record format: "human" (a readable one-line layout) or "json" (one JSON object
+    # per record, for log shippers).
+    log_format: str = "human"
+    # Write a structured per-query event log (the Spark event-log analog). On by default.
+    event_log: bool = True
+    # Directory for event-log documents. Empty → ``$BATCHER_HOME/logs`` (or
+    # ``~/.batcher/logs``), resolved at write time so `config` stays free of filesystem I/O.
+    event_log_dir: str = ""
+    # Keep at most this many event-log files (oldest pruned on write). 0 → unbounded.
+    event_log_max_files: int = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,6 +727,7 @@ class Config:
     pid: PIDConfig = PIDConfig()
     metadata: MetadataConfig = MetadataConfig()
     distributed: DistributedConfig = DistributedConfig()
+    observability: ObservabilityConfig = ObservabilityConfig()
 
     def replace(self, **section_overrides: object) -> Config:
         """Return a new Config with whole sections replaced."""
@@ -680,7 +779,9 @@ class Config:
             self.execution.parallelism,
             self._rust_memory_budget_bytes(),
             self.memory.spill_dir,
+            self.memory.spill_compression,
             self.execution.fuse_linear,
+            self.execution.shrink_output_dtypes,
             self.execution.bloom_fp_rate,
             self.execution.bloom_min_build_rows,
             self.execution.window_parallel_row_threshold,
@@ -789,11 +890,14 @@ def _overlay_dict(obj: Config, data: dict[str, object]) -> Config:
 
 
 def _resolved(cfg: Config) -> Config:
-    """Apply the active resilience profile, then validate — the single resolution
-    chokepoint every config entry point shares so the profile and range checks run in
-    lockstep regardless of how the config was built."""
-    from batcher.config.profiles import apply_resilience_profile
+    """Auto-select the spot profile on a preemptible node, apply the resilience profile,
+    then validate — the single resolution chokepoint every config entry point shares so
+    auto-detection, the profile, and range checks run in lockstep regardless of how the
+    config was built. A user-chosen `resilience` is never overridden (explicit wins)."""
+    from batcher.config.profiles import apply_resilience_profile, detect_spot_environment
 
+    if cfg.distributed.resilience == "default" and detect_spot_environment():
+        cfg = cfg.replace(distributed=replace(cfg.distributed, resilience="spot"))
     return apply_resilience_profile(cfg).validate()
 
 

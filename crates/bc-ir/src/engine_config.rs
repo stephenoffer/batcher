@@ -46,6 +46,12 @@ pub struct EngineConfig {
     /// Scratch directory for spill files (one Arrow-IPC file per hash partition).
     /// `None`/absent falls back to the OS temp dir. Mirrors `MemoryConfig.spill_dir`.
     pub spill_dir: Option<String>,
+    /// Compression codec for spilled Arrow-IPC streams: `"lz4"`, `"zstd"`, or
+    /// `None`/absent for uncompressed. Spill is perf-only and result-invariant — IPC
+    /// self-describes its compression, so the read path needs no codec — this only
+    /// trades CPU for spill-file (and disk-bandwidth) bytes. Mirrors
+    /// `MemoryConfig.spill_compression`; the default (`"lz4"`) matches it.
+    pub spill_compression: Option<String>,
     /// Per-operator spill budget (bytes), keyed by the pre-order `op_id` Kyber
     /// assigns in `_annotate_ops` (the same numbering the metrics side-channel uses).
     /// This is the *byte-true, per-operator* envelope (Kyber's `m_max_bytes`) that
@@ -64,6 +70,14 @@ pub struct EngineConfig {
     /// default) keeps the staged operator-at-a-time path. Mirrors
     /// `ExecutionConfig.fuse_linear`.
     pub fuse_linear: bool,
+    /// Re-narrow output columns to their source numeric width. The FFI widens narrow
+    /// numerics on input; with this on, an output column that passes through a narrow
+    /// *source* column unchanged (same name + the widened type) and whose values all
+    /// fit is cast back to the source width. Lossless (an out-of-range value keeps the
+    /// wide type) but data-dependent, so `false` (the default) leaves outputs widened
+    /// — keeping the physical schema equal to the statically-inferred `Dataset.schema`.
+    /// Mirrors `ExecutionConfig.shrink_output_dtypes`.
+    pub shrink_output_dtypes: bool,
     // --- Performance-threshold knobs (mirror `bc_arrow::RuntimeTuning`) ----------
     // These are performance-only: they change *how* the parallel executor runs an
     // operator, never the relation it produces. Each default equals the historical
@@ -97,8 +111,10 @@ impl Default for EngineConfig {
             parallelism: 0,
             memory_budget_bytes: 0,
             spill_dir: None,
+            spill_compression: Some("auto".to_string()),
             op_budgets: HashMap::new(),
             fuse_linear: true,
+            shrink_output_dtypes: false,
             // Mirror `bc_arrow::RuntimeTuning::default()` field-for-field; the skew
             // floors reference the morsel consts the tuning struct derives them from.
             bloom_fp_rate: 0.01,
@@ -171,6 +187,14 @@ mod tests {
         // control plane ships a positive budget.
         assert_eq!(EngineConfig::default().memory_budget_bytes, 0);
         assert_eq!(EngineConfig::default().spill_dir, None);
+        // Spill compression defaults to the datatype-aware policy, matching Python's
+        // MemoryConfig.
+        assert_eq!(
+            EngineConfig::default().spill_compression.as_deref(),
+            Some("auto")
+        );
+        // Output re-narrowing is opt-in so the physical schema matches Dataset.schema.
+        assert!(!EngineConfig::default().shrink_output_dtypes);
     }
 
     #[test]

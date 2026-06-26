@@ -76,10 +76,12 @@ install-hooks:
     @echo "pre-commit hook installed (runs: lint-structure, ruff check, lint-layers)"
 
 # Build the documentation site. Warnings are errors, so an orphan page or a
-# broken cross-reference fails the build. Doc code examples are executed
-# separately by `just test-py` (tests/docs/test_doc_examples.py), which needs the
-# engine built first.
+# broken cross-reference fails the build. The doctest builder runs first, so a
+# docstring `.. doctest::` example that disagrees with the engine fails here (the
+# markdown code blocks under docs/ are executed separately by `just test-py`,
+# tests/docs/test_doc_examples.py). Both need the engine built first.
 docs:
+    sphinx-build -b doctest docs docs/_build/doctest
     sphinx-build -b html -E -W --keep-going docs docs/_build/html
     @echo "docs built -> docs/_build/html/index.html"
 

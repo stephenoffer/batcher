@@ -118,6 +118,36 @@ def test_delta_roundtrip_and_time_travel(tmp_path) -> None:
     )
 
 
+def test_delta_deletion_vectors_read(tmp_path) -> None:
+    # A merge-on-read delete (deletion vectors) must be applied on read: the deleted
+    # rows are absent, projection still works, and we don't claim a (now-overcounting)
+    # exact row count. delta-rs's pyarrow path raises on DV tables; the connector
+    # routes them through the DataFusion QueryBuilder, which masks the deletes.
+    pytest.importorskip("deltalake")
+    from deltalake import DeltaTable, write_deltalake
+
+    path = str(tmp_path / "delta_dv")
+    write_deltalake(
+        path,
+        pa.table({"id": list(range(10)), "v": [i * 10 for i in range(10)]}),
+        configuration={"delta.enableDeletionVectors": "true"},
+    )
+    DeltaTable(path).delete("id < 4")  # logically delete ids 0..3, no file rewrite
+
+    src = DeltaSource(path)
+    assert src._has_deletion_vectors()
+    out = pa.Table.from_batches(src.read())
+    assert sorted(out.column("id").to_pylist()) == [4, 5, 6, 7, 8, 9]
+    proj = pa.Table.from_batches(src.read(projection=["id"]))
+    assert proj.schema.names == ["id"]
+    assert sorted(proj.column("id").to_pylist()) == [4, 5, 6, 7, 8, 9]
+    streamed = pa.Table.from_batches(list(src.iter_batches()))
+    assert streamed.num_rows == 6
+    # The add-action num_records counts pre-delete rows, so don't answer count/stats.
+    assert src.row_count() is None
+    assert src.statistics() is None
+
+
 def test_delta_projection_pushdown(tmp_path) -> None:
     pytest.importorskip("deltalake")
     path = str(tmp_path / "delta_proj")

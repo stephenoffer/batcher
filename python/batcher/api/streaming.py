@@ -150,9 +150,14 @@ def _build_run_batch(plan: LogicalPlan, sources: list[Source]):
     from batcher.io.source import InMemorySource
 
     if core.has_map_batches(plan):
+        # Build the (class) UDFs once for the whole stream, so a load-once inference
+        # model loads a single time and is reused across every micro-batch — not rebuilt
+        # per micro-batch (which would reload the model on every trigger). This is the
+        # single-node resident-inference path; the distributed streaming pool is W1.
+        resident = core.prebuild_factories(plan)
 
         def run_batch(batch: pa.RecordBatch) -> list[pa.RecordBatch]:
-            return core.execute_with_udfs(plan, [InMemorySource([batch])])
+            return core.execute_with_udfs(resident, [InMemorySource([batch])])
 
         return run_batch
 
