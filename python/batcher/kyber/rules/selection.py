@@ -118,6 +118,14 @@ def _rewrite(
         # Build-side swap is only valid for inner joins (associative/commutative).
         # Compare the cost of this orientation against the swapped one; children are
         # identical between them, so the per-join `op_cost` is the deciding term.
+        # Build-side swap is only valid for inner joins (associative/commutative).
+        # Compare the cost of this orientation against the swapped one; children are
+        # identical between them, so the per-join `op_cost` is the deciding term.
+        # (A left/right join's `A LEFT JOIN B == B RIGHT JOIN A` rename was tried to
+        # build the smaller *preserved* side, but it regressed: building the small side
+        # forces probing the large one, and the scattered probe lookups cost more than
+        # the larger but cache-friendlier build. The current cost model's build:probe
+        # ratio mis-ranks that, so the rename is withheld until the model is calibrated.)
         cost_delta = 0.0
         swap = False
         if node.join_type == "inner":

@@ -59,9 +59,17 @@ pub(crate) fn var_state(
 
 pub(crate) fn count_non_null(values: &ArrayRef, group_ids: &[u32], num_groups: usize) -> ArrayRef {
     let mut counts = vec![0i64; num_groups];
-    for (i, &g) in group_ids.iter().enumerate() {
-        if values.is_valid(i) {
+    if values.null_count() == 0 {
+        // No-null fast path: every row counts, so skip the per-row validity bitmap
+        // check entirely (the dominant COUNT(col)/AVG path, e.g. TPC-H Q1).
+        for &g in group_ids {
             counts[g as usize] += 1;
+        }
+    } else {
+        for (i, &g) in group_ids.iter().enumerate() {
+            if values.is_valid(i) {
+                counts[g as usize] += 1;
+            }
         }
     }
     Arc::new(Int64Array::from(counts))

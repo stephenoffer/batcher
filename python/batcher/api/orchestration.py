@@ -250,12 +250,6 @@ def auto_num_partitions(plan: LogicalPlan, sources: list[Source], hub: MetadataH
         return DEFAULT_PARTITIONS
 
 
-# The estimator's reserved key for per-column distinct counts (see
-# `kyber.cardinality` / `kyber.learning`). Used here only to skip already-measured
-# columns so the sketch build never repeats.
-_NDV_KEY = "__column_ndv__"
-
-
 def run_relational(
     plan: LogicalPlan,
     sources: list[Source],
@@ -360,7 +354,9 @@ def _run_relational(
         if prof is not None:
             prof.worker_metrics = wm
         # Core collects metadata on every path so later plans improve with use.
-        _collect_source_metadata(ctx.hub, sources)
+        from batcher.api.terminal._metadata import collect_source_metadata
+
+        collect_source_metadata(ctx.hub, sources)
         return result, decisions
 
     # Carbonite decides out-of-core: if the estimated working set won't fit the
@@ -429,72 +425,8 @@ def _run_relational(
     # filter's measured selectivity (a ratio that generalizes across input sizes) —
     # so later plans get sketch- and feedback-driven cardinality.
     kyber.record_execution(ctx.hub, plan, table.num_rows)
-    _learn_column_stats(ctx.hub, resolved)
+    from batcher.api.terminal._metadata import learn_column_stats
+
+    learn_column_stats(ctx.hub, resolved)
     kyber.record_selectivity(ctx.hub, plan, sources, table.num_rows)
     return table, decisions
-
-
-def _collect_source_metadata(hub, sources: list[Source]) -> None:
-    """Record per-column ndv/quantiles from the base sources (Core collects).
-
-    The UDF and distributed paths don't surface their scanned batches the way the
-    native path hands `resolved` to `_learn_column_stats`, so this reads the base
-    sources directly. It is gated on the cheap `Source.schema` — a source is only
-    read when it has a not-yet-measured column — so a file is never re-scanned once
-    its columns are learned. Best-effort: learning never breaks a query.
-    """
-    if hub is None:
-        return
-    from batcher import kyber
-
-    try:
-        known = set(kyber.load_learned_stats(hub).get(_NDV_KEY, {}))
-        resolved = [
-            read_source(src, None, None)
-            for src in sources
-            if any(c not in known for c in src.schema().names)
-        ]
-        if resolved:
-            _learn_column_stats(hub, resolved)
-    except Exception:  # pragma: no cover - learning must never break execution
-        pass
-
-
-def _learn_column_stats(hub, resolved: list[list[pa.RecordBatch]]) -> None:
-    """Measure per-column ndv/quantiles from the just-scanned input and record them.
-
-    Gated to columns not already known, so the O(rows) sketch build happens at most
-    once per column — a bounded, one-time cost that sharpens every later plan. Core
-    measures (`core.column_statistics`); Kyber persists/consumes. Best-effort: a
-    failure here never affects the query result.
-    """
-    if hub is None:
-        return
-    from batcher import core, kyber
-
-    try:
-        known = set(kyber.load_learned_stats(hub).get(_NDV_KEY, {}))
-        min_frac = active_config().optimizer.cardinality.mcv_min_fraction
-        ndv_all: dict[str, float] = {}
-        quant_all: dict[str, dict[str, list[float]]] = {}
-        bytes_all: dict[str, float] = {}
-        mcv_all: dict[str, dict[str, float]] = {}
-        for batches in resolved:
-            if not batches:
-                continue
-            cols = [c for c in batches[0].schema.names if c not in known]
-            if not cols:
-                continue
-            ndv, quants, avg_bytes = core.column_statistics(batches, cols)
-            ndv_all.update(ndv)
-            quant_all.update(quants)
-            bytes_all.update(avg_bytes)
-            # MCV: a skew value's measured frequency sharpens `col = value` past 1/ndv.
-            total = sum(b.num_rows for b in batches)
-            for col_name, hits in core.heavy_hitters(batches, cols, min_frac).items():
-                if total > 0 and hits:
-                    mcv_all[col_name] = {str(v): n / total for v, n in hits}
-        if ndv_all or quant_all or bytes_all or mcv_all:
-            kyber.record_column_stats(hub, ndv_all, quant_all, bytes_all, mcv_all)
-    except Exception:  # pragma: no cover - learning must never break execution
-        pass

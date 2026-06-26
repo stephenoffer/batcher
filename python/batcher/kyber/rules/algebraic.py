@@ -18,7 +18,13 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase, RuleCategory
 from batcher.kyber.stats.selectivity import comparison_col_side
 from batcher.plan.expr_ir import Binary, Expr, Lit
-from batcher.plan.expr_rewrite import combine_conjuncts, split_conjuncts, substitute_columns
+from batcher.plan.expr_rewrite import (
+    combine_conjuncts,
+    combine_disjuncts,
+    split_conjuncts,
+    split_disjuncts,
+    substitute_columns,
+)
 from batcher.plan.logical import (
     Aggregate,
     Distinct,
@@ -35,6 +41,7 @@ __all__ = [
     "combine_limits",
     "constant_propagation",
     "eliminate_sort_before_aggregate",
+    "factor_common_conjuncts",
     "merge_adjacent_filters",
     "prune_true_filter",
     "push_distinct_into_union",
@@ -43,6 +50,65 @@ __all__ = [
     "push_limit_through_project",
     "remove_redundant_distinct",
 ]
+
+
+@rule(name="factor_common_conjuncts", phase=Phase.NORMALIZE, matches=(Filter,))
+def factor_common_conjuncts(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """Factor a conjunct common to every branch of an `OR` out of the disjunction.
+
+    `(A AND X) OR (A AND Y) OR (A AND Z)` → `A AND (X OR Y OR Z)`. Boolean algebra,
+    always semantics-preserving. The payoff is structural: the factored `A` becomes a
+    top-level conjunct, so an equi-join condition hidden inside a disjunction (TPC-H
+    Q19's `(p=l AND ...) OR (p=l AND ...) OR ...`) is exposed where predicate pushdown
+    and join-key derivation can see it — without it the join degrades to a cartesian
+    product. A branch whose conjuncts are *all* common contributes a `TRUE` disjunct,
+    collapsing the residual `OR` to nothing (the factored conjuncts alone).
+
+    Fires only when at least one conjunct is shared by all branches and the predicate
+    is a genuine top-level `OR` (a non-OR predicate is left to the other rules).
+    """
+    disjuncts = split_disjuncts(node.predicate)
+    if len(disjuncts) < 2:
+        return None  # not a disjunction
+
+    per_branch = [split_conjuncts(d) for d in disjuncts]
+    # Conjuncts present (by structural identity) in the first branch and every other.
+    branch_key_sets = [{_ir_key(c) for c in br} for br in per_branch]
+    common: list[Expr] = []
+    common_keys: set = set()
+    for conj in per_branch[0]:
+        k = _ir_key(conj)
+        if k in common_keys:
+            continue
+        if all(k in s for s in branch_key_sets):
+            common.append(conj)
+            common_keys.add(k)
+    if not common:
+        return None
+
+    # Each branch's residual = its conjuncts minus the common ones. An empty residual
+    # means the branch is implied by `common` alone → the OR is satisfied there, i.e.
+    # a TRUE disjunct, which makes the whole residual OR vanish.
+    residuals: list[Expr] = []
+    any_empty = False
+    for br in per_branch:
+        rest = [c for c in br if _ir_key(c) not in common_keys]
+        if not rest:
+            any_empty = True
+            break
+        residuals.append(combine_conjuncts(rest))
+
+    factored = list(common)
+    if not any_empty:
+        factored.append(combine_disjuncts(residuals))
+    return Filter(node.input, combine_conjuncts(factored))
+
+
+def _ir_key(expr: Expr):
+    """A hashable structural identity for an expression (its IR rendered hashable)."""
+    import json
+
+    return json.dumps(expr.to_ir(), sort_keys=True)
 
 
 @rule(name="push_distinct_into_union", phase=Phase.REWRITE, matches=(Distinct,))

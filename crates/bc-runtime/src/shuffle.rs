@@ -58,9 +58,15 @@ pub fn partition_by_key_arrays(
     let n = batch.num_rows();
 
     // One hash pass → the bucket id per row. An empty key set routes every row to
-    // bucket 0 (hashing an empty row is ill-defined).
+    // bucket 0 (hashing an empty row is ill-defined). A single integer key hashes its
+    // native values directly, skipping the `RowConverter` encoding the general path
+    // needs — the bucket id is a deterministic function of the key value either way,
+    // and both sides of a join shuffle dispatch on the same key type, so equal keys
+    // still co-partition (the invariant the distributed/parallel join relies on).
     let part_of: Vec<u32> = if keys.is_empty() {
         vec![0u32; n]
+    } else if let Some(part) = partition_int_key(keys, num_partitions) {
+        part
     } else {
         let fields: Vec<SortField> = keys
             .iter()
@@ -275,6 +281,25 @@ fn salted_hash(key_hash: u64, salt: u32) -> u64 {
 /// hash's high-entropy bits. Deterministic, so equal keys (and both join sides)
 /// always agree within a run.
 #[inline]
+/// Per-row bucket ids for a single `Int64` key, hashing native values directly (no
+/// row encoding). `None` unless `keys` is exactly one `Int64` column — narrow integer
+/// types are normalized to `Int64` upstream, so this is the common key-shuffle shape.
+/// Null slots hash their (arbitrary) raw value; that is harmless — a null key still
+/// lands in *some* bucket consistently, and join matching rejects it separately.
+fn partition_int_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32>> {
+    use arrow::array::Int64Array;
+    if keys.len() != 1 || keys[0].data_type() != &DataType::Int64 {
+        return None;
+    }
+    let a = keys[0].as_any().downcast_ref::<Int64Array>()?;
+    Some(
+        a.values()
+            .iter()
+            .map(|&v| bucket_of(SEED.hash_one(v), num_partitions))
+            .collect(),
+    )
+}
+
 fn bucket_of(hash: u64, num_partitions: usize) -> u32 {
     if num_partitions.is_power_of_two() {
         (hash & (num_partitions as u64 - 1)) as u32

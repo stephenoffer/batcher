@@ -7,16 +7,19 @@
 //! morsel is "full" at **either** the row target or the byte budget
 //! ([`bc_arrow::MorselTarget`]).
 //!
-//! Byte sizing is *measured*, not estimated. For an all-fixed-width batch the
-//! per-row width is constant, so the split is O(1). For a batch with
-//! variable-width columns (strings/blobs/embeddings) we read the offset buffers to
-//! get each row's true byte cost and accumulate greedily — so a single row wider
-//! than the whole budget becomes its own one-row morsel (a giant cell never
-//! co-resides with 16 k others), and intra-batch width variance (999 tiny rows +
-//! 1 huge one) is split where it actually is, not where a batch-average would
-//! guess. Reading `get_array_memory_size()` on a *slice* cannot do this: an Arrow
-//! slice shares the parent buffer and reports its full capacity, so it would
-//! over-count every slice.
+//! Byte sizing is *measured*, not estimated — but only when it can matter. For an
+//! all-fixed-width batch the per-row width is constant, so the split is O(1). For a
+//! variable-width batch whose *average* row is narrow enough that the row target
+//! always trips first (`avg_row_bytes × rows ≤ byte_budget` — the common analytical
+//! case of a few short string/code columns beside numerics), per-row widths cannot
+//! move the boundaries, so it too splits uniformly in O(1). Only when the average row
+//! is wide enough to approach the byte budget do we read the offset buffers for each
+//! row's true cost and accumulate greedily — so a single row wider than the whole
+//! budget becomes its own one-row morsel (a giant cell never co-resides with 16 k
+//! others), and intra-batch width variance (999 tiny rows + 1 huge one) is split
+//! where it actually is. The average-width guard uses `get_array_memory_size()`, which
+//! over-counts a *slice* (shared parent buffer); that only makes the guard
+//! conservative — it never skips the per-row walk when the walk is needed.
 //!
 //! With a row-only target (`MorselTarget::rows`, byte bound = `usize::MAX`) every
 //! path short-circuits to the historical row-count morselizer — byte-for-byte
@@ -83,7 +86,21 @@ fn split_batch(out: &mut Vec<RecordBatch>, b: &RecordBatch, target: bc_arrow::Mo
         emit_uniform(out, b, n, target.rows.min(by_bytes));
         return;
     }
-    // Variable-width batch: accumulate rows by *measured* per-row bytes.
+    // Variable-width batch, but the *average* row is narrow enough that the row cap
+    // always trips before the byte budget: then per-row widths cannot change the
+    // boundaries, so slice uniformly by rows and skip the O(rows) byte walk. This is
+    // the common analytical case (a few short string/code columns alongside numerics) —
+    // q1's `l_returnflag`/`l_linestatus` are single chars, so a morsel of `rows` is far
+    // under the byte budget. `get_array_memory_size` over-counts a *slice* (shared
+    // parent buffer), which only makes this guard conservative: it never wrongly skips
+    // the walk, it just occasionally does it when it could have been skipped.
+    let avg_row_bytes = b.get_array_memory_size() / n;
+    if avg_row_bytes.saturating_mul(target.rows) <= target.bytes {
+        emit_uniform(out, b, n, target.rows);
+        return;
+    }
+    // Wide/variable rows: accumulate by *measured* per-row bytes so a few large rows
+    // (decoded frames, long lists) are isolated into their own morsels.
     let costs = per_row_bytes(b);
     let mut start = 0usize;
     let mut acc = 0usize;
@@ -357,6 +374,39 @@ mod tests {
             out.len() > 1,
             "tight byte budget should split fixed-width data"
         );
+    }
+
+    /// A variable-width batch whose average row is narrow (short strings) splits by the
+    /// row cap with no per-row byte walk — the O(1) fast path — and still isolates a
+    /// genuinely huge row when one appears (the walk re-engages).
+    #[test]
+    fn narrow_strings_split_uniformly_by_rows() {
+        // 1000 short strings; average row ~ a few bytes, far under any sane byte budget.
+        let vals: Vec<String> = (0..1000).map(|i| format!("c{}", i % 5)).collect();
+        let refs: Vec<&str> = vals.iter().map(String::as_str).collect();
+        let b = str_batch(&refs);
+        // Row cap 128, generous byte budget: avg_row_bytes × 128 ≪ budget, so every
+        // morsel is exactly the row cap (uniform) — the boundaries the per-row walk
+        // would also produce, reached without it.
+        let target = bc_arrow::MorselTarget::new(128, 1 << 20);
+        let out = morselize(&[b], target);
+        assert_eq!(total_rows(&out), 1000);
+        assert!(out.iter().all(|m| m.num_rows() <= 128));
+        assert_eq!(out.len(), 1000_usize.div_ceil(128));
+
+        // A batch with one giant string still isolates it (avg width is pulled high, so
+        // the per-row walk runs and stands the giant row alone).
+        let giant = "y".repeat(2 << 20);
+        let mixed = str_batch(&["a", giant.as_str(), "b"]);
+        let out = morselize(&[mixed], bc_arrow::MorselTarget::new(128, 1 << 20));
+        let big = out
+            .iter()
+            .find(|m| {
+                let s = m.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..s.len()).any(|i| s.value(i).len() == 2 << 20)
+            })
+            .expect("the giant string row survives");
+        assert_eq!(big.num_rows(), 1, "the giant string row must stand alone");
     }
 
     /// A row-only target never walks bytes: a wide batch under the row cap is one

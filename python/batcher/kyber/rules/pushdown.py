@@ -35,10 +35,12 @@ from batcher.plan.logical import (
     Sample,
     Sort,
     Window,
+    is_cartesian_key_pair,
 )
 from batcher.plan.visitor import transform_up
 
 __all__ = [
+    "derive_join_keys",
     "infer_join_predicates",
     "push_filter_through_aggregate",
     "push_filter_through_sort",
@@ -120,6 +122,91 @@ def _push_into_join(predicate: Expr, join: Join) -> LogicalPlan | None:
     if keep:
         result = Filter(result, combine_conjuncts(keep))
     return result
+
+
+@rule(name="derive_join_keys", phase=Phase.PUSHDOWN, matches=(Filter,))
+def derive_join_keys(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """Absorb an equi-conjunct spanning both sides of an inner join into the join keys.
+
+    A `WHERE a.k = b.k` over a comma join (and any cross join) is lowered as a Filter
+    sitting above a cartesian join — in this engine, an inner join on a synthetic
+    constant `__cross_key`. Predicate pushdown cannot move such a conjunct (it
+    references *both* sides), so without this rule the equality is evaluated only
+    *after* the full cartesian product is built — a catastrophic blow-up on multi-table
+    queries. This rewrite turns each `eq(left_col, right_col)` conjunct into a real
+    join key pair, then drops the now-redundant cartesian pseudo-keys (the `__cross_key`
+    carries no information once a real key drives the join). The result is the equi-join
+    the query always meant, which join reordering can then place to avoid cross products.
+
+    Only inner joins (equi-join semantics; an outer join's null-extended rows make a
+    derived key unsafe). Non-equality and single-side conjuncts are left in the filter.
+    """
+    join = node.input
+    if not isinstance(join, Join) or join.join_type != "inner":
+        return None
+
+    left_src = {o.alias: o.name for o in join.output if o.side == "left"}
+    right_src = {o.alias: o.name for o in join.output if o.side == "right"}
+    left_keys = list(join.left_keys)
+    right_keys = list(join.right_keys)
+    existing = set(zip(left_keys, right_keys, strict=True))
+
+    keep: list[Expr] = []
+    derived = False
+    for conj in split_conjuncts(node.predicate):
+        pair = _equi_key_pair(conj, left_src, right_src)
+        if pair is not None and pair not in existing:
+            left_keys.append(pair[0])
+            right_keys.append(pair[1])
+            existing.add(pair)
+            derived = True
+        else:
+            keep.append(conj)
+    if not derived:
+        return None
+
+    # A real key now drives the join, so the cartesian pseudo-keys (`__cross_key`) are
+    # redundant — drop them to avoid a needless constant column in the hash key.
+    real = [
+        (lk, rk)
+        for lk, rk in zip(left_keys, right_keys, strict=True)
+        if not is_cartesian_key_pair(join.left, lk, join.right, rk)
+    ]
+    if real:
+        left_keys = [lk for lk, _ in real]
+        right_keys = [rk for _, rk in real]
+
+    new_join = Join(
+        join.left,
+        join.right,
+        tuple(left_keys),
+        tuple(right_keys),
+        "inner",
+        join.output,
+        join.strategy,
+    )
+    return new_join if not keep else Filter(new_join, combine_conjuncts(keep))
+
+
+def _equi_key_pair(
+    conj: Expr, left_src: dict[str, str], right_src: dict[str, str]
+) -> tuple[str, str] | None:
+    """`(left_key, right_key)` if `conj` is `left_col = right_col` across the join, else None.
+
+    Both operands must be bare columns, one resolving to a left output alias and the
+    other to a right output alias; the returned names are the *input* (source) column
+    names the join keys are phrased in.
+    """
+    if not isinstance(conj, Binary) or conj.op != "eq":
+        return None
+    lhs, rhs = conj.left, conj.right
+    if not (isinstance(lhs, Col) and isinstance(rhs, Col)):
+        return None
+    if lhs.name in left_src and rhs.name in right_src:
+        return (left_src[lhs.name], right_src[rhs.name])
+    if lhs.name in right_src and rhs.name in left_src:
+        return (left_src[rhs.name], right_src[lhs.name])
+    return None
 
 
 @rule(name="infer_join_predicates", phase=Phase.PUSHDOWN, matches=(Join,))

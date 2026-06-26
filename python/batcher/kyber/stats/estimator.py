@@ -291,12 +291,36 @@ class StatsEstimator:
                 return RelStats(float(learned_rows), Provenance.LEARNED)
         if node.join_type in {"semi", "anti"}:
             return RelStats(left.rows, Provenance.DEFAULT)
+        # PK–FK detection first: if one side's join key is (nearly) unique — its
+        # distinct count reaches its row count — then every row of the *other* side
+        # matches at most one row here, so under containment the result is ≈ the other
+        # side's rows. This is the dominant join shape (a fact table joined to a
+        # dimension on the dimension's primary key) and the Selinger ratio below gets
+        # it badly wrong for a *composite* PK: the fact side's key-combination ndv is
+        # over-estimated (its columns are correlated), which deflates `|L||R|/max(ndv)`
+        # — TPC-H Q9's `lineitem ⋈ partsupp ON (partkey, suppkey)` was estimated 8× low,
+        # steering the join order into a needless multi-million-row intermediate.
+        left_ndv = self._side_ndv(node.left_keys, left.rows)
+        right_ndv = self._side_ndv(node.right_keys, right.rows)
+        # Many-to-one (PK–FK) detection for *composite* keys. A composite key's
+        # combination ndv is the damped product capped at the side's rows; when it
+        # saturates (≈ rows) that side's key is plausibly unique, so the join is
+        # many-to-one and the FK side is preserved — the result is ≈ the larger input.
+        # The Selinger ratio below would instead *under*-estimate this badly (the fact
+        # side's correlated key columns inflate its combination ndv, deflating the
+        # divisor's effect), which steered TPC-H Q9 into a needless 6M-row intermediate.
+        # Single keys keep the ratio (their ndv is measured directly, so it is accurate);
+        # a non-saturated composite is a genuine many-to-many join the ratio models well.
+        if len(node.left_keys) >= 2 and _composite_pk_fk(
+            left.rows, right.rows, left_ndv, right_ndv
+        ):
+            return RelStats(max(left.rows, right.rows), Provenance.DEFAULT)
         # Classic equi-join estimate: |L⋈R| ≈ |L|·|R| / max(ndv_lk, ndv_rk) when a
         # single key's distinct count is known. Without it, assume the key is
         # ~unique on the smaller side, so the result ≈ the larger side.
-        ndv = self._join_key_ndv(node, left.rows, right.rows)
-        if ndv is not None and ndv > 0:
-            return RelStats(left.rows * right.rows / ndv, Provenance.DEFAULT)
+        ndvs = [v for v in (left_ndv, right_ndv) if v is not None and v > 0]
+        if ndvs:
+            return RelStats(left.rows * right.rows / max(ndvs), Provenance.DEFAULT)
         return RelStats(max(left.rows, right.rows), Provenance.DEFAULT)
 
     # --- shared metadata accessors ----------------------------------------
@@ -363,53 +387,59 @@ class StatsEstimator:
         avg_known = sum(measured) / len(measured)
         return sum(widths.get(c, avg_known) for c in cols)
 
-    def _join_key_ndv(self, node: Join, left_rows: float, right_rows: float) -> float | None:
-        """`max(ndv)` over the join's two key *sets*, if either is fully known.
+    def _side_ndv(self, keys: tuple[str, ...], rows: float) -> float | None:
+        """Distinct count of one join side's key *set*, capped at its row count.
 
-        For a composite key, a side's distinct-combination count combines the
-        per-key ndvs with **exponential backoff** (largest at full weight, each
-        subsequent one dampened) rather than a raw product. The result lies between
-        `max_k ndv[k]` (the perfectly-correlated / functional-dependence floor — a
-        composite key is at least as distinct as its most-distinct column) and the
-        full product (the independence ceiling), and is capped at the side's rows —
-        a learned ndv reflects the *unfiltered* source, but a filtered input can't
-        carry more distinct keys than it has rows. The classic `|L|·|R| / max(ndv)`
-        estimate then uses whichever side is fully measured (max of the two when
-        both are). Returns `None` when neither side's full key set has learned
-        distinct counts, so the caller keeps its `max(rows)` fallback.
+        For a composite key, the per-key ndvs combine with **exponential backoff**
+        (largest at full weight, each subsequent one dampened) rather than a raw
+        product: real composite keys are usually correlated, so the independence
+        product overshoots. The result lies between `max_k ndv[k]` (the
+        perfectly-correlated / functional-dependence floor) and the full product (the
+        independence ceiling), capped at the side's rows — a learned ndv reflects the
+        *unfiltered* source, but a filtered input can't carry more distinct keys than
+        it has rows. Returns `None` when any key lacks a learned distinct count.
         """
-        if not node.left_keys or len(node.left_keys) != len(node.right_keys):
+        if not keys:
             return None
         ndv = self._ndv
-
-        def side_ndv(keys: list[str], rows: float) -> float | None:
-            if not all(k in ndv and ndv[k] > 0 for k in keys):
-                return None
-            # Damped combination: real composite keys are usually correlated, so the
-            # independence product overshoots. Sort distinct counts descending and
-            # apply diminishing exponents — interpolating between max (correlated)
-            # and product (independent).
-            per_key = sorted((ndv[k] for k in keys), reverse=True)
-            combined = 1.0
-            exponent = 1.0
-            for d in per_key:
-                combined *= d**exponent
-                exponent /= 2.0
-            return min(combined, rows)
-
-        candidates = [
-            c
-            for c in (
-                side_ndv(node.left_keys, left_rows),
-                side_ndv(node.right_keys, right_rows),
-            )
-            if c is not None
-        ]
-        return max(candidates) if candidates else None
+        if not all(k in ndv and ndv[k] > 0 for k in keys):
+            return None
+        per_key = sorted((ndv[k] for k in keys), reverse=True)
+        combined = 1.0
+        exponent = 1.0
+        for d in per_key:
+            combined *= d**exponent
+            exponent /= 2.0
+        return min(combined, rows)
 
     def input_sizes(self, node: Join) -> tuple[RelStats, RelStats]:
         """The estimated sizes of a join's two inputs (for build-side choice)."""
         return self.estimate(node.left), self.estimate(node.right)
+
+
+# A composite join key is treated as unique (a candidate key) when its distinct-count
+# estimate reaches this fraction of its rows — allowing for the ndv sketch's ~1% error
+# and a lightly-filtered dimension.
+_UNIQUE_KEY_NDV_RATIO = 0.95
+
+
+def _composite_pk_fk(
+    left_rows: float,
+    right_rows: float,
+    left_ndv: float | None,
+    right_ndv: float | None,
+) -> bool:
+    """Whether a composite-key join is many-to-one (one side's key plausibly unique).
+
+    True when either side's (capped) combination ndv saturates its row count — that
+    side's composite key is then ~unique, so each row of the other side matches at most
+    one, and the result is the FK side's rows (the caller uses `max(left, right)`).
+    """
+
+    def saturated(ndv: float | None, rows: float) -> bool:
+        return ndv is not None and rows > 0 and ndv >= _UNIQUE_KEY_NDV_RATIO * rows
+
+    return saturated(left_ndv, left_rows) or saturated(right_ndv, right_rows)
 
 
 def _join_provably_empty(join_type: str, left: RelStats, right: RelStats) -> bool:

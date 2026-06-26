@@ -22,7 +22,8 @@ import pyarrow as pa
 
 from batcher._internal.registry import Registry
 from batcher.api._join_helpers import _empty_schema
-from batcher.api.orchestration import _collect_source_metadata, run_relational
+from batcher.api.orchestration import run_relational
+from batcher.api.terminal._metadata import collect_source_metadata
 from batcher.core import ExecutionContext, Executor
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
@@ -58,7 +59,7 @@ class DistributedExecutor:
                 envelope=envelope,
                 hub=ctx.hub,
             )
-            _collect_source_metadata(ctx.hub, sources)
+            collect_source_metadata(ctx.hub, sources)
             return table
         # Relational distributed result — deterministic and identical to single-node,
         # so it shares the same result cache (`Dataset.cache()`).
@@ -81,7 +82,7 @@ class UdfExecutor:
         batches = core.execute_with_udfs(plan, sources)
         schema = batches[0].schema if batches else _empty_schema(ctx.columns)
         table = pa.Table.from_batches(batches, schema=schema)
-        _collect_source_metadata(ctx.hub, sources)
+        collect_source_metadata(ctx.hub, sources)
         return table
 
 

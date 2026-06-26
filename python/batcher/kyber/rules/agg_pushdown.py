@@ -19,7 +19,14 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.rules.joins import _right_unique_on_keys
-from batcher.plan.expr_ir import AggExpr, Col
+from batcher.plan.expr_ir import (
+    AggExpr,
+    Coalesce,
+    Col,
+    Lit,
+    referenced_columns,
+    remap_columns,
+)
 from batcher.plan.logical import (
     Aggregate,
     AggregateSpec,
@@ -30,7 +37,20 @@ from batcher.plan.logical import (
 )
 from batcher.plan.stats import Provenance
 
-__all__ = ["eager_aggregation", "pre_aggregation_through_join"]
+__all__ = [
+    "eager_aggregation",
+    "pre_aggregate_join_measures",
+    "pre_aggregation_through_join",
+]
+
+# Pushing the *measure* (right) side of a join down: each decomposable aggregate and the
+# function that merges its per-key partials. `avg`/`median`/`distinct` are excluded —
+# they cannot be recombined from a single partial column.
+_MEASURE_MERGE = {"sum": "sum", "count": "sum", "min": "min", "max": "max"}
+# On a LEFT join, an unmatched left row has a NULL partial. For `count` the empty result
+# must be 0 (count over no rows is 0); for `sum`/`min`/`max` it is NULL (their identity),
+# which a SUM/MIN/MAX over the group already produces — so only `count` needs a coalesce.
+_MEASURE_ZERO_ON_EMPTY = frozenset({"count"})
 
 # Aggregates idempotent under row duplication — safe to push below any-fan-out join.
 _FANOUT_SAFE_AGGS = frozenset({"min", "max"})
@@ -203,6 +223,125 @@ def pre_aggregation_through_join(node: Aggregate, ctx: OptimizerContext) -> Logi
     )
     final_aggs = tuple(
         AggregateSpec(spec.alias, AggExpr(_PREAGG_MERGE[spec.agg.func], Col(f"__pre_{i}")))
+        for i, spec in enumerate(node.aggregates)
+    )
+    return Aggregate(new_join, node.group_keys, final_aggs)
+
+
+@rule(name="pre_aggregate_join_measures", phase=Phase.REWRITE, matches=(Aggregate,))
+def pre_aggregate_join_measures(node: Aggregate, ctx: OptimizerContext) -> LogicalPlan | None:
+    """Pre-aggregate the *measure* (right) side of a join, grouped by the join key.
+
+    The aggregates all reference one join side (the *measure* side); the group keys
+    reference the *other* side. Pre-aggregating the measure side by its join key shrinks
+    the join's input to one row per key, so the join no longer materialises the full
+    fan-out before the group-by. Two canonical shapes:
+
+    * **measure on the right** — `customer LEFT JOIN orders GROUP BY c_custkey,
+      COUNT(o_orderkey)` (TPC-H Q13): pre-aggregate orders by `o_custkey`.
+    * **measure on the left** — `lineitem JOIN orders GROUP BY o_orderpriority,
+      SUM(l_extendedprice*(1-l_discount))` (the operator-mix join→agg): pre-aggregate
+      lineitem by `l_orderkey` (the aggregate input may be a *computed expression* over
+      the measure side, not just a bare column).
+
+    Correctness for **any** fan-out: pre-aggregating the measure side makes it unique on
+    the join key, and the outer aggregate recombines the partials (COUNT→SUM, SUM→SUM,
+    MIN→MIN, MAX→MAX) — so duplicating a partial across N rows of the other side and then
+    re-summing reproduces the direct result. For a LEFT join an unmatched left row gets a
+    NULL partial; only `count` coalesces it to 0 (empty count is 0; empty sum/min/max is
+    NULL, which the merge already yields). To keep the LEFT semantics simple the measure
+    side must be the **right** (non-preserved) side on a left join. Group keys are plain
+    columns of the group side; single equi-key; cost-gated on a measured row reduction
+    (also what makes it idempotent — a second push finds the measure side already unique).
+    """
+    join = node.input
+    if not isinstance(join, Join) or join.join_type not in {"inner", "left"} or not node.aggregates:
+        return None
+    if len(join.left_keys) != 1 or len(join.right_keys) != 1:
+        return None  # single equi-key only (conservative)
+    out_map = {o.alias: o for o in join.output}
+    side_aliases = {
+        "left": {a for a, o in out_map.items() if o.side == "left"},
+        "right": {a for a, o in out_map.items() if o.side == "right"},
+    }
+
+    # Every aggregate must be a decomposable function whose input references exactly one
+    # side — that single side is the measure side to pre-aggregate.
+    measure_side: str | None = None
+    for spec in node.aggregates:
+        agg = spec.agg
+        if agg.func not in _MEASURE_MERGE or agg.input2 is not None or agg.input is None:
+            return None
+        cols = referenced_columns(agg.input)
+        side = next((s for s in ("left", "right") if cols and cols <= side_aliases[s]), None)
+        if side is None:
+            return None  # input is constant, or spans both sides
+        if measure_side is None:
+            measure_side = side
+        elif measure_side != side:
+            return None  # aggregates reference different sides
+    group_side = "left" if measure_side == "right" else "right"
+
+    # Group keys: plain columns of the group side.
+    for key in node.group_keys:
+        if not isinstance(key.expr, Col) or key.expr.name not in side_aliases[group_side]:
+            return None
+
+    # On a LEFT join only the right (non-preserved) side may be pre-aggregated.
+    if join.join_type == "left" and measure_side != "right":
+        return None
+
+    m_input = join.left if measure_side == "left" else join.right
+    m_key = (join.left_keys if measure_side == "left" else join.right_keys)[0]
+    alias_to_src = {a: out_map[a].name for a in side_aliases[measure_side]}
+
+    # Partial aggregate on the measure side: group by its join key, the (remapped to
+    # source columns) aggregate expressions.
+    partials = tuple(
+        AggregateSpec(
+            f"__pm_{i}", AggExpr(spec.agg.func, remap_columns(spec.agg.input, alias_to_src))
+        )
+        for i, spec in enumerate(node.aggregates)
+    )
+    pushed = Aggregate(m_input, (Projection(m_key, Col(m_key)),), partials)
+
+    # Cost gate: fire only on a *measured* reduction of the measure side (a learned `ndv`,
+    # not the estimator's default), so a stats-less plan never pushes a pointless
+    # group-by and a second push (measure side already unique) is a no-op.
+    pushed_stats = ctx.estimator.estimate(pushed)
+    if pushed_stats.provenance is Provenance.DEFAULT:
+        return None
+    if not pushed_stats.rows < ctx.estimator.estimate(m_input).rows:
+        return None
+
+    # New join: keep the group side's outputs (the group keys read them); replace the
+    # measure side's outputs with the partial-aggregate columns.
+    new_output = [o for o in join.output if o.side == group_side]
+    new_output += [
+        JoinOutputCol(measure_side, f"__pm_{i}", f"__pm_{i}") for i in range(len(partials))
+    ]
+    if measure_side == "left":
+        new_join = Join(
+            pushed, join.right, (m_key,), join.right_keys, join.join_type, tuple(new_output)
+        )
+    else:
+        new_join = Join(
+            join.left, pushed, join.left_keys, (m_key,), join.join_type, tuple(new_output)
+        )
+
+    # A LEFT join's unmatched (left) rows carry a NULL measure-side partial here (measure
+    # is always the right side on a left join), so `count` coalesces to 0.
+    coalesce_empty = join.join_type == "left"
+    final_aggs = tuple(
+        AggregateSpec(
+            spec.alias,
+            AggExpr(
+                _MEASURE_MERGE[spec.agg.func],
+                Coalesce([Col(f"__pm_{i}"), Lit(0)])
+                if coalesce_empty and spec.agg.func in _MEASURE_ZERO_ON_EMPTY
+                else Col(f"__pm_{i}"),
+            ),
+        )
         for i, spec in enumerate(node.aggregates)
     )
     return Aggregate(new_join, node.group_keys, final_aggs)

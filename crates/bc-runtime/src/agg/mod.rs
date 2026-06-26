@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Int64Array, UInt32Array};
 use arrow::datatypes::{
-    ArrowPrimitiveType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    ArrowPrimitiveType, BinaryType, Int16Type, Int32Type, Int64Type, Int8Type, LargeBinaryType,
+    LargeUtf8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
 };
 use arrow::row::{RowConverter, SortField};
 use hashbrown::hash_table::Entry;
@@ -301,6 +301,12 @@ pub(crate) fn assign_groups(
             DataType::UInt16 => return assign_groups_int::<UInt16Type>(arr, num_rows),
             DataType::UInt32 => return assign_groups_int::<UInt32Type>(arr, num_rows),
             DataType::UInt64 => return assign_groups_int::<UInt64Type>(arr, num_rows),
+            // String/binary keys hash their bytes directly, the same win as the integer
+            // path — a `GROUP BY <status/category/region>` is exactly this shape.
+            DataType::Utf8 => return assign_groups_bytes::<Utf8Type>(arr, num_rows),
+            DataType::LargeUtf8 => return assign_groups_bytes::<LargeUtf8Type>(arr, num_rows),
+            DataType::Binary => return assign_groups_bytes::<BinaryType>(arr, num_rows),
+            DataType::LargeBinary => return assign_groups_bytes::<LargeBinaryType>(arr, num_rows),
             _ => {}
         }
     }
@@ -358,6 +364,59 @@ where
     T::Native: std::hash::Hash + Eq,
 {
     let a = arr.as_primitive::<T>();
+    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
+    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
+    let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
+    let mut group_ids = Vec::with_capacity(num_rows);
+    let mut null_gid: Option<u32> = None;
+
+    for i in 0..num_rows {
+        if a.is_null(i) {
+            let gid = *null_gid.get_or_insert_with(|| {
+                let g = reps.len() as u32;
+                reps.push(i as u32);
+                g
+            });
+            group_ids.push(gid);
+            continue;
+        }
+        let v = a.value(i);
+        let hash = state.hash_one(v);
+        // The table holds only non-null groups, so a rep is always a valid value.
+        let gid = match table.entry(
+            hash,
+            |&g| a.value(reps[g as usize] as usize) == v,
+            |&g| state.hash_one(a.value(reps[g as usize] as usize)),
+        ) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let gid = reps.len() as u32;
+                reps.push(i as u32);
+                e.insert(gid);
+                gid
+            }
+        };
+        group_ids.push(gid);
+    }
+
+    let num_groups = reps.len();
+    let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
+    Ok((group_ids, num_groups, group_columns))
+}
+
+/// Single string/binary-key `assign_groups`: hash each value's bytes directly (no row
+/// encoding), the byte-keyed analog of [`assign_groups_int`]. Nulls form one group
+/// (SQL semantics); the output key column is the representative rows `take`n from the
+/// input, so the type and nulls carry through.
+fn assign_groups_bytes<T>(
+    arr: &ArrayRef,
+    num_rows: usize,
+) -> Result<(Vec<u32>, usize, Vec<ArrayRef>), RuntimeError>
+where
+    T: arrow::array::types::ByteArrayType,
+    for<'a> &'a T::Native: std::hash::Hash + Eq,
+{
+    let a = arr.as_bytes::<T>();
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
     let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
     let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
@@ -730,6 +789,75 @@ mod tests {
     }
     fn strs(v: &[&str]) -> ArrayRef {
         Arc::new(StringArray::from(v.to_vec()))
+    }
+
+    /// The native-value fast paths (single string, multi-column) must assign exactly the
+    /// same groups — same partition of rows, same group count — as the row-encoder
+    /// fallback. Verified by comparing the group *partition* each path induces (the
+    /// group ids are dense but their numbering may differ, so compare the equivalence
+    /// relation: two rows share a group under one iff they do under the other).
+    fn same_partition(a: &[u32], b: &[u32]) {
+        assert_eq!(a.len(), b.len(), "row count");
+        for i in 0..a.len() {
+            for j in 0..a.len() {
+                assert_eq!(
+                    a[i] == a[j],
+                    b[i] == b[j],
+                    "rows {i},{j} disagree on co-grouping"
+                );
+            }
+        }
+    }
+
+    fn via_row_encoder(keys: &[ArrayRef], n: usize) -> (Vec<u32>, usize) {
+        let fields: Vec<SortField> = keys
+            .iter()
+            .map(|a| SortField::new(a.data_type().clone()))
+            .collect();
+        let conv = RowConverter::new(fields).unwrap();
+        let rows = conv.convert_columns(keys).unwrap();
+        let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
+        let mut table: HashTable<u32> = HashTable::with_capacity(n.max(1));
+        let mut reps: Vec<u32> = Vec::new();
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let row_i = rows.row(i);
+            let h = state.hash_one(row_i);
+            let gid = match table.entry(
+                h,
+                |&g| rows.row(reps[g as usize] as usize) == row_i,
+                |&g| state.hash_one(rows.row(reps[g as usize] as usize)),
+            ) {
+                Entry::Occupied(e) => *e.get(),
+                Entry::Vacant(e) => {
+                    let g = reps.len() as u32;
+                    reps.push(i as u32);
+                    e.insert(g);
+                    g
+                }
+            };
+            ids.push(gid);
+        }
+        (ids, reps.len())
+    }
+
+    #[test]
+    fn string_fast_path_matches_row_encoder() {
+        // A single Utf8 key with a null and repeats — the byte fast path must induce the
+        // same group partition as the row-encoder oracle (group ids may be renumbered).
+        let keys: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("b"),
+            Some("a"),
+            None,
+            Some("b"),
+            None,
+        ])) as ArrayRef];
+        let n = keys[0].len();
+        let (fast_ids, fast_n, _) = assign_groups(&keys, n).unwrap();
+        let (slow_ids, slow_n) = via_row_encoder(&keys, n);
+        assert_eq!(fast_n, slow_n, "group count");
+        same_partition(&fast_ids, &slow_ids);
     }
 
     const FUNCS: [AggFunc; 5] = [

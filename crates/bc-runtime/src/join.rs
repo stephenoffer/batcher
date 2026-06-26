@@ -140,25 +140,153 @@ pub(crate) fn hash_join_indices_impl(
 ) -> Result<JoinIndices, RuntimeError> {
     let left_rows = left_keys.first().map_or(0, |a| a.len());
     let right_rows = right_keys.first().map_or(0, |a| a.len());
+    let left_null = null_mask(left_keys, left_rows);
+    let right_null = null_mask(right_keys, right_rows);
 
-    // Encode both sides' keys with one shared converter (key types must align).
+    // Fast path: a single integer key column hashes/compares its native values
+    // directly, skipping the `RowConverter` encoding pass (a per-row allocation +
+    // copy, plus a byte-slice compare on every chain walk) the general path needs for
+    // multi-column / variable-length / float keys. This is the dominant join shape in
+    // analytical workloads (a fact joined to a dimension on an integer id). The
+    // *same* `build_probe` loop drives both paths, so the int path is bit-identical to
+    // the row-encoded oracle by construction — only the key accessor differs.
+    if let Some(keys) = I64Keys::try_new(left_keys, right_keys) {
+        return Ok(build_probe(
+            &keys,
+            left_rows,
+            right_rows,
+            &left_null,
+            &right_null,
+            join_type,
+            use_bloom,
+            bloom_fp_rate,
+        ));
+    }
+
+    // General path: encode both sides' keys with one shared converter (types align).
     let fields: Vec<SortField> = right_keys
         .iter()
         .map(|a| SortField::new(a.data_type().clone()))
         .collect();
     let converter = RowConverter::new(fields)?;
-    let right_encoded = converter.convert_columns(right_keys)?;
-    let left_encoded = converter.convert_columns(left_keys)?;
+    let keys = RowKeys {
+        right: converter.convert_columns(right_keys)?,
+        left: converter.convert_columns(left_keys)?,
+    };
+    Ok(build_probe(
+        &keys,
+        left_rows,
+        right_rows,
+        &left_null,
+        &right_null,
+        join_type,
+        use_bloom,
+        bloom_fp_rate,
+    ))
+}
 
-    let left_null = null_mask(left_keys, left_rows);
-    let right_null = null_mask(right_keys, right_rows);
+/// Key access for the hash-join build/probe: how to hash a build (right) or probe
+/// (left) row and how to compare two rows for equality. One trait, two
+/// implementations (row-encoded for any type, raw `i64` for the integer fast path),
+/// so a single [`build_probe`] loop produces an identical result either way — equal
+/// keys on the two sides hash equally within an implementation, which is all the join
+/// needs.
+trait JoinKeys {
+    fn hash_right(&self, state: &ahash::RandomState, i: usize) -> u64;
+    fn hash_left(&self, state: &ahash::RandomState, i: usize) -> u64;
+    /// Whether build rows `a` and `b` carry the same key (chain comparison).
+    fn right_eq_right(&self, a: usize, b: usize) -> bool;
+    /// Whether build row `r` and probe row `l` carry the same key (probe comparison).
+    fn right_eq_left(&self, r: usize, l: usize) -> bool;
+}
 
-    // Build a chained hash table over the right (build) side, keyed by *row index*.
-    // Encoded rows are compared by borrow, so there is no per-row owned-key
-    // allocation (the same trick as `agg::assign_groups`). `heads` maps a key to the
-    // head of a singly-linked chain of right-row indices sharing that key; `next`
-    // threads the rest (`u32::MAX` terminates). Null-key rows are skipped — they
-    // never match (NULL ≠ NULL).
+/// Row-encoded keys (the general path): equal keys produce equal byte rows, so they
+/// hash and compare correctly across any number of columns and any type.
+struct RowKeys {
+    right: Rows,
+    left: Rows,
+}
+
+impl JoinKeys for RowKeys {
+    fn hash_right(&self, state: &ahash::RandomState, i: usize) -> u64 {
+        state.hash_one(self.right.row(i))
+    }
+    fn hash_left(&self, state: &ahash::RandomState, i: usize) -> u64 {
+        state.hash_one(self.left.row(i))
+    }
+    fn right_eq_right(&self, a: usize, b: usize) -> bool {
+        self.right.row(a) == self.right.row(b)
+    }
+    fn right_eq_left(&self, r: usize, l: usize) -> bool {
+        self.right.row(r) == self.left.row(l)
+    }
+}
+
+/// Raw `i64` keys (the fast path): a single `Int64` key column on each side. Narrow
+/// integer types are normalized to `Int64` at the FFI boundary, so this covers the
+/// common integer-id join without the row-format detour.
+struct I64Keys<'a> {
+    right: &'a [i64],
+    left: &'a [i64],
+}
+
+impl<'a> I64Keys<'a> {
+    /// `Some` when both sides are exactly one `Int64` column — the fast-path shape.
+    fn try_new(left_keys: &'a [ArrayRef], right_keys: &'a [ArrayRef]) -> Option<Self> {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::DataType;
+        if left_keys.len() != 1 || right_keys.len() != 1 {
+            return None;
+        }
+        if left_keys[0].data_type() != &DataType::Int64
+            || right_keys[0].data_type() != &DataType::Int64
+        {
+            return None;
+        }
+        let left = left_keys[0].as_any().downcast_ref::<Int64Array>()?;
+        let right = right_keys[0].as_any().downcast_ref::<Int64Array>()?;
+        // `values()` is the raw slice; null rows are masked out by the null mask in
+        // `build_probe`, so a null slot's arbitrary value is never hashed or compared.
+        Some(Self {
+            right: right.values(),
+            left: left.values(),
+        })
+    }
+}
+
+impl JoinKeys for I64Keys<'_> {
+    fn hash_right(&self, state: &ahash::RandomState, i: usize) -> u64 {
+        state.hash_one(self.right[i])
+    }
+    fn hash_left(&self, state: &ahash::RandomState, i: usize) -> u64 {
+        state.hash_one(self.left[i])
+    }
+    fn right_eq_right(&self, a: usize, b: usize) -> bool {
+        self.right[a] == self.right[b]
+    }
+    fn right_eq_left(&self, r: usize, l: usize) -> bool {
+        self.right[r] == self.left[l]
+    }
+}
+
+/// Build a chained hash table over the right (build) side, probe with the left, and
+/// emit the index pairs. Shared by every key representation via [`JoinKeys`]; the
+/// loop — including null handling, bloom pre-filtering, chain walking, and unmatched
+/// emission for each join type — is written exactly once, so all paths agree.
+#[allow(clippy::too_many_arguments)]
+fn build_probe<K: JoinKeys>(
+    keys: &K,
+    left_rows: usize,
+    right_rows: usize,
+    left_null: &[bool],
+    right_null: &[bool],
+    join_type: JoinType,
+    use_bloom: bool,
+    bloom_fp_rate: f64,
+) -> JoinIndices {
+    // `heads` maps a key to the head of a singly-linked chain of right-row indices
+    // sharing that key; `next` threads the rest (`u32::MAX` terminates). Null-key rows
+    // are skipped — they never match (NULL ≠ NULL).
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
     let mut heads: HashTable<u32> = HashTable::with_capacity(right_rows);
     let mut next: Vec<u32> = vec![u32::MAX; right_rows];
@@ -169,15 +297,14 @@ pub(crate) fn hash_join_indices_impl(
         if is_null {
             continue;
         }
-        let row_i = right_encoded.row(i);
-        let hash = state.hash_one(row_i);
+        let hash = keys.hash_right(&state, i);
         if let Some(b) = bloom.as_mut() {
             b.add_hash(hash);
         }
         match heads.entry(
             hash,
-            |&h| right_encoded.row(h as usize) == row_i,
-            |&h| state.hash_one(right_encoded.row(h as usize)),
+            |&h| keys.right_eq_right(h as usize, i),
+            |&h| keys.hash_right(&state, h as usize),
         ) {
             // Prepend i to the chain — order within a key is irrelevant (the join
             // output is an unordered relation).
@@ -206,15 +333,14 @@ pub(crate) fn hash_join_indices_impl(
         let head = if is_null {
             None
         } else {
-            let row_i = left_encoded.row(i);
-            let hash = state.hash_one(row_i);
+            let hash = keys.hash_left(&state, i);
             // A bloom miss is definitive (no false negatives): the key is not on the
             // build side, so the chain is provably empty — skip the hash-table lookup.
             if bloom.as_ref().is_some_and(|b| !b.contains_hash(hash)) {
                 None
             } else {
                 heads
-                    .find(hash, |&h| right_encoded.row(h as usize) == row_i)
+                    .find(hash, |&h| keys.right_eq_left(h as usize, i))
                     .copied()
             }
         };
@@ -267,10 +393,10 @@ pub(crate) fn hash_join_indices_impl(
         }
     }
 
-    Ok(JoinIndices {
+    JoinIndices {
         left: UInt32Array::from(left_out),
         right: UInt32Array::from(right_out),
-    })
+    }
 }
 
 /// Sort `idx` into ascending encoded-key order, skipping the sort when the indices
@@ -547,6 +673,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::Int64Array;
+    use arrow::datatypes::DataType;
 
     fn keys(v: &[i64]) -> Vec<ArrayRef> {
         vec![Arc::new(Int64Array::from(v.to_vec())) as ArrayRef]
@@ -658,6 +785,56 @@ mod tests {
         let mut p = pairs(idx);
         p.sort();
         p
+    }
+
+    /// The single-`Int64`-key fast path (`I64Keys`) must produce exactly the relation
+    /// the row-encoded path (`RowKeys`) does, for every join type — including duplicate
+    /// keys (cross products), unmatched rows, and null keys. Driving `build_probe` with
+    /// each key implementation over the same inputs pins that equivalence directly.
+    #[test]
+    fn i64_fast_path_matches_row_encoded() {
+        let left: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
+            Some(1),
+            Some(2),
+            Some(2),
+            None,
+            Some(7),
+        ]))];
+        let right: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
+            Some(2),
+            Some(2),
+            Some(3),
+            None,
+            Some(1),
+        ]))];
+        let ln = null_mask(&left, 5);
+        let rn = null_mask(&right, 5);
+        let i64keys = I64Keys::try_new(&left, &right).expect("both single Int64");
+        let fields = vec![SortField::new(DataType::Int64)];
+        let conv = RowConverter::new(fields).unwrap();
+        let rowkeys = RowKeys {
+            right: conv.convert_columns(&right).unwrap(),
+            left: conv.convert_columns(&left).unwrap(),
+        };
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            // Exercise both with and without the probe bloom (a pure short-circuit).
+            for bloom in [false, true] {
+                let fast = build_probe(&i64keys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                let slow = build_probe(&rowkeys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                assert_eq!(
+                    sorted_pairs(&fast),
+                    sorted_pairs(&slow),
+                    "i64 vs row mismatch for {jt:?} bloom={bloom}"
+                );
+            }
+        }
     }
 
     /// Sort-merge join must produce the same relation as the hash-join oracle for

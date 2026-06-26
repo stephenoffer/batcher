@@ -423,3 +423,23 @@ def optimize_traced(
 ) -> tuple[PhysicalPlan, list[BuildSideDecision]]:
     """Convenience wrapper around `Optimizer.optimize_traced`."""
     return Optimizer(config, sources, hub, source_stats=source_stats).optimize_traced(logical)
+
+
+def optimize_logical(
+    logical: LogicalPlan,
+    config: Config | None = None,
+    sources: list | None = None,
+    hub: MetadataHub | None = None,
+    source_stats: list | None = None,
+) -> LogicalPlan:
+    """Run every optimizer phase but return the optimized **logical** plan, not its IR.
+
+    The adaptive executor splits a plan at its pipeline breakers and re-optimizes each
+    stage with measured cardinalities. It must start from the optimized logical
+    structure — join conditions derived from `WHERE` equalities, predicates pushed,
+    joins reordered — or a stage subtree taken from the *raw* plan can omit the filter
+    that constrains a cross join and execute a cartesian product. This is that
+    structure (the same `_run` `optimize`/`optimize_traced` use, stopping before the
+    PhysicalPlan wrapping so the loop can still splice `Scan`s into it).
+    """
+    return Optimizer(config, sources, hub, source_stats=source_stats).logical_rewrite(logical)

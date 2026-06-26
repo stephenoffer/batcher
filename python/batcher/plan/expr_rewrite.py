@@ -61,8 +61,10 @@ from batcher.plan.logical import (
 
 __all__ = [
     "combine_conjuncts",
+    "combine_disjuncts",
     "map_node_expressions",
     "split_conjuncts",
+    "split_disjuncts",
     "substitute_columns",
     "transform_expr_up",
 ]
@@ -90,6 +92,29 @@ def combine_conjuncts(exprs: list[Expr]) -> Expr:
     out = exprs[0]
     for e in exprs[1:]:
         out = Binary("and", out, e)
+    return out
+
+
+def split_disjuncts(expr: Expr) -> list[Expr]:
+    """Flatten a top-level `OR` chain into its disjuncts (a non-OR yields `[expr]`).
+
+    The inverse of `combine_disjuncts`; the `OR` analogue of `split_conjuncts`, used to
+    factor a conjunct common to every branch of a disjunction out of the `OR`."""
+    if isinstance(expr, Binary) and expr.op == "or":
+        return split_disjuncts(expr.left) + split_disjuncts(expr.right)
+    return [expr]
+
+
+def combine_disjuncts(exprs: list[Expr]) -> Expr:
+    """Combine a non-empty list of expressions into a left-deep `OR` chain.
+
+    The inverse of `split_disjuncts`; raises on an empty list (no neutral disjunct
+    exists without inventing a literal)."""
+    if not exprs:
+        raise ValueError("combine_disjuncts requires at least one expression")
+    out = exprs[0]
+    for e in exprs[1:]:
+        out = Binary("or", out, e)
     return out
 
 

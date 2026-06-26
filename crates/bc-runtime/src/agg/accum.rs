@@ -40,20 +40,22 @@ pub(crate) fn sum_acc(
         DataType::Float64 => {
             let arr = values.as_primitive::<Float64Type>();
             let mut sums = vec![0f64; num_groups];
-            let mut valid = vec![false; num_groups];
             if arr.null_count() == 0 {
                 // No-null fast path: gather straight from the values slice, skipping
-                // the per-row validity branch. This is the dominant SUM/AVG path.
+                // both the per-row validity branch *and* the per-row `valid` write —
+                // every group is non-empty (it exists because a row mapped to it) and
+                // has only non-null values, so all groups are valid. Removing the 6M
+                // redundant bool writes (per aggregate) is the dominant SUM/AVG path.
                 for (&g, &v) in group_ids.iter().zip(arr.values()) {
                     sums[g as usize] += v;
-                    valid[g as usize] = true;
                 }
-            } else {
-                for (i, &g) in group_ids.iter().enumerate() {
-                    if arr.is_valid(i) {
-                        sums[g as usize] += arr.value(i);
-                        valid[g as usize] = true;
-                    }
+                return Ok(Arc::new(masked_f64(sums, vec![true; num_groups])));
+            }
+            let mut valid = vec![false; num_groups];
+            for (i, &g) in group_ids.iter().enumerate() {
+                if arr.is_valid(i) {
+                    sums[g as usize] += arr.value(i);
+                    valid[g as usize] = true;
                 }
             }
             Ok(Arc::new(masked_f64(sums, valid)))

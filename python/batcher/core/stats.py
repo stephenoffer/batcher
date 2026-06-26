@@ -47,8 +47,9 @@ def column_statistics(
     try:
         import batcher._native as _native
 
-        stats = _native.column_stats(list(columns), batches)
-        quants = _native.column_quantiles(list(columns), batches, list(probs))
+        # One sketch pass for both summary stats and quantiles (the native side builds
+        # each column's HLL+KLL once), instead of two FFI calls that each rebuilt it.
+        stats, quants = _native.column_stats_full(list(columns), batches, list(probs))
     except Exception:  # pragma: no cover - measurement must never break execution
         return {}, {}, {}
 

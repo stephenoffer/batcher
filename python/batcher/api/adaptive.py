@@ -208,7 +208,18 @@ def _execute_adaptive(
     """The adaptive stage loop (one attempt). `_fault_inject_stage` is a test hook
     invoked with the live fleet after each intermediate stage, to exercise cross-stage
     worker loss."""
+    from batcher import kyber
+
     srcs = list(sources)
+    # Re-optimize each stage starting from the *optimized* logical structure, not the
+    # raw plan. A stage is a subtree rooted at a pipeline breaker; in the raw plan a
+    # join's condition can live in a `Filter` *above* that breaker (a comma/cross join
+    # whose `WHERE` equality has not yet been folded into the join keys), so splitting
+    # there would execute the join as a cartesian product. Folding keys, pushing
+    # predicates, and reordering joins over the whole plan first makes every breaker
+    # subtree self-contained — the per-stage loop then only refines cost-based choices
+    # with measured cardinalities. Holds for single-node and distributed alike.
+    plan = kyber.optimize_logical(plan, sources=srcs, hub=hub)
     decisions: list = []
     stages = 0
     intermediates: list = []  # partitioned-on-disk/Flight sources, cleaned up at the end
