@@ -33,6 +33,7 @@ use crate::error::RuntimeError;
 mod accum;
 mod argextreme;
 mod distinct;
+mod fused;
 mod hll;
 mod median;
 mod qsketch;
@@ -246,25 +247,37 @@ pub fn partial(
     num_rows: usize,
 ) -> Result<Partial, RuntimeError> {
     let (group_ids, num_groups, group_columns) = assign_groups(group_keys, num_rows)?;
+
+    // Fused fast path: the simple scalar aggregates (sum/count/min/max/mean) read
+    // `group_ids` *once* in a single fused scan instead of once per aggregate. It
+    // fills `slots[idx]` for the calls it fused (positions match `calls`) and leaves
+    // the rest `None` for the per-call loop below — so the result is identical, just
+    // with fewer passes over `group_ids`. A no-op when <2 calls are fusable.
+    let mut slots: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
+    fused::run_fused(calls, &group_ids, num_groups, &mut slots)?;
+
     let mut states = Vec::with_capacity(calls.len());
-    for call in calls {
-        let state = match call.func {
-            // Two-input: arg_min/arg_max need both the value and the ordering key.
-            AggFunc::ArgMin | AggFunc::ArgMax => arg_extreme_state(
-                require(call.values.as_ref(), call.func)?,
-                require(call.key.as_ref(), call.func)?,
-                &group_ids,
-                num_groups,
-                matches!(call.func, AggFunc::ArgMax),
-            )?,
-            // covar/corr are two-input: `values` is x, `key` carries y.
-            AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => covar_state(
-                require(call.values.as_ref(), call.func)?,
-                require(call.key.as_ref(), call.func)?,
-                &group_ids,
-                num_groups,
-            )?,
-            _ => accumulate(call.func, call.values.as_ref(), &group_ids, num_groups)?,
+    for (idx, call) in calls.iter().enumerate() {
+        let state = match slots[idx].take() {
+            Some(fused_state) => fused_state, // already computed in the fused scan
+            None => match call.func {
+                // Two-input: arg_min/arg_max need both the value and the ordering key.
+                AggFunc::ArgMin | AggFunc::ArgMax => arg_extreme_state(
+                    require(call.values.as_ref(), call.func)?,
+                    require(call.key.as_ref(), call.func)?,
+                    &group_ids,
+                    num_groups,
+                    matches!(call.func, AggFunc::ArgMax),
+                )?,
+                // covar/corr are two-input: `values` is x, `key` carries y.
+                AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => covar_state(
+                    require(call.values.as_ref(), call.func)?,
+                    require(call.key.as_ref(), call.func)?,
+                    &group_ids,
+                    num_groups,
+                )?,
+                _ => accumulate(call.func, call.values.as_ref(), &group_ids, num_groups)?,
+            },
         };
         states.push(state);
     }

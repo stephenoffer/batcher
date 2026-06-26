@@ -115,10 +115,34 @@ def _ray_init_kwargs(workers: int) -> dict:
     return kwargs
 
 
+def _neutralize_broken_runtime_env_hook() -> None:
+    """Drop a `RAY_RUNTIME_ENV_HOOK`/`RAY_RUNTIME_ENV_PLUGINS` whose module is missing.
+
+    A deployment env may export a runtime-env hook (e.g. Anyscale's
+    `cgroup_runtime_plugin`) that Ray imports during `ray.init`. When Batcher runs
+    *outside* that runtime the module is absent and `ray.init` raises
+    `ModuleNotFoundError` before any work starts. A hook pointing at an
+    unimportable module is broken regardless of context, so removing it is strictly
+    safer than crashing — and a no-op where the module is present (a real cluster)."""
+    import importlib.util
+    import os
+
+    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
+        value = os.environ.get(var)
+        if not value:
+            continue
+        # The leading dotted path before the first `.` / `[` names the module to import
+        # (`mod._hook`, or `[{"class": "mod.Plugin"}]` JSON). Probe just the base module.
+        head = value.lstrip("[{\"' ").split(".")[0].split("[")[0]
+        if head and importlib.util.find_spec(head) is None:
+            os.environ.pop(var, None)
+
+
 def _ensure_ray(workers: int) -> None:
     import ray
 
     if not ray.is_initialized():
+        _neutralize_broken_runtime_env_hook()
         ray.init(**_ray_init_kwargs(workers))
     _wrap_tasks(ray, task_options(current_envelope()))
 
