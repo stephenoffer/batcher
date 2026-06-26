@@ -29,6 +29,7 @@ from batcher.plan.logical import (
     Distinct,
     Filter,
     Join,
+    JoinOutputCol,
     Limit,
     LogicalPlan,
     Project,
@@ -45,6 +46,7 @@ __all__ = [
     "push_filter_through_aggregate",
     "push_filter_through_sort",
     "push_filter_through_window",
+    "push_semijoin_through_join",
     "rewrite_predicate",
 ]
 
@@ -249,6 +251,86 @@ def infer_join_predicates(node: Join, _ctx: OptimizerContext) -> LogicalPlan | N
         node.join_type,
         node.output,
         node.strategy,
+    )
+
+
+@rule(name="push_semijoin_through_join", phase=Phase.PUSHDOWN, matches=(Join,))
+def push_semijoin_through_join(node: Join, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """Sink a semi/anti join below an inner join, onto the child its keys come from.
+
+    `SemiJoin(InnerJoin(A, B) ON k, S) ON A.col` == `InnerJoin(SemiJoin(A, S) ON A.col, B) ON k`
+    A semi/anti join only *filters* its left input by key membership, and an inner
+    join preserves every surviving row's key columns — so filtering a child before the
+    join is identical to filtering the join's output (fan-out and all), but it shrinks
+    the expensive join's input. This is the classic optimization behind TPC-H Q18,
+    whose `o_orderkey IN (SELECT ... HAVING sum > 300)` semijoin sinks below the
+    `lineitem ⋈ orders` join so only the handful of qualifying orders reach it instead
+    of materializing the full 6M-row join and filtering afterward.
+
+    Restricted to an inner join below (an outer join's null-extended side would change
+    key membership), and only when the semijoin's keys all attribute to one child —
+    via the inner join's output map, so a renamed key resolves to its source column.
+    """
+    if node.join_type not in ("semi", "anti"):
+        return None
+    # Peel column-only ("transparent") projects between the semijoin and an inner
+    # join — projects are 1:1 on rows, so the semijoin commutes with them; remap the
+    # keys to each project's source columns as we descend, and re-apply the projects
+    # on top afterward (their output schema is unchanged by a filtering child).
+    projects: list[Project] = []
+    cur: LogicalPlan = node.left
+    keys: list[str] = list(node.left_keys)
+    while isinstance(cur, Project):
+        passthrough = {
+            item.alias: item.expr.name for item in cur.items if isinstance(item.expr, Col)
+        }
+        if any(k not in passthrough for k in keys):
+            return None  # a key is a computed column here — cannot attribute it
+        keys = [passthrough[k] for k in keys]
+        projects.append(cur)
+        cur = cur.input
+    if not isinstance(cur, Join) or cur.join_type != "inner":
+        return None
+    inner = cur
+    # Resolve each semijoin key (an alias in the inner join's output) to the child
+    # side + source column it came from; all must land on the same side.
+    out_by_alias = {o.alias: o for o in inner.output}
+    sides: set[str] = set()
+    src_keys: list[str] = []
+    for k in keys:
+        col = out_by_alias.get(k)
+        if col is None:
+            return None  # key is not a pass-through column — cannot attribute it
+        sides.add(col.side)
+        src_keys.append(col.name)
+    if len(sides) != 1:
+        return None  # keys span both children — cannot push to one side
+    on_left = sides.pop() == "left"
+    target = inner.left if on_left else inner.right
+    pushed = _semijoin_onto(target, node, tuple(src_keys))
+    result: LogicalPlan = Join(
+        pushed if on_left else inner.left,
+        inner.right if on_left else pushed,
+        inner.left_keys,
+        inner.right_keys,
+        inner.join_type,
+        inner.output,
+        inner.strategy,
+    )
+    for project in reversed(projects):
+        result = Project(result, project.items)
+    return result
+
+
+def _semijoin_onto(target: LogicalPlan, semi: Join, left_keys: tuple[str, ...]) -> Join:
+    """Rebuild `semi` (a semi/anti join) filtering `target` on `target`'s own key names.
+
+    The output is `target`'s columns unchanged (a semi/anti join adds none), so the
+    inner join above still sees the same schema after the push.
+    """
+    output = tuple(JoinOutputCol("left", c, c) for c in target.available_columns())
+    return Join(
+        target, semi.right, left_keys, semi.right_keys, semi.join_type, output, semi.strategy
     )
 
 
