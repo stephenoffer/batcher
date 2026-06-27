@@ -65,6 +65,25 @@ fn distinct_pairs_to_list(
     num_groups: usize,
 ) -> Result<ArrayRef, RuntimeError> {
     let n = values.len();
+    // Fast path: an `Int64` value column (the common `count(distinct <int id>)`, e.g.
+    // TPC-H Q16's `count(distinct ps_suppkey)`) dedups the raw `(group, value)` pairs
+    // through a hash set, skipping the `RowConverter` encoding the general path runs
+    // over every row. First-seen order is preserved (matching `assign_groups`), so the
+    // bucketed lists are identical.
+    if let Some(vals) = values.as_any().downcast_ref::<Int64Array>() {
+        let grp = groups.as_primitive::<Int64Type>();
+        let mut seen: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+        let (mut dgroups, mut dvalues): (Vec<i64>, Vec<i64>) = (Vec::new(), Vec::new());
+        for i in 0..n {
+            let pair = (grp.value(i), vals.value(i));
+            if seen.insert(pair) {
+                dgroups.push(pair.0);
+                dvalues.push(pair.1);
+            }
+        }
+        let distinct_values: ArrayRef = Arc::new(Int64Array::from(dvalues));
+        return bucket_values_into_list(&Int64Array::from(dgroups), &distinct_values, num_groups);
+    }
     let (_ids, _n_pairs, pair_cols) = assign_groups(&[groups, values], n)?;
     let distinct_groups = pair_cols[0].as_primitive::<Int64Type>();
     bucket_values_into_list(distinct_groups, &pair_cols[1], num_groups)
