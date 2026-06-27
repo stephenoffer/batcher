@@ -45,8 +45,11 @@ pub(crate) fn eval_str(
         }
         StrFunc::Substr => {
             // SQL semantics: 1-based start; `length` optional (to end of string).
+            // Borrowing variant: the result is always a slice of the input, so it
+            // avoids the per-row `Vec<char>` + `String` allocation the generic
+            // `map_str` closure would force (the array builder copies the slices once).
             let start = start.unwrap_or(1);
-            Arc::new(map_str(s, |v| substr(v, start, length)))
+            Arc::new(map_str_borrow(s, |v| substr_slice(v, start, length)))
         }
         StrFunc::Replace => {
             let pat = require_pattern(pattern, func)?;
@@ -580,6 +583,13 @@ fn map_str(s: &StringArray, f: impl Fn(&str) -> String) -> StringArray {
     s.iter().map(|o| o.map(&f)).collect()
 }
 
+/// `map_str` for functions whose result is a *slice* of the input row (e.g.
+/// `substr`): no per-row `String` allocation — the builder copies each `&str` into
+/// the output's one contiguous buffer.
+fn map_str_borrow<'a>(s: &'a StringArray, f: impl Fn(&'a str) -> &'a str) -> StringArray {
+    s.iter().map(|o| o.map(&f)).collect()
+}
+
 fn map_bool(s: &StringArray, f: impl Fn(&str) -> bool) -> BooleanArray {
     s.iter().map(|o| o.map(&f)).collect()
 }
@@ -593,9 +603,12 @@ fn map_bool(s: &StringArray, f: impl Fn(&str) -> bool) -> BooleanArray {
 /// then clipped to `[1, n]` (out-of-range positions are dropped, not shifted), so
 /// e.g. `substring('abcdef', 0, 3)` = `'ab'` and `substring('abcdef', -2, 4)` =
 /// `'ef'`. An empty intersection yields `""`.
-fn substr(v: &str, start: i64, length: Option<i64>) -> String {
-    let chars: Vec<char> = v.chars().collect();
-    let n = chars.len() as i64;
+/// `substr`/`substring` (DuckDB semantics) returning a borrowed slice of `v` — the
+/// allocation-free form. Computes the char-window byte boundaries via `char_indices`,
+/// so it allocates nothing per row (no `Vec<char>`, no `String`); correct for
+/// multi-byte UTF-8.
+fn substr_slice(v: &str, start: i64, length: Option<i64>) -> &str {
+    let n = v.chars().count() as i64;
     let s = if start < 0 { n + start + 1 } else { start }; // 1-based, may be <= 0
     let (lo, hi) = match length {
         None => (s, n), // to the end, inclusive
@@ -604,9 +617,11 @@ fn substr(v: &str, start: i64, length: Option<i64>) -> String {
     };
     let (lo, hi) = (lo.max(1), hi.min(n)); // clip to [1, n] inclusive
     if hi < lo {
-        return String::new();
+        return "";
     }
-    chars[(lo - 1) as usize..hi as usize].iter().collect()
+    // Byte offset of char index `k` (or the string's end when `k == n`).
+    let byte_at = |k: i64| v.char_indices().nth(k as usize).map_or(v.len(), |(b, _)| b);
+    &v[byte_at(lo - 1)..byte_at(hi)]
 }
 
 /// Split a JSON path like `$.a.b` or `a.b` into its keys.
