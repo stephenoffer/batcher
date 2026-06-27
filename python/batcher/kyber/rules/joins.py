@@ -48,11 +48,41 @@ from batcher.plan.logical import (
 from batcher.plan.stats import ColumnStat, Provenance
 
 __all__ = [
+    "drop_redundant_distinct_build",
     "eliminate_left_join",
     "join_to_semijoin",
     "outer_to_inner_join",
     "runtime_join_filter",
 ]
+
+
+@rule(name="drop_redundant_distinct_build", phase=Phase.REWRITE, matches=(Join,))
+def drop_redundant_distinct_build(node: Join, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`Semi/Anti Join(L, Distinct(R))` → `Semi/Anti Join(L, R)` — drop the redundant dedup.
+
+    A semi/anti join only tests whether each left row's key has *any* match on the
+    right; duplicate right (build-side) rows never change that membership. So
+    deduplicating the build side first is pure wasted work — the join result is
+    identical either way. The classic case is a `NOT EXISTS`/`IN` subquery that
+    decorrelates to `Anti/Semi(L, Distinct(keys))`: TPC-H Q22's `NOT EXISTS (SELECT *
+    FROM orders WHERE o_custkey = c_custkey)` becomes `Anti(customer,
+    Distinct(orders.o_custkey))`, and that distinct over 1.5M orders is ~55% of the
+    query's time and entirely removable. `Distinct` preserves its input's columns, so
+    the join keys (and the left-only output) stay valid after the drop.
+    """
+    if node.join_type not in ("semi", "anti"):
+        return None
+    if not isinstance(node.right, Distinct):
+        return None
+    return Join(
+        node.left,
+        node.right.input,
+        node.left_keys,
+        node.right_keys,
+        node.join_type,
+        node.output,
+        node.strategy,
+    )
 
 
 @rule(name="join_to_semijoin", phase=Phase.REWRITE, matches=(Distinct,))
