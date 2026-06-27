@@ -163,6 +163,23 @@ pub(crate) fn hash_join_indices_impl(
         ));
     }
 
+    // Two-`Int64`-key fast path: a composite integer key (e.g. a fact joined on
+    // `(part_id, supplier_id)`, TPC-H Q9's `partsupp ⋈ lineitem`) hashes/compares the
+    // raw `(i64, i64)` pair, skipping the `RowConverter` encoding the general path runs
+    // over every row. Same `build_probe` loop → bit-identical to the row-encoded oracle.
+    if let Some(keys) = I64x2Keys::try_new(left_keys, right_keys) {
+        return Ok(build_probe(
+            &keys,
+            left_rows,
+            right_rows,
+            &left_null,
+            &right_null,
+            join_type,
+            use_bloom,
+            bloom_fp_rate,
+        ));
+    }
+
     // General path: encode both sides' keys with one shared converter (types align).
     let fields: Vec<SortField> = right_keys
         .iter()
@@ -266,6 +283,54 @@ impl JoinKeys for I64Keys<'_> {
     }
     fn right_eq_left(&self, r: usize, l: usize) -> bool {
         self.right[r] == self.left[l]
+    }
+}
+
+/// Two-`Int64`-key fast path: the raw value slices of both key columns per side.
+struct I64x2Keys<'a> {
+    right: (&'a [i64], &'a [i64]),
+    left: (&'a [i64], &'a [i64]),
+}
+
+impl<'a> I64x2Keys<'a> {
+    /// `Some` when both sides are exactly two `Int64` columns.
+    fn try_new(left_keys: &'a [ArrayRef], right_keys: &'a [ArrayRef]) -> Option<Self> {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::DataType;
+        if left_keys.len() != 2 || right_keys.len() != 2 {
+            return None;
+        }
+        if left_keys
+            .iter()
+            .chain(right_keys)
+            .any(|k| k.data_type() != &DataType::Int64)
+        {
+            return None;
+        }
+        let col = |a: &'a ArrayRef| {
+            a.as_any()
+                .downcast_ref::<Int64Array>()
+                .map(Int64Array::values)
+        };
+        Some(Self {
+            right: (col(&right_keys[0])?, col(&right_keys[1])?),
+            left: (col(&left_keys[0])?, col(&left_keys[1])?),
+        })
+    }
+}
+
+impl JoinKeys for I64x2Keys<'_> {
+    fn hash_right(&self, state: &ahash::RandomState, i: usize) -> u64 {
+        state.hash_one((self.right.0[i], self.right.1[i]))
+    }
+    fn hash_left(&self, state: &ahash::RandomState, i: usize) -> u64 {
+        state.hash_one((self.left.0[i], self.left.1[i]))
+    }
+    fn right_eq_right(&self, a: usize, b: usize) -> bool {
+        self.right.0[a] == self.right.0[b] && self.right.1[a] == self.right.1[b]
+    }
+    fn right_eq_left(&self, r: usize, l: usize) -> bool {
+        self.right.0[r] == self.left.0[l] && self.right.1[r] == self.left.1[l]
     }
 }
 
@@ -832,6 +897,75 @@ mod tests {
                     sorted_pairs(&fast),
                     sorted_pairs(&slow),
                     "i64 vs row mismatch for {jt:?} bloom={bloom}"
+                );
+            }
+        }
+    }
+
+    /// The two-`Int64`-key fast path (`I64x2Keys`) must match the row-encoded oracle
+    /// for every join type, including a partial-key match (first component equal,
+    /// second differs → no match), duplicate composite keys, and null keys.
+    #[test]
+    fn i64x2_fast_path_matches_row_encoded() {
+        let left: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(1),
+                Some(2),
+                None,
+                Some(7),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(2),
+                Some(3),
+                Some(2),
+                Some(5),
+                None,
+            ])),
+        ];
+        let right: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(1),
+                None,
+                Some(7),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(2),
+                Some(2),
+                Some(9),
+                Some(5),
+                None,
+            ])),
+        ];
+        let ln = null_mask(&left, 5);
+        let rn = null_mask(&right, 5);
+        let fastkeys = I64x2Keys::try_new(&left, &right).expect("both two Int64");
+        let fields = vec![
+            SortField::new(DataType::Int64),
+            SortField::new(DataType::Int64),
+        ];
+        let conv = RowConverter::new(fields).unwrap();
+        let rowkeys = RowKeys {
+            right: conv.convert_columns(&right).unwrap(),
+            left: conv.convert_columns(&left).unwrap(),
+        };
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            for bloom in [false, true] {
+                let fast = build_probe(&fastkeys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                let slow = build_probe(&rowkeys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                assert_eq!(
+                    sorted_pairs(&fast),
+                    sorted_pairs(&slow),
+                    "i64x2 vs row mismatch for {jt:?} bloom={bloom}"
                 );
             }
         }
