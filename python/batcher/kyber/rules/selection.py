@@ -45,7 +45,12 @@ __all__ = ["BuildSideDecision", "adaptive_build_side", "build_side_rule"]
 # When neither side is broadcast-small but both exceed this, prefer a sort-merge
 # join (no hash table over a huge build side). Also a performance knob — every
 # strategy yields the same relation.
-SORT_MERGE_MIN_ROWS = 1_000_000.0
+# Build-side row floor above which a hash table is large enough that sort-merge's
+# bounded-memory merge is worth its encoding cost. Set high because hash beats SMJ
+# until the build genuinely strains memory: a build of this many narrow-key rows is a
+# multi-GB hash table. Below it (the common case, including selective joins whose small
+# side is still > 1M rows) a hash join over the smaller side wins.
+SORT_MERGE_MIN_ROWS = 50_000_000.0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -146,15 +151,19 @@ def _rewrite(
         broadcast = build_bytes <= max_bytes
         if broadcast:
             node = dataclasses.replace(node, strategy="broadcast")
-        elif l_est.rows >= SORT_MERGE_MIN_ROWS and r_est.rows >= SORT_MERGE_MIN_ROWS:
-            # Two large inputs, neither small enough to broadcast: sort-merge avoids
-            # building a hash table over a huge side (Spark's default large-join).
-            # NOTE: preferring sort-merge for *already-ordered* inputs was tried and
-            # reverted — benchmarking showed SMJ's RowConverter encoding overhead loses
-            # to the hash join even when its sort is skipped, so it was a regression.
-            # The engine's skip-sort fast-path (`bc-runtime` `sort_indices_if_unsorted`)
-            # still makes this size-driven SMJ cheaper when its inputs happen to arrive
-            # sorted; only the planner *preference* was withdrawn.
+        elif build_rows >= SORT_MERGE_MIN_ROWS:
+            # Sort-merge only when the *build* side (the one hashed, after the swap) is
+            # itself so large that a hash table over it is memory-prohibitive — then
+            # SMJ's bounded-memory merge wins despite its RowConverter encoding cost.
+            # Gating on the build side (not both inputs) is the key: a hash join builds
+            # only the smaller side and streams the larger one, so a 6M ⋈ 1.5M join
+            # hashes 1.5M (fits easily) and beats sorting *both* 6M and 1.5M. The old
+            # "both sides large" gate mis-chose SMJ for selective joins whose small side
+            # was merely over a million rows (TPC-H Q18's top join: 219ms SMJ sorting 6M
+            # lineitem to emit 399 rows, where a hash probe is ~30ms).
+            # NOTE: preferring SMJ for *already-ordered* inputs was tried and reverted —
+            # SMJ's encoding overhead loses to hash even when its sort is skipped; only
+            # the genuinely-too-big-to-hash build keeps it.
             node = dataclasses.replace(node, strategy="sort_merge")
         decisions.append(
             BuildSideDecision(
