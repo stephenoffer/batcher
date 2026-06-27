@@ -206,7 +206,16 @@ pub(crate) fn broadcast_join(
                 output.to_vec(),
             )
         };
-    let p = rayon::current_num_threads().max(1);
+    // Each probe chunk rebuilds the broadcast side's hash table, so over-splitting a
+    // *small* probe rebuilds it many times for no parallelism gain — pathological when
+    // the probe is smaller than the build (a mis-estimated broadcast side, e.g. TPC-H
+    // Q18's 57-row probe was split ~57 ways, rebuilding a 150K-row table each time).
+    // Cap the chunk count so every chunk's probe rows at least cover one build, so the
+    // per-chunk build is amortized. Result-invariant: chunking only splits the probe.
+    let build_rows = build.num_rows().max(1);
+    let p = rayon::current_num_threads()
+        .max(1)
+        .min((probe.num_rows() / build_rows).max(1));
     split_rows(probe, p)
         .par_iter()
         .map(|chunk| ops::join_batches(chunk, build, pkeys, bkeys, jt, &out, JoinStrategy::Hash))
