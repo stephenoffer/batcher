@@ -19,6 +19,8 @@ join untouched — correctness over an extra rewrite.
 
 from __future__ import annotations
 
+import dataclasses
+
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase, RuleCategory
@@ -45,15 +47,49 @@ from batcher.plan.logical import (
     Project,
     Projection,
 )
+from batcher.plan.logical.transforms import is_cartesian_key_pair
 from batcher.plan.stats import ColumnStat, Provenance
 
 __all__ = [
+    "drop_redundant_cross_key",
     "drop_redundant_distinct_build",
     "eliminate_left_join",
     "join_to_semijoin",
     "outer_to_inner_join",
     "runtime_join_filter",
 ]
+
+
+@rule(name="drop_redundant_cross_key", phase=Phase.REWRITE, matches=(Join,))
+def drop_redundant_cross_key(node: Join, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """Drop a comma-join's constant `__cross_key` pseudo-key once a real key drives the join.
+
+    A comma/cross join lowers to an inner join on a synthetic constant `__cross_key`;
+    once a real equi-key is derived, that pseudo-key is redundant — the same constant on
+    both sides matches every row, so the `(__cross_key, real_key)` composite selects
+    exactly what `real_key` alone does. Dropping it is **result-invariant** and lets the
+    join take the single-key fast path (`I64Keys`, not the two-key `I64x2Keys`) and
+    unblocks single-equi-key rewrites (eager aggregation, semi-join pushdown).
+    `derive_join_keys` already drops it on the path where it fires, but a pseudo-key can
+    survive when that rule does not match — e.g. a semi-join sits between the
+    join-condition filter and the comma join (TPC-H Q18) — so this catches every
+    surviving case. Only fires when a non-cartesian key remains (a genuine cross join,
+    all keys cartesian, keeps its single pseudo-key).
+    """
+    if node.join_type != "inner" or len(node.left_keys) < 2:
+        return None
+    real = [
+        (lk, rk)
+        for lk, rk in zip(node.left_keys, node.right_keys, strict=True)
+        if not is_cartesian_key_pair(node.left, lk, node.right, rk)
+    ]
+    if not real or len(real) == len(node.left_keys):
+        return None  # all keys cartesian (true cross join), or nothing to drop
+    return dataclasses.replace(
+        node,
+        left_keys=tuple(lk for lk, _ in real),
+        right_keys=tuple(rk for _, rk in real),
+    )
 
 
 @rule(name="drop_redundant_distinct_build", phase=Phase.REWRITE, matches=(Join,))

@@ -74,7 +74,12 @@ def constant_column_value(plan: LogicalPlan, column: str) -> object:
         return _NOT_CONSTANT
     if isinstance(plan, (Filter, Sort, Limit, Sample, Distinct)):
         return constant_column_value(plan.input, column)
-    if isinstance(plan, Join) and plan.join_type == "inner":
+    # Inner joins pass both sides' values through; semi/anti joins only *filter* the
+    # left side's rows (their output is left-only), so a constant on the traced side
+    # stays constant. Tracing through semi/anti lets a comma join's `__cross_key` be
+    # recognized as a pseudo-edge even when a semi/anti join sits between it and the
+    # join key referencing it (TPC-H Q18's `o_orderkey IN (…)`).
+    if isinstance(plan, Join) and plan.join_type in ("inner", "semi", "anti"):
         for o in plan.output:
             if o.alias == column:
                 child = plan.left if o.side == "left" else plan.right
