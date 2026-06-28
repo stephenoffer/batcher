@@ -22,10 +22,14 @@ from __future__ import annotations
 import dataclasses
 import os
 import pickle
-from inspect import signature
 
 import pyarrow as pa
 
+from batcher.dist.executors.scan_read import (
+    _SCAN_PREFETCH,
+    _SPLIT_TARGET_BYTES,
+    _read_split_batches,
+)
 from batcher.io.source import InMemorySource, Source
 from batcher.io.splits import Split, WholeSourceSplit
 from batcher.plan.logical import Aggregate, LogicalPlan, Scan
@@ -51,6 +55,27 @@ def source_pushdown(plan: LogicalPlan, source_id: int) -> tuple[list[str] | None
         return projection, predicate
     except Exception:
         return None, None
+
+
+def _scan_splits(source: Source, workers: int) -> list[Split]:
+    """A source's splits sized for a `workers`-wide distributed read.
+
+    One split per native chunk (Parquet row-group) is ideal for *balance* and *prefetch
+    overlap*, but a dataset with thousands of small row-groups makes per-request latency
+    dominate, so we coalesce adjacent ones up to `_SPLIT_TARGET_BYTES`. The catch: over-
+    coalescing a *small* dataset collapses it below the fan-out — sf10's 60 row-group
+    splits became 10 whole-file splits at a 64 MB target, starving the 8 workers of
+    balance and prefetch and *regressing* it 16.6 s → 40 s. So coalesce only while the
+    result still has at least `workers x prefetch` splits (enough to fill every worker's
+    prefetch window); below that, keep the fine splits. Large datasets (sf100: 4,900 →
+    1,700) still coalesce; small ones keep their parallelism.
+    """
+    fine = source.splits()
+    floor = max(1, workers) * max(1, _SCAN_PREFETCH)
+    if len(fine) <= floor:
+        return fine
+    coalesced = source.splits(target_size=_SPLIT_TARGET_BYTES)
+    return coalesced if len(coalesced) >= floor else fine
 
 
 def _balance(splits: list[Split], workers: int) -> list[list[Split]]:
@@ -86,7 +111,7 @@ def _partition_source(
     once on the driver before slicing). Either kind is read back with
     `read_partition`.
     """
-    splits = source.splits()
+    splits = _scan_splits(source, workers)
     if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):
         return _eager_range_split(source, workers, work_dir, tag, projection, predicate)
 
@@ -168,7 +193,7 @@ def partition_descriptors(
 
     Read back with `read_partition_descriptor`.
     """
-    splits = source.splits()
+    splits = _scan_splits(source, workers)
     if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):
         from batcher.io.source import iter_source
 
@@ -208,9 +233,7 @@ def read_partition_descriptor(desc: dict) -> list[pa.RecordBatch]:
     """
     if "splits" in desc:
         projection, predicate, splits = desc["projection"], desc["predicate"], desc["splits"]
-        out: list[pa.RecordBatch] = []
-        for s in splits:
-            out.extend(_split_read(s, projection, predicate))
+        out = list(_read_split_batches(splits, projection, predicate))
         if not out and splits:
             schema = splits[0].schema()
             if projection is not None:
@@ -227,10 +250,9 @@ def iter_partition_descriptor(desc: dict):
     if "splits" in desc:
         projection, predicate, splits = desc["projection"], desc["predicate"], desc["splits"]
         emitted = False
-        for s in splits:
-            for b in _split_read(s, projection, predicate):
-                emitted = True
-                yield b
+        for b in _read_split_batches(splits, projection, predicate):
+            emitted = True
+            yield b
         if not emitted and splits:
             schema = splits[0].schema()
             if projection is not None:
@@ -240,7 +262,12 @@ def iter_partition_descriptor(desc: dict):
     yield from desc["batches"]
 
 
-def streaming_partial_aggregate(nat, map_ir, gk, aj, batches, engine_config, chunk_bytes=16 << 20):
+_FOLD_CHUNK_BYTES = max(1 << 20, int(os.environ.get("BATCHER_FOLD_CHUNK_BYTES", str(256 << 20))))
+
+
+def streaming_partial_aggregate(
+    nat, map_ir, gk, aj, batches, engine_config, chunk_bytes=_FOLD_CHUNK_BYTES
+):
     """Fold a partition's batches through the (breaker-free) map prefix + partial
     aggregate into one running partial, a byte-bounded chunk at a time.
 
@@ -252,21 +279,47 @@ def streaming_partial_aggregate(nat, map_ir, gk, aj, batches, engine_config, chu
     running = None
     chunk: list = []
     size = 0
+    import os as _os
+    import time as _t
+
+    _dbg = _os.environ.get("BATCHER_DBG")
+    _rw = _ft = 0.0
+    _nrows = 0
+
+    _ep = _pa = _cb = 0.0
 
     def fold(rows):
-        nonlocal running
+        nonlocal running, _ft, _ep, _pa, _cb
+        _f0 = _t.perf_counter()
         mapped = nat.execute_plan(map_ir, [rows], engine_config)
+        _e1 = _t.perf_counter()
         partial = nat.partial_aggregate(gk, aj, mapped)
+        _e2 = _t.perf_counter()
         running = partial if running is None else nat.combine(gk, aj, [running, partial])
+        _e3 = _t.perf_counter()
+        _ep += _e1 - _f0
+        _pa += _e2 - _e1
+        _cb += _e3 - _e2
+        _ft += _e3 - _f0
 
+    _t0 = _t.perf_counter()
     for b in batches:
+        _rw += _t.perf_counter() - _t0
+        _nrows += b.num_rows
         chunk.append(b)
         size += b.nbytes
         if size >= chunk_bytes:
             fold(chunk)
             chunk, size = [], 0
+        _t0 = _t.perf_counter()
     if chunk:
         fold(chunk)
+    if _dbg:
+        print(
+            f"[PROF-W] read={_rw:.1f}s fold={_ft:.1f}s (exec={_ep:.1f} partial={_pa:.1f} "
+            f"combine={_cb:.1f}) rows={_nrows:,}",
+            flush=True,
+        )
     if running is None:  # empty partition → the empty (schema-bearing) partial
         running = nat.partial_aggregate(gk, aj, nat.execute_plan(map_ir, [[]], engine_config))
     return running
@@ -285,9 +338,7 @@ def read_partition(path: str) -> list[pa.RecordBatch]:
         projection = manifest["projection"]
         predicate = manifest["predicate"]
         splits = manifest["splits"]
-        out: list[pa.RecordBatch] = []
-        for s in splits:
-            out.extend(_split_read(s, projection, predicate))
+        out = list(_read_split_batches(splits, projection, predicate))
         if not out and splits:
             # A partition fully eliminated by predicate pushdown (or an empty
             # source) still must carry a schema, so downstream operators — notably
@@ -319,10 +370,9 @@ def iter_partition(path: str):
             manifest["splits"],
         )
         emitted = False
-        for s in splits:
-            for b in _split_read(s, projection, predicate):
-                emitted = True
-                yield b
+        for b in _read_split_batches(splits, projection, predicate):
+            emitted = True
+            yield b
         if not emitted and splits:
             schema = splits[0].schema()
             if projection is not None:
@@ -331,13 +381,6 @@ def iter_partition(path: str):
         return
     with pa.OSFile(path, "rb") as src, pa.ipc.open_stream(src) as reader:
         yield from reader
-
-
-def _split_read(split: Split, projection: list[str] | None, predicate: dict | None) -> list:
-    """Read a split, passing `predicate` only if its `read` accepts one."""
-    if predicate is not None and "predicate" in signature(split.read).parameters:
-        return split.read(projection, predicate=predicate)
-    return split.read(projection)
 
 
 def materialize_reduce_output(result_paths, work_dir: str, fallback_schema: pa.Schema):

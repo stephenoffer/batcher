@@ -307,12 +307,22 @@ def _run_relational(
     # the conductor's already-collected stats when present (the metadata-answer
     # attempt for a missed count()/is_empty() collected them), so a terminal op reads
     # each source's footer once across both passes.
+    import os as _o
+    import time as _tm
+
+    _dbg = _o.environ.get("BATCHER_DBG")
+    _t0 = _tm.perf_counter()
     source_stats = (
         ctx.source_stats if ctx.source_stats is not None else collect_source_stats(sources, ctx.hub)
     )
+    if _dbg:
+        print(f"[ORCH] collect_source_stats={_tm.perf_counter() - _t0:.1f}s", flush=True)
+        _t0 = _tm.perf_counter()
     opt, decisions = kyber.optimize_traced(
         plan, sources=sources, hub=ctx.hub, source_stats=source_stats
     )
+    if _dbg:
+        print(f"[ORCH] optimize_traced={_tm.perf_counter() - _t0:.1f}s", flush=True)
     prof = ctx.profile
     if prof is not None:
         from batcher.api.terminal.profile import record_plan
@@ -339,10 +349,26 @@ def _run_relational(
         from batcher import dist
 
         envelope = rm.scheduling_envelope(opt, ctx.num_workers)
+        # Distribute the OPTIMIZED logical plan, not the raw one: the distributed executor
+        # reads join keys / pushed predicates straight off the LogicalPlan, and a comma
+        # join (`FROM a, b WHERE a.k=b.k`) is raw-lowered as a cartesian inner join on a
+        # constant `__cross_key` with the equality stranded in a Filter above it. Run raw,
+        # every row hashes to one bucket (a cross product) and the shuffle collapses onto a
+        # single reducer; `optimize_logical` derives the real `a.k=b.k` join keys first (the
+        # same structure the adaptive path already distributes). Single-node was unaffected
+        # because it executes `opt`'s IR, which carries the derived keys.
+        if _dbg:
+            _t0 = _tm.perf_counter()
+        logical = kyber.optimize_logical(
+            plan, sources=sources, hub=ctx.hub, source_stats=source_stats
+        )
+        if _dbg:
+            print(f"[ORCH] optimize_logical={_tm.perf_counter() - _t0:.1f}s", flush=True)
+            _t0 = _tm.perf_counter()
         # Profiling: collect the workers' map sub-plan metrics (their own profile section).
         wm: list = []
         result = dist.execute_distributed(
-            plan,
+            logical,
             sources,
             ctx.num_workers,
             transport=ctx.transport,
@@ -351,12 +377,17 @@ def _run_relational(
             materialize=materialize,
             metrics_out=wm if prof is not None else None,
         )
+        if _dbg:
+            print(f"[ORCH] execute_distributed={_tm.perf_counter() - _t0:.1f}s", flush=True)
+            _t0 = _tm.perf_counter()
         if prof is not None:
             prof.worker_metrics = wm
         # Core collects metadata on every path so later plans improve with use.
         from batcher.api.terminal._metadata import collect_source_metadata
 
         collect_source_metadata(ctx.hub, sources)
+        if _dbg:
+            print(f"[ORCH] collect_source_metadata={_tm.perf_counter() - _t0:.1f}s", flush=True)
         return result, decisions
 
     # Carbonite decides out-of-core: if the estimated working set won't fit the

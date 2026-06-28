@@ -110,9 +110,37 @@ def _ray_init_kwargs(workers: int) -> dict:
         kwargs["address"] = "auto"
     else:
         kwargs["num_cpus"] = workers
-    if dc.runtime_env:
+    # Ship the data plane to workers. An explicit `runtime_env` wins; otherwise, when
+    # attaching to a *cluster* (not a local single-process Ray), auto-ship the batcher
+    # package if it is a source/editable install the worker image won't already carry —
+    # the flight workers import `batcher` + its native extension to run, and die with
+    # `ModuleNotFoundError` without it. A no-op for a normal site-packages install.
+    if dc.runtime_env is not None:
         kwargs["runtime_env"] = dc.runtime_env
+    elif "address" in kwargs:
+        shipped = _self_ship_runtime_env()
+        if shipped is not None:
+            kwargs["runtime_env"] = shipped
     return kwargs
+
+
+def _self_ship_runtime_env() -> dict | None:
+    """A Ray `runtime_env` that uploads the batcher package to workers, or `None`.
+
+    Returns `{"py_modules": [<batcher pkg dir>]}` when batcher is imported from a
+    source/editable tree (the dev install, or a freshly-built wheel laid out in the
+    repo) — the worker image then can't be assumed to carry it, so the package dir is
+    uploaded via Ray's job-level `py_modules` (cached in the object store, abi3 native
+    extension included). Returns `None` for a normal site-/dist-packages install: the
+    cluster image already provides batcher, so shipping it would just churn an upload.
+    """
+    import os
+
+    import batcher
+
+    pkg = os.path.dirname(os.path.abspath(batcher.__file__))
+    installed = f"{os.sep}site-packages{os.sep}" in pkg or f"{os.sep}dist-packages{os.sep}" in pkg
+    return None if installed else {"py_modules": [pkg]}
 
 
 def _neutralize_broken_runtime_env_hook() -> None:

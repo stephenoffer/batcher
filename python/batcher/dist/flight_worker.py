@@ -327,7 +327,9 @@ try:
                 return ("ok", None)
             return ("ok", nat.execute_plan(win_ir, [rows], self._engine_config))
 
-        def reduce_join(self, join_ir, addrs, reducer_id, left_schema, right_schema):
+        def reduce_join(
+            self, join_ir, addrs, reducer_id, left_schema, right_schema, gk=None, aj=None
+        ):
             import batcher._native as nat
 
             # A join needs its bucket's whole left and right side, so it holds them
@@ -344,12 +346,19 @@ try:
             if not left and not right:
                 return ("ok", None)
             # Schema-bearing empties so an outer join can null-extend the missing side.
-            return (
-                "ok",
-                nat.execute_plan(
-                    join_ir, [left or [left_schema], right or [right_schema]], self._engine_config
-                ),
+            joined = nat.execute_plan(
+                join_ir, [left or [left_schema], right or [right_schema]], self._engine_config
             )
+            if gk is not None:
+                # Fused post-join aggregate: the group keys ⊇ the join key, so every group's
+                # rows share one join key and land in THIS bucket — a per-bucket
+                # partial+finalize is therefore complete (no cross-bucket combine). Only the
+                # small aggregated bucket leaves the worker; the full join never reaches the
+                # driver (exchange elimination). `combine_finalize` returns one batch (or
+                # None); reduce_join's contract is a list of batches, so wrap it.
+                out = nat.combine_finalize(gk, aj, [nat.partial_aggregate(gk, aj, joined)])
+                joined = [out] if out is not None else []
+            return ("ok", joined)
 
         def sample_quantiles(self, map_ir, key_name, probs, partition):
             """Sample this split's leading-key distribution as a small quantile grid.

@@ -23,7 +23,11 @@ import json
 import pyarrow as pa
 
 from batcher.dist.executor import _apply_above, _ensure_ray, _relabel_single_source
-from batcher.dist.executors.partition_io import merge_boundaries, partition_descriptors
+from batcher.dist.executors.partition_io import (
+    merge_boundaries,
+    partition_descriptors,
+    source_pushdown,
+)
 from batcher.dist.executors.ray_runtime import engine_config_json, release_placement
 from batcher.dist.fleet import acquire_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
@@ -77,7 +81,14 @@ def execute_sort_flight(
     actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = workers
     try:
-        parts = partition_descriptors(sources[sid], workers)
+        # Push the map prefix's projection + predicate into the read so each worker
+        # fetches only the columns/rows it needs (the sort keys + carried output), not
+        # the whole wide source — the projection the `map_ir` would otherwise discard
+        # after paying to read it (see flight_aggregate).
+        projection, predicate = source_pushdown(map_plan, sid)
+        parts = partition_descriptors(
+            sources[sid], workers, projection=projection, predicate=predicate
+        )
 
         # SAMPLE: each worker samples its own split's leading-key distribution.
         grids = ray.get(

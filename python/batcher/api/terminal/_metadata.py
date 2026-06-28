@@ -16,7 +16,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 from batcher.config import active_config
-from batcher.io.source import Source, read_source
+from batcher.io.source import Source, iter_source
 
 __all__ = ["collect_source_metadata", "learn_column_stats"]
 
@@ -24,14 +24,43 @@ __all__ = ["collect_source_metadata", "learn_column_stats"]
 _NDV_KEY = "__column_ndv__"
 
 
+# Row cap for the driver-side column-stat sample (≈ a couple of Parquet row-groups).
+# Enough for usable ndv/quantile sketches; small enough that learning never re-scans a
+# large input on the driver.
+_STATS_SAMPLE_ROWS = 1 << 18
+
+
+def _stats_sample(src: Source) -> list[pa.RecordBatch]:
+    """A bounded row sample of `src` for column-stat learning — NOT the whole source.
+
+    `collect_source_metadata` runs on the driver after a query; on the distributed/UDF
+    paths it has no scanned batches in hand and so samples the base source here. Reading
+    the *whole* source would re-scan it single-node on the driver — which on a large
+    distributed input dwarfs the query itself (sf100: a 140 GB driver re-read that hung
+    for minutes *after* a ~60 s distributed agg). The actual cardinalities of that run are
+    already learned from the worker metrics; these column sketches are an approximate
+    prior the estimator refines across runs, so a bounded sample is the right trade.
+    `iter_source` is lazy, so this stops after the first batches past the row cap (an
+    in-memory source is already resident and small)."""
+    out: list[pa.RecordBatch] = []
+    n = 0
+    for b in iter_source(src, None, None):
+        out.append(b)
+        n += b.num_rows
+        if n >= _STATS_SAMPLE_ROWS:
+            break
+    return out
+
+
 def collect_source_metadata(hub, sources: list[Source]) -> None:
     """Record per-column ndv/quantiles from the base sources (Core collects).
 
     The UDF and distributed paths don't surface their scanned batches the way the
-    native path hands `resolved` to `learn_column_stats`, so this reads the base
-    sources directly. It is gated on the cheap `Source.schema` — a source is only
-    read when it has a not-yet-measured column — so a file is never re-scanned once
-    its columns are learned. Best-effort: learning never breaks a query.
+    native path hands `resolved` to `learn_column_stats`, so this samples the base
+    sources directly (see `_stats_sample` — bounded, never a whole-source driver scan).
+    It is gated on the cheap `Source.schema` — a source is only read when it has a
+    not-yet-measured column — so a file is never re-scanned once its columns are
+    learned. Best-effort: learning never breaks a query.
     """
     if hub is None:
         return
@@ -40,7 +69,7 @@ def collect_source_metadata(hub, sources: list[Source]) -> None:
     try:
         known = set(kyber.load_learned_stats(hub).get(_NDV_KEY, {}))
         resolved = [
-            read_source(src, None, None)
+            _stats_sample(src)
             for src in sources
             if any(c not in known for c in src.schema().names)
         ]

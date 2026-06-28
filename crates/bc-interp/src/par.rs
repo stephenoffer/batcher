@@ -293,12 +293,21 @@ pub fn execute_parallel_with_metrics(
     // The plan walk that records metrics is itself single-threaded — only the
     // per-operator work fans out across rayon and is fully joined before each
     // `OpMetric` is recorded — so a plain `&mut ExecMetrics` is race-free.
-    let out = if opts.parallelism > 0 {
-        let pool = pool_for(opts.parallelism)?;
-        pool.install(|| exec(plan, sources, opts, &mut m, &mut ids))
+    // Always run inside a width-sized scoped pool — never rayon's *global* pool. On a Ray
+    // worker the global pool is built (lazily, at first use) before Ray pins the actor's
+    // CPU affinity, so it is fixed at ONE thread and every `par_iter` on it runs
+    // single-threaded — the silent throttle that made a distributed map ~Ncores× too slow.
+    // `parallelism == 0` ("all cores") therefore resolves to `available_parallelism`, which
+    // reads the now-applied affinity; a positive value pins the requested width. On a
+    // single node this is the same width as the global pool, so the result is unchanged.
+    let width = if opts.parallelism > 0 {
+        opts.parallelism
     } else {
-        exec(plan, sources, opts, &mut m, &mut ids)
-    }?;
+        std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1)
+    };
+    let out = pool_for(width)?.install(|| exec(plan, sources, opts, &mut m, &mut ids))?;
     Ok((out, m))
 }
 
@@ -313,7 +322,7 @@ pub fn execute_parallel_with_metrics(
 /// letting concurrent queries each spawn `parallelism` threads. Width is the cache
 /// key because `current_num_threads()` drives the hash-shuffle bucket count, so a
 /// query must run on a pool of exactly the width it asked for.
-fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpError> {
+pub(crate) fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpError> {
     static POOLS: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock::new();
     let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = pools

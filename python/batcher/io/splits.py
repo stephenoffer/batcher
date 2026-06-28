@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import pyarrow as pa
@@ -266,6 +267,25 @@ class LineRangeSplit:
         return f"{self.format_name}:{self.path}:{self.start}-{self.end}"
 
 
+@lru_cache(maxsize=1024)
+def _parquet_footer(path: str):
+    """The Parquet `FileMetaData` for `path`, read once and cached per process.
+
+    Reading the footer (row-group offsets, schema) is a ~100ms object-store round trip;
+    a worker reads many row-group splits of the same file, so caching the footer turns
+    N footer reads into one. The metadata is immutable — safe to share across the
+    threads of the scan prefetch pool. Bounded LRU so a long-lived process scanning many
+    files stays memory-bounded.
+    """
+    import pyarrow.parquet as pq
+
+    from batcher.io.filesystem import resolve_filesystem
+
+    fs = resolve_filesystem(path)
+    with fs.open(path) as fh:
+        return pq.ParquetFile(fh).metadata
+
+
 @dataclass(frozen=True, slots=True)
 class RowGroupSplit:
     """A contiguous run of Parquet row-groups within one file.
@@ -286,7 +306,20 @@ class RowGroupSplit:
         from batcher.io.filesystem import resolve_filesystem
 
         fs = resolve_filesystem(self.path)
-        return pq.ParquetFile(fs.open(self.path))
+        # Pass the cached footer so opening this row-group reader does NOT re-read the
+        # Parquet metadata from object storage. A worker reads several row-group splits
+        # of one file; re-reading the footer per split is ~100ms each on S3 (the
+        # dominant distributed-scan overhead). The footer is immutable, so sharing it
+        # is safe; only a fresh data stream is opened per read.
+        #
+        # `pre_buffer` coalesces this read's column-chunk byte ranges into a few large
+        # asynchronous object-store reads instead of one small GET per (column, row-group).
+        # With projection pushdown a split fetches only a handful of columns scattered
+        # across its row-groups, so un-buffered it issues many tiny latency-bound GETs —
+        # the throughput wall on a high-latency worker→S3 path. Result-invariant.
+        return pq.ParquetFile(
+            fs.open(self.path), metadata=_parquet_footer(self.path), pre_buffer=True
+        )
 
     def schema(self) -> pa.Schema:
         return self._file().schema_arrow

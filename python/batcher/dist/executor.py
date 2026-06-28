@@ -17,6 +17,7 @@ working for the Flight and spill paths.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -115,6 +116,26 @@ def execute_distributed(
     request_autoscale(math.ceil(workers * num_cpus))
     try:
         _ensure_ray(workers)
+        # Now Ray is connected, so the live topology is readable: ensure each worker
+        # gets an EVEN SHARE of the cluster's CPUs (capped at one node's cores) rather
+        # than a single core. Carbonite sizes `num_cpus` from per-operator shares (≈1
+        # core, modelling one task = one morsel), but a distributed `_FlightWorker` runs
+        # the *multi-core* parallel executor (the scan prefetch pool + rayon fold) over a
+        # whole partition; pinned to 1 core by Anyscale's cgroup it serializes that work
+        # and throttles the scan ~Ncores× (a worker's read measured 19 MB/s at 1 CPU vs 64
+        # at 16). This is a hardware-utilization floor needing the live cluster topology
+        # only this layer can see; Carbonite's memory/credit/fan-out are kept untouched.
+        # MUST run after `_ensure_ray` — `ray.nodes()` is empty before the cluster is up.
+        share = _even_cpu_share(workers)
+        if share > num_cpus:
+            envelope = (
+                dataclasses.replace(envelope, num_cpus=share)
+                if envelope is not None
+                else SchedulingEnvelope(num_cpus=share, n_tasks=workers)
+            )
+            num_cpus = share
+            reset_scheduling_envelope(token)
+            token = set_scheduling_envelope(envelope)
         clamped = clamp_workers(workers, num_cpus)
         # Carbonite sized the per-task memory hint against its *desired* fan-out;
         # once the cluster clamp reduces (or the data-driven want exceeds) it, each
@@ -135,6 +156,35 @@ def execute_distributed(
         reset_scheduling_envelope(token)
 
 
+def _even_cpu_share(workers: int) -> float:
+    """CPUs to grant each distributed worker so the fan-out isn't single-core-starved.
+
+    Two hard constraints: the grant must be **placeable on every node** (capped at
+    `min(node cores)`, since workers are SPREAD across nodes and a bundle larger than the
+    smallest node can't place) and must **not over-subscribe** (capped at `floor(total /
+    workers)`). Within those, hand each worker as many cores as possible (`>= 1`) so its
+    parallel scan-read + fold use the node, not one cgroup-pinned core. The grant is
+    deliberately *uniform* — data/compute skew is handled orthogonally (splits are
+    LPT-balanced by row count in `_balance`; hot join keys are salted in `join_par`), so a
+    heavier worker still gets a full node's cores rather than this code fragilely
+    predicting skew. Returns 1.0 (historical default) when topology is unavailable.
+    """
+    try:
+        import ray
+
+        node_cpus = [
+            float(n.get("Resources", {}).get("CPU", 0.0)) for n in ray.nodes() if n.get("Alive")
+        ]
+        node_cpus = [c for c in node_cpus if c > 0]
+        if not node_cpus or workers <= 0:
+            return 1.0
+        placeable = float(int(min(node_cpus)))  # fits the smallest node (SPREAD-safe)
+        non_oversubscribing = float(sum(node_cpus) // workers)  # workers x grant <= cluster
+        return max(1.0, min(placeable, non_oversubscribing))
+    except Exception:
+        return 1.0
+
+
 def _rescale_envelope(
     envelope: SchedulingEnvelope, desired: int, actual: int
 ) -> SchedulingEnvelope:
@@ -143,8 +193,6 @@ def _rescale_envelope(
     The per-task memory hint was `peak // desired`; with `actual` tasks each holds
     `peak // actual`, so scale the hint by `desired / actual` (and update `n_tasks`).
     """
-    import dataclasses
-
     actual = max(1, actual)
     memory_bytes = int(envelope.memory_bytes * desired / actual) if envelope.memory_bytes else 0
     return dataclasses.replace(envelope, n_tasks=actual, memory_bytes=memory_bytes)
@@ -241,11 +289,9 @@ def _dispatch(
             if transport == "flight":
                 from batcher.dist.flight_aggregate import execute_aggregate_flight
 
-                # When a query-lifetime `ShuffleFleet` is ambient (the adaptive loop
-                # installed one), `materialize=False` keeps the stage's result on the
-                # fleet's workers and returns a `FlightMaterializedSource` the next
-                # stage reads in place — no driver collect. With no fleet the operator
-                # spawns its own and collects, exactly as before.
+                # `materialize=False` (when an adaptive-loop fleet is ambient) keeps the
+                # result on the workers as a `FlightMaterializedSource` the next stage
+                # reads in place — no driver collect; else it spawns + collects as before.
                 return execute_aggregate_flight(
                     above, agg, sources, workers, materialize=materialize
                 )
@@ -254,11 +300,13 @@ def _dispatch(
             return _distributed_aggregate(
                 above, agg, sources, workers, hub, materialize=materialize, metrics_out=metrics_out
             )
-        # Aggregate directly over an inner join, grouped by (a superset of) the join
-        # key: reuse the join's co-partitioning to aggregate per bucket — no second
-        # shuffle, and the full join never lands on the driver (exchange elimination).
-        # The disk co-partition shuffle handles this; Flight keeps the fallback.
-        if transport != "flight" and _fusable_join_aggregate(agg):
+        # Aggregate over an inner join grouped by ⊇ the join key: fold each reducer's bucket
+        # to groups (exchange elimination) — the full join never collects on the head.
+        if _fusable_join_aggregate(agg):
+            if transport == "flight":
+                from batcher.dist.flight_join import execute_join_flight
+
+                return execute_join_flight(above, agg.input, sources, workers, fused_agg=agg)
             from batcher.dist.executors.join import _distributed_join_aggregate
 
             return _distributed_join_aggregate(above, agg, agg.input, sources, workers)

@@ -159,10 +159,20 @@ class FileSource(ABC):
             from batcher.io.splits import WholeSourceSplit
 
             return [WholeSourceSplit(self)]
-        splits: list[Split] = []
-        for f in self._files():
-            splits.extend(self._file_splits(f, target_size))
-        return splits
+        files = self._files()
+        # `_file_splits` reads each file's footer (a ~100ms object-store round trip for
+        # Parquet); over a many-file dataset that serial loop dominates a distributed
+        # query's driver phase (TPC-H sf100: 100 files ≈ 12s of otherwise-idle driver
+        # time while the workers wait). Read the footers concurrently on a small pool —
+        # order is preserved so a downstream that assumes file order is unaffected. A
+        # single file (the common small case) skips the pool entirely.
+        if len(files) <= 1:
+            return [s for f in files for s in self._file_splits(f, target_size)]
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:
+            per_file = pool.map(lambda f: self._file_splits(f, target_size), files)
+        return [s for file_splits in per_file for s in file_splits]
 
     # ---- override points --------------------------------------------------
     @abstractmethod
@@ -378,13 +388,13 @@ def _safe_size(fs: Any, path: str) -> int:
 
 def _parquet_row_group_splits(path: str, target_size: int | None) -> list[Split]:
     """Build `RowGroupSplit`s for a single Parquet file (used by ParquetSource)."""
-    import pyarrow.parquet as pq
+    from batcher.io.splits import _parquet_footer
 
-    fs = resolve_filesystem(path)
-    with fs.open(path) as fh:
-        meta = pq.ParquetFile(fh).metadata
-        sizes = [meta.row_group(i).total_byte_size for i in range(meta.num_row_groups)]
-        rows = [meta.row_group(i).num_rows for i in range(meta.num_row_groups)]
-        runs = pack_row_groups(meta.num_row_groups, sizes, target_size)
+    # The cached footer avoids re-reading the metadata here AND on the worker that later
+    # reads these splits (a ~100ms object-store round trip per call); see `_parquet_footer`.
+    meta = _parquet_footer(path)
+    sizes = [meta.row_group(i).total_byte_size for i in range(meta.num_row_groups)]
+    rows = [meta.row_group(i).num_rows for i in range(meta.num_row_groups)]
+    runs = pack_row_groups(meta.num_row_groups, sizes, target_size)
     # Carry the footer-derived row count so balancing never re-opens the file.
     return [RowGroupSplit(path, run, sum(rows[i] for i in run)) for run in runs]

@@ -21,6 +21,7 @@ use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::{Field, Schema};
 use bc_ir::{AggregateItem, ProjectionItem};
 use bc_runtime::{agg, shuffle};
+use rayon::prelude::*;
 
 use crate::error::InterpError;
 use crate::ops;
@@ -30,14 +31,50 @@ use crate::ops;
 /// The output batch is `[group_key_columns..., state_columns...]`; state column
 /// names are synthetic (`__s{agg}_{col}`) and decoded by [`combine_finalize`]
 /// using the aggregate list (only `mean` has two state columns).
+///
+/// Parallel across the morsels of the input (rayon): a distributed map worker folds
+/// tens of millions of rows here, and a single-threaded partial would pin it to one
+/// core while the read (now ~16-way concurrent) finishes in a fraction of the time —
+/// leaving the fold the whole bottleneck. Partial-aggregate per morsel and `combine`
+/// (the same mergeable path the parallel executor uses): the combine of per-morsel
+/// partials equals one partial over the whole input, so the result is bit-identical to
+/// the sequential fold — only the core count changes. A single morsel stays sequential.
 pub fn partial_aggregate(
     group_keys: &[ProjectionItem],
     aggregates: &[AggregateItem],
     batches: &[RecordBatch],
 ) -> Result<RecordBatch, InterpError> {
-    let combined = ops::materialize(batches).map_err(|_| InterpError::EmptyAggregateInput)?;
-    let partial = ops::eval_partial(&combined, group_keys, aggregates)?;
-    partial_to_batch(group_keys, &partial)
+    // The input is already morsel-sized (the map prefix's output), so partial-aggregate
+    // each batch in parallel and `combine` — no `materialize` concat (it would serialize
+    // the whole partition through one core, defeating the point). One batch stays
+    // sequential. Runs on a dedicated pool sized to the worker's cores: Ray actors can
+    // leave the *global* rayon pool sized to 1 (it is built before the cgroup affinity
+    // lands), so `par_iter` on it would run single-threaded — the explicit pool is what
+    // actually spreads the fold across all cores.
+    let non_empty: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
+    if non_empty.is_empty() {
+        let combined = ops::materialize(batches).map_err(|_| InterpError::EmptyAggregateInput)?;
+        let partial = ops::eval_partial(&combined, group_keys, aggregates)?;
+        return partial_to_batch(group_keys, &partial);
+    }
+    if non_empty.len() == 1 {
+        let partial = ops::eval_partial(non_empty[0], group_keys, aggregates)?;
+        return partial_to_batch(group_keys, &partial);
+    }
+    let funcs = ops::agg_funcs(aggregates);
+    let agg_jit = ops::compile_agg(group_keys, aggregates, non_empty[0]);
+    // Share the executor's width-sized pool (NOT rayon's global pool, which a Ray worker
+    // leaves at 1 thread — see `par::execute_parallel_with_metrics`), so the fold spreads
+    // across every core. `available_parallelism` reads the actor's applied CPU affinity.
+    let width = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1);
+    let partials: Vec<agg::Partial> = crate::par::pool_for(width)?.install(|| {
+        non_empty
+            .par_iter()
+            .map(|b| ops::eval_partial_jit(b, group_keys, aggregates, &agg_jit))
+            .collect::<Result<_, InterpError>>()
+    })?;
+    let merged = agg::combine(&partials, &funcs)?;
+    partial_to_batch(group_keys, &merged)
 }
 
 /// Per-aggregate partial-state column count (mean keeps sum+count; var/stddev keep

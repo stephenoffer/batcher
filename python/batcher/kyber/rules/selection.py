@@ -133,22 +133,44 @@ def _rewrite(
         # ratio mis-ranks that, so the rename is withheld until the model is calibrated.)
         cost_delta = 0.0
         swap = False
-        if node.join_type == "inner":
-            swapped = _swap(node)
-            here = cost.op_cost(node).total()
-            there = cost.op_cost(swapped).total()
-            cost_delta = here - there
-            swap = there < here
-            if swap:
-                node = swapped
-        # After any swap, the right input is the build side. Broadcast it when it is
-        # small enough to replicate — cheaper than shuffling the probe side. Valid
-        # for every join type (the engine probes the left, replicating the right).
-        build_rows = min(l_est.rows, r_est.rows) if swap else r_est.rows
-        # Size the build side in bytes (rows × measured per-row width), so wide
+        broadcast = False
+        # Size *both* sides in bytes (rows × measured per-row width) up front, so wide
         # payloads aren't broadcast on a misleadingly small row count.
-        build_bytes = build_rows * cost.row_bytes(node.right)
-        broadcast = build_bytes <= max_bytes
+        left_bytes = l_est.rows * cost.row_bytes(node.left)
+        right_bytes = r_est.rows * cost.row_bytes(node.right)
+        if node.join_type == "inner":
+            # Broadcast-first: replicating the *smaller* side as the build and probing
+            # the larger in parallel (no shuffle of the big side) is the dominant
+            # strategy whenever the small side fits the byte threshold — what DuckDB /
+            # Spark do. Decide it from the two sides' bytes directly, independent of the
+            # marginal cpu-delta swap below: a mis-ranked cost delta must never forfeit a
+            # clearly-beneficial broadcast. The old code only ever checked the *right*
+            # side, so when the cost model failed to swap and the small side was the
+            # left/probe, broadcast was missed and the join fell back to shuffling the
+            # 6M-row build (TPC-H Q5's orders⋈lineitem: 419 ms shuffle vs 78 ms broadcast).
+            if min(left_bytes, right_bytes) <= max_bytes:
+                # Build the smaller side (the runtime builds the right); swap when it is
+                # the left. Inner joins are associative/commutative, so this is safe.
+                swap = left_bytes < right_bytes
+                if swap:
+                    node = _swap(node)
+                broadcast = True
+            else:
+                # Neither side is broadcast-small: pick the cheaper build orientation by
+                # cost (build the smaller of two large sides; shuffle either way).
+                swapped = _swap(node)
+                here = cost.op_cost(node).total()
+                there = cost.op_cost(swapped).total()
+                cost_delta = here - there
+                swap = there < here
+                if swap:
+                    node = swapped
+        else:
+            # Non-inner joins are not commutative — the build is always the right input.
+            # Broadcast it when it is small enough to replicate (the engine probes left).
+            broadcast = right_bytes <= max_bytes
+        # After any swap, the right input is the build side.
+        build_rows = min(l_est.rows, r_est.rows) if swap else r_est.rows
         if broadcast:
             node = dataclasses.replace(node, strategy="broadcast")
         elif build_rows >= SORT_MERGE_MIN_ROWS:

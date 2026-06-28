@@ -43,15 +43,17 @@ def _ensure_ray() -> None:
 
     if not ray.is_initialized():
         _neutralize_broken_runtime_env_hook()
-        # Start a fresh, isolated local cluster — never attach to a host cluster that
-        # may be a different Ray version (a benchmark must be reproducible in-process).
+        # Attach to the existing cluster (Anyscale / a running Ray head). Ray Data is a
+        # distributed engine; benchmarking it on the real multi-node cluster it is built
+        # for is the representative comparison. ``BENCH_RAY_ADDRESS`` overrides the
+        # target; the default "auto" discovers the local head. We do NOT spin up an
+        # isolated local cluster — the data plane comparison must run on Ray's home turf.
+        address = os.environ.get("BENCH_RAY_ADDRESS", "auto")
         ray.init(
-            address="local",
-            include_dashboard=False,
+            address=address,
             ignore_reinit_error=True,
             configure_logging=False,
             log_to_driver=False,
-            num_cpus=int(os.environ.get("BENCH_RAY_CPUS", "0")) or None,
         )
         # Silence Ray Data's per-dataset progress/execution logging so the benchmark
         # output stays readable (these are INFO logs, not part of the measured work).

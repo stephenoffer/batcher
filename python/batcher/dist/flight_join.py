@@ -16,12 +16,12 @@ import json
 import pyarrow as pa
 
 from batcher.dist.executor import _apply_above, _ensure_ray, _relabel_single_source
-from batcher.dist.executors.partition_io import partition_descriptors
+from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
 from batcher.dist.executors.ray_runtime import engine_config_json, release_placement
 from batcher.dist.fleet import acquire_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.io.source import Source
-from batcher.plan.logical import Join, LogicalPlan
+from batcher.plan.logical import Aggregate, Join, LogicalPlan
 
 __all__ = ["execute_join_flight"]
 
@@ -32,8 +32,14 @@ def execute_join_flight(
     sources: list[Source],
     workers: int,
     _fault_inject: set[int] | None = None,
+    *,
+    fused_agg: Aggregate | None = None,
 ) -> pa.Table:
     """Co-partition both join sides over a Flight shuffle and join per bucket.
+
+    `fused_agg` (an aggregate whose group keys ⊇ the join key) is folded INTO the reduce:
+    each reducer aggregates its joined bucket and only the small per-bucket result reaches
+    the driver — the full join never materializes on the head (exchange elimination).
 
     Left and right mappers publish their key-hashed buckets on their own Flight
     servers (shuffle stages 0 and 1); reducer r fetches bucket r from every mapper
@@ -63,6 +69,12 @@ def execute_join_flight(
             "output": [{"side": o.side, "name": o.name, "alias": o.alias} for o in join.output],
         }
     )
+    # A fused aggregate's group keys/aggregates (over the join output columns), shipped to
+    # each reducer to fold its joined bucket down before it leaves the worker.
+    gk = aj = None
+    if fused_agg is not None:
+        gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in fused_agg.group_keys])
+        aj = json.dumps([s.agg.to_ir(s.alias) for s in fused_agg.aggregates])
 
     # 0-row schema probes so reducers can type the null-extended side of an outer join.
     def probe(sub_ir, source):
@@ -78,8 +90,12 @@ def execute_join_flight(
     actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = workers
     try:
-        lparts = partition_descriptors(sources[lsid], workers)
-        rparts = partition_descriptors(sources[rsid], workers)
+        # Each side reads only the columns/rows its map prefix needs (join keys + carried
+        # output), not the whole wide table — the biggest scan win on a star-schema join.
+        lproj, lpred = source_pushdown(left_plan, lsid)
+        rproj, rpred = source_pushdown(right_plan, rsid)
+        lparts = partition_descriptors(sources[lsid], workers, projection=lproj, predicate=lpred)
+        rparts = partition_descriptors(sources[rsid], workers, projection=rproj, predicate=rpred)
 
         ray.get(
             [
@@ -113,6 +129,8 @@ def execute_join_flight(
             (lschema, rschema),
             n_buckets,
             workers,
+            gk,
+            aj,
         )
     finally:
         if owns:
@@ -121,14 +139,18 @@ def execute_join_flight(
                     ray.kill(a)
             release_placement(pg)
 
-    table = (
-        pa.Table.from_batches(batches) if batches else pa.table({o.alias: [] for o in join.output})
-    )
+    if batches:
+        table = pa.Table.from_batches(batches)
+    elif fused_agg is not None:
+        keys = [k.alias for k in fused_agg.group_keys]
+        table = pa.table({c: [] for c in keys + [s.alias for s in fused_agg.aggregates]})
+    else:
+        table = pa.table({o.alias: [] for o in join.output})
     return table if not above else _apply_above(above, table)
 
 
 def _join_reduce_with_recovery(
-    actors, addrs, parts, irs, keys, join_ir, schemas, n_buckets, workers
+    actors, addrs, parts, irs, keys, join_ir, schemas, n_buckets, workers, gk=None, aj=None
 ):
     """Run the join reduce under recompute-on-worker-loss recovery.
 
@@ -181,7 +203,7 @@ def _join_reduce_with_recovery(
 
         def _launch(r: int, avoid: set[int]):
             host = _host_for(r, avoid)
-            ref = actors[host].reduce_join.remote(join_ir, addrs, r, lschema, rschema)
+            ref = actors[host].reduce_join.remote(join_ir, addrs, r, lschema, rschema, gk, aj)
             ref_host[ref] = host
             return ref
 
