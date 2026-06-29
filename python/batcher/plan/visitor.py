@@ -26,6 +26,21 @@ __all__ = [
     "with_children",
 ]
 
+# Per-type field-name cache. A node's dataclass fields are fixed by its *type*, but
+# `dataclasses.fields(node)` rebuilds the field tuple on every call — and the optimizer
+# walks the tree thousands of times per query. Caching the names once per type turns the
+# hot `children`/`with_children` traversal into plain `getattr`s. Keyed by the node class,
+# which is process-stable, so the cache never invalidates.
+_FIELD_NAMES: dict[type, tuple[str, ...]] = {}
+
+
+def _field_names(node: LogicalPlan) -> tuple[str, ...]:
+    names = _FIELD_NAMES.get(type(node))
+    if names is None:
+        names = tuple(f.name for f in dataclasses.fields(node))
+        _FIELD_NAMES[type(node)] = names
+    return names
+
 
 def children(node: LogicalPlan) -> list[LogicalPlan]:
     """The direct child plans of `node`, left-to-right.
@@ -35,8 +50,8 @@ def children(node: LogicalPlan) -> list[LogicalPlan]:
     new node types need no edit here.
     """
     out: list[LogicalPlan] = []
-    for f in dataclasses.fields(node):
-        value = getattr(node, f.name)
+    for name in _field_names(node):
+        value = getattr(node, name)
         if isinstance(value, LogicalPlan):
             out.append(value)
         elif isinstance(value, tuple):
@@ -59,16 +74,16 @@ def with_children(node: LogicalPlan, new_children: list[LogicalPlan]) -> Logical
     """
     it = iter(new_children)
     changes: dict[str, object] = {}
-    for f in dataclasses.fields(node):
-        value = getattr(node, f.name)
+    for name in _field_names(node):
+        value = getattr(node, name)
         if isinstance(value, LogicalPlan):
             replacement = next(it)
             if replacement is not value:
-                changes[f.name] = replacement
+                changes[name] = replacement
         elif isinstance(value, tuple) and any(isinstance(v, LogicalPlan) for v in value):
             rebuilt = tuple(next(it) if isinstance(v, LogicalPlan) else v for v in value)
             if any(a is not b for a, b in zip(rebuilt, value, strict=True)):
-                changes[f.name] = rebuilt
+                changes[name] = rebuilt
     return node if not changes else dataclasses.replace(node, **changes)
 
 

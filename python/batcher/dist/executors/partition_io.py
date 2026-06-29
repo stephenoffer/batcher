@@ -222,6 +222,29 @@ def partition_descriptors(
     return descriptors
 
 
+def descriptor_rows(desc: dict) -> int:
+    """Approximate row count of a partition descriptor — for skew-aware per-task sizing.
+
+    Splittable partitions sum their splits' footer-derived row counts (no I/O — the
+    count was captured when the split was built); in-memory partitions sum their batch
+    sizes. Used to give each distributed task a CPU share proportional to its data (a
+    heavier partition gets more cores, a tiny one a fraction), so per-task allocation
+    tracks data skew that LPT balancing could not fully even out.
+    """
+    if "splits" in desc:
+        total = 0
+        for s in desc["splits"]:
+            rows = getattr(s, "rows", None)
+            if rows is None and hasattr(s, "row_count"):
+                try:
+                    rows = s.row_count()
+                except Exception:
+                    rows = None
+            total += rows or 0
+        return total
+    return sum(b.num_rows for b in desc.get("batches", []))
+
+
 def read_partition_descriptor(desc: dict) -> list[pa.RecordBatch]:
     """Read a descriptor from `partition_descriptors` (split-manifest or batch list).
 
@@ -279,47 +302,21 @@ def streaming_partial_aggregate(
     running = None
     chunk: list = []
     size = 0
-    import os as _os
-    import time as _t
-
-    _dbg = _os.environ.get("BATCHER_DBG")
-    _rw = _ft = 0.0
-    _nrows = 0
-
-    _ep = _pa = _cb = 0.0
 
     def fold(rows):
-        nonlocal running, _ft, _ep, _pa, _cb
-        _f0 = _t.perf_counter()
+        nonlocal running
         mapped = nat.execute_plan(map_ir, [rows], engine_config)
-        _e1 = _t.perf_counter()
         partial = nat.partial_aggregate(gk, aj, mapped)
-        _e2 = _t.perf_counter()
         running = partial if running is None else nat.combine(gk, aj, [running, partial])
-        _e3 = _t.perf_counter()
-        _ep += _e1 - _f0
-        _pa += _e2 - _e1
-        _cb += _e3 - _e2
-        _ft += _e3 - _f0
 
-    _t0 = _t.perf_counter()
     for b in batches:
-        _rw += _t.perf_counter() - _t0
-        _nrows += b.num_rows
         chunk.append(b)
         size += b.nbytes
         if size >= chunk_bytes:
             fold(chunk)
             chunk, size = [], 0
-        _t0 = _t.perf_counter()
     if chunk:
         fold(chunk)
-    if _dbg:
-        print(
-            f"[PROF-W] read={_rw:.1f}s fold={_ft:.1f}s (exec={_ep:.1f} partial={_pa:.1f} "
-            f"combine={_cb:.1f}) rows={_nrows:,}",
-            flush=True,
-        )
     if running is None:  # empty partition → the empty (schema-bearing) partial
         running = nat.partial_aggregate(gk, aj, nat.execute_plan(map_ir, [[]], engine_config))
     return running

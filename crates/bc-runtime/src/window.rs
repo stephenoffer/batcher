@@ -86,15 +86,13 @@ impl WindowFn {
         }
     }
 
-    fn is_ranking(self) -> bool {
+    /// Reducing aggregate functions (one value per partition). Without an ORDER BY or
+    /// explicit frame these are whole-partition aggregates — computable as a plain
+    /// group-by broadcast (the fast path in [`window_with`]).
+    fn is_aggregate(self) -> bool {
         matches!(
             self,
-            WindowFn::RowNumber
-                | WindowFn::Rank
-                | WindowFn::DenseRank
-                | WindowFn::PercentRank
-                | WindowFn::CumeDist
-                | WindowFn::Ntile
+            WindowFn::Sum | WindowFn::Avg | WindowFn::Min | WindowFn::Max | WindowFn::Count
         )
     }
 
@@ -156,6 +154,33 @@ pub fn window_with(
     num_rows: usize,
     parallel_row_threshold: usize,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
+    // Fast path: PARTITION BY with no ORDER BY and only plain aggregates (no frame, no
+    // ranking / value functions) is exactly "group-by the partition keys, aggregate,
+    // broadcast back to each row". Assign dense group ids once via the shared native
+    // fast paths (`agg::assign_groups`) and reduce + broadcast in linear passes — far
+    // cheaper than materializing per-partition index lists and gathering by scattered
+    // index, and it parallelizes the grouping. The result is identical (the order within
+    // a partition never affects a whole-partition aggregate).
+    if order_keys.is_empty()
+        && !partition_keys.is_empty()
+        && funcs
+            .iter()
+            .all(|c| c.frame.is_none() && c.func.is_aggregate())
+    {
+        let (group_ids, num_groups, _) = crate::agg::assign_groups(partition_keys, num_rows)?;
+        return funcs
+            .iter()
+            .map(|call| {
+                crate::window_partition_agg::broadcast_partition_aggregate(
+                    call.func,
+                    &group_ids,
+                    num_groups,
+                    call.values.as_ref(),
+                )
+            })
+            .collect();
+    }
+
     // Group row indices into partitions (first-seen order is irrelevant; we
     // scatter results back to original positions regardless).
     let partitions = assign_partitions(partition_keys, num_rows)?;
@@ -211,9 +236,12 @@ pub fn window_with(
             )?,
             // With an ORDER BY, an aggregate window is a *running* (cumulative)
             // aggregate over the ordered partition; without one it's whole-partition.
-            f if order_keys.is_empty() => {
-                partition_aggregate(f, &partitions, call.values.as_ref(), num_rows)?
-            }
+            f if order_keys.is_empty() => crate::window_partition_agg::partition_aggregate(
+                f,
+                &partitions,
+                call.values.as_ref(),
+                num_rows,
+            )?,
             f => running_aggregate(
                 f,
                 &ordered,
@@ -645,151 +673,10 @@ fn running_str_minmax(
 
 /// Whole-partition aggregate: compute one value per partition and broadcast it to
 /// every row of that partition (same value regardless of order — v1 semantics).
-fn partition_aggregate(
-    func: WindowFn,
-    partitions: &[Vec<usize>],
+pub(crate) fn require(
     values: Option<&ArrayRef>,
-    num_rows: usize,
-) -> Result<ArrayRef, RuntimeError> {
-    debug_assert!(!func.is_ranking());
-    if func == WindowFn::Count {
-        // count: number of non-null input values per partition (Int64).
-        let values = require(values, func)?;
-        let mut out = vec![0i64; num_rows];
-        for part in partitions {
-            let c = part.iter().filter(|&&i| values.is_valid(i)).count() as i64;
-            for &i in part {
-                out[i] = c;
-            }
-        }
-        return Ok(Arc::new(Int64Array::from(out)));
-    }
-
-    let values = require(values, func)?;
-    match values.data_type() {
-        DataType::Int64 => agg_numeric_i64(func, partitions, values, num_rows),
-        DataType::Float64 => agg_numeric_f64(func, partitions, values, num_rows),
-        DataType::Utf8 if matches!(func, WindowFn::Min | WindowFn::Max) => {
-            agg_str_minmax(func, partitions, values, num_rows)
-        }
-        other => Err(RuntimeError::UnsupportedWindow {
-            func: func.name().to_string(),
-            dtype: other.to_string(),
-        }),
-    }
-}
-
-fn agg_numeric_i64(
     func: WindowFn,
-    partitions: &[Vec<usize>],
-    values: &ArrayRef,
-    num_rows: usize,
-) -> Result<ArrayRef, RuntimeError> {
-    let arr = values.as_primitive::<Int64Type>();
-    // sum/min/max stay Int64; avg becomes Float64.
-    if func == WindowFn::Avg {
-        let mut out: Vec<Option<f64>> = vec![None; num_rows];
-        for part in partitions {
-            let (mut sum, mut cnt) = (0f64, 0i64);
-            for &i in part {
-                if arr.is_valid(i) {
-                    sum += arr.value(i) as f64;
-                    cnt += 1;
-                }
-            }
-            let v = (cnt > 0).then(|| sum / cnt as f64);
-            for &i in part {
-                out[i] = v;
-            }
-        }
-        return Ok(Arc::new(Float64Array::from(out)));
-    }
-    let mut out: Vec<Option<i64>> = vec![None; num_rows];
-    for part in partitions {
-        let mut acc: Option<i64> = None;
-        for &i in part {
-            if arr.is_valid(i) {
-                let v = arr.value(i);
-                acc = Some(match (func, acc) {
-                    (_, None) => v,
-                    (WindowFn::Sum, Some(a)) => a + v,
-                    (WindowFn::Min, Some(a)) => a.min(v),
-                    (WindowFn::Max, Some(a)) => a.max(v),
-                    (_, Some(a)) => a,
-                });
-            }
-        }
-        for &i in part {
-            out[i] = acc;
-        }
-    }
-    Ok(Arc::new(Int64Array::from(out)))
-}
-
-fn agg_numeric_f64(
-    func: WindowFn,
-    partitions: &[Vec<usize>],
-    values: &ArrayRef,
-    num_rows: usize,
-) -> Result<ArrayRef, RuntimeError> {
-    let arr = values.as_primitive::<Float64Type>();
-    let mut out: Vec<Option<f64>> = vec![None; num_rows];
-    for part in partitions {
-        let (mut acc, mut cnt): (Option<f64>, i64) = (None, 0);
-        for &i in part {
-            if arr.is_valid(i) {
-                let v = arr.value(i);
-                cnt += 1;
-                acc = Some(match (func, acc) {
-                    (_, None) => v,
-                    (WindowFn::Sum | WindowFn::Avg, Some(a)) => a + v,
-                    (WindowFn::Min, Some(a)) => a.min(v),
-                    (WindowFn::Max, Some(a)) => a.max(v),
-                    (_, Some(a)) => a,
-                });
-            }
-        }
-        let final_v = match func {
-            WindowFn::Avg => acc.map(|s| s / cnt as f64),
-            _ => acc,
-        };
-        for &i in part {
-            out[i] = final_v;
-        }
-    }
-    Ok(Arc::new(Float64Array::from(out)))
-}
-
-fn agg_str_minmax(
-    func: WindowFn,
-    partitions: &[Vec<usize>],
-    values: &ArrayRef,
-    num_rows: usize,
-) -> Result<ArrayRef, RuntimeError> {
-    let arr = values.as_any().downcast_ref::<StringArray>().expect("utf8");
-    let is_min = func == WindowFn::Min;
-    let mut out: Vec<Option<String>> = vec![None; num_rows];
-    for part in partitions {
-        let mut acc: Option<&str> = None;
-        for &i in part {
-            if arr.is_valid(i) {
-                let v = arr.value(i);
-                acc = Some(match acc {
-                    None => v,
-                    Some(a) if (is_min && v < a) || (!is_min && v > a) => v,
-                    Some(a) => a,
-                });
-            }
-        }
-        let owned = acc.map(|s| s.to_string());
-        for &i in part {
-            out[i] = owned.clone();
-        }
-    }
-    Ok(Arc::new(StringArray::from(out)))
-}
-
-fn require(values: Option<&ArrayRef>, func: WindowFn) -> Result<&ArrayRef, RuntimeError> {
+) -> Result<&ArrayRef, RuntimeError> {
     values.ok_or_else(|| RuntimeError::MissingWindowInput {
         func: func.name().to_string(),
     })

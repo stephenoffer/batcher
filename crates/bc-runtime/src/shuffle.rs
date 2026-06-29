@@ -16,8 +16,15 @@ use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, StringArray, UInt
 use arrow::compute::{cast, take};
 use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
+use rayon::prelude::*;
 
 use crate::error::RuntimeError;
+
+/// Below this row count the hash pass runs serially: rayon's fan-out/join costs more
+/// than it saves on a small batch (and most morsels are small). A shuffle of millions
+/// of rows — a join build/probe side or a distributed map partition — clears it and
+/// fans the hash across every core.
+const PAR_HASH_MIN_ROWS: usize = 1 << 16;
 
 // Fixed seeds → deterministic partitioning within a process (so the two sides of
 // a join hash identically). Not for security; collision resistance is irrelevant.
@@ -74,9 +81,16 @@ pub fn partition_by_key_arrays(
             .collect();
         let converter = RowConverter::new(fields)?;
         let rows = converter.convert_columns(keys)?;
-        (0..n)
-            .map(|i| bucket_of(SEED.hash_one(rows.row(i)), num_partitions))
-            .collect()
+        if n >= PAR_HASH_MIN_ROWS {
+            (0..n)
+                .into_par_iter()
+                .map(|i| bucket_of(SEED.hash_one(rows.row(i)), num_partitions))
+                .collect()
+        } else {
+            (0..n)
+                .map(|i| bucket_of(SEED.hash_one(rows.row(i)), num_partitions))
+                .collect()
+        }
     };
 
     scatter_into_buckets(batch, &part_of, num_partitions)
@@ -109,14 +123,30 @@ fn scatter_into_buckets(
         *pos += 1;
     }
 
-    (0..num_partitions)
-        .map(|b| {
-            take_rows(
-                batch,
-                &scatter[offsets[b] as usize..offsets[b + 1] as usize],
-            )
-        })
-        .collect()
+    // Build each bucket's batch in parallel: every bucket gathers a disjoint set of rows
+    // across all columns (the dominant cost — an O(bucket rows × columns) copy), and the
+    // buckets are independent. This is what lets a parallel hash join's repartition step
+    // use every core instead of one (n ≥ the threshold ⇒ the whole partition is large).
+    if n >= PAR_HASH_MIN_ROWS {
+        (0..num_partitions)
+            .into_par_iter()
+            .map(|b| {
+                take_rows(
+                    batch,
+                    &scatter[offsets[b] as usize..offsets[b + 1] as usize],
+                )
+            })
+            .collect()
+    } else {
+        (0..num_partitions)
+            .map(|b| {
+                take_rows(
+                    batch,
+                    &scatter[offsets[b] as usize..offsets[b + 1] as usize],
+                )
+            })
+            .collect()
+    }
 }
 
 /// Range-partition `batch` into `n_buckets` globally-ordered buckets by the leading
@@ -140,6 +170,29 @@ pub fn range_partition_by_key(
     nulls_first: bool,
     descending: bool,
 ) -> Result<Vec<RecordBatch>, RuntimeError> {
+    range_partition_by_key_array(
+        batch,
+        batch.column(key_index),
+        boundaries,
+        n_buckets,
+        nulls_first,
+        descending,
+    )
+}
+
+/// Like [`range_partition_by_key`], but the leading sort key is supplied directly as an
+/// array rather than by column index — so a *computed* `ORDER BY` key (or the
+/// single-node parallel sample-sort, whose key comes from an expression eval) can
+/// range-partition without first appending the key to `batch`. `key` must have
+/// `batch.num_rows()` rows.
+pub fn range_partition_by_key_array(
+    batch: &RecordBatch,
+    key_col: &ArrayRef,
+    boundaries: &[f64],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<RecordBatch>, RuntimeError> {
     assert!(n_buckets >= 1);
     if n_buckets == 1 {
         return Ok(vec![batch.clone()]);
@@ -156,7 +209,6 @@ pub fn range_partition_by_key(
     // Arrow would happily parse a string like "12" to 12.0, which would disagree with
     // the single-node *lexical* string sort — exactly what the old `to_numpy()` on a
     // string column refused to do.
-    let key_col = batch.column(key_index);
     if !key_col.data_type().is_numeric() {
         return Err(RuntimeError::NonNumericRangeKey {
             dtype: key_col.data_type().to_string(),
@@ -182,6 +234,56 @@ pub fn range_partition_by_key(
                     boundaries.partition_point(|&b| b <= v)
                 };
                 id as u32
+            }
+        })
+        .collect();
+
+    scatter_into_buckets(batch, &part_of, n_buckets)
+}
+
+/// Like [`range_partition_by_key_array`], but for an **integer** leading key compared
+/// **exactly** as `i64` (boundaries are `i64` quantiles) — no `f64` cast, so a key beyond
+/// `2^53` is routed without precision loss. Any signed/unsigned integer width is widened
+/// to `i64` (order-preserving). The single-node parallel sample-sort uses this for an
+/// integer `ORDER BY` leading key; floats keep [`range_partition_by_key_array`].
+pub fn range_partition_by_i64_key(
+    batch: &RecordBatch,
+    key_col: &ArrayRef,
+    boundaries: &[i64],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<RecordBatch>, RuntimeError> {
+    assert!(n_buckets >= 1);
+    if n_buckets == 1 {
+        return Ok(vec![batch.clone()]);
+    }
+    let front = if descending { n_buckets - 1 } else { 0 };
+    let null_bucket = if nulls_first {
+        front
+    } else {
+        n_buckets - 1 - front
+    } as u32;
+
+    if !matches!(key_col.data_type(), t if t.is_integer()) {
+        return Err(RuntimeError::NonNumericRangeKey {
+            dtype: key_col.data_type().to_string(),
+        });
+    }
+    let key = cast(key_col, &DataType::Int64)?;
+    let key = key
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .ok_or_else(|| RuntimeError::NonNumericRangeKey {
+            dtype: key_col.data_type().to_string(),
+        })?;
+
+    let part_of: Vec<u32> = (0..batch.num_rows())
+        .map(|i| {
+            if key.is_null(i) {
+                null_bucket
+            } else {
+                boundaries.partition_point(|&b| b <= key.value(i)) as u32
             }
         })
         .collect();
@@ -292,12 +394,20 @@ fn partition_int_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32
         return None;
     }
     let a = keys[0].as_any().downcast_ref::<Int64Array>()?;
-    Some(
-        a.values()
-            .iter()
-            .map(|&v| bucket_of(SEED.hash_one(v), num_partitions))
-            .collect(),
-    )
+    let vals = a.values();
+    if vals.len() >= PAR_HASH_MIN_ROWS {
+        Some(
+            vals.par_iter()
+                .map(|&v| bucket_of(SEED.hash_one(v), num_partitions))
+                .collect(),
+        )
+    } else {
+        Some(
+            vals.iter()
+                .map(|&v| bucket_of(SEED.hash_one(v), num_partitions))
+                .collect(),
+        )
+    }
 }
 
 fn bucket_of(hash: u64, num_partitions: usize) -> u32 {

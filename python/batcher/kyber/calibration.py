@@ -40,6 +40,12 @@ _CALIB_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, tuple, CostCoeff
     weakref.WeakKeyDictionary()
 )
 
+# Re-fit the cost coefficients only after this many *new* feedback rows accrue (the hub
+# version bumps once per recorded operator). A small query records a handful of rows, so
+# this refits roughly every few-to-ten queries — fresh enough for a cost heuristic while
+# keeping per-query planning overhead flat instead of growing with session history.
+_RECALIBRATE_AFTER = 64
+
 # Each calibratable operator `kind` (the native `ExecMetrics` tag) maps to the cost
 # coefficient its dominant per-row term scales, plus the `basis(rows_in, rows_out)`
 # that term multiplies. `hash_build_row` is fit from `aggregate` (the purest hash-build
@@ -109,9 +115,19 @@ def calibrate(hub: MetadataHub | None, config: Config | None = None) -> CostCoef
         cfg.optimizer.learning_smoothing_alpha,
         cfg.optimizer.cost_calibration_clamp,
     )
+    # Throttle: a cost fit is a statistical estimate that barely moves with one more
+    # sample among many, so reuse it until enough *new* feedback accrues rather than
+    # re-scanning the whole op-stats history on every `collect()` (the hub version bumps
+    # per recorded operator, so an exact-version cache would miss every query — turning a
+    # stream of small queries into O(queries²) calibration work). Staleness only affects
+    # plan *cost*, never results, so a slightly old fit is safe.
     version = hub.version
     cached = _CALIB_CACHE.get(hub)
-    if cached is not None and cached[0] == version and cached[1] == fingerprint:
+    if (
+        cached is not None
+        and cached[1] == fingerprint
+        and 0 <= version - cached[0] < _RECALIBRATE_AFTER
+    ):
         return cached[2]
     try:
         coeffs = _calibrate(hub.op_stats_by_kind(), defaults, cfg)

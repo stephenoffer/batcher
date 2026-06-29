@@ -1,0 +1,26 @@
+[package]
+name = "bc-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow.workspace = true
+# Native Parquet decode. `async` + `object_store` give the streaming reader that
+# fetches column chunks concurrently straight from object storage (the throughput
+# win over a per-chunk pyarrow read). Pinned to 56 to match arrow 56 so the
+# RecordBatch/Schema types are identical across the graph.
+parquet = { version = "56", features = ["async", "object_store"] }
+# Uniform object storage: S3 (+ MinIO/Ceph via endpoint), GCS, Azure, local, HTTP.
+# Version matched to parquet 56's `object_store` integration so `ParquetObjectReader`
+# accepts the store we build.
+object_store = { version = "0.12", features = ["aws", "gcp", "azure", "http"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+futures = "0.3"
+bytes = "1"
+url = "2"
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

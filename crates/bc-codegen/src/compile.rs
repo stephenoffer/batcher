@@ -18,7 +18,7 @@ use crate::{CodegenError, ColumnSet, Compiled, ScalarTy};
 /// so the JIT result is bit-for-bit identical to the interpreter's `eval_math`.
 const LIBM_UNARY: &[&str] = &[
     "log", "log10", "log2", "exp", "sin", "cos", "tan", "sinh", "cosh", "tanh", "asin", "acos",
-    "atan", "cbrt",
+    "atan",
 ];
 
 /// libm symbols for the two-arg math functions the JIT lowers via a libcall.

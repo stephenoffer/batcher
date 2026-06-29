@@ -66,7 +66,9 @@ pub fn partial_aggregate(
     // Share the executor's width-sized pool (NOT rayon's global pool, which a Ray worker
     // leaves at 1 thread — see `par::execute_parallel_with_metrics`), so the fold spreads
     // across every core. `available_parallelism` reads the actor's applied CPU affinity.
-    let width = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1);
+    let width = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
     let partials: Vec<agg::Partial> = crate::par::pool_for(width)?.install(|| {
         non_empty
             .par_iter()
@@ -172,7 +174,7 @@ pub fn combine(
         return Err(InterpError::EmptyAggregateInput);
     }
     let funcs = ops::agg_funcs(aggregates);
-    let merged = agg::combine(&partials, &funcs)?;
+    let merged = in_worker_pool(|| agg::combine(&partials, &funcs))??;
     partial_to_batch(group_keys, &merged)
 }
 
@@ -190,9 +192,23 @@ pub fn combine_finalize(
     }
 
     let funcs = ops::agg_funcs(aggregates);
-    let merged = agg::combine(&partials, &funcs)?;
+    let merged = in_worker_pool(|| agg::combine(&partials, &funcs))??;
     let agg_cols = agg::finalize(&funcs, &merged)?;
     ops::build_agg_batch(group_keys, aggregates, &merged.group_columns, &agg_cols)
+}
+
+/// Run a rayon-parallel data-plane step inside the worker's **width-sized** pool rather
+/// than rayon's global pool. A Ray map/reduce actor leaves the global pool sized to one
+/// thread — it is built before the actor's cgroup CPU affinity lands — so the
+/// rayon-parallel kernels in `bc_runtime` (the high-cardinality combine's regroup/merge,
+/// the shuffle's hash + scatter) would pin a worker that processes millions of rows to a
+/// single core. The width-sized pool (the same fix `partial_aggregate` applies to the map
+/// fold) spreads them across every core the actor owns. Result-identical; scheduling only.
+fn in_worker_pool<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T, InterpError> {
+    let width = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    Ok(crate::par::pool_for(width)?.install(f))
 }
 
 /// Hash-shuffle `batches` into `num_partitions` buckets by the given key columns.
@@ -203,7 +219,8 @@ pub fn partition_batches(
     num_partitions: usize,
 ) -> Result<Vec<Vec<RecordBatch>>, InterpError> {
     let combined = ops::materialize(batches)?;
-    let parts = shuffle::partition_by_keys(&combined, key_indices, num_partitions)?;
+    let parts =
+        in_worker_pool(|| shuffle::partition_by_keys(&combined, key_indices, num_partitions))??;
     Ok(parts.into_iter().map(|b| vec![b]).collect())
 }
 
@@ -221,14 +238,16 @@ pub fn range_partition_batches(
     descending: bool,
 ) -> Result<Vec<Vec<RecordBatch>>, InterpError> {
     let combined = ops::materialize(batches)?;
-    let parts = shuffle::range_partition_by_key(
-        &combined,
-        key_index,
-        boundaries,
-        n_buckets,
-        nulls_first,
-        descending,
-    )?;
+    let parts = in_worker_pool(|| {
+        shuffle::range_partition_by_key(
+            &combined,
+            key_index,
+            boundaries,
+            n_buckets,
+            nulls_first,
+            descending,
+        )
+    })??;
     Ok(parts.into_iter().map(|b| vec![b]).collect())
 }
 
@@ -248,14 +267,16 @@ pub fn salted_partition_batches(
     replicate: bool,
 ) -> Result<Vec<Vec<RecordBatch>>, InterpError> {
     let combined = ops::materialize(batches)?;
-    let parts = shuffle::salted_partition_by_keys(
-        &combined,
-        key_indices,
-        num_partitions,
-        hot_keys,
-        salt_count,
-        replicate,
-    )?;
+    let parts = in_worker_pool(|| {
+        shuffle::salted_partition_by_keys(
+            &combined,
+            key_indices,
+            num_partitions,
+            hot_keys,
+            salt_count,
+            replicate,
+        )
+    })??;
     Ok(parts.into_iter().map(|b| vec![b]).collect())
 }
 

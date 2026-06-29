@@ -110,6 +110,87 @@ def test_actor_pool_runs_distributed_and_gpu_feedback_is_safe():
     assert hub.op_stats_by_kind() is not None
 
 
+def test_fleet_spawn_failure_releases_placement_group(monkeypatch):
+    # A failure between reserving the gang placement group and collecting every
+    # worker's Flight address must not leak the reservation: the guarded spawn helper
+    # kills the actors and releases the placement group before re-raising. Without the
+    # guard the gang would leak (no ShuffleFleet is built, so its cleanup never runs).
+    import ray
+
+    from batcher.dist.fleet import _fleet
+
+    released: list = []
+    killed: list = []
+
+    class _FakeActor:
+        def __init__(self) -> None:
+            self.addr = self
+
+        def remote(self):  # actor.addr.remote() — a ref ray.get will choke on
+            return object()
+
+    sentinel_pg = object()
+
+    def _fake_spawn(workers, credits, cfg_json, plan_id=None):
+        return [_FakeActor() for _ in range(workers)], sentinel_pg
+
+    def _boom(refs, *args, **kwargs):
+        raise RuntimeError("actor failed to start")
+
+    monkeypatch.setattr("batcher.dist.flight_worker.spawn_flight_workers", _fake_spawn)
+    monkeypatch.setattr("batcher.dist.executors.ray_runtime.release_placement", released.append)
+    monkeypatch.setattr(ray, "get", _boom)
+    monkeypatch.setattr(ray, "kill", killed.append)
+
+    with pytest.raises(RuntimeError, match="actor failed to start"):
+        _fleet._spawn_fleet_with_addrs(2, 4, "{}")
+
+    assert released == [sentinel_pg], "the placement group must be released on spawn failure"
+    assert len(killed) == 2, "every spawned actor must be killed on spawn failure"
+
+
+def test_gpu_autoscale_requests_gpu_bundles(monkeypatch):
+    # A GPU query must lift a GPU *bundle* floor, not just a CPU-core floor — otherwise
+    # the autoscaler never provisions GPU nodes and the query hangs / falls back to CPU
+    # nodes it cannot run on.
+    import ray.autoscaler.sdk as sdk
+
+    from batcher.dist.executors.ray_runtime import scaling
+
+    captured: list = []
+    monkeypatch.setattr(sdk, "request_resources", lambda **kw: captured.append(kw))
+
+    scaling.request_autoscale(4, target_gpus=2.0)
+    try:
+        assert captured, "request_resources must be called"
+        last = captured[-1]
+        assert last.get("num_cpus") == 4
+        gpus = sum(b.get("GPU", 0) for b in (last.get("bundles") or []))
+        assert gpus >= 2, "a GPU query must request GPU bundles from the autoscaler"
+    finally:
+        scaling.release_autoscale()
+    # Releasing the last scope drops the floor (no GPU bundles requested at rest).
+    assert captured[-1].get("num_cpus") == 0
+    assert not captured[-1].get("bundles")
+
+
+def test_clamp_workers_bounded_by_gpu_capacity(monkeypatch):
+    # A GPU stage cannot pack more workers than there are GPUs, even when the cores would
+    # fit more; a CPU-only stage is unaffected by GPU capacity.
+    import ray
+
+    from batcher.dist.executors.ray_runtime import scaling
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        scaling, "cluster_topology", lambda: {"nodes": 2, "cpus": 16.0, "gpus": 2.0}
+    )
+    # 16 cores would fit 8 one-core workers, but only 2 GPUs ⇒ clamp to 2.
+    assert scaling.clamp_workers(8, num_cpus=1.0, num_gpus=1.0) == 2
+    # CPU-only stage: 16 cores / 2 each = 8, GPUs irrelevant.
+    assert scaling.clamp_workers(8, num_cpus=2.0, num_gpus=0.0) == 8
+
+
 def test_gpu_record_and_adapt_loop_with_real_plan_key():
     # The driver half of the GPU loop, end-to-end with the real pipeline key: a
     # measured idle utilization is persisted and the next run's num_gpus is packed

@@ -18,16 +18,52 @@ pub(crate) fn sum_acc(
     num_groups: usize,
     func: AggFunc,
 ) -> Result<ArrayRef, RuntimeError> {
+    // Global-sum fast path: when there is a single group every row maps to it, so the
+    // group sum equals the whole-column sum — arrow's SIMD reduction kernels beat the
+    // scalar scatter loop below (the dominant cost of a global `SUM`/`COUNT`-derived
+    // aggregate, and of every distributed `combine` that folds a handful of partials).
+    // Null-only / empty input yields a null sum (SQL semantics), matching `masked_*`.
+    if num_groups == 1 {
+        match values.data_type() {
+            DataType::Int64 => {
+                let s = arrow::compute::sum_checked(values.as_primitive::<Int64Type>())
+                    .map_err(|_| RuntimeError::SumOverflow)?;
+                return Ok(Arc::new(masked_i64(
+                    vec![s.unwrap_or(0)],
+                    vec![s.is_some()],
+                )));
+            }
+            DataType::Float64 => {
+                let s = arrow::compute::sum(values.as_primitive::<Float64Type>());
+                return Ok(Arc::new(masked_f64(
+                    vec![s.unwrap_or(0.0)],
+                    vec![s.is_some()],
+                )));
+            }
+            // Decimal keeps the scatter loop below (exact i128 accumulation, scale-aware).
+            _ => {}
+        }
+    }
     match values.data_type() {
         DataType::Int64 => {
             let arr = values.as_primitive::<Int64Type>();
             let mut sums = vec![0i64; num_groups];
+            // Checked add throughout: a silent i64 wrap would be a wrong answer. (DuckDB
+            // promotes BIGINT sums to 128-bit; we error rather than corrupt until that
+            // wider-output promotion lands.)
+            if arr.null_count() == 0 {
+                // No-null fast path: gather straight from the values slice, skipping the
+                // per-row validity branch and the per-row `valid` write (every group is
+                // non-empty and all-valid) — mirrors the Float64 path below.
+                for (&g, &v) in group_ids.iter().zip(arr.values()) {
+                    let slot = &mut sums[g as usize];
+                    *slot = slot.checked_add(v).ok_or(RuntimeError::SumOverflow)?;
+                }
+                return Ok(Arc::new(masked_i64(sums, vec![true; num_groups])));
+            }
             let mut valid = vec![false; num_groups];
             for (i, &g) in group_ids.iter().enumerate() {
                 if arr.is_valid(i) {
-                    // Checked: a silent i64 wrap would be a wrong answer. (DuckDB
-                    // promotes BIGINT sums to 128-bit; we error rather than corrupt
-                    // until that wider-output promotion lands.)
                     let slot = &mut sums[g as usize];
                     *slot = slot
                         .checked_add(arr.value(i))

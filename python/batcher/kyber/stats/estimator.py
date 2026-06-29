@@ -86,6 +86,9 @@ class StatsEstimator:
         # a freed node's reused `id()` can never produce a stale hit.
         self._row_cache: dict[int, tuple[LogicalPlan, RelStats]] = {}
         self._sig_cache: dict[int, tuple[LogicalPlan, str]] = {}
+        # Merged column→ndv map (source-stats NDV seeded under learned NDV), built once
+        # on first access since `_ndv` is read on every selectivity / join estimate.
+        self._ndv_cache: dict[str, float] | None = None
 
     def estimate(self, node: LogicalPlan) -> RelStats:
         """Cardinality + column stats for `node`, memoized by node identity for the
@@ -344,9 +347,27 @@ class StatsEstimator:
 
     @property
     def _ndv(self) -> dict[str, float]:
-        """Learned per-column distinct counts (column name → ndv), used to sharpen
-        equality selectivity to `1/ndv`. Empty until the metadata loop fills it."""
-        return self._learned.get("__column_ndv__", {})
+        """Per-column distinct counts (column name → ndv), used to sharpen equality
+        selectivity to `1/ndv` and to estimate join cardinality as `|L||R|/max(ndv)`.
+
+        Seeded from **source statistics** (footer / written-file HLL sketches carried by
+        `SourceStatistics.columns`) and overlaid with **learned** ndv from measured runs
+        (which wins, being workload-true). Source NDV is what gives a *cold* join — before
+        any run has been measured — an NDV-based cardinality instead of the
+        `max(left, right)` fallback that mis-estimates a low-NDV many-to-many join by
+        orders of magnitude and steers join order into huge intermediates.
+        """
+        if self._ndv_cache is None:
+            merged: dict[str, float] = {}
+            for st in self._source_stats or ():
+                if st is None:
+                    continue
+                for name, col in st.columns.items():
+                    if col.ndv is not None and col.ndv > 0:
+                        merged[name] = float(col.ndv)
+            merged.update(self._learned.get("__column_ndv__", {}))  # measured wins
+            self._ndv_cache = merged
+        return self._ndv_cache
 
     @property
     def _quantiles(self) -> dict[str, Any]:

@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from batcher.config import active_config
-from batcher.kyber.calibration import calibrate
+from batcher.kyber.calibration import _RECALIBRATE_AFTER, calibrate
 from batcher.metadata import MetadataHub
 from batcher.metadata.backends import InProcessBackend
 from batcher.plan.feedback import OperatorFeedback
@@ -70,8 +70,10 @@ def test_calibration_tracks_measured_ratio():
 
 def test_calibration_is_cached_until_new_feedback():
     # The whole-history op_stats scan must not run on every optimize: a repeated
-    # calibrate with no new feedback reuses the prior fit. Recording new feedback
-    # bumps the hub version and forces exactly one recompute.
+    # calibrate reuses the prior fit, and — since a cost fit barely moves with one more
+    # sample — the cache is *throttled*, holding until `_RECALIBRATE_AFTER` new feedback
+    # rows accrue (a single new row does not force a re-scan). This keeps per-query
+    # planning flat instead of growing O(history) with the session's query count.
     cfg = active_config()
     n = cfg.optimizer.cost_calibration_min_samples
     hub = _hub()
@@ -93,9 +95,13 @@ def test_calibration_is_cached_until_new_feedback():
     assert scans[0] == 1  # second call is a pure cache hit — no re-scan
     assert again == first
 
-    _record(hub, "scan", 1, rows=1000, t_ms=1.0)  # version bumps
+    _record(hub, "scan", 1, rows=1000, t_ms=1.0)  # one new row → below the refresh interval
     calibrate(hub, cfg)
-    assert scans[0] == 2  # exactly one recompute after new feedback
+    assert scans[0] == 1  # still cached (throttled — one row doesn't force a re-scan)
+
+    _record(hub, "scan", _RECALIBRATE_AFTER, rows=1000, t_ms=1.0)  # cross the refresh interval
+    calibrate(hub, cfg)
+    assert scans[0] == 2  # enough new feedback → exactly one recompute
 
 
 def test_clamp_bounds_runaway():

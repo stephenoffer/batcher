@@ -30,18 +30,24 @@ from batcher.plan.expr_ir import (
 from batcher.plan.logical import (
     Aggregate,
     AggregateSpec,
+    Distinct,
     Join,
     JoinOutputCol,
     LogicalPlan,
+    Project,
     Projection,
 )
 from batcher.plan.stats import Provenance
 
 __all__ = [
+    "count_distinct_to_distinct_count",
     "eager_aggregation",
     "pre_aggregate_join_measures",
     "pre_aggregation_through_join",
 ]
+
+# Synthetic column the count-distinct rewrite materializes the distinct input under.
+_COUNT_DISTINCT_VALUE = "__count_distinct_value"
 
 # Pushing the *measure* (right) side of a join down: each decomposable aggregate and the
 # function that merges its per-key partials. `avg`/`median`/`distinct` are excluded —
@@ -59,6 +65,45 @@ _FANOUT_SAFE_AGGS = frozenset({"min", "max"})
 # excluded — they can't be re-aggregated from a single partial column.
 _PREAGG_MERGE = {"sum": "sum", "count": "sum", "count_star": "sum", "min": "min", "max": "max"}
 _ADDITIVE_AGGS = frozenset({"sum", "count", "count_star"})
+
+
+@rule(name="count_distinct_to_distinct_count", phase=Phase.REWRITE, matches=(Aggregate,))
+def count_distinct_to_distinct_count(
+    node: Aggregate, _ctx: OptimizerContext
+) -> LogicalPlan | None:
+    """Rewrite a lone ``COUNT(DISTINCT x)`` group-by into a distinct then a plain count.
+
+    ``Aggregate(group=G, [count_distinct(x) AS a])`` →
+    ``Aggregate(group=G, [count(x) AS a])`` over ``Distinct(Project(G…, x AS v))``.
+
+    Deduping the ``(G, x)`` pairs and counting the non-null ``x`` per group equals the
+    distinct count, but reuses the radix-parallel distinct + count kernels — which
+    parallelize across the distinct *values*. The direct ``count_distinct`` combine
+    partitions by ``G``, so a query with few groups but many distinct values per group
+    (the common shape) runs on only a handful of cores. ``COUNT(x)`` (not ``COUNT(*)``)
+    drops the single ``(G, NULL)`` row a group with null inputs contributes, matching
+    SQL's NULL-excluding ``COUNT(DISTINCT)``.
+
+    Restricted to a *lone* ``count_distinct`` (no other aggregate, exact only — not
+    ``approx_count_distinct``): mixing it with row-level aggregates would need them to
+    see the un-deduped rows, which this single distinct can't serve.
+    """
+    if len(node.aggregates) != 1:
+        return None
+    spec = node.aggregates[0]
+    if spec.agg.func != "count_distinct" or spec.agg.input is None:
+        return None
+    # Alias clash with the synthetic value column (vanishingly rare) → leave it alone.
+    if any(key.alias == _COUNT_DISTINCT_VALUE for key in node.group_keys):
+        return None
+
+    # Inner: project the group keys + the distinct input, then dedup the whole row.
+    proj_items = (*node.group_keys, Projection(_COUNT_DISTINCT_VALUE, spec.agg.input))
+    deduped = Distinct(Project(node.input, proj_items))
+    # Outer: group by the projected key columns, count the now-distinct non-null values.
+    group_keys = tuple(Projection(key.alias, Col(key.alias)) for key in node.group_keys)
+    aggregates = (AggregateSpec(spec.alias, AggExpr("count", Col(_COUNT_DISTINCT_VALUE))),)
+    return Aggregate(deduped, group_keys, aggregates)
 
 
 @rule(name="eager_aggregation", phase=Phase.REWRITE, matches=(Aggregate,))

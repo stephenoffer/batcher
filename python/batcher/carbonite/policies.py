@@ -227,7 +227,23 @@ class DefaultSchedulingPolicy:
         peak = peak_operator_bytes(plan)
         morsel_bytes = max(1, cfg.execution.morsel_rows * cfg.optimizer.row_bytes)
         if peak <= 0:
-            memory_bytes = 0
+            # Kyber could not size the plan — a cold start, an unbounded source, or a
+            # shape its estimator abstained on. Granting 0 here leaves each worker's
+            # spill budget unbounded (the engine makes no memory pool for a 0 budget),
+            # so a large unknown-size distributed query OOMs instead of spilling — the
+            # one case a regular user would have to rescue by hand (`num_workers` /
+            # `max_memory_bytes`). Carbonite protects even when Kyber can't measure:
+            # fall back to a conservative fair share of the budget so the worker SPILLS
+            # and the query "just works" (survives). It sharpens to the real footprint
+            # once a run measures it; a query that fits under the share never spills, so
+            # the only cost is mild over-spill on an un-estimable large query — far
+            # better than an OOM. A no-op when the budget is unknown (`available_bytes`
+            # <= 0, e.g. test stubs), preserving the old "no hint" behavior there.
+            memory_bytes = (
+                max(morsel_bytes, int(available_bytes * cfg.memory.soft_limit) // n_tasks)
+                if available_bytes > 0
+                else 0
+            )
         else:
             per_task = max(morsel_bytes, peak // n_tasks)
             fair_share = (
@@ -244,10 +260,26 @@ class DefaultSchedulingPolicy:
             default=cfg.execution.cpus_per_task,
         )
 
+        # Placement-strategy preference (resolved against the live cluster in `dist`).
+        # A small-shuffle breaker prefers PACK — co-locate the workers, no cross-node
+        # shuffle — but only when the gang plausibly fits one node: a fan-out wider than
+        # a node's cores cannot PACK, so it stays SPREAD. Carbonite has no live topology;
+        # `cpu_budget` (≈ one machine's cores) is the feasibility proxy, and `dist` makes
+        # the final call (it can downgrade SPREAD→PACK on a single-node cluster).
+        prefers_local = any(op.bounds.prefers_locality for op in plan.ops)
+        placement_strategy = "PACK" if prefers_local and n_tasks <= cpu_budget else "SPREAD"
+
+        # This is the *relational* (CPU shuffle) grant — `num_gpus` is 0 here, the GPU
+        # map/inference path sets its own. Record the intent to keep this fleet off GPU
+        # nodes; `dist` enforces it only when the live cluster has CPU-only capacity to
+        # host the fleet (a no-op on a homogeneous cluster), so a CPU shuffle never
+        # steals an inference stage's GPU-node cores on a mixed cluster.
         return SchedulingEnvelope(
             num_cpus=num_cpus,
             memory_bytes=int(memory_bytes),
             num_gpus=0.0,
             n_tasks=n_tasks,
             credits=cfg.flow_control.default_credits,
+            placement_strategy=placement_strategy,
+            prefer_cpu_only_nodes=True,
         )

@@ -117,6 +117,28 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # for the model/loader paths. The examples, not the thin delegating bodies, push it
     # over; the methods are one cohesive accessor bound as a unit.
     "python/batcher/api/dataset/ml.py": "ds.ml accessor; per-method examples push it over",
+    # The distributed dispatcher: one cohesive routing hub that inspects a plan's shape
+    # and sends it to the matching distributed operator (map / aggregate / join / sort /
+    # distinct / window / union / asof), plus the cluster-fill + envelope sizing every
+    # route shares. Like `par.rs`, splitting the arms scatters the routing it exists to
+    # centralize; `executors/` is at the 12-file dir cap so a sibling can't take them.
+    "python/batcher/dist/executor.py": "distributed dispatch hub; per-shape routing + sizing, executors/ at 12-file cap",
+    # The distributed map/inference path: one cohesive hub over its scheduling variants
+    # (stateless tasks, autoscaling actor pool, query-resident pool, streamed CPU→GPU
+    # stages, map→aggregate) and the data/compute-skew-adaptive task sizing they share.
+    # `executors/` is at the 12-file dir cap, so the variants can't move to a sibling.
+    "python/batcher/dist/executors/map.py": "distributed map/inference hub; scheduling variants + adaptive sizing, executors/ at 12-file cap",
+    # The one shared Flight-shuffle worker actor: every flight_* operator (aggregate /
+    # join / sort / window) drives this SAME `_FlightWorker` so they share its session
+    # and lineage-recovery contract. The module docstring's whole rationale is keeping
+    # it single so operators share the actor without a circular import — splitting it
+    # would reintroduce exactly that cycle.
+    "python/batcher/dist/flight_worker.py": "single shared _FlightWorker actor for all flight ops; split reintroduces an import cycle",
+    # The cardinality/stats estimator: one cohesive `StatsEstimator` (row-count
+    # estimation, column stats, per-column NDV from source + learned stats, quantiles,
+    # selectivity dispatch) memoized by node identity. The arms share that per-instance
+    # cache state, so splitting scatters one estimator across files for ~a dozen lines.
+    "python/batcher/kyber/stats/estimator.py": "cardinality/stats estimator hub; shared per-instance caches",
 }
 
 fails: list[str] = []

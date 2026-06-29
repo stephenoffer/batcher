@@ -34,11 +34,73 @@ from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Sort
 
-__all__ = ["execute_sort_flight"]
+__all__ = ["execute_sort_flight", "execute_topn_flight"]
 
 # Per-worker CDF sample granularity: a fine grid (33 probe points) so the merged
 # boundaries balance the ranges well. Precision affects only balance, not result.
 _SAMPLE_PROBS = [i / 32 for i in range(33)]
+
+
+def _sort_ir(keys, limit, input_ir):
+    """The sort IR over `input_ir` carrying `keys` and `limit` (None = no limit)."""
+    return json.dumps(
+        {
+            "op": "sort",
+            "input": input_ir,
+            "keys": [
+                {"expr": k.expr.to_ir(), "descending": k.descending, "nulls_first": k.nulls_first}
+                for k in keys
+            ],
+            "limit": limit,
+        }
+    )
+
+
+def execute_topn_flight(
+    above: list[LogicalPlan],
+    sort: Sort,
+    sources: list[Source],
+    workers: int,
+) -> pa.Table:
+    """A distributed **top-N** (`ORDER BY ... LIMIT k`) with NO shuffle — mergeable.
+
+    The global top-N is the top-N of the union of each worker's top-N, so every worker
+    reads its own split, runs the map prefix + the single-node top-N heap (`sort+limit`),
+    and ships only `k` rows; the driver merges the `workers x k` rows with one more
+    `sort+limit`. This skips the full range-partition sort entirely (which would shuffle
+    every row just to slice the first `k`), the dominant cost for a small `k`.
+    """
+    import ray
+
+    import batcher._native as nat
+
+    _ensure_ray(workers)
+    cfg_json = engine_config_json()
+    map_plan, sid = _relabel_single_source(sort.input)
+    # Per-worker plan: read the split (scan 0) → map prefix → local top-N heap.
+    local_ir = _sort_ir(sort.keys, sort.limit, map_plan.to_ir())
+    # Driver merge plan: top-N over the concatenated per-worker top-Ns (scan 0).
+    merge_ir = _sort_ir(sort.keys, sort.limit, {"op": "scan", "source_id": 0})
+
+    projection, predicate = source_pushdown(map_plan, sid)
+    parts = partition_descriptors(sources[sid], workers, projection=projection, predicate=predicate)
+    actors, pg, _addrs, workers, owns = acquire_fleet(workers, _shuffle_credits(), cfg_json)
+    try:
+        results = ray.get([actors[i].local_topn.remote(local_ir, parts[i]) for i in range(workers)])
+    finally:
+        if owns:
+            for a in actors:
+                with contextlib.suppress(Exception):
+                    ray.kill(a)
+            release_placement(pg)
+
+    gathered = [b for r in results for b in r if b.num_rows > 0]
+    merged = nat.execute_plan(merge_ir, [gathered], cfg_json) if gathered else []
+    if merged:
+        table = pa.Table.from_batches(merged)
+    else:
+        table = pa.table({k.expr.name: [] for k in sort.keys})
+    return table if not above else _apply_above(above, table)
 
 
 def execute_sort_flight(

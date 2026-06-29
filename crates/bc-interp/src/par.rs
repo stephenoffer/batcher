@@ -698,7 +698,13 @@ fn exec(
                         }
                         Admit::InMemory(_reservation) => {
                             let combined = ops::materialize(&parts)?;
-                            vec![ops::sort_batch(&combined, keys, None)?]
+                            // Parallel sample-sort for a large single float-key full sort
+                            // (range-partition + per-range parallel sort); falls back to
+                            // the serial sort where it doesn't apply.
+                            match ops::parallel_sort_batch(&combined, keys, None)? {
+                                Some(sorted) => vec![sorted],
+                                None => vec![ops::sort_batch(&combined, keys, None)?],
+                            }
                         }
                     }
                 }

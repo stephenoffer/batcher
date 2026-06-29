@@ -72,6 +72,10 @@ _CPU_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, int, dict[str, flo
     weakref.WeakKeyDictionary()
 )
 
+# Recompute the utilization medians only after this many new feedback rows (mirrors
+# `calibration._RECALIBRATE_AFTER`): keeps per-query planning overhead flat.
+_REFRESH_AFTER = 64
+
 
 def class_ir_tag(class_name: str) -> str | None:
     """The native metrics `kind` tag for a `LogicalPlan` class name, if measured."""
@@ -97,9 +101,17 @@ def load_cpu_utilization(hub: MetadataHub | None, config: Config | None = None) 
         return {}
     cfg = config or active_config()
     min_samples = max(1, cfg.optimizer.cost_calibration_min_samples)
+    # Throttle like `calibrate`: reuse the per-kind utilization medians until enough new
+    # feedback accrues, rather than re-scanning the whole op-stats history every query
+    # (the hub version bumps per recorded operator, so an exact-version cache misses every
+    # `collect()`). These medians only steer per-task CPU shares, never results.
     version = hub.version
     cached = _CPU_CACHE.get(hub)
-    if cached is not None and cached[0] == version and cached[1] == min_samples:
+    if (
+        cached is not None
+        and cached[1] == min_samples
+        and 0 <= version - cached[0] < _REFRESH_AFTER
+    ):
         return cached[2]
     try:
         out: dict[str, float] = {}

@@ -14,7 +14,7 @@ use arrow::compute::SortOptions;
 use arrow::compute::{
     concat_batches, filter_record_batch, lexsort_to_indices, sort_to_indices, take, SortColumn,
 };
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 use bc_ir::{
     AggFunc, AggregateItem, FrameBound, FrameUnits, ProjectionItem, SortKey, WindowFn, WindowFrame,
     WindowFunc,
@@ -387,6 +387,141 @@ pub(crate) fn sort_batch(
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
+/// Rows below which the single-node sample-sort stays serial — the sampling + range
+/// partition + concat overhead only pays off on a large full sort.
+const PARALLEL_SORT_MIN_ROWS: usize = 1 << 17;
+
+/// Parallel single-node full sort by sample-sort: range-partition the rows by the
+/// leading key (sampled quantile boundaries), sort each range in parallel, and
+/// concatenate in key order — no final merge, because the ranges are globally ordered
+/// relative to each other. This is the single-node form of the distributed range sort
+/// (`dist/flight_sort.py`), so one implementation serves both.
+///
+/// Returns `None` (caller falls back to the serial [`sort_batch`]) unless it applies: a
+/// full sort (no `LIMIT` — top-N is already cheap), a large input, and a **float or
+/// integer leading key** (the bucket boundaries route it *exactly* — floats by `f64`,
+/// integers by `i64`; a string leading key falls back). Multi-key sorts are supported:
+/// rows are bucketed by the leading key (equal leading keys never span a boundary, so
+/// they stay in one range), then each range is sorted by the *full* key list — so a plain
+/// concatenation in leading-key order is the globally sorted multi-key relation, no merge.
+pub(crate) fn parallel_sort_batch(
+    batch: &RecordBatch,
+    keys: &[SortKey],
+    limit: Option<usize>,
+) -> Result<Option<RecordBatch>, InterpError> {
+    use rayon::prelude::*;
+
+    let Some(k0) = keys.first() else {
+        return Ok(None);
+    };
+    if limit.is_some() || batch.num_rows() < PARALLEL_SORT_MIN_ROWS {
+        return Ok(None);
+    }
+    let key = k0.expr.eval(batch)?;
+    let parts = rayon::current_num_threads().clamp(2, 64);
+
+    // Range-partition by the leading key — exactly (f64 for floats, i64 for integers).
+    // A string/other leading key can't be range-partitioned here, so fall back.
+    let buckets = if matches!(key.data_type(), DataType::Float64 | DataType::Float32) {
+        let key_f64 = arrow::compute::cast(&key, &DataType::Float64)?;
+        let keyv = key_f64
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("cast to Float64");
+        let Some(b) = sample_boundaries_f64(keyv, parts) else {
+            return Ok(None);
+        };
+        bc_runtime::shuffle::range_partition_by_key_array(
+            batch,
+            &key_f64,
+            &b,
+            parts,
+            k0.nulls_first,
+            k0.descending,
+        )?
+    } else if key.data_type().is_integer() {
+        let key_i64 = arrow::compute::cast(&key, &DataType::Int64)?;
+        let keyv = key_i64
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("cast to Int64");
+        let Some(b) = sample_boundaries_i64(keyv, parts) else {
+            return Ok(None);
+        };
+        bc_runtime::shuffle::range_partition_by_i64_key(
+            batch,
+            &key_i64,
+            &b,
+            parts,
+            k0.nulls_first,
+            k0.descending,
+        )?
+    } else {
+        return Ok(None);
+    };
+
+    // Each range sorts by the *full* key list in parallel.
+    let sorted: Vec<RecordBatch> = buckets
+        .par_iter()
+        .map(|b| sort_batch(b, keys, None))
+        .collect::<Result<_, InterpError>>()?;
+
+    // Ascending → ranges 0..P; descending → reversed (range P-1 holds the largest keys).
+    let ordered: Vec<&RecordBatch> = if k0.descending {
+        sorted.iter().rev().collect()
+    } else {
+        sorted.iter().collect()
+    };
+    Ok(Some(concat_batches(&batch.schema(), ordered)?))
+}
+
+/// Sample `parts-1` ascending f64 quantile boundaries from a float key column. Returns
+/// `None` if fewer than `parts` finite values exist (nothing meaningful to split).
+fn sample_boundaries_f64(key: &arrow::array::Float64Array, parts: usize) -> Option<Vec<f64>> {
+    let n = key.len();
+    let target = 8192.min(n).max(parts);
+    let stride = (n / target).max(1);
+    let mut sample: Vec<f64> = (0..n)
+        .step_by(stride)
+        .filter(|&i| key.is_valid(i))
+        .map(|i| key.value(i))
+        .filter(|v| !v.is_nan())
+        .collect();
+    if sample.len() < parts {
+        return None;
+    }
+    sample.sort_unstable_by(|a, b| a.total_cmp(b));
+    let m = sample.len();
+    Some(
+        (1..parts)
+            .map(|j| sample[(j * m / parts).min(m - 1)])
+            .collect(),
+    )
+}
+
+/// Sample `parts-1` ascending i64 quantile boundaries from an integer key column (the
+/// exact-integer analog of [`sample_boundaries_f64`]). `None` if too few non-null values.
+fn sample_boundaries_i64(key: &arrow::array::Int64Array, parts: usize) -> Option<Vec<i64>> {
+    let n = key.len();
+    let target = 8192.min(n).max(parts);
+    let stride = (n / target).max(1);
+    let mut sample: Vec<i64> = (0..n)
+        .step_by(stride)
+        .filter(|&i| key.is_valid(i))
+        .map(|i| key.value(i))
+        .collect();
+    if sample.len() < parts {
+        return None;
+    }
+    sample.sort_unstable();
+    let m = sample.len();
+    Some(
+        (1..parts)
+            .map(|j| sample[(j * m / parts).min(m - 1)])
+            .collect(),
+    )
+}
+
 /// Window over a single (already-materialized) batch, at the default parallel-row
 /// threshold. Evaluates partition/order keys + each function input, runs the runtime
 /// window kernel, and appends one column per function (named by alias) to the input.
@@ -602,4 +737,206 @@ pub(crate) fn limit(batches: Vec<RecordBatch>, n: usize, offset: usize) -> Vec<R
         }
     }
     out
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+    use arrow::array::{Float64Array, Int64Array};
+    use bc_expr::Expr;
+    use std::sync::Arc;
+
+    /// The parallel sample-sort must produce a relation byte-identical to the serial
+    /// stable sort — same order for every column, including the tie / null / NaN /
+    /// descending cases — across a large float key (the path that engages it).
+    #[test]
+    fn parallel_sort_matches_serial_sort() {
+        let n = 200_000usize; // > PARALLEL_SORT_MIN_ROWS so the parallel path engages
+                              // Keys with heavy ties (low precision), scattered nulls and a few NaNs, plus a
+                              // distinct payload so a tie-break difference would show as a column mismatch.
+        let keyv: Vec<Option<f64>> = (0..n)
+            .map(|i| {
+                if i % 101 == 0 {
+                    None
+                } else if i % 997 == 0 {
+                    Some(f64::NAN)
+                } else {
+                    Some(((i * 7) % 500) as f64 / 4.0)
+                }
+            })
+            .collect();
+        let payload: Vec<i64> = (0..n as i64).collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("k", Arc::new(Float64Array::from(keyv)) as ArrayRef),
+            ("p", Arc::new(Int64Array::from(payload)) as ArrayRef),
+        ])
+        .unwrap();
+
+        let names = ["k", "p"];
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                let keys = vec![SortKey {
+                    expr: Expr::Col { name: "k".into() },
+                    descending,
+                    nulls_first,
+                }];
+                check_parallel_matches_serial(&batch, &keys, &names, descending, nulls_first);
+            }
+        }
+    }
+
+    /// Single integer key and a two-key (int leading) sort — the integer / multi-key
+    /// generalization of the float sample-sort. Same invariant: identical key-column
+    /// sequence and row multiset vs the serial sort.
+    #[test]
+    fn parallel_int_and_multikey_sort_match_serial() {
+        let n = 200_000usize;
+        let k: Vec<Option<i64>> = (0..n)
+            .map(|i| {
+                if i % 101 == 0 {
+                    None
+                } else {
+                    Some(((i * 13) % 700) as i64)
+                }
+            })
+            .collect();
+        let s: Vec<i64> = (0..n as i64).map(|i| (i * 31) % 50).collect();
+        let p: Vec<i64> = (0..n as i64).collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("k", Arc::new(Int64Array::from(k)) as ArrayRef),
+            ("s", Arc::new(Int64Array::from(s)) as ArrayRef),
+            ("p", Arc::new(Int64Array::from(p)) as ArrayRef),
+        ])
+        .unwrap();
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                // Single int key.
+                let one = vec![SortKey {
+                    expr: Expr::Col { name: "k".into() },
+                    descending,
+                    nulls_first,
+                }];
+                check_parallel_matches_serial(
+                    &batch,
+                    &one,
+                    &["k", "s", "p"],
+                    descending,
+                    nulls_first,
+                );
+                // Two-key sort (int leading): the secondary key sorts within each range.
+                let two = vec![
+                    SortKey {
+                        expr: Expr::Col { name: "k".into() },
+                        descending,
+                        nulls_first,
+                    },
+                    SortKey {
+                        expr: Expr::Col { name: "s".into() },
+                        descending: false,
+                        nulls_first,
+                    },
+                ];
+                check_parallel_matches_serial(
+                    &batch,
+                    &two,
+                    &["k", "s", "p"],
+                    descending,
+                    nulls_first,
+                );
+            }
+        }
+    }
+
+    /// Parallel sample-sort must match the serial sort in the **key-column sequence**
+    /// (identical regardless of tie order — fully-tied rows carry identical key values)
+    /// and in the **full-row multiset**.
+    fn check_parallel_matches_serial(
+        batch: &RecordBatch,
+        keys: &[SortKey],
+        col_names: &[&str],
+        descending: bool,
+        nulls_first: bool,
+    ) {
+        let serial = sort_batch(batch, keys, None).unwrap();
+        let parallel = parallel_sort_batch(batch, keys, None)
+            .unwrap()
+            .expect("parallel sort should engage");
+
+        // Encode a column's values as comparable tokens (null distinct from any value).
+        let col_tokens = |b: &RecordBatch, name: &str| -> Vec<(u8, u64)> {
+            let c = b.column(b.schema().index_of(name).unwrap());
+            (0..c.len())
+                .map(|i| {
+                    if c.is_null(i) {
+                        (0u8, 0)
+                    } else if let Some(a) = c.as_any().downcast_ref::<Float64Array>() {
+                        (1, a.value(i).to_bits())
+                    } else {
+                        (
+                            1,
+                            c.as_any().downcast_ref::<Int64Array>().unwrap().value(i) as u64,
+                        )
+                    }
+                })
+                .collect()
+        };
+        // Key-column sequences must match position-for-position.
+        let key_names: Vec<&str> = keys
+            .iter()
+            .map(|k| match &k.expr {
+                Expr::Col { name } => name.as_str(),
+                _ => unreachable!("test uses column keys"),
+            })
+            .collect();
+        for name in &key_names {
+            assert_eq!(
+                col_tokens(&serial, name),
+                col_tokens(&parallel, name),
+                "key '{name}' ordering differs (descending={descending}, nulls_first={nulls_first})"
+            );
+        }
+        // Full-row multiset must be preserved.
+        let rows = |b: &RecordBatch| -> Vec<Vec<(u8, u64)>> {
+            let cols: Vec<Vec<(u8, u64)>> = col_names.iter().map(|n| col_tokens(b, n)).collect();
+            let mut rows: Vec<Vec<(u8, u64)>> = (0..b.num_rows())
+                .map(|i| cols.iter().map(|c| c[i]).collect())
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+        assert_eq!(
+            rows(&serial),
+            rows(&parallel),
+            "row multiset differs (descending={descending}, nulls_first={nulls_first})"
+        );
+    }
+
+    /// The parallel path declines for a small input and for a non-numeric (string)
+    /// leading key, so the caller uses the serial sort.
+    #[test]
+    fn parallel_sort_declines_small_and_string() {
+        let small = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(Float64Array::from(vec![3.0, 1.0, 2.0])) as ArrayRef,
+        )])
+        .unwrap();
+        let keys = vec![SortKey {
+            expr: Expr::Col { name: "k".into() },
+            descending: false,
+            nulls_first: false,
+        }];
+        assert!(parallel_sort_batch(&small, &keys, None).unwrap().is_none());
+
+        let n = 200_000usize;
+        let strs: Vec<String> = (0..n).map(|i| format!("s{}", i % 1000)).collect();
+        let str_batch = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(arrow::array::StringArray::from(strs)) as ArrayRef,
+        )])
+        .unwrap();
+        // String leading key → declines (can't range-partition here); serial sort handles it.
+        assert!(parallel_sort_batch(&str_batch, &keys, None)
+            .unwrap()
+            .is_none());
+    }
 }

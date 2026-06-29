@@ -13,6 +13,7 @@ level to throttle / spill / pause. The monitor only *measures* — it never acts
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass
 from enum import IntEnum
@@ -36,6 +37,7 @@ class PressureLevel(IntEnum):
     CRITICAL = 3  # past the hard limit — pause producers, only drain
 
 
+@functools.lru_cache(maxsize=1)
 def _cgroup_limit_bytes() -> int | None:
     """The container memory limit from cgroup v2 (`memory.max`) or v1
     (`memory.limit_in_bytes`), or `None` when unlimited / not in a cgroup.
@@ -43,6 +45,10 @@ def _cgroup_limit_bytes() -> int | None:
     A container's cgroup cap is the *real* ceiling — the host's RAM is not — so
     honoring it is what stops the engine over-admitting and getting OOM-killed by
     the kernel (C25).
+
+    Cached for the process: the cgroup cap is fixed for a container's lifetime, while
+    this is read on every admission check — re-opening `memory.max` per query is pure
+    hot-path I/O. (The *current* usage, which does change, is read live and uncached.)
     """
     for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
         try:

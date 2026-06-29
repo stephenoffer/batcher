@@ -34,12 +34,18 @@ def execute_join_flight(
     _fault_inject: set[int] | None = None,
     *,
     fused_agg: Aggregate | None = None,
+    combine_partials: bool = False,
 ) -> pa.Table:
     """Co-partition both join sides over a Flight shuffle and join per bucket.
 
-    `fused_agg` (an aggregate whose group keys ⊇ the join key) is folded INTO the reduce:
-    each reducer aggregates its joined bucket and only the small per-bucket result reaches
-    the driver — the full join never materializes on the head (exchange elimination).
+    `fused_agg` is folded INTO the reduce so only small aggregated/partial buckets reach
+    the driver — the full join never materializes on the head (exchange elimination). When
+    its group keys ⊇ the join key every group lands in one bucket, so each reducer's
+    per-bucket aggregate is complete and the driver concatenates. When they do NOT (set
+    `combine_partials`), a group spans buckets: each reducer emits its PARTIAL state and
+    the driver does the cross-bucket `combine_finalize` (standard mergeable two-phase),
+    so an aggregate over an arbitrary join still runs fully distributed instead of
+    collecting the whole join to the driver to aggregate it single-node.
 
     Left and right mappers publish their key-hashed buckets on their own Flight
     servers (shuffle stages 0 and 1); reducer r fetches bucket r from every mapper
@@ -54,8 +60,17 @@ def execute_join_flight(
     _ensure_ray(workers)
     cfg_json = engine_config_json()  # driver config → shipped to worker actors
 
-    left_plan, lsid = _relabel_single_source(join.left)
-    right_plan, rsid = _relabel_single_source(join.right)
+    # Restrict each side to exactly the columns the join OUTPUT carries (Kyber already
+    # pruned `join.output` to what the consumer above needs) plus the join keys, so the
+    # shuffle moves only those columns — not the whole wide table. Without this each side
+    # ships every source column (the relabeled per-side sub-plan is a bare scan, so its
+    # own `source_pushdown` can't see that the join above keeps just a few): TPC-H lineitem
+    # has 17 columns but a `…⋈ orders GROUP BY priority` join needs 2, so the un-pruned
+    # shuffle moved ~8× the bytes and dominated the join.
+    left_need = {o.name for o in join.output if o.side == "left"} | set(join.left_keys)
+    right_need = {o.name for o in join.output if o.side == "right"} | set(join.right_keys)
+    left_plan, lsid = _relabel_single_source(_project_join_side(join.left, left_need))
+    right_plan, rsid = _relabel_single_source(_project_join_side(join.right, right_need))
     left_ir = json.dumps(left_plan.to_ir())
     right_ir = json.dumps(right_plan.to_ir())
     join_ir = json.dumps(
@@ -131,6 +146,7 @@ def execute_join_flight(
             workers,
             gk,
             aj,
+            finalize=not combine_partials,
         )
     finally:
         if owns:
@@ -139,18 +155,58 @@ def execute_join_flight(
                     ray.kill(a)
             release_placement(pg)
 
+    # Non-fusable fused aggregate: reducers shipped PARTIAL state (one per bucket); the
+    # group spans buckets, so do the cross-bucket combine+finalize here on the small
+    # partials (workers × groups rows), not on the full join.
+    if combine_partials and fused_agg is not None:
+        final = nat.combine_finalize(gk, aj, batches) if batches else None
+        table = pa.Table.from_batches([final]) if final is not None else _empty_fused(fused_agg)
+        return table if not above else _apply_above(above, table)
+
     if batches:
         table = pa.Table.from_batches(batches)
     elif fused_agg is not None:
-        keys = [k.alias for k in fused_agg.group_keys]
-        table = pa.table({c: [] for c in keys + [s.alias for s in fused_agg.aggregates]})
+        table = _empty_fused(fused_agg)
     else:
         table = pa.table({o.alias: [] for o in join.output})
     return table if not above else _apply_above(above, table)
 
 
+def _empty_fused(fused_agg: Aggregate) -> pa.Table:
+    """The empty result table for a fused post-join aggregate (group keys + aggregates)."""
+    keys = [k.alias for k in fused_agg.group_keys]
+    return pa.table({c: [] for c in keys + [s.alias for s in fused_agg.aggregates]})
+
+
+def _project_join_side(side: LogicalPlan, needed: set[str]) -> LogicalPlan:
+    """Wrap a join side in a `Project` selecting only `needed` columns, so its scan reads
+    and shuffles just those — `source_pushdown` then maps them through any rename/filter
+    to the actual scan columns. A no-op when nothing can be pruned (needed ⊇ available),
+    so a `SELECT *`-style join whose output Kyber did not prune is unchanged.
+    """
+    from batcher.plan.expr_ir import Col
+    from batcher.plan.logical import Project, Projection
+
+    avail = side.available_columns()
+    keep = [c for c in avail if c in needed]  # preserve the side's column order
+    if not keep or len(keep) == len(avail):
+        return side
+    return Project(side, tuple(Projection(alias=c, expr=Col(c)) for c in keep))
+
+
 def _join_reduce_with_recovery(
-    actors, addrs, parts, irs, keys, join_ir, schemas, n_buckets, workers, gk=None, aj=None
+    actors,
+    addrs,
+    parts,
+    irs,
+    keys,
+    join_ir,
+    schemas,
+    n_buckets,
+    workers,
+    gk=None,
+    aj=None,
+    finalize=True,
 ):
     """Run the join reduce under recompute-on-worker-loss recovery.
 
@@ -203,7 +259,9 @@ def _join_reduce_with_recovery(
 
         def _launch(r: int, avoid: set[int]):
             host = _host_for(r, avoid)
-            ref = actors[host].reduce_join.remote(join_ir, addrs, r, lschema, rschema, gk, aj)
+            ref = actors[host].reduce_join.remote(
+                join_ir, addrs, r, lschema, rschema, gk, aj, finalize
+            )
             ref_host[ref] = host
             return ref
 

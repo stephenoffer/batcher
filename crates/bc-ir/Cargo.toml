@@ -9,7 +9,9 @@ license.workspace = true
 bc-arrow.workspace = true
 bc-expr.workspace = true
 serde.workspace = true
-serde_json = { workspace = true }
+# `unbounded_depth` exposes `Deserializer::disable_recursion_limit`, so a deep but
+# Python-depth-bounded plan IR parses without serde_json's default 128-deep guard.
+serde_json = { workspace = true, features = ["unbounded_depth"] }
 thiserror.workspace = true
 
 [features]

@@ -328,7 +328,15 @@ try:
             return ("ok", nat.execute_plan(win_ir, [rows], self._engine_config))
 
         def reduce_join(
-            self, join_ir, addrs, reducer_id, left_schema, right_schema, gk=None, aj=None
+            self,
+            join_ir,
+            addrs,
+            reducer_id,
+            left_schema,
+            right_schema,
+            gk=None,
+            aj=None,
+            finalize=True,
         ):
             import batcher._native as nat
 
@@ -350,15 +358,31 @@ try:
                 join_ir, [left or [left_schema], right or [right_schema]], self._engine_config
             )
             if gk is not None:
-                # Fused post-join aggregate: the group keys ⊇ the join key, so every group's
-                # rows share one join key and land in THIS bucket — a per-bucket
-                # partial+finalize is therefore complete (no cross-bucket combine). Only the
-                # small aggregated bucket leaves the worker; the full join never reaches the
-                # driver (exchange elimination). `combine_finalize` returns one batch (or
-                # None); reduce_join's contract is a list of batches, so wrap it.
-                out = nat.combine_finalize(gk, aj, [nat.partial_aggregate(gk, aj, joined)])
-                joined = [out] if out is not None else []
+                # Fused post-join aggregate (only a small bucket leaves the worker — the
+                # full join never reaches the driver). `finalize=True` when group keys ⊇
+                # join key (each group is whole in this bucket, so finalize here; driver
+                # concatenates disjoint groups); `finalize=False` otherwise (a group spans
+                # buckets, so emit PARTIAL state and let the driver `combine_finalize`).
+                partial = nat.partial_aggregate(gk, aj, joined)
+                if finalize:
+                    out = nat.combine_finalize(gk, aj, [partial])
+                    joined = [out] if out is not None else []
+                else:
+                    joined = [partial] if partial is not None else []
             return ("ok", joined)
+
+        def local_topn(self, plan_ir, partition):
+            """Run `plan_ir` (the map prefix + sort + limit) on this worker's own split and
+            return its local top-N rows — no shuffle. For a top-N (`ORDER BY ... LIMIT k`)
+            the global answer is the top-N of the union of per-worker top-Ns, so each
+            worker reads its split, applies the single-node top-N heap, and ships only k
+            rows; the driver merges. Reads the split directly (never on the driver)."""
+            import batcher._native as nat
+            from batcher.dist.executors.partition_io import read_partition_descriptor
+
+            return nat.execute_plan(
+                plan_ir, [read_partition_descriptor(partition)], self._engine_config
+            )
 
         def sample_quantiles(self, map_ir, key_name, probs, partition):
             """Sample this split's leading-key distribution as a small quantile grid.

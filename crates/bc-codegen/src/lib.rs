@@ -718,7 +718,11 @@ pub(crate) fn libm_unary_symbol(func: bc_expr::MathFunc) -> Option<&'static str>
         Asin => "asin",
         Acos => "acos",
         Atan => "atan",
-        Cbrt => "cbrt",
+        // NB: `cbrt` is intentionally NOT lowered. Rust's `f64::cbrt()` (the
+        // interpreter oracle) is a software implementation that differs from the system
+        // `cbrt` libcall by 1 ULP on ~half of inputs, so a JIT libcall cannot be
+        // bit-for-bit identical to the oracle. Per the engine contract the JIT must then
+        // fall back, so cbrt stays on the interpreter (correct, just un-accelerated).
         _ => return None,
     })
 }
@@ -1264,8 +1268,9 @@ mod tests {
         // Math funcs that stay on the interpreter (different rounding mode /
         // select / constant-multiply / reciprocal — out of scope for the JIT)
         // must NOT compile so the interpreter handles them and parity is
-        // preserved. (Ln/Sin/Cbrt etc. ARE now supported — see
-        // `differential_transcendental`.)
+        // preserved. (Ln/Sin/Exp etc. ARE now supported — see
+        // `differential_transcendental`; `cbrt` is excluded too, for the 1-ULP
+        // oracle mismatch documented there.)
         for func in [
             MathFunc::Round,
             MathFunc::Sign,
@@ -1315,6 +1320,7 @@ mod tests {
     /// JIT now lowers via a libm libcall. Domains are chosen so neither tier
     /// produces a NaN (which would fail `assert_eq!` regardless of parity); the
     /// equality is exact (bit-for-bit), so a single-ULP divergence FAILS here.
+
     #[test]
     fn differential_transcendental() {
         use bc_expr::{Math2Func, MathFunc};
@@ -1339,12 +1345,19 @@ mod tests {
             MathFunc::Sinh,
             MathFunc::Cosh,
             MathFunc::Tanh,
-            MathFunc::Cbrt,
         ];
         for f in any_domain {
             assert_parity(&math(f, col("p")), &batch);
             assert_parity(&math(f, col("u")), &batch);
         }
+
+        // `cbrt` is interpreter-only: Rust's `f64::cbrt()` (the oracle) is a software
+        // impl that differs from the system `cbrt` libcall by 1 ULP on ~half of inputs,
+        // so the JIT cannot match it bit-for-bit and must fall back (no JIT compile).
+        assert!(
+            compile_expr(&math(MathFunc::Cbrt, col("p")), &batch).is_err(),
+            "cbrt must fall back to the interpreter, not JIT (no cross-platform ULP parity)"
+        );
 
         // tan is finite for these inputs (no value near pi/2 + k*pi).
         assert_parity(&math(MathFunc::Tan, col("u")), &batch);

@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import threading
 
 __all__ = [
     "ShuffleFleet",
     "acquire_fleet",
     "current_fleet",
     "maybe_spawn_query_fleet",
+    "release_session_fleet",
     "reset_fleet",
     "set_fleet",
 ]
@@ -40,6 +42,36 @@ __all__ = [
 _FLEET: contextvars.ContextVar[ShuffleFleet | None] = contextvars.ContextVar(
     "batcher_shuffle_fleet", default=None
 )
+
+
+def _spawn_fleet_with_addrs(workers: int, credits: int, cfg_json: str, plan_id: int | None = None):
+    """Spawn the worker fleet and fetch their Flight addresses, releasing the gang on failure.
+
+    Returns ``(actors, placement_group, addrs)``. If anything between reserving the
+    placement group and collecting every worker's advertised address fails (an actor
+    that can't bind its Flight server, a node lost mid-spawn, an interrupt), the actors
+    are killed and the placement group released before the error propagates — otherwise
+    the reserved gang would leak (no `ShuffleFleet` is constructed, so its `cleanup`
+    never runs). The single guarded spawn point both `ShuffleFleet.spawn` and the
+    transient `acquire_fleet` path go through.
+    """
+    import ray
+
+    from batcher.dist.executors.ray_runtime import release_placement
+    from batcher.dist.flight_worker import spawn_flight_workers
+
+    actors, pg = spawn_flight_workers(workers, credits, cfg_json, plan_id)
+    ok = False
+    try:
+        addrs = list(ray.get([a.addr.remote() for a in actors]))
+        ok = True
+        return actors, pg, addrs
+    finally:
+        if not ok:
+            for a in actors:
+                with contextlib.suppress(Exception):
+                    ray.kill(a)
+            release_placement(pg)
 
 
 class ShuffleFleet:
@@ -71,13 +103,10 @@ class ShuffleFleet:
     @classmethod
     def spawn(cls, workers: int, credits: int, cfg_json: str) -> ShuffleFleet:
         """Gang-schedule `workers` actors once and cache their advertised addresses."""
-        import ray
-
-        from batcher.dist.flight_worker import new_plan_id, spawn_flight_workers
+        from batcher.dist.flight_worker import new_plan_id
 
         plan_id = new_plan_id()
-        actors, pg = spawn_flight_workers(workers, credits, cfg_json, plan_id)
-        addrs = list(ray.get([a.addr.remote() for a in actors]))
+        actors, pg, addrs = _spawn_fleet_with_addrs(workers, credits, cfg_json, plan_id)
         return cls(actors, pg, addrs, credits, cfg_json, plan_id)
 
     def cleanup(self) -> None:
@@ -94,15 +123,93 @@ class ShuffleFleet:
         self.pg = None
 
 
-def acquire_fleet(workers: int, credits: int, cfg_json: str):
-    """Borrow the ambient query fleet, or spawn a transient one for this operator.
+# --- Session fleet: one warm fleet reused across separate distributed queries -------
+# Guards `_SESSION` (the cached cross-query fleet) and its idle-release timer. A query
+# fleet (the adaptive-loop `ContextVar` above) always wins over this; this only serves
+# the otherwise-transient per-operator spawn so a second `collect()` starts warm.
+_SESSION_LOCK = threading.RLock()
+_SESSION: ShuffleFleet | None = None
+_SESSION_TIMER: threading.Timer | None = None
 
-    Returns ``(actors, pg, addrs, workers, owns)``. When a query-lifetime fleet is
-    installed, every Flight operator MUST borrow it (``owns`` is ``False``, the
-    returned `workers` is the fleet's fixed count) — spawning its own placement group
-    instead would contend with the fleet's already-held bundles and deadlock, the very
-    hazard the persistent fleet exists to remove. With no fleet, spawn a transient one
-    the caller tears down (``owns`` is ``True``): the pre-existing per-operator path.
+
+def _session_fleet_alive(fleet: ShuffleFleet) -> bool:
+    """Whether every actor in `fleet` is still reachable (cheap liveness ping)."""
+    import ray
+
+    if not fleet.actors:
+        return False
+    try:
+        ray.get([a.addr.remote() for a in fleet.actors], timeout=10.0)
+        return True
+    except Exception:
+        return False
+
+
+def _arm_idle_release(idle_s: float) -> None:
+    """(Re)start the idle timer that tears down the session fleet after `idle_s`."""
+    global _SESSION_TIMER
+    if _SESSION_TIMER is not None:
+        _SESSION_TIMER.cancel()
+    if idle_s <= 0:
+        return
+    _SESSION_TIMER = threading.Timer(idle_s, release_session_fleet)
+    _SESSION_TIMER.daemon = True
+    _SESSION_TIMER.start()
+
+
+def _acquire_session_fleet(workers: int, credits: int, cfg_json: str) -> ShuffleFleet:
+    """Get the warm session fleet, spawning (or respawning a dead one) as needed.
+
+    The cached fleet's worker count wins for the whole session (a borrowing operator
+    fans out over the actors that exist), so a later query with a different data-driven
+    `workers` reuses the warm fleet instead of churning a new placement group. A fleet
+    whose actors died (preemption) is torn down and respawned transparently.
+    """
+    global _SESSION
+    from batcher.config import active_config
+
+    with _SESSION_LOCK:
+        if _SESSION is not None and not _session_fleet_alive(_SESSION):
+            with contextlib.suppress(Exception):
+                _SESSION.cleanup()
+            _SESSION = None
+        if _SESSION is None:
+            _SESSION = ShuffleFleet.spawn(workers, credits, cfg_json)
+        _arm_idle_release(active_config().distributed.session_fleet_idle_s)
+        return _SESSION
+
+
+def release_session_fleet() -> None:
+    """Tear down the cached session fleet and release its cluster cores (idempotent).
+
+    Called by the idle timer, and available to a caller that wants to free the cluster
+    immediately (e.g. before handing it to another engine). A no-op when no fleet is
+    cached.
+    """
+    global _SESSION, _SESSION_TIMER
+    with _SESSION_LOCK:
+        if _SESSION_TIMER is not None:
+            _SESSION_TIMER.cancel()
+            _SESSION_TIMER = None
+        if _SESSION is not None:
+            with contextlib.suppress(Exception):
+                _SESSION.cleanup()
+            _SESSION = None
+
+
+def acquire_fleet(workers: int, credits: int, cfg_json: str):
+    """Borrow the query/session fleet, or spawn a transient one for this operator.
+
+    Returns ``(actors, pg, addrs, workers, owns)``. Precedence:
+
+    1. A query-lifetime fleet (the adaptive loop's ambient `ContextVar`) — every Flight
+       operator MUST borrow it (``owns`` False); spawning its own placement group would
+       contend with the fleet's held bundles and deadlock.
+    2. The warm **session fleet** (when `reuse_session_fleet` is on) — reused across
+       separate `collect()` calls so a short query skips the ~1-2s fleet spawn. Returned
+       with ``owns`` False so the per-operator teardown leaves it warm for the next query.
+    3. Otherwise spawn a transient fleet the caller tears down (``owns`` True) — the
+       pre-existing per-operator path (single-node == distributed stays bit-identical).
     """
     fleet = current_fleet()
     if fleet is not None:
@@ -113,12 +220,16 @@ def acquire_fleet(workers: int, credits: int, cfg_json: str):
         set_current_plan_id(fleet.plan_id)
         return fleet.actors, fleet.pg, fleet.addrs, fleet.workers, False
 
-    import ray
+    from batcher.config import active_config
 
-    from batcher.dist.flight_worker import spawn_flight_workers
+    if active_config().distributed.reuse_session_fleet:
+        from batcher.dist.flight_worker import set_current_plan_id
 
-    actors, pg = spawn_flight_workers(workers, credits, cfg_json)
-    addrs = list(ray.get([a.addr.remote() for a in actors]))
+        session = _acquire_session_fleet(workers, credits, cfg_json)
+        set_current_plan_id(session.plan_id)
+        return session.actors, session.pg, session.addrs, session.workers, False
+
+    actors, pg, addrs = _spawn_fleet_with_addrs(workers, credits, cfg_json)
     return actors, pg, addrs, workers, True
 
 
@@ -174,6 +285,9 @@ def maybe_spawn_query_fleet(num_workers: int | None, transport: str) -> ShuffleF
             return None
         from batcher.dist.flight_aggregate import _shuffle_credits
 
+        # An adaptive query fleet reserves its own placement group; free any warm
+        # session fleet first so its held bundles can't deadlock the new gang request.
+        release_session_fleet()
         return ShuffleFleet.spawn(workers, _shuffle_credits(), engine_config_json())
     finally:
         release_autoscale()

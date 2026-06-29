@@ -141,9 +141,19 @@ def _apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordB
         # Auto batch sizing: an inference stage (a GPU stage, or a load-once class `fn`)
         # with no explicit `batch_size` hill-climbs the size online toward the
         # VRAM-capped throughput plateau — so the user never hand-tunes it (a hand-set
-        # or unset `batch_size` is Ray Data's #1 OOM cause). A plain-function transform
-        # keeps the engine morsel size (no warm-up penalty for cheap work).
+        # or unset `batch_size` is Ray Data's #1 OOM cause).
         return _apply_udf_autobatch(op, batches)
+    else:
+        # A plain-function transform with no explicit `batch_size` is bounded to the
+        # engine morsel size, so a downloading / row-exploding `fn` never receives the
+        # whole partition as one batch (the unbounded-batch OOM — Ray Data's #1 cause;
+        # an in-memory or wide-row source can hand a single multi-million-row batch
+        # straight to the `fn`). Re-chunk only when an upstream batch actually exceeds
+        # the morsel — a relation-level no-op (same rows, smaller chunks; map_batches is
+        # per-batch by contract) that leaves an already-morselized pipeline untouched.
+        morsel = max(1, active_config().execution.morsel_rows)
+        if any(b.num_rows > morsel for b in current):
+            batches = pa.Table.from_batches(current).to_batches(max_chunksize=morsel)
 
     strategy = _map_strategy(op, len(batches))
     if strategy == "processes":

@@ -343,10 +343,18 @@ def push_filter_into_union(node: Filter, _ctx: OptimizerContext) -> LogicalPlan 
 def merge_adjacent_filters(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`Filter(Filter(x, a), b)` → `Filter(x, a AND b)`. One predicate evaluation
     instead of two, and it hands predicate pushdown a single conjunction to split
-    across a join below."""
+    across a join below.
+
+    The merged predicate is built by flattening both sides' conjuncts and recombining
+    them into a *balanced* `AND` tree (`combine_conjuncts`). A naive `a AND b` would nest
+    one level deeper on every merge, so a long filter chain (hundreds of stacked
+    `.filter(...)` calls — common in generated/programmatic pipelines) would build a
+    predicate deep enough to exceed the data plane's IR-deserialization recursion limit.
+    Balancing keeps the depth at O(log n) so the chain collapses safely out of the box."""
     inner = node.input
     if isinstance(inner, Filter):
-        return Filter(inner.input, Binary("and", inner.predicate, node.predicate))
+        conjuncts = split_conjuncts(inner.predicate) + split_conjuncts(node.predicate)
+        return Filter(inner.input, combine_conjuncts(conjuncts))
     return None
 
 

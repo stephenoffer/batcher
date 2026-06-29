@@ -82,19 +82,35 @@ def metadata_is_empty(
         return None
 
 
+def is_global_aggregate(plan: LogicalPlan) -> bool:
+    """Whether `plan` is a keyless aggregate, optionally behind output projection(s).
+
+    `SELECT count(*) AS n FROM t` and `ds.agg(n=col(...).count())` both lower to a
+    `Project(Aggregate(...))` — the projection just names/forwards the aggregate's
+    output — so the bare-`Aggregate` check would miss them and force a full scan of a
+    query the footer can answer. `answer_aggregate` propagates stats through the
+    projection and is EXACT-gated, so this widened structural guard is safe: it only
+    decides *whether to attempt* the metadata answer, never the answer itself.
+    """
+    from batcher.plan.logical import Aggregate, Project
+
+    node = plan
+    while isinstance(node, Project):
+        node = node.input
+    return isinstance(node, Aggregate) and not node.group_keys
+
+
 def metadata_aggregate_table(
     plan: LogicalPlan, sources: list[Source], source_stats: list | None = None
 ) -> pa.Table | None:
     """One-row result of a global aggregate from metadata, or None to execute.
 
-    Returns a single-row Arrow table when the plan's root is a keyless aggregate
-    whose every output is exactly derivable from source statistics (e.g.
-    `count(*)`, `min`/`max` over footer bounds). The cheap structural guard runs
-    first so non-aggregate collects pay nothing.
+    Returns a single-row Arrow table when the plan is a keyless aggregate (optionally
+    behind output projections) whose every output is exactly derivable from source
+    statistics (e.g. `count(*)`, `min`/`max` over footer bounds). The cheap structural
+    guard runs first so non-aggregate collects pay nothing.
     """
-    from batcher.plan.logical import Aggregate
-
-    if not isinstance(plan, Aggregate) or plan.group_keys:
+    if not is_global_aggregate(plan):
         return None
     if not _metadata_answerable(plan, sources):
         return None

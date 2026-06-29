@@ -117,12 +117,210 @@ def test_scheduling_policy_unsized_falls_back_to_local_budget():
     assert env.n_tasks == max(1, budget)
 
 
-def test_unsized_plan_falls_back_without_memory_hint():
-    # No Kyber sizes → no memory hint, fan-out falls back to the cpu budget.
+def test_unsized_plan_gets_a_safe_spill_budget_not_unbounded():
+    # No Kyber size estimate must NOT leave the worker unbounded (a 0 budget makes the
+    # engine build no memory pool → OOM on large unknown data). Carbonite grants a
+    # conservative fair-share spill budget so the query "just works" (spills) with no
+    # user config. Fan-out still falls back to the cpu budget.
     plan = _plan([_op(0, "Scan", mem=0, credits=0, par=0)])
     env = ResourceManager().scheduling_envelope(plan)
-    assert env.memory_bytes == 0
+    assert env.memory_bytes > 0  # a safe spill budget, never unbounded
     assert env.n_tasks >= 1
+
+
+def test_unsized_plan_safe_budget_is_a_capped_fair_share():
+    # The unsized-plan spill budget is a *soft fair share* of the budget per task —
+    # never 0 (unbounded → OOM) and never the whole budget — and degrades to the old
+    # "no hint" (0) only when the budget itself is unknown (a test stub).
+    from batcher.carbonite.base import ResourceContext
+
+    cfg = active_config()
+    ctx = ResourceContext(config=cfg)
+    plan = _plan([_op(0, "Scan", mem=0, credits=0, par=0)])
+    avail = 8 << 30
+    env = DefaultSchedulingPolicy().envelope(
+        plan, ctx, requested_workers=4, available_bytes=avail
+    )
+    assert 0 < env.memory_bytes <= int(avail * cfg.memory.soft_limit) // 4
+    env0 = DefaultSchedulingPolicy().envelope(
+        plan, ctx, requested_workers=4, available_bytes=0
+    )
+    assert env0.memory_bytes == 0  # unknown budget → preserves the old no-hint behavior
+
+
+# --- "Just works" for the regular user: no knobs → a complete, safe Ray config ---
+
+
+def test_regular_user_query_auto_configures_every_ray_knob_with_no_input():
+    # The contract: a regular user writes a query and sets NO Ray knobs (no num_workers,
+    # num_cpus, memory, gpus, placement). The real optimize → scheduling_envelope chain
+    # must derive a COMPLETE, valid Ray configuration on its own, for a challenging shape
+    # (a filter + group-by breaker), and lower it to valid `.options()` kwargs.
+    import batcher as bt
+    from batcher.dist.executors.ray_runtime import task_options
+    from batcher.kyber import optimize
+
+    ds = (
+        bt.from_pydict(
+            {"k": [i % 9 for i in range(900)], "v": [float(i) for i in range(900)]}
+        )
+        .filter(bt.col("v") > 5)
+        .group_by("k")
+        .agg(s=bt.col("v").sum())
+    )
+    phys = optimize(ds._plan, sources=ds._sources)
+    env = ResourceManager().scheduling_envelope(phys)  # requested_workers=None → user set nothing
+
+    # Every Ray knob is populated and sane without any user input.
+    assert env.n_tasks >= 1
+    assert env.num_cpus > 0
+    assert env.credits >= 1
+    assert env.memory_bytes > 0  # spill-safe, never unbounded
+    assert env.num_gpus == 0.0  # no GPU requested → none reserved (runs on CPU)
+    assert env.placement_strategy in {"PACK", "SPREAD", "STRICT_PACK", "STRICT_SPREAD"}
+    # It lowers to valid Ray `.options()` kwargs — no missing/None required fields.
+    opts = task_options(env)
+    assert opts["num_cpus"] > 0
+    assert opts.get("memory", 1) > 0
+
+
+def test_unestimable_plan_still_auto_configures_safely_no_oom():
+    # The hardest case for "just works": Kyber's estimator abstains entirely (empty
+    # bounds — an unbounded source or a shape it cannot size). The regular user still
+    # gets a COMPLETE, spill-safe Ray config — no OOM, no manual num_workers/max-memory
+    # rescue.
+    env = ResourceManager().scheduling_envelope(_plan([]))  # abstain → no per-op bounds
+    assert env.n_tasks >= 1
+    assert env.num_cpus > 0
+    assert env.credits >= 1
+    assert env.memory_bytes > 0  # the OOM fix: a spill budget even with zero estimates
+
+
+# --- Placement strategy: Kyber preference → Carbonite veto → dist resolve --------
+
+
+def _breaker(par: int, prefers_local: bool) -> PhysicalOp:
+    return PhysicalOp(
+        op_id=OpId(0),
+        kind="Aggregate",
+        backend="native",
+        algorithm="",
+        bounds=ResourceBounds(
+            m_max_bytes=1 << 20,
+            c_max_credits=4,
+            n_max_parallelism=par,
+            prefers_locality=prefers_local,
+        ),
+        inputs=(),
+    )
+
+
+def test_envelope_picks_pack_only_for_a_small_local_shuffle_that_fits_a_node():
+    from batcher.carbonite.base import ResourceContext
+
+    cfg = active_config()
+    ctx = ResourceContext(config=cfg)
+    budget = cfg.execution.parallelism or __import__("os").cpu_count() or 4
+    # Small breaker that prefers locality and fits one node → PACK (no cross-node shuffle).
+    small = _plan([_breaker(par=2, prefers_local=True)])
+    env = DefaultSchedulingPolicy().envelope(
+        small, ctx, requested_workers=None, available_bytes=1 << 40
+    )
+    assert env.placement_strategy == "PACK"
+    # Same locality preference, but a fan-out wider than a node's cores can't PACK → SPREAD.
+    wide = _plan([_breaker(par=budget * 100, prefers_local=True)])
+    env = DefaultSchedulingPolicy().envelope(
+        wide, ctx, requested_workers=None, available_bytes=1 << 40
+    )
+    assert env.placement_strategy == "SPREAD"
+    # A large shuffle (no locality preference) → SPREAD (distribute the network load).
+    big = _plan([_breaker(par=2, prefers_local=False)])
+    env = DefaultSchedulingPolicy().envelope(
+        big, ctx, requested_workers=None, available_bytes=1 << 40
+    )
+    assert env.placement_strategy == "SPREAD"
+
+
+def test_resolve_placement_strategy_against_live_nodes(monkeypatch):
+    ray = pytest.importorskip("ray")
+    from batcher.dist.executors.ray_runtime import scheduling
+
+    pack = SchedulingEnvelope(placement_strategy="PACK")
+    spread = SchedulingEnvelope(placement_strategy="SPREAD")
+    # PACK preference is honored regardless of node count.
+    monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True}, {"Alive": True}])
+    assert scheduling._resolve_placement_strategy(pack) == "PACK"
+    # SPREAD over >1 node → SPREAD; no envelope → SPREAD default.
+    assert scheduling._resolve_placement_strategy(spread) == "SPREAD"
+    assert scheduling._resolve_placement_strategy(None) == "SPREAD"
+    # SPREAD on a single node buys nothing → degrade to PACK.
+    monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True}])
+    assert scheduling._resolve_placement_strategy(spread) == "PACK"
+
+
+def test_annotate_ops_sets_locality_for_small_shuffle_only():
+    import batcher as bt
+    from batcher.kyber.cardinality import CardinalityEstimator
+    from batcher.kyber.optimizer import _annotate_ops
+
+    class _Source:
+        def __init__(self, rows: int) -> None:
+            self._rows = rows
+
+        def row_count(self) -> int:
+            return self._rows
+
+    cfg = active_config()
+    ds = bt.from_pydict({"k": [1, 2], "v": [3, 4]}).group_by("k").agg(s=bt.col("v").sum())
+    # A tiny shuffle (few rows × width) is below the broadcast threshold → prefers locality.
+    small = _annotate_ops(ds._plan, CardinalityEstimator([_Source(10)]), cfg)
+    assert next(op for op in small if op.kind == "Aggregate").bounds.prefers_locality is True
+    # A shuffle of ~broadcast_max_bytes *rows* (× width ≫ threshold) → no locality preference.
+    big = _annotate_ops(
+        ds._plan, CardinalityEstimator([_Source(cfg.optimizer.broadcast_max_bytes)]), cfg
+    )
+    assert next(op for op in big if op.kind == "Aggregate").bounds.prefers_locality is False
+
+
+# --- Heterogeneous CPU+GPU cluster model (Phase 2) ------------------------------
+
+
+def test_relational_envelope_prefers_cpu_only_nodes():
+    # The relational (CPU shuffle) grant records the intent to keep its fleet off GPU
+    # nodes; dist enforces it only when CPU-only capacity exists (a no-op otherwise).
+    plan = _plan([_breaker(par=4, prefers_local=False)])
+    env = ResourceManager().scheduling_envelope(plan)
+    assert env.prefer_cpu_only_nodes is True
+    assert env.num_gpus == 0.0  # relational path never asks for a GPU here
+
+
+def test_node_classes_and_cpu_only_can_host(monkeypatch):
+    ray = pytest.importorskip("ray")
+    from batcher.dist.executors.ray_runtime import scaling
+
+    # A mixed cluster: two 8-core CPU-only nodes and one 16-core A100 GPU node.
+    mixed = [
+        {"Alive": True, "Resources": {"CPU": 8.0}},
+        {"Alive": True, "Resources": {"CPU": 8.0}},
+        {
+            "Alive": True,
+            "Resources": {"CPU": 16.0, "GPU": 4.0},
+            "Labels": {"ray.io/accelerator-type": "A100"},
+        },
+        {"Alive": False, "Resources": {"CPU": 99.0}},  # dead node ignored
+    ]
+    monkeypatch.setattr(ray, "nodes", lambda: mixed)
+    classes = scaling.node_classes()
+    assert len(classes) == 3  # the dead node is dropped
+    assert sum(1 for c in classes if c["gpus"] > 0) == 1
+    assert any(c["accelerator_type"] == "A100" for c in classes)
+    # 16 CPU-only cores can host 8 one-core workers, but not 32.
+    assert scaling.cpu_only_can_host(8, 1.0) is True
+    assert scaling.cpu_only_can_host(32, 1.0) is False
+
+    # A homogeneous CPU cluster → no GPU nodes to avoid ⇒ no restriction (False).
+    monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True, "Resources": {"CPU": 8.0}}])
+    assert scaling.cpu_only_can_host(4, 1.0) is False
 
 
 # --- Worker engine config inherits the per-task envelope budget (OOM survival) --
@@ -451,6 +649,31 @@ def test_clamp_workers_packs_fractional_cpu(monkeypatch):
     assert ray_runtime.clamp_workers(8, 1.0) == 8
     assert ray_runtime.clamp_workers(10, 1.0) == 8  # the pre-existing 1-CPU behavior
     assert ray_runtime.clamp_workers(8, 2.0) == 4
+
+
+def test_object_store_memory_only_on_local_start(monkeypatch):
+    # The object-store knob is applied only when batcher starts a *local* Ray; attaching
+    # to an existing cluster must not pass it (Ray rejects `object_store_memory` there).
+    from batcher.config import Config, DistributedConfig, config_context
+    from batcher.dist.executors.ray_runtime.lifecycle import _ray_init_kwargs
+
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    with config_context(
+        Config().replace(distributed=DistributedConfig(object_store_memory_bytes=2 << 30))
+    ):
+        kw = _ray_init_kwargs(4)
+        assert kw["object_store_memory"] == 2 << 30
+        assert kw["num_cpus"] == 4
+    with config_context(
+        Config().replace(
+            distributed=DistributedConfig(
+                ray_address="auto", trust_cluster_image=True, object_store_memory_bytes=2 << 30
+            )
+        )
+    ):
+        kw = _ray_init_kwargs(4)
+        assert "object_store_memory" not in kw  # never sent when attaching to a cluster
+        assert "num_cpus" not in kw
 
 
 def test_fault_options_from_config():

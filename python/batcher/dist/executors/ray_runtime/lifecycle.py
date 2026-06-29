@@ -28,7 +28,7 @@ from batcher.plan.logical import LogicalPlan
 
 from .policies import actor_fault_options, fault_options
 from .scaling import cluster_topology
-from .scheduling import current_envelope, task_options
+from .scheduling import current_envelope, set_job_ships_batcher, task_options
 
 
 def engine_config_json() -> str:
@@ -63,7 +63,7 @@ def engine_config_json() -> str:
 # Names of the module-level Ray task functions, keyed by the module they live in.
 # `_ensure_ray` rebinds each `<module>.<name> = ray.remote(<module>.<name>)`.
 _TASK_FUNCS: dict[str, tuple[str, ...]] = {
-    "batcher.dist.executors.map": ("_map_udf_task", "_MapActor"),
+    "batcher.dist.executors.map": ("_map_udf_task", "_map_agg_task", "_MapActor"),
     "batcher.dist.executors.aggregate": ("_map_task", "_reduce_task"),
     "batcher.dist.executors.join": (
         "_join_map_task",
@@ -110,6 +110,10 @@ def _ray_init_kwargs(workers: int) -> dict:
         kwargs["address"] = "auto"
     else:
         kwargs["num_cpus"] = workers
+        # Only a locally started Ray accepts an object-store size; attaching to an
+        # existing cluster (the branches above) would be rejected by Ray.
+        if dc.object_store_memory_bytes is not None:
+            kwargs["object_store_memory"] = int(dc.object_store_memory_bytes)
     # Ship the data plane to workers. An explicit `runtime_env` wins; otherwise, when
     # attaching to a *cluster* (not a local single-process Ray), auto-ship the batcher
     # package if it is a source/editable install the worker image won't already carry —
@@ -125,22 +129,29 @@ def _ray_init_kwargs(workers: int) -> dict:
 
 
 def _self_ship_runtime_env() -> dict | None:
-    """A Ray `runtime_env` that uploads the batcher package to workers, or `None`.
+    """A Ray `runtime_env` that uploads the driver's batcher package to workers.
 
-    Returns `{"py_modules": [<batcher pkg dir>]}` when batcher is imported from a
-    source/editable tree (the dev install, or a freshly-built wheel laid out in the
-    repo) — the worker image then can't be assumed to carry it, so the package dir is
-    uploaded via Ray's job-level `py_modules` (cached in the object store, abi3 native
-    extension included). Returns `None` for a normal site-/dist-packages install: the
-    cluster image already provides batcher, so shipping it would just churn an upload.
+    Returns `{"py_modules": [<batcher pkg dir>]}` so the driver's *exact* batcher
+    package (abi3 native extension included) runs on every worker — Ray caches the
+    upload in the object store, so it is a one-time ~10MB transfer per package
+    content, not per query. This is correctness-first: a driver that pip-installed
+    batcher and attached to an arbitrary cluster cannot assume that cluster's image
+    carries a *compatible* batcher, and shipping guarantees driver==worker code. (The
+    old heuristic skipped shipping for any site-/dist-packages install, which produced
+    a silent `ModuleNotFoundError` on workers for the common local-install →
+    remote-cluster case.)
+
+    Returns `None` only when `distributed.trust_cluster_image` is set — a production
+    image that bakes a matching batcher into every node and wants to skip the upload.
     """
     import os
 
     import batcher
 
+    if active_config().distributed.trust_cluster_image:
+        return None
     pkg = os.path.dirname(os.path.abspath(batcher.__file__))
-    installed = f"{os.sep}site-packages{os.sep}" in pkg or f"{os.sep}dist-packages{os.sep}" in pkg
-    return None if installed else {"py_modules": [pkg]}
+    return {"py_modules": [pkg]}
 
 
 def _neutralize_broken_runtime_env_hook() -> None:
@@ -166,12 +177,30 @@ def _neutralize_broken_runtime_env_hook() -> None:
             os.environ.pop(var, None)
 
 
+# Once we've decided whether the job ships batcher (on the first `_ensure_ray`), the
+# answer is fixed for the process — a later `_ensure_ray` must not flip it just because
+# Ray now reports initialized.
+_ship_decided = False
+
+
 def _ensure_ray(workers: int) -> None:
+    global _ship_decided
     import ray
 
     if not ray.is_initialized():
         _neutralize_broken_runtime_env_hook()
         ray.init(**_ray_init_kwargs(workers))
+        # Batcher initialized Ray: a local cluster shares the driver's modules and a
+        # remote one carries the self-shipped runtime_env, so the job makes batcher
+        # importable — no per-remote shipping needed.
+        set_job_ships_batcher(True)
+        _ship_decided = True
+    elif not _ship_decided:
+        # A foreign `ray.init` ran before batcher (e.g. the user attached to the
+        # cluster themselves): batcher couldn't set the job runtime_env, so it must
+        # ship its package on each remote instead. A no-op when trust_cluster_image.
+        set_job_ships_batcher(False)
+        _ship_decided = True
     _wrap_tasks(ray, task_options(current_envelope()))
 
 

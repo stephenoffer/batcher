@@ -181,6 +181,32 @@ fn combine(
     Ok(PyArrowType(out))
 }
 
+/// Native Parquet read of one object's selected row-groups into pyarrow batches.
+///
+/// `bc_io` decodes Parquet in Rust and fetches the projected column chunks of the
+/// requested row-groups concurrently from object storage (S3/GCS/Azure/HTTP/local),
+/// returning zero-copy Arrow `RecordBatch`es — the throughput path the distributed
+/// scan uses instead of PyArrow's per-chunk reads. `row_groups` empty = all;
+/// `columns` `None` = all (else a name projection pushed into the decode).
+#[pyfunction]
+#[pyo3(signature = (uri, row_groups, columns, batch_size))]
+fn read_parquet(
+    py: Python<'_>,
+    uri: &str,
+    row_groups: Vec<usize>,
+    columns: Option<Vec<String>>,
+    batch_size: usize,
+) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
+    // Release the GIL across the (object-store-I/O-bound) read so other Python threads
+    // on the worker — the engine's fold, concurrent split reads — run during the S3
+    // fetch instead of serializing behind it. Holding the GIL here made the native read
+    // ~3x slower than PyArrow (which releases it) in the distributed path.
+    let batches = py
+        .allow_threads(|| bc_io::read_parquet(uri, &row_groups, columns.as_deref(), batch_size))
+        .map_err(to_pyerr)?;
+    Ok(batches.into_iter().map(PyArrowType).collect())
+}
+
 /// A process-wide memory accounting pool (Carbonite's reserve-before-allocate
 /// enforcement primitive, from `bc-resource`). Carbonite sets the limit from its
 /// memory envelope and reserves/releases against it so the engine spills instead
@@ -475,6 +501,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tracing_init::init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_metered, m)?)?;
+    m.add_function(wrap_pyfunction!(read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(partial_aggregate, m)?)?;
     m.add_function(wrap_pyfunction!(combine, m)?)?;
     m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;

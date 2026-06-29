@@ -501,6 +501,16 @@ class DistributedConfig:
     # ``{"py_modules": [...]}``) so ``batcher`` + its native extension are present
     # cluster-wide. None when batcher is already installed on every node.
     runtime_env: dict[str, object] | None = None
+    # Trust that every worker node's image already carries a *compatible* batcher,
+    # so the driver should not upload its own package. Default False: when attaching
+    # to a remote cluster with no explicit ``runtime_env``, the driver self-ships its
+    # exact batcher package (py_modules, cached by Ray) so worker code matches the
+    # driver's — correctness over a one-time ~10MB upload. A pip-installed driver
+    # cannot assume an arbitrary cluster carries a matching batcher, and the old
+    # "skip shipping for site-packages installs" heuristic produced silent
+    # ModuleNotFoundError on workers for the common local-install→remote-cluster case.
+    # Set True for a production image that bakes batcher in (skips the upload).
+    trust_cluster_image: bool = False
     # Shuffle transport: ``"auto"`` picks Flight on a genuine multi-node cluster
     # (the disk shuffle's work_dir is driver-local and unreachable cross-node) and
     # disk on a single node / shared filesystem. ``"flight"`` / ``"disk"`` force it.
@@ -511,6 +521,13 @@ class DistributedConfig:
     # Show the Ray dashboard. Off by default (and for local/test runs); a real
     # multi-node cluster benefits from it for the task/actor timeline.
     dashboard: bool = False
+    # Object store (plasma) size in bytes for a *locally started* Ray (None → Ray's
+    # default, ~30% of RAM). Applied only when batcher starts a local cluster — Ray
+    # rejects `object_store_memory` when attaching to an existing cluster (which owns
+    # its own store). The data plane bypasses the object store (Arrow Flight), so this
+    # only bounds the small control-plane metadata; set it for an object-store-heavy
+    # mixed workload or a memory-constrained box.
+    object_store_memory_bytes: int | None = None
     # AIMD adaptive shuffle credits: the credit window grows/shrinks per remote fetch
     # from observed memory backpressure (TCP-like) instead of the static grant. On by
     # default — it is result-preserving (flow control only, never affects the merged
@@ -629,6 +646,22 @@ class DistributedConfig:
     # unchanged either way (the mergeable algebra guarantees it); this only changes
     # where the bytes live between stages.
     persistent_fleet: bool = False
+    # Reuse one shuffle-actor fleet across *separate* distributed queries in a session,
+    # so a second `collect(distributed=True)` skips the ~1-2s actor + placement-group +
+    # Flight-server spawn that otherwise dominates a short query (measured: a warm sf10
+    # group-by is ~1.5s shuffle/compute but pays another ~1.5s spawning the fleet each
+    # call). The cached fleet is health-checked before reuse and respawned if a worker
+    # died, and auto-released after `session_fleet_idle_s` of no use so an idle session
+    # never pins the cluster. Result-identical (same mergeable shuffle, just warm
+    # actors). On by default — it is the in-memory-warm-workers win Ray Data gets from a
+    # long-lived streaming executor. Disabled automatically while a `persistent_fleet`
+    # adaptive query owns a fleet (that one wins, so there is never a second placement
+    # group to deadlock against).
+    reuse_session_fleet: bool = True
+    # Seconds an idle reused session fleet lives before it is torn down and its cluster
+    # cores released. Short enough that a finished session frees the cluster promptly,
+    # long enough to span the gaps between queries in an interactive/iterative session.
+    session_fleet_idle_s: float = 30.0
     # How many times to (re-)attempt a `persistent_fleet` adaptive query on a fresh fleet
     # when a worker dies holding an *already-materialized* cross-stage intermediate (which
     # has no fine-grained recompute, unlike an in-stage loss). The whole deterministic

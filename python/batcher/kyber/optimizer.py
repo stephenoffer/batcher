@@ -126,9 +126,16 @@ def _annotate_ops(
             # ~`target_rows` of the data it *shuffles* — its input volume, not its
             # (possibly tiny) grouped output. Streaming ops inherit the pipeline's
             # width (0 = unset). Carbonite clamps the request to the cpu budget.
+            prefers_local = False
             if known and kind in _BREAKER_KINDS:
                 in_rows = sum(estimator.estimate(c).rows for c in children(node)) or rows
                 n_par = max(1, math.ceil(in_rows / target_rows))
+                # A breaker whose shuffle volume is small enough to keep node-local
+                # (≤ the broadcast threshold — the existing "small enough to not pay
+                # the network" knob) prefers PACK over SPREAD: co-locating its few
+                # workers avoids a cross-node shuffle that buys nothing. Large shuffles
+                # keep SPREAD so the network load distributes. dist makes the final call.
+                prefers_local = int(in_rows * width) <= config.optimizer.broadcast_max_bytes
             else:
                 n_par = 0
             # Desired credit window: enough in-flight batch slots to cover one task's
@@ -150,6 +157,7 @@ def _annotate_ops(
                         c_max_credits=c_max,
                         n_max_parallelism=n_par,
                         c_cpu_shares=c_cpu,
+                        prefers_locality=prefers_local,
                     ),
                     inputs=(),
                     properties=PlanProperties(est_rows=rows, provenance=est.provenance),
@@ -177,7 +185,11 @@ def _applicable(rules: list[Rule], present: frozenset[type]) -> list[Rule]:
 
 
 def _run_phase(
-    plan: LogicalPlan, rules: list[Rule], ctx: OptimizerContext, max_iterations: int
+    plan: LogicalPlan,
+    rules: list[Rule],
+    ctx: OptimizerContext,
+    max_iterations: int,
+    present: frozenset[type] | None = None,
 ) -> tuple[LogicalPlan, dict | None]:
     """Run one phase's rules, up to `max_iterations` (1 = once, >1 = to fixpoint).
 
@@ -200,7 +212,8 @@ def _run_phase(
     """
     if not rules:
         return plan, None
-    present = _present(plan)
+    if present is None:  # standalone callers (tests) don't precompute it
+        present = _present(plan)
     current_ir = None  # lazily computed, only on the identity-says-changed path
     changed = False
     for _ in range(max_iterations):
@@ -323,11 +336,18 @@ class Optimizer:
         plan = logical
         last_ir: dict | None = None
         fixpoint = self._config.optimizer.fixpoint_iterations
+        # The node-type set drives each phase's rule pattern-index. It only changes when
+        # a phase rewrites the plan, so compute it once and refresh after a real change
+        # rather than re-walking the whole tree at the start of every phase (7 walks → ~1
+        # per actual rewrite). Threaded into `_run_phase`, which still refreshes it across
+        # its own fixpoint iterations.
+        present = _present(plan)
         for phase in Phase:  # IntEnum iterates in declared (ascending) order
             max_iter = fixpoint if phase in _FIXPOINT_PHASES else 1
-            plan, ir = _run_phase(plan, self._by_phase[phase], ctx, max_iter)
+            plan, ir = _run_phase(plan, self._by_phase[phase], ctx, max_iter, present)
             if ir is not None:  # a no-op phase leaves the plan (and its IR) unchanged
                 last_ir = ir
+                present = _present(plan)  # refresh once for the next phase
         return plan, last_ir
 
     def optimize(self, logical: LogicalPlan) -> PhysicalPlan:

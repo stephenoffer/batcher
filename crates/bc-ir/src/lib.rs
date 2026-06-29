@@ -434,8 +434,20 @@ pub struct ProjectionItem {
 
 impl RelOp {
     /// Parse a plan from the JSON IR document emitted by the Python control plane.
+    ///
+    /// serde_json guards against stack overflow with a default 128-deep recursion limit,
+    /// but a legitimately deep generated pipeline — a long `.filter(...)` chain, hundreds
+    /// of interleaved operators — nests past it and would fail with "recursion limit
+    /// exceeded". The Python control plane already caps plan depth at its own recursion
+    /// limit (~1000), which the native stack comfortably handles, so we lift serde_json's
+    /// guard here and rely on that bound — deep plans deserialize out of the box. `end()`
+    /// still rejects trailing garbage, matching `serde_json::from_str`'s contract.
     pub fn from_json(s: &str) -> Result<Self, IrError> {
-        serde_json::from_str(s).map_err(IrError::from)
+        let mut de = serde_json::Deserializer::from_str(s);
+        de.disable_recursion_limit();
+        let op = Self::deserialize(&mut de)?;
+        de.end()?;
+        Ok(op)
     }
 }
 

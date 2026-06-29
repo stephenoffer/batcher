@@ -100,9 +100,9 @@ def _collect(
     # during execution. A non-aggregate collect skips this entirely (the attempt
     # returns at its cheap structural guard). `count()`/`is_empty()` pass theirs in.
     if source_stats is None:
-        from batcher.plan.logical import Aggregate
+        from batcher.api.terminal.metadata_answer import is_global_aggregate
 
-        if isinstance(plan, Aggregate) and not plan.group_keys:
+        if is_global_aggregate(plan):
             from batcher import core
             from batcher.api.orchestration import collect_source_stats
 

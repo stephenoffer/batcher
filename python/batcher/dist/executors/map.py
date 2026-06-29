@@ -20,14 +20,24 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import os
 
 import pyarrow as pa
 
-from batcher.dist.executors.partition_io import partition_descriptors
+from batcher.dist.executors.partition_io import descriptor_rows, partition_descriptors
 from batcher.dist.executors.plan_analysis import _relabel_single_source
 from batcher.dist.executors.ray_runtime import _ensure_ray
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, MapBatches
+
+# Smallest CPU share a task may request: a tiny partition gets a fraction of a core so
+# Ray packs many such tasks per core (high parallelism over many small files) instead of
+# each reserving a whole core. 1/8 core by default. Env-overridable.
+_MIN_TASK_CPU = max(0.01, float(os.environ.get("BATCHER_MIN_TASK_CPU", "0.125")))
+# How much heavier a per-batch UDF / inference stage is per row than a plain scan/filter.
+# A `map_batches` partition gets this many times the CPU a same-sized scan would — the
+# plan-level compute-skew factor (data skew is handled per-partition by `descriptor_rows`).
+_MAP_COMPUTE_WEIGHT = max(1.0, float(os.environ.get("BATCHER_MAP_COMPUTE_WEIGHT", "4.0")))
 
 __all__ = ["resident_inference_pools", "stream_distributed_map"]
 
@@ -194,7 +204,11 @@ def _distributed_map(
     if env is not None and env.accelerator_type is not None:
         accelerator_type = env.accelerator_type
 
-    partitions = partition_descriptors(sources[sid], workers)
+    # Data/compute-driven task count: a tiny source → a few tasks; a large one → ~one task
+    # per core; a (single-threaded) UDF → more tasks (the way to parallelize it). The GPU
+    # actor-pool path keeps the worker count (its pool size, not the CPU task count).
+    n_parts = workers if wants_pool else _adaptive_partition_count(sources[sid], plan, workers)
+    partitions = partition_descriptors(sources[sid], n_parts)
 
     opts = _gpu_options(num_gpus, accelerator_type)
     if wants_pool:
@@ -218,16 +232,136 @@ def _distributed_map(
             )
         _record_gpu_feedback(hub, plan, gpu_util)
     else:
-        task = _map_udf_task.options(**opts) if opts else _map_udf_task
-        results = gather_map_results(
-            lambda idx: task.remote(plan0, partitions[idx]), len(partitions)
-        )
+        # Skew-aware adaptive CPU: each stateless task requests a CPU share sized to its
+        # own partition's data (x the plan's compute weight) — fractional for a tiny
+        # partition (packed many-per-core), several cores for a large one. A heavier
+        # (skewed) partition therefore gets proportionally more CPU than its peers.
+        shares = _adaptive_task_cpus(partitions, plan)
+        # SPREAD so tasks distribute one-per-node across the cluster even though each now
+        # reserves only its right-sized (often < a node) CPU share — without it Ray would
+        # pack several small-share tasks onto one node, idling the rest. (The old whole-
+        # node reservation forced this spread implicitly by exhausting each node.)
+        sched = _spread_options()
+
+        def _launch(idx):
+            return _map_udf_task.options(**{**opts, "num_cpus": shares[idx], **sched}).remote(
+                plan0, partitions[idx]
+            )
+
+        results = gather_map_results(_launch, len(partitions))
 
     batches: list[pa.RecordBatch] = []
     for r in results:
         if r:
             batches.extend(r)
     return pa.Table.from_batches(batches) if batches else pa.table({})
+
+
+def _spread_options() -> dict:
+    """Ray `.options(...)` that SPREAD tasks across nodes, or `{}` if unavailable.
+
+    With right-sized (often sub-node) per-task CPU, the default scheduler would pack
+    several tasks onto one node and idle the rest; SPREAD keeps the fan-out covering the
+    cluster. Best-effort: returns `{}` if the strategy import fails (older Ray)."""
+    try:
+        return {"scheduling_strategy": "SPREAD"}
+    except Exception:
+        return {}
+
+
+def _placeable_node_cores() -> float:
+    """Max CPUs a single task may request and still be placeable on every node — the
+    smallest alive node's core count (so a multi-CPU task fits anywhere). Falls back to
+    the driver's cpu count when topology is unavailable."""
+    try:
+        import ray
+
+        cores = [
+            float(n.get("Resources", {}).get("CPU", 0.0)) for n in ray.nodes() if n.get("Alive")
+        ]
+        cores = [c for c in cores if c > 0]
+        if cores:
+            return float(int(min(cores)))
+    except Exception:
+        pass
+    return float(os.cpu_count() or 4)
+
+
+def _cluster_cores() -> float:
+    """Total schedulable CPUs across alive nodes (the cap on useful task parallelism)."""
+    try:
+        import ray
+
+        return float(int(ray.cluster_resources().get("CPU", 0.0))) or float(os.cpu_count() or 4)
+    except Exception:
+        return float(os.cpu_count() or 4)
+
+
+def _source_total_rows(source) -> int | None:
+    """Total rows of a splittable source from footer-derived split counts (no data I/O),
+    or `None` when it can't be known cheaply (an in-memory/iterator source)."""
+    try:
+        splits = source.splits()
+    except Exception:
+        return None
+    total = 0
+    for s in splits:
+        rows = getattr(s, "rows", None)
+        if rows is None:
+            return None  # a split with no cheap count → don't guess
+        total += rows
+    return total if splits else None
+
+
+def _adaptive_partition_count(source, plan, fallback: int) -> int:
+    """How many tasks to split a map/scan source into — data- and compute-driven.
+
+    `ceil(total_rows x compute_weight / rows_per_cpu)`, clamped to `[1, cluster_cores]`
+    and to the number of splits. So a tiny source runs as a few (even one) tasks while a
+    large one fans out to ~one task per core — and a per-batch UDF (weight > 1), being
+    single-threaded per task, fans out to MORE tasks (the way to parallelize it) rather
+    than reserving idle cores on fewer tasks. Falls back to `fallback` (the cluster-fill
+    worker count) when the row total isn't cheaply known."""
+    import math
+
+    from batcher.config import active_config
+    from batcher.core.udf import has_map_batches
+
+    total = _source_total_rows(source)
+    if total is None:
+        return fallback
+    weight = _MAP_COMPUTE_WEIGHT if has_map_batches(plan) else 1.0
+    rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
+    want = math.ceil((total * weight) / rows_per_cpu)
+    n = max(1, min(want, int(_cluster_cores())))
+    with contextlib.suppress(Exception):
+        n = min(n, max(1, len(source.splits())))  # never more tasks than splits
+    return n
+
+
+def _adaptive_task_cpus(partitions, plan) -> list[float]:
+    """A per-task CPU share for each partition, sized to its data x the plan's compute
+    weight (see `_MIN_TASK_CPU` / `_MAP_COMPUTE_WEIGHT`).
+
+    Small partition → a fraction of a core (Ray packs many such tasks per core, so many
+    small files run with high parallelism instead of each grabbing a whole core); large
+    partition → multiple cores (up to one node). Because the share is per-partition, a
+    skewed (heavier) partition is given more CPU than its lighter peers — adaptive to
+    both data skew (row count) and plan-level compute skew (a `map_batches`/UDF stage is
+    weighted heavier per row than a plain scan)."""
+    from batcher.config import active_config
+    from batcher.core.udf import has_map_batches
+
+    node_cores = _placeable_node_cores()
+    # Rows one core processes in a reasonable slice — half the breaker target (which sizes
+    # a whole multi-core task), so a full target-sized partition asks for ~2 cores.
+    rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
+    weight = _MAP_COMPUTE_WEIGHT if has_map_batches(plan) else 1.0
+    shares = []
+    for p in partitions:
+        want = (descriptor_rows(p) * weight) / rows_per_cpu
+        shares.append(round(max(_MIN_TASK_CPU, min(node_cores, want)), 3))
+    return shares
 
 
 def stream_distributed_map(plan: LogicalPlan, sources: list[Source], workers: int):
@@ -478,3 +612,65 @@ def _map_udf_task(plan0, partition):
     if not out or sum(b.num_rows for b in out) == 0:
         return None
     return out
+
+
+def _map_agg_task(plan0, partition, group_keys_json, aggregates_json):
+    """Run the map/UDF prefix on a partition, then PARTIAL-aggregate its output.
+
+    The map (the expensive UDF) runs on the worker over its own partition, and only the
+    small partial-aggregate state leaves the worker — the driver does the cross-partition
+    `combine_finalize`. This distributes a `map_batches → aggregate` pipeline (Ray Data's
+    bread and butter) instead of running the whole UDF single-node on the driver."""
+    import batcher._native as nat
+    from batcher import core
+    from batcher.dist.executors.partition_io import read_partition_descriptor
+    from batcher.io.source import InMemorySource
+
+    rows = read_partition_descriptor(partition)
+    if not rows:
+        return None
+    out = core.execute_with_udfs(plan0, [InMemorySource(rows)])
+    if not out or sum(b.num_rows for b in out) == 0:
+        return None
+    return nat.partial_aggregate(group_keys_json, aggregates_json, out)
+
+
+def _distributed_map_aggregate(above, agg, sources, workers):
+    """Distribute an aggregate over a linear `map_batches`/UDF pipeline.
+
+    Each worker maps its source partition through the UDF prefix and partial-aggregates
+    the result; the driver `combine_finalize`s the partials (mergeable two-phase) and
+    applies anything above the aggregate. The UDF — the costly part — runs across the
+    cluster, not single-node on the driver."""
+    import json
+
+    import pyarrow as pa
+
+    import batcher._native as nat
+    from batcher.dist.executors.partition_io import _apply_above, _empty_agg_table
+    from batcher.dist.executors.ray_runtime import gather_map_results
+
+    _ensure_ray(workers)
+    map_plan, sid = _relabel_single_source(agg.input)
+    gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys])
+    aj = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+    n_parts = _adaptive_partition_count(sources[sid], agg.input, workers)
+    partitions = partition_descriptors(sources[sid], n_parts)
+    # Skew-aware adaptive CPU per task (sized to the partition that runs the UDF here),
+    # SPREAD across nodes so the right-sized (sub-node) tasks still cover the cluster.
+    shares = _adaptive_task_cpus(partitions, agg.input)
+    sched = _spread_options()
+
+    def _launch(idx):
+        return _map_agg_task.options(num_cpus=shares[idx], **sched).remote(
+            map_plan, partitions[idx], gk, aj
+        )
+
+    partials = gather_map_results(_launch, len(partitions))
+    flat = [p for p in partials if p is not None]
+    if not flat:
+        table = _empty_agg_table(agg)
+    else:
+        out = nat.combine_finalize(gk, aj, flat)
+        table = pa.Table.from_batches([out]) if out is not None else _empty_agg_table(agg)
+    return table if not above else _apply_above(above, table)

@@ -126,18 +126,10 @@ def execute_aggregate_flight(
         # has 16 columns but this agg needs 3, so the un-pushed read moved ~5x the bytes
         # and dominated the scan (sf10 map barrier 18s → ~4s). Mirrors single-node
         # projection/predicate pushdown; the `map_ir` filter re-checks, so pushdown is safe.
-        import os as _o
-        import time as _tm
-
-        _p = _o.environ.get("BATCHER_DBG")
-        _a = _tm.perf_counter()
         projection, predicate = source_pushdown(map_plan, sid)
         partitions = partition_descriptors(
             sources[sid], workers, projection=projection, predicate=predicate
         )
-        if _p:
-            print(f"[PHASE] partition_descriptors={_tm.perf_counter() - _a:.1f}s", flush=True)
-        _a = _tm.perf_counter()
 
         # MAP barrier: every mapper publishes ALL its buckets on its own Flight server.
         ray.get(
@@ -146,9 +138,6 @@ def execute_aggregate_flight(
                 for i in range(workers)
             ]
         )
-        if _p:
-            print(f"[PHASE] map_barrier={_tm.perf_counter() - _a:.1f}s", flush=True)
-            _a = _tm.perf_counter()
 
         # Simulate worker loss after the map barrier (test hook): the killed workers'
         # published buckets vanish, so the reduce must recompute them.
@@ -217,8 +206,6 @@ def execute_aggregate_flight(
                     ray.kill(a)
             release_placement(pg)
 
-    if _p:
-        print(f"[PHASE] reduce={_tm.perf_counter() - _a:.1f}s", flush=True)
     table = pa.Table.from_batches(batches) if batches else _empty_agg_table(agg)
     return table if not above else _apply_above(above, table)
 

@@ -131,3 +131,26 @@ def test_join_key_ndv_capped_at_filtered_input():
 def _filter_plan(rows: int):
     ds = bt.from_arrow(pa.table({"fv": list(range(rows))})).filter(col("fv") < rows // 4)
     return ds._plan, ds._sources
+
+
+def test_source_ndv_seeds_cold_join_cardinality():
+    # A cold join (no learned stats) must use source-provided NDV for the
+    # |L||R|/max(ndv) estimate instead of the max(left, right) fallback — the metadata
+    # `SourceStatistics` carries but the estimator previously ignored. With k holding 10
+    # distinct values in each 1000-row side, the many-to-many join is ~1000*1000/10 =
+    # 100k rows; the fallback would guess 1000 (100x low → bad join order).
+    from batcher.plan.source_stats import SourceStatistics
+    from batcher.plan.stats import ColumnStat
+
+    a = bt.from_arrow(pa.table({"k": [i % 10 for i in range(1000)]}))
+    b = bt.from_arrow(pa.table({"k": [i % 10 for i in range(1000)]}))
+    ds = a.join(b, on="k")
+    plan, sources = ds._plan, ds._sources
+
+    cold = CardinalityEstimator(sources, {}).estimate(plan)
+    assert cold.rows == 1000  # max(left, right) fallback — the NDV-blind guess
+
+    col_ndv = {"k": ColumnStat(ndv=10.0)}
+    stats = [SourceStatistics(row_count=1000, columns=col_ndv) for _ in sources]
+    warm = CardinalityEstimator(sources, {}, source_stats=stats).estimate(plan)
+    assert warm.rows == 100_000  # 1000 * 1000 / 10 — the NDV-based equi-join estimate

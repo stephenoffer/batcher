@@ -83,16 +83,25 @@ def split_conjuncts(expr: Expr) -> list[Expr]:
 
 
 def combine_conjuncts(exprs: list[Expr]) -> Expr:
-    """Combine a non-empty list of expressions back into a left-deep `AND` chain.
+    """Combine a non-empty list of expressions into a **balanced** `AND` tree.
 
-    The inverse of `split_conjuncts`; raises on an empty list (there is no neutral
-    predicate to return without inventing a literal)."""
+    The inverse of `split_conjuncts`. The tree is balanced — depth O(log n) rather than
+    the naive left-deep O(n) — so a long predicate (a fused chain of hundreds of filters,
+    a large `IN` list, a generated boolean) never nests deep enough to exceed the engine's
+    recursion limit when the IR is deserialized in the data plane, nor Python's own limit
+    when `split_conjuncts` walks it back. `AND` is associative + commutative, so balancing
+    preserves the predicate exactly (the conjuncts' left-to-right order is kept). Raises on
+    an empty list (there is no neutral predicate to return without inventing a literal)."""
     if not exprs:
         raise ValueError("combine_conjuncts requires at least one expression")
-    out = exprs[0]
-    for e in exprs[1:]:
-        out = Binary("and", out, e)
-    return out
+    while len(exprs) > 1:
+        # Pairwise-fold one level at a time (a bottom-up balanced tree); an odd tail
+        # carries forward. log2(n) passes ⇒ a tree of depth ceil(log2(n)).
+        exprs = [
+            Binary("and", exprs[i], exprs[i + 1]) if i + 1 < len(exprs) else exprs[i]
+            for i in range(0, len(exprs), 2)
+        ]
+    return exprs[0]
 
 
 def split_disjuncts(expr: Expr) -> list[Expr]:
