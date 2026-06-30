@@ -108,45 +108,63 @@ fn scatter_into_buckets(
     num_partitions: usize,
 ) -> Result<Vec<RecordBatch>, RuntimeError> {
     let n = part_of.len();
-    let mut offsets = vec![0u32; num_partitions + 1];
-    for &b in part_of {
-        offsets[b as usize + 1] += 1;
-    }
-    for b in 0..num_partitions {
-        offsets[b + 1] += offsets[b];
-    }
-    let mut scatter = vec![0u32; n];
-    let mut cursor = offsets[..num_partitions].to_vec();
-    for (i, &b) in part_of.iter().enumerate() {
-        let pos = &mut cursor[b as usize];
-        scatter[*pos as usize] = i as u32;
-        *pos += 1;
+    // Small input: serial counting sort, one contiguous scatter buffer.
+    if n < PAR_HASH_MIN_ROWS {
+        let mut offsets = vec![0u32; num_partitions + 1];
+        for &b in part_of {
+            offsets[b as usize + 1] += 1;
+        }
+        for b in 0..num_partitions {
+            offsets[b + 1] += offsets[b];
+        }
+        let mut scatter = vec![0u32; n];
+        let mut cursor = offsets[..num_partitions].to_vec();
+        for (i, &b) in part_of.iter().enumerate() {
+            let pos = &mut cursor[b as usize];
+            scatter[*pos as usize] = i as u32;
+            *pos += 1;
+        }
+        return (0..num_partitions)
+            .map(|b| {
+                take_rows(
+                    batch,
+                    &scatter[offsets[b] as usize..offsets[b + 1] as usize],
+                )
+            })
+            .collect();
     }
 
-    // Build each bucket's batch in parallel: every bucket gathers a disjoint set of rows
-    // across all columns (the dominant cost — an O(bucket rows × columns) copy), and the
-    // buckets are independent. This is what lets a parallel hash join's repartition step
-    // use every core instead of one (n ≥ the threshold ⇒ the whole partition is large).
-    if n >= PAR_HASH_MIN_ROWS {
-        (0..num_partitions)
-            .into_par_iter()
-            .map(|b| {
-                take_rows(
-                    batch,
-                    &scatter[offsets[b] as usize..offsets[b + 1] as usize],
-                )
-            })
-            .collect()
-    } else {
-        (0..num_partitions)
-            .map(|b| {
-                take_rows(
-                    batch,
-                    &scatter[offsets[b] as usize..offsets[b + 1] as usize],
-                )
-            })
-            .collect()
-    }
+    // Large input: stable parallel counting sort. Each row-range chunk builds its own
+    // per-bucket index lists in parallel; concatenating those lists in chunk order
+    // (each chunk's already ascending) reproduces the serial scatter's exact per-bucket
+    // ordering. The per-bucket gather then runs across every core — the partitioner
+    // under both the single-node hash join and the distributed shuffle.
+    let nthreads = rayon::current_num_threads().max(1);
+    let chunk = n.div_ceil(nthreads).max(1);
+    let per_chunk: Vec<Vec<Vec<u32>>> = part_of
+        .par_chunks(chunk)
+        .enumerate()
+        .map(|(ci, slice)| {
+            let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); num_partitions];
+            let base = (ci * chunk) as u32;
+            for (j, &b) in slice.iter().enumerate() {
+                buckets[b as usize].push(base + j as u32);
+            }
+            buckets
+        })
+        .collect();
+
+    (0..num_partitions)
+        .into_par_iter()
+        .map(|b| {
+            let total: usize = per_chunk.iter().map(|c| c[b].len()).sum();
+            let mut idx = Vec::with_capacity(total);
+            for c in &per_chunk {
+                idx.extend_from_slice(&c[b]);
+            }
+            take_rows(batch, &idx)
+        })
+        .collect()
 }
 
 /// Range-partition `batch` into `n_buckets` globally-ordered buckets by the leading

@@ -8,10 +8,27 @@ parse surface as ``n/a``/``PARTIAL``, never a wrong answer).
 from __future__ import annotations
 
 import importlib.util
+import re
 
 import pyarrow as pa
 
 from .base import Engine, SqlRunner
+
+# Polars' SQL parser accepts the combined ANSI interval literal ``INTERVAL '90 days'``
+# but rejects the equally-standard split form ``INTERVAL '90' DAY`` the TPC-H text
+# uses. The two are identical in meaning, so rewriting the split form into the
+# combined one lets Polars run the query on the *same* workload (a dialect
+# adaptation, like the harness's date→timestamp normalization — never a result
+# change). Queries Polars genuinely cannot express (scalar/correlated subquery
+# comparisons) still surface as PARTIAL rather than a wrong answer.
+_SPLIT_INTERVAL = re.compile(
+    r"interval\s+'(\d+)'\s+(year|month|week|day|hour|minute|second)s?\b", re.I
+)
+
+
+def _polars_sql_dialect(query: str) -> str:
+    """Rewrite split interval literals to the combined form Polars' parser accepts."""
+    return _SPLIT_INTERVAL.sub(lambda m: f"INTERVAL '{m.group(1)} {m.group(2).lower()}s'", query)
 
 
 class PolarsEngine(Engine):
@@ -40,4 +57,4 @@ class PolarsEngine(Engine):
         ctx = pl.SQLContext(eager=True)
         for name, tbl in tables.items():
             ctx.register(name, pl.from_arrow(tbl))
-        return lambda query: ctx.execute(query).to_arrow()
+        return lambda query: ctx.execute(_polars_sql_dialect(query)).to_arrow()

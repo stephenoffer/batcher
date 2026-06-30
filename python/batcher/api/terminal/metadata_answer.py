@@ -82,6 +82,17 @@ def metadata_is_empty(
         return None
 
 
+# Aggregate functions whose result can *ever* be derived from EXACT source
+# statistics (row count, footer min/max, exact distinct count). Any other function
+# — `sum`, `mean`, `stddev`, … — needs the actual values, so a metadata answer is
+# structurally impossible and the (non-trivial) `answer_aggregate` rewrite+estimate
+# would only burn ~0.5ms to return `None`. Skipping it when an aggregate is provably
+# non-derivable is the dominant fixed cost on a small global-aggregate query (e.g.
+# `SELECT sum(x) FROM t`). Conservative: a func in this set is only a *candidate* —
+# `answer_aggregate` stays the EXACT-gated authority on whether it truly answers.
+_METADATA_DERIVABLE_AGGS = frozenset({"count", "count_star", "count_distinct", "min", "max"})
+
+
 def is_global_aggregate(plan: LogicalPlan) -> bool:
     """Whether `plan` is a keyless aggregate, optionally behind output projection(s).
 
@@ -91,13 +102,19 @@ def is_global_aggregate(plan: LogicalPlan) -> bool:
     query the footer can answer. `answer_aggregate` propagates stats through the
     projection and is EXACT-gated, so this widened structural guard is safe: it only
     decides *whether to attempt* the metadata answer, never the answer itself.
+
+    Also requires that *every* output aggregate is metadata-derivable in principle
+    (`_METADATA_DERIVABLE_AGGS`): a `sum`/`mean`/… aggregate can never be answered
+    from stats, so attempting the (non-trivial) metadata rewrite for it is pure waste.
     """
     from batcher.plan.logical import Aggregate, Project
 
     node = plan
     while isinstance(node, Project):
         node = node.input
-    return isinstance(node, Aggregate) and not node.group_keys
+    if not isinstance(node, Aggregate) or node.group_keys:
+        return False
+    return all(spec.agg.func in _METADATA_DERIVABLE_AGGS for spec in node.aggregates)
 
 
 def metadata_aggregate_table(

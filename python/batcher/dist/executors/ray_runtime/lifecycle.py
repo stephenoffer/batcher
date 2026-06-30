@@ -86,7 +86,7 @@ _wrapped_resources: tuple | None = None
 _wrap_lock = threading.Lock()
 
 
-def _ray_init_kwargs(workers: int) -> dict:
+def _ray_init_kwargs(workers: int, *, force_attach: bool = False) -> dict:
     """`ray.init(**kwargs)` for the active config — attach to a cluster or spin local.
 
     Attach to a *running* cluster when an address is configured (`Config` or the
@@ -94,7 +94,13 @@ def _ray_init_kwargs(workers: int) -> dict:
     extension via `runtime_env` so workers can run the data plane. Only when no
     address is given do we start a *local* cluster capped at `workers` CPUs (the
     single-node / test path); against a real cluster we leave fan-out to the
-    scheduler/autoscaler and never pin `num_cpus`."""
+    scheduler/autoscaler and never pin `num_cpus`.
+
+    `force_attach` overrides the local branch to attach to a discoverable cluster
+    (`address="auto"`, no local-only `num_cpus`/object-store hints): a managed
+    workspace (e.g. Anyscale) can run a cluster *without* setting `RAY_ADDRESS`, so a
+    plain `ray.init` auto-connects and then rejects those hints — `_ensure_ray`
+    retries here when Ray reports exactly that conflict."""
     import os
 
     dc = active_config().distributed
@@ -106,7 +112,7 @@ def _ray_init_kwargs(workers: int) -> dict:
     }
     if dc.ray_address:
         kwargs["address"] = dc.ray_address
-    elif os.environ.get("RAY_ADDRESS"):
+    elif force_attach or os.environ.get("RAY_ADDRESS"):
         kwargs["address"] = "auto"
     else:
         kwargs["num_cpus"] = workers
@@ -189,7 +195,16 @@ def _ensure_ray(workers: int) -> None:
 
     if not ray.is_initialized():
         _neutralize_broken_runtime_env_hook()
-        ray.init(**_ray_init_kwargs(workers))
+        try:
+            ray.init(**_ray_init_kwargs(workers))
+        except ValueError as e:
+            # A cluster is already running but no address was configured (a managed
+            # workspace that doesn't export `RAY_ADDRESS`): Ray auto-attaches and then
+            # rejects the local-only `num_cpus`/object-store hints. Retry as a plain
+            # attach so the distributed path works on the cluster instead of failing.
+            if "existing cluster" not in str(e):
+                raise
+            ray.init(**_ray_init_kwargs(workers, force_attach=True))
         # Batcher initialized Ray: a local cluster shares the driver's modules and a
         # remote one carries the self-shipped runtime_env, so the job makes batcher
         # importable — no per-remote shipping needed.
