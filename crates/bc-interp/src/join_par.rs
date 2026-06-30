@@ -18,7 +18,7 @@
 
 use arrow::array::RecordBatch;
 use bc_runtime::agg::spill::{DiskSpillStore, SpillStore};
-use bc_runtime::shuffle;
+use bc_runtime::{join, shuffle};
 use rayon::prelude::*;
 
 use crate::error::InterpError;
@@ -206,19 +206,31 @@ pub(crate) fn broadcast_join(
                 output.to_vec(),
             )
         };
-    // Each probe chunk rebuilds the broadcast side's hash table, so over-splitting a
-    // *small* probe rebuilds it many times for no parallelism gain — pathological when
-    // the probe is smaller than the build (a mis-estimated broadcast side, e.g. TPC-H
-    // Q18's 57-row probe was split ~57 ways, rebuilding a 150K-row table each time).
-    // Cap the chunk count so every chunk's probe rows at least cover one build, so the
-    // per-chunk build is amortized. Result-invariant: chunking only splits the probe.
+    // Build the (replicated) build-side hash table ONCE, then probe `probe` across
+    // `p` parallel row-range chunks against that single shared table — rather than
+    // rebuilding the table per chunk (the old path's cost). The chunk count is still
+    // capped so every chunk's probe rows at least cover one build (no parallelism gain
+    // from over-splitting a probe smaller than the build, e.g. a mis-estimated
+    // broadcast side); since the table is built once now, the cap only governs probe
+    // parallelism. Each chunk's indices gather into its own output batch and the chunks
+    // concatenate to the full relation. Result-invariant: chunking only splits the probe.
     let build_rows = build.num_rows().max(1);
     let p = rayon::current_num_threads()
         .max(1)
         .min((probe.num_rows() / build_rows).max(1));
-    split_rows(probe, p)
-        .par_iter()
-        .map(|chunk| ops::join_batches(chunk, build, pkeys, bkeys, jt, &out, JoinStrategy::Hash))
+    let probe_keys = ops::columns_by_name(probe, pkeys)?;
+    let build_keys = ops::columns_by_name(build, bkeys)?;
+    let tuning = bc_arrow::RuntimeTuning::default();
+    let idxs = join::broadcast_hash_join_indices(
+        &probe_keys,
+        &build_keys,
+        ops::map_join_type(jt),
+        p,
+        tuning.bloom_fp_rate,
+        tuning.bloom_min_build_rows,
+    )?;
+    idxs.par_iter()
+        .map(|idx| ops::gather_join_output(probe, build, idx, &out))
         .collect()
 }
 
@@ -275,24 +287,6 @@ pub(crate) fn skew_salting_eligible(join_type: bc_ir::JoinType) -> bool {
         join_type,
         JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti | JoinType::Right
     )
-}
-
-/// Split a batch into at most `parts` contiguous, near-equal row-range slices
-/// (zero-copy). Empty batches yield a single empty slice.
-fn split_rows(batch: &RecordBatch, parts: usize) -> Vec<RecordBatch> {
-    let n = batch.num_rows();
-    if n == 0 || parts <= 1 {
-        return vec![batch.clone()];
-    }
-    let per = n.div_ceil(parts);
-    let mut out = Vec::with_capacity(parts);
-    let mut off = 0;
-    while off < n {
-        let len = per.min(n - off);
-        out.push(batch.slice(off, len));
-        off += len;
-    }
-    out
 }
 
 #[cfg(test)]

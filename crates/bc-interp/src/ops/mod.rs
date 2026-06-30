@@ -33,7 +33,10 @@ mod quantile_spill;
 mod radix_sort;
 mod reshape;
 pub(crate) use external_sort::{external_merge_sort, external_sort_to_final_store};
-pub(crate) use joins::{asof_join_batches, join_batches, join_batches_with, key_indices};
+pub(crate) use joins::{
+    asof_join_batches, columns_by_name, gather_join_output, join_batches, join_batches_with,
+    key_indices, map_join_type,
+};
 pub(crate) use mixed_spill::try_bounded_mixed_spill;
 pub(crate) use morsel::{morselize, remorselize};
 pub(crate) use quantile_spill::{

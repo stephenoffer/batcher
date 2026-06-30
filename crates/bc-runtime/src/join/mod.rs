@@ -16,13 +16,19 @@
 
 use arrow::array::{Array, ArrayRef, UInt32Array};
 use arrow::buffer::NullBuffer;
-use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
+use arrow::row::{RowConverter, Rows, SortField};
 use bc_sketches::BloomFilter;
 use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
-use indexmap::IndexMap;
+use rayon::prelude::*;
 
 use crate::error::RuntimeError;
+
+mod asof;
+mod sort_merge;
+
+pub use asof::asof_join_indices;
+pub use sort_merge::sort_merge_join_indices;
 
 /// False-positive rate for the probe-side runtime bloom (see [`use_probe_bloom_with`]).
 /// At 1% a bloom costs ~1.2 bytes/key — far less than the ~9 bytes/entry chained
@@ -334,10 +340,153 @@ impl JoinKeys for I64x2Keys<'_> {
     }
 }
 
+/// A chained hash table over a build (right) side, ready to be probed.
+///
+/// Built once by [`JoinTable::build`] and then probed — either in a single pass
+/// (the [`build_probe`] oracle path) or **many times, read-only and in parallel**,
+/// by the broadcast executor, which builds the table once and fans the probe of a
+/// large left side across worker chunks instead of rebuilding the table per chunk.
+/// `heads` maps a key to the head of a singly-linked chain of right-row indices
+/// sharing it; `next` threads the rest (`u32::MAX` terminates). Null-key build rows
+/// are never inserted (NULL ≠ NULL), so a present chain head is always a real match.
+struct JoinTable {
+    heads: HashTable<u32>,
+    next: Vec<u32>,
+    state: ahash::RandomState,
+    bloom: Option<BloomFilter>,
+}
+
+impl JoinTable {
+    /// Build the chained hash table over the right (build) side. The optional probe
+    /// bloom is populated in this same pass (no extra hashing) — see
+    /// [`use_probe_bloom_with`].
+    fn build<K: JoinKeys>(
+        keys: &K,
+        right_rows: usize,
+        right_null: &[bool],
+        use_bloom: bool,
+        bloom_fp_rate: f64,
+    ) -> Self {
+        let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
+        let mut heads: HashTable<u32> = HashTable::with_capacity(right_rows);
+        let mut next: Vec<u32> = vec![u32::MAX; right_rows];
+        let mut bloom =
+            use_bloom.then(|| BloomFilter::with_params(right_rows as u64, bloom_fp_rate));
+        for (i, &is_null) in right_null.iter().enumerate() {
+            if is_null {
+                continue;
+            }
+            let hash = keys.hash_right(&state, i);
+            if let Some(b) = bloom.as_mut() {
+                b.add_hash(hash);
+            }
+            match heads.entry(
+                hash,
+                |&h| keys.right_eq_right(h as usize, i),
+                |&h| keys.hash_right(&state, h as usize),
+            ) {
+                // Prepend i to the chain — order within a key is irrelevant (the join
+                // output is an unordered relation).
+                Entry::Occupied(mut e) => {
+                    next[i] = *e.get();
+                    *e.get_mut() = i as u32;
+                }
+                Entry::Vacant(e) => {
+                    e.insert(i as u32);
+                }
+            }
+        }
+        Self {
+            heads,
+            next,
+            state,
+            bloom,
+        }
+    }
+
+    /// The chain head for probe (left) row `l` — `None` for a null key, a bloom miss,
+    /// or no match; otherwise a real right-row index (`is_some()` ⇒ ≥1 match).
+    #[inline]
+    fn head_for<K: JoinKeys>(&self, keys: &K, l: usize, is_null: bool) -> Option<u32> {
+        if is_null {
+            return None;
+        }
+        let hash = keys.hash_left(&self.state, l);
+        // A bloom miss is definitive (no false negatives): the key is not on the build
+        // side, so the chain is provably empty — skip the hash-table lookup.
+        if self.bloom.as_ref().is_some_and(|b| !b.contains_hash(hash)) {
+            return None;
+        }
+        self.heads
+            .find(hash, |&h| keys.right_eq_left(h as usize, l))
+            .copied()
+    }
+
+    /// Probe left rows `range` against the table, appending index pairs for the
+    /// **left-driven** join types (Inner/Left/Semi/Anti). `right_matched`, when
+    /// supplied, records which build rows were hit (for the Right/Full unmatched
+    /// emission the single-pass oracle does after probing). The broadcast path passes
+    /// `None` — it never emits build-side-unmatched rows (Full/Right run single-pass).
+    #[allow(clippy::too_many_arguments)]
+    fn probe_range<K: JoinKeys>(
+        &self,
+        keys: &K,
+        range: std::ops::Range<usize>,
+        left_null: &[bool],
+        join_type: JoinType,
+        left_out: &mut Vec<Option<u32>>,
+        right_out: &mut Vec<Option<u32>>,
+        mut right_matched: Option<&mut [bool]>,
+    ) {
+        let emit_left_unmatched = matches!(join_type, JoinType::Left | JoinType::Full);
+        for i in range {
+            let head = self.head_for(keys, i, left_null[i]);
+            match join_type {
+                JoinType::Semi => {
+                    if head.is_some() {
+                        left_out.push(Some(i as u32));
+                        right_out.push(None);
+                    }
+                }
+                JoinType::Anti => {
+                    if head.is_none() {
+                        left_out.push(Some(i as u32));
+                        right_out.push(None);
+                    }
+                }
+                _ => match head {
+                    Some(mut r) => {
+                        // Walk the chain of right rows sharing this key.
+                        loop {
+                            if let Some(rm) = right_matched.as_deref_mut() {
+                                rm[r as usize] = true;
+                            }
+                            left_out.push(Some(i as u32));
+                            right_out.push(Some(r));
+                            let nxt = self.next[r as usize];
+                            if nxt == u32::MAX {
+                                break;
+                            }
+                            r = nxt;
+                        }
+                    }
+                    None => {
+                        if emit_left_unmatched {
+                            left_out.push(Some(i as u32));
+                            right_out.push(None);
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
 /// Build a chained hash table over the right (build) side, probe with the left, and
 /// emit the index pairs. Shared by every key representation via [`JoinKeys`]; the
-/// loop — including null handling, bloom pre-filtering, chain walking, and unmatched
-/// emission for each join type — is written exactly once, so all paths agree.
+/// build and probe loops live in [`JoinTable`] (so the broadcast executor's
+/// build-once/probe-many path runs exactly the same code) and are composed here once,
+/// so every join path agrees.
 #[allow(clippy::too_many_arguments)]
 fn build_probe<K: JoinKeys>(
     keys: &K,
@@ -349,105 +498,26 @@ fn build_probe<K: JoinKeys>(
     use_bloom: bool,
     bloom_fp_rate: f64,
 ) -> JoinIndices {
-    // `heads` maps a key to the head of a singly-linked chain of right-row indices
-    // sharing that key; `next` threads the rest (`u32::MAX` terminates). Null-key rows
-    // are skipped — they never match (NULL ≠ NULL).
-    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut heads: HashTable<u32> = HashTable::with_capacity(right_rows);
-    let mut next: Vec<u32> = vec![u32::MAX; right_rows];
-    // Probe-side bloom over the build keys (when it pays — see `use_probe_bloom_with`).
-    // Built in the same pass that hashes each build row, so it adds no extra hashing.
-    let mut bloom = use_bloom.then(|| BloomFilter::with_params(right_rows as u64, bloom_fp_rate));
-    for (i, &is_null) in right_null.iter().enumerate() {
-        if is_null {
-            continue;
-        }
-        let hash = keys.hash_right(&state, i);
-        if let Some(b) = bloom.as_mut() {
-            b.add_hash(hash);
-        }
-        match heads.entry(
-            hash,
-            |&h| keys.right_eq_right(h as usize, i),
-            |&h| keys.hash_right(&state, h as usize),
-        ) {
-            // Prepend i to the chain — order within a key is irrelevant (the join
-            // output is an unordered relation).
-            Entry::Occupied(mut e) => {
-                next[i] = *e.get();
-                *e.get_mut() = i as u32;
-            }
-            Entry::Vacant(e) => {
-                e.insert(i as u32);
-            }
-        }
-    }
+    let table = JoinTable::build(keys, right_rows, right_null, use_bloom, bloom_fp_rate);
 
     // Probe with the left side. Pre-size outputs to the left row count — the lower
     // bound for inner/left; outer and duplicate-key cases grow from there.
     let mut left_out: Vec<Option<u32>> = Vec::with_capacity(left_rows);
     let mut right_out: Vec<Option<u32>> = Vec::with_capacity(left_rows);
-    let mut right_matched = vec![false; right_rows];
-
     let emit_right_unmatched = matches!(join_type, JoinType::Right | JoinType::Full);
-    let emit_left_unmatched = matches!(join_type, JoinType::Left | JoinType::Full);
+    let mut right_matched = emit_right_unmatched.then(|| vec![false; right_rows]);
 
-    for (i, &is_null) in left_null.iter().enumerate() {
-        // Chain head for this left key — `None` for a null key or no match. A present
-        // head always points at a real right row, so `is_some()` means "≥1 match".
-        let head = if is_null {
-            None
-        } else {
-            let hash = keys.hash_left(&state, i);
-            // A bloom miss is definitive (no false negatives): the key is not on the
-            // build side, so the chain is provably empty — skip the hash-table lookup.
-            if bloom.as_ref().is_some_and(|b| !b.contains_hash(hash)) {
-                None
-            } else {
-                heads
-                    .find(hash, |&h| keys.right_eq_left(h as usize, i))
-                    .copied()
-            }
-        };
+    table.probe_range(
+        keys,
+        0..left_rows,
+        left_null,
+        join_type,
+        &mut left_out,
+        &mut right_out,
+        right_matched.as_deref_mut(),
+    );
 
-        match join_type {
-            JoinType::Semi => {
-                if head.is_some() {
-                    left_out.push(Some(i as u32));
-                    right_out.push(None);
-                }
-            }
-            JoinType::Anti => {
-                if head.is_none() {
-                    left_out.push(Some(i as u32));
-                    right_out.push(None);
-                }
-            }
-            _ => match head {
-                Some(mut r) => {
-                    // Walk the chain of right rows sharing this key.
-                    loop {
-                        right_matched[r as usize] = true;
-                        left_out.push(Some(i as u32));
-                        right_out.push(Some(r));
-                        let nxt = next[r as usize];
-                        if nxt == u32::MAX {
-                            break;
-                        }
-                        r = nxt;
-                    }
-                }
-                None => {
-                    if emit_left_unmatched {
-                        left_out.push(Some(i as u32));
-                        right_out.push(None);
-                    }
-                }
-            },
-        }
-    }
-
-    if emit_right_unmatched {
+    if let Some(right_matched) = right_matched {
         // Every unmatched right row is preserved — including null-key rows, which
         // match nothing (NULL != NULL) but are still part of the right relation.
         for (r, matched) in right_matched.iter().enumerate() {
@@ -464,159 +534,94 @@ fn build_probe<K: JoinKeys>(
     }
 }
 
-/// Sort `idx` into ascending encoded-key order, skipping the sort when the indices
-/// already arrive that way (one O(n) pass). Pre-sorted input — time-series, an
-/// upstream `Sort`, sorted lakehouse files — then merges without the O(n log n) sort,
-/// which is what makes sort-merge the right pick for already-ordered inputs.
-/// Result-identical: the merge consumes ascending keys either way, and equal-key
-/// group order does not affect the unordered join relation.
-fn sort_indices_if_unsorted(idx: &mut [u32], enc: &Rows) {
-    let already = idx
-        .windows(2)
-        .all(|w| enc.row(w[0] as usize) <= enc.row(w[1] as usize));
-    if !already {
-        idx.sort_by(|&a, &b| enc.row(a as usize).cmp(&enc.row(b as usize)));
-    }
-}
-
-/// Sort-merge join: sort both sides by key, then merge. Produces the **same
-/// [`JoinIndices`] relation** as [`hash_join_indices`] for every join type (output
-/// order differs — these are unordered relations). The win is no hash table: both
-/// sides stream in key order, so it suits two large (or already-sorted) inputs the
-/// way Spark's default join does. NULL keys never match (`NULL ≠ NULL`).
-pub fn sort_merge_join_indices(
+/// Build the hash table over the right (build) side **once**, then probe the left
+/// side in `n_chunks` parallel row-range slices — the broadcast join's core.
+///
+/// Returns one [`JoinIndices`] per chunk (left/right indices absolute into the full
+/// sides), in chunk order, so the caller gathers each chunk's output against the full
+/// batches and concatenates. This is what lets a broadcast join probe a large left
+/// side across every core *without* rebuilding the (replicated) build table per
+/// chunk and *without* shuffling either side by key.
+///
+/// Only the **left-driven** join types are valid here (Inner/Left/Semi/Anti): each
+/// left row lands in exactly one chunk, and no build-side-unmatched rows are emitted
+/// (Right/Full must coordinate across all chunks, so the executor runs them
+/// single-pass). The produced relation (unioned over chunks) is identical to
+/// [`hash_join_indices`] — same build, same probe loop, only the probe is sliced.
+pub fn broadcast_hash_join_indices(
     left_keys: &[ArrayRef],
     right_keys: &[ArrayRef],
     join_type: JoinType,
-) -> Result<JoinIndices, RuntimeError> {
-    use std::cmp::Ordering;
+    n_chunks: usize,
+    bloom_fp_rate: f64,
+    bloom_min_build_rows: usize,
+) -> Result<Vec<JoinIndices>, RuntimeError> {
+    debug_assert!(
+        matches!(
+            join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti
+        ),
+        "broadcast probe is left-driven only; Right/Full run single-pass"
+    );
+    let left_rows = left_keys.first().map_or(0, |a| a.len());
+    let right_rows = right_keys.first().map_or(0, |a| a.len());
+    let left_null = null_mask(left_keys, left_rows);
+    let right_null = null_mask(right_keys, right_rows);
+    let use_bloom = use_probe_bloom_with(right_rows, left_rows, bloom_min_build_rows);
 
-    let n_left = left_keys.first().map_or(0, |a| a.len());
-    let n_right = right_keys.first().map_or(0, |a| a.len());
+    // The chunk row-range boundaries (near-equal, contiguous, covering 0..left_rows).
+    let chunks = n_chunks.max(1);
+    let per = left_rows.div_ceil(chunks).max(1);
+    let ranges: Vec<std::ops::Range<usize>> = (0..left_rows)
+        .step_by(per)
+        .map(|s| s..(s + per).min(left_rows))
+        .collect();
 
-    // One shared converter so left/right encoded keys are mutually comparable.
+    // One key representation, one build, then a parallel sliced probe. The macro keeps
+    // the three key shapes (single i64, two i64, row-encoded) on the same code without
+    // boxing a `dyn JoinKeys` (the hot probe loop must monomorphize).
+    macro_rules! run {
+        ($keys:expr) => {{
+            let table = JoinTable::build(&$keys, right_rows, &right_null, use_bloom, bloom_fp_rate);
+            ranges
+                .par_iter()
+                .map(|r| {
+                    let mut left_out: Vec<Option<u32>> = Vec::with_capacity(r.len());
+                    let mut right_out: Vec<Option<u32>> = Vec::with_capacity(r.len());
+                    table.probe_range(
+                        &$keys,
+                        r.clone(),
+                        &left_null,
+                        join_type,
+                        &mut left_out,
+                        &mut right_out,
+                        None,
+                    );
+                    JoinIndices {
+                        left: UInt32Array::from(left_out),
+                        right: UInt32Array::from(right_out),
+                    }
+                })
+                .collect()
+        }};
+    }
+
+    if let Some(keys) = I64Keys::try_new(left_keys, right_keys) {
+        return Ok(run!(keys));
+    }
+    if let Some(keys) = I64x2Keys::try_new(left_keys, right_keys) {
+        return Ok(run!(keys));
+    }
     let fields: Vec<SortField> = right_keys
         .iter()
         .map(|a| SortField::new(a.data_type().clone()))
         .collect();
     let converter = RowConverter::new(fields)?;
-    let left_enc = converter.convert_columns(left_keys)?;
-    let right_enc = converter.convert_columns(right_keys)?;
-    let left_null = null_mask(left_keys, n_left);
-    let right_null = null_mask(right_keys, n_right);
-
-    // Sort the non-null-key rows of each side by encoded key (null keys never match
-    // and are handled with the unmatched rows below).
-    let mut l: Vec<u32> = (0..n_left as u32)
-        .filter(|&i| !left_null[i as usize])
-        .collect();
-    let mut r: Vec<u32> = (0..n_right as u32)
-        .filter(|&i| !right_null[i as usize])
-        .collect();
-    // Skip the O(n log n) sort on a side that already arrives in ascending key order
-    // (pre-sorted lakehouse / time-series input, or an upstream `Sort`): a one-pass
-    // check is O(n). The merge only needs ascending keys — equal-key group order is
-    // irrelevant to the unordered result — so the as-is order is bit-equivalent.
-    sort_indices_if_unsorted(&mut l, &left_enc);
-    sort_indices_if_unsorted(&mut r, &right_enc);
-
-    // Left/Full/Anti preserve unmatched left rows; Right/Full preserve unmatched
-    // right rows (Semi emits only *matched* left rows, once each).
-    let emit_left_unmatched = matches!(join_type, JoinType::Left | JoinType::Full | JoinType::Anti);
-    let emit_right_unmatched = matches!(join_type, JoinType::Right | JoinType::Full);
-
-    let mut left_out: Vec<Option<u32>> = Vec::new();
-    let mut right_out: Vec<Option<u32>> = Vec::new();
-    let mut push = |lo: Option<u32>, ro: Option<u32>| {
-        left_out.push(lo);
-        right_out.push(ro);
+    let keys = RowKeys {
+        right: converter.convert_columns(right_keys)?,
+        left: converter.convert_columns(left_keys)?,
     };
-
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < l.len() && j < r.len() {
-        match left_enc
-            .row(l[i] as usize)
-            .cmp(&right_enc.row(r[j] as usize))
-        {
-            Ordering::Less => {
-                if emit_left_unmatched {
-                    push(Some(l[i]), None);
-                }
-                i += 1;
-            }
-            Ordering::Greater => {
-                if emit_right_unmatched {
-                    push(None, Some(r[j]));
-                }
-                j += 1;
-            }
-            Ordering::Equal => {
-                // Extents of the equal-key group on each side.
-                let key = left_enc.row(l[i] as usize);
-                let mut i2 = i + 1;
-                while i2 < l.len() && left_enc.row(l[i2] as usize) == key {
-                    i2 += 1;
-                }
-                let mut j2 = j + 1;
-                while j2 < r.len() && right_enc.row(r[j2] as usize) == key {
-                    j2 += 1;
-                }
-                match join_type {
-                    // Semi: each matched left row once (no right column).
-                    JoinType::Semi => {
-                        for &li in &l[i..i2] {
-                            push(Some(li), None);
-                        }
-                    }
-                    // Anti: matched rows are dropped (only unmatched left survives).
-                    JoinType::Anti => {}
-                    // Inner/Left/Right/Full: the group cross product.
-                    _ => {
-                        for &li in &l[i..i2] {
-                            for &rj in &r[j..j2] {
-                                push(Some(li), Some(rj));
-                            }
-                        }
-                    }
-                }
-                i = i2;
-                j = j2;
-            }
-        }
-    }
-    // Tails: rows past the other side's end are all unmatched.
-    while i < l.len() {
-        if emit_left_unmatched {
-            push(Some(l[i]), None);
-        }
-        i += 1;
-    }
-    while j < r.len() {
-        if emit_right_unmatched {
-            push(None, Some(r[j]));
-        }
-        j += 1;
-    }
-    // Null-key rows match nothing but are still part of their relation for outer joins.
-    if emit_left_unmatched {
-        for (li, &is_null) in left_null.iter().enumerate() {
-            if is_null {
-                push(Some(li as u32), None);
-            }
-        }
-    }
-    if emit_right_unmatched {
-        for (rj, &is_null) in right_null.iter().enumerate() {
-            if is_null {
-                push(None, Some(rj as u32));
-            }
-        }
-    }
-
-    Ok(JoinIndices {
-        left: UInt32Array::from(left_out),
-        right: UInt32Array::from(right_out),
-    })
+    Ok(run!(keys))
 }
 
 /// A per-row mask: true where ANY key column is null (such rows never match).
@@ -637,99 +642,6 @@ fn null_mask(keys: &[ArrayRef], rows: usize) -> Vec<bool> {
         None => vec![false; rows],
         Some(nulls) => (0..rows).map(|i| nulls.is_null(i)).collect(),
     }
-}
-
-/// Compute ASOF (nearest-match) join indices. Every left row is emitted (left-style);
-/// it is matched to the right row whose `on` key is nearest *in `direction`* within
-/// the same `by` group (exact `by` equality). Unmatched left rows get a null right
-/// index (arrow `take` then yields null), exactly like a left outer join.
-///
-/// `backward = true` picks the largest right.on ≤ left.on; `false` picks the smallest
-/// right.on ≥ left.on. Keys are arrow row-encoded, so `on` (order-preserving) and
-/// `by` (equality) work for any type. Rows with a null `on` never match. As with the
-/// equi-join primitive, partitioning both sides by `by` makes a global ASOF equal the
-/// union of per-partition ASOFs — the seam the distributed path can use.
-pub fn asof_join_indices(
-    left_on: &ArrayRef,
-    right_on: &ArrayRef,
-    left_by: &[ArrayRef],
-    right_by: &[ArrayRef],
-    backward: bool,
-) -> Result<JoinIndices, RuntimeError> {
-    let n_left = left_on.len();
-    let n_right = right_on.len();
-
-    // One shared converter so left/right `on` encodings are mutually order-comparable.
-    let on_conv = RowConverter::new(vec![SortField::new(right_on.data_type().clone())])?;
-    let left_on_enc = on_conv.convert_columns(std::slice::from_ref(left_on))?;
-    let right_on_enc = on_conv.convert_columns(std::slice::from_ref(right_on))?;
-
-    let by_conv = if left_by.is_empty() {
-        None
-    } else {
-        Some(RowConverter::new(
-            right_by
-                .iter()
-                .map(|a| SortField::new(a.data_type().clone()))
-                .collect(),
-        )?)
-    };
-    let left_by_enc = by_conv
-        .as_ref()
-        .map(|c| c.convert_columns(left_by))
-        .transpose()?;
-    let right_by_enc = by_conv
-        .as_ref()
-        .map(|c| c.convert_columns(right_by))
-        .transpose()?;
-
-    // Group right rows by `by` key (byte-encoded; empty key when there are no `by`
-    // columns), each group sorted ascending by `on` for binary search.
-    let mut groups: IndexMap<Vec<u8>, Vec<(OwnedRow, u32)>> = IndexMap::new();
-    for j in 0..n_right {
-        if right_on.is_null(j) {
-            continue;
-        }
-        let key = right_by_enc
-            .as_ref()
-            .map_or_else(Vec::new, |e| e.row(j).as_ref().to_vec());
-        groups
-            .entry(key)
-            .or_default()
-            .push((right_on_enc.row(j).owned(), j as u32));
-    }
-    for v in groups.values_mut() {
-        v.sort_by(|a, b| a.0.row().cmp(&b.0.row()));
-    }
-
-    let mut right_idx: Vec<Option<u32>> = Vec::with_capacity(n_left);
-    for i in 0..n_left {
-        if left_on.is_null(i) {
-            right_idx.push(None);
-            continue;
-        }
-        let key = left_by_enc
-            .as_ref()
-            .map_or_else(Vec::new, |e| e.row(i).as_ref().to_vec());
-        let target = left_on_enc.row(i);
-        let matched = groups.get(&key).and_then(|g| {
-            if backward {
-                // largest on ≤ target
-                let pp = g.partition_point(|(on, _)| on.row() <= target);
-                (pp > 0).then(|| g[pp - 1].1)
-            } else {
-                // smallest on ≥ target
-                let pp = g.partition_point(|(on, _)| on.row() < target);
-                (pp < g.len()).then(|| g[pp].1)
-            }
-        });
-        right_idx.push(matched);
-    }
-
-    Ok(JoinIndices {
-        left: UInt32Array::from((0..n_left as u32).collect::<Vec<_>>()),
-        right: UInt32Array::from(right_idx),
-    })
 }
 
 #[cfg(test)]
@@ -1116,6 +1028,72 @@ mod tests {
             BLOOM_MIN_BUILD_ROWS * 4,
             BLOOM_MIN_BUILD_ROWS
         ));
+    }
+
+    /// The broadcast probe (build the table once, probe the left side in parallel
+    /// row-range chunks) must produce exactly the relation the single-pass oracle does
+    /// for every left-driven join type — across chunk counts that don't divide the
+    /// left evenly, duplicate keys (cross products), and null keys. Unioning the
+    /// per-chunk indices and comparing as a multiset pins that equivalence.
+    #[test]
+    fn broadcast_probe_matches_single_pass_oracle() {
+        let left = keys(&[5, 9, 5, 7, 2, 5, 1, 8, 9]);
+        let right = keys(&[5, 5, 8, 9, 7]);
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let oracle = hash_join_indices(&left, &right, jt).unwrap();
+            // A chunk count that splits 9 left rows unevenly (1, 4, 9 chunks).
+            for n_chunks in [1usize, 4, 9] {
+                let parts =
+                    broadcast_hash_join_indices(&left, &right, jt, n_chunks, BLOOM_FP_RATE, 1)
+                        .unwrap();
+                let mut got: Vec<_> = parts.iter().flat_map(pairs).collect();
+                got.sort();
+                assert_eq!(
+                    got,
+                    sorted_pairs(&oracle),
+                    "broadcast disagrees with oracle for {jt:?} n_chunks={n_chunks}"
+                );
+            }
+        }
+    }
+
+    /// Broadcast probe over a null-key-bearing input, with the bloom forced on (a
+    /// large `min_build_rows` threshold of 1 makes the probe bloom engage), still
+    /// equals the oracle — the parallel sliced probe honors NULL ≠ NULL identically.
+    #[test]
+    fn broadcast_probe_handles_nulls_and_bloom() {
+        let left: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
+            Some(1),
+            None,
+            Some(2),
+            Some(2),
+            None,
+            Some(3),
+        ]))];
+        let right: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
+            Some(2),
+            None,
+            Some(3),
+            Some(2),
+        ]))];
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let oracle = hash_join_indices(&left, &right, jt).unwrap();
+            let parts =
+                broadcast_hash_join_indices(&left, &right, jt, 3, BLOOM_FP_RATE, 1).unwrap();
+            let mut got: Vec<_> = parts.iter().flat_map(pairs).collect();
+            got.sort();
+            assert_eq!(got, sorted_pairs(&oracle), "broadcast+null mismatch {jt:?}");
+        }
     }
 
     #[test]
