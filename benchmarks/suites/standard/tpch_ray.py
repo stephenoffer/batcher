@@ -59,19 +59,31 @@ def _impl(name: str) -> Callable[[RayImpl], RayImpl]:
 
 
 def case_with_ray(name: str, query: str) -> Callable[[Context], EngineQueries]:
-    """Build a TPC-H case: the SQL fanout, plus a Ray pipeline when one exists.
+    """Build a TPC-H case: the SQL fanout, plus native DataFrame pipelines.
 
     Mirrors the operator-mix ``with_native`` mechanism but threads *all* TPC-H table
-    handles (a query joins several), so Ray Data competes on the full query.
+    handles (a query joins several) so the DataFrame engines compete on the full
+    query: Ray Data (no SQL surface) via its ``ray.data.Dataset`` pipeline, and
+    batcher via its native ``bt.Dataset`` pipeline (a parse-free, apples-to-apples
+    counterpart to Ray Data — same DataFrame-style workload). SQL engines keep the
+    SQL string; an engine without a pipeline for this query simply stays on SQL (or
+    ``n/a`` for Ray Data), never a wrong answer.
     """
+    from suites.standard.tpch_dataframe import batcher_impl
+
     sql_build = sql_case(query)
+    bt_impl = batcher_impl(name)
 
     def build(ctx: Context) -> EngineQueries:
         fns = sql_build(ctx)
-        impl = _IMPLS.get(name)
-        if impl is not None and "ray" in ctx.names():
-            handles = {t: ctx.handle(t, "ray") for t in _TPCH_TABLES if t in ctx.tables}
-            fns["ray"] = lambda: impl(handles)
+
+        def native(engine: str, impl: Callable[[dict[str, Any]], Any]) -> None:
+            if impl is not None and engine in ctx.names():
+                handles = {t: ctx.handle(t, engine) for t in _TPCH_TABLES if t in ctx.tables}
+                fns[engine] = lambda: impl(handles)
+
+        native("ray", _IMPLS.get(name))
+        native("batcher", bt_impl)
         return fns
 
     return build
