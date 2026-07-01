@@ -29,6 +29,8 @@ from batcher.plan.expr_ir import Binary, Cast, Col, referenced_columns
 from batcher.plan.expr_rewrite import combine_conjuncts, split_conjuncts
 from batcher.plan.ir_tags import WINDOW_RANKING
 from batcher.plan.logical import (
+    Aggregate,
+    AggregateSpec,
     Filter,
     Join,
     Limit,
@@ -46,6 +48,7 @@ from batcher.plan.types import DTYPE_REGISTRY, infer_type
 
 __all__ = [
     "collapse_adjacent_windows",
+    "count_over_filter_to_count_if",
     "fuse_topn",
     "push_down_narrowing_cast",
     "qualify_to_partition_topn",
@@ -119,6 +122,32 @@ def qualify_to_partition_topn(node: Filter, _ctx: OptimizerContext) -> LogicalPl
 
     fused = Window(win.input, win.partition_keys, win.order_keys, win.functions, rank_limit=limit)
     return fused if not rest else Filter(fused, combine_conjuncts(rest))
+
+
+@rule(name="count_over_filter_to_count_if", phase=Phase.FUSION, matches=(Aggregate,))
+def count_over_filter_to_count_if(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`COUNT(*)` over a `Filter(p)` → `count_if(p)` over the filter's input.
+
+    A keyless `SELECT COUNT(*) ... WHERE p` materializes every passing row just to
+    count it. `count_if(p)` (`sum(iff(p, 1, 0))`) counts the predicate mask directly —
+    no filtered batch is built — so the filter and its per-row row-copy disappear.
+
+    Gated to a keyless aggregate whose every output is `count_star`: with GROUP BY the
+    filter also drops groups whose rows all fail `p` (which `count_if` would instead
+    report as 0), and a non-count aggregate over the filtered rows is not a plain mask
+    count. Returns None otherwise, so the rule is a no-op on everything else.
+    """
+    from batcher.plan.functions.aggregate import count_if
+
+    if node.group_keys or not isinstance(node.input, Filter):
+        return None
+    if not node.aggregates or any(s.agg.func != "count_star" for s in node.aggregates):
+        return None
+    predicate = node.input.predicate
+    new_aggs = tuple(
+        AggregateSpec(alias=s.alias, agg=count_if(predicate)) for s in node.aggregates
+    )
+    return dataclasses.replace(node, input=node.input.input, aggregates=new_aggs)
 
 
 def _rank_bound(conj: object, rank_alias: str) -> int | None:
