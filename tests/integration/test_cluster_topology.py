@@ -19,9 +19,11 @@ from batcher import dist  # noqa: E402  (after importorskip)
 
 @pytest.fixture(scope="module", autouse=True)
 def _ray_session():
-    ray.init(num_cpus=2, include_dashboard=False, logging_level="ERROR", ignore_reinit_error=True)
+    from conftest import init_test_ray, shutdown_test_ray
+
+    started = init_test_ray(2)
     yield
-    ray.shutdown()
+    shutdown_test_ray(started)
 
 
 @pytest.fixture

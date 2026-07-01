@@ -615,6 +615,22 @@ def _join_reduce_task(join_ir, left_paths, right_paths, work_dir, reducer_id, en
         right: list = []
         for p in right_paths:
             right.extend(read_ipc(p))
+        # An inner equi-join needs rows on BOTH sides; a reducer whose co-partitioned
+        # bucket is empty on one side (a key present in only one input — routine under
+        # skew or a high reducer count) produces no rows, so it contributes nothing to
+        # the join or to an aggregate fused above it. Short-circuit rather than hand the
+        # native engine a schema-less empty input, which it cannot type the result from.
+        # Strictly inner `hash_join`: a left/right/full join keeps the non-empty side's
+        # unmatched rows, and this same reducer also runs `asof_join` (left-style — every
+        # left row is emitted with a null match even when the right bucket is empty).
+        top = _json.loads(join_ir)
+        join_node = top.get("input", top) if top.get("op") == "aggregate" else top
+        if (
+            join_node.get("op") == "hash_join"
+            and join_node.get("join_type", "inner") == "inner"
+            and (not any(b.num_rows for b in left) or not any(b.num_rows for b in right))
+        ):
+            return (None, 0)
         result = nat.execute_plan(join_ir, [left, right], engine_config)
 
     rows = sum(b.num_rows for b in result) if result else 0
