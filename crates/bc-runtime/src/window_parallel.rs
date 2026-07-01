@@ -91,21 +91,59 @@ pub(crate) fn window_parallel(
         .collect()
 }
 
+const SEED: ahash::RandomState =
+    ahash::RandomState::with_seeds(0x1234_5678, 0x9abc_def0, 0x0fed_cba9, 0x8765_4321);
+
 /// Hash-partition `0..num_rows` into `nbuckets` index lists by the partition keys, so
-/// equal keys share a bucket (whole window partitions never split).
+/// equal keys share a bucket (whole window partitions never split). The per-row bucket
+/// id is computed in parallel; the per-bucket index lists are then assembled by
+/// concatenating each chunk's lists in chunk order (so each bucket's indices stay
+/// ascending, which the scatter-back relies on for a deterministic permutation).
 fn partition_row_indices(
     partition_keys: &[ArrayRef],
     num_rows: usize,
     nbuckets: usize,
 ) -> Result<Vec<Vec<u32>>, RuntimeError> {
-    let state = ahash::RandomState::with_seeds(0x1234_5678, 0x9abc_def0, 0x0fed_cba9, 0x8765_4321);
-    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); nbuckets];
-    let mut push = |b: usize, i: usize| buckets[b].push(i as u32);
+    let part_of = bucket_of_each_row(partition_keys, num_rows, nbuckets)?;
 
-    // Fast path: a single integer / string key hashes its native value directly,
-    // skipping the `RowConverter` encoding pass (a per-row allocation) — the dominant
-    // window-partition shape (`PARTITION BY <id>` / `<category>`). Equal keys hash
-    // equally, which is all the co-partitioning invariant needs.
+    // Parallel stable counting sort into per-bucket lists: each row-range chunk builds
+    // its own per-bucket lists, then bucket `b`'s global list is the chunks' `b`-lists
+    // concatenated in chunk order. Mirrors `shuffle::scatter_into_buckets`.
+    let nthreads = rayon::current_num_threads().max(1);
+    let chunk = num_rows.div_ceil(nthreads).max(1);
+    let per_chunk: Vec<Vec<Vec<u32>>> = part_of
+        .par_chunks(chunk)
+        .enumerate()
+        .map(|(ci, slice)| {
+            let base = (ci * chunk) as u32;
+            let mut lists: Vec<Vec<u32>> = vec![Vec::new(); nbuckets];
+            for (j, &b) in slice.iter().enumerate() {
+                lists[b as usize].push(base + j as u32);
+            }
+            lists
+        })
+        .collect();
+    Ok((0..nbuckets)
+        .into_par_iter()
+        .map(|b| {
+            let total: usize = per_chunk.iter().map(|c| c[b].len()).sum();
+            let mut out = Vec::with_capacity(total);
+            for c in &per_chunk {
+                out.extend_from_slice(&c[b]);
+            }
+            out
+        })
+        .collect())
+}
+
+/// The bucket id (`hash(key) % nbuckets`) of each row, computed in parallel. A single
+/// integer / string key hashes its native value directly (no `RowConverter`).
+fn bucket_of_each_row(
+    partition_keys: &[ArrayRef],
+    num_rows: usize,
+    nbuckets: usize,
+) -> Result<Vec<u32>, RuntimeError> {
+    let n = nbuckets as u64;
     if partition_keys.len() == 1 {
         use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::DataType;
@@ -113,27 +151,31 @@ fn partition_row_indices(
         match a.data_type() {
             DataType::Int64 => {
                 let v = a.as_any().downcast_ref::<Int64Array>().expect("i64");
-                for i in 0..num_rows {
-                    let h = if v.is_null(i) {
-                        0
-                    } else {
-                        state.hash_one(v.value(i))
-                    };
-                    push((h % nbuckets as u64) as usize, i);
-                }
-                return Ok(buckets);
+                return Ok((0..num_rows)
+                    .into_par_iter()
+                    .map(|i| {
+                        let h = if v.is_null(i) {
+                            0
+                        } else {
+                            SEED.hash_one(v.value(i))
+                        };
+                        (h % n) as u32
+                    })
+                    .collect());
             }
             DataType::Utf8 => {
                 let v = a.as_any().downcast_ref::<StringArray>().expect("utf8");
-                for i in 0..num_rows {
-                    let h = if v.is_null(i) {
-                        0
-                    } else {
-                        state.hash_one(v.value(i))
-                    };
-                    push((h % nbuckets as u64) as usize, i);
-                }
-                return Ok(buckets);
+                return Ok((0..num_rows)
+                    .into_par_iter()
+                    .map(|i| {
+                        let h = if v.is_null(i) {
+                            0
+                        } else {
+                            SEED.hash_one(v.value(i))
+                        };
+                        (h % n) as u32
+                    })
+                    .collect());
             }
             _ => {}
         }
@@ -146,9 +188,7 @@ fn partition_row_indices(
         .collect();
     let converter = RowConverter::new(fields)?;
     let rows = converter.convert_columns(partition_keys)?;
-    for i in 0..num_rows {
-        let b = (state.hash_one(rows.row(i)) % nbuckets as u64) as usize;
-        push(b, i);
-    }
-    Ok(buckets)
+    Ok((0..num_rows)
+        .map(|i| (SEED.hash_one(rows.row(i)) % n) as u32)
+        .collect())
 }
