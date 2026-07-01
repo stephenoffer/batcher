@@ -72,13 +72,24 @@ class Session:
             {'total': [6]}
     """
 
-    __slots__ = ("_dialect", "_functions", "_tables")
+    __slots__ = ("_dialect", "_functions", "_generation", "_plan_cache", "_tables")
 
     def __init__(self, *, dialect: str = "duckdb") -> None:
         """Create an empty session reading SQL in `dialect` (the sqlglot read dialect)."""
         self._tables: dict[str, Dataset] = {}
         self._functions: dict[str, _RegisteredFunction] = {}
         self._dialect = dialect
+        # Prepared-statement cache: query text -> (catalog generation, built Dataset).
+        # A repeated SELECT against an unchanged catalog skips the sqlglot parse + AST
+        # translation. `_generation` bumps on every catalog mutation (register / drop /
+        # create / clear / register_function), invalidating stale entries — so a plan
+        # never outlives the tables or functions it was built against.
+        self._plan_cache: dict[str, tuple[int, Dataset]] = {}
+        self._generation = 0
+
+    def _bump(self) -> None:
+        """Invalidate the prepared-statement cache after a catalog mutation."""
+        self._generation += 1
 
     # --- tables ------------------------------------------------------------
     def register(self, name: str, dataset: Dataset | pa.Table) -> Dataset:
@@ -105,6 +116,7 @@ class Session:
         """
         ds = self._as_dataset(dataset)
         self._tables[name] = ds
+        self._bump()
         return ds
 
     def table(self, name: str) -> Dataset:
@@ -153,6 +165,7 @@ class Session:
                 ['b']
         """
         self._tables.pop(name, None)
+        self._bump()
 
     def clear(self) -> None:
         """Remove every registered table (registered functions and dialect are kept).
@@ -168,6 +181,7 @@ class Session:
                 []
         """
         self._tables.clear()
+        self._bump()
 
     # --- functions ---------------------------------------------------------
     def register_function(
@@ -236,6 +250,7 @@ class Session:
             output_columns=tuple(output_columns) if output_columns is not None else None,
             config=config,
         )
+        self._bump()
 
     def list_functions(self) -> list[str]:
         """The sorted names of all registered functions.
@@ -282,6 +297,17 @@ class Session:
     # --- internals ---------------------------------------------------------
     def _run(self, query: str, tables: dict[str, Dataset | pa.Table]) -> Dataset:
         """Parse and dispatch `query` (tables passed as a dict to allow any name)."""
+        # Prepared-statement fast path: re-running the same query text against an
+        # unchanged catalog reuses its built plan, skipping the sqlglot parse + AST
+        # translation. Only for plain (SELECT-shaped) queries with no per-call table
+        # bindings — CREATE/DROP mutate the catalog and are never cached, and a
+        # `tables` override changes what the names resolve to.
+        cacheable = not tables
+        if cacheable:
+            hit = self._plan_cache.get(query)
+            if hit is not None and hit[0] == self._generation:
+                return hit[1]
+
         import sqlglot
         from sqlglot import expressions as exp
 
@@ -290,7 +316,10 @@ class Session:
             return self._create(ast, tables)
         if isinstance(ast, exp.Drop):
             return self._drop(ast)
-        return self._translate(ast, tables)
+        ds = self._translate(ast, tables)
+        if cacheable:
+            self._plan_cache[query] = (self._generation, ds)
+        return ds
 
     def _translate(self, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Dataset:
         from batcher._sql import translate_ast
@@ -311,6 +340,7 @@ class Session:
             raise PlanError("CREATE TABLE/VIEW requires an AS <select> body")
         ds = self._translate(body, tables)
         self._tables[name] = ds
+        self._bump()
         return ds
 
     def _drop(self, ast: Any) -> Dataset:
@@ -319,6 +349,7 @@ class Session:
         if not bool(ast.args.get("exists")) and name not in self._tables:
             raise PlanError(f"no table {name!r} to drop")
         self._tables.pop(name, None)
+        self._bump()
         return self._as_dataset(pa.table({"dropped": pa.array([name], pa.string())}))
 
     def _with_dialect(self, dialect: str) -> Session:
