@@ -154,6 +154,52 @@ pub fn window_with(
     num_rows: usize,
     parallel_row_threshold: usize,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
+    // Parallelize across CORES by hash-partitioning rows on the PARTITION BY keys:
+    // equal keys co-partition, so every window partition lands wholly inside one
+    // bucket and each bucket is an independent window over a disjoint row set. Run the
+    // serial kernel per bucket on rayon, then scatter every function's column back to
+    // original row order. This spreads the dominant per-partition cost — the ordering
+    // sort behind ranking / running-aggregate / value / framed functions — across all
+    // cores (the serial kernel left it single-threaded).
+    //
+    // Gated to windows with an ORDER BY: those pay a per-partition sort that dwarfs the
+    // partition + scatter-back plumbing this adds. A *frameless* aggregate
+    // (`sum() OVER (PARTITION BY k)`, empty order) is only a group-by + broadcast whose
+    // per-row work is already cheap, so the scattered gather/scatter here would cost
+    // more than it parallelizes — it stays on the serial group-id fast path. Also skip
+    // below the row threshold and when there is no PARTITION BY (a single global
+    // partition can't be split).
+    let nthreads = rayon::current_num_threads();
+    let worth_parallel = !partition_keys.is_empty()
+        && !order_keys.is_empty()
+        && num_rows >= parallel_row_threshold
+        && nthreads > 1;
+    if !worth_parallel {
+        return window_serial(
+            partition_keys,
+            order_keys,
+            funcs,
+            num_rows,
+            parallel_row_threshold,
+        );
+    }
+    crate::window_parallel::window_parallel(
+        partition_keys,
+        order_keys,
+        funcs,
+        num_rows,
+        nthreads,
+        parallel_row_threshold,
+    )
+}
+
+pub(crate) fn window_serial(
+    partition_keys: &[ArrayRef],
+    order_keys: &[(ArrayRef, SortOptions)],
+    funcs: &[WindowCall],
+    num_rows: usize,
+    parallel_row_threshold: usize,
+) -> Result<Vec<ArrayRef>, RuntimeError> {
     // Fast path: PARTITION BY with no ORDER BY and only plain aggregates (no frame, no
     // ranking / value functions) is exactly "group-by the partition keys, aggregate,
     // broadcast back to each row". Assign dense group ids once via the shared native
@@ -710,6 +756,70 @@ mod tests {
     fn floats(a: &ArrayRef) -> Vec<f64> {
         let x = a.as_any().downcast_ref::<Float64Array>().unwrap();
         (0..x.len()).map(|i| x.value(i)).collect()
+    }
+
+    /// The bucket-parallel path (`window_with` with a low row threshold) must produce
+    /// exactly what the serial kernel does, for ordered windows across many partitions
+    /// — ranking, running aggregate, and a positional (lag) function. Partitioning by
+    /// key and scattering back must not change any per-row result.
+    #[test]
+    fn parallel_matches_serial_ordered() {
+        let n = 600usize;
+        // ~40 partitions (key = i % 40), each ordered by a shuffled value.
+        let part = i64s(&(0..n as i64).map(|i| i % 40).collect::<Vec<_>>());
+        let ord = i64s(
+            &(0..n as i64)
+                .map(|i| (i * 7 + 13) % 100)
+                .collect::<Vec<_>>(),
+        );
+        let vals = i64s(&(0..n as i64).map(|i| i * 2 - 5).collect::<Vec<_>>());
+        let order = [asc(ord)];
+        let cases: Vec<WindowCall> = vec![
+            WindowCall {
+                func: WindowFn::Rank,
+                values: None,
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::RowNumber,
+                values: None,
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::Sum,
+                values: Some(vals.clone()),
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::Lag,
+                values: Some(vals.clone()),
+                offset: 1,
+                frame: None,
+            },
+        ];
+        // Null-aware read (Lag yields nulls at each partition's first row; the raw
+        // value in a null slot is unspecified, so compare validity + value together).
+        let opt_ints = |a: &ArrayRef| -> Vec<Option<i64>> {
+            let x = a.as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..x.len())
+                .map(|i| x.is_valid(i).then(|| x.value(i)))
+                .collect()
+        };
+        for call in cases {
+            let funcs = [call];
+            // threshold 1 forces the parallel path; usize::MAX keeps the serial oracle.
+            let par = window_with(&[part.clone()], &order, &funcs, n, 1).unwrap();
+            let ser = window_serial(&[part.clone()], &order, &funcs, n, usize::MAX).unwrap();
+            assert_eq!(
+                opt_ints(&par[0]),
+                opt_ints(&ser[0]),
+                "parallel != serial for {:?}",
+                funcs[0].func
+            );
+        }
     }
 
     #[test]

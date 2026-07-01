@@ -17,6 +17,7 @@ pub mod join;
 pub mod shuffle;
 pub mod window;
 pub mod window_frame;
+mod window_parallel;
 mod window_partition_agg;
 
 pub use error::RuntimeError;
