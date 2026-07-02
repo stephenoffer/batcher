@@ -908,3 +908,10 @@ width (no OOM); warm pools reuse the model. Distributed over 8×T4, 4096 clips
 
 **batcher vs ray: 3.6×** — Ray must be hand-given a wide-row-safe `batch_size` (else OOM);
 Batcher sizes it automatically.
+
+### Audio feature extraction — Batcher 12.5× Ray Data
+
+Waveform → mel-spectrogram (torchaudio, CPU) → ResNet-18 (GPU) — the audio branch of the
+multimodal workload, a two-stage CPU→GPU chain on a different modality. 8×T4, 16384 clips
+(`gpu_audio.py`): batcher **38546 clip/s** vs ray **3076** = **12.5×**, 100% agreement — the
+same stage-overlap + warm-pool machinery, on audio.
