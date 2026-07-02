@@ -960,3 +960,25 @@ streaming, session-warm pools, zero-config adaptive batch, parallel CPU decode, 
 zero-copy loader), not per-workload tuning — so they carry to related workloads (RAG = retrieval
 + LLM, etc.). The single exception remains a maximally-large *compute-bound* single job (~parity:
 both saturate the same GPU at the same FLOPs; 2× there needs FP16, model-side).
+
+## Dirty-data tolerance — Batcher retains 99%, Ray retains 0% (2026-07-02)
+
+Real AI data is messy: a fraction of images/records fail to decode. `benchmarks/cluster/gpu_dirty.py`
+injects ~1% corrupt rows (a UDF that raises on them) across 200k rows and asks each engine to
+*survive* and keep the good data.
+
+| engine | tolerance knob | granularity | completed | rows kept |
+|---|---|---|---|---|
+| **Batcher** | `max_errored_rows` | **per-row** | ✅ | **198,000 / 200,000 (99%)** |
+| Ray Data | `max_errored_blocks=-1` | per-block | ✅ | **0 / 200,000 (0%)** |
+
+Both engines *complete* (neither crashes with tolerance enabled), but granularity decides the
+outcome: with corruption spread ~1-per-100-rows, **every** Ray block contains a bad row, so
+`max_errored_blocks` drops the whole dataset — 0 rows survive. Batcher's `max_errored_rows`
+(batch-bisection down to the offending row, reusing the CUDA-OOM-halving path) drops only the
+corrupt rows and keeps 99%. This is the difference between "survives the crash" and "salvages
+the data." Without any tolerance flag both engines raise — Batcher's default stays strict
+(`max_errored_rows=0`) so silent data loss is always opt-in.
+
+This closes the dirty-data gap the optimization guides flag (corrupt images/JSON/records) — and
+turns it into a retention *advantage*, not just parity.
