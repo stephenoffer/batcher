@@ -822,3 +822,22 @@ type; mergeable algebra + bounded-memory streaming + spill carry it across scale
 (diffusion) follow the identical `map_batches` + warm-pool pattern — where warm pools help
 most, since a multi-GB LLM/diffusion model load (tens of seconds) is paid once per session vs
 Ray's per-execution reload.
+
+### LLM batch inference — Batcher 11× Ray Data (warm pools' biggest win)
+
+The workload where cold start dominates most: a causal LM (HF `transformers` gpt2, FP16)
+loads in ~7 s, and Ray Data reloads it on **every execution** while Batcher keeps the pool
+warm across `collect()`s. Distributed over 8×T4, 2048 prompts, greedy decode (deterministic),
+`benchmarks/cluster/gpu_llm.py`:
+
+| engine | time | prompt/s | correctness |
+|---|---|---|---|
+| **batcher** (warm) | 2.51 s | **814.8** | 100% text match |
+| ray data (reloads/run) | 27.98 s | 73.2 | 100% text match |
+
+**batcher vs ray: 11.1×.** Because generation is fast relative to the model load (the probe
+measured load 7-10 s vs generate ~1 s for 32×32 tokens), Ray's per-execution reload is the
+whole cost — so the warm-pool advantage is scale-independent here and grows with model size
+(a multi-GB LLM/diffusion load is tens of seconds). This is the general `map_batches` +
+warm-pool mechanism proven on batch-inference/embeddings, now on the LLM/generative workload
+where it matters most.
