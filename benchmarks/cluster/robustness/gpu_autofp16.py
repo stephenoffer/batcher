@@ -110,7 +110,11 @@ class _Fp32Pipeline:
         )
 
     def __call__(self, batch: pa.RecordBatch) -> dict:
-        preds = self._pipe(batch.column("text").to_pylist(), truncation=True)
+        # Batch the forward pass too (batch_size defaults to 1 in a HF pipeline), so this
+        # FP32 baseline is a fair apples-to-apples comparison against the batched FP16 path
+        # — isolating the dtype, not the batching.
+        inputs = batch.column("text").to_pylist()
+        preds = self._pipe(inputs, truncation=True, batch_size=max(1, len(inputs)))
         return {"label": [p["label"] for p in preds]}
 
 
