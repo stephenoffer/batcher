@@ -124,12 +124,32 @@ def _linear_map_chain(plan: LogicalPlan) -> tuple[Scan, list[MapBatches]] | None
     return node, stages
 
 
-# Default GPU-inference batch when a GPU stage has no explicit `batch_size` (the truly
-# zero-config `ds.map_batches(Model, num_gpus=1)` call): large enough to fill the device,
-# small enough to stay VRAM-safe for common vision/embedding models (the guides' image
-# range is 32-128; 256 suits most and self-corrects on CUDA OOM by halving). An explicit
-# `batch_size` always wins; env-overridable.
+# Adaptive GPU-inference batch when a GPU stage has no explicit `batch_size` (the truly
+# zero-config `ds.map_batches(Model, num_gpus=1)` call). `_GPU_STREAM_BATCH_ROWS` is the
+# row cap (large enough to fill the device; the guides' image range is 32-128, 256 suits
+# most vision/embedding models); `_GPU_STREAM_BATCH_BYTES` is a per-batch input-byte budget
+# so the row count SHRINKS on wide rows (a decoded frame, a float embedding tensor) that
+# would otherwise OOM the GPU at the row cap, and stays at the cap for narrow rows. Floored
+# so the batch always fills the SMs. An explicit `batch_size` always wins; env-overridable.
 _GPU_STREAM_BATCH_ROWS = max(1, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_ROWS", "256")))
+_GPU_STREAM_BATCH_BYTES = max(
+    1 << 20, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_BYTES", str(64 << 20)))
+)
+_GPU_STREAM_BATCH_MIN = max(1, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_MIN", "8")))
+
+
+def _gpu_batch_rows(batch: pa.RecordBatch) -> int:
+    """Adaptive GPU sub-batch row count for a morsel, from its per-row byte width.
+
+    ``min(row_cap, byte_budget / per_row_bytes)`` floored at `_GPU_STREAM_BATCH_MIN`: narrow
+    rows batch up to the row cap (fill the device); wide rows (large images/tensors) batch
+    fewer rows to stay under the VRAM budget — data-width-adaptive, so the same zero-config
+    call is safe for a 150 KB image and a 3 MB frame alike (OOM-halving covers the rest)."""
+    if batch.num_rows <= 0:
+        return _GPU_STREAM_BATCH_ROWS
+    per_row = max(1, batch.nbytes // batch.num_rows)
+    by_bytes = _GPU_STREAM_BATCH_BYTES // per_row
+    return max(_GPU_STREAM_BATCH_MIN, min(_GPU_STREAM_BATCH_ROWS, by_bytes))
 
 
 def _stream_eligible(stages: list[MapBatches]) -> bool:
@@ -182,14 +202,19 @@ def _apply_udf_stream(gen: Iterator[pa.RecordBatch], op: MapBatches) -> Iterator
     call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
     morsel = max(1, active_config().execution.morsel_rows)
     is_gpu = op.num_gpus > 0
-    # An explicit batch_size wins; a GPU stage without one gets the VRAM-safe inference
-    # default (not the whole morsel, which could OOM the device); a CPU stage keeps morsel.
-    target = op.batch_size or (_GPU_STREAM_BATCH_ROWS if is_gpu else morsel)
+    # An explicit batch_size always wins. A CPU stage keeps the morsel bound. A GPU stage
+    # WITHOUT a batch_size gets a size that ADAPTS to the data's row width (`target=None` →
+    # `_gpu_batch_rows` per morsel): a fixed row count OOMs the device on wide rows (a large
+    # image / float tensor) and under-fills it on narrow ones, so the size is derived from a
+    # byte budget instead — capped at the row default and floored so it always fills the SMs.
+    # OOM-halving remains the safety net if a model's activations still overflow.
+    target: int | None = op.batch_size or (None if is_gpu else morsel)
     workers = op.num_workers if isinstance(op.num_workers, int) and op.num_workers > 1 else 1
 
     def _subs(batch: pa.RecordBatch) -> list[pa.RecordBatch]:
-        if batch.num_rows > target:
-            return pa.Table.from_batches([batch]).to_batches(max_chunksize=target)
+        t = target if target is not None else _gpu_batch_rows(batch)
+        if batch.num_rows > t:
+            return pa.Table.from_batches([batch]).to_batches(max_chunksize=t)
         return [batch]
 
     # A GPU stage runs one CUDA context (num_workers=1) and survives a transient VRAM spike
