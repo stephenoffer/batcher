@@ -306,13 +306,16 @@ def _pipeline_accel_kwargs() -> dict[str, Any]:
     try:
         import torch
 
-        from batcher.ml.gpu import detect_backend, recommend_inference_dtype
+        from batcher.ml.gpu import detect_backend, recommend_inference_dtype, torch_device
 
+        # Vendor-agnostic device placement. `detect_backend` only names a backend that is
+        # actually available, so NVIDIA/AMD (cuda), Intel (xpu), Apple (mps), and TPU (xla)
+        # all get placed on the accelerator — not only CUDA. transformers wants an int for
+        # the primary CUDA device and a device string for the rest.
         backend = detect_backend()
-        if backend in ("cuda", "rocm") and torch.cuda.is_available():
-            kwargs["device"] = 0
-        elif backend == "mps":
-            kwargs["device"] = "mps"
+        if backend != "cpu":
+            dev = torch_device(backend)
+            kwargs["device"] = 0 if dev == "cuda" else dev
         dtype = recommend_inference_dtype(backend)
         if dtype is not None:
             kwargs["torch_dtype"] = getattr(torch, dtype)

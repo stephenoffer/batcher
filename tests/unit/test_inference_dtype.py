@@ -70,3 +70,17 @@ def test_accel_kwargs_empty_on_cpu(monkeypatch):
     pytest.importorskip("torch")
     monkeypatch.setattr("batcher.ml.gpu.detect_backend", lambda: "cpu")
     assert _pipeline_accel_kwargs() == {}
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected_device"),
+    [("cuda", 0), ("rocm", 0), ("xpu", "xpu"), ("mps", "mps"), ("tpu", "xla")],
+)
+def test_accel_kwargs_places_on_any_accelerator(monkeypatch, backend, expected_device):
+    """Vendor-agnostic device placement: NVIDIA/AMD -> int 0, Intel/Apple/TPU -> device
+    string. Not only CUDA — the managed path works on any GPU type."""
+    pytest.importorskip("torch")
+    monkeypatch.setattr("batcher.ml.gpu.detect_backend", lambda: backend)
+    # No dtype needed for this assertion; force it None so we isolate device placement.
+    monkeypatch.setattr("batcher.ml.gpu.recommend_inference_dtype", lambda b=None: None)
+    assert _pipeline_accel_kwargs() == {"device": expected_device}
