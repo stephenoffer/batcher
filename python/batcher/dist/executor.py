@@ -176,22 +176,37 @@ def execute_distributed(
         reset_scheduling_envelope(token)
 
 
+def _worker_node_cpus() -> list[float]:
+    """CPU counts of the nodes eligible to run distributed workers.
+
+    Excludes the Ray **head** node (marker ``node:__internal_head__``) when at least one
+    other node exists: the head runs the GCS / dashboard / job supervisor, and scheduling
+    data operators on it causes contention and instability (Ray Data hits this — the
+    guides' "set `num_cpus=0` on the head" rule). Anyscale already gives the head 0 CPU, so
+    the `> 0` filter handles it there; excluding by marker makes Batcher correct on a raw
+    Ray cluster whose head has cores too — "works on any cluster type". A single-node
+    cluster (head only) keeps the head, since it must run the work.
+    """
+    import ray
+
+    alive = [n for n in ray.nodes() if n.get("Alive")]
+    non_head = [n for n in alive if "node:__internal_head__" not in n.get("Resources", {})]
+    nodes = non_head if non_head else alive  # keep the head only if it's the whole cluster
+    return [c for c in (float(n.get("Resources", {}).get("CPU", 0.0)) for n in nodes) if c > 0]
+
+
 def _cluster_fill_workers() -> tuple[int, float] | None:
-    """The cluster-filling fan-out: one worker per node, each owning that node's cores.
+    """The cluster-filling fan-out: one worker per (non-head) node, each owning that node's
+    cores.
 
     Returns `(workers, num_cpus)` on a genuine multi-node cluster — `workers` = the live
-    node count, `num_cpus` = the smallest node's cores (so the per-worker grant is
+    worker-node count, `num_cpus` = the smallest node's cores (so the per-worker grant is
     placeable on every node, SPREAD-safe). Returns `None` on a single node or when the
     topology is unreadable, so the caller keeps the data-driven `_even_cpu_share` sizing.
     Ray must already be initialized (`ray.nodes()` is empty before).
     """
     try:
-        import ray
-
-        node_cpus = [
-            float(n.get("Resources", {}).get("CPU", 0.0)) for n in ray.nodes() if n.get("Alive")
-        ]
-        node_cpus = [c for c in node_cpus if c > 0]
+        node_cpus = _worker_node_cpus()
         if len(node_cpus) <= 1:
             return None
         return len(node_cpus), float(int(min(node_cpus)))
@@ -211,12 +226,7 @@ def _even_cpu_share(workers: int) -> float:
     default) when topology is unavailable.
     """
     try:
-        import ray
-
-        node_cpus = [
-            float(n.get("Resources", {}).get("CPU", 0.0)) for n in ray.nodes() if n.get("Alive")
-        ]
-        node_cpus = [c for c in node_cpus if c > 0]
+        node_cpus = _worker_node_cpus()
         if not node_cpus or workers <= 0:
             return 1.0
         placeable = float(int(min(node_cpus)))  # fits the smallest node (SPREAD-safe)
