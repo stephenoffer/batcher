@@ -982,3 +982,28 @@ the data." Without any tolerance flag both engines raise — Batcher's default s
 
 This closes the dirty-data gap the optimization guides flag (corrupt images/JSON/records) — and
 turns it into a retention *advantage*, not just parity.
+
+## Fraud feature aggregation — Batcher 139× Ray Data (tabular, structural) (2026-07-02)
+
+Beyond GPU inference: the **tabular** batch path of the fraud-detection workload. Its dominant
+cost is feature engineering — per-account aggregations over transaction history (count/velocity,
+sum, mean, max) that become the model features (the guides' "feature preprocessing 10×" lever).
+`benchmarks/cluster/fraud_scoring.py` runs it distributed over 20M transactions / 200k accounts.
+
+| engine | throughput | wall |
+|---|---|---|
+| **Batcher** (native mergeable group-by + Flight shuffle) | **77.0 M rows/s** | **260 ms** |
+| Ray Data (`groupby().aggregate(...)`, its native path) | 0.6 M rows/s | 36,301 ms |
+
+**Batcher 139× Ray Data**, correctness-gated (per-account mean agrees to 4.3e-14). This is a
+*structural* win, not a physics race: the aggregation is relational, so Batcher runs it in the
+Rust engine as a mergeable `partial → shuffle → combine` (the same algebra single-node and
+distributed) while Ray Data has no relational optimizer and its group-by shuffle is a known-weak
+path. Unlike GPU compute (bounded to parity by FLOPs), tabular feature engineering is where the
+native-engine advantage is largest — the fraud/risk workload's actual bottleneck.
+
+Known gap (documented, not hidden): the *enrich* shape — joining fact rows back to their
+per-account aggregate — has **no distributed route** yet. The Flight co-partition join can't take
+an aggregate as a build side (each mapper would compute a wrong per-partition aggregate); the
+correct fix is aggregate-then-broadcast, a follow-up `add-distributed-operator` task. The engine
+raises loudly rather than silently falling back to single-node (the invariant held).
