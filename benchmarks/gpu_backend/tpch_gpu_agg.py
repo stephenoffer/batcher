@@ -54,7 +54,9 @@ def _init() -> None:
         )
 
 
-def _gpu_groupby_sum(keys_np, vals_np, n_groups: int, runs: int) -> tuple[list[float], float, float]:
+def _gpu_groupby_sum(
+    keys_np, vals_np, n_groups: int, runs: int
+) -> tuple[list[float], float, float]:
     """A group-by SUM on the GPU via torch scatter_add.
 
     Returns `(per_group_sums, best_compute_s, best_e2e_s)`: compute-only (data already resident
@@ -121,9 +123,10 @@ def main() -> int:
         print("FAIL: GPU and CPU group sums diverge — not reporting")
         return 1
 
-    print(f"batcher-cpu       {n / best_cpu / 1e6:8.1f} M rows/s  ({best_cpu * 1000:.0f} ms)")
-    print(f"torch-gpu e2e     {n / best_e2e / 1e6:8.1f} M rows/s  ({best_e2e * 1000:.1f} ms)  [+H2D transfer]")
-    print(f"torch-gpu compute {n / best_compute / 1e6:8.1f} M rows/s  ({best_compute * 1000:.1f} ms)  [data resident]")
+    cpu_r, e2e_r, comp_r = n / best_cpu / 1e6, n / best_e2e / 1e6, n / best_compute / 1e6
+    print(f"batcher-cpu       {cpu_r:8.1f} M rows/s  ({best_cpu * 1000:.0f} ms)")
+    print(f"torch-gpu e2e     {e2e_r:8.1f} M rows/s  ({best_e2e * 1000:.1f} ms)  [+H2D transfer]")
+    print(f"torch-gpu compute {comp_r:8.1f} M rows/s  ({best_compute * 1000:.1f} ms)  [resident]")
     print(
         f"\nGPU vs Batcher CPU: {best_cpu / best_e2e:.1f}x end-to-end (single op, transfer-bound), "
         f"{best_cpu / best_compute:.0f}x compute-only (fused/resident ceiling)"
