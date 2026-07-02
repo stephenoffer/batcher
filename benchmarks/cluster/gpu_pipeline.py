@@ -153,7 +153,7 @@ def batcher_thunk(cfg: dict):
             batch_format="numpy",
             num_gpus=cfg["num_gpus"],
             concurrency=conc,
-            batch_size=cfg["batch"],
+            batch_size=cfg["batch"] or None,
         )
     )
 
@@ -180,13 +180,13 @@ def ray_thunk(cfg: dict):
 
     ds = (
         rd.read_parquet(cfg["dir"])
-        .map_batches(_decode, num_cpus=1, batch_format="pyarrow", batch_size=cfg["batch"])
+        .map_batches(_decode, num_cpus=1, batch_format="pyarrow", batch_size=cfg["batch"] or None)
         .map_batches(
             _RayModel,
             concurrency=conc,
             num_gpus=cfg["num_gpus"],
             num_cpus=0,
-            batch_size=cfg["batch"],
+            batch_size=cfg["batch"] or None,
             batch_format="numpy",
         )
     )

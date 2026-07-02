@@ -764,3 +764,16 @@ decode→model shape that was impossible before.
 Note on utilization: a *higher* GPU-util % is not automatically better — a slower engine
 spreads the same GPU-work over more wall-clock and reads as higher util. The number that
 matters is throughput at a healthy util; Batcher leads on both.
+
+### Zero-config GPU inference — Batcher runs it, Ray Data refuses
+
+The *simplest* call — `ds.map_batches(Model, num_gpus=1)` with **no `batch_size`** —
+is where out-of-the-box GPU utilization is won or lost. Ray Data **hard-errors**:
+`ValueError: You must provide batch_size to map_batches when requesting GPUs` — the user
+must hand-tune it (the "no auto-tuning" gap the guides call out). Batcher instead picks a
+VRAM-safe default (`BATCHER_GPU_STREAM_BATCH_ROWS=256`), streams it with stage overlap,
+and self-corrects on a CUDA OOM by halving the batch — so a two-stage decode→model chain
+with no tuning reaches **82% GPU util at 2451 img/s** (131k imgs, 8×T4). Same result as the
+tuned `batch_size=128` path (2504 img/s, 81%), with zero knobs. `core/udf.py` chooses the
+default only for a multi-stage GPU chain (where there is upstream CPU work to overlap); a
+single-stage GPU `map_batches` keeps the dynamic-autobatch `InferencePool` path.

@@ -124,25 +124,30 @@ def _linear_map_chain(plan: LogicalPlan) -> tuple[Scan, list[MapBatches]] | None
     return node, stages
 
 
+# Default GPU-inference batch when a GPU stage has no explicit `batch_size` (the truly
+# zero-config `ds.map_batches(Model, num_gpus=1)` call): large enough to fill the device,
+# small enough to stay VRAM-safe for common vision/embedding models (the guides' image
+# range is 32-128; 256 suits most and self-corrects on CUDA OOM by halving). An explicit
+# `batch_size` always wins; env-overridable.
+_GPU_STREAM_BATCH_ROWS = max(1, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_ROWS", "256")))
+
+
 def _stream_eligible(stages: list[MapBatches]) -> bool:
     """Whether a linear chain should run on the streaming, stage-overlapped path.
 
     Targets the **multi-stage inference shape** — two or more stages, at least one on a
     GPU — where a CPU stage (decode/resize/tokenize) feeding a GPU stage overlaps to keep
-    the device fed (the whole point). A single stage has nothing to overlap with (and its
-    intra-stage `num_workers` threading + the auto-process path stay on the materializing
-    route, unchanged). A GPU-autobatch stage (`num_gpus > 0`, no `batch_size`) owns its
-    own dynamic batching via `InferencePool`, and an explicit `multiprocessing` stage runs
-    across processes — both keep the materializing path.
+    the device fed (the whole point). This includes the zero-config `num_gpus>0` stage with
+    no `batch_size`: streaming with a VRAM-safe default + OOM-halving beats materializing
+    the whole partition (the GPU would idle through the decode), so the overlap wins over
+    the autobatch path's dynamic sizing when there is an upstream CPU stage to overlap. A
+    single stage has nothing to overlap with (its intra-stage `num_workers` threading, the
+    auto-process path, and single-stage GPU autobatch stay on the materializing route,
+    unchanged). An explicit `multiprocessing` stage runs across processes — it stays too.
     """
     if len(stages) < 2 or not any(op.num_gpus > 0 for op in stages):
         return False
-    for op in stages:
-        if op.num_gpus > 0 and op.batch_size is None:
-            return False
-        if getattr(op, "multiprocessing", False):
-            return False
-    return True
+    return not any(getattr(op, "multiprocessing", False) for op in stages)
 
 
 def _stream_linear_chain(
@@ -176,7 +181,10 @@ def _apply_udf_stream(gen: Iterator[pa.RecordBatch], op: MapBatches) -> Iterator
     fn = build_udf_callable(op.fn)
     call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
     morsel = max(1, active_config().execution.morsel_rows)
-    target = op.batch_size if op.batch_size is not None else morsel
+    is_gpu = op.num_gpus > 0
+    # An explicit batch_size wins; a GPU stage without one gets the VRAM-safe inference
+    # default (not the whole morsel, which could OOM the device); a CPU stage keeps morsel.
+    target = op.batch_size or (_GPU_STREAM_BATCH_ROWS if is_gpu else morsel)
     workers = op.num_workers if isinstance(op.num_workers, int) and op.num_workers > 1 else 1
 
     def _subs(batch: pa.RecordBatch) -> list[pa.RecordBatch]:
@@ -184,11 +192,15 @@ def _apply_udf_stream(gen: Iterator[pa.RecordBatch], op: MapBatches) -> Iterator
             return pa.Table.from_batches([batch]).to_batches(max_chunksize=target)
         return [batch]
 
-    if workers <= 1:
+    # A GPU stage runs one CUDA context (num_workers=1) and survives a transient VRAM spike
+    # by halving the batch; a CPU stage may fan its sub-batches across a persistent pool.
+    if is_gpu or workers <= 1:
         for batch in gen:
             if batch.num_rows:
                 for sub in _subs(batch):
-                    yield from _coerce_udf_result(call(sub))
+                    yield from (
+                        _gpu_call_oom_safe(call, sub) if is_gpu else _coerce_udf_result(call(sub))
+                    )
         return
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for batch in gen:
@@ -196,6 +208,28 @@ def _apply_udf_stream(gen: Iterator[pa.RecordBatch], op: MapBatches) -> Iterator
                 continue
             for res in pool.map(call, _subs(batch)):
                 yield from _coerce_udf_result(res)
+
+
+def _gpu_call_oom_safe(call, sub: pa.RecordBatch) -> list[pa.RecordBatch]:
+    """Run a GPU stage call on `sub`, surviving a CUDA OOM by halving and retrying.
+
+    A too-large default batch (or a co-tenant VRAM spike) that OOMs at size N often fits at
+    N/2; the halves' per-row-independent inference outputs concatenate to the whole batch's
+    result, so this is result-invariant. Re-raises once a single row still OOMs (a genuine
+    over-allocation) or for any non-OOM error — the safety net that lets the zero-config
+    default batch size be aggressive without risking the job."""
+    from batcher.ml.inference import _empty_cuda_cache, _is_cuda_oom
+
+    try:
+        return _coerce_udf_result(call(sub))
+    except Exception as exc:
+        if not _is_cuda_oom(exc) or sub.num_rows <= 1:
+            raise
+        _empty_cuda_cache()
+        mid = sub.num_rows // 2
+        return _gpu_call_oom_safe(call, sub.slice(0, mid)) + _gpu_call_oom_safe(
+            call, sub.slice(mid)
+        )
 
 
 def _execute_node(node: LogicalPlan, sources: list) -> tuple[list[pa.RecordBatch], pa.Schema]:
