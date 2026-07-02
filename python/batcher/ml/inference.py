@@ -15,6 +15,7 @@ Python — so the control plane never touches a tuple in the hot path.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
@@ -45,14 +46,24 @@ def _is_cuda_oom(exc: BaseException) -> bool:
 
 
 def _empty_cuda_cache() -> None:
-    """Best-effort release of cached CUDA blocks so a halved retry has room to run."""
+    """Best-effort release of cached accelerator blocks so a halved retry has room to run.
+
+    Vendor-agnostic: NVIDIA/AMD share ``torch.cuda.empty_cache`` (ROCm shims the CUDA API),
+    Intel is ``torch.xpu``, Apple ``torch.mps`` — so the OOM-halving safety net works on any
+    accelerator, not just CUDA. A no-op where the backend or method is absent."""
     try:
         import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     except Exception:
-        pass
+        return
+    for name in ("cuda", "xpu", "mps"):
+        backend = getattr(torch, name, None)
+        empty = getattr(backend, "empty_cache", None)
+        if empty is None:
+            continue
+        with contextlib.suppress(Exception):
+            avail = getattr(backend, "is_available", None)
+            if name == "mps" or avail is None or avail():
+                empty()
 
 
 def _run_with_oom_retry(worker: Worker, batch: pa.RecordBatch) -> tuple[pa.RecordBatch, float]:
