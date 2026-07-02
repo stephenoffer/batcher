@@ -1002,8 +1002,21 @@ distributed) while Ray Data has no relational optimizer and its group-by shuffle
 path. Unlike GPU compute (bounded to parity by FLOPs), tabular feature engineering is where the
 native-engine advantage is largest — the fraud/risk workload's actual bottleneck.
 
-Known gap (documented, not hidden): the *enrich* shape — joining fact rows back to their
-per-account aggregate — has **no distributed route** yet. The Flight co-partition join can't take
-an aggregate as a build side (each mapper would compute a wrong per-partition aggregate); the
-correct fix is aggregate-then-broadcast, a follow-up `add-distributed-operator` task. The engine
-raises loudly rather than silently falling back to single-node (the invariant held).
+**Full enrich pipeline — Batcher 5.3× Ray Data.** The complete fraud batch path — per-account
+aggregate → **join the features back onto every transaction** → logistic risk score — now runs
+fully distributed (10M txns / 100k accounts), correctness-gated (per-row score agrees to
+3.3e-16):
+
+| engine | throughput | wall |
+|---|---|---|
+| **Batcher** (distributed aggregate → join → JIT score) | **3.8 M rows/s** | **2.6 s** |
+| Ray Data (`groupby().map_groups`, per-account Python) | 0.7 M rows/s | 14.0 s |
+
+The enrich shape was blocked (the distributed executor raised "no path for this plan shape") —
+diagnosed and **fixed** (`fix(dist): scope the no-path guard to sources the plan reads`). The
+adaptive loop already staged it correctly (aggregate → materialize → join → project); the bug
+was the trailing `project` over the in-memory intermediate being wrongly rejected because an
+*unused* splittable scan source was still ambient. Scoping the splittable check to the sources
+the plan actually reads fixed it — verified distributed == single-node exactly (max abs err 0.0).
+No new operator was needed; the invariant (raise loudly, never silent single-node fallback on
+real distributed data) still holds for genuinely-unsupported shapes.

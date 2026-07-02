@@ -1,20 +1,21 @@
-"""Batcher vs Ray Data — distributed fraud feature aggregation (tabular preprocessing).
+"""Batcher vs Ray Data — distributed fraud batch scoring (tabular feature engineering).
 
-The dominant cost of the fraud-detection batch path is **feature engineering**: per-account
-aggregations over transaction history (count/velocity, sum, mean, max) that become the model
-features. The optimization guides call this out as the big speedup lever ("feature
-preprocessing 10x").
+The full fraud-detection batch path: per-account **feature engineering** (aggregations over
+transaction history) → join the features back onto every transaction → a risk score → a
+decision. Feature preprocessing is the dominant cost and the piece the optimization guides
+call out as the big speedup lever ("feature preprocessing 10x").
 
-This is Batcher's *structural* home turf, not a physics race: the aggregation is
-**relational**, so Batcher runs it in the Rust engine as a mergeable group-by (partial per
-partition → Flight shuffle by key → combine) with JIT-compiled derived-feature expressions,
-while Ray Data runs its own `groupby().aggregate(...)`. Both read the same Parquet
-transaction shards distributed; the per-account mean must match before any timing.
+This is Batcher's *structural* home turf, not a physics race: the feature engineering and
+the enrich are **relational** — a mergeable group-by aggregate, a join back, and vectorized
+derived-column/score expressions — so Batcher runs the whole pipeline in the Rust engine
+(distributed aggregate over Flight → join → JIT-compiled score) while Ray Data has no
+relational optimizer and runs it as a per-account **Python** function (``groupby().
+map_groups``) over pandas. The score is a deterministic logistic so both engines must produce
+identical risk scores before any timing.
 
-Note: the *enrich* shape (join fact rows back to their per-account aggregate) is a known
-distributed gap — the Flight co-partition join can't take an aggregate build side (each
-mapper would compute a wrong per-partition aggregate); it needs aggregate-then-broadcast.
-This benchmark measures the aggregation itself, which is the supported, dominant-cost step.
+The enrich shape (join fact rows to their per-account aggregate) runs fully distributed via
+the adaptive aggregate → materialize → join → project staging (fixed 2026-07-02). Both read
+the same Parquet transaction shards distributed.
 
 Run:
     python benchmarks/cluster/fraud_scoring.py                 # 20M txns, 200k accounts
@@ -84,49 +85,51 @@ def _init() -> None:
         )
 
 
-def batcher_features(directory: str):
-    """Native distributed per-account risk features (a group-by aggregate in the Rust
-    engine, shuffled over Flight) plus a derived risk expression."""
+def _score_np(amt, avg, n):
+    """The shared logistic risk score — identical math in both engines (a stand-in for
+    the trained model; deterministic so decisions can be compared exactly)."""
+    z = _W_RATIO * (amt / avg) + _W_VELOCITY * n + _BIAS
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def batcher_pipeline(directory: str):
+    """The full fraud enrich pipeline, native in the Rust engine: distributed group-by
+    aggregate (per-account features) → join the aggregates back onto every fact row →
+    vectorized logistic risk score → decision. Enabled by the enrich-join distributed
+    route (aggregate → materialize → join → project); all stages run distributed."""
     import batcher as bt
     from batcher import col
 
-    stats = (
-        bt.read.parquet(directory)
-        .group_by("acct")
-        .agg(
-            n=col("amt").count(),
-            total=col("amt").sum(),
-            avg=col("amt").mean(),
-            mx=col("amt").max(),
-        )
-    )
-    # A derived risk feature over the aggregates (still native, vectorized).
-    return stats.with_columns(
-        risk=(_W_VELOCITY * col("n") + _W_RATIO * (col("mx") / col("avg")) + _BIAS)
-    )
+    ds = bt.read.parquet(directory)
+    stats = ds.group_by("acct").agg(avg=col("amt").mean(), n=col("amt").count())
+    joined = ds.join(stats, on="acct", how="inner")
+    z = _W_RATIO * (col("amt") / col("avg")) + _W_VELOCITY * col("n") + _BIAS
+    return joined.with_columns(score=(1.0 / (1.0 + (-z).exp()))).select("acct", "amt", "score")
 
 
-def ray_features(directory: str):
-    """Ray Data's native multi-aggregate over the same group-by (its optimized path)."""
+def _score_group(g):
+    """Ray Data's idiomatic per-account feature+score: a Python fn over one group (pandas)."""
+    amt = g["amt"].to_numpy()
+    score = _score_np(amt, amt.mean(), len(g))
+    return g.assign(score=score)[["acct", "amt", "score"]]
+
+
+def ray_dataset(directory: str):
     import ray.data as rd
-    from ray.data.aggregate import Count, Max, Mean, Sum
 
-    ds = (
-        rd.read_parquet(directory)
-        .groupby("acct")
-        .aggregate(Count(), Sum("amt"), Mean("amt"), Max("amt"))
+    return (
+        rd.read_parquet(directory).groupby("acct").map_groups(_score_group, batch_format="pandas")
     )
-    return ds
 
 
 def _ray_table(directory: str) -> pa.Table:
-    return pa.concat_tables(list(ray_features(directory).iter_batches(batch_format="pyarrow")))
+    return pa.concat_tables(list(ray_dataset(directory).iter_batches(batch_format="pyarrow")))
 
 
-def _acct_avg(tbl: pa.Table, avg_col: str) -> dict:
-    """A acct -> mean(amt) map for order-independent correctness comparison."""
+def _key_scores(tbl: pa.Table) -> dict:
+    """A (acct, amt-rounded) -> score map for order-independent correctness comparison."""
     d = tbl.to_pydict()
-    return dict(zip(d["acct"], d[avg_col], strict=True))
+    return {(a, round(m, 2)): s for a, m, s in zip(d["acct"], d["amt"], d["score"], strict=True)}
 
 
 def main() -> int:
@@ -135,28 +138,25 @@ def main() -> int:
     directory = write_shards(cfg["dir"], cfg["n"], cfg["accounts"], cfg["shards"])
     print(f"txns={cfg['n']}  accounts={cfg['accounts']}  shards={cfg['shards']}\n")
 
-    # Correctness: per-account mean amount must match between engines on a sample.
+    # Correctness: per-row risk scores must match between engines on a sample.
     sample_dir = write_shards(cfg["dir"] + "_s", 20000, 2000, 4)
-    bs = _acct_avg(batcher_features(sample_dir).collect(), "avg")
-    r_tbl = _ray_table(sample_dir)
-    # Ray names the mean column "mean(amt)".
-    mean_col = next(c for c in r_tbl.column_names if "mean" in c.lower())
-    rs = _acct_avg(r_tbl, mean_col)
+    bs = _key_scores(batcher_pipeline(sample_dir).collect())
+    rs = _key_scores(_ray_table(sample_dir))
     common = set(bs) & set(rs)
     if not common:
-        print("FAIL: no comparable accounts")
+        print("FAIL: no comparable rows")
         return 1
     max_err = max(abs(bs[k] - rs[k]) for k in common)
-    print(f"per-account mean agreement on {len(common)} accounts: max abs err {max_err:.2e}")
+    print(f"per-row score agreement on {len(common)} rows: max abs err {max_err:.2e}")
     if max_err > 1e-6:
-        print("FAIL: aggregates diverge — not timing")
+        print("FAIL: scores diverge — not timing")
         return 1
 
     def batcher_run():
-        return batcher_features(directory).collect()
+        return batcher_pipeline(directory).collect()
 
     def ray_run():
-        return ray_features(directory).materialize()
+        return ray_dataset(directory).materialize()
 
     res = {}
     for name, fn in (("batcher", batcher_run), ("ray", ray_run)):
@@ -170,7 +170,7 @@ def main() -> int:
         print(f"{name:<8} {cfg['n'] / best / 1e6:6.1f} M rows/s  ({best * 1000:.0f} ms)")
 
     ratio = res["ray"] / res["batcher"]
-    print(f"\nfraud feature aggregation (per-account risk features): batcher {ratio:.2f}x Ray Data")
+    print(f"\nfraud enrich pipeline (features + join + score): batcher {ratio:.2f}x Ray Data")
     return 0
 
 
