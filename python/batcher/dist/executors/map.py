@@ -18,6 +18,7 @@ Two scheduling shapes:
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import contextvars
 import os
@@ -39,7 +40,7 @@ _MIN_TASK_CPU = max(0.01, float(os.environ.get("BATCHER_MIN_TASK_CPU", "0.125"))
 # plan-level compute-skew factor (data skew is handled per-partition by `descriptor_rows`).
 _MAP_COMPUTE_WEIGHT = max(1.0, float(os.environ.get("BATCHER_MAP_COMPUTE_WEIGHT", "4.0")))
 
-__all__ = ["resident_inference_pools", "stream_distributed_map"]
+__all__ = ["release_inference_pools", "resident_inference_pools", "stream_distributed_map"]
 
 # A query-lifetime registry of inference actor pools, keyed by pipeline signature, so a
 # `map_batches`/inference pipeline's model loads ONCE per query and is reused across
@@ -50,6 +51,30 @@ __all__ = ["resident_inference_pools", "stream_distributed_map"]
 _INFERENCE_POOLS: contextvars.ContextVar[dict[tuple, list] | None] = contextvars.ContextVar(
     "batcher_inference_pools", default=None
 )
+
+# A SESSION-lifetime registry (module-global, not scoped) of warm inference pools, used
+# when `distributed.warm_inference_pools` is on and no `resident_inference_pools()` scope is
+# active. Keyed by pipeline signature so the same model loads once per session and is reused
+# across every `collect()` — the long-lived-actor win (Ray Data respawns the pool per
+# execution, paying the ~20x-first-batch cold start each time). Torn down at process exit or
+# by `release_inference_pools()`; a pool whose actors died is rebuilt on next use.
+_SESSION_POOLS: dict[tuple, list] = {}
+
+
+def release_inference_pools() -> None:
+    """Tear down all session-warm inference actor pools and free their GPUs.
+
+    Warm pools (``distributed.warm_inference_pools``, on by default) keep a model's actors
+    alive across ``collect()`` calls so it loads once per session. Call this to release those
+    GPUs before other GPU work, or when done with inference; it also runs automatically at
+    process exit. A no-op when no pools are warm. The next inference `collect()` rebuilds the
+    pool (paying the one-time load again)."""
+    _shutdown_pools(_SESSION_POOLS)
+
+
+# Free any session-warm GPU actors at process exit so a finished batch job never leaves GPUs
+# held on the cluster (best-effort — Ray may already be shutting down).
+atexit.register(release_inference_pools)
 
 
 @contextlib.contextmanager
@@ -99,31 +124,77 @@ def _new_map_actor(plan0: LogicalPlan, opts: dict):
     return cls.remote(plan0)
 
 
-def _resident_pool_for(plan0: LogicalPlan, opts: dict, size: int) -> list:
-    """The resident actor pool for `plan0` (built once on first use, reused after).
+def _resident_pool_for(plan0: LogicalPlan, opts: dict, size: int, registry: dict) -> list:
+    """The resident actor pool for `plan0` in `registry` (built once, reused after).
 
-    Caller guarantees a `resident_inference_pools()` scope is active. The model is built
-    in each actor's `__init__`, so reuse means it loads once per query, not per stage."""
-    registry = _INFERENCE_POOLS.get()
+    The model is built in each actor's `__init__`, so reuse means it loads once per
+    registry lifetime (a query scope, or the whole session for the warm registry). A pool
+    whose actors have died (preemption between reuses) is healed — dead actors are dropped
+    and respawned to the requested size — so a session-warm pool survives node churn."""
     sig = _pipeline_signature(plan0)
     pool = registry.get(sig)
-    if pool is None:
-        pool = [_new_map_actor(plan0, opts) for _ in range(max(1, size))]
-        registry[sig] = pool
+    pool = _healthy_actors(pool) if pool else []
+    if len(pool) < max(1, size):
+        pool = pool + [_new_map_actor(plan0, opts) for _ in range(max(1, size) - len(pool))]
+    registry[sig] = pool
     return pool
 
 
-def _run_resident_pool(plan0, partitions, opts, size):
-    """Map `partitions` through the query-resident pool for `plan0` (model loaded once),
-    preserving submission order. Returns ``(ordered_results, peak_gpu_util)``."""
+def _healthy_actors(pool: list) -> list:
+    """Drop actors that are no longer alive (a cheap liveness ping), keeping the survivors —
+    so a warm pool reused after a preemption doesn't dispatch to a dead actor."""
+    import ray
+
+    alive = []
+    probes = {a: a.gpu_stats.remote() for a in pool}
+    for actor, ref in probes.items():
+        try:
+            ray.get(ref, timeout=10)
+            alive.append(actor)
+        except Exception:  # dead / unreachable — drop it (a replacement is spawned to size)
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+    return alive
+
+
+def _run_resident_pool(plan0, partitions, opts, size, registry):
+    """Map `partitions` through the resident pool for `plan0` in `registry` (model loaded
+    once), preserving submission order. Returns ``(ordered_results, peak_gpu_util)``."""
     import ray
     from ray.util.actor_pool import ActorPool
 
-    actors = _resident_pool_for(plan0, opts, size)
+    actors = _resident_pool_for(plan0, opts, size, registry)
     pool = ActorPool(actors)
     results = list(pool.map(lambda actor, part: actor.run.remote(part), list(partitions)))
     samples = [s for s in ray.get([a.gpu_stats.remote() for a in actors]) if s is not None]
     return results, (max(samples) if samples else None)
+
+
+def _run_warm_pool(plan0, partitions, opts, lo, hi):
+    """Run `partitions` through the SESSION-warm pool for `plan0`, healing a lost pool.
+
+    On the rare case the warm pool loses actors mid-run (a node preempted after the liveness
+    check), it evicts the pool and re-runs on a fresh recovering per-call pool, so a warm
+    pool never turns a preemption into a failed query. The next inference call rebuilds the
+    warm pool. Returns ``(ordered_results, peak_gpu_util)``."""
+    from ray.exceptions import RayError
+
+    from batcher.dist.executors.ray_runtime import recovery_policy
+
+    try:
+        return _run_resident_pool(plan0, partitions, opts, hi, _SESSION_POOLS)
+    except RayError:
+        _evict_session_pool(plan0)
+        return _drive_actor_pool(plan0, partitions, opts, lo, hi, recovery_policy())
+
+
+def _evict_session_pool(plan0) -> None:
+    """Drop (and kill) the session-warm pool for `plan0` — after a preemption or on demand."""
+    import ray
+
+    for actor in _SESSION_POOLS.pop(_pipeline_signature(plan0), []):
+        with contextlib.suppress(Exception):
+            ray.kill(actor)
 
 
 def _map_resources(plan: LogicalPlan) -> tuple[float, bool, object, str | None]:
@@ -224,11 +295,19 @@ def _distributed_map(
                 num_gpus, workers, len(partitions), accelerator_type
             )
             lo = hi = _resolve_pool_size(concurrency, len(partitions), default_pool)
-        # A query-resident pool (model loaded once, reused across stages) when a
-        # `resident_inference_pools()` scope is active; otherwise the per-call pool with
-        # autoscaling + preemption recovery.
-        if _INFERENCE_POOLS.get() is not None:
-            results, gpu_util = _run_resident_pool(plan0, partitions, opts, hi)
+        # Pick the pool lifetime: an explicit `resident_inference_pools()` scope (query
+        # lifetime) wins; else the SESSION-warm registry when `warm_inference_pools` is on
+        # (model loads once per session, reused across `collect()`s — the 2x win on repeated
+        # / iterative / cold-start-bound inference); else the per-call pool with autoscaling +
+        # preemption recovery (spawned and killed each call, the historical default).
+        from batcher.config import active_config
+
+        scope = _INFERENCE_POOLS.get()
+        warm = active_config().distributed.warm_inference_pools
+        if scope is not None:
+            results, gpu_util = _run_resident_pool(plan0, partitions, opts, hi, scope)
+        elif warm:
+            results, gpu_util = _run_warm_pool(plan0, partitions, opts, lo, hi)
         else:
             results, gpu_util = _drive_actor_pool(
                 plan0, partitions, opts, lo, hi, recovery_policy()

@@ -76,3 +76,41 @@ def test_invalid_concurrency_rejected(bad):
     ds = bt.from_pydict({"x": [1, 2, 3]})
     with pytest.raises(PlanError, match="concurrency"):
         ds.ml.map_batches(lambda b: b, concurrency=bad)
+
+
+def test_warm_inference_pools_default_on():
+    from batcher.config import active_config
+
+    assert active_config().distributed.warm_inference_pools is True
+
+
+def test_pipeline_signature_distinguishes_models():
+    from batcher.dist.executors.map import _pipeline_signature
+    from batcher.plan.logical import MapBatches, Scan
+    from batcher.plan.schema import SchemaRef
+
+    scan = Scan(
+        0,
+        SchemaRef.from_arrow(__import__("pyarrow").schema([("x", __import__("pyarrow").int64())])),
+    )
+
+    def model_a(b):
+        return b
+
+    def model_b(b):
+        return b
+
+    p_a = MapBatches(input=scan, fn=model_a, output_columns=["x"])
+    p_a2 = MapBatches(input=scan, fn=model_a, output_columns=["x"])
+    p_b = MapBatches(input=scan, fn=model_b, output_columns=["x"])
+    # same fn identity -> same signature (reuse the warm pool); different fn -> different.
+    assert _pipeline_signature(p_a) == _pipeline_signature(p_a2)
+    assert _pipeline_signature(p_a) != _pipeline_signature(p_b)
+
+
+def test_release_inference_pools_clears_registry():
+    from batcher.dist.executors import map as m
+
+    m._SESSION_POOLS[("sig",)] = []  # no live actors -> shutdown is a no-op kill loop
+    m.release_inference_pools()
+    assert m._SESSION_POOLS == {}

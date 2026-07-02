@@ -678,6 +678,16 @@ class DistributedConfig:
     # embarrassingly parallel exactly as before, so single-node==distributed stays
     # bit-identical. Result is unchanged either way — only the scheduling overlaps.
     stream_inference: bool = False
+    # Keep GPU / load-once inference actor pools WARM across `collect()` calls in a session,
+    # keyed by pipeline identity (the model's `map_batches` fn). The model then loads ONCE
+    # per session and is reused, instead of every distributed-map call paying the actor spawn
+    # + CUDA-context init + model load again (~5 s on 8 GPUs, and the guides' "actors are
+    # ~20x slower on the first batch"). The analog of `reuse_session_fleet` for the inference
+    # plane — the long-lived-actor win Ray Data leaves on the table (it respawns the pool per
+    # execution). Pools are torn down at process exit or by `release_inference_pools()`; a
+    # pool whose actors died (preemption) is transparently respawned on next use. On by
+    # default; result-identical (same model, same per-batch contract).
+    warm_inference_pools: bool = True
     # Named fault-tolerance profile. ``"default"`` keeps the conservative budgets above
     # (tuned for a stable on-demand cluster — minimal retries, no keepalive, no
     # straggler speculation). ``"spot"`` hardens them as a bundle for a churning
