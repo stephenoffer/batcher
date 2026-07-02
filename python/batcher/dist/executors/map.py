@@ -339,7 +339,14 @@ def _distributed_map(
     for r in results:
         if r:
             batches.extend(r)
-    return pa.Table.from_batches(batches) if batches else pa.table({})
+    if not batches:
+        return pa.table({})
+    # Reconcile a UDF whose output schema drifts across partitions (e.g. one partition's
+    # rows carry extra fields) to one union schema, so the gather concatenates instead of
+    # failing — the same schema-drift tolerance the single-node path gives.
+    from batcher.io.schema.evolution import reconcile_batches
+
+    return pa.Table.from_batches(reconcile_batches(batches))
 
 
 def _spread_options() -> dict:

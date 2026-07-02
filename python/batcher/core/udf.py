@@ -21,6 +21,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher.config import active_config
+from batcher.io.schema.evolution import reconcile_batches
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 from batcher.plan.schema import SchemaRef
 from batcher.plan.visitor import children, with_children
@@ -148,7 +149,10 @@ def _execute_node(node: LogicalPlan, sources: list) -> tuple[list[pa.RecordBatch
         return batches, (batches[0].schema if batches else node.schema.arrow)
     if isinstance(node, MapBatches):
         inputs, in_schema = _execute_node(node.input, sources)
-        out = _apply_udf(inputs, node)
+        # Reconcile a UDF whose output schema drifts across batches (e.g. LLM structured
+        # outputs with varying fields) to one union schema, so the stage's batches concat
+        # instead of failing — the schema-inference footgun Ray Data hits.
+        out = reconcile_batches(_apply_udf(inputs, node))
         # On empty input the UDF isn't called; assume a pass-through schema.
         return out, (out[0].schema if out else in_schema)
     # Any other relational operator: materialize each child, then run this single

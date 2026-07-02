@@ -171,3 +171,21 @@ def test_max_errored_rows_budget_exhausted_raises():
         bt.from_arrow(t).map_batches(
             _flaky, output_columns=["x", "y"], batch_format="numpy", max_errored_rows=5
         ).collect()
+
+
+def test_map_batches_output_schema_drift_reconciles():
+    """A UDF whose output schema DRIFTS across batches — later batches carry an extra
+    field (the LLM-structured-output shape) — reconciles to one union schema instead of
+    failing at the concat, the schema-inference footgun Ray Data hits."""
+
+    def drift(batch: pa.RecordBatch) -> dict:
+        n = batch.num_rows
+        if batch.column("x")[0].as_py() < 3:
+            return {"a": [10] * n}
+        return {"a": [10] * n, "b": [20] * n}
+
+    out = bt.from_pydict({"x": list(range(6))}).map_batches(drift, batch_size=2).collect()
+    assert out.column_names == ["a", "b"]
+    assert out.column("a").to_pylist() == [10] * 6
+    # early batches (x < 3) had no "b" -> filled with null; later batches carry 20.
+    assert out.column("b").to_pylist() == [None, None, None, None, 20, 20]

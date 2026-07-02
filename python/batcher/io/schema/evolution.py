@@ -21,7 +21,13 @@ import pyarrow as pa
 from batcher._internal.errors import SchemaError
 from batcher.plan.types import promote
 
-__all__ = ["SchemaDrift", "normalize_batch", "schema_drift", "unify_schemas"]
+__all__ = [
+    "SchemaDrift",
+    "normalize_batch",
+    "reconcile_batches",
+    "schema_drift",
+    "unify_schemas",
+]
 
 
 def _promote(a: pa.DataType, b: pa.DataType, *, column: str) -> pa.DataType:
@@ -76,6 +82,25 @@ def unify_schemas(schemas: list[pa.Schema], mode: str = "union") -> pa.Schema:
                 _promote(fields[f.name], f.type, column=f.name) if f.name in fields else f.type
             )
     return pa.schema([pa.field(name, t) for name, t in fields.items()])
+
+
+def reconcile_batches(batches: list[pa.RecordBatch]) -> list[pa.RecordBatch]:
+    """Reconcile a list of batches with possibly-differing schemas to one union schema.
+
+    A no-op (fast path) when every batch already shares the first's schema. Otherwise the
+    columns are unioned (missing columns become typed nulls, promotable types widened) so the
+    batches can be concatenated, iterated, or written as one table. This is what lets a
+    `map_batches` UDF whose output schema DRIFTS across batches — e.g. LLM structured outputs
+    where later batches carry extra fields — succeed instead of failing at the concat, the
+    schema-inference footgun Ray Data hits (it infers from the first batch and the merge
+    fails). Vectorized Arrow kernels only; never iterates rows."""
+    if len(batches) <= 1:
+        return batches
+    first = batches[0].schema
+    if all(b.schema.equals(first) for b in batches[1:]):
+        return batches
+    target = unify_schemas([b.schema for b in batches], mode="union")
+    return [normalize_batch(b, target) for b in batches]
 
 
 def normalize_batch(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
