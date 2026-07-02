@@ -217,8 +217,21 @@ def _apply_udf_stream(gen: Iterator[pa.RecordBatch], op: MapBatches) -> Iterator
             return pa.Table.from_batches([batch]).to_batches(max_chunksize=t)
         return [batch]
 
+    def _parallel_units(batch: pa.RecordBatch) -> list[pa.RecordBatch]:
+        """Sub-batches to run in parallel for a CPU stage: the `batch_size` chunks if that
+        already yields ``>= workers`` of them, else the morsel split into `workers` even
+        slices — so a decode/preprocess stage with no `batch_size` still uses every spare
+        core to stay ahead of a fast GPU stage (the guides' CPU:GPU-ratio feeding)."""
+        subs = _subs(batch)
+        if len(subs) >= workers or batch.num_rows < workers:
+            return subs
+        step = -(-batch.num_rows // workers)  # ceil, so exactly <= workers slices
+        return [
+            batch.slice(i, min(step, batch.num_rows - i)) for i in range(0, batch.num_rows, step)
+        ]
+
     # A GPU stage runs one CUDA context (num_workers=1) and survives a transient VRAM spike
-    # by halving the batch; a CPU stage may fan its sub-batches across a persistent pool.
+    # by halving the batch; a CPU stage fans its morsel across a persistent pool of cores.
     if is_gpu or workers <= 1:
         for batch in gen:
             if batch.num_rows:
@@ -231,7 +244,7 @@ def _apply_udf_stream(gen: Iterator[pa.RecordBatch], op: MapBatches) -> Iterator
         for batch in gen:
             if not batch.num_rows:
                 continue
-            for res in pool.map(call, _subs(batch)):
+            for res in pool.map(call, _parallel_units(batch)):
                 yield from _coerce_udf_result(res)
 
 

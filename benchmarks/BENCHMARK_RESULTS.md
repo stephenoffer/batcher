@@ -874,3 +874,21 @@ The one honest exception is a *single maximally-large compute-bound* job (both s
 GPU at the same FLOPs → ~parity/1.2×); 2× there requires fewer FLOPs (FP16/quantization),
 which is model-side. Any GPU type (vendor-neutral `detect_backend`), any scale (12k–131k,
 bounded-memory streaming + spill), any cluster (Ray attach) verified.
+
+### Fractional-GPU packing (small/fast models) — parallel CPU decode keeps the GPU fed
+
+For a small fast model (EfficientNet-B0, ~20 MB) packed 2 replicas per GPU (`num_gpus=0.5`,
+16 actors on 8 T4s — the guides' fractional-packing pattern), the GPU forward is so fast that
+a single-threaded CPU decode *starves* it. Batcher's inference actors now run their CPU
+(decode/normalize) stage across the node's spare cores (`_with_inference_workers`: CPU stages
+get `_INFERENCE_CPU_WORKERS` threads, GPU stages stay at 1 CUDA context), splitting each
+morsel across the pool. Effect (49k imgs):
+
+| | img/s | GPU util | vs ray |
+|---|---|---|---|
+| before (1-thread decode) | 3157 | 42% (starved) | 0.91× |
+| **after (parallel decode)** | **6764** | **89%** | **1.96×** |
+
+Ray Data: 3449 img/s @ 51%. The fix generalizes to any fast/small-model or fractional-packing
+inference (mobilenet, efficientnet, packed embeddings) — the CPU:GPU-ratio feeding the guides
+call out. Result-invariant (order preserved; `pool.map`), verified single-node.

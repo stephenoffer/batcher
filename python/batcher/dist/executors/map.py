@@ -638,7 +638,7 @@ class _MapActor:
         # Build the (class) UDFs locally, once — the model load happens here. The pool's
         # size is the parallelism, so each actor runs its UDF serially (workers=1) rather
         # than spawning a full-width intra-actor pool that would oversubscribe the node.
-        self._plan = _with_map_workers(_prebuild_factories(plan0), 1)
+        self._plan = _with_inference_workers(_prebuild_factories(plan0))
         self._gpu_util_max: float | None = None
 
     def run(self, partition: dict):
@@ -685,6 +685,33 @@ class _MapActor:
     def gpu_stats(self) -> float | None:
         """The peak GPU utilization this actor observed, or `None` if no GPU."""
         return self._gpu_util_max
+
+
+# Threads a CPU (preprocess/decode) stage runs inside a GPU inference actor, so it keeps a
+# fast GPU stage fed (the guides' 2-4:1 CPU:GPU ratio). GPU stages always stay at 1 (one CUDA
+# context). Modest so several fractional-GPU actors per node don't grossly oversubscribe the
+# cores; a decode/normalize `fn` releases the GIL (PIL/cv2/NumPy/torch) so threads scale.
+_INFERENCE_CPU_WORKERS = max(1, int(os.environ.get("BATCHER_INFERENCE_CPU_WORKERS", "4")))
+
+
+def _with_inference_workers(plan):
+    """Set each map stage's `num_workers` for a GPU inference actor: a GPU stage keeps 1 (one
+    CUDA context), a CPU stage gets `_INFERENCE_CPU_WORKERS` so its decode/preprocess fans
+    across the node's spare cores and stays ahead of the GPU stage — the fix for a fast/small
+    model whose single-threaded decode would otherwise starve the device (util < 50%)."""
+    import dataclasses
+
+    from batcher.plan.logical import MapBatches
+    from batcher.plan.visitor import children, with_children
+
+    if isinstance(plan, MapBatches):
+        plan = dataclasses.replace(
+            plan, num_workers=1 if plan.num_gpus > 0 else _INFERENCE_CPU_WORKERS
+        )
+    kids = children(plan)
+    if kids:
+        return with_children(plan, [_with_inference_workers(c) for c in kids])
+    return plan
 
 
 def _with_map_workers(plan, n: int):
