@@ -1020,3 +1020,25 @@ was the trailing `project` over the in-memory intermediate being wrongly rejecte
 the plan actually reads fixed it — verified distributed == single-node exactly (max abs err 0.0).
 No new operator was needed; the invariant (raise loudly, never silent single-node fallback on
 real distributed data) still holds for genuinely-unsupported shapes.
+
+## Managed `ds.ml.infer` path — model loads once + GPU saturated (2026-07-02)
+
+The one-liner convenience path `ds.ml.infer("<hf-model-id>", column=...)` had two GPU-idling
+bugs, both now fixed (`benchmarks/cluster/robustness/gpu_autofp16.py`, distilbert-sst2 on a T4):
+
+| stage | warm collect, 4096 rows | throughput | fix |
+|---|---|---|---|
+| before | ~9.0 s | ~450 rows/s | — |
+| + memoize encoder (warm-pool reuse) | ~9.0 s | ~450 rows/s | model loads once/session, not per `collect()` |
+| + batch the HF pipeline | **~1.03 s** | **~3960 rows/s** | `batch_size=len(inputs)` (HF defaults to 1 → one forward pass per row) |
+
+**~8.7× on the warm path**, output bit-identical (labels match). Two footguns closed: (1) a
+warm-pool key tied to `id(fn)` needs the generated encoder class to be *stable* across calls
+(memoized per model/column/task); (2) a HuggingFace pipeline defaults to `batch_size=1`, which
+silently starves the GPU — always pass an explicit batch size.
+
+With the path now warm + batched, the auto-FP16 lever is finally measurable compute-bound
+(both precisions batched, 16384 rows, agreement 0.9999): **FP16 1.70× FP32** — the realistic T4
+half-precision gain (near the 2× ceiling; larger models / longer sequences push closer). Earlier
+measurements of 0.63× (setup-bound) and 10.5× (unbatched FP32 baseline) were both confounded;
+1.70× is the honest, isolated dtype number.
