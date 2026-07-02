@@ -852,11 +852,17 @@ device="cpu" to isolate the loader from the identical H2D):
 
 | engine | rows/s | correctness |
 |---|---|---|
-| **batcher** | **2,354,502** | rows + checksum match |
-| ray data | 283,214 | rows + checksum match |
+| **batcher** | **1,058,203** | feat tensor + label, checksum match |
+| ray data | 281,141 | feat tensor + label, checksum match |
 
-**batcher vs ray: 8.3×** — the loader is not the bottleneck (it can feed a GPU training loop
-far above the model's consumption rate), where Ray Data's conversion overhead makes it one.
+**batcher vs ray: 3.01×** (no shuffle) — the zero-copy DLPack loader feeds a GPU training loop
+far above the model's consumption rate. With a per-epoch local shuffle it is memory-bound
+(gathering the wide feature column), so both engines hit ~315k rows/s = **parity** (0.99×).
+
+_(Correction: an earlier draft reported 8.3× here; that was unfair — Batcher's loader was
+silently dropping the `FixedSizeList` feature column while Ray tensorized it. Fixed: the
+feature/embedding vector now tensorizes as a `(n, width)` tensor in both, and the numbers
+above are the corrected, apples-to-apples result.)_
 
 ## Summary — Batcher vs Ray Data across GPU workload families (8×T4)
 
@@ -940,7 +946,7 @@ workers also churned/died under repeated respawn; Batcher's warm pool stayed sta
 | audio feature extraction | **12.5×** | torchaudio mel + ResNet-18 |
 | LLM batch inference | **11.1×** | HF gpt2 |
 | image generation (diffusion) | **8.6×** | diffusers ddpm-cifar10 |
-| training-data ingest | **8.3×** | iter_torch_batches (DLPack) |
+| training-data ingest (no shuffle) | **3.0×** | iter_torch_batches (DLPack) |
 | video-clip inference | **3.6×** | ResNet-18 per frame |
 | batch inference | **2.05×** | ResNet-50 |
 | batch embeddings (image) | **1.98×** | ResNet-50 features |

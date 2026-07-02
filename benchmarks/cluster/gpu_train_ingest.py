@@ -33,6 +33,9 @@ def _cfg() -> dict:
         "dim": int(os.environ.get("BENCH_INGEST_DIM", "1024")),
         "batch": int(os.environ.get("BENCH_INGEST_BATCH", "256")),
         "prefetch": int(os.environ.get("BENCH_INGEST_PREFETCH", "2")),
+        # Training shuffle: 0 = none; >0 = a per-epoch local-shuffle buffer of that many rows
+        # (the guides' cheap block-order + local buffer, vs a global random_shuffle O(n) OOM).
+        "shuffle": int(os.environ.get("BENCH_INGEST_SHUFFLE", "0")),
         "runs": int(os.environ.get("BENCH_RUNS", "3")),
     }
 
@@ -54,10 +57,15 @@ def batcher_iter(table: pa.Table, cfg: dict):
 
     ds = bt.from_arrow(table)
 
+    shuf = cfg["shuffle"] or None
+
     def run():
         seen, checksum = 0, 0.0
         for b in ds.ml.iter_torch_batches(
-            batch_size=cfg["batch"], prefetch_batches=cfg["prefetch"], device="cpu"
+            batch_size=cfg["batch"],
+            prefetch_batches=cfg["prefetch"],
+            device="cpu",
+            local_shuffle_buffer_size=shuf,
         ):
             seen += int(b["label"].shape[0])
             checksum += float(b["label"].sum().item())
@@ -70,10 +78,15 @@ def ray_iter(table: pa.Table, cfg: dict):
     import ray.data as rd
 
     ds = rd.from_arrow(table)
+    shuf = cfg["shuffle"] or None
 
     def run():
         seen, checksum = 0, 0.0
-        for b in ds.iter_torch_batches(batch_size=cfg["batch"], prefetch_batches=cfg["prefetch"]):
+        for b in ds.iter_torch_batches(
+            batch_size=cfg["batch"],
+            prefetch_batches=cfg["prefetch"],
+            local_shuffle_buffer_size=shuf,
+        ):
             seen += int(b["label"].shape[0])
             checksum += float(b["label"].sum().item())
         return {"rows": seen, "checksum": round(checksum, 1)}
