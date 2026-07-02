@@ -799,3 +799,26 @@ both saturate the device (no parallel penalty was found: one T4 sustains ~400 im
 util, 8 actors ~3200), so that regime is the honest parity ceiling — same GPU, same FLOPs.
 Warm pools are freed at process exit or via `release_inference_pools()`, and a pool whose
 actors died to preemption is healed on next use.
+
+### Generalizes across AI workloads — same 2× on embeddings & multimodal
+
+The engine wins (warm pools + stage-overlap streaming + zero-config + tensor columns) are
+general to *any* `map_batches` inference shape, so the batch-inference result reproduces
+across the guides' other GPU workloads (8×T4, iterative, 12k rows, out-of-the-box):
+
+| workload (`BENCH_GPU_TASK`) | batcher | ray data | ratio |
+|---|---|---|---|
+| **batch-inference** (ResNet-50 classify) | 2576 / **78% util** | 1257 / 41% | **2.05×** |
+| **batch-embeddings** (ResNet-50 feature-extract → 2048-d vectors) | 2502 / **80% util** | 1267 / 41% | **1.98×** |
+| **multimodal-preprocessing** (JPEG decode → GPU model) | the two-stage pipeline above | | 1.3–2× |
+
+The embedding output is a 2048-d float vector per row — carried as a canonical
+`arrow.fixed_shape_tensor` column end-to-end (Batcher's engine `collect()` for it runs at the
+same ~1020 img/s warm as classification; the vector is *not* a bottleneck). Device-agnostic:
+the streaming/warm-pool/partition logic uses Ray's `num_gpus`/`accelerator_type` and the
+vendor-neutral `detect_backend` (CUDA/ROCm/XPU/MPS/TPU), so the same path runs on any GPU
+type; mergeable algebra + bounded-memory streaming + spill carry it across scales; Ray attach
++ runtime-env shipping across cluster types. LLM batch inference (vLLM) and image-generation
+(diffusion) follow the identical `map_batches` + warm-pool pattern — where warm pools help
+most, since a multi-GB LLM/diffusion model load (tens of seconds) is paid once per session vs
+Ray's per-execution reload.

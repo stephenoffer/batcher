@@ -111,18 +111,27 @@ def decode_batch(batch) -> dict:
 # --------------------------------------------------------------------------- #
 class GPUModel:
     """GPU stage: consumes a numpy batch ``{"id", "chw"}`` (chw = (B,3,224,224) uint8),
-    normalizes on device, runs the model, returns ``{"id", "pred"}``."""
+    normalizes on device, runs the model. Two tasks (``BENCH_GPU_TASK``):
+
+    * ``classify`` (default) — argmax class, returns ``{"id", "pred"}`` (int).
+    * ``embed`` — the batch-embeddings / feature-extraction workload: strip the classifier
+      head (``fc = Identity``) → a 2048-d float **embedding vector per row**, returns
+      ``{"id", "embed"}`` (a multi-dim tensor column — the Ray Data tensor-block shape).
+    """
 
     def __init__(self) -> None:
         import torch
         import torchvision
 
         name = os.environ.get("BENCH_GPU_MODEL", "resnet50")
+        self._task = os.environ.get("BENCH_GPU_TASK", "classify")
         torch.manual_seed(_SEED)
         self._dev = "cuda" if torch.cuda.is_available() else "cpu"
         if self._dev == "cuda":
             torch.set_float32_matmul_precision("high")
         self._m = getattr(torchvision.models, name)(weights=None).to(self._dev).eval()
+        if self._task == "embed":
+            self._m.fc = torch.nn.Identity()  # feature extractor → embedding vectors
         self._mean = torch.tensor(_MEAN, device=self._dev).view(1, 3, 1, 1)
         self._std = torch.tensor(_STD, device=self._dev).view(1, 3, 1, 1)
 
@@ -131,15 +140,21 @@ class GPUModel:
 
         chw = np.ascontiguousarray(batch["chw"]).reshape(-1, 3, _HW, _HW)
         x = torch.from_numpy(chw).to(self._dev, non_blocking=True)
+        ids = np.asarray(batch["id"])
         with torch.inference_mode():
             xf = x.float().div_(255.0).sub_(self._mean).div_(self._std)  # normalize on GPU
-            pred = self._m(xf).argmax(1).to("cpu").numpy()
-        return {"id": np.asarray(batch["id"]), "pred": pred}
+            out = self._m(xf)
+            if self._task == "embed":
+                return {"id": ids, "embed": out.to("cpu").numpy().astype(np.float32)}
+            return {"id": ids, "pred": out.argmax(1).to("cpu").numpy()}
 
 
 # --------------------------------------------------------------------------- #
 # Engine pipelines
 # --------------------------------------------------------------------------- #
+_OUT_COL = "embed" if os.environ.get("BENCH_GPU_TASK") == "embed" else "pred"
+
+
 def batcher_thunk(cfg: dict):
     import batcher as bt
 
@@ -149,7 +164,7 @@ def batcher_thunk(cfg: dict):
         .map_batches(decode_batch, output_columns=["id", "chw"], batch_format="pyarrow")
         .map_batches(
             GPUModel,
-            output_columns=["id", "pred"],
+            output_columns=["id", _OUT_COL],
             batch_format="numpy",
             num_gpus=cfg["num_gpus"],
             concurrency=conc,
@@ -176,7 +191,7 @@ def ray_thunk(cfg: dict):
             self._m = GPUModel()
 
         def __call__(self, b):
-            return self._m(b) if len(b["id"]) else {"id": [], "pred": []}
+            return self._m(b) if len(b["id"]) else {"id": [], _OUT_COL: []}
 
     ds = (
         rd.read_parquet(cfg["dir"])
@@ -208,14 +223,35 @@ def _auto_gpu_actors(num_gpus: float) -> int:
 # Correctness + timing
 # --------------------------------------------------------------------------- #
 def _sig(tbl: pa.Table) -> dict:
-    d = tbl.to_pydict()
-    return {"rows": tbl.num_rows, "preds": dict(zip(d["id"], d["pred"], strict=False))}
+    """Per-id signature: the predicted class (classify) or a rounded checksum of the
+    embedding vector (embed), so the same model on the same input matches across engines.
+
+    The embed path checksums the tensor column via NumPy (``to_numpy_ndarray`` → row sums),
+    NOT ``to_pydict`` — expanding 2048-d vectors to Python floats would cost seconds and
+    unfairly land in the timed run; the checksum is a cheap columnar reduction."""
+    if _OUT_COL == "embed":
+        col = tbl.column("embed")
+        col = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
+        try:
+            arr = np.asarray(col.to_numpy_ndarray())  # (N, D) — FixedShapeTensor / Ray tensor
+        except Exception:
+            arr = np.stack([np.asarray(v) for v in col.to_pylist()])
+        ids = tbl.column("id").to_numpy(zero_copy_only=False)
+        sums = arr.reshape(arr.shape[0], -1).sum(axis=1)
+        preds = {int(i): round(float(s), 1) for i, s in zip(ids, sums, strict=False)}
+    else:
+        d = tbl.to_pydict()
+        preds = dict(zip(d["id"], d["pred"], strict=False))
+    return {"rows": tbl.num_rows, "preds": preds}
 
 
 def _agreement(a: dict, b: dict) -> float:
     pa_, pb = a["preds"], b["preds"]
     common = set(pa_) & set(pb)
-    return sum(1 for k in common if pa_[k] == pb[k]) / len(common) if common else 0.0
+    if not common:
+        return 0.0
+    # exact for class ids; a small tolerance for the float embedding checksum (GPU nondeterminism)
+    return sum(1 for k in common if abs(pa_[k] - pb[k]) <= 0.5) / len(common)
 
 
 def _with_timeout(fn, t):
@@ -308,7 +344,9 @@ def _init(cfg: dict) -> None:
     from batcher.config import active_config, set_config
 
     pkg = os.path.dirname(os.path.abspath(batcher.__file__))
-    renv = {"py_modules": [pkg], "pip": None, "env_vars": {}}
+    # Propagate the benchmark's model/task selection to the workers (the UDF reads them).
+    env_vars = {k: os.environ[k] for k in ("BENCH_GPU_TASK", "BENCH_GPU_MODEL") if k in os.environ}
+    renv = {"py_modules": [pkg], "pip": None, "env_vars": env_vars}
     base = active_config()
     set_config(
         base.replace(
