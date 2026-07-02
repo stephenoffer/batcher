@@ -28,7 +28,11 @@ from batcher.dist.executors.partition_io import (
     partition_descriptors,
     source_pushdown,
 )
-from batcher.dist.executors.ray_runtime import engine_config_json, release_placement
+from batcher.dist.executors.ray_runtime import (
+    engine_config_json,
+    release_placement,
+    shuffle_partitions,
+)
 from batcher.dist.fleet import acquire_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.io.source import Source
@@ -141,7 +145,7 @@ def execute_sort_flight(
     # Borrow the query-lifetime fleet if installed (every Flight operator must, or a
     # second placement group deadlocks against the fleet's bundles); else spawn our own.
     actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
-    n_buckets = workers
+    n_buckets = shuffle_partitions(workers)
     try:
         # Push the map prefix's projection + predicate into the read so each worker
         # fetches only the columns/rows it needs (the sort keys + carried output), not

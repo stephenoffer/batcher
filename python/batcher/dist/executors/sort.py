@@ -21,7 +21,12 @@ import pyarrow as pa
 
 from batcher.dist.executors.partition_io import _apply_above, _partition_source, merge_boundaries
 from batcher.dist.executors.plan_analysis import _relabel_single_source
-from batcher.dist.executors.ray_runtime import _ensure_ray, _rmtree, engine_config_json
+from batcher.dist.executors.ray_runtime import (
+    _ensure_ray,
+    _rmtree,
+    engine_config_json,
+    shuffle_partitions,
+)
 from batcher.dist.shuffle_io import read_ipc
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Sort
@@ -59,7 +64,7 @@ def _distributed_sort(
             "limit": sort.limit,
         }
     )
-    n_buckets = workers
+    n_buckets = shuffle_partitions(workers)
 
     work_dir = tempfile.mkdtemp(prefix="batcher_dsort_")
     try:

@@ -33,6 +33,7 @@ from .scaling import (
     cluster_topology,
     release_autoscale,
     request_autoscale,
+    shuffle_partitions,
 )
 from .scheduling import (
     create_worker_placement,
@@ -67,6 +68,7 @@ __all__ = [
     "resolve_transport",
     "runtime_bloom_join",
     "set_scheduling_envelope",
+    "shuffle_partitions",
     "skew_join_salt",
     "speculation_policy",
     "task_options",

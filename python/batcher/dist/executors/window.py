@@ -20,7 +20,12 @@ import pyarrow as pa
 
 from batcher.dist.executors.partition_io import _apply_above, _partition_source
 from batcher.dist.executors.plan_analysis import _relabel_single_source
-from batcher.dist.executors.ray_runtime import _ensure_ray, _rmtree, engine_config_json
+from batcher.dist.executors.ray_runtime import (
+    _ensure_ray,
+    _rmtree,
+    engine_config_json,
+    shuffle_partitions,
+)
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Window
 
@@ -46,7 +51,7 @@ def _distributed_window(
     win_ir = window.to_ir()
     win_ir["input"] = {"op": "scan", "source_id": 0}
     win_json = json.dumps(win_ir)
-    n_reducers = workers
+    n_reducers = shuffle_partitions(workers)
 
     work_dir = tempfile.mkdtemp(prefix="batcher_winshuffle_")
     try:

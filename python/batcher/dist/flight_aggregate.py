@@ -26,7 +26,11 @@ from batcher.dist.executor import (
     _relabel_single_source,
 )
 from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
-from batcher.dist.executors.ray_runtime import engine_config_json, release_placement
+from batcher.dist.executors.ray_runtime import (
+    engine_config_json,
+    release_placement,
+    shuffle_partitions,
+)
 from batcher.dist.flight_worker import _ticket
 from batcher.io.source import Source
 from batcher.plan.logical import Aggregate, LogicalPlan
@@ -115,7 +119,7 @@ def execute_aggregate_flight(
     # worker count to the fleet's, so every stage shuffles over the same actors);
     # otherwise spawn one we tear down. `owns` gates teardown.
     actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
-    n_reducers = 1 if n_keys == 0 else workers
+    n_reducers = 1 if n_keys == 0 else shuffle_partitions(workers)
 
     keep_actors = False  # set when a FlightMaterializedSource takes ownership of them
     try:

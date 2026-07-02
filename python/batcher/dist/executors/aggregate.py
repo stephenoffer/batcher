@@ -20,7 +20,12 @@ from batcher.dist.executors.partition_io import (
     source_pushdown,
 )
 from batcher.dist.executors.plan_analysis import _relabel_single_source
-from batcher.dist.executors.ray_runtime import _ensure_ray, _rmtree, engine_config_json
+from batcher.dist.executors.ray_runtime import (
+    _ensure_ray,
+    _rmtree,
+    engine_config_json,
+    shuffle_partitions,
+)
 from batcher.io.source import Source
 from batcher.plan.logical import Aggregate, LogicalPlan
 
@@ -52,7 +57,7 @@ def _distributed_aggregate(
     map_ir = json.dumps(map_plan.to_ir())
     n_keys = len(agg.group_keys)
     # Global aggregate (no keys) cannot shuffle by key → a single reducer.
-    n_reducers = 1 if n_keys == 0 else workers
+    n_reducers = 1 if n_keys == 0 else shuffle_partitions(workers)
 
     # Push the sub-plan's projection + predicate into the source read (the map_ir
     # still re-checks the filter, so this is a pure I/O optimization).

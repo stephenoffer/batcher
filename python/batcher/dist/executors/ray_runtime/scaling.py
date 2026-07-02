@@ -15,6 +15,22 @@ import threading
 from batcher.config import active_config
 
 
+def shuffle_partitions(workers: int) -> int:
+    """The number of shuffle partitions (reducers / hash buckets) for an all-to-all
+    exchange over `workers` mappers — capped by `distributed.max_shuffle_partitions`.
+
+    An exchange creates `mappers * reducers` streams; leaving the reducer count equal to the
+    worker fan-out (one per node) makes it O(nodes^2), which collapses at 10k+ nodes. The
+    reducer count only needs to balance keys and keep each reducer's state in memory, so it
+    is capped: regular clusters (≤ the cap) are unchanged, huge clusters stay bounded. Any
+    reducer count is result-correct under the mergeable algebra, so this only affects scaling.
+    Always at least 1; the cap is disabled when the config value is 0.
+    """
+    cap = active_config().distributed.max_shuffle_partitions
+    n = max(1, workers)
+    return n if cap <= 0 else min(n, cap)
+
+
 def cluster_topology() -> dict:
     """Live cluster shape: alive node count + total CPUs/GPUs. Ray must be up.
 

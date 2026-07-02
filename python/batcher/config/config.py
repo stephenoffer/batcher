@@ -697,6 +697,16 @@ class DistributedConfig:
     # unknown/large size distributes as before. Result-identical either way; an explicit
     # `distributed=True/False` always overrides. Set to 0 to always distribute on a cluster.
     distribute_min_rows: int = 1_000_000
+    # Cap on the number of shuffle partitions (reducers / hash buckets) an all-to-all
+    # exchange creates — aggregate, join, sort, window, distinct. Without a cap the count
+    # equals the worker fan-out (one per node), so the exchange is O(nodes²): at 10k nodes a
+    # keyed group-by would open ~100M mapper→reducer streams and collapse. The reducer count
+    # only needs to be enough to balance keys and keep each reducer's state in memory — past a
+    # few thousand it adds shuffle overhead, not parallelism (Spark's 200-default lineage). So
+    # `n_reducers = min(workers, this)`: regular clusters (≤ this many nodes) are UNCHANGED,
+    # while very large clusters stay bounded. Mergeable algebra makes any reducer count
+    # correct (result-identical), so this is purely a scaling knob. 0 disables the cap.
+    max_shuffle_partitions: int = 2048
     # Named fault-tolerance profile. ``"default"`` keeps the conservative budgets above
     # (tuned for a stable on-demand cluster — minimal retries, no keepalive, no
     # straggler speculation). ``"spot"`` hardens them as a bundle for a churning

@@ -17,7 +17,11 @@ import pyarrow as pa
 
 from batcher.dist.executor import _apply_above, _ensure_ray, _relabel_single_source
 from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
-from batcher.dist.executors.ray_runtime import engine_config_json, release_placement
+from batcher.dist.executors.ray_runtime import (
+    engine_config_json,
+    release_placement,
+    shuffle_partitions,
+)
 from batcher.dist.fleet import acquire_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.io.source import Source
@@ -103,7 +107,7 @@ def execute_join_flight(
     # one we tear down. Every Flight operator must borrow it — spawning a second
     # placement group would contend with the fleet's held bundles and deadlock.
     actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
-    n_buckets = workers
+    n_buckets = shuffle_partitions(workers)
     try:
         # Each side reads only the columns/rows its map prefix needs (join keys + carried
         # output), not the whole wide table — the biggest scan win on a star-schema join.
