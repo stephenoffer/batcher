@@ -358,7 +358,13 @@ def transformers_pipeline_encoder(
         def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
             import pyarrow as pa
 
-            results = self._pipe(batch.column(column).to_pylist())
+            # A HF pipeline defaults to batch_size=1 — it runs the model once PER ROW,
+            # starving the GPU (the classic pipeline footgun). Feed the whole Arrow batch
+            # as one GPU batch (`batch_size=num_rows`) so the forward pass is actually
+            # batched; the map_batches `batch_size` already bounds `num_rows`, and the
+            # actor-pool OOM-halving is the safety net if a batch is too large for VRAM.
+            inputs = batch.column(column).to_pylist()
+            results = self._pipe(inputs, batch_size=max(1, len(inputs)))
             out_col = pa.array([_primary_output(r) for r in results])
             if output_column in batch.schema.names:
                 idx = batch.schema.get_field_index(output_column)
