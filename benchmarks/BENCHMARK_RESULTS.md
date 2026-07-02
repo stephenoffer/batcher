@@ -1063,3 +1063,24 @@ Result is byte-identical (same 48886 rows as the forced-distributed path); an ex
 139×/5.3× results) still cross the threshold and distribute as before, and GPU inference always
 distributes — so the cluster-scale wins are unaffected while sub-second small queries stop
 paying the fan-out tax.
+
+## Ray Data pain points → Batcher's answer (audit from optimization-guides, 2026-07-02)
+
+Systematic pass over the pain points the guides document for Ray Data:
+
+| Ray Data pain point (from the guides) | Batcher's answer |
+|---|---|
+| Schema inferred from the **first batch**; later batches with extra fields fail the merge (LLM structured outputs) | **Fixed this session** — `io.schema.reconcile_batches` unions drifting `map_batches` output at both map choke points (missing cols → typed nulls) |
+| Operators scheduled on the **head node** → GCS contention / instability (must set `num_cpus=0` by hand) | **Fixed this session** — worker fan-out excludes the `node:__internal_head__` node on any cluster type (single-node head kept) |
+| Keyed shuffle fan-out scales with node count → collapse at very large clusters | **Fixed this session** — `shuffle_partitions` caps reducers (default 2048); 10k-node exchange 100M→20M streams |
+| `batch_format='default'` forces an Arrow→NumPy conversion | Data plane stays Arrow zero-copy end to end; `batch_format` converts only around the UDF call |
+| HF pipeline defaults to `batch_size=1`, starving the GPU | **Fixed this session** — managed `ds.ml.infer` batches the pipeline (~8.7× warm) |
+| CUDA OOM **hangs** the pipeline (actor dies, upstream keeps producing) | OOM-halving (`_resilient_call`, GPU stages always resilient) splits and retries; warm-pool `_healthy_actors` respawns dead actors — survives, never stalls |
+| Mixed doc sizes: large docs hold memory hostage → OOM / stalls | Byte-aware morselization bounds a morsel by bytes (`morsel_bytes`), not just rows, so a few large rows don't blow the budget |
+| Global object-store budget over-allocates to GPU nodes → OOM | Bulk data bypasses the object store entirely (Arrow Flight, credit-based backpressure); per-node memory is mergeable + spill-bounded |
+| Cross-process IPC (Ray Data → trainer) serialization overhead | Zero-copy DLPack loader; data moves via Flight, not the object store |
+| Ray Data overhead not justified on small datasets (<1M rows) | `distributed="auto"` routes small queries single-node (~32× on an 80k-row query) |
+| Training ingest ~20% slower than native DataLoader | Zero-copy loader measured 3.0× Ray Data on training-data ingest |
+
+The three "Fixed this session" rows were genuine gaps Batcher shared with Ray Data; the rest
+were already designed out. Each fix ships with unit/integration tests and preserves results.
