@@ -230,44 +230,65 @@ def _apply_udf_stream(gen: Iterator[pa.RecordBatch], op: MapBatches) -> Iterator
             batch.slice(i, min(step, batch.num_rows - i)) for i in range(0, batch.num_rows, step)
         ]
 
+    # Resilient per-call handling is needed for a GPU stage (survive a transient CUDA OOM by
+    # halving) or when the user allowed skipping corrupt rows (`max_errored_rows`); a plain CPU
+    # stage with no error budget calls directly so a real bug still fails fast.
+    budget = [op.max_errored_rows]
+    resilient = is_gpu or op.max_errored_rows > 0
+
+    def _emit(sub: pa.RecordBatch):
+        return (
+            _resilient_call(call, sub, budget, is_gpu)
+            if resilient
+            else _coerce_udf_result(call(sub))
+        )
+
     # A GPU stage runs one CUDA context (num_workers=1) and survives a transient VRAM spike
     # by halving the batch; a CPU stage fans its morsel across a persistent pool of cores.
     if is_gpu or workers <= 1:
         for batch in gen:
             if batch.num_rows:
                 for sub in _subs(batch):
-                    yield from (
-                        _gpu_call_oom_safe(call, sub) if is_gpu else _coerce_udf_result(call(sub))
-                    )
+                    yield from _emit(sub)
         return
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for batch in gen:
             if not batch.num_rows:
                 continue
-            for res in pool.map(call, _parallel_units(batch)):
-                yield from _coerce_udf_result(res)
+            for out in pool.map(_emit, _parallel_units(batch)):
+                yield from out
 
 
-def _gpu_call_oom_safe(call, sub: pa.RecordBatch) -> list[pa.RecordBatch]:
-    """Run a GPU stage call on `sub`, surviving a CUDA OOM by halving and retrying.
+def _resilient_call(
+    call, sub: pa.RecordBatch, budget: list[int], is_gpu: bool
+) -> list[pa.RecordBatch]:
+    """Run a per-batch `call`, isolating failures by bisection — the unified OOM-halving +
+    dirty-data-tolerance path.
 
-    A too-large default batch (or a co-tenant VRAM spike) that OOMs at size N often fits at
-    N/2; the halves' per-row-independent inference outputs concatenate to the whole batch's
-    result, so this is result-invariant. Re-raises once a single row still OOMs (a genuine
-    over-allocation) or for any non-OOM error — the safety net that lets the zero-config
-    default batch size be aggressive without risking the job."""
+    On a CUDA OOM (GPU stage) the batch is halved and retried (a too-large batch often fits at
+    N/2; the per-row-independent outputs concatenate to the whole result); a single row that
+    still OOMs is a genuine over-allocation and re-raises. On any OTHER error the batch is
+    bisected to isolate the offending row(s): a failing single row is DROPPED (charged against
+    `budget`, the ``max_errored_rows`` allowance) so a corrupt image / malformed record doesn't
+    kill a long job — until the budget is exhausted, when it re-raises. With ``budget == 0``
+    and a CPU stage this reduces to strict behavior (any error propagates), so a real bug on
+    clean data still fails fast."""
     from batcher.ml.inference import _empty_cuda_cache, _is_cuda_oom
 
     try:
         return _coerce_udf_result(call(sub))
     except Exception as exc:
-        if not _is_cuda_oom(exc) or sub.num_rows <= 1:
-            raise
-        _empty_cuda_cache()
+        oom = is_gpu and _is_cuda_oom(exc)
+        if oom:
+            _empty_cuda_cache()
+        if sub.num_rows <= 1:
+            if oom or budget[0] <= 0:
+                raise  # genuine single-row over-allocation, or the error budget is spent
+            budget[0] -= 1
+            return []  # drop the one corrupt row and carry on
         mid = sub.num_rows // 2
-        return _gpu_call_oom_safe(call, sub.slice(0, mid)) + _gpu_call_oom_safe(
-            call, sub.slice(mid)
-        )
+        left = _resilient_call(call, sub.slice(0, mid), budget, is_gpu)
+        return left + _resilient_call(call, sub.slice(mid), budget, is_gpu)
 
 
 def _execute_node(node: LogicalPlan, sources: list) -> tuple[list[pa.RecordBatch], pa.Schema]:
@@ -393,6 +414,24 @@ def _apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordB
         # Build the model once for this whole call (a class `fn` is a load-once factory).
         fn = build_udf_callable(op.fn)
         call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
+        if op.max_errored_rows > 0:
+            # Dirty-data tolerance: isolate and skip corrupt rows (up to the budget) instead
+            # of crashing — a single-stage inference / preprocess over messy data survives.
+            budget = [op.max_errored_rows]
+            is_gpu = op.num_gpus > 0
+
+            def _emit(b: pa.RecordBatch) -> list[pa.RecordBatch]:
+                return _resilient_call(call, b, budget, is_gpu)
+
+            if strategy == "threads":
+                with ThreadPoolExecutor(max_workers=op.num_workers) as pool:
+                    chunks = list(pool.map(_emit, batches))
+            else:
+                chunks = [_emit(b) for b in batches]
+            out: list[pa.RecordBatch] = []
+            for c in chunks:
+                out.extend(c)
+            return out
         if strategy == "threads":
             # ThreadPoolExecutor.map keeps input order; concurrency only helps when `fn`
             # releases the GIL (Rust/GPU/NumPy inference), which is the intended use.
@@ -401,7 +440,7 @@ def _apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordB
         else:
             results = [call(batch) for batch in batches]
 
-    out: list[pa.RecordBatch] = []
+    out = []
     for result in results:
         out.extend(_coerce_udf_result(result))
     return out

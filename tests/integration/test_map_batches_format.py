@@ -130,3 +130,44 @@ def test_tensor_column_round_trips_through_numpy_stage():
     )
     got = dict(zip(out.to_pydict()["x"], out.to_pydict()["s"], strict=False))
     assert got == {1: 6.0, 2: 12.0, 3: 18.0, 4: 24.0}  # each id filled 6 cells
+
+
+# --------------------------------------------------------------------------- #
+# Dirty-data tolerance (max_errored_rows)
+# --------------------------------------------------------------------------- #
+def _flaky(d: dict) -> dict:
+    """A numpy-format UDF that raises on any row whose x is divisible by 7."""
+    x = d["x"]
+    if (x % 7 == 0).any():
+        raise ValueError("corrupt row")
+    return {"x": x, "y": (x * 2).astype(np.int64)}
+
+
+def test_max_errored_rows_strict_default_raises():
+    t = pa.table({"x": np.arange(1, 50, dtype=np.int64)})  # contains multiples of 7
+    with pytest.raises(Exception, match="corrupt"):
+        bt.from_arrow(t).map_batches(
+            _flaky, output_columns=["x", "y"], batch_format="numpy"
+        ).collect()
+
+
+def test_max_errored_rows_skips_bad_rows():
+    t = pa.table({"x": np.arange(1, 200, dtype=np.int64)})
+    bad = [v for v in range(1, 200) if v % 7 == 0]
+    out = (
+        bt.from_arrow(t)
+        .map_batches(_flaky, output_columns=["x", "y"], batch_format="numpy", max_errored_rows=50)
+        .collect()
+    )
+    xs = out.to_pydict()["x"]
+    assert out.num_rows == 199 - len(bad)
+    assert not any(v % 7 == 0 for v in xs)  # corrupt rows dropped
+    assert out.to_pydict()["y"][:3] == [2, 4, 6]  # surviving rows computed correctly
+
+
+def test_max_errored_rows_budget_exhausted_raises():
+    t = pa.table({"x": np.arange(1, 200, dtype=np.int64)})  # ~28 bad rows
+    with pytest.raises(Exception, match="corrupt"):
+        bt.from_arrow(t).map_batches(
+            _flaky, output_columns=["x", "y"], batch_format="numpy", max_errored_rows=5
+        ).collect()

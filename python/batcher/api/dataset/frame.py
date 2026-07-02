@@ -615,14 +615,21 @@ class Dataset:
         *,
         batch_size: int | None = None,
         output_columns: list[str] | None = None,
-        num_workers: int = 1,
+        num_workers: int | str = "auto",
         num_gpus: float = 0.0,
         concurrency: int | None = None,
         batch_format: str = "pyarrow",
         multiprocessing: bool = False,
+        max_errored_rows: int = 0,
     ) -> Dataset:
         """Apply a Python function to each batch — `ds.ml.map_batches`, kept
         top-level for the familiar spelling (see `ds.ml` for the full ML surface).
+
+        `num_workers` defaults to ``"auto"`` — the per-batch calls fan across all
+        local cores, so a batch transform is parallel by default rather than
+        single-threaded (the Ray Data foot-gun). Threads only speed up a
+        GIL-releasing `fn` (Arrow/NumPy/torch); pass ``multiprocessing=True`` for a
+        CPU-bound pure-Python `fn`. An explicit int wins.
 
         Examples:
             .. doctest::
@@ -644,6 +651,7 @@ class Dataset:
             concurrency=concurrency,
             batch_format=batch_format,
             multiprocessing=multiprocessing,
+            max_errored_rows=max_errored_rows,
         )
 
     def offload_blobs(
@@ -1748,9 +1756,7 @@ class Dataset:
                 >>> len(ds.filter(bt.col("x") > 1).explain(analyze=True)) > 0
                 True
         """
-        return _explain(
-            self._plan, self._sources, self.columns, analyze=analyze, fmt=format
-        )
+        return _explain(self._plan, self._sources, self.columns, analyze=analyze, fmt=format)
 
     def stats(self) -> RunStats:
         """Execute (single-node) and return measured per-operator `RunStats`.
