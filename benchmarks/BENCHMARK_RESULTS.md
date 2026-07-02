@@ -1084,3 +1084,25 @@ Systematic pass over the pain points the guides document for Ray Data:
 
 The three "Fixed this session" rows were genuine gaps Batcher shared with Ray Data; the rest
 were already designed out. Each fix ships with unit/integration tests and preserves results.
+
+## GPU backend for transforms — TPC-H on GPU vs Batcher CPU (task #9, 2026-07-02)
+
+First phase of the CPU-and-GPU-backends goal: measure core relational transforms on the GPU
+against Batcher's native CPU engine. The GPU path uses torch (the env's CUDA-13 vehicle;
+cudf-cu13 is the richer backend once the cluster syncs it to workers), on a GPU worker via Ray.
+Both correctness-gated.
+
+| query | rows | Batcher CPU | GPU end-to-end | GPU compute-only |
+|---|---|---|---|---|
+| group-by SUM (Q1 core), `benchmarks/gpu_backend/tpch_gpu_agg.py` | 50M | 21 M rows/s | **13.6×** (incl. transfer) | 751× (resident) |
+| **TPC-H Q6** (filter + revenue), `benchmarks/gpu_backend/tpch_q6_gpu.py` | 100M | 9.7 M rows/s | **14.2×** (incl. transfer) | 240× (resident) |
+
+Both revenue/sums are bit-exact vs Batcher (rel err ≤ 2e-16). The **end-to-end** numbers
+(13–14×) include the one host→device PCIe transfer; the **compute-only** ceiling (240–751×) is
+what a *fused, GPU-resident* pipeline approaches — transfer once, run the op chain on-GPU. Q6
+already fuses filter+multiply+reduce over one transfer, so 14.2× holds on a real query.
+
+Design implication (recorded for the Batcher GPU backend): expose GPU as a `core` Executor
+strategy (CPU vs GPU, not call-site branching) that lowers a numeric scan→filter→project→agg
+chain to the GPU and keeps columns resident across a query, approaching the compute ceiling.
+The Polars-GPU (cuDF) head-to-head is pending cuDF sync to the workers.
