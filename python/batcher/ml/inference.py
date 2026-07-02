@@ -292,6 +292,34 @@ class InferencePool:
             yield from drain(block=True)
 
 
+def _pipeline_accel_kwargs() -> dict[str, Any]:
+    """Zero-config accelerator placement + precision for a ``transformers.pipeline``.
+
+    On a GPU worker: put the model on the detected device and, when the GPU has fast
+    half-precision tensor cores, run it in BF16/FP16 (`recommend_inference_dtype`) —
+    ~2x throughput on a compute-bound model at negligible inference quality loss. A
+    no-op (CPU, FP32) where half gives no speedup or torch is absent, so correctness is
+    never traded for the fast path. This is the per-GPU default Ray Data users set by hand.
+    """
+    kwargs: dict[str, Any] = {}
+    try:
+        import torch
+
+        from batcher.ml.gpu import detect_backend, recommend_inference_dtype
+
+        backend = detect_backend()
+        if backend in ("cuda", "rocm") and torch.cuda.is_available():
+            kwargs["device"] = 0
+        elif backend == "mps":
+            kwargs["device"] = "mps"
+        dtype = recommend_inference_dtype(backend)
+        if dtype is not None:
+            kwargs["torch_dtype"] = getattr(torch, dtype)
+    except Exception:
+        return {}
+    return kwargs
+
+
 def transformers_pipeline_encoder(
     model: str, column: str, *, output_column: str = "prediction", task: str | None = None
 ) -> type:
@@ -301,8 +329,10 @@ def transformers_pipeline_encoder(
     model=model)`` once per worker (the load-once GPU-inference pattern) and runs it
     over each batch's `column`, appending the pipeline's primary output per row as
     `output_column`. For a classification pipeline that is the predicted ``label``;
-    for text generation the ``generated_text``; otherwise the raw scalar output. Needs
-    ``transformers`` (``batcher-engine[transformers]``).
+    for text generation the ``generated_text``; otherwise the raw scalar output. On a
+    GPU worker the model is placed on the device and auto-cast to BF16/FP16 where the
+    hardware benefits (see `_pipeline_accel_kwargs`). Needs ``transformers``
+    (``batcher-engine[transformers]``).
     """
 
     class _PipelineModel:
@@ -314,7 +344,7 @@ def transformers_pipeline_encoder(
 
                 msg = "ds.ml.infer(<model id>) needs: pip install 'batcher-engine[transformers]'"
                 raise BackendError(msg) from exc
-            self._pipe = pipeline(task, model=model)
+            self._pipe = pipeline(task, model=model, **_pipeline_accel_kwargs())
 
         def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
             import pyarrow as pa

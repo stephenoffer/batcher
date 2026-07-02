@@ -35,6 +35,7 @@ __all__ = [
     "load_gpu_utilization",
     "max_actors_per_gpu",
     "recommend_gpu_fraction",
+    "recommend_inference_dtype",
     "recommend_num_gpus",
     "recommend_quantization",
     "record_gpu_utilization",
@@ -404,6 +405,45 @@ def recommend_quantization(backend: str | None = None) -> str | None:
         return "fp8" if tuple(capability) >= _NATIVE_FP8_CAPABILITY else None
     except Exception:
         return None
+
+
+# NVIDIA compute capability with native BF16 tensor cores: Ampere (8.0+, A100/A10G)
+# and up. BF16 keeps FP32's exponent range, so it is the numerically-safe half-precision
+# default there. Turing/Volta (7.x, T4/V100) have fast FP16 tensor cores but emulate BF16,
+# so they take FP16. Below 7.0 (Pascal) half-precision has no tensor-core speedup — keep FP32.
+_NATIVE_BF16_CAPABILITY = (8, 0)
+_FAST_FP16_CAPABILITY = (7, 0)
+
+
+def recommend_inference_dtype(backend: str | None = None) -> str | None:
+    """A safe half-precision dtype name for model inference on the current GPU, or `None`.
+
+    Inference is numerically forgiving (no gradients to accumulate error), so half
+    precision roughly doubles compute-bound throughput at negligible quality loss — the
+    single lever that turns a compute-bound job from parity into a win. Returns
+    ``"bfloat16"`` on Ampere+ (native BF16, FP32 exponent range — the safe default),
+    ``"float16"`` on Turing/Volta and Apple MPS (fast FP16, no native BF16), and `None`
+    (keep FP32) on older/CPU/probe-failure so the model never silently loses precision
+    where half gives no speedup. The per-GPU default Ray Data users otherwise set by hand.
+    """
+    b = backend or detect_backend()
+    try:
+        import torch
+
+        if b in ("cuda", "rocm"):
+            if not torch.cuda.is_available():
+                return None
+            capability = tuple(torch.cuda.get_device_capability())
+            if capability >= _NATIVE_BF16_CAPABILITY:
+                return "bfloat16"
+            if capability >= _FAST_FP16_CAPABILITY:
+                return "float16"
+            return None
+        if b == "mps":
+            return "float16"
+    except Exception:
+        return None
+    return None
 
 
 def recommend_num_gpus(util_fraction: float | None, requested: float) -> float:

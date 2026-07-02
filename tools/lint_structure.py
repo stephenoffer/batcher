@@ -117,6 +117,13 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # for the model/loader paths. The examples, not the thin delegating bodies, push it
     # over; the methods are one cohesive accessor bound as a unit.
     "python/batcher/api/dataset/ml.py": "ds.ml accessor; per-method examples push it over",
+    # The GPU/accelerator module: vendor-agnostic backend detection plus the per-GPU
+    # zero-config *recommendation* family (`recommend_quantization` / `recommend_inference_dtype`
+    # / `recommend_num_gpus` / `recommend_gpu_fraction`) and the utilization-feedback loop, all
+    # sharing the same backend-probe / capability / const scaffolding. `ml/` is already at the
+    # 12-file directory cap, so the recommendation family can't move to a sibling module without
+    # breaching it — the dir-size invariant wins (same case as `kyber/rules/join_order.py`).
+    "python/batcher/ml/gpu.py": "accelerator detect + per-GPU recommendations + feedback; ml/ at the 12-file dir cap",
     # The distributed dispatcher: one cohesive routing hub that inspects a plan's shape
     # and sends it to the matching distributed operator (map / aggregate / join / sort /
     # distinct / window / union / asof), plus the cluster-fill + envelope sizing every
