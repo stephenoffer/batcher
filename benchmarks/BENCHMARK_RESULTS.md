@@ -892,3 +892,19 @@ morsel across the pool. Effect (49k imgs):
 Ray Data: 3449 img/s @ 51%. The fix generalizes to any fast/small-model or fractional-packing
 inference (mobilenet, efficientnet, packed embeddings) — the CPU:GPU-ratio feeding the guides
 call out. Result-invariant (order preserved; `pool.map`), verified single-node.
+
+### Video-clip inference (large-intermediate multimodal) — Batcher 3.6× Ray Data
+
+Each row is a 16-frame clip (~0.6 MB) → per-frame ResNet-18 → mean-pool → clip label — the
+large-row / row-expansion regime the guides drop block size to 64 MiB for. Batcher's
+byte-aware morselization isolates the wide rows and its zero-config batch shrinks by row
+width (no OOM); warm pools reuse the model. Distributed over 8×T4, 4096 clips
+(`gpu_video.py`):
+
+| engine | clip/s | correctness |
+|---|---|---|
+| **batcher** (zero-config) | **2074.8** | 100% match |
+| ray data (batch_size=64) | 574.8 | 100% match |
+
+**batcher vs ray: 3.6×** — Ray must be hand-given a wide-row-safe `batch_size` (else OOM);
+Batcher sizes it automatically.
