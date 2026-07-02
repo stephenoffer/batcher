@@ -288,6 +288,10 @@ def bench(cfg: dict, n: int) -> dict:
                     from batcher.dist.fleet import release_session_fleet
 
                     release_session_fleet()
+                with contextlib.suppress(Exception):
+                    from batcher.dist.executors.map import release_inference_pools
+
+                    release_inference_pools()
     return out
 
 
