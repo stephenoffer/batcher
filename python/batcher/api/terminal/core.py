@@ -18,6 +18,7 @@ from batcher.api.terminal.metadata_answer import (
     metadata_count,
     metadata_is_empty,
 )
+from batcher.api.terminal.routing import resolve_distributed as _resolve_distributed
 from batcher.io.manifest import WriteManifest
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
@@ -37,27 +38,6 @@ __all__ = [
     "_to_pylist",
     "_write",
 ]
-
-
-def _resolve_distributed(distributed: bool | str) -> bool:
-    """Resolve ``distributed="auto"``: use the cluster iff already connected to a
-    multi-node one, else stay single-node.
-
-    Never forces a Ray init for a local query — if Ray isn't up, "auto" is local.
-    An explicit ``True``/``False`` always wins (the user's override).
-    """
-    if distributed != "auto":
-        return bool(distributed)
-    try:
-        import ray
-
-        if not ray.is_initialized():
-            return False
-        from batcher import dist
-
-        return dist.cluster_topology()["nodes"] > 1
-    except Exception:
-        return False
 
 
 @with_auto_config
@@ -116,7 +96,7 @@ def _collect(
     from batcher.api.terminal.blob_offload import maybe_insert_blob_offload
 
     plan = maybe_insert_blob_offload(plan)
-    distributed = _resolve_distributed(distributed)
+    distributed = _resolve_distributed(distributed, plan, sources)
     # Resolve `adaptive="auto"` to a concrete decision before the fast-path checks
     # below ("auto" is a truthy string). Join-less plans short-circuit to False without
     # touching source stats, so the common path pays nothing.
@@ -161,16 +141,15 @@ def _collect(
         ).table
 
     if spill and not distributed:
-        from batcher import core
+        from batcher import core, kyber
         from batcher.api.orchestration import auto_num_partitions
         from batcher.dist.spill import spill_collect
 
-        partitions = (
-            num_partitions
-            if num_partitions is not None
-            else auto_num_partitions(plan, sources, core.default_hub())
-        )
-        spilled = spill_collect(plan, sources, partitions)
+        hub = core.default_hub()
+        partitions = num_partitions or auto_num_partitions(plan, sources, hub)
+        # Spill the optimized plan (COUNT(DISTINCT)→COUNT over DISTINCT; derived join keys).
+        opt_lp = kyber.optimize_logical(plan, sources=sources, hub=hub)
+        spilled = spill_collect(opt_lp, sources, partitions)
         if spilled is not None:
             return spilled
         # Other plan shapes have no spilling path → fall through to in-memory.
@@ -232,21 +211,22 @@ def _shared_source_stats(plan: LogicalPlan, sources: list[Source]) -> list | Non
     return collect_source_stats(sources, core.default_hub())
 
 
-def _count(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> int:
-    """Return the number of result rows, from metadata when provable, else execute.
+def _count(plan: LogicalPlan, sources: list[Source], _columns: list[str]) -> int:
+    """Return the number of result rows — from metadata when provable, else a `COUNT(*)`.
 
-    Metadata-first: a plan whose row count is exactly derivable without execution
-    (`limit(n)`, a global aggregate, an empty source, counts through row-preserving
-    operators) is answered from `SourceStatistics` alone. Otherwise it falls back to
-    a full `_collect`, which is always correct — and, crucially, executes the *same*
-    plan shape, so its measured per-operator cardinalities feed the learning loop
-    (e.g. a filter's selectivity) under the plan's own signature.
+    Metadata answers a derivable count (`limit(n)`, a global aggregate, empty source,
+    row-preserving operators) with no execution. Otherwise a global `COUNT(*)` runs (via
+    `global_count_plan`): projection pushdown reads only the filter/key columns and a count
+    over a `Filter` fuses into one `count_if` pass, so no result rows are materialized.
     """
+    from batcher.api.terminal.metadata_answer import global_count_plan
+
     source_stats = _shared_source_stats(plan, sources)
     answer = metadata_count(plan, sources, source_stats)
     if answer is not None:
         return answer
-    return _collect(plan, sources, columns, source_stats=source_stats).num_rows
+    table = _collect(global_count_plan(plan), sources, ["n"], source_stats=source_stats)
+    return int(table.column("n")[0].as_py()) if table.num_rows else 0
 
 
 def _is_empty(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> bool:
@@ -412,14 +392,16 @@ def _write(
         num_files,
         target_bytes_per_file,
     ):
+        from batcher._internal.prefetch import prefetch
+        from batcher.api.terminal.map_stream import peek_stream
         from batcher.api.terminal.stream import _iter_batches
 
-        written = sink.write_stream(
-            _iter_batches(plan, sources, columns),
-            path,
-            schema=_schema(plan, sources, columns),
-            resume=resume,
+        # Peek the first batch for the schema (else an opaque `map_batches` forces an
+        # extra zero-row pass), then overlap read→transform with the write off-thread.
+        schema, stream = peek_stream(
+            _iter_batches(plan, sources, columns), lambda: _schema(plan, sources, columns)
         )
+        written = sink.write_stream(prefetch(stream), path, schema=schema, resume=resume)
         manifest = WriteManifest((written,))
         sink.commit(manifest, path)
         return manifest

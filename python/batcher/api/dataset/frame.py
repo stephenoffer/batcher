@@ -1896,7 +1896,7 @@ class Dataset:
             self._sources,
             self.columns,
             batch_size=batch_size,
-            distributed=_resolve_distributed(distributed),
+            distributed=_resolve_distributed(distributed, self._plan, self._sources),
             num_workers=num_workers,
             transport=transport,
         )

@@ -688,6 +688,15 @@ class DistributedConfig:
     # pool whose actors died (preemption) is transparently respawned on next use. On by
     # default; result-identical (same model, same per-batch contract).
     warm_inference_pools: bool = True
+    # `distributed="auto"` distributes only when it PAYS. On a multi-node cluster the Ray
+    # fan-out (SPREAD placement + task dispatch + result gather) is a ~2 s fixed cost, so a
+    # small query runs far faster single-node (measured: an 80k-row filter is ~55 ms
+    # single-node vs ~2.1 s distributed). Below this estimated input-row count, `auto` stays
+    # single-node even on a big cluster — the "sub-second small queries, low fixed overhead"
+    # mandate — while a GPU stage always distributes (it must reach the cluster's GPUs) and an
+    # unknown/large size distributes as before. Result-identical either way; an explicit
+    # `distributed=True/False` always overrides. Set to 0 to always distribute on a cluster.
+    distribute_min_rows: int = 1_000_000
     # Named fault-tolerance profile. ``"default"`` keeps the conservative budgets above
     # (tuned for a stable on-demand cluster — minimal retries, no keepalive, no
     # straggler speculation). ``"spot"`` hardens them as a bundle for a churning
