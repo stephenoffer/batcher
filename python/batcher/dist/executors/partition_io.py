@@ -94,6 +94,38 @@ def _balance(splits: list[Split], workers: int) -> list[list[Split]]:
     return groups
 
 
+def _slice_rows_evenly(batches: list[pa.RecordBatch], workers: int) -> list[list[pa.RecordBatch]]:
+    """Split an ordered batch list into `workers` groups of near-equal total row count.
+
+    Batches are sliced (zero-copy) at group boundaries, so even a single large batch is
+    spread evenly across every worker rather than assigned whole to one — order preserved,
+    the first ``total % workers`` groups getting one extra row. Empty groups are returned
+    as ``[]`` (the caller substitutes a schema-only empty batch) so the per-worker shape
+    stays uniform. The row counts of the returned groups sum to the input's total.
+    """
+    total = sum(b.num_rows for b in batches)
+    groups: list[list[pa.RecordBatch]] = [[] for _ in range(workers)]
+    if workers <= 1 or total == 0:
+        groups[0] = [b for b in batches if b.num_rows]
+        return groups
+    base, extra = divmod(total, workers)
+    targets = [base + (1 if i < extra else 0) for i in range(workers)]
+    w, filled = 0, 0
+    for b in batches:
+        off, n = 0, b.num_rows
+        while off < n:
+            if w < workers - 1 and filled >= targets[w]:
+                w += 1
+                filled = 0
+                continue
+            room = (targets[w] - filled) if w < workers - 1 else (n - off)
+            take = min(room, n - off)
+            groups[w].append(b.slice(off, take))
+            off += take
+            filled += take
+    return groups
+
+
 def _partition_source(
     source: Source,
     workers: int,
@@ -197,15 +229,17 @@ def partition_descriptors(
     if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):
         from batcher.io.source import iter_source
 
-        # Stream the source round-robin into per-worker batch lists, holding one
-        # batch at a time rather than concatenating the whole source into a Table
-        # first (which doubled driver memory). The batches still ship as Ray task
-        # args — bounded one-time input movement, not shuffle — but peak driver
-        # memory drops to a single batch plus the per-worker references.
+        # Range-slice the source into per-worker batch lists of near-equal ROW COUNT, not
+        # round-robin whole batches: a source that arrives as one large batch (a
+        # `from_arrow` table, an in-memory image/tensor set) must still fan out evenly
+        # across every worker instead of landing entirely on worker 0 while the rest sit
+        # idle — the imbalance the round-robin-by-batch scheme produced whenever the batch
+        # count was below the worker count (the common case for GPU/UDF inputs, which are
+        # few, wide rows). Slices are zero-copy views, so this is bounded one-time input
+        # movement (Ray task args), not shuffle, and matches the disk path's range split.
         proj_schema = _projected_schema(source, projection)
-        groups: list[list[pa.RecordBatch]] = [[] for _ in range(workers)]
-        for i, b in enumerate(iter_source(source, projection, predicate)):
-            groups[i % workers].append(b)
+        batches = list(iter_source(source, projection, predicate))
+        groups = _slice_rows_evenly(batches, workers)
         empty = pa.RecordBatch.from_pylist([], schema=proj_schema)
         return [{"batches": g or [empty]} for g in groups]
 

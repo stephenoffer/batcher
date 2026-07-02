@@ -206,7 +206,10 @@ def _distributed_map(
 
     # Data/compute-driven task count: a tiny source → a few tasks; a large one → ~one task
     # per core; a (single-threaded) UDF → more tasks (the way to parallelize it). The GPU
-    # actor-pool path keeps the worker count (its pool size, not the CPU task count).
+    # actor-pool path keeps the worker count (its pool size, not the CPU task count) —
+    # `partition_descriptors` row-balances those partitions across every worker, so a source
+    # arriving as one large batch fans out evenly (one balanced slice per GPU actor) instead
+    # of landing whole on worker 0.
     n_parts = workers if wants_pool else _adaptive_partition_count(sources[sid], plan, workers)
     partitions = partition_descriptors(sources[sid], n_parts)
 
@@ -244,8 +247,11 @@ def _distributed_map(
         sched = _spread_options()
 
         def _launch(idx):
+            # Intra-task workers = this task's own CPU share (>=1); cluster-wide
+            # parallelism is the many tasks, not a full-width pool inside each one.
+            workers = max(1, round(shares[idx]))
             return _map_udf_task.options(**{**opts, "num_cpus": shares[idx], **sched}).remote(
-                plan0, partitions[idx]
+                plan0, partitions[idx], workers
             )
 
         results = gather_map_results(_launch, len(partitions))
@@ -550,8 +556,10 @@ class _MapActor:
     `num_gpus` request on the next run (the feedback half of GPU scheduling)."""
 
     def __init__(self, plan0: LogicalPlan) -> None:
-        # Build the (class) UDFs locally, once — the model load happens here.
-        self._plan = _prebuild_factories(plan0)
+        # Build the (class) UDFs locally, once — the model load happens here. The pool's
+        # size is the parallelism, so each actor runs its UDF serially (workers=1) rather
+        # than spawning a full-width intra-actor pool that would oversubscribe the node.
+        self._plan = _with_map_workers(_prebuild_factories(plan0), 1)
         self._gpu_util_max: float | None = None
 
     def run(self, partition: dict):
@@ -600,7 +608,28 @@ class _MapActor:
         return self._gpu_util_max
 
 
-def _map_udf_task(plan0, partition):
+def _with_map_workers(plan, n: int):
+    """Return `plan` with every `map_batches` stage's `num_workers` set to `n`.
+
+    Distributed parallelism comes from running many partition tasks across the cluster,
+    so a task must run its UDF with intra-task workers sized to *its own* CPU share — not
+    the driver-resolved all-local-cores count, which would make every task on every node
+    spawn a full-width thread/process pool and oversubscribe the cluster many times over.
+    """
+    import dataclasses
+
+    from batcher.plan.logical import MapBatches
+    from batcher.plan.visitor import children, with_children
+
+    if isinstance(plan, MapBatches):
+        plan = dataclasses.replace(plan, num_workers=n)
+    kids = children(plan)
+    if kids:
+        return with_children(plan, [_with_map_workers(c, n) for c in kids])
+    return plan
+
+
+def _map_udf_task(plan0, partition, workers: int = 1):
     from batcher import core
     from batcher.dist.executors.partition_io import read_partition_descriptor
     from batcher.io.source import InMemorySource
@@ -608,13 +637,13 @@ def _map_udf_task(plan0, partition):
     rows = read_partition_descriptor(partition)
     if not rows:
         return None
-    out = core.execute_with_udfs(plan0, [InMemorySource(rows)])
+    out = core.execute_with_udfs(_with_map_workers(plan0, workers), [InMemorySource(rows)])
     if not out or sum(b.num_rows for b in out) == 0:
         return None
     return out
 
 
-def _map_agg_task(plan0, partition, group_keys_json, aggregates_json):
+def _map_agg_task(plan0, partition, group_keys_json, aggregates_json, workers: int = 1):
     """Run the map/UDF prefix on a partition, then PARTIAL-aggregate its output.
 
     The map (the expensive UDF) runs on the worker over its own partition, and only the
@@ -629,7 +658,7 @@ def _map_agg_task(plan0, partition, group_keys_json, aggregates_json):
     rows = read_partition_descriptor(partition)
     if not rows:
         return None
-    out = core.execute_with_udfs(plan0, [InMemorySource(rows)])
+    out = core.execute_with_udfs(_with_map_workers(plan0, workers), [InMemorySource(rows)])
     if not out or sum(b.num_rows for b in out) == 0:
         return None
     return nat.partial_aggregate(group_keys_json, aggregates_json, out)
@@ -662,8 +691,9 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     sched = _spread_options()
 
     def _launch(idx):
+        workers = max(1, round(shares[idx]))
         return _map_agg_task.options(num_cpus=shares[idx], **sched).remote(
-            map_plan, partitions[idx], gk, aj
+            map_plan, partitions[idx], gk, aj, workers
         )
 
     partials = gather_map_results(_launch, len(partitions))

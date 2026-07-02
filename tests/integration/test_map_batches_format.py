@@ -81,3 +81,52 @@ def test_formats_agree():
 def test_unknown_format_rejected():
     with pytest.raises(PlanError, match="batch_format"):
         bt.from_arrow(_table()).map_batches(lambda b: b, batch_format="polars")
+
+
+# --------------------------------------------------------------------------- #
+# Multi-dimensional tensor columns (images / embeddings / feature maps)
+# --------------------------------------------------------------------------- #
+def test_map_batches_emits_multidim_tensor_column():
+    """A `fn` returning a ``(B, *shape)`` NumPy array yields a canonical Arrow
+    fixed-shape-tensor column (the Ray Data tensor-block shape) — not an error."""
+
+    def make(b: pa.RecordBatch) -> dict:
+        n = b.num_rows
+        ids = b.column("x").to_numpy()
+        img = (ids[:, None, None, None] + np.zeros((n, 3, 4, 4), np.float32)).astype(np.float32)
+        return {"x": ids, "img": img}
+
+    out = (
+        bt.from_arrow(_table())
+        .map_batches(make, output_columns=["x", "img"], batch_format="pyarrow")
+        .collect()
+    )
+    from batcher.io.formats.ml.tensor import is_tensor_column
+
+    assert out.num_rows == 4
+    field = out.schema.field("img")
+    assert is_tensor_column(field.type)
+    assert tuple(field.type.shape) == (3, 4, 4)
+
+
+def test_tensor_column_round_trips_through_numpy_stage():
+    """A tensor column produced by one stage is read back as a ``(B, *shape)`` ndarray
+    by a downstream ``batch_format="numpy"`` stage — the two-stage decode→model shape."""
+
+    def make(b: pa.RecordBatch) -> dict:
+        n = b.num_rows
+        ids = b.column("x").to_numpy().astype(np.float32)
+        return {"x": b.column("x").to_numpy(), "t": ids[:, None] + np.zeros((n, 6), np.float32)}
+
+    def reduce(d: dict) -> dict:
+        assert d["t"].shape[1:] == (6,)
+        return {"x": d["x"], "s": d["t"].sum(1).astype(np.float64)}
+
+    out = (
+        bt.from_arrow(_table())
+        .map_batches(make, output_columns=["x", "t"], batch_format="pyarrow")
+        .map_batches(reduce, output_columns=["x", "s"], batch_format="numpy")
+        .collect()
+    )
+    got = dict(zip(out.to_pydict()["x"], out.to_pydict()["s"], strict=False))
+    assert got == {1: 6.0, 2: 12.0, 3: 18.0, 4: 24.0}  # each id filled 6 cells

@@ -44,6 +44,116 @@ none of it.
 Batcher beats Ray Data **50× even on Ray Data's own `map_batches` pattern**. This is
 the structural, reliable 10×+ win.
 
+## Ray Data's data-plane home turf (map ETL, inference, training ingest)
+
+The operator mix above is SQL-shaped, where Ray Data is weakest. This section is the
+harder, fairer test: Ray Data's *bread-and-butter* streaming `map_batches` ETL / batch
+inference and last-mile training ingest. Single 96-core node, 188 GB; each row
+correctness-gated (row count + checksum equal across engines). Ratio = `ray_ms /
+batcher_ms` (>1 ⇒ batcher faster). Harness: `scratchpad/vs_ray_home*.py`,
+`vs_ray_ops.py`, `vs_ray_train.py`.
+
+**Map-heavy ETL / batch inference, 20 M rows / 96 files, `batch_size` auto:**
+
+| workload | batcher_ms | ray_ms | vs Ray |
+|----------|-----------:|-------:|-------:|
+| `cpu_map` (per-batch NumPy transform → sum) | 1011 | 2372 | **2.35×** |
+| `py_map` (pure-Python per-row UDF → sum) | 1123–1808 | ~2400 | **1.3–2.2×** |
+| `flat_map` (1→4 row expansion → count) | 455 | 1586 | **3.5×** |
+| `class_inference` (`map_batches(Model)` load-once) | 2067 | 2672 | **1.29×** |
+| `numpy_format` (`batch_format="numpy"`) | 2002 | 2883 | **1.44×** |
+| `pandas_format` (`batch_format="pandas"`) | 1663 | 1702 | **1.02×** |
+| `chained_map` (map → map → filter → group-by) | 1807 | 5733 | **3.17×** |
+| `many_files_map` (2000 files → map → sum) | 2356 | 2982 | **1.27×** |
+| `map_write_dir` (map → write parquet directory) | 1250 | 2099 | **1.68×** |
+| `read_count` (metadata) | 0 | 64–446 | **170–1069×** |
+
+At 60 M rows the same wins hold (cpu_map 1.5–1.8×, flat_map 1.7×, py_map ~1.1×,
+read_map_write dir 1.2–1.5×). The enablers: a warm shared **process pool** for CPU-bound
+UDFs that reads its input from RAM-backed shared memory zero-copy (no per-worker pickle),
+threads for GIL-releasing NumPy/torch `fn`s (no IPC), parallel multi-file read + write,
+and a `read→map→write` that overlaps compute with I/O off-thread.
+
+**Distributed-training ingest** (`iter_torch_batches`, 10 M rows × 32 float features,
+`bs=1024`, `prefetch=2`). Ray Data's own docs concede ~20 % slower than a native PyTorch
+`DataLoader` here:
+
+| configuration | batcher Mrows/s | ray Mrows/s | vs Ray |
+|---------------|----------------:|------------:|-------:|
+| plain | 1.76 | 0.58 | **3.02×** |
+| `local_shuffle_buffer_size` | 1.14 | 0.53 | **2.14×** |
+| in-stream `map_batches` normalize | 1.33 | 0.56 | **2.38×** |
+| DDP `streaming_split` (4 ranks) | 1.28 | 0.36 | **3.52×** |
+
+**Lazy / metadata control plane** (where Ray Data pays a fixed scheduling cost, batcher
+reads Parquet metadata; 10 M rows / 64 files, warm best-of-5):
+
+| op | batcher_ms | ray_ms | vs Ray |
+|----|-----------:|-------:|-------:|
+| `schema` | ~0.01 | ~0 | tie (cold 0.03 vs 4.1) |
+| `count()` | 0.05 | 76 | **~1400×** |
+| `head(10)` | ~0 | 170 | **>100 000×** |
+| `limit(100).collect()` | 71 | 173 | **2.4×** |
+| `filter(pred).count()` | 47 | 695 | **15×** |
+
+`filter(...).count()` was the one loss here (2187 ms, all 32 columns scanned); fixed by
+compiling `.count()` to a `COUNT(*)` aggregate so projection pushdown prunes the scan to
+the predicate's column and fuses into `count_if` — **2187 → 47 ms, from 3.2× behind Ray
+to 15× ahead.** `count()`/`head()` are answered from metadata / early-stop streaming.
+
+**Broad operation sweep** (20 M rows, both fingerprinted in Arrow — no Python
+materialization): `sort` 3.6×, `sort→head(n)` >100×, `top_k(100)` 9×, `group_by` low-card
+29×, `distinct` 13×, `value_counts` 34×, `sample→count` 16×, selective `filter→count`
+14×, `union→count` >1000×, `join→count` 18×, `take(1000)` 6.6×. Ray Data's group-by /
+distinct / value_counts pay an all-to-all shuffle + block/pandas bridge; batcher's are
+native morsel-parallel hash aggregations. **Lazy metadata after a transform chain**:
+`schema`/`columns`/`count()` are inferred over the plan (<1 ms) — even after
+`join→group_by` — while Ray Data executes when an opaque `add_column`/`map` is present
+(~200 ms), a 100×+ gap on the exploratory inner loop.
+
+**`write_csv` was the one op that lost** (single-file 3539 ms vs Ray's parallel-directory
+1512 ms). Fixed by parallelizing the CSV encode: rows are independent text and pyarrow's
+CSV encoder releases the GIL, so a single-file streaming write now encodes a bounded
+window of batches concurrently (header only on the first) and writes them back to back —
+**3539 → 1127 ms, now 1.3× ahead single-file and 3.6× ahead writing a directory**
+(`repartition(N).write.csv`). Same parallel-encode also speeds the collect-path
+`_write_file`.
+
+**At scale / out of memory:** single-node `collect()` materializes (fastest up to memory
+limits — these wins hold to ~60 M rows). Beyond that the *same* mergeable operators run
+distributed (`collect(distributed=True)`) or streaming (`iter_batches` /
+`iter_torch_batches`), keeping per-node memory bounded — e.g. a 120 M-row row-exploding
+`flat_map → count` that would materialize 480 M rows on one node runs **~5.8× faster**
+distributed, reducing each partition before anything leaves it.
+
+## Data connectors — reads + directory writes (parquet / CSV / JSON)
+
+Both engines write a DIRECTORY of shards (Ray Data's default output) for fairness. 20 M
+rows / 64 files, single node. Ratio = `ray_ms / batcher_ms` (>1 ⇒ batcher faster).
+Harness: `scratchpad/vs_ray_connectors.py`.
+
+| connector op | batcher_ms | ray_ms | vs Ray |
+|--------------|-----------:|-------:|-------:|
+| read_parquet + sum | 72 | 1502 | **20.8×** |
+| read_csv + sum | 98 | 1394 | **14.3×** |
+| read_json + sum | 302 | 1588 | **5.3×** |
+| write_parquet (dir) | 317 | 1396 | **4.4×** |
+| write_csv (dir) | 326 | 1430 | **4.4×** |
+| write_json (dir) | 1016 | 1709 | **1.68×** |
+
+Reads win because batcher decodes files concurrently in-process (Parquet/CSV/JSON decode
+releases the GIL) with none of Ray Data's per-file task scheduling + object-store hop.
+
+**JSON write was catastrophic and is fixed.** The old sink did `to_pylist()` + a per-row
+`json.dumps` — **>65 s** for a single file, and a directory write was **12.9 s** (2.3–7.7×
+BEHIND Ray). pandas' `to_json` is ~5× faster but holds the GIL, so: (1) a single-file write
+encodes a bounded window of batches across PROCESSES and streams them out (>65 s → 2.5 s);
+(2) a directory write hands each part to a worker process that encodes and writes it
+directly — no result IPC, no concat — **12.9 s → 1.0 s, from 7.7× behind to 1.68× ahead.**
+CSV got the analogous thread-parallel encode (its writer releases the GIL). Both fall back
+to a correct serial path when a process pool can't start (a non-import-safe entrypoint),
+and both shard per-worker in the distributed path — so multi-node writes parallelize too.
+
 ## vs Daft: competitive — wins top-N, parity on agg/expr, trails on multi-joins
 
 Daft is a mature, fast, multi-core Rust engine (~DuckDB class, ~4 ms fixed overhead).
@@ -607,3 +717,50 @@ flight relational path (group-by/join) is unchanged (group-by 953 ms, no regress
 bit-identical to single-node. Tiny sources stay cheap (a few fractional-CPU tasks rather
 than reserving the whole cluster). Env knobs: `BATCHER_MIN_TASK_CPU`,
 `BATCHER_MAP_COMPUTE_WEIGHT`.
+
+## GPU batch inference vs Ray Data — distributed, multi-node (8×T4)
+
+The Ray Data flagship workload: a two-stage image pipeline — a CPU stage decodes/resizes
+JPEGs and a GPU stage runs a torchvision **ResNet-50** as a model-load-once actor pool —
+fanned across every GPU in the cluster. Both engines read the same Parquet shards
+(distributed, from shared storage), run the same seeded weights, and are checked for
+prediction agreement before any timing. Harness: `benchmarks/cluster/gpu_pipeline.py`
+(+ `gpu_inference.py` single-stage, `gpu_util.py` per-node NVML utilization).
+
+**Headline (131,072 images, 8×T4, out-of-the-box `num_gpus=1`, `batch_size=128`):**
+
+| engine  | img/s | GPU util | correctness |
+|---------|-------|----------|-------------|
+| batcher | **2504** | **81%** | 100% match |
+| ray data | 2383 | 78% | 100% match |
+
+Batcher reaches the **≥80% sustained GPU-utilization target** and beats Ray Data. At
+smaller scale the streaming overlap wins by more (49k imgs: batcher 1814 vs ray 1329 =
+**1.37×**); at large scale both saturate the devices and converge near the hardware
+ceiling (a single T4 sustains ~400 img/s at 100% util for ResNet-50; 8 actors ~3200
+img/s — **no parallel penalty**, so the pipeline, not the GPU, was the historical limit).
+
+**What made it fast — stage-overlapped streaming execution (`core/udf.py`).**
+`execute_with_udfs` previously ran a multi-stage `map_batches` chain **stage-at-a-time**
+(decode the whole partition, *then* run the GPU forward), so the GPU idled through the
+entire CPU decode. It now detects a linear `scan → map → … → map` inference chain and runs
+it as a **prefetch-pipelined stream**: each stage on its own thread, so the CPU decode of
+morsel *k+1* overlaps the GPU forward of morsel *k*. The device stays fed. This lifted the
+two-stage pipeline from **942 → 2504 img/s** and GPU utilization from **~30% → 81%**,
+result-identical to the materializing path (per-batch contract; order preserved) and
+verified single-node == distributed. It is a unified execution property — any CPU→GPU (or
+CPU-heavy → compute) chain benefits, single-node and distributed, for every modality.
+
+**Two supporting fixes.** (1) *Even fan-out for in-memory sources*
+(`partition_io._slice_rows_evenly`): `partition_descriptors` used to round-robin whole
+batches, so a `from_arrow` source arriving as one batch landed entirely on worker 0 —
+capping every in-memory distributed pipeline (GPU or relational) to a single worker (**1 of
+8 GPUs**). It now row-balances (zero-copy slices) like the disk path → **8/8 GPUs**. (2)
+*Tensor columns in `map_batches`*: a UDF returning a `(B, C, H, W)` NumPy image tensor
+previously raised `ArrowInvalid`; it is now stored as the canonical `arrow.fixed_shape_tensor`
+column, round-tripping zero-copy through the FFI across pyarrow/numpy/torch — the two-stage
+decode→model shape that was impossible before.
+
+Note on utilization: a *higher* GPU-util % is not automatically better — a slower engine
+spreads the same GPU-work over more wall-clock and reads as higher util. The number that
+matters is throughput at a healthy util; Batcher leads on both.

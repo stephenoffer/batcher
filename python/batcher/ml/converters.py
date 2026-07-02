@@ -70,7 +70,21 @@ def to_numpy_batches(
     """
     for batch in batches:
         names = list(batch.schema.names) if columns is None else list(columns)
-        yield {name: batch.column(name).to_numpy(zero_copy_only=False) for name in names}
+        yield {name: _column_to_numpy(batch.column(name)) for name in names}
+
+
+def _column_to_numpy(column: pa.Array) -> np.ndarray:
+    """One Arrow column → NumPy, restoring a fixed-shape-tensor column to its full
+    ``(n, *shape)`` array (image/embedding/feature-map columns) rather than an opaque
+    per-row object array. Plain columns convert as before (zero-copy where possible)."""
+    from batcher.io.formats.ml.tensor import is_tensor_column
+
+    if is_tensor_column(column):
+        import pyarrow as pa
+
+        arr = column.combine_chunks() if isinstance(column, pa.ChunkedArray) else column
+        return arr.to_numpy_ndarray()  # (n, *shape), shape from the tensor type
+    return column.to_numpy(zero_copy_only=False)
 
 
 def to_torch_iterable(
