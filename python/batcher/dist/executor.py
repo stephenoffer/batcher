@@ -486,8 +486,16 @@ def _unsupported(plan: LogicalPlan, sources: list[Source], reason: str):
     (real distributed data), raise loudly with the shape — the gap must be fixed, not
     hidden. When every source is in-memory / non-splittable there is no distributed data
     to speak of, so executing it on one node is the correct plan, not a fallback.
+
+    The splittable check is scoped to the sources **this plan actually reads**
+    (`_source_ids`), not the whole ambient `sources` list: a later adaptive stage — e.g. a
+    trailing `project` over an in-memory intermediate materialized by an earlier stage —
+    reads only that in-memory source and is correctly a single-node local transform, even
+    though the original splittable scan source is still present in `sources` (unused here).
+    Without this scoping such a tail stage would wrongly raise as "unsupported."
     """
-    if any(_is_splittable_source(s) for s in sources):
+    read_ids = _source_ids(plan)
+    if any(_is_splittable_source(sources[i]) for i in read_ids if i < len(sources)):
         from batcher._internal.errors import PlanError
 
         raise PlanError(
