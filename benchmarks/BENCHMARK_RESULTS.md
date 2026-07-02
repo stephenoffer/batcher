@@ -915,3 +915,11 @@ Waveform → mel-spectrogram (torchaudio, CPU) → ResNet-18 (GPU) — the audio
 multimodal workload, a two-stage CPU→GPU chain on a different modality. 8×T4, 16384 clips
 (`gpu_audio.py`): batcher **38546 clip/s** vs ray **3076** = **12.5×**, 100% agreement — the
 same stage-overlap + warm-pool machinery, on audio.
+
+### Image generation (diffusion) — Batcher 8.6× Ray Data
+
+Batch generation with a diffusion UNet (diffusers `ddpm-cifar10-32`, 20 DDIM steps/image) —
+model-load-dominated like LLM (the UNet loads ~4 s, generation a few seconds), so Ray Data's
+per-execution reload dominates while Batcher keeps it warm. Per-id-seeded noise → deterministic
+images (batch-invariant). 8×T4, 2048 images (`gpu_imagegen.py`): batcher **169.1 img/s** vs ray
+**19.5** = **8.6×**, 100% agreement. (A larger diffusion model widens the gap — the load is longer.)
