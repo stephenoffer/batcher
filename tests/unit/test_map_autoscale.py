@@ -108,6 +108,23 @@ def test_pipeline_signature_distinguishes_models():
     assert _pipeline_signature(p_a) != _pipeline_signature(p_b)
 
 
+def test_managed_infer_encoder_signature_is_stable_across_calls():
+    """The `ds.ml.infer(<model id>)` convenience path must map to a STABLE warm-pool
+    signature across separate `.infer()` calls with the same model — otherwise the
+    session-warm pool never matches and the model reloads every `collect()`. The encoder
+    class is memoized per (model, column, output_column, task), so its identity is stable
+    for the same model and distinct for a different one."""
+    import batcher as bt
+    from batcher.dist.executors.map import _pipeline_signature
+
+    ds = bt.from_pydict({"text": ["a", "b"]})
+    p1 = ds.ml.infer("gpt2", column="text", task="text-classification")._plan
+    p2 = ds.ml.infer("gpt2", column="text", task="text-classification")._plan
+    p3 = ds.ml.infer("distilgpt2", column="text", task="text-classification")._plan
+    assert _pipeline_signature(p1) == _pipeline_signature(p2)  # same model -> reuse pool
+    assert _pipeline_signature(p1) != _pipeline_signature(p3)  # different model -> isolated
+
+
 def test_release_inference_pools_clears_registry():
     from batcher.dist.executors import map as m
 

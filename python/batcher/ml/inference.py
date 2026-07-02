@@ -16,6 +16,7 @@ Python — so the control plane never touches a tuple in the hot path.
 from __future__ import annotations
 
 import contextlib
+import functools
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
@@ -320,6 +321,7 @@ def _pipeline_accel_kwargs() -> dict[str, Any]:
     return kwargs
 
 
+@functools.cache
 def transformers_pipeline_encoder(
     model: str, column: str, *, output_column: str = "prediction", task: str | None = None
 ) -> type:
@@ -333,6 +335,13 @@ def transformers_pipeline_encoder(
     GPU worker the model is placed on the device and auto-cast to BF16/FP16 where the
     hardware benefits (see `_pipeline_accel_kwargs`). Needs ``transformers``
     (``batcher-engine[transformers]``).
+
+    The generated class is **memoized** per ``(model, column, output_column, task)`` so
+    repeated ``ds.ml.infer(<same model>)`` calls return the *same* class object. The
+    distributed warm-pool key is the UDF's identity (`dist…map._pipeline_signature`), so a
+    stable class is what lets a session-warm inference pool be reused across `collect()`s
+    instead of reloading the model every call — the whole point of the warm pool on the
+    convenience path.
     """
 
     class _PipelineModel:
