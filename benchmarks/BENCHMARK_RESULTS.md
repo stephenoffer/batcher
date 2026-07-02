@@ -1042,3 +1042,24 @@ With the path now warm + batched, the auto-FP16 lever is finally measurable comp
 half-precision gain (near the 2× ceiling; larger models / longer sequences push closer). Earlier
 measurements of 0.63× (setup-bound) and 10.5× (unbatched FP32 baseline) were both confounded;
 1.70× is the honest, isolated dtype number.
+
+## `distributed="auto"` is now data-size-aware — 32× on small queries (2026-07-02)
+
+`auto` used to distribute *every* query on a multi-node cluster based on topology alone,
+paying the ~2 s Ray fan-out (SPREAD placement + task dispatch + result gather) even for a
+tiny input — the anti-pattern the perf mandate warns against ("don't add per-query setup cost
+that hurts the small case").
+
+`auto` now distributes only when it pays: a GPU stage always distributes (it must reach the
+cluster's accelerators); otherwise only when the estimated input (a cheap Parquet-footer
+`row_count`) is ≥ `distributed.distribute_min_rows` (default 1M) or unknown.
+
+| query (80k-row filter, 8×T4 cluster) | before | after |
+|---|---|---|
+| `collect(distributed="auto")` | ~2150 ms | **~67 ms** (~32×) |
+
+Result is byte-identical (same 48886 rows as the forced-distributed path); an explicit
+`distributed=True/False` always overrides. Large queries (fraud 20M-row aggregate/enrich, the
+139×/5.3× results) still cross the threshold and distribute as before, and GPU inference always
+distributes — so the cluster-scale wins are unaffected while sub-second small queries stop
+paying the fan-out tax.
