@@ -963,7 +963,7 @@ both saturate the same GPU at the same FLOPs; 2× there needs FP16, model-side).
 
 ## Dirty-data tolerance — Batcher retains 99%, Ray retains 0% (2026-07-02)
 
-Real AI data is messy: a fraction of images/records fail to decode. `benchmarks/cluster/gpu_dirty.py`
+Real AI data is messy: a fraction of images/records fail to decode. `benchmarks/cluster/robustness/gpu_dirty.py`
 injects ~1% corrupt rows (a UDF that raises on them) across 200k rows and asks each engine to
 *survive* and keep the good data.
 

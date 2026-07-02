@@ -12,8 +12,8 @@ pipeline pinned to ``torch_dtype=float32`` via a class UDF. Correctness-gated: t
 precisions must agree on ≥ the required fraction of predicted labels before any timing.
 
 Run:
-    python benchmarks/cluster/gpu_autofp16.py
-    BENCH_FP16_MODEL=<hf-classifier-id> python benchmarks/cluster/gpu_autofp16.py
+    python benchmarks/cluster/robustness/gpu_autofp16.py
+    BENCH_FP16_MODEL=<hf-classifier-id> python benchmarks/cluster/robustness/gpu_autofp16.py
 """
 
 from __future__ import annotations

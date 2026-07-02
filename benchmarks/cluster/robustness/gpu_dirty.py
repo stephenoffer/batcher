@@ -11,7 +11,7 @@ injects ~1% corrupt rows (a UDF that raises on them) and compares:
 * throughput on the surviving data.
 
 Run:
-    python benchmarks/cluster/gpu_dirty.py            # 200k rows, ~1% corrupt
+    python benchmarks/cluster/robustness/gpu_dirty.py            # 200k rows, ~1% corrupt
 """
 
 from __future__ import annotations
