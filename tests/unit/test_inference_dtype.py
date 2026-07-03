@@ -84,3 +84,50 @@ def test_accel_kwargs_places_on_any_accelerator(monkeypatch, backend, expected_d
     # No dtype needed for this assertion; force it None so we isolate device placement.
     monkeypatch.setattr("batcher.ml.gpu.recommend_inference_dtype", lambda b=None: None)
     assert _pipeline_accel_kwargs() == {"device": expected_device}
+
+
+def test_compile_helper_is_noop_off_or_on_cpu(monkeypatch):
+    """`_maybe_compile_pipeline` never touches the model when compile is off or there is no
+    GPU — a perf optimization must never break inference on the CPU/test host."""
+    import dataclasses
+
+    from batcher.config import active_config, config_context
+    from batcher.ml.inference import _maybe_compile_pipeline
+
+    class _Pipe:
+        model = "orig"
+
+    # off -> untouched
+    base = active_config()
+    off = base.replace(distributed=dataclasses.replace(base.distributed, torch_compile=False))
+    with config_context(off):
+        p = _Pipe()
+        _maybe_compile_pipeline(p)
+        assert p.model == "orig"
+
+    # on but GPU-less host -> untouched (torch.cuda unavailable)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False, raising=False)
+    p2 = _Pipe()
+    _maybe_compile_pipeline(p2)
+    assert p2.model == "orig"
+
+
+def test_compile_skips_non_cnn_on_gpu(monkeypatch):
+    """Only CNN (Conv2d) models are compiled — a text transformer (no conv) is left eager,
+    because torch.compile regresses dynamic-shape text models."""
+    torch = pytest.importorskip("torch")
+    from batcher.ml.inference import _maybe_compile_pipeline
+
+    class _Text(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(4, 4)
+
+    class _Pipe:
+        pass
+
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True, raising=False)
+    p = _Pipe()
+    p.model = _Text()
+    _maybe_compile_pipeline(p)
+    assert type(p.model).__name__ == "_Text"  # untouched — not a CNN

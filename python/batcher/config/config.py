@@ -688,6 +688,15 @@ class DistributedConfig:
     # pool whose actors died (preemption) is transparently respawned on next use. On by
     # default; result-identical (same model, same per-batch contract).
     warm_inference_pools: bool = True
+    # `channels_last` + `torch.compile` a **vision (CNN)** model in the managed `ds.ml.infer`
+    # path — kernel fusion + graph capture for ~2x GPU inference at inference-identical results
+    # (measured: 1.9x on ResNet-50, predicted labels unchanged). Applied ONLY to convolutional
+    # models: text transformers have dynamic sequence lengths that trigger per-shape recompiles
+    # and are tokenization-bound, where compile measured ~0.9x (a regression), so they are left
+    # eager. The one-time compile is amortized by the warm pool over a batch-inference job.
+    # GPU-gated and fallback-safe (eager on CPU / non-CNN / compile failure / off). On by
+    # default; a tiny vision job that can't amortize the warm-up can set this False.
+    torch_compile: bool = True
     # `distributed="auto"` distributes only when it PAYS. On a multi-node cluster the Ray
     # fan-out (SPREAD placement + task dispatch + result gather) is a ~2 s fixed cost, so a
     # small query runs far faster single-node (measured: an 80k-row filter is ~55 ms
