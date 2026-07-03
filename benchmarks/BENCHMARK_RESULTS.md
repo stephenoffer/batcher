@@ -1224,3 +1224,29 @@ Net: the prebuilt vision AI functions are ~2x and the GPU relational kernel is ~
 perf, both with the same safe CPU fallback and identical results. The architecture is now
 "integrate the fast GPU engine (cuDF / torch.compile), don't hand-roll it" — validated by the
 earlier negative result where a torch multi-GPU aggregate LOST to single-GPU cuDF.
+
+## backend="gpu" now covers the relational algebra via cuDF (2026-07-02)
+
+Extended the GPU backend from a single group-by to a **cuDF plan executor** (`core.gpu_plan`)
+that translates the plan's RelOp IR + Expr IR to cuDF operations — the same approach Polars-GPU
+takes to its cuDF engine. Supported on `collect(backend="gpu")`:
+
+| op | GPU (cuDF) | notes |
+|---|---|---|
+| filter | ✅ | arithmetic / comparison / and-or / math-fn predicates |
+| project / with_columns | ✅ | expression columns |
+| group-by aggregate | ✅ | multi-key; sum/count/mean/min/max (single-key runs distributed) |
+| sort (+ top-n) | ✅ | |
+| distinct | ✅ | |
+| limit | ✅ | |
+| **join** | ✅ | inner/left/right/outer equi-join + a chain above it |
+| chains of the above | ✅ | e.g. read → join → filter → group-by |
+
+Every shape is correctness-gated: the identical `_execute_df_plan` runs on **pandas** for the
+head-runnable unit tests (13 tests, translator == native CPU engine) and on **cuDF** on the GPU,
+verified end-to-end on the cluster (`backend="gpu"` == `"cpu"` for filter+project on 500k rows,
+multi-key group-by, sort+limit, distinct, a 2M-row inner join, and join+filter+agg). Anything
+outside the translated subset — window, union, a non-equi join, an unsupported expression, a
+cuDF-less worker, a GPU OOM — silently falls back to the CPU engine, so `backend="gpu"` is
+always safe. This is "as GPU-accelerated as possible" by *integrating* cuDF (the mature GPU
+dataframe, ~3x the torch kernel) rather than hand-rolling kernels.
