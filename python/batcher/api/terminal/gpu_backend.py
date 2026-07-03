@@ -75,9 +75,10 @@ def try_gpu_collect(
                 return None
             result = _dispatch_gpu_aggregate(pa.Table.from_batches(batches), key_src, aggs)
         # Record this GPU run so Kyber can learn the GPU/CPU crossover (Core measures, Kyber
-        # consumes). Keyed on the estimated input rows the decision used — the same x the CPU
-        # side records against — so the two fitted lines are comparable.
-        _record_gpu_timing(hub, decision.est_rows, (time.perf_counter() - t0) * 1000.0)
+        # consumes). Keyed on the source's ACTUAL input rows — the same exact x the CPU side
+        # records against — so the two fitted lines are directly comparable.
+        gpu_ms = (time.perf_counter() - t0) * 1000.0
+        _record_gpu_timing(hub, plan, sources, decision.est_rows, gpu_ms)
         if key_out != key_src and key_src in result.column_names:
             result = result.rename_columns(
                 [key_out if n == key_src else n for n in result.column_names]
@@ -122,14 +123,32 @@ def try_gpu_collect(
     return None
 
 
-def _record_gpu_timing(hub, est_rows: int, wall_ms: float) -> None:
-    """Feed one GPU aggregate run's (estimated rows, wall time) to Kyber's crossover learner.
+def _agg_input_rows(plan, sources, fallback: int = 0) -> int:
+    """The ACTUAL input row count for an aggregate-over-scan (the scan source's footer count) —
+    the exact x-coordinate for the crossover learner, identical for the same source across GPU
+    and CPU runs so the two fitted lines are directly comparable. An estimate drifts cold→warm
+    and would pollute the fit; the footer count does not. `fallback` (the estimate) is used only
+    when the source can't report an exact count."""
+    try:
+        spec = _gpu_agg_spec(plan)
+        if spec is not None:
+            rc = sources[spec[3].source_id].row_count()
+            if rc:
+                return int(rc)
+    except Exception:
+        pass
+    return fallback
+
+
+def _record_gpu_timing(hub, plan, sources, est_rows: int, wall_ms: float) -> None:
+    """Feed one GPU aggregate run's (actual input rows, wall time) to Kyber's crossover learner.
     Best-effort — a missing hub or unknown size is silently skipped; never breaks the query."""
-    if hub is None or est_rows <= 0:
+    rows = _agg_input_rows(plan, sources, fallback=est_rows)
+    if hub is None or rows <= 0:
         return
     from batcher.kyber.gpu import record_backend_timing
 
-    record_backend_timing(hub, "gpu", est_rows, wall_ms)
+    record_backend_timing(hub, "gpu", rows, wall_ms)
 
 
 def record_cpu_crossover(plan, sources, hub, wall_ms: float) -> None:
@@ -144,9 +163,9 @@ def record_cpu_crossover(plan, sources, hub, wall_ms: float) -> None:
         from batcher.kyber.gpu import record_backend_timing
         from batcher.kyber.gpu.policy import _estimate
 
-        rows, _ws = _estimate(plan, sources, hub)
+        rows = _agg_input_rows(plan, sources, fallback=int(_estimate(plan, sources, hub)[0] or 0))
         if rows:
-            record_backend_timing(hub, "cpu", int(rows), wall_ms)
+            record_backend_timing(hub, "cpu", rows, wall_ms)
     except Exception:  # pragma: no cover - learning must never break a query
         return
 

@@ -2,12 +2,13 @@
 
 `gpu_min_rows` is a measured default for one cluster; this closes Kyber's learning loop for the
 backend choice so it self-corrects to *this* hardware. Every GPU or CPU group-by run records its
-(estimated input rows, wall time) to the hub; from the two point-clouds we fit one line per
-backend — `t ≈ a + b·rows` — and solve for their crossover, the row count above which the GPU's
-lower per-row cost overtakes its higher fixed overhead. **Core measures, Kyber consumes:** a
-faster GPU, a slower CPU, or a wider table moves the threshold on its own. Until enough distinct
-samples exist for both backends the learned value is `None` and the caller keeps the config
-default.
+(actual input rows, wall time) to the hub — the *actual* footer row count, not an estimate, so
+the same source yields the same x on both backends and cold/warm estimate drift can't pollute
+the fit. From the two point-clouds we fit one line per backend — `t ≈ a + b·rows` — and solve
+for their crossover, the row count above which the GPU's lower per-row cost overtakes its higher
+fixed overhead. **Core measures, Kyber consumes:** a faster GPU, a slower CPU, or a wider table
+moves the threshold on its own. Until enough distinct samples exist for both backends the learned
+value is `None` and the caller keeps the config default.
 
 Storage is a per-backend bucket of ordinary least-squares sufficient statistics
 (`n, Σx, Σy, Σxx, Σxy`) under one hub learned-params namespace, updated in place — O(1) per run,
