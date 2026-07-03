@@ -71,3 +71,30 @@ def test_unsupported_shapes_return_none():
     assert gpu_plan_ops(ds.map_batches(lambda b: b)._plan) is None
     # a group key that is an EXPRESSION (not a plain column) -> unsupported (safe fallback)
     assert gpu_plan_ops(ds.group_by(x2=col("x") + 1).agg(s=col("y").sum())._plan) is None
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda a, b: a.join(b, on="id", how="inner"),
+        lambda a, b: a.join(b, on="id", how="left"),
+        lambda a, b: a.join(b, on="id", how="inner").filter(col("w") > 100),
+        lambda a, b: a.join(b, on="id", how="inner").group_by("w").agg(s=col("v").sum()),
+    ],
+)
+def test_join_translator_matches_cpu_engine(build):
+    import pandas as pd
+
+    from batcher.core.gpu_plan import _execute_join_plan, gpu_join_spec
+
+    fact = pa.table({"id": np.array([1, 2, 3, 1, 2], "int64"), "v": np.array([1.0, 2, 3, 4, 5])})
+    dim = pa.table({"id": np.array([1, 2, 3], "int64"), "w": np.array([100, 200, 300], "int64")})
+    ds = build(bt.from_arrow(fact), bt.from_arrow(dim))
+    spec = gpu_join_spec(ds._plan)
+    assert spec is not None
+    ls, rs, jir, ops = spec
+    lt = fact if ls.source_id == 0 else dim
+    rt = dim if rs.source_id == 1 else fact
+    got = _execute_join_plan(lt, rt, jir, ops, pd)
+    exp = ds.collect().to_pandas()
+    assert _norm(got[exp.columns]).equals(_norm(exp))

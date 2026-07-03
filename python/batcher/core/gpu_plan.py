@@ -22,7 +22,9 @@ if TYPE_CHECKING:
 
     from batcher.plan.logical import LogicalPlan
 
-__all__ = ["execute_cudf_plan", "gpu_plan_ops"]
+__all__ = ["execute_cudf_join", "execute_cudf_plan", "gpu_join_spec", "gpu_plan_ops"]
+
+_JOIN_HOW = {"inner": "inner", "left": "left", "right": "right", "outer": "outer", "full": "outer"}
 
 _SUPPORTED_OPS = ("filter", "project", "aggregate", "sort", "distinct", "limit")
 _AGG_FUNCS = {"sum", "count", "mean", "min", "max"}
@@ -71,6 +73,36 @@ def gpu_plan_ops(plan: LogicalPlan):
         return None
     ops.reverse()  # bottom-up: apply nearest-the-scan first
     return node, ops
+
+
+def gpu_join_spec(plan: LogicalPlan):
+    """`(left_scan, right_scan, join_ir, [op_ir, ...])` for a `[supported ops] over Join(scan,
+    scan)` plan, else `None`. Enables an equi-join plus a supported op chain above it on the GPU;
+    both join sides must be plain scans (a chain under a join → CPU fallback for now)."""
+    from batcher.plan.logical import Join, Scan
+
+    ops: list[dict] = []
+    node: Any = plan
+    while node is not None and not isinstance(node, (Scan, Join)):
+        try:
+            ir = node.to_ir()
+        except Exception:
+            return None
+        if ir.get("op") not in _SUPPORTED_OPS or (
+            ir["op"] == "aggregate" and not _agg_is_supported(ir)
+        ):
+            return None
+        ops.append(ir)
+        node = getattr(node, "input", None)
+    if not isinstance(node, Join):
+        return None
+    if not isinstance(node.left, Scan) or not isinstance(node.right, Scan):
+        return None
+    join_ir = node.to_ir()
+    if join_ir.get("join_type") not in _JOIN_HOW:
+        return None
+    ops.reverse()
+    return node.left, node.right, join_ir, ops
 
 
 def _agg_is_supported(ir: dict) -> bool:
@@ -164,10 +196,7 @@ def _aggregate(df, op: dict, lib):
 
 def _execute_df_plan(table: pa.Table, ops: list[dict], lib):
     """Replay `ops` on a dataframe built from `table` using module `lib` (cuDF or pandas)."""
-    if hasattr(lib.DataFrame, "from_arrow"):
-        df = lib.DataFrame.from_arrow(table)
-    else:
-        df = table.to_pandas()
+    df = _df_from_arrow(table, lib)
     for op in ops:
         df = _apply(df, op, lib)
     return df
@@ -180,3 +209,40 @@ def execute_cudf_plan(table: pa.Table, ops: list[dict]) -> pa.Table:
 
     out = _execute_df_plan(table, ops, cudf)
     return out.to_arrow()
+
+
+def _df_from_arrow(table, lib):
+    if hasattr(lib.DataFrame, "from_arrow"):
+        return lib.DataFrame.from_arrow(table)
+    return table.to_pandas()
+
+
+def _execute_join_plan(left_t, right_t, join_ir: dict, ops: list[dict], lib):
+    """Equi-join two tables then replay `ops`. Each side's columns are prefixed (L__/R__) before
+    the merge so same-named columns never collide; the join's `output` spec then picks the right
+    side by name and aliases it — the exact columns and order the CPU engine would produce."""
+    lg = _df_from_arrow(left_t, lib).add_prefix("L__")
+    rg = _df_from_arrow(right_t, lib).add_prefix("R__")
+    merged = lg.merge(
+        rg,
+        left_on=[f"L__{k}" for k in join_ir["left_keys"]],
+        right_on=[f"R__{k}" for k in join_ir["right_keys"]],
+        how=_JOIN_HOW[join_ir["join_type"]],
+    )
+    cols = {}
+    for o in join_ir["output"]:
+        src = ("L__" if o["side"] == "left" else "R__") + o["name"]
+        cols[o["alias"]] = merged[src].reset_index(drop=True)
+    out = lib.DataFrame(cols)
+    for op in ops:
+        out = _apply(out, op, lib)
+    return out
+
+
+def execute_cudf_join(
+    left_t: pa.Table, right_t: pa.Table, join_ir: dict, ops: list[dict]
+) -> pa.Table:
+    """Run an equi-join + op chain on the GPU via cuDF, returning Arrow."""
+    import cudf
+
+    return _execute_join_plan(left_t, right_t, join_ir, ops, cudf).to_arrow()
