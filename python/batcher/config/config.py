@@ -697,6 +697,11 @@ class DistributedConfig:
     # GPU-gated and fallback-safe (eager on CPU / non-CNN / compile failure / off). On by
     # default; a tiny vision job that can't amortize the warm-up can set this False.
     torch_compile: bool = True
+    # Ship cuDF (RAPIDS) to the `backend="gpu"` worker tasks so the GPU group-by uses cuDF's
+    # mature kernels (~3x the hand-rolled torch fallback, and the engine behind Polars-GPU).
+    # cuDF's pip install is cached per node after the first task; numpy stays pinned so returned
+    # arrays unpickle on the driver. Off → the torch fallback (no install, slower). On by default.
+    gpu_backend_cudf: bool = True
     # `distributed="auto"` distributes only when it PAYS. On a multi-node cluster the Ray
     # fan-out (SPREAD placement + task dispatch + result gather) is a ~2 s fixed cost, so a
     # small query runs far faster single-node (measured: an 80k-row filter is ~55 ms

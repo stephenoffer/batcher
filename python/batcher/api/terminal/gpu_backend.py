@@ -127,7 +127,6 @@ def _distributed_gpu_aggregate(
 
         from batcher.dist.executors.partition_io import _scan_splits
         from batcher.dist.executors.ray_runtime import _ensure_ray, cluster_topology
-        from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
     except Exception:
         return None
 
@@ -148,7 +147,7 @@ def _distributed_gpu_aggregate(
     descs = partition_descriptors(source, n_gpus)
     partial_aggs = _partial_aggs(aggs)
     opts: dict = {"num_gpus": 1}
-    rt = worker_runtime_env()
+    rt = _gpu_task_runtime_env()
     if rt is not None:
         opts["runtime_env"] = rt
     task = ray.remote(**opts)(_gpu_partial_task)
@@ -179,6 +178,20 @@ def _gpu_agg_spec(plan: LogicalPlan):
             return None
         aggs[spec.alias] = (ae.input.name, ae.func)
     return gk.alias, gk.expr.name, aggs, plan.input
+
+
+def _gpu_task_runtime_env() -> dict | None:
+    """The runtime_env for a GPU dispatch task: batcher (via `worker_runtime_env`, so the worker
+    can import the kernel) plus — when `distributed.gpu_backend_cudf` is on — cuDF (pip) so the
+    group-by uses cuDF's fast kernels. numpy is pinned to the cluster version so arrays returned
+    from the task unpickle on the driver (cuDF's install otherwise drags numpy to 2.x)."""
+    from batcher.config import active_config
+    from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
+
+    rt = dict(worker_runtime_env() or {})
+    if active_config().distributed.gpu_backend_cudf:
+        rt["pip"] = ["cudf-cu13==26.6.0", "numpy==1.26.4"]
+    return rt or None
 
 
 def _cluster_has_gpu() -> bool:
@@ -214,11 +227,10 @@ def _dispatch_gpu_aggregate(table: pa.Table, key: str, aggs: dict) -> pa.Table:
     import ray
 
     from batcher.dist.executors.ray_runtime import _ensure_ray
-    from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
 
     _ensure_ray(1)
     opts: dict = {"num_gpus": 1}
-    rt = worker_runtime_env()
+    rt = _gpu_task_runtime_env()
     if rt is not None:
         opts["runtime_env"] = rt
     task = ray.remote(**opts)(_gpu_aggregate_worker)
