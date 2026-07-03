@@ -129,15 +129,17 @@ def main() -> int:
     )
     task = ray.remote(num_gpus=1, num_cpus=cfg["workers"])(_worker)
     t0 = time.perf_counter()
-    results = ray.get(
-        [task.remote(i, cfg["batch"], cfg["iters"], cfg["warmup"], cfg["workers"]) for i in range(n_gpus)]
-    )
+    refs = [
+        task.remote(i, cfg["batch"], cfg["iters"], cfg["warmup"], cfg["workers"])
+        for i in range(n_gpus)
+    ]
+    results = ray.get(refs)
     wall = time.perf_counter() - t0
     utils = [r["mean_util"] for r in results]
     for r in sorted(results, key=lambda r: r["gpu"]):
         print(f"  gpu[{r['gpu']}]  util={r['mean_util']:5.1f}%")
     agg = sum(utils) / len(utils)
-    flag = "  >= FULL CAPACITY" if agg >= 90 and min(utils) >= 85 else "  (GPU-starved: decode-bound)"
+    flag = "  >= FULL CAPACITY" if agg >= 90 and min(utils) >= 85 else "  (GPU-starved)"
     print(f"\ncluster GPU util: mean={agg:.1f}%  min={min(utils):.1f}%{flag}")
     print(f"cluster throughput: {sum(r['imgs'] for r in results) / wall:.0f} img/s")
     return 0

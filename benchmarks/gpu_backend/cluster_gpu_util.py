@@ -103,7 +103,8 @@ def main() -> int:
 
     task = ray.remote(num_gpus=1)(_worker)
     t0 = time.perf_counter()
-    results = ray.get([task.remote(i, cfg["batch"], cfg["iters"], cfg["warmup"]) for i in range(n_gpus)])
+    refs = [task.remote(i, cfg["batch"], cfg["iters"], cfg["warmup"]) for i in range(n_gpus)]
+    results = ray.get(refs)
     wall = time.perf_counter() - t0
 
     utils = [r["mean_util"] for r in results]
