@@ -1094,8 +1094,8 @@ Both correctness-gated.
 
 | query | rows | Batcher CPU | GPU end-to-end | GPU compute-only |
 |---|---|---|---|---|
-| group-by SUM (Q1 core), `benchmarks/gpu_backend/tpch_gpu_agg.py` | 50M | 21 M rows/s | **13.6×** (incl. transfer) | 751× (resident) |
-| **TPC-H Q6** (filter + revenue), `benchmarks/gpu_backend/tpch_q6_gpu.py` | 100M | 9.7 M rows/s | **14.2×** (incl. transfer) | 240× (resident) |
+| group-by SUM (Q1 core) via the productized `core.gpu_transform` kernel | 50M | 21 M rows/s | **7.6×** (incl. transfer + arbitrary-key densify) | — |
+| **TPC-H Q6** (filter + revenue, inline fused torch) | 100M | 9.7 M rows/s | **14.2×** (incl. transfer) | 240× (resident) |
 
 Both revenue/sums are bit-exact vs Batcher (rel err ≤ 2e-16). The **end-to-end** numbers
 (13–14×) include the one host→device PCIe transfer; the **compute-only** ceiling (240–751×) is
