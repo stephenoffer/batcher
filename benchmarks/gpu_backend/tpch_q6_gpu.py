@@ -32,7 +32,10 @@ _DISC_LO, _DISC_HI, _QTY_MAX = 0.05, 0.07, 24.0
 
 
 def _cfg() -> dict:
-    return {"n": int(os.environ.get("BENCH_Q6_N", "100000000")), "runs": int(os.environ.get("BENCH_RUNS", "3"))}
+    return {
+        "n": int(os.environ.get("BENCH_Q6_N", "100000000")),
+        "runs": int(os.environ.get("BENCH_RUNS", "3")),
+    }
 
 
 def _init() -> None:
