@@ -37,10 +37,23 @@ def test_self_ship_uploads_a_source_install(monkeypatch):
     assert env == {"py_modules": ["/repo/python/batcher"]}
 
 
-def test_self_ship_skips_a_site_packages_install(monkeypatch):
+def test_self_ship_uploads_a_site_packages_install_too(monkeypatch):
+    # A pip/site-packages install is shipped too: a driver that pip-installed batcher and
+    # attached to an arbitrary cluster cannot assume that cluster's image carries a compatible
+    # batcher, so shipping guarantees driver==worker code (the old skip-for-site-packages
+    # heuristic produced a silent ModuleNotFoundError on the local-install → remote-cluster case).
     monkeypatch.setattr(
         "batcher.__file__", "/opt/conda/lib/python3.12/site-packages/batcher/__init__.py"
     )
+    assert lifecycle._self_ship_runtime_env() == {
+        "py_modules": ["/opt/conda/lib/python3.12/site-packages/batcher"]
+    }
+
+
+def test_self_ship_skipped_only_when_cluster_image_is_trusted(monkeypatch, restore_config):
+    # The one opt-out: a production image that bakes a matching batcher into every node.
+    monkeypatch.setattr("batcher.__file__", "/repo/python/batcher/__init__.py")
+    _with_distributed(trust_cluster_image=True)
     assert lifecycle._self_ship_runtime_env() is None
 
 

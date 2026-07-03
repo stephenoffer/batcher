@@ -626,7 +626,7 @@ def test_record_exec_metrics_computes_cpu_utilization():
 
 
 def test_fractional_gpu_round_trips_through_options_and_bundle():
-    from batcher.dist.executors.ray_runtime import _bundle
+    from batcher.dist.executors.ray_runtime.scheduling import _bundle
 
     env = SchedulingEnvelope(num_cpus=0.5, memory_bytes=0, num_gpus=0.25, n_tasks=2, credits=4)
     # Ray scheduling kwargs carry the fractional GPU verbatim (so 4 actors pack a GPU).
@@ -638,10 +638,13 @@ def test_fractional_gpu_round_trips_through_options_and_bundle():
 def test_clamp_workers_packs_fractional_cpu(monkeypatch):
     ray = pytest.importorskip("ray")
     from batcher.dist.executors import ray_runtime
+    from batcher.dist.executors.ray_runtime import scaling
 
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    # clamp_workers reads cluster_topology from its own module (scaling), so patch it there —
+    # patching only the ray_runtime re-export would not reach the in-module lookup.
     monkeypatch.setattr(
-        ray_runtime, "cluster_topology", lambda: {"nodes": 1, "cpus": 8.0, "gpus": 0.0}
+        scaling, "cluster_topology", lambda: {"nodes": 1, "cpus": 8.0, "gpus": 0.0}
     )
     # 0.5 CPU/task → 16 tasks fit on 8 cores; 1.0 reproduces today's count; 2.0 → 4.
     assert ray_runtime.clamp_workers(16, 0.5) == 16
