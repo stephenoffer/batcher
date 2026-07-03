@@ -3,7 +3,7 @@
 cuDF / Polars-GPU run on ONE GPU. Batcher has many. The lever to beat them: a pool of
 persistent GPU actors, each holding a resident shard of the data, aggregating in parallel; the
 driver combines the mergeable partials. Warm (data resident, model of an iterative query) the
-pool's throughput is ~N_gpus × a single GPU's — so 8×T4 should beat single-GPU cuDF well past 2×.
+pool's throughput is ~N_gpus x a single GPU's, so 8 T4s should beat single-GPU cuDF well past 2x.
 
 Compares, on the same 20M-row / 200k-group aggregate, all GPU-resident (warm):
   * Batcher multi-GPU persistent actors (this prototype)
@@ -126,7 +126,10 @@ def main() -> int:
     actors = [ShardAgg.remote() for _ in range(n_gpus)]
     bounds = np.linspace(0, n, n_gpus + 1).astype(int)
     ray.get(
-        [actors[i].load.remote(keys[bounds[i] : bounds[i + 1]], vals[bounds[i] : bounds[i + 1]]) for i in range(n_gpus)]
+        [
+            actors[i].load.remote(keys[bounds[i] : bounds[i + 1]], vals[bounds[i] : bounds[i + 1]])
+            for i in range(n_gpus)
+        ]
     )
 
     # Warm multi-GPU aggregate: all actors aggregate their resident shard in parallel, combine.
@@ -152,7 +155,8 @@ def main() -> int:
         t = time.perf_counter()
         multi_gpu_run()
         best_mg = min(best_mg, time.perf_counter() - t)
-    print(f"batcher multi-GPU ({n_gpus}x)  {n / best_mg / 1e6:8.1f} M rows/s  ({best_mg * 1000:.1f} ms)")
+    mg_r = n / best_mg / 1e6
+    print(f"batcher multi-GPU ({n_gpus}x)  {mg_r:8.1f} M rows/s  ({best_mg * 1000:.1f} ms)")
 
     # Release the persistent actors so their GPUs free up — otherwise the single-GPU cuDF task
     # (num_gpus=1) can never schedule (the whole cluster's GPUs are held by the pool).
@@ -169,7 +173,8 @@ def main() -> int:
         print(f"cuDF unavailable: {type(e).__name__}")
 
     if best_cudf is not None:
-        print(f"cudf single-GPU            {n / best_cudf / 1e6:8.1f} M rows/s  ({best_cudf * 1000:.1f} ms)")
+        cd_r = n / best_cudf / 1e6
+        print(f"cudf single-GPU            {cd_r:8.1f} M rows/s  ({best_cudf * 1000:.1f} ms)")
         print(f"\nBatcher {n_gpus}xGPU vs cuDF single-GPU: {best_cudf / best_mg:.2f}x")
     return 0
 
