@@ -54,35 +54,25 @@ def _init() -> None:
         )
 
 
-def _gpu_groupby_sum(
-    keys_np, vals_np, n_groups: int, runs: int
-) -> tuple[list[float], float, float]:
-    """A group-by SUM on the GPU via torch scatter_add.
+def _gpu_groupby_sum(keys_np, vals_np, runs: int) -> tuple[dict, float]:
+    """Run Batcher's GPU kernel (`core.gpu_transform.gpu_groupby_agg`) on a GPU worker.
 
-    Returns `(per_group_sums, best_compute_s, best_e2e_s)`: compute-only (data already resident
-    on the GPU — the ceiling when ops are fused so one transfer is amortized) and end-to-end
-    (host→device transfer + compute + device→host result — the honest cost of a single op)."""
-    import torch
+    Returns `(key->sum map, best_end_to_end_seconds)` — the honest single-op cost including the
+    host→device transfer done inside the kernel. Exercises the productized module on real GPU
+    hardware (the module's algorithm is separately unit-tested on CPU-torch vs the CPU engine)."""
+    import pyarrow as pa
 
-    dev = torch.device("cuda")
-    best_compute = float("inf")
-    best_e2e = float("inf")
+    from batcher.core.gpu_transform import gpu_groupby_agg
+
+    tbl = pa.table({"k": keys_np, "v": vals_np})
     out = None
+    best_e2e = float("inf")
     for _ in range(runs):
-        torch.cuda.synchronize()
         t0 = time.perf_counter()
-        keys = torch.from_numpy(keys_np).to(dev)
-        vals = torch.from_numpy(vals_np).to(dev)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        out = torch.zeros(n_groups, device=dev, dtype=torch.float64).scatter_add_(0, keys, vals)
-        torch.cuda.synchronize()
-        t2 = time.perf_counter()
-        result = out.cpu().numpy()
-        t3 = time.perf_counter()
-        best_compute = min(best_compute, t2 - t1)
-        best_e2e = min(best_e2e, t3 - t0)
-    return result.tolist(), best_compute, best_e2e
+        out = gpu_groupby_agg(tbl, "k", {"s": ("v", "sum")})
+        best_e2e = min(best_e2e, time.perf_counter() - t0)
+    d = out.to_pydict()
+    return dict(zip(d["k"], d["s"], strict=True)), best_e2e
 
 
 def main() -> int:
@@ -113,24 +103,28 @@ def main() -> int:
         batcher_run()
         best_cpu = min(best_cpu, time.perf_counter() - t0)
 
-    # GPU transform on a worker (the driver has no GPU).
-    gpu_task = ray.remote(num_gpus=1)(_gpu_groupby_sum)
-    gpu_sums, best_compute, best_e2e = ray.get(gpu_task.remote(keys, vals, g, cfg["runs"]))
+    # GPU transform on a worker (the driver has no GPU), running the real Batcher kernel.
+    # `worker_runtime_env()` ships the driver's batcher (package + native .so) so the GPU
+    # worker can `import batcher.core.gpu_transform` regardless of Ray init order.
+    from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
 
-    max_err = max(abs(b_map.get(i, 0.0) - gpu_sums[i]) for i in range(g))
+    opts = {"num_gpus": 1}
+    rt = worker_runtime_env()
+    if rt is not None:
+        opts["runtime_env"] = rt
+    gpu_task = ray.remote(**opts)(_gpu_groupby_sum)
+    gpu_sums, best_e2e = ray.get(gpu_task.remote(keys, vals, cfg["runs"]))
+
+    max_err = max(abs(b_map.get(i, 0.0) - gpu_sums.get(i, 0.0)) for i in range(g))
     print(f"per-group sum agreement over {g} groups: max abs err {max_err:.2e}")
     if max_err > 1e-3:
         print("FAIL: GPU and CPU group sums diverge — not reporting")
         return 1
 
-    cpu_r, e2e_r, comp_r = n / best_cpu / 1e6, n / best_e2e / 1e6, n / best_compute / 1e6
-    print(f"batcher-cpu       {cpu_r:8.1f} M rows/s  ({best_cpu * 1000:.0f} ms)")
-    print(f"torch-gpu e2e     {e2e_r:8.1f} M rows/s  ({best_e2e * 1000:.1f} ms)  [+H2D transfer]")
-    print(f"torch-gpu compute {comp_r:8.1f} M rows/s  ({best_compute * 1000:.1f} ms)  [resident]")
-    print(
-        f"\nGPU vs Batcher CPU: {best_cpu / best_e2e:.1f}x end-to-end (single op, transfer-bound), "
-        f"{best_cpu / best_compute:.0f}x compute-only (fused/resident ceiling)"
-    )
+    cpu_r, e2e_r = n / best_cpu / 1e6, n / best_e2e / 1e6
+    print(f"batcher-cpu           {cpu_r:8.1f} M rows/s  ({best_cpu * 1000:.0f} ms)")
+    print(f"batcher-gpu (kernel)  {e2e_r:8.1f} M rows/s  ({best_e2e * 1000:.1f} ms)  [end-to-end]")
+    print(f"\nGPU group-by (core.gpu_transform) vs Batcher CPU: {best_cpu / best_e2e:.1f}x")
     return 0
 
 
