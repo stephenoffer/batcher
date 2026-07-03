@@ -92,3 +92,31 @@ def test_decision_consumes_the_learned_threshold():
     # Same plan, same estimate — now above the learned threshold, so Kyber picks the GPU.
     d = decide_gpu_backend(q._plan, q._sources, hub, gpu_count=4, force=False)
     assert d.use_gpu is True
+
+
+def test_record_cpu_crossover_feeds_the_learner_when_a_gpu_is_present(monkeypatch):
+    # The executor's CPU-side hook records a sample only on a GPU cluster (else it's a no-op that
+    # never calls the estimator). Mock the GPU count so the gated path runs without a cluster.
+    from batcher.api.terminal import gpu_backend
+
+    monkeypatch.setattr(gpu_backend, "_cluster_gpu_count", lambda: 4)
+    hub = _hub()
+    ds = bt.from_pydict({"k": [1, 1, 2, 3], "v": [1.0, 2.0, 3.0, 4.0]})
+    q = ds.group_by("k").agg(s=bt.col("v").sum())
+    gpu_backend.record_cpu_crossover(q._plan, q._sources, hub, wall_ms=12.3)
+    # a "cpu" bucket now exists in the crossover namespace
+    from batcher.kyber.gpu.adaptive import _NS
+
+    assert (hub.get_keyed_param(_NS, "cpu") or {}).get("n", 0) == 1
+
+
+def test_record_cpu_crossover_is_a_noop_without_a_gpu(monkeypatch):
+    from batcher.api.terminal import gpu_backend
+    from batcher.kyber.gpu.adaptive import _NS
+
+    monkeypatch.setattr(gpu_backend, "_cluster_gpu_count", lambda: 0)
+    hub = _hub()
+    ds = bt.from_pydict({"k": [1, 2], "v": [1.0, 2.0]})
+    q = ds.group_by("k").agg(s=bt.col("v").sum())
+    gpu_backend.record_cpu_crossover(q._plan, q._sources, hub, wall_ms=5.0)
+    assert hub.get_keyed_param(_NS, "cpu") is None  # nothing recorded on a CPU-only cluster
