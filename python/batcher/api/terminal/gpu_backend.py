@@ -1,18 +1,24 @@
-"""The opt-in GPU execution backend for a supported relational shape.
+"""The opt-in GPU execution backend for supported relational shapes.
 
-`collect(backend="gpu")` routes a supported plan — currently a single-key group-by aggregate
-(sum/count/mean/min/max over numeric columns) directly over a scan — to the GPU, and falls
-back to the native CPU engine for everything else (and when no GPU is present). The heavy
-compute (the aggregate) runs on a GPU worker via the tested `core.gpu_transform` kernel; the
-dispatch ships the driver's batcher with `worker_runtime_env()` so the worker can import it.
+`collect(backend="gpu")` routes a supported plan to the GPU and falls back to the native CPU
+engine for everything else (and when no GPU is present). Two routes:
 
-This is the "CPU and GPU backends for data transformations" seam: same result, different
-*where*. GPU is an accelerator, never a requirement — an unsupported shape or a GPU-less
-cluster silently uses the CPU engine, so `backend="gpu"` is always safe to request.
+* A pure single-key group-by aggregate over a scan runs **distributed** — each GPU worker
+  partial-aggregates its own shard (cuDF kernel), mergeable combine on the driver — so it scales
+  past one GPU's memory (2B rows where single-GPU cuDF/Polars-GPU OOM).
+* A linear chain of ops — filter, project / with_columns, multi-key group-by, sort, distinct,
+  limit — is translated to a cuDF execution (`core.gpu_plan`) and run on one GPU.
+
+The GPU tasks ship batcher (`worker_runtime_env`) + cuDF (a merged runtime_env) so the worker
+runs the tested kernels. This is the "CPU and GPU backends for data transformations" seam: same
+result, different *where*. GPU is an accelerator, never a requirement — an unsupported shape,
+expression, OOM, or a GPU-less cluster silently uses the CPU engine, so `backend="gpu"` is
+always safe to request.
 """
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -32,27 +38,42 @@ def try_gpu_collect(plan: LogicalPlan, sources: list[Source]) -> pa.Table | None
     **distributed** GPU aggregate (each GPU worker reads and partial-aggregates its own shard —
     no whole-table transfer, uses every GPU); otherwise a single-dispatch path ships one table
     to one GPU (fine for small / in-memory sources)."""
-    spec = _gpu_agg_spec(plan)
-    if spec is None or not _cluster_has_gpu():
+    if not _cluster_has_gpu():
         return None
-    key_out, key_src, aggs, scan = spec
     import pyarrow as pa
 
-    source = sources[scan.source_id]
-    distributed = _distributed_gpu_aggregate(source, key_src, aggs)
-    if distributed is not None:
-        result = distributed
-    else:
-        batches = list(source.read())
-        if not batches:
-            return None
-        result = _dispatch_gpu_aggregate(pa.Table.from_batches(batches), key_src, aggs)
-    # The kernel names the group column by its source name; rename to the aggregate's alias.
-    if key_out != key_src and key_src in result.column_names:
-        result = result.rename_columns(
-            [key_out if n == key_src else n for n in result.column_names]
-        )
-    return result
+    # Fast path: a pure single-key group-by aggregate over a scan runs DISTRIBUTED (each GPU
+    # worker partial-aggregates its own shard, mergeable combine) — scales past one GPU's memory.
+    spec = _gpu_agg_spec(plan)
+    if spec is not None:
+        key_out, key_src, aggs, scan = spec
+        distributed = _distributed_gpu_aggregate(sources[scan.source_id], key_src, aggs)
+        if distributed is not None:
+            result = distributed
+        else:
+            batches = list(sources[scan.source_id].read())
+            if not batches:
+                return None
+            result = _dispatch_gpu_aggregate(pa.Table.from_batches(batches), key_src, aggs)
+        if key_out != key_src and key_src in result.column_names:
+            result = result.rename_columns(
+                [key_out if n == key_src else n for n in result.column_names]
+            )
+        return result
+
+    # General path: a linear chain of supported ops (filter / project / sort / distinct / limit /
+    # multi-key aggregate) is translated to cuDF and run on ONE GPU (single-dispatch). Correct for
+    # any data that fits a GPU; OOM / an unsupported expression falls back to the CPU engine.
+    from batcher.core.gpu_plan import gpu_plan_ops
+
+    plan_spec = gpu_plan_ops(plan)
+    if plan_spec is None:
+        return None
+    scan, ops = plan_spec
+    batches = list(sources[scan.source_id].read())
+    if not batches:
+        return None
+    return _dispatch_cudf_plan(pa.Table.from_batches(batches), ops)
 
 
 def _partial_aggs(aggs: dict[str, tuple[str, str]]) -> dict[str, tuple[str, str]]:
@@ -156,6 +177,37 @@ def _distributed_gpu_aggregate(
     if not partials:
         return None
     return _combine_partials(partials, key, aggs)
+
+
+def _cudf_plan_worker(table, ops):
+    from batcher.core.gpu_plan import execute_cudf_plan
+
+    return execute_cudf_plan(table, ops)
+
+
+def _dispatch_cudf_plan(table: pa.Table, ops: list[dict]) -> pa.Table | None:
+    """Run a translated op chain on ONE GPU via cuDF — in-process if this process owns a GPU with
+    cuDF, else on a GPU worker (cuDF shipped in the runtime_env). Returns `None` on any failure —
+    an unsupported expression, a cuDF-less worker, or a GPU OOM — so the caller uses the CPU
+    engine. GPU is an accelerator, never a requirement."""
+    from batcher.core.gpu_transform import gpu_available
+
+    try:
+        if gpu_available():
+            with contextlib.suppress(Exception):
+                return _cudf_plan_worker(table, ops)  # GPU-equipped process with cuDF
+        import ray
+
+        from batcher.dist.executors.ray_runtime import _ensure_ray
+
+        _ensure_ray(1)
+        opts: dict = {"num_gpus": 1}
+        rt = _gpu_task_runtime_env()
+        if rt is not None:
+            opts["runtime_env"] = rt
+        return ray.get(ray.remote(**opts)(_cudf_plan_worker).remote(table, ops))
+    except Exception:
+        return None  # cuDF-less / OOM / unsupported expr -> CPU fallback
 
 
 def _gpu_agg_spec(plan: LogicalPlan):
