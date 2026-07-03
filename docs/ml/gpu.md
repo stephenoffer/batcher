@@ -61,16 +61,24 @@ ds.ml.infer(Model, num_gpus=1, concurrency=4, accelerator_type="NVIDIA_A100")
 
 ## Letting the engine pack by memory
 
-`model_memory_gb` declares the model's footprint in gigabytes. The resource layer
-uses it to budget host RAM per worker (OOM protection) and to VRAM-pack small models
-onto a shared GPU — so you can state the size once and let the engine choose a safe
-packing instead of hand-tuning `num_gpus`. Kyber also uses it to cost an inference
-stage by model size.
+`model_memory_gb` declares the model's footprint in gigabytes. State the size once and
+Kyber sizes the stage for you: when you leave `num_gpus` and `batch_size` unset, it
+picks the GPU fraction from the model's size versus one GPU's memory — packing several
+copies of a light model onto one device, or reserving whole GPUs for a model larger
+than one — and seeds the initial `batch_size` from the VRAM left after the model. The
+online throughput controller then refines that batch size from measured VRAM and
+throughput. The resource layer additionally uses `model_memory_gb` to budget host RAM
+per worker (OOM protection), and Kyber to cost an inference stage by size.
+
+Any value you set yourself is always honored; Kyber only fills what you leave unset.
 
 ```python
 # docs: skip
-# A 1.5 GB model: the engine budgets host RAM and packs replicas onto each GPU.
-ds.ml.infer(Model, num_gpus=0.25, concurrency=8, model_memory_gb=1.5)
+# State only the model size — Kyber picks the GPU fraction and a starting batch size.
+ds.ml.infer(Model, model_memory_gb=1.5)
+
+# Or pin them yourself; the engine respects an explicit value.
+ds.ml.infer(Model, num_gpus=0.25, concurrency=8, batch_size=256, model_memory_gb=1.5)
 ```
 
 ## The num_gpus request adapts across runs

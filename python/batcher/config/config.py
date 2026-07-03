@@ -718,7 +718,13 @@ class DistributedConfig:
     # routed to the distributed GPU aggregate (shard across GPUs) instead of a single-dispatch
     # that would OOM; a set exceeding the whole cluster's GPU memory stays on the (spillable) CPU
     # engine. Defaults target a T4 (16 GB, ~12 usable).
-    gpu_min_rows: int = 200_000
+    #
+    # `gpu_min_rows` is set from the measured crossover of the distributed GPU group-by vs the
+    # native (fast, multi-core Rust) CPU engine on the 8xT4 cluster: at ~4M rows the GPU loses
+    # ~5x (host<->device transfer, cuDF import, task dispatch dominate); by ~100M it wins ~2-7x.
+    # Break-even sits near ~10M rows, so below that `auto` stays on the CPU engine. Retune if the
+    # CPU engine or the GPU data plane gets materially faster.
+    gpu_min_rows: int = 10_000_000
     gpu_memory_gb: float = 12.0
     # Estimated GPU activation bytes per row, used to seed a GPU inference stage's initial batch
     # size from the VRAM left after the model (headroom_bytes / this). A coarse per-row estimate

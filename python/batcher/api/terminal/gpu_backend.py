@@ -3,11 +3,13 @@
 `collect(backend="gpu")` routes a supported plan to the GPU and falls back to the native CPU
 engine for everything else (and when no GPU is present). Two routes:
 
-* A pure single-key group-by aggregate over a scan runs **distributed** — each GPU worker
-  partial-aggregates its own shard (cuDF kernel), mergeable combine on the driver — so it scales
-  past one GPU's memory (2B rows where single-GPU cuDF/Polars-GPU OOM).
+* A pure single-key group-by aggregate over a scan has the GPU **worker read its shard directly
+  from storage** (cuDF kernel) — never materializing the source on the driver. Kyber sizes it:
+  it fans out one shard per GPU (mergeable combine) when the working set exceeds one GPU — so it
+  scales past one GPU's memory (2B rows where single-GPU cuDF/Polars-GPU OOM) — or runs a single
+  worker-read shard when it fits one GPU. Only a non-splittable in-memory source is shipped whole.
 * A linear chain of ops — filter, project / with_columns, multi-key group-by, sort, distinct,
-  limit — is translated to a cuDF execution (`core.gpu_plan`) and run on one GPU.
+  limit, window — is translated to a cuDF execution (`core.gpu_plan`) and run on one GPU.
 
 The GPU tasks ship batcher (`worker_runtime_env`) + cuDF (a merged runtime_env) so the worker
 runs the tested kernels. This is the "CPU and GPU backends for data transformations" seam: same
@@ -58,12 +60,12 @@ def try_gpu_collect(
     spec = _gpu_agg_spec(plan)
     if spec is not None:
         key_out, key_src, aggs, scan = spec
-        # Kyber routes by working-set size: shard across GPUs when it exceeds one GPU, else a
-        # single-dispatch. Distributed still self-falls-back to single-dispatch if the source
-        # turns out non-splittable (returns None).
-        result = None
-        if decision.distributed:
-            result = _distributed_gpu_aggregate(sources[scan.source_id], key_src, aggs)
+        # Kyber routes by working-set size: shard across GPUs when it exceeds one GPU, else one
+        # GPU. Either way the WORKER reads its shard from storage (no driver materialization); the
+        # helper returns None only for a non-splittable in-memory source, which we then ship whole.
+        result = _distributed_gpu_aggregate(
+            sources[scan.source_id], key_src, aggs, sharded=decision.distributed
+        )
         if result is None:
             batches = list(sources[scan.source_id].read())
             if not batches:
@@ -174,12 +176,17 @@ def _gpu_partial_task(desc: dict, key: str, partial_aggs: dict):
 
 
 def _distributed_gpu_aggregate(
-    source: Source, key: str, aggs: dict[str, tuple[str, str]]
+    source: Source, key: str, aggs: dict[str, tuple[str, str]], *, sharded: bool
 ) -> pa.Table | None:
-    """Distributed GPU aggregate: partition the (splittable) source, GPU-partial-aggregate each
-    shard on its own GPU worker (no whole-table transfer), then combine the mergeable partials
-    on the driver. Returns `None` when the source isn't splittable or the cluster has no GPUs,
-    so the caller uses the single-dispatch path."""
+    """GPU aggregate where the GPU WORKER reads its shard directly from storage — no
+    whole-table transfer through the driver.
+
+    `sharded=True` (Kyber says the working set exceeds one GPU) fans out `n_gpus x oversubscribe`
+    shards across the cluster and combines the mergeable partials; `sharded=False` (fits one GPU)
+    runs ONE shard on ONE GPU that reads the whole source itself, so even the single-GPU case
+    avoids materializing the source on the driver and shipping it. Returns `None` when the source
+    isn't splittable (an in-memory handle) or the cluster has no GPUs → the caller ships the
+    in-memory table directly."""
     try:
         import ray
 
@@ -198,7 +205,7 @@ def _distributed_gpu_aggregate(
     if n_gpus < 1:
         return None
     # Only worth it for a genuinely splittable source (shared-nothing shard reads). An
-    # in-memory source has no splits → let the single-dispatch path handle it.
+    # in-memory source has no splits → let the driver-ships-table path handle it.
     from batcher.config import active_config
     from batcher.dist.executors.partition_io import WholeSourceSplit, partition_descriptors
 
@@ -206,16 +213,21 @@ def _distributed_gpu_aggregate(
     if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):
         return None
 
+    if sharded:
+        # Oversubscribe shards past the GPU count: bound each shard (no single-GPU OOM on a big
+        # source), load-balance finely across the cluster, and keep a spot-preempted shard's
+        # retry cheap. Ray runs at most `n_gpus` `num_gpus=1` tasks at once, so the rest pipeline.
+        factor = max(1, int(active_config().distributed.gpu_shard_oversubscribe))
+        n_shards = n_gpus * factor
+    else:
+        n_shards = 1  # fits one GPU: one worker reads the whole source, no distribution overhead
+
     # Hold a GPU autoscale floor for the query so a churning spot cluster keeps (or grows) the
     # GPU nodes instead of the autoscaler reclaiming them mid-aggregate; released in `finally`.
     request_autoscale(n_gpus, target_gpus=float(n_gpus))
     try:
         _ensure_ray(n_gpus)
-        # Oversubscribe shards past the GPU count: bound each shard (no single-GPU OOM on a big
-        # source), load-balance finely across the cluster, and keep a spot-preempted shard's
-        # retry cheap. Ray runs at most `n_gpus` `num_gpus=1` tasks at once, so the rest pipeline.
-        factor = max(1, int(active_config().distributed.gpu_shard_oversubscribe))
-        descs = partition_descriptors(source, n_gpus * factor)
+        descs = partition_descriptors(source, n_shards)
         partial_aggs = _partial_aggs(aggs)
         opts = _gpu_task_opts()
         task = ray.remote(**opts)(_gpu_partial_task)
