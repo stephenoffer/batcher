@@ -16,7 +16,7 @@ import pytest
 
 import batcher as bt
 from batcher.config import active_config, set_config
-from batcher.kyber.gpu_policy import decide_gpu_backend
+from batcher.kyber.gpu.policy import decide_gpu_backend
 
 pytestmark = pytest.mark.unit
 

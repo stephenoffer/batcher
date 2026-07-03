@@ -720,6 +720,12 @@ class DistributedConfig:
     # engine. Defaults target a T4 (16 GB, ~12 usable).
     gpu_min_rows: int = 200_000
     gpu_memory_gb: float = 12.0
+    # Estimated GPU activation bytes per row, used to seed a GPU inference stage's initial batch
+    # size from the VRAM left after the model (headroom_bytes / this). A coarse per-row estimate
+    # the online `ThroughputController` then corrects from measured VRAM/throughput — it only has
+    # to put the *starting* batch in the right order of magnitude (small model → big first batch,
+    # heavy model → cautious). ~64 KB/row suits typical vision/embedding activations.
+    gpu_activation_bytes_per_row: int = 65_536
     # `distributed="auto"` distributes only when it PAYS. On a multi-node cluster the Ray
     # fan-out (SPREAD placement + task dispatch + result gather) is a ~2 s fixed cost, so a
     # small query runs far faster single-node (measured: an 80k-row filter is ~55 ms

@@ -17,6 +17,7 @@ distributed; exceeds them all → the spillable CPU engine.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -27,7 +28,12 @@ if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
     from batcher.plan.logical import LogicalPlan
 
-__all__ = ["GpuDecision", "decide_gpu_backend"]
+__all__ = ["GpuDecision", "GpuMapParams", "decide_gpu_backend", "decide_gpu_map_params"]
+
+# The GPU-packing quanta a model's memory fraction is rounded UP to, so Ray can co-locate
+# several light inference stages on one GPU (a 3 GB model on a 12 GB GPU → 0.25 → 4 per GPU)
+# instead of each wasting a whole device. A model larger than one GPU reserves whole GPUs.
+_PACK_QUANTA = (0.25, 0.5, 1.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,4 +112,57 @@ def decide_gpu_backend(
         )
     return GpuDecision(
         False, False, f"~{ws_gb:.1f}GB exceeds all {gpu_count} GPUs: CPU engine (spillable)"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class GpuMapParams:
+    """Kyber's resource sizing for one GPU `map_batches` (inference) stage: how much of a GPU to
+    reserve per worker and the initial batch size to seed the online throughput controller."""
+
+    num_gpus: float
+    batch_size: int | None
+    reason: str
+
+
+def decide_gpu_map_params(
+    model_memory_gb: float,
+    num_gpus: float,
+    batch_size: int | None,
+) -> GpuMapParams:
+    """Size a GPU inference stage from the model's memory footprint vs one GPU's memory.
+
+    A user-set `num_gpus` (>0) or `batch_size` is always honored — this only *fills* what the
+    user left unset, and only when `model_memory_gb` is known (the signal that the stage is a GPU
+    model, since an unset `num_gpus` defaults to 0/CPU). The GPU-fraction packs light models
+    (fraction rounded up to a packing quantum, so several share a device → higher utilization)
+    and reserves whole GPUs for a model larger than one. The batch-size seed spends the VRAM left
+    after the model on activations at `gpu_activation_bytes_per_row`, clamped — the online
+    `ThroughputController` refines it from measured throughput/VRAM, but a memory-aware start
+    beats a fixed 256 (too small for a light model, an instant OOM for a heavy one)."""
+    dc = active_config().distributed
+    gpu_gb = max(dc.gpu_memory_gb, 1e-9)
+    cap = 0.85  # leave VRAM headroom for activations + fragmentation (the guides' ~80-85%)
+
+    if model_memory_gb <= 0.0:
+        return GpuMapParams(num_gpus, batch_size, "model memory unknown; left as given")
+
+    out_gpus = num_gpus
+    if num_gpus <= 0.0:  # user left it unset → decide the packing fraction
+        frac = model_memory_gb / (gpu_gb * cap)
+        if frac <= 1.0:
+            out_gpus = next((q for q in _PACK_QUANTA if q >= frac), 1.0)
+        else:
+            out_gpus = float(math.ceil(frac))
+
+    out_bs = batch_size
+    if batch_size is None:  # seed the throughput controller from the VRAM headroom
+        per_gpu = out_gpus if out_gpus >= 1.0 else 1.0  # a packed fraction still sees one device
+        headroom_gb = max(gpu_gb * per_gpu * cap - model_memory_gb, gpu_gb * 0.05)
+        act = max(dc.gpu_activation_bytes_per_row, 1)
+        out_bs = int(min(max(headroom_gb * 1e9 / act, 1), 65_536))
+    return GpuMapParams(
+        out_gpus,
+        out_bs,
+        f"model {model_memory_gb:.1f}GB → num_gpus={out_gpus}, batch_size={out_bs}",
     )

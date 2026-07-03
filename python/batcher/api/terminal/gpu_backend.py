@@ -46,7 +46,7 @@ def try_gpu_collect(
     gpu_count = _cluster_gpu_count()
     if gpu_count < 1:
         return None
-    from batcher.kyber.gpu_policy import decide_gpu_backend
+    from batcher.kyber.gpu.policy import decide_gpu_backend
 
     decision = decide_gpu_backend(plan, sources, hub, gpu_count=gpu_count, force=force)
     if not decision.use_gpu:
