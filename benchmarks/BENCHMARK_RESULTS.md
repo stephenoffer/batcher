@@ -1126,8 +1126,24 @@ But the measured perf is the important, honest part — a **distributed group-by
 **A group-by SUM is memory-bound, so the GPU's compute advantage does not apply** — the Rust
 CPU aggregate is already saturated (and already 105× Ray Data), while the GPU path pays Ray
 task dispatch + per-shard read + host→device transfer for a reduction that is trivial once the
-bytes are moved. So GPU aggregation is ~parity with Ray Data and **loses to Batcher's own CPU
-engine**. GPU wins where **compute** dominates (TPC-H Q6's filter+arithmetic, 14.2× vs CPU),
-not on memory-bound reductions. `backend="gpu"` stays opt-in (default `cpu`), so it never
-auto-regresses; the takeaway is that a GPU backend must be routed by *compute intensity*, not
-applied blanketly — the honest boundary of when accelerators help a data engine.
+bytes are moved. So Batcher's `backend="gpu"` is ~parity with Ray Data and **loses to Batcher's
+own CPU engine**. `backend="gpu"` stays opt-in (default `cpu`), so it never auto-regresses.
+
+**vs Polars-GPU / cuDF (the explicit comparison).** To separate the GPU *compute* from
+Batcher's dispatch overhead, cuDF-cu13 (the engine behind Polars' `collect(engine="gpu")`) was
+run on a GPU worker on the same 20M-row / 200k-group aggregate:
+
+| engine | throughput | note |
+|---|---|---|
+| **cuDF-GPU** (Polars-GPU's backend) | **221 M rows/s** (90 ms) | data **GPU-resident**, no I/O |
+| Batcher CPU (native Rust) | 69 M rows/s (289 ms) | includes the Parquet read |
+| Ray Data | 0.7 M rows/s | — |
+
+So the GPU *compute* for aggregation is genuinely fast — cuDF is ~3× Batcher's CPU number here
+(not apples-to-apples: cuDF's 90 ms is in-memory compute-only, Batcher's 289 ms includes the
+read). The lesson is precise: **GPU aggregation is not slow — Batcher's current GPU backend is
+slow because of per-call overhead** (Ray dispatch + `worker_runtime_env` upload + host→device
+transfer), which negates the fast compute. To realize the cuDF-class speed, the GPU backend
+needs **persistent GPU actors with columns kept resident across calls** (the cuDF/Polars-GPU
+model) — the clear, measured next step. GPU still wins outright where compute dominates even
+with the transfer (TPC-H Q6 filter+arithmetic, 14.2× vs CPU).
