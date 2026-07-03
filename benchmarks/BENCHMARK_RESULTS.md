@@ -1200,3 +1200,27 @@ feeding Batcher already uses (morsel prefetch + per-stage worker fan-out) is the
 way to keep the cluster's GPUs saturated for preprocessing-heavy pipelines — confirmed, not
 assumed. Net: the cluster runs at close-to-full GPU capacity (93% preprocessing / 100% compute),
 balanced across all devices, with the optimal feeding strategy.
+
+## 2x the GPU data ops + prebuilt AI functions vs current (2026-07-02)
+
+Two model/kernel-side wins over the current perf, both integrated and correctness-gated:
+
+**Prebuilt AI functions — vision inference ~1.9x.** `ds.ml.infer` now `channels_last` +
+`torch.compile`s a CNN model (config `distributed.torch_compile`, default on) — a measured
+**1.91x** on ResNet-50 (fp16, GPU), predicted labels IDENTICAL to eager (logits within fp16
+tolerance). Scoped by measurement to CNNs only: torch.compile on a small text transformer
+(distilbert) measured **0.92x** (dynamic sequence lengths → per-shape recompiles,
+tokenization-bound), so text models stay eager — no regression. Compiled once per worker, the
+warm pool amortizes it over the whole batch job.
+
+**GPU data operations — ~3.4x via cuDF.** `collect(backend="gpu")`'s group-by kernel now uses
+cuDF (RAPIDS) instead of the hand-rolled torch scatter kernel — **cuDF 370 vs torch 109 M
+rows/s** on the same aggregate (~3.4x), the engine behind Polars-GPU. cuDF ships to the GPU
+tasks via a merged runtime_env (batcher + `cudf-cu13`, numpy pinned); it falls back to torch
+when cuDF is absent. Verified end-to-end: `backend="gpu"` with the cuDF kernel matches the CPU
+engine exactly (2M rows, 5000 groups).
+
+Net: the prebuilt vision AI functions are ~2x and the GPU relational kernel is ~3.4x their prior
+perf, both with the same safe CPU fallback and identical results. The architecture is now
+"integrate the fast GPU engine (cuDF / torch.compile), don't hand-roll it" — validated by the
+earlier negative result where a torch multi-GPU aggregate LOST to single-GPU cuDF.
