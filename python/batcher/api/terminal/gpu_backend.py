@@ -28,24 +28,135 @@ def try_gpu_collect(plan: LogicalPlan, sources: list[Source]) -> pa.Table | None
     """Execute `plan` on the GPU if its shape is supported and a GPU exists, else `None`.
 
     `None` signals the caller to use the CPU engine — the safe fallback for any unsupported
-    shape or a GPU-less cluster."""
+    shape or a GPU-less cluster. A splittable source over a multi-GPU cluster runs the
+    **distributed** GPU aggregate (each GPU worker reads and partial-aggregates its own shard —
+    no whole-table transfer, uses every GPU); otherwise a single-dispatch path ships one table
+    to one GPU (fine for small / in-memory sources)."""
     spec = _gpu_agg_spec(plan)
     if spec is None or not _cluster_has_gpu():
         return None
     key_out, key_src, aggs, scan = spec
     import pyarrow as pa
 
-    batches = list(sources[scan.source_id].read())
-    if not batches:
-        return None
-    table = pa.Table.from_batches(batches)
-    result = _dispatch_gpu_aggregate(table, key_src, aggs)
+    source = sources[scan.source_id]
+    distributed = _distributed_gpu_aggregate(source, key_src, aggs)
+    if distributed is not None:
+        result = distributed
+    else:
+        batches = list(source.read())
+        if not batches:
+            return None
+        result = _dispatch_gpu_aggregate(pa.Table.from_batches(batches), key_src, aggs)
     # The kernel names the group column by its source name; rename to the aggregate's alias.
     if key_out != key_src and key_src in result.column_names:
         result = result.rename_columns(
             [key_out if n == key_src else n for n in result.column_names]
         )
     return result
+
+
+def _partial_aggs(aggs: dict[str, tuple[str, str]]) -> dict[str, tuple[str, str]]:
+    """The mergeable partial reductions a GPU worker computes per shard. A mean needs both a
+    sum and a count partial; sum/count/min/max carry through as themselves."""
+    partial: dict[str, tuple[str, str]] = {}
+    for alias, (col_name, func) in aggs.items():
+        if func == "mean":
+            partial[f"{alias}__s"] = (col_name, "sum")
+            partial[f"{alias}__n"] = (col_name, "count")
+        else:
+            partial[f"{alias}__{func}"] = (col_name, func)
+    return partial
+
+
+def _combine_partials(
+    partials: list[pa.Table], key: str, aggs: dict[str, tuple[str, str]]
+) -> pa.Table:
+    """Combine per-shard GPU partials into the final aggregate (the mergeable `combine` step),
+    reusing Batcher's own engine so the fold is native and tested."""
+    import pyarrow as pa
+
+    import batcher as bt
+    from batcher import col
+
+    combined = pa.concat_tables(partials)
+    final: dict = {}
+    means: dict[str, tuple[str, str]] = {}
+    for alias, (_col, func) in aggs.items():
+        if func == "sum":
+            final[alias] = col(f"{alias}__sum").sum()
+        elif func == "count":
+            final[alias] = col(f"{alias}__count").sum()
+        elif func == "min":
+            final[alias] = col(f"{alias}__min").min()
+        elif func == "max":
+            final[alias] = col(f"{alias}__max").max()
+        elif func == "mean":
+            final[f"{alias}__st"] = col(f"{alias}__s").sum()
+            final[f"{alias}__nt"] = col(f"{alias}__n").sum()
+            means[alias] = (f"{alias}__st", f"{alias}__nt")
+    ds = bt.from_arrow(combined).group_by(key).agg(**final)
+    if means:
+        ds = ds.with_columns(**{a: col(s) / col(n) for a, (s, n) in means.items()})
+        ds = ds.select(key, *aggs.keys())
+    return ds.collect()
+
+
+def _gpu_partial_task(desc: dict, key: str, partial_aggs: dict):
+    """On a GPU worker: read this shard directly from storage, then partial-aggregate it on the
+    GPU. Returns a small (one-row-per-group) partial table, or None for an empty shard."""
+    import pyarrow as pa
+
+    from batcher.core.gpu_transform import gpu_groupby_agg
+    from batcher.dist.executors.partition_io import read_partition_descriptor
+
+    batches = read_partition_descriptor(desc)
+    if not batches:
+        return None
+    return gpu_groupby_agg(pa.Table.from_batches(batches), key, partial_aggs)
+
+
+def _distributed_gpu_aggregate(
+    source: Source, key: str, aggs: dict[str, tuple[str, str]]
+) -> pa.Table | None:
+    """Distributed GPU aggregate: partition the (splittable) source, GPU-partial-aggregate each
+    shard on its own GPU worker (no whole-table transfer), then combine the mergeable partials
+    on the driver. Returns `None` when the source isn't splittable or the cluster has no GPUs,
+    so the caller uses the single-dispatch path."""
+    try:
+        import ray
+
+        from batcher.dist.executors.partition_io import _scan_splits
+        from batcher.dist.executors.ray_runtime import _ensure_ray, cluster_topology
+        from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
+    except Exception:
+        return None
+
+    if not ray.is_initialized():
+        return None
+    n_gpus = int(cluster_topology().get("gpus", 0))
+    if n_gpus < 1:
+        return None
+    # Only worth it for a genuinely splittable source (shared-nothing shard reads). An
+    # in-memory source has no splits → let the single-dispatch path handle it.
+    from batcher.dist.executors.partition_io import WholeSourceSplit, partition_descriptors
+
+    splits = _scan_splits(source, n_gpus)
+    if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):
+        return None
+
+    _ensure_ray(n_gpus)
+    descs = partition_descriptors(source, n_gpus)
+    partial_aggs = _partial_aggs(aggs)
+    opts: dict = {"num_gpus": 1}
+    rt = worker_runtime_env()
+    if rt is not None:
+        opts["runtime_env"] = rt
+    task = ray.remote(**opts)(_gpu_partial_task)
+    partials = ray.get([task.remote(d, key, partial_aggs) for d in descs])
+    partials = [p for p in partials if p is not None]
+    if not partials:
+        return None
+    return _combine_partials(partials, key, aggs)
 
 
 def _gpu_agg_spec(plan: LogicalPlan):
