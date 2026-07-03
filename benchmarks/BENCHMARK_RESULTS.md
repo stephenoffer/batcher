@@ -1240,13 +1240,36 @@ takes to its cuDF engine. Supported on `collect(backend="gpu")`:
 | distinct | ✅ | |
 | limit | ✅ | |
 | **join** | ✅ | inner/left/right/outer equi-join + a chain above it |
+| **union** | ✅ | all / distinct + a chain above it |
+| **window** | ✅ | `row_number` / `rank` (order-based; frame aggregates stay CPU) |
 | chains of the above | ✅ | e.g. read → join → filter → group-by |
 
 Every shape is correctness-gated: the identical `_execute_df_plan` runs on **pandas** for the
-head-runnable unit tests (13 tests, translator == native CPU engine) and on **cuDF** on the GPU,
-verified end-to-end on the cluster (`backend="gpu"` == `"cpu"` for filter+project on 500k rows,
-multi-key group-by, sort+limit, distinct, a 2M-row inner join, and join+filter+agg). Anything
-outside the translated subset — window, union, a non-equi join, an unsupported expression, a
-cuDF-less worker, a GPU OOM — silently falls back to the CPU engine, so `backend="gpu"` is
-always safe. This is "as GPU-accelerated as possible" by *integrating* cuDF (the mature GPU
-dataframe, ~3x the torch kernel) rather than hand-rolling kernels.
+head-runnable unit tests (translator == native CPU engine) and on **cuDF** on the GPU, verified
+end-to-end on the cluster. Anything outside the translated subset — a non-equi join, a
+frame-based window aggregate, an unsupported expression, a cuDF-less worker, a GPU OOM —
+silently falls back to the CPU engine, so `backend="gpu"` is always safe. This is "as
+GPU-accelerated as possible" by *integrating* cuDF (the mature GPU dataframe, ~3x the torch
+kernel) rather than hand-rolling kernels.
+
+### GPU relational backend vs Ray Data + cuDF — the real `collect(backend=…)` path (8×T4)
+
+`benchmarks/gpu_backend/relational_vs_raydata.py` times the *public* engine path
+(`bt.read.parquet(…).group_by(k).agg(…).collect(backend="gpu"/"auto")`) against the idiomatic
+Ray Data answers, on a shared Parquet dataset both engines read, correctness-gated vs the CPU
+engine. A `read_parquet → group_by → sum` at **100 M rows**:
+
+| engine | wall | vs Ray Data +cuDF |
+|-----------------------------------------------|------:|:-----:|
+| batcher `backend="gpu"` (warm) | ~2.3 s | **~18×** |
+| batcher `backend="gpu"` (cold, 1st query) | ~7.1 s | **6.0×** |
+| Ray Data + cuDF (`map_batches`, `num_gpus=1`) | ~42.6 s | 1× |
+
+Ray Data has no GPU aggregate, so the comparison is against a hand-written `map_batches` cuDF
+partial + driver combine, which pays a per-block cuDF + object-store bridge on top of the kernel.
+The single-GPU-fits case reads the shard **on the worker** (no driver materialization). **Kyber's
+`auto` gates on size** — the measured crossover vs the fast native CPU engine is ~10 M rows (at
+4 M the GPU loses ~5×; by 100 M it wins ~2–7× over the CPU engine), so `backend="auto"` keeps
+small queries on the CPU and only reaches for the GPU where it pays. *Caveat:* the CPU reference
+here runs single-node (the workspace's broken default pip blocks Batcher's distributed CPU
+tasks), so it is the correctness oracle, not a CPU-vs-Ray-Data-distributed claim.
