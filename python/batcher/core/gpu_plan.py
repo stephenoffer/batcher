@@ -33,8 +33,37 @@ __all__ = [
 
 _JOIN_HOW = {"inner": "inner", "left": "left", "right": "right", "outer": "outer", "full": "outer"}
 
-_SUPPORTED_OPS = ("filter", "project", "aggregate", "sort", "distinct", "limit")
+_SUPPORTED_OPS = ("filter", "project", "aggregate", "sort", "distinct", "limit", "window")
 _AGG_FUNCS = {"sum", "count", "mean", "min", "max"}
+# Order-based window functions with no frame — safe to run on the GPU. Frame-based aggregate
+# windows (sum/avg over a partition with ROWS/RANGE bounds) fall back to the CPU engine.
+_WINDOW_FNS = {"row_number", "rank"}
+
+
+def _supported_op(ir: dict) -> bool:
+    """Whether one RelOp IR node is translatable to the GPU dataframe kernel."""
+    op = ir.get("op")
+    if op not in _SUPPORTED_OPS:
+        return False
+    if op == "aggregate":
+        return _agg_is_supported(ir)
+    if op == "window":
+        return _window_is_supported(ir)
+    return True
+
+
+def _window_is_supported(ir: dict) -> bool:
+    if any(k.get("e") != "col" for k in ir["partition_keys"]):
+        return False
+    if any(k["expr"].get("e") != "col" for k in ir["order_keys"]):
+        return False
+    if not ir["functions"] or any(f["func"] not in _WINDOW_FNS for f in ir["functions"]):
+        return False
+    # rank is defined over a single order key (pandas .rank is per-column); multi-key rank → CPU.
+    has_rank = any(f["func"] == "rank" for f in ir["functions"])
+    return not (has_rank and len(ir["order_keys"]) != 1)
+
+
 _BINOPS = {
     "add": operator.add,
     "sub": operator.sub,
@@ -69,10 +98,7 @@ def gpu_plan_ops(plan: LogicalPlan):
             ir = node.to_ir()
         except Exception:
             return None  # e.g. map_batches — Python-only, not lowered to the engine IR
-        if ir.get("op") not in _SUPPORTED_OPS:
-            return None
-        # group keys / agg inputs must be plain columns for the fast cuDF path.
-        if ir["op"] == "aggregate" and not _agg_is_supported(ir):
+        if not _supported_op(ir):
             return None
         ops.append(ir)
         node = getattr(node, "input", None)
@@ -95,9 +121,7 @@ def gpu_join_spec(plan: LogicalPlan):
             ir = node.to_ir()
         except Exception:
             return None
-        if ir.get("op") not in _SUPPORTED_OPS or (
-            ir["op"] == "aggregate" and not _agg_is_supported(ir)
-        ):
+        if not _supported_op(ir):
             return None
         ops.append(ir)
         node = getattr(node, "input", None)
@@ -124,9 +148,7 @@ def gpu_union_spec(plan: LogicalPlan):
             ir = node.to_ir()
         except Exception:
             return None
-        if ir.get("op") not in _SUPPORTED_OPS or (
-            ir["op"] == "aggregate" and not _agg_is_supported(ir)
-        ):
+        if not _supported_op(ir):
             return None
         ops.append(ir)
         node = getattr(node, "input", None)
@@ -212,7 +234,25 @@ def _apply(df, op: dict, lib):
     if kind == "limit":
         off = op.get("offset", 0)
         return df.iloc[off : off + op["n"]].reset_index(drop=True)
+    if kind == "window":
+        return _window(df, op)
     raise _Unsupported(kind)
+
+
+def _window(df, op: dict):
+    """Order-based window functions (row_number / rank) — sort by partition+order, then a
+    per-partition running index / rank. Adds a column per function, keeping all rows."""
+    part = [k["name"] for k in op["partition_keys"]]
+    order = [k["expr"]["name"] for k in op["order_keys"]]
+    asc = [not k["descending"] for k in op["order_keys"]]
+    df = df.sort_values(part + order, ascending=[True] * len(part) + asc).reset_index(drop=True)
+    grp = df.groupby(part, sort=False)
+    for f in op["functions"]:
+        if f["func"] == "row_number":
+            df[f["alias"]] = grp.cumcount() + f.get("offset", 1)
+        else:  # rank
+            df[f["alias"]] = grp[order[0]].rank(method="min", ascending=asc[0]).astype("int64")
+    return df
 
 
 def _broadcast(scalar, df, lib):

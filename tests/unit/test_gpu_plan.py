@@ -47,6 +47,13 @@ def _norm(df):
         lambda ds: ds.sort("y", descending=True).limit(10),
         lambda ds: ds.select("x", "z").distinct(),
         lambda ds: ds.filter(col("y") > 0.3).group_by("x").agg(s=col("y").sum(), mx=col("y").max()),
+        lambda ds: ds.window(
+            partition_by=["x"], order_by=[("y", False)], functions={"rn": "row_number"}
+        ),
+        lambda ds: ds.window(partition_by=["z"], order_by=[("y", True)], functions={"rk": "rank"}),
+        lambda ds: ds.window(
+            partition_by=["z"], order_by=[("y", False)], functions={"rn": "row_number"}
+        ).filter(col("rn") <= 3),
     ],
 )
 def test_translator_matches_cpu_engine(build):
