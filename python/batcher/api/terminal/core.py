@@ -91,13 +91,20 @@ def _collect(
     metadata = metadata_aggregate_table(plan, sources, source_stats)
     if metadata is not None:
         return metadata
-    # Opt-in GPU backend: a supported shape (a group-by aggregate over a scan) runs on the
-    # GPU; anything else — or a GPU-less cluster — silently falls back to the CPU engine, so
-    # `backend="gpu"` is always safe. Same result, different *where*.
-    if backend == "gpu":
+    # GPU backend. `backend="gpu"` forces the GPU for any supported shape (honoring the user past
+    # the small-input threshold, but Kyber still routes single-device vs sharded by working-set
+    # size); `backend="auto"` lets Kyber's cost policy decide GPU vs CPU fully. Anything else — an
+    # unsupported shape, a GPU-less cluster, or data Kyber routes to the CPU — silently uses the
+    # CPU engine, so both are always safe. Same result, different *where*.
+    if backend not in ("cpu", "gpu", "auto"):
+        from batcher._internal.errors import PlanError
+
+        raise PlanError(f"backend must be 'cpu', 'gpu', or 'auto', got {backend!r}")
+    if backend in ("gpu", "auto"):
+        from batcher import core
         from batcher.api.terminal.gpu_backend import try_gpu_collect
 
-        gpu_result = try_gpu_collect(plan, sources)
+        gpu_result = try_gpu_collect(plan, sources, core.default_hub(), force=(backend == "gpu"))
         if gpu_result is not None:
             return gpu_result
     # Opt-in: offload large-payload columns out of line around breakers (the blobs ride

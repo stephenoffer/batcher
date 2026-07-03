@@ -1704,11 +1704,15 @@ class Dataset:
         it and `num_partitions` overrides the bucket count. `adaptive="auto"` turns on
         intra-query re-optimization only when a join's input size is a pure estimate
         (so measured cardinality could change a build-side/join-order choice), and
-        stays one-shot otherwise; `True`/`False` force it. `backend="gpu"` runs a
-        supported shape (a group-by aggregate over a scan) on the GPU and falls back to
-        the CPU engine for anything else or a GPU-less cluster — always safe to request.
-        The result is identical whichever way it runs. Raises `PlanError` if the dataset
-        is unbounded (a streaming source) — use `iter_batches()` / `write()`.
+        stays one-shot otherwise; `True`/`False` force it. `backend` selects where a
+        supported shape runs: `"cpu"` (default) the native engine, `"gpu"` forces the GPU
+        (cuDF) for any supported shape, and `"auto"` lets Kyber's cost policy decide — GPU
+        only when the estimated input is large enough to amortize the device overhead and
+        fits the cluster's GPU memory (sharding across GPUs when it exceeds one), else the
+        CPU engine. Any unsupported shape or a GPU-less cluster falls back to the CPU engine,
+        so every value is safe to request and the result is identical whichever way it runs.
+        Raises `PlanError` if the dataset is unbounded (a streaming source) — use
+        `iter_batches()` / `write()`.
 
         Examples:
             .. doctest::

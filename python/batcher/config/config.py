@@ -710,6 +710,16 @@ class DistributedConfig:
     # cluster and makes a spot-preempted shard's retry cheap (1/N the work). The mergeable
     # combine is correct for any shard count. 1 = one shard per GPU (the old behavior).
     gpu_shard_oversubscribe: int = 4
+    # Kyber's cost-based GPU-backend policy (`backend="auto"`, and the memory routing under an
+    # explicit `backend="gpu"`). Below `gpu_min_rows` estimated rows the fixed GPU overhead —
+    # host<->device transfer, kernel launch, first-touch cuDF import — is not amortized, so
+    # `auto` stays on the CPU engine (the GPU analog of `distribute_min_rows`). `gpu_memory_gb`
+    # is the usable memory budget of ONE GPU: a plan whose estimated working set exceeds it is
+    # routed to the distributed GPU aggregate (shard across GPUs) instead of a single-dispatch
+    # that would OOM; a set exceeding the whole cluster's GPU memory stays on the (spillable) CPU
+    # engine. Defaults target a T4 (16 GB, ~12 usable).
+    gpu_min_rows: int = 200_000
+    gpu_memory_gb: float = 12.0
     # `distributed="auto"` distributes only when it PAYS. On a multi-node cluster the Ray
     # fan-out (SPREAD placement + task dispatch + result gather) is a ~2 s fixed cost, so a
     # small query runs far faster single-node (measured: an 80k-row filter is ~55 ms

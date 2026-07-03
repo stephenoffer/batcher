@@ -30,15 +30,26 @@ if TYPE_CHECKING:
 _GPU_AGGS = ("sum", "count", "mean", "min", "max")
 
 
-def try_gpu_collect(plan: LogicalPlan, sources: list[Source]) -> pa.Table | None:
-    """Execute `plan` on the GPU if its shape is supported and a GPU exists, else `None`.
+def try_gpu_collect(
+    plan: LogicalPlan, sources: list[Source], hub=None, *, force: bool = True
+) -> pa.Table | None:
+    """Execute `plan` on the GPU if Kyber's cost policy says it pays and the shape is supported,
+    else `None`.
 
     `None` signals the caller to use the CPU engine — the safe fallback for any unsupported
-    shape or a GPU-less cluster. A splittable source over a multi-GPU cluster runs the
-    **distributed** GPU aggregate (each GPU worker reads and partial-aggregates its own shard —
-    no whole-table transfer, uses every GPU); otherwise a single-dispatch path ships one table
-    to one GPU (fine for small / in-memory sources)."""
-    if not _cluster_has_gpu():
+    shape, a GPU-less cluster, or a plan Kyber routes to the CPU (too small to amortize the GPU
+    overhead, or larger than the cluster's GPU memory). `force=True` (an explicit `backend="gpu"`)
+    honors the request past the small-input threshold but still respects the memory routing;
+    `force=False` (`backend="auto"`) lets Kyber decide fully. When the working set exceeds one
+    GPU, the aggregate shards across GPUs (mergeable partials); otherwise a single-dispatch ships
+    one table to one GPU."""
+    gpu_count = _cluster_gpu_count()
+    if gpu_count < 1:
+        return None
+    from batcher.kyber.gpu_policy import decide_gpu_backend
+
+    decision = decide_gpu_backend(plan, sources, hub, gpu_count=gpu_count, force=force)
+    if not decision.use_gpu:
         return None
     import pyarrow as pa
 
@@ -47,10 +58,13 @@ def try_gpu_collect(plan: LogicalPlan, sources: list[Source]) -> pa.Table | None
     spec = _gpu_agg_spec(plan)
     if spec is not None:
         key_out, key_src, aggs, scan = spec
-        distributed = _distributed_gpu_aggregate(sources[scan.source_id], key_src, aggs)
-        if distributed is not None:
-            result = distributed
-        else:
+        # Kyber routes by working-set size: shard across GPUs when it exceeds one GPU, else a
+        # single-dispatch. Distributed still self-falls-back to single-dispatch if the source
+        # turns out non-splittable (returns None).
+        result = None
+        if decision.distributed:
+            result = _distributed_gpu_aggregate(sources[scan.source_id], key_src, aggs)
+        if result is None:
             batches = list(sources[scan.source_id].read())
             if not batches:
                 return None
@@ -347,20 +361,28 @@ def _gpu_task_opts() -> dict:
     return opts
 
 
-def _cluster_has_gpu() -> bool:
-    """Whether the live cluster (or local process) exposes at least one GPU."""
+def _cluster_gpu_count() -> int:
+    """Live GPU count across the cluster (or 1 for a GPU-equipped local process), else 0.
+
+    The count — not just presence — so Kyber's policy can size the cluster's aggregate GPU
+    memory and pick single-device vs sharded execution."""
     try:
         import ray
 
         if ray.is_initialized():
             from batcher.dist.executors.ray_runtime import cluster_topology
 
-            return cluster_topology().get("gpus", 0) > 0
+            return int(cluster_topology().get("gpus", 0))
     except Exception:
         pass
     from batcher.core.gpu_transform import gpu_available
 
-    return gpu_available()
+    return 1 if gpu_available() else 0
+
+
+def _cluster_has_gpu() -> bool:
+    """Whether the live cluster (or local process) exposes at least one GPU."""
+    return _cluster_gpu_count() > 0
 
 
 def _gpu_aggregate_worker(table, key: str, aggs: dict):
