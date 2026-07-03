@@ -59,10 +59,13 @@ def try_gpu_collect(
     # worker partial-aggregates its own shard, mergeable combine) — scales past one GPU's memory.
     spec = _gpu_agg_spec(plan)
     if spec is not None:
+        import time
+
         key_out, key_src, aggs, scan = spec
         # Kyber routes by working-set size: shard across GPUs when it exceeds one GPU, else one
         # GPU. Either way the WORKER reads its shard from storage (no driver materialization); the
         # helper returns None only for a non-splittable in-memory source, which we then ship whole.
+        t0 = time.perf_counter()
         result = _distributed_gpu_aggregate(
             sources[scan.source_id], key_src, aggs, sharded=decision.distributed
         )
@@ -71,6 +74,10 @@ def try_gpu_collect(
             if not batches:
                 return None
             result = _dispatch_gpu_aggregate(pa.Table.from_batches(batches), key_src, aggs)
+        # Record this GPU run so Kyber can learn the GPU/CPU crossover (Core measures, Kyber
+        # consumes). Keyed on the estimated input rows the decision used — the same x the CPU
+        # side records against — so the two fitted lines are comparable.
+        _record_gpu_timing(hub, decision.est_rows, (time.perf_counter() - t0) * 1000.0)
         if key_out != key_src and key_src in result.column_names:
             result = result.rename_columns(
                 [key_out if n == key_src else n for n in result.column_names]
@@ -113,6 +120,35 @@ def try_gpu_collect(
             return None
         return _dispatch_cudf_union(tables, distinct, ops)
     return None
+
+
+def _record_gpu_timing(hub, est_rows: int, wall_ms: float) -> None:
+    """Feed one GPU aggregate run's (estimated rows, wall time) to Kyber's crossover learner.
+    Best-effort — a missing hub or unknown size is silently skipped; never breaks the query."""
+    if hub is None or est_rows <= 0:
+        return
+    from batcher.kyber.gpu import record_backend_timing
+
+    record_backend_timing(hub, "gpu", est_rows, wall_ms)
+
+
+def record_cpu_crossover(plan, sources, hub, wall_ms: float) -> None:
+    """Record a CPU group-by run for Kyber's GPU/CPU crossover learner (Core measures, Kyber
+    consumes). Best-effort and tightly gated: only a single-key aggregate over a scan, and only
+    when the cluster actually has a GPU (else the crossover is irrelevant and this pays nothing —
+    no estimator call). Never raises into the query. Lives here, next to the GPU-side recorder, so
+    both halves of the crossover feed the same learner from one place."""
+    try:
+        if hub is None or _gpu_agg_spec(plan) is None or _cluster_gpu_count() < 1:
+            return
+        from batcher.kyber.gpu import record_backend_timing
+        from batcher.kyber.gpu.policy import _estimate
+
+        rows, _ws = _estimate(plan, sources, hub)
+        if rows:
+            record_backend_timing(hub, "cpu", int(rows), wall_ms)
+    except Exception:  # pragma: no cover - learning must never break a query
+        return
 
 
 def _partial_aggs(aggs: dict[str, tuple[str, str]]) -> dict[str, tuple[str, str]]:

@@ -11,7 +11,7 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.errors import BackendError, PlanError
 from batcher.api.orchestration import with_auto_config
 from batcher.api.terminal.metadata_answer import (
     metadata_aggregate_table,
@@ -69,8 +69,6 @@ def _collect(
     from batcher.io.source import is_bounded
 
     if any(not is_bounded(s) for s in sources):
-        from batcher._internal.errors import PlanError
-
         raise PlanError(
             "this operation materializes the full result, but the dataset has an "
             "unbounded (streaming) source. Consume it with iter_batches() or write "
@@ -97,8 +95,6 @@ def _collect(
     # unsupported shape, a GPU-less cluster, or data Kyber routes to the CPU — silently uses the
     # CPU engine, so both are always safe. Same result, different *where*.
     if backend not in ("cpu", "gpu", "auto"):
-        from batcher._internal.errors import PlanError
-
         raise PlanError(f"backend must be 'cpu', 'gpu', or 'auto', got {backend!r}")
     if backend in ("gpu", "auto"):
         from batcher import core
@@ -190,7 +186,11 @@ def _collect(
     )
     t0 = time.perf_counter()
     table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
-    write_event_log(ctx.profile, total_ms=(time.perf_counter() - t0) * 1000.0, rows=table.num_rows)
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    write_event_log(ctx.profile, total_ms=total_ms, rows=table.num_rows)
+    from batcher.api.terminal.gpu_backend import record_cpu_crossover  # adaptive-crossover sample
+
+    record_cpu_crossover(plan, sources, ctx.hub, total_ms)  # gated to a GPU cluster; else no-op
     return table
 
 

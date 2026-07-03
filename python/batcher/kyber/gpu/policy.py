@@ -42,12 +42,14 @@ class GpuDecision:
 
     `distributed` is only meaningful when `use_gpu` is True: True means the working set exceeds
     one GPU's memory so the run must fan out across GPUs (the mergeable distributed aggregate);
-    False means a single-device dispatch fits. `reason` is a short human string for the decision
-    log / `explain()`."""
+    False means a single-device dispatch fits. `est_rows` is the estimated input cardinality the
+    decision used (`-1` when unknown) — the x-coordinate the adaptive crossover records against.
+    `reason` is a short human string for the decision log / `explain()`."""
 
     use_gpu: bool
     distributed: bool
     reason: str
+    est_rows: int = -1
 
 
 def _estimate(plan: LogicalPlan, sources: list[Source], hub: MetadataHub | None):
@@ -98,20 +100,28 @@ def decide_gpu_backend(
             else GpuDecision(False, False, "size unknown; GPU overhead not justified")
         )
 
-    if not force and rows < dc.gpu_min_rows:
+    # The row threshold below which the GPU overhead isn't amortized: the measured crossover
+    # learned from this hub's own GPU/CPU runs when available (Core measures, Kyber consumes),
+    # else the config default. This is what makes the backend choice adaptive to the hardware.
+    from batcher.kyber.gpu.adaptive import learned_gpu_min_rows
+
+    learned_min = learned_gpu_min_rows(hub)
+    min_rows = learned_min or dc.gpu_min_rows
+    learned = "learned " if learned_min else ""
+    if not force and rows < min_rows:
         return GpuDecision(
-            False, False, f"{rows} rows < gpu_min_rows={dc.gpu_min_rows}: CPU wins on overhead"
+            False, False, f"{rows} rows < {learned}min_rows={min_rows}: CPU wins on overhead", rows
         )
 
     one_gpu_gb = max(dc.gpu_memory_gb, 1e-9)
     if ws_gb <= one_gpu_gb:
-        return GpuDecision(True, False, f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)")
+        return GpuDecision(True, False, f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)", rows)
     if ws_gb <= one_gpu_gb * gpu_count:
         return GpuDecision(
-            True, True, f"~{ws_gb:.1f}GB exceeds one GPU: shard across {gpu_count} GPUs"
+            True, True, f"~{ws_gb:.1f}GB exceeds one GPU: shard across {gpu_count} GPUs", rows
         )
     return GpuDecision(
-        False, False, f"~{ws_gb:.1f}GB exceeds all {gpu_count} GPUs: CPU engine (spillable)"
+        False, False, f"~{ws_gb:.1f}GB exceeds all {gpu_count} GPUs: CPU engine (spillable)", rows
     )
 
 
