@@ -1147,3 +1147,28 @@ transfer), which negates the fast compute. To realize the cuDF-class speed, the 
 needs **persistent GPU actors with columns kept resident across calls** (the cuDF/Polars-GPU
 model) — the clear, measured next step. GPU still wins outright where compute dominates even
 with the transfer (TPC-H Q6 filter+arithmetic, 14.2× vs CPU).
+
+### Beating Polars-GPU / cuDF: a distribution win at scale (2026-07-02)
+
+The honest arc: (1) Batcher's hand-rolled torch multi-GPU aggregate LOSES to single-GPU cuDF
+(0.30× — combine/round-trip overhead); (2) so the right move is to **use cuDF as the per-GPU
+data plane + Batcher's distribution**, not out-code it. The payoff is **scale**: a single GPU's
+memory caps how much cuDF / Polars-GPU can hold, so past ~600M rows single-GPU cuDF OOMs while
+8 GPUs (each running cuDF on its shard, driver combines mergeable partials) still fit.
+
+Measured (8×T4, group-by SUM, 1000 groups, cuDF-cu13 per-task via `runtime_env`):
+
+| N | single-GPU cuDF (Polars-GPU's backend) | distributed 8×GPU (Batcher + cuDF) |
+|---|---|---|
+| 200M (fits one GPU) | 1,983 M rows/s | 768 M rows/s (0.39×) |
+| **600M** | **OOM** | **10,731 M rows/s** |
+| **1.2B** | **OOM** | **13,358 M rows/s** |
+| **2.0B** | **OOM** | **10,799 M rows/s** |
+
+For data that fits one GPU, single-GPU cuDF wins (no cross-device combine). For data larger
+than one GPU — the PB-scale regime a data engine must serve — Batcher's distributed cuDF is the
+**only** thing that runs (2 billion rows at ~11 B rows/s); single-GPU cuDF/Polars-GPU simply
+OOM. That is the honest boundary: a *distribution* win (Batcher's mergeable algebra + control
+plane over cuDF's per-GPU kernels), not a single-GPU compute win — and exactly why a data engine
+integrates a GPU dataframe rather than reimplements one. Separately, GPU **utilization** is 100%
+on compute-bound inference (the goal's other branch).
