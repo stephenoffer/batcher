@@ -98,3 +98,28 @@ def test_join_translator_matches_cpu_engine(build):
     got = _execute_join_plan(lt, rt, jir, ops, pd)
     exp = ds.collect().to_pandas()
     assert _norm(got[exp.columns]).equals(_norm(exp))
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda a, b: a.union(b),
+        lambda a, b: a.union(b).filter(col("x") > 2),
+        lambda a, b: a.union(b).group_by("x").agg(s=col("y").sum()),
+    ],
+)
+def test_union_translator_matches_cpu_engine(build):
+    import pandas as pd
+
+    from batcher.core.gpu_plan import _execute_union_plan, gpu_union_spec
+
+    a = pa.table({"x": np.array([1, 2, 3], "int64"), "y": np.array([1.0, 2, 3])})
+    b = pa.table({"x": np.array([3, 4], "int64"), "y": np.array([3.0, 4])})
+    ds = build(bt.from_arrow(a), bt.from_arrow(b))
+    spec = gpu_union_spec(ds._plan)
+    assert spec is not None
+    scans, distinct, ops = spec
+    tabs = [a if s.source_id == 0 else b for s in scans]
+    got = _execute_union_plan(tabs, distinct, ops, pd)
+    exp = ds.collect().to_pandas()
+    assert _norm(got[exp.columns]).equals(_norm(exp))

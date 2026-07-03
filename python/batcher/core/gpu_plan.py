@@ -22,7 +22,14 @@ if TYPE_CHECKING:
 
     from batcher.plan.logical import LogicalPlan
 
-__all__ = ["execute_cudf_join", "execute_cudf_plan", "gpu_join_spec", "gpu_plan_ops"]
+__all__ = [
+    "execute_cudf_join",
+    "execute_cudf_plan",
+    "execute_cudf_union",
+    "gpu_join_spec",
+    "gpu_plan_ops",
+    "gpu_union_spec",
+]
 
 _JOIN_HOW = {"inner": "inner", "left": "left", "right": "right", "outer": "outer", "full": "outer"}
 
@@ -103,6 +110,46 @@ def gpu_join_spec(plan: LogicalPlan):
         return None
     ops.reverse()
     return node.left, node.right, join_ir, ops
+
+
+def gpu_union_spec(plan: LogicalPlan):
+    """`(scans, distinct, [op_ir, ...])` for a `[supported ops] over Union(all scans)` plan, else
+    `None`. All union inputs must be plain scans; `distinct` selects concat vs concat+dedup."""
+    from batcher.plan.logical import Scan, Union
+
+    ops: list[dict] = []
+    node: Any = plan
+    while node is not None and not isinstance(node, (Scan, Union)):
+        try:
+            ir = node.to_ir()
+        except Exception:
+            return None
+        if ir.get("op") not in _SUPPORTED_OPS or (
+            ir["op"] == "aggregate" and not _agg_is_supported(ir)
+        ):
+            return None
+        ops.append(ir)
+        node = getattr(node, "input", None)
+    if not isinstance(node, Union) or not all(isinstance(i, Scan) for i in node.inputs):
+        return None
+    ops.reverse()
+    return list(node.inputs), bool(node.to_ir().get("distinct", False)), ops
+
+
+def _execute_union_plan(tables: list, distinct: bool, ops: list[dict], lib):
+    out = lib.concat([_df_from_arrow(t, lib) for t in tables], ignore_index=True)
+    if distinct:
+        out = out.drop_duplicates().reset_index(drop=True)
+    for op in ops:
+        out = _apply(out, op, lib)
+    return out
+
+
+def execute_cudf_union(tables: list, distinct: bool, ops: list[dict]) -> pa.Table:
+    """Union (concat, optional dedup) tables + an op chain on the GPU via cuDF, returning Arrow."""
+    import cudf
+
+    return _execute_union_plan(tables, distinct, ops, cudf).to_arrow()
 
 
 def _agg_is_supported(ir: dict) -> bool:

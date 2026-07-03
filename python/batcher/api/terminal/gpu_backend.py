@@ -64,7 +64,7 @@ def try_gpu_collect(plan: LogicalPlan, sources: list[Source]) -> pa.Table | None
     # General path: a linear chain of supported ops (filter / project / sort / distinct / limit /
     # multi-key aggregate) is translated to cuDF and run on ONE GPU (single-dispatch). Correct for
     # any data that fits a GPU; OOM / an unsupported expression falls back to the CPU engine.
-    from batcher.core.gpu_plan import gpu_join_spec, gpu_plan_ops
+    from batcher.core.gpu_plan import gpu_join_spec, gpu_plan_ops, gpu_union_spec
 
     plan_spec = gpu_plan_ops(plan)
     if plan_spec is not None:
@@ -85,6 +85,19 @@ def try_gpu_collect(plan: LogicalPlan, sources: list[Source]) -> pa.Table | None
         return _dispatch_cudf_join(
             pa.Table.from_batches(lb), pa.Table.from_batches(rb), join_ir, ops
         )
+
+    # A `[supported ops] over Union(scans)` — concat (+ optional dedup) + a chain — on one GPU.
+    union_spec = gpu_union_spec(plan)
+    if union_spec is not None:
+        scans, distinct, ops = union_spec
+        tables = [
+            pa.Table.from_batches(b)
+            for sc in scans
+            if (b := list(sources[sc.source_id].read()))
+        ]
+        if not tables:
+            return None
+        return _dispatch_cudf_union(tables, distinct, ops)
     return None
 
 
@@ -201,6 +214,34 @@ def _cudf_join_worker(left_t, right_t, join_ir, ops):
     from batcher.core.gpu_plan import execute_cudf_join
 
     return execute_cudf_join(left_t, right_t, join_ir, ops)
+
+
+def _cudf_union_worker(tables, distinct, ops):
+    from batcher.core.gpu_plan import execute_cudf_union
+
+    return execute_cudf_union(tables, distinct, ops)
+
+
+def _dispatch_cudf_union(tables: list, distinct: bool, ops: list[dict]) -> pa.Table | None:
+    """Run a union (+ op chain) on one GPU via cuDF; `None` on failure → CPU fallback."""
+    from batcher.core.gpu_transform import gpu_available
+
+    try:
+        if gpu_available():
+            with contextlib.suppress(Exception):
+                return _cudf_union_worker(tables, distinct, ops)
+        import ray
+
+        from batcher.dist.executors.ray_runtime import _ensure_ray
+
+        _ensure_ray(1)
+        opts: dict = {"num_gpus": 1}
+        rt = _gpu_task_runtime_env()
+        if rt is not None:
+            opts["runtime_env"] = rt
+        return ray.get(ray.remote(**opts)(_cudf_union_worker).remote(tables, distinct, ops))
+    except Exception:
+        return None
 
 
 def _dispatch_cudf_join(left_t, right_t, join_ir: dict, ops: list[dict]) -> pa.Table | None:
