@@ -40,14 +40,12 @@ def _plan(n_rows: int):
 
 
 def _working_set_gb(plan, sources) -> float:
-    """The same working-set estimate the policy uses, so memory-regime tests set budgets around
-    the real number instead of a guessed one."""
-    from batcher.kyber.cardinality import CardinalityEstimator
+    """The exact working-set the policy uses (reducing-op-aware), so memory-regime tests set
+    budgets around the real number the decision sees."""
+    from batcher.kyber.gpu.policy import _estimate
 
-    est = CardinalityEstimator(sources=sources)
-    rows = int(est.estimate(plan).rows)
-    width = est.row_width(plan, active_config().optimizer.row_bytes)
-    return rows * max(width, 1) / 1e9
+    _rows, ws = _estimate(plan, sources, None)
+    return ws
 
 
 def test_no_gpu_is_always_cpu():

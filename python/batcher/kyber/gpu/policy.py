@@ -53,16 +53,26 @@ class GpuDecision:
 
 
 def _estimate(plan: LogicalPlan, sources: list[Source], hub: MetadataHub | None):
-    """`(rows, working_set_gb)` estimated by Kyber's cardinality model, or `(None, None)` when
-    the size is unknown (an estimator failure or an unbounded source)."""
+    """`(rows, working_set_gb)` for the volume the GPU actually processes, or `(None, None)` when
+    the size is unknown (an estimator failure or an unbounded source).
+
+    For a *reducing* top operator (a group-by aggregate or a distinct) the plan's OUTPUT
+    cardinality is the group/distinct count — a handful of rows — which massively understates the
+    work and the memory: the GPU reads and reduces the whole INPUT. So we estimate the input to a
+    reducing top node, not its output. A map-shaped plan (filter/project) already has
+    output ≈ processed, so it estimates the plan directly."""
     from batcher.kyber import load_learned_stats
     from batcher.kyber.cardinality import CardinalityEstimator
+    from batcher.plan.logical import Aggregate, Distinct
 
+    target = plan
+    if isinstance(plan, (Aggregate, Distinct)) and getattr(plan, "input", None) is not None:
+        target = plan.input
     try:
         learned = load_learned_stats(hub) if hub is not None else None
         est = CardinalityEstimator(sources=sources, learned=learned)
-        rows = int(est.estimate(plan).rows)
-        width = est.row_width(plan, active_config().optimizer.row_bytes)
+        rows = int(est.estimate(target).rows)
+        width = est.row_width(target, active_config().optimizer.row_bytes)
     except Exception:
         return None, None
     if rows <= 0:
