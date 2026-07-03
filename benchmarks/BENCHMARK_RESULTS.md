@@ -1106,3 +1106,28 @@ Design implication (recorded for the Batcher GPU backend): expose GPU as a `core
 strategy (CPU vs GPU, not call-site branching) that lowers a numeric scan→filter→project→agg
 chain to the GPU and keeps columns resident across a query, approaching the compute ceiling.
 The Polars-GPU (cuDF) head-to-head is pending cuDF sync to the workers.
+
+### `collect(backend="gpu")` shipped — and where GPU does NOT help (honest, measured)
+
+`collect(backend="gpu")` is a real, opt-in capability: a supported group-by aggregate runs on
+the GPU (single-dispatch for small/in-memory sources; a **distributed** partial-per-GPU-worker
++ mergeable driver combine for splittable sources), falling back to the CPU engine otherwise.
+Correctness verified on the cluster (20M rows / 200k groups, `backend="gpu"` == `"cpu"` exactly).
+
+But the measured perf is the important, honest part — a **distributed group-by SUM** (20M rows,
+8×T4), where the GPU aggregate competes against Batcher's own CPU engine and Ray Data:
+
+| engine | throughput | wall | vs Ray Data |
+|---|---|---|---|
+| **Batcher CPU** (native Rust mergeable aggregate) | 69 M rows/s | 289 ms | **105×** |
+| Ray Data (`groupby().aggregate()`) | 0.7 M rows/s | 30.4 s | 1× |
+| Batcher GPU (`backend="gpu"`, distributed) | 0.6 M rows/s | 33.9 s | 0.9× |
+
+**A group-by SUM is memory-bound, so the GPU's compute advantage does not apply** — the Rust
+CPU aggregate is already saturated (and already 105× Ray Data), while the GPU path pays Ray
+task dispatch + per-shard read + host→device transfer for a reduction that is trivial once the
+bytes are moved. So GPU aggregation is ~parity with Ray Data and **loses to Batcher's own CPU
+engine**. GPU wins where **compute** dominates (TPC-H Q6's filter+arithmetic, 14.2× vs CPU),
+not on memory-bound reductions. `backend="gpu"` stays opt-in (default `cpu`), so it never
+auto-regresses; the takeaway is that a GPU backend must be routed by *compute intensity*, not
+applied blanketly — the honest boundary of when accelerators help a data engine.
