@@ -40,23 +40,37 @@ def _true_crossover() -> float:
     return (6000.0 - 200.0) / (4.0e-4 - 1.1e-4)
 
 
+# eight spread-out sizes so the fit clears the _MIN_SAMPLES=8 confidence gate.
+_SAMPLE_ROWS = (
+    2_000_000,
+    6_000_000,
+    12_000_000,
+    18_000_000,
+    26_000_000,
+    40_000_000,
+    60_000_000,
+    80_000_000,
+)
+
+
 def test_learns_crossover_from_samples():
     hub = _hub()
     # not enough / no spread yet -> no learned value
     assert learned_gpu_min_rows(hub) is None
-    for rows in (2_000_000, 10_000_000, 30_000_000, 80_000_000):
+    for rows in _SAMPLE_ROWS:
         record_backend_timing(hub, "cpu", rows, _cpu_ms(rows))
         record_backend_timing(hub, "gpu", rows, _gpu_ms(rows))
     got = learned_gpu_min_rows(hub)
     assert got is not None
-    # recovered within 10% of the analytic crossover
+    # the analytic crossover (~20M) sits inside the band around the 10M default, so it is
+    # recovered within 10% (not clamped).
     assert abs(got - _true_crossover()) / _true_crossover() < 0.10
 
 
 def test_no_crossover_when_gpu_never_cheaper_per_row():
     hub = _hub()
     # GPU is worse per row AND has higher fixed cost -> no useful threshold, defer to config
-    for rows in (1_000_000, 20_000_000, 60_000_000):
+    for rows in _SAMPLE_ROWS:
         record_backend_timing(hub, "cpu", rows, 100.0 + 1.0e-4 * rows)
         record_backend_timing(hub, "gpu", rows, 5000.0 + 5.0e-4 * rows)
     assert learned_gpu_min_rows(hub) is None
@@ -65,33 +79,45 @@ def test_no_crossover_when_gpu_never_cheaper_per_row():
 def test_needs_row_spread_not_just_count():
     hub = _hub()
     # many samples but all at the SAME row count -> slope unidentifiable -> None
-    for _ in range(6):
+    for _ in range(10):
         record_backend_timing(hub, "cpu", 10_000_000, 4200.0)
         record_backend_timing(hub, "gpu", 10_000_000, 7100.0)
     assert learned_gpu_min_rows(hub) is None
 
 
-def test_decision_consumes_the_learned_threshold():
-    # A plan whose estimate sits BELOW the config default (10M) but ABOVE a lower learned
-    # crossover flips from CPU to GPU once the hub has learned the lower threshold.
-    ds = bt.from_pydict({"k": list(range(4_000_000)), "v": [1.0] * 4_000_000})
+def test_learned_crossover_is_clamped_to_a_band_around_the_default():
+    # A learned crossover far below the default is clamped to default/8, so a noisy early fit
+    # can only nudge the threshold within a bounded range.
+    hub = _hub()
+    for rows in _SAMPLE_ROWS:
+        record_backend_timing(hub, "cpu", rows, 50.0 + 2.0e-3 * rows)  # very steep per-row
+        record_backend_timing(hub, "gpu", rows, 200.0 + 1.0e-3 * rows)  # true crossover ~150k
+    learned = learned_gpu_min_rows(hub)
+    from batcher.config import active_config
+
+    default = active_config().distributed.gpu_min_rows
+    assert learned == default // 8  # clamped up to the band floor
+
+
+def test_decision_consumes_the_learned_threshold(monkeypatch):
+    # Kyber's decision must use the learned crossover, not the config default. Pin the estimate
+    # so the test turns only on the threshold: 5M input sits below the 10M default (→ CPU) but
+    # above a learned+clamped crossover (→ GPU).
+    from batcher.kyber.gpu import policy
+
+    monkeypatch.setattr(policy, "_estimate", lambda *a, **k: (5_000_000, 0.08))
+    ds = bt.from_pydict({"k": [1, 2], "v": [1.0, 2.0]})
     q = ds.group_by("k").agg(s=bt.col("v").sum())
 
-    # With no learning, the config default (10M) keeps this small estimate on the CPU.
-    fresh = _hub()
+    fresh = _hub()  # no learning -> config default 10M -> 5M stays on CPU
     assert decide_gpu_backend(q._plan, q._sources, fresh, gpu_count=4, force=False).use_gpu is False
 
-    # Learn a low crossover (~150k) from measured timings: GPU dear fixed cost, cheap per row.
-    hub = _hub()
-    for rows in (100_000, 300_000, 600_000, 1_000_000):
-        record_backend_timing(hub, "cpu", rows, 50.0 + 2.0e-3 * rows)  # steep per-row
-        record_backend_timing(hub, "gpu", rows, 200.0 + 1.0e-3 * rows)  # higher fixed, flat
-    learned = learned_gpu_min_rows(hub)
-    assert learned is not None and learned < 400_000
-
-    # Same plan, same estimate — now above the learned threshold, so Kyber picks the GPU.
-    d = decide_gpu_backend(q._plan, q._sources, hub, gpu_count=4, force=False)
-    assert d.use_gpu is True
+    hub = _hub()  # learn a low crossover (clamps to default/8 = 1.25M) -> 5M flips to GPU
+    for rows in _SAMPLE_ROWS:
+        record_backend_timing(hub, "cpu", rows, 50.0 + 2.0e-3 * rows)
+        record_backend_timing(hub, "gpu", rows, 200.0 + 1.0e-3 * rows)
+    assert learned_gpu_min_rows(hub) < 5_000_000
+    assert decide_gpu_backend(q._plan, q._sources, hub, gpu_count=4, force=False).use_gpu is True
 
 
 def test_record_cpu_crossover_feeds_the_learner_when_a_gpu_is_present(monkeypatch):

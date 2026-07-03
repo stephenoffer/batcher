@@ -20,15 +20,21 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher.config import active_config
+
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
 
 __all__ = ["learned_gpu_min_rows", "record_backend_timing"]
 
 _NS = "gpu_backend_xover"
-_MIN_SAMPLES = 3  # per backend, with at least two distinct row counts, before we trust a fit
-_XOVER_LO = 100_000  # clamp the learned crossover to a sane band (guards a noisy early fit)
-_XOVER_HI = 5_000_000_000
+# Trust the fit only after enough spread-out samples per backend — single-run timings are noisy,
+# so a handful of points can swing the intercept wildly. This keeps the (already well-chosen)
+# config default in charge until there is real evidence, and the loop stays conservative.
+_MIN_SAMPLES = 8
+# And even then, clamp the learned crossover to a band around the config default, so one bad
+# early fit can only nudge the threshold within a bounded range, never send it to an absurd value.
+_BAND = 8.0  # learned ∈ [default / _BAND, default * _BAND]
 
 
 def record_backend_timing(hub: MetadataHub | None, backend: str, rows: int, wall_ms: float) -> None:
@@ -95,4 +101,5 @@ def learned_gpu_min_rows(hub: MetadataHub | None) -> int | None:
     xover = (a_gpu - a_cpu) / (b_cpu - b_gpu)
     if xover <= 0.0:
         return None
-    return int(min(max(xover, _XOVER_LO), _XOVER_HI))
+    default = float(active_config().distributed.gpu_min_rows)
+    return int(min(max(xover, default / _BAND), default * _BAND))
