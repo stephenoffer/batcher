@@ -7,6 +7,7 @@ unsupported shape or a GPU-less host transparently uses the CPU engine (same res
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 import batcher as bt
@@ -61,3 +62,43 @@ def test_gpu_task_opts_carry_spot_preemption_retry_budget():
     # A deterministic app error (OOM / unsupported expr) must fall back to CPU immediately, not
     # burn N retries -> retry_exceptions stays off for the GPU path.
     assert "retry_exceptions" not in opts
+
+
+def test_oversubscribed_shards_combine_to_the_same_aggregate():
+    # Oversubscribing shards past the GPU count (to bound per-GPU memory + cheapen spot retries)
+    # must not change the answer: the mergeable partial->combine algebra is exact for ANY shard
+    # count. Simulate the per-shard GPU partials with pandas and fold them via the real combine.
+    import pandas as pd
+    import pyarrow as pa
+
+    from batcher.api.terminal.gpu_backend import _combine_partials, _partial_aggs
+
+    rng = np.random.default_rng(0)
+    n = 5000
+    full = pd.DataFrame({"k": rng.integers(0, 7, n), "v": rng.random(n)})
+    aggs = {"s": ("v", "sum"), "c": ("v", "count"), "m": ("v", "mean"), "mx": ("v", "max")}
+    partial_aggs = _partial_aggs(aggs)
+
+    def shard_partial(df: pd.DataFrame) -> pa.Table:
+        cols: dict[str, list] = {"k": []}
+        agg_map: dict[str, list] = {a: [] for a in partial_aggs}
+        for kval, grp in df.groupby("k"):
+            cols["k"].append(kval)
+            for alias, (colname, func) in partial_aggs.items():
+                agg_map[alias].append(getattr(grp[colname], func)())
+        return pa.table({**cols, **agg_map})
+
+    for n_shards in (1, 4, 32):
+        shards = np.array_split(full.sample(frac=1.0, random_state=1), n_shards)
+        partials = [shard_partial(s) for s in shards if len(s)]
+        got = _combine_partials(partials, "k", aggs).to_pandas().sort_values("k").round(6)
+        exp = (
+            full.groupby("k")
+            .agg(s=("v", "sum"), c=("v", "count"), m=("v", "mean"), mx=("v", "max"))
+            .reset_index()
+            .round(6)
+        )
+        assert got["s"].tolist() == exp["s"].round(6).tolist()
+        assert got["c"].tolist() == exp["c"].tolist()
+        assert got["m"].tolist() == exp["m"].round(6).tolist()
+        assert got["mx"].tolist() == exp["mx"].round(6).tolist()

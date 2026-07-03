@@ -171,6 +171,10 @@ def _distributed_gpu_aggregate(
 
         from batcher.dist.executors.partition_io import _scan_splits
         from batcher.dist.executors.ray_runtime import _ensure_ray, cluster_topology
+        from batcher.dist.executors.ray_runtime.scaling import (
+            release_autoscale,
+            request_autoscale,
+        )
     except Exception:
         return None
 
@@ -181,18 +185,29 @@ def _distributed_gpu_aggregate(
         return None
     # Only worth it for a genuinely splittable source (shared-nothing shard reads). An
     # in-memory source has no splits → let the single-dispatch path handle it.
+    from batcher.config import active_config
     from batcher.dist.executors.partition_io import WholeSourceSplit, partition_descriptors
 
     splits = _scan_splits(source, n_gpus)
     if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):
         return None
 
-    _ensure_ray(n_gpus)
-    descs = partition_descriptors(source, n_gpus)
-    partial_aggs = _partial_aggs(aggs)
-    opts = _gpu_task_opts()
-    task = ray.remote(**opts)(_gpu_partial_task)
-    partials = ray.get([task.remote(d, key, partial_aggs) for d in descs])
+    # Hold a GPU autoscale floor for the query so a churning spot cluster keeps (or grows) the
+    # GPU nodes instead of the autoscaler reclaiming them mid-aggregate; released in `finally`.
+    request_autoscale(n_gpus, target_gpus=float(n_gpus))
+    try:
+        _ensure_ray(n_gpus)
+        # Oversubscribe shards past the GPU count: bound each shard (no single-GPU OOM on a big
+        # source), load-balance finely across the cluster, and keep a spot-preempted shard's
+        # retry cheap. Ray runs at most `n_gpus` `num_gpus=1` tasks at once, so the rest pipeline.
+        factor = max(1, int(active_config().distributed.gpu_shard_oversubscribe))
+        descs = partition_descriptors(source, n_gpus * factor)
+        partial_aggs = _partial_aggs(aggs)
+        opts = _gpu_task_opts()
+        task = ray.remote(**opts)(_gpu_partial_task)
+        partials = ray.get([task.remote(d, key, partial_aggs) for d in descs])
+    finally:
+        release_autoscale()
     partials = [p for p in partials if p is not None]
     if not partials:
         return None

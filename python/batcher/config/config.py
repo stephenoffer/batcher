@@ -702,6 +702,14 @@ class DistributedConfig:
     # cuDF's pip install is cached per node after the first task; numpy stays pinned so returned
     # arrays unpickle on the driver. Off → the torch fallback (no install, slower). On by default.
     gpu_backend_cudf: bool = True
+    # Shards per GPU for the distributed GPU aggregate. Fanning out one shard per GPU puts an
+    # unbounded slice on each device — a big source then OOMs a single GPU and the whole query
+    # collapses to the CPU fallback. Oversubscribing (this many shards per GPU) bounds each
+    # shard, and because Ray runs at most `#GPUs` `num_gpus=1` tasks at once the extra shards
+    # queue and pipeline: finer granularity load-balances across a heterogeneous / churning spot
+    # cluster and makes a spot-preempted shard's retry cheap (1/N the work). The mergeable
+    # combine is correct for any shard count. 1 = one shard per GPU (the old behavior).
+    gpu_shard_oversubscribe: int = 4
     # `distributed="auto"` distributes only when it PAYS. On a multi-node cluster the Ray
     # fan-out (SPREAD placement + task dispatch + result gather) is a ~2 s fixed cost, so a
     # small query runs far faster single-node (measured: an 80k-row filter is ~55 ms
