@@ -46,3 +46,18 @@ def test_gpu_backend_falls_back_to_cpu_on_gpuless_host():
     ds = bt.from_pydict({"k": [1, 1, 2, 3, 2], "v": [10.0, 20.0, 5.0, 7.0, 9.0]})
     q = ds.group_by("k").agg(s=col("v").sum(), c=col("v").count())
     assert q.collect(backend="gpu").to_pydict() == q.collect(backend="cpu").to_pydict()
+
+
+def test_gpu_task_opts_carry_spot_preemption_retry_budget():
+    # Every GPU dispatch task must retry a lost (spot-preempted) worker on a survivor rather than
+    # collapsing the distributed GPU query to the single-node CPU fallback. The budget is the same
+    # config knob the flight shuffle tasks use.
+    from batcher.api.terminal.gpu_backend import _gpu_task_opts
+    from batcher.config import active_config
+
+    opts = _gpu_task_opts()
+    assert opts["num_gpus"] == 1
+    assert opts["max_retries"] == active_config().distributed.task_max_retries
+    # A deterministic app error (OOM / unsupported expr) must fall back to CPU immediately, not
+    # burn N retries -> retry_exceptions stays off for the GPU path.
+    assert "retry_exceptions" not in opts

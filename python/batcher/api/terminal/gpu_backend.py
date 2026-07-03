@@ -91,9 +91,7 @@ def try_gpu_collect(plan: LogicalPlan, sources: list[Source]) -> pa.Table | None
     if union_spec is not None:
         scans, distinct, ops = union_spec
         tables = [
-            pa.Table.from_batches(b)
-            for sc in scans
-            if (b := list(sources[sc.source_id].read()))
+            pa.Table.from_batches(b) for sc in scans if (b := list(sources[sc.source_id].read()))
         ]
         if not tables:
             return None
@@ -192,10 +190,7 @@ def _distributed_gpu_aggregate(
     _ensure_ray(n_gpus)
     descs = partition_descriptors(source, n_gpus)
     partial_aggs = _partial_aggs(aggs)
-    opts: dict = {"num_gpus": 1}
-    rt = _gpu_task_runtime_env()
-    if rt is not None:
-        opts["runtime_env"] = rt
+    opts = _gpu_task_opts()
     task = ray.remote(**opts)(_gpu_partial_task)
     partials = ray.get([task.remote(d, key, partial_aggs) for d in descs])
     partials = [p for p in partials if p is not None]
@@ -235,10 +230,7 @@ def _dispatch_cudf_union(tables: list, distinct: bool, ops: list[dict]) -> pa.Ta
         from batcher.dist.executors.ray_runtime import _ensure_ray
 
         _ensure_ray(1)
-        opts: dict = {"num_gpus": 1}
-        rt = _gpu_task_runtime_env()
-        if rt is not None:
-            opts["runtime_env"] = rt
+        opts = _gpu_task_opts()
         return ray.get(ray.remote(**opts)(_cudf_union_worker).remote(tables, distinct, ops))
     except Exception:
         return None
@@ -258,13 +250,8 @@ def _dispatch_cudf_join(left_t, right_t, join_ir: dict, ops: list[dict]) -> pa.T
         from batcher.dist.executors.ray_runtime import _ensure_ray
 
         _ensure_ray(1)
-        opts: dict = {"num_gpus": 1}
-        rt = _gpu_task_runtime_env()
-        if rt is not None:
-            opts["runtime_env"] = rt
-        return ray.get(
-            ray.remote(**opts)(_cudf_join_worker).remote(left_t, right_t, join_ir, ops)
-        )
+        opts = _gpu_task_opts()
+        return ray.get(ray.remote(**opts)(_cudf_join_worker).remote(left_t, right_t, join_ir, ops))
     except Exception:
         return None
 
@@ -285,10 +272,7 @@ def _dispatch_cudf_plan(table: pa.Table, ops: list[dict]) -> pa.Table | None:
         from batcher.dist.executors.ray_runtime import _ensure_ray
 
         _ensure_ray(1)
-        opts: dict = {"num_gpus": 1}
-        rt = _gpu_task_runtime_env()
-        if rt is not None:
-            opts["runtime_env"] = rt
+        opts = _gpu_task_opts()
         return ray.get(ray.remote(**opts)(_cudf_plan_worker).remote(table, ops))
     except Exception:
         return None  # cuDF-less / OOM / unsupported expr -> CPU fallback
@@ -330,6 +314,24 @@ def _gpu_task_runtime_env() -> dict | None:
     return rt or None
 
 
+def _gpu_task_opts() -> dict:
+    """Ray remote-options for a GPU dispatch task: one GPU, the batcher+cuDF runtime_env, and a
+    spot-preemption retry budget.
+
+    `max_retries` reruns a task whose GPU worker/node was lost (spot reclamation) on surviving
+    capacity — so a large GPU query on a churning spot cluster self-heals instead of one lost
+    shard collapsing it to the single-node CPU fallback. `retry_exceptions` is deliberately left
+    off: a deterministic application error (a GPU OOM, an unsupported expression) must fall back
+    to the CPU engine immediately, not after N pointless retries."""
+    from batcher.config import active_config
+
+    opts: dict = {"num_gpus": 1, "max_retries": int(active_config().distributed.task_max_retries)}
+    rt = _gpu_task_runtime_env()
+    if rt is not None:
+        opts["runtime_env"] = rt
+    return opts
+
+
 def _cluster_has_gpu() -> bool:
     """Whether the live cluster (or local process) exposes at least one GPU."""
     try:
@@ -365,9 +367,6 @@ def _dispatch_gpu_aggregate(table: pa.Table, key: str, aggs: dict) -> pa.Table:
     from batcher.dist.executors.ray_runtime import _ensure_ray
 
     _ensure_ray(1)
-    opts: dict = {"num_gpus": 1}
-    rt = _gpu_task_runtime_env()
-    if rt is not None:
-        opts["runtime_env"] = rt
+    opts = _gpu_task_opts()
     task = ray.remote(**opts)(_gpu_aggregate_worker)
     return ray.get(task.remote(table, key, aggs))
