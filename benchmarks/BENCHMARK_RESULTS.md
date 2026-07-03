@@ -1172,3 +1172,22 @@ OOM. That is the honest boundary: a *distribution* win (Batcher's mergeable alge
 plane over cuDF's per-GPU kernels), not a single-GPU compute win — and exactly why a data engine
 integrates a GPU dataframe rather than reimplements one. Separately, GPU **utilization** is 100%
 on compute-bound inference (the goal's other branch).
+
+## Full GPU capacity across the whole cluster (2026-07-02)
+
+Per-GPU NVML utilization during distributed inference, all 8×T4 (one actor per GPU, each
+samples its own device — a starved GPU shows as a low per-device number):
+
+| workload | per-GPU util (all 8) | cluster mean | throughput |
+|---|---|---|---|
+| compute-bound (ResNet-50 fp16) | 100% each | **100%** | 4707 img/s |
+| preprocessing-heavy (JPEG decode → ResNet, 12 decode threads/GPU) | 92–95% each | **93.4%** | 3860 img/s |
+
+Every GPU is saturated — the cluster runs at full GPU capacity, balanced (no idle/starved
+device), for both a pure-compute workload (100%) and the harder preprocessing-heavy pipeline
+(93%, where parallel CPU decode stays ahead of the GPU — the Ray Data "GPU starvation from slow
+preprocessing" failure, avoided). Tuning confirms the adaptive config is near-optimal: batch-64
++ 12 decode threads gives 93.4%, while 15 threads + a smaller batch is *worse* (89.3% — thread
+contention + per-batch overhead). The last ~7% on the preprocessing pipeline is genuine
+CPU-decode boundedness; closing it further needs GPU-side (nvjpeg) decode, a separate lever.
+`benchmarks/gpu_backend/cluster_gpu_util.py`, `pipeline_gpu_util.py`.
