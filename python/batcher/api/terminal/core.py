@@ -53,6 +53,7 @@ def _collect(
     transport: str = "auto",
     cache: bool = False,
     source_stats: list | None = None,
+    backend: str = "cpu",
 ) -> pa.Table:
     """Execute the plan and materialize the result as a `pyarrow.Table`.
 
@@ -90,6 +91,15 @@ def _collect(
     metadata = metadata_aggregate_table(plan, sources, source_stats)
     if metadata is not None:
         return metadata
+    # Opt-in GPU backend: a supported shape (a group-by aggregate over a scan) runs on the
+    # GPU; anything else — or a GPU-less cluster — silently falls back to the CPU engine, so
+    # `backend="gpu"` is always safe. Same result, different *where*.
+    if backend == "gpu":
+        from batcher.api.terminal.gpu_backend import try_gpu_collect
+
+        gpu_result = try_gpu_collect(plan, sources)
+        if gpu_result is not None:
+            return gpu_result
     # Opt-in: offload large-payload columns out of line around breakers (the blobs ride
     # through as tiny handles). Inserted before execution routing so the resulting
     # `map_batches` stages take the same mixed-executor path as an explicit offload.

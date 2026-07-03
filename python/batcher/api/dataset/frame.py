@@ -1693,6 +1693,7 @@ class Dataset:
         num_partitions: int | None = None,
         adaptive: bool | str = "auto",
         transport: str = "auto",
+        backend: str = "cpu",
     ) -> pa.Table:
         """Execute the plan and materialize the result as a `pyarrow.Table`.
 
@@ -1703,9 +1704,11 @@ class Dataset:
         it and `num_partitions` overrides the bucket count. `adaptive="auto"` turns on
         intra-query re-optimization only when a join's input size is a pure estimate
         (so measured cardinality could change a build-side/join-order choice), and
-        stays one-shot otherwise; `True`/`False` force it. The result is identical
-        whichever way it runs. Raises `PlanError` if the dataset is unbounded (a
-        streaming source) — use `iter_batches()` / `write()`.
+        stays one-shot otherwise; `True`/`False` force it. `backend="gpu"` runs a
+        supported shape (a group-by aggregate over a scan) on the GPU and falls back to
+        the CPU engine for anything else or a GPU-less cluster — always safe to request.
+        The result is identical whichever way it runs. Raises `PlanError` if the dataset
+        is unbounded (a streaming source) — use `iter_batches()` / `write()`.
 
         Examples:
             .. doctest::
@@ -1726,6 +1729,7 @@ class Dataset:
             adaptive=adaptive,
             transport=transport,
             cache=self._cache,
+            backend=backend,
         )
 
     def explain(self, analyze: bool = False, *, format: str = "text") -> str:
