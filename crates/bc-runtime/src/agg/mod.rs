@@ -19,14 +19,8 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, Int64Array, UInt32Array};
-use arrow::datatypes::{
-    ArrowPrimitiveType, BinaryType, Int16Type, Int32Type, Int64Type, Int8Type, LargeBinaryType,
-    LargeUtf8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
-};
-use arrow::row::{RowConverter, SortField};
-use hashbrown::hash_table::Entry;
-use hashbrown::HashTable;
+use arrow::array::{Array, ArrayRef, Int64Array};
+use rayon::prelude::*;
 
 use crate::error::RuntimeError;
 
@@ -44,6 +38,7 @@ mod var;
 
 use accum::{bitfold_acc, bool_acc, concat_col, minmax_acc, product_acc, require, sum_acc};
 use argextreme::{arg_extreme_state, merge_arg_extreme};
+pub use distinct::distinct_batch;
 use distinct::{bucket_values_into_list, distinct_state, finalize_count_distinct, merge_distinct};
 use hll::{approx_distinct_state, finalize_approx_distinct, merge_approx_distinct};
 use median::{
@@ -51,6 +46,7 @@ use median::{
     merge_median,
 };
 use qsketch::{approx_quantile_state, finalize_approx_quantile, merge_approx_quantile};
+pub(crate) use radix::assign_groups;
 use stats::{
     covar_state, finalize_corr, finalize_covar, finalize_kurtosis, finalize_skewness, moment_state,
 };
@@ -245,6 +241,15 @@ pub fn partial(
     calls: &[AggCall],
     num_rows: usize,
 ) -> Result<Partial, RuntimeError> {
+    // Global aggregate (no GROUP BY): every row is one group, so each aggregate's partial
+    // state is the whole-column reduction — computable with arrow's SIMD kernels and, for
+    // those, WITHOUT the `vec![0u32; num_rows]` group-id buffer the grouped path allocates
+    // (and zeroes) per morsel but never reads on the single-group fast paths. That
+    // allocation dominated a global `SUM`/`MIN`/`MAX`/`COUNT` (measured ~2 ms at 6 M rows).
+    if group_keys.is_empty() {
+        return accum::global_partial(calls, num_rows);
+    }
+
     let (group_ids, num_groups, group_columns) = assign_groups(group_keys, num_rows)?;
 
     // Fused fast path: the simple scalar aggregates (sum/count/min/max/mean) read
@@ -259,24 +264,7 @@ pub fn partial(
     for (idx, call) in calls.iter().enumerate() {
         let state = match slots[idx].take() {
             Some(fused_state) => fused_state, // already computed in the fused scan
-            None => match call.func {
-                // Two-input: arg_min/arg_max need both the value and the ordering key.
-                AggFunc::ArgMin | AggFunc::ArgMax => arg_extreme_state(
-                    require(call.values.as_ref(), call.func)?,
-                    require(call.key.as_ref(), call.func)?,
-                    &group_ids,
-                    num_groups,
-                    matches!(call.func, AggFunc::ArgMax),
-                )?,
-                // covar/corr are two-input: `values` is x, `key` carries y.
-                AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => covar_state(
-                    require(call.values.as_ref(), call.func)?,
-                    require(call.key.as_ref(), call.func)?,
-                    &group_ids,
-                    num_groups,
-                )?,
-                _ => accumulate(call.func, call.values.as_ref(), &group_ids, num_groups)?,
-            },
+            None => accum::accumulate_call(call, &group_ids, num_groups)?,
         };
         states.push(state);
     }
@@ -284,189 +272,6 @@ pub fn partial(
         group_columns,
         states,
     })
-}
-
-/// Assign each row a dense group id, returning the ids, the group count, and the
-/// distinct group-key columns (in first-seen order).
-pub(crate) fn assign_groups(
-    group_keys: &[ArrayRef],
-    num_rows: usize,
-) -> Result<(Vec<u32>, usize, Vec<ArrayRef>), RuntimeError> {
-    if group_keys.is_empty() {
-        // Global aggregate: a single group over all rows.
-        return Ok((vec![0; num_rows], 1, Vec::new()));
-    }
-    // Fast path: a single integer key column hashes its native values directly,
-    // skipping the RowConverter encoding pass (a per-row allocation + copy) that the
-    // general path needs for multi-column / variable-length / float keys. Integers are
-    // exact under raw hashing — floats (NaN, ±0.0) and strings keep the RowConverter,
-    // which imposes a correct total order. This is the common GROUP BY <int id> case.
-    if group_keys.len() == 1 {
-        use arrow::datatypes::DataType;
-        let arr = &group_keys[0];
-        match arr.data_type() {
-            DataType::Int8 => return assign_groups_int::<Int8Type>(arr, num_rows),
-            DataType::Int16 => return assign_groups_int::<Int16Type>(arr, num_rows),
-            DataType::Int32 => return assign_groups_int::<Int32Type>(arr, num_rows),
-            DataType::Int64 => return assign_groups_int::<Int64Type>(arr, num_rows),
-            DataType::UInt8 => return assign_groups_int::<UInt8Type>(arr, num_rows),
-            DataType::UInt16 => return assign_groups_int::<UInt16Type>(arr, num_rows),
-            DataType::UInt32 => return assign_groups_int::<UInt32Type>(arr, num_rows),
-            DataType::UInt64 => return assign_groups_int::<UInt64Type>(arr, num_rows),
-            // String/binary keys hash their bytes directly, the same win as the integer
-            // path — a `GROUP BY <status/category/region>` is exactly this shape.
-            DataType::Utf8 => return assign_groups_bytes::<Utf8Type>(arr, num_rows),
-            DataType::LargeUtf8 => return assign_groups_bytes::<LargeUtf8Type>(arr, num_rows),
-            DataType::Binary => return assign_groups_bytes::<BinaryType>(arr, num_rows),
-            DataType::LargeBinary => return assign_groups_bytes::<LargeBinaryType>(arr, num_rows),
-            _ => {}
-        }
-    }
-    let fields: Vec<SortField> = group_keys
-        .iter()
-        .map(|a| SortField::new(a.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields)?;
-    let rows = converter.convert_columns(group_keys)?;
-
-    // Group via a raw hash table keyed by *row index* — we store only the
-    // first-seen row of each group and compare encoded rows directly, avoiding
-    // the per-row owned-key allocation an `IndexMap<OwnedRow, _>` would incur.
-    // Size for the worst case (all rows distinct): the table holds at most
-    // `num_rows` entries, so pre-sizing avoids the rehash cascade a small initial
-    // capacity forces on a high-cardinality group-by (the hot per-morsel path).
-    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
-    let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
-    let mut group_ids = Vec::with_capacity(num_rows);
-
-    for i in 0..num_rows {
-        let row_i = rows.row(i);
-        let hash = state.hash_one(row_i);
-        let gid = match table.entry(
-            hash,
-            |&g| rows.row(reps[g as usize] as usize) == row_i,
-            |&g| state.hash_one(rows.row(reps[g as usize] as usize)),
-        ) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let gid = reps.len() as u32;
-                reps.push(i as u32);
-                e.insert(gid);
-                gid
-            }
-        };
-        group_ids.push(gid);
-    }
-
-    let num_groups = reps.len();
-    let group_columns = converter.convert_rows(reps.iter().map(|&i| rows.row(i as usize)))?;
-    Ok((group_ids, num_groups, group_columns))
-}
-
-/// Single-integer-key `assign_groups`: hash the native values directly (no row
-/// encoding). Nulls form one group (SQL semantics); the output key column is the
-/// representative rows `take`n from the input, so type and the null carry through.
-fn assign_groups_int<T>(
-    arr: &ArrayRef,
-    num_rows: usize,
-) -> Result<(Vec<u32>, usize, Vec<ArrayRef>), RuntimeError>
-where
-    T: ArrowPrimitiveType,
-    T::Native: std::hash::Hash + Eq,
-{
-    let a = arr.as_primitive::<T>();
-    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
-    let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
-    let mut group_ids = Vec::with_capacity(num_rows);
-    let mut null_gid: Option<u32> = None;
-
-    for i in 0..num_rows {
-        if a.is_null(i) {
-            let gid = *null_gid.get_or_insert_with(|| {
-                let g = reps.len() as u32;
-                reps.push(i as u32);
-                g
-            });
-            group_ids.push(gid);
-            continue;
-        }
-        let v = a.value(i);
-        let hash = state.hash_one(v);
-        // The table holds only non-null groups, so a rep is always a valid value.
-        let gid = match table.entry(
-            hash,
-            |&g| a.value(reps[g as usize] as usize) == v,
-            |&g| state.hash_one(a.value(reps[g as usize] as usize)),
-        ) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let gid = reps.len() as u32;
-                reps.push(i as u32);
-                e.insert(gid);
-                gid
-            }
-        };
-        group_ids.push(gid);
-    }
-
-    let num_groups = reps.len();
-    let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
-    Ok((group_ids, num_groups, group_columns))
-}
-
-/// Single string/binary-key `assign_groups`: hash each value's bytes directly (no row
-/// encoding), the byte-keyed analog of [`assign_groups_int`]. Nulls form one group
-/// (SQL semantics); the output key column is the representative rows `take`n from the
-/// input, so the type and nulls carry through.
-fn assign_groups_bytes<T>(
-    arr: &ArrayRef,
-    num_rows: usize,
-) -> Result<(Vec<u32>, usize, Vec<ArrayRef>), RuntimeError>
-where
-    T: arrow::array::types::ByteArrayType,
-    for<'a> &'a T::Native: std::hash::Hash + Eq,
-{
-    let a = arr.as_bytes::<T>();
-    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
-    let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
-    let mut group_ids = Vec::with_capacity(num_rows);
-    let mut null_gid: Option<u32> = None;
-
-    for i in 0..num_rows {
-        if a.is_null(i) {
-            let gid = *null_gid.get_or_insert_with(|| {
-                let g = reps.len() as u32;
-                reps.push(i as u32);
-                g
-            });
-            group_ids.push(gid);
-            continue;
-        }
-        let v = a.value(i);
-        let hash = state.hash_one(v);
-        // The table holds only non-null groups, so a rep is always a valid value.
-        let gid = match table.entry(
-            hash,
-            |&g| a.value(reps[g as usize] as usize) == v,
-            |&g| state.hash_one(a.value(reps[g as usize] as usize)),
-        ) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let gid = reps.len() as u32;
-                reps.push(i as u32);
-                e.insert(gid);
-                gid
-            }
-        };
-        group_ids.push(gid);
-    }
-
-    let num_groups = reps.len();
-    let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
-    Ok((group_ids, num_groups, group_columns))
 }
 
 /// The row count above which `combine` groups in parallel (hash-radix). Below it the
@@ -620,8 +425,12 @@ pub fn combine_with(
 
     let n_keys = parts[0].group_columns.len();
 
-    // Concatenate the group-key columns and each aggregate's state columns.
+    // Concatenate the group-key columns and each aggregate's state columns. On a
+    // high-cardinality combine (e.g. an all-distinct DISTINCT) each partial contributes
+    // ~its whole morsel, so this concatenation is a multi-million-row copy per column —
+    // fan the per-column concats across cores rather than running them one after another.
     let group_concat: Vec<ArrayRef> = (0..n_keys)
+        .into_par_iter()
         .map(|i| concat_col(parts.iter().map(|p| &p.group_columns[i])))
         .collect::<Result<_, _>>()?;
     // Number of partial rows to regroup. With group keys it's the key-column
@@ -720,7 +529,11 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::array::{AsArray, Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::Int64Type;
+    use arrow::row::{RowConverter, SortField};
+    use hashbrown::hash_table::Entry;
+    use hashbrown::HashTable;
 
     fn i64s(v: &[i64]) -> ArrayRef {
         Arc::new(Int64Array::from(v.to_vec()))
@@ -796,6 +609,48 @@ mod tests {
         let (slow_ids, slow_n) = via_row_encoder(&keys, n);
         assert_eq!(fast_n, slow_n, "group count");
         same_partition(&fast_ids, &slow_ids);
+    }
+
+    #[test]
+    fn int64_multi_fast_path_matches_row_encoder() {
+        // Two Int64 key columns with repeats and a repeated composite pair — the
+        // multi-column fast path must induce the same group partition (and reps, so the
+        // same group-key columns) as the row-encoder oracle.
+        let k0 = i64s(&[1, 2, 1, 3, 2, 1]);
+        let k1 = i64s(&[7, 8, 7, 9, 8, 8]); // (1,7) repeats; (1,8) is its own group
+        let keys = vec![k0, k1];
+        let n = keys[0].len();
+        let (fast_ids, fast_n, fast_cols) = assign_groups(&keys, n).unwrap();
+        let (slow_ids, slow_n) = via_row_encoder(&keys, n);
+        assert_eq!(fast_n, slow_n, "group count");
+        same_partition(&fast_ids, &slow_ids);
+        // The representative key columns carry the first-seen distinct pairs:
+        // (1,7), (2,8), (3,9), (1,8) in first-seen order.
+        assert_eq!(fast_cols.len(), 2);
+        let c0 = fast_cols[0].as_primitive::<Int64Type>();
+        let c1 = fast_cols[1].as_primitive::<Int64Type>();
+        let pairs: Vec<(i64, i64)> = (0..fast_n).map(|g| (c0.value(g), c1.value(g))).collect();
+        assert_eq!(pairs, vec![(1, 7), (2, 8), (3, 9), (1, 8)]);
+    }
+
+    #[test]
+    fn multi_raw_mixed_fast_path_matches_row_encoder() {
+        // Mixed Int64 + Utf8 composite key (the `GROUP BY <id>, <status>` shape) with
+        // repeats — the raw mixed multi-key path must induce the same group partition and
+        // first-seen representative columns as the row-encoder oracle.
+        let k0 = i64s(&[1, 2, 1, 3, 2, 1]);
+        let k1: ArrayRef = Arc::new(StringArray::from(vec!["x", "y", "x", "y", "y", "z"]));
+        let keys = vec![k0, k1]; // (1,x) repeats; (1,z) is its own group; (2,y) repeats
+        let n = keys[0].len();
+        let (fast_ids, fast_n, fast_cols) = assign_groups(&keys, n).unwrap();
+        let (slow_ids, slow_n) = via_row_encoder(&keys, n);
+        assert_eq!(fast_n, slow_n, "group count");
+        same_partition(&fast_ids, &slow_ids);
+        // First-seen distinct pairs: (1,x), (2,y), (3,y), (1,z).
+        let c0 = fast_cols[0].as_primitive::<Int64Type>();
+        let c1 = fast_cols[1].as_string::<i32>();
+        let pairs: Vec<(i64, &str)> = (0..fast_n).map(|g| (c0.value(g), c1.value(g))).collect();
+        assert_eq!(pairs, vec![(1, "x"), (2, "y"), (3, "y"), (1, "z")]);
     }
 
     const FUNCS: [AggFunc; 5] = [

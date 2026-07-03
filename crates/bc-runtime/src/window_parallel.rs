@@ -4,9 +4,13 @@
 //! function's output column back to original row order. Split out of `window` along the
 //! parallelism seam; bit-identical to the serial kernel as a per-row result.
 
-use arrow::array::{Array, ArrayRef, UInt32Array};
+use std::sync::Arc;
+
+use arrow::array::{Array, ArrayRef, AsArray, PrimitiveArray, UInt32Array};
+use arrow::buffer::NullBuffer;
 use arrow::compute::take;
 use arrow::compute::SortOptions;
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Float64Type, Int64Type};
 use arrow::row::{RowConverter, SortField};
 use rayon::prelude::*;
 
@@ -24,7 +28,6 @@ pub(crate) fn window_parallel(
     funcs: &[WindowCall],
     num_rows: usize,
     nbuckets: usize,
-    parallel_row_threshold: usize,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
     let buckets = partition_row_indices(partition_keys, num_rows, nbuckets)?;
 
@@ -36,13 +39,7 @@ pub(crate) fn window_parallel(
     // dominates — otherwise stay on the parallel path.
     let max_bucket = buckets.iter().map(Vec::len).max().unwrap_or(0);
     if max_bucket > num_rows / 2 {
-        return window_serial(
-            partition_keys,
-            order_keys,
-            funcs,
-            num_rows,
-            parallel_row_threshold,
-        );
+        return window_serial(partition_keys, order_keys, funcs, num_rows);
     }
 
     // Each bucket gathers its rows' keys/order/values and runs the serial kernel over
@@ -69,26 +66,111 @@ pub(crate) fn window_parallel(
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            window_serial(&bk, &bo, &bc, idx.len(), usize::MAX)
+            window_serial(&bk, &bo, &bc, idx.len())
         })
         .collect::<Result<_, _>>()?;
 
-    // Scatter back: concatenate each function's per-bucket columns in bucket order,
-    // then `take` by the inverse permutation to restore original row positions. `perm`
-    // is the original index of each bucket-order row; `inv[orig] = k` inverts it.
+    // Scatter each function's per-bucket results back to original row order. For the
+    // primitive output types (every window function here yields Int64 or Float64) this is
+    // a cache-blocked parallel scatter ([`scatter_blocked`], the dominant window cost done
+    // right); other output types fall back to a concat + inverse-permutation gather.
+    (0..funcs.len())
+        .map(|f| {
+            let cols: Vec<&ArrayRef> = per_bucket.iter().map(|b| &b[f]).collect();
+            match cols[0].data_type() {
+                DataType::Int64 => scatter_blocked::<Int64Type>(&cols, &buckets, num_rows),
+                DataType::Float64 => scatter_blocked::<Float64Type>(&cols, &buckets, num_rows),
+                _ => scatter_by_gather(&cols, &buckets, num_rows),
+            }
+        })
+        .collect()
+}
+
+/// Cache-blocked parallel scatter of the per-bucket result columns back to original row
+/// order — the window's dominant cost, done right.
+///
+/// `cols[b]` are bucket `b`'s results in bucket-local order; `buckets[b][k]` is the original
+/// row index of that bucket's `k`-th row, and **each bucket's indices are ascending**
+/// (guaranteed by [`partition_row_indices`]). The output is split into `nthreads` disjoint
+/// contiguous ranges (`chunks_mut` — safe, no aliasing), and each range, on its own core,
+/// binary-searches every bucket for the ascending slice of indices that fall in it and
+/// writes only those. So every core writes solely to its own cache-local output range (no
+/// cross-core cache-line contention that sinks a naive parallel scatter) and reads each
+/// bucket's values sequentially. Result-identical to a `take` by the inverse permutation.
+fn scatter_blocked<T>(
+    cols: &[&ArrayRef],
+    buckets: &[Vec<u32>],
+    num_rows: usize,
+) -> Result<ArrayRef, RuntimeError>
+where
+    T: ArrowPrimitiveType,
+    T::Native: Copy + Default + Send + Sync,
+{
+    let any_null = cols.iter().any(|c| c.null_count() > 0);
+    let arrs: Vec<&PrimitiveArray<T>> = cols.iter().map(|c| c.as_primitive::<T>()).collect();
+    let nthreads = rayon::current_num_threads().max(1);
+    let range = num_rows.div_ceil(nthreads).max(1);
+    let mut values = vec![T::Native::default(); num_rows];
+
+    // Write each output range on its own core. `lo` is the range's first original index;
+    // for each bucket the rows in `[lo, hi)` are the ascending slice `[start, end)`.
+    let fill = |lo: usize, hi: usize, vc: &mut [T::Native], bc: Option<&mut [bool]>| {
+        let mut bc = bc;
+        for (b, bucket) in buckets.iter().enumerate() {
+            let start = bucket.partition_point(|&x| (x as usize) < lo);
+            let end = bucket.partition_point(|&x| (x as usize) < hi);
+            let arr = arrs[b];
+            for (offset, &orig) in bucket[start..end].iter().enumerate() {
+                let k = start + offset; // bucket-local position in `arr`
+                let o = orig as usize - lo;
+                vc[o] = arr.value(k);
+                if let Some(bc) = bc.as_deref_mut() {
+                    bc[o] = arr.is_valid(k);
+                }
+            }
+        }
+    };
+
+    let nulls = if any_null {
+        let mut valid = vec![false; num_rows];
+        values
+            .par_chunks_mut(range)
+            .zip(valid.par_chunks_mut(range))
+            .enumerate()
+            .for_each(|(ci, (vc, bc))| {
+                let lo = ci * range;
+                fill(lo, lo + vc.len(), vc, Some(bc));
+            });
+        Some(NullBuffer::from(valid))
+    } else {
+        values
+            .par_chunks_mut(range)
+            .enumerate()
+            .for_each(|(ci, vc)| {
+                let lo = ci * range;
+                fill(lo, lo + vc.len(), vc, None);
+            });
+        None
+    };
+    Ok(Arc::new(PrimitiveArray::<T>::new(values.into(), nulls)))
+}
+
+/// Fallback scatter for non-primitive window outputs: concatenate the per-bucket columns in
+/// bucket order and `take` by the inverse permutation. (Ranking / running / value functions
+/// here all yield Int64 / Float64, so this is reached only by exotic output types.)
+fn scatter_by_gather(
+    cols: &[&ArrayRef],
+    buckets: &[Vec<u32>],
+    num_rows: usize,
+) -> Result<ArrayRef, RuntimeError> {
     let perm: Vec<u32> = buckets.iter().flatten().copied().collect();
     let mut inv = vec![0u32; num_rows];
     for (k, &orig) in perm.iter().enumerate() {
         inv[orig as usize] = k as u32;
     }
-    let inv_arr = UInt32Array::from(inv);
-    (0..funcs.len())
-        .map(|f| {
-            let cols: Vec<&dyn Array> = per_bucket.iter().map(|b| b[f].as_ref()).collect();
-            let concatenated = arrow::compute::concat(&cols)?;
-            Ok(take(concatenated.as_ref(), &inv_arr, None)?)
-        })
-        .collect()
+    let refs: Vec<&dyn Array> = cols.iter().map(|a| a.as_ref()).collect();
+    let concatenated = arrow::compute::concat(&refs)?;
+    Ok(take(concatenated.as_ref(), &UInt32Array::from(inv), None)?)
 }
 
 const SEED: ahash::RandomState =

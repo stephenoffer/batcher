@@ -127,6 +127,22 @@ def _iter_batches(
         # with bounded memory: fold each micro-batch's partial into one running state.
         from batcher import core
 
+        # A plain aggregate over a `map_batches` input streams too: apply the (parallel,
+        # windowed) map in bounded memory and fold each mapped batch's partial into the
+        # running state — so a large `map→agg` (Ray Data's bread-and-butter) never
+        # materializes the whole mapped output on the driver.
+        if (
+            isinstance(plan, Aggregate)
+            and plan.watermark is None
+            and is_streamable(plan.input)
+            and core.has_map_batches(plan.input)
+        ):
+            from batcher.api.terminal.map_stream import stream_map_aggregate
+
+            yield from stream_map_aggregate(
+                plan, _iter_streaming(plan.input, sources, None), batch_size
+            )
+            return
         if (
             isinstance(plan, (Aggregate, Distinct))
             and is_streamable(plan.input)
@@ -249,22 +265,36 @@ def _iter_streaming(
         # and is reused across every streamed batch, not rebuilt per batch.
         resident = core.prebuild_factories(plan)
 
-        def run(batch):
-            return core.execute_with_udfs(resident, [InMemorySource([batch])])
+        # Stream the source in *windows* of batches, not one batch at a time: a
+        # `map_batches` UDF parallelizes across `num_workers` only when it is handed
+        # several batches at once (a single batch is applied sequentially). Feeding one
+        # source batch per call throws away all UDF parallelism — the difference between
+        # a serial and an all-cores read→map→write. The window holds ~one morsel per
+        # worker so the pool fills, and bounds driver memory to that window (+ its
+        # output) — never the whole input.
+        from batcher.api.terminal.map_stream import max_map_workers, stream_windowed
+        from batcher.config import active_config
 
-        projection = None
-        predicate = None
-    else:
-        hub = core.default_hub()
-        opt_plan = kyber.optimize(plan, sources=sources, hub=hub)
-        projection = opt_plan.source_projections.get(0)
-        predicate = opt_plan.source_predicates.get(0)
+        workers = max(1, max_map_workers(resident))
+        target_rows = workers * max(1, active_config().execution.morsel_rows)
 
-        # Close the metadata loop on the streaming path too: each micro-batch's
-        # per-operator stats feed the learner, so streaming queries also improve
-        # future plans (cost calibration, cardinality, selectivity).
-        def run(batch):
-            return core.execute_local(opt_plan, [[batch]], feedback=hub)
+        def run_window(window_batches):
+            return core.execute_with_udfs(resident, [InMemorySource(window_batches)])
+
+        yield from stream_windowed(source, run_window, target_rows, batch_size)
+        return
+
+    # Relational (no UDF) breaker-free pipeline: optimize once, then stream micro-batches.
+    hub = core.default_hub()
+    opt_plan = kyber.optimize(plan, sources=sources, hub=hub)
+    projection = opt_plan.source_projections.get(0)
+    predicate = opt_plan.source_predicates.get(0)
+
+    # Close the metadata loop on the streaming path too: each micro-batch's
+    # per-operator stats feed the learner, so streaming queries also improve
+    # future plans (cost calibration, cardinality, selectivity).
+    def run(batch):
+        return core.execute_local(opt_plan, [[batch]], feedback=hub)
 
     for batch in iter_source(source, projection, predicate):
         if batch.num_rows == 0:

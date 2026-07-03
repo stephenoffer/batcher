@@ -206,18 +206,17 @@ pub(crate) fn broadcast_join(
                 output.to_vec(),
             )
         };
-    // Build the (replicated) build-side hash table ONCE, then probe `probe` across
-    // `p` parallel row-range chunks against that single shared table — rather than
-    // rebuilding the table per chunk (the old path's cost). The chunk count is still
-    // capped so every chunk's probe rows at least cover one build (no parallelism gain
-    // from over-splitting a probe smaller than the build, e.g. a mis-estimated
-    // broadcast side); since the table is built once now, the cap only governs probe
-    // parallelism. Each chunk's indices gather into its own output batch and the chunks
-    // concatenate to the full relation. Result-invariant: chunking only splits the probe.
-    let build_rows = build.num_rows().max(1);
-    let p = rayon::current_num_threads()
-        .max(1)
-        .min((probe.num_rows() / build_rows).max(1));
+    // Build the (replicated) build-side hash table ONCE, then probe `probe` across `p`
+    // parallel row-range chunks against that single shared table (rather than rebuilding
+    // it per chunk — the old path's cost). Split the probe into ~one chunk per core so a
+    // large probe is fully parallel; bound the count by the probe's morsel count so chunks
+    // never shrink below a morsel (tiny chunks are pure scheduling overhead). The table is
+    // built once, so chunk count governs *only* probe parallelism — it is independent of
+    // the build size (the old `probe/build` cap throttled a 6 M-row probe to a handful of
+    // chunks whenever the build was large). Each chunk gathers its own output batch; the
+    // chunks concatenate to the full relation. Result-invariant: chunking only splits the probe.
+    let max_chunks = (probe.num_rows() / bc_arrow::DEFAULT_MORSEL_ROWS).max(1);
+    let p = rayon::current_num_threads().max(1).min(max_chunks);
     let probe_keys = ops::columns_by_name(probe, pkeys)?;
     let build_keys = ops::columns_by_name(build, bkeys)?;
     let tuning = bc_arrow::RuntimeTuning::default();

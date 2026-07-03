@@ -124,6 +124,10 @@ pub trait SpillStore {
     /// Drain every batch previously appended to `partition`. Called once per
     /// partition; a store may free the partition's backing storage afterward.
     fn read(&mut self, partition: usize) -> Result<Vec<RecordBatch>, RuntimeError>;
+    /// Spawn a fresh, independent store of the same kind with `partitions` partitions —
+    /// used to recursively re-partition an over-large partition during the merge phase
+    /// (a disk store nests a subdirectory; a memory store makes another memory store).
+    fn child(&self, partitions: usize) -> Result<Box<dyn SpillStore>, RuntimeError>;
 }
 
 /// In-memory partitions. Does not reduce resident memory — it exists to test the
@@ -151,6 +155,9 @@ impl SpillStore for MemSpillStore {
     }
     fn read(&mut self, partition: usize) -> Result<Vec<RecordBatch>, RuntimeError> {
         Ok(std::mem::take(&mut self.parts[partition]))
+    }
+    fn child(&self, partitions: usize) -> Result<Box<dyn SpillStore>, RuntimeError> {
+        Ok(Box::new(MemSpillStore::new(partitions)))
     }
 }
 
@@ -272,6 +279,16 @@ impl SpillStore for DiskSpillStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(RuntimeError::from)
     }
+    fn child(&self, partitions: usize) -> Result<Box<dyn SpillStore>, RuntimeError> {
+        // Nest the recursive re-partition under this store's private directory (itself
+        // removed on drop), inheriting the codec. `with_codec` adds its own unique
+        // `bc-spill-{pid}-{seq}` subdir, so siblings never collide.
+        Ok(Box::new(DiskSpillStore::with_codec(
+            self.dir.clone(),
+            partitions,
+            self.codec,
+        )?))
+    }
 }
 
 impl Drop for DiskSpillStore {
@@ -288,10 +305,19 @@ impl Drop for DiskSpillStore {
 /// [`super::group_aggregate`] over the concatenated input (group order differs —
 /// these are unordered relations). `funcs` must match the aggregates used to
 /// build the partials; for an all-columns distinct grouping pass `&[]`.
+///
+/// `budget_bytes` bounds the memory of a single partition's `combine`. The initial
+/// partition count is only an *average*-case fit (`total / budget`); under key skew one
+/// partition can hold far more than its share and OOM the merge. When a partition's
+/// spilled bytes exceed `budget_bytes`, it is **recursively re-partitioned** (a fresh
+/// salted hash spreads the colliding keys) and merged sub-partition by sub-partition — so
+/// peak memory stays bounded regardless of distribution. `budget_bytes == 0` disables the
+/// guard (the historical single-level behavior, for callers that don't supply an envelope).
 pub fn combine_finalize_spilling(
     chunk_partials: impl IntoIterator<Item = Partial>,
     funcs: &[AggFunc],
     store: &mut dyn SpillStore,
+    budget_bytes: usize,
 ) -> Result<GroupAggResult, RuntimeError> {
     let partitions = store.num_partitions().max(1);
 
@@ -321,13 +347,9 @@ pub fn combine_finalize_spilling(
         if batches.is_empty() {
             continue;
         }
-        let partials: Vec<Partial> = batches
-            .iter()
-            .map(|b| unpack_partial(b, n_keys, funcs))
-            .collect::<Result<_, _>>()?;
-        let merged = combine(&partials, funcs)?;
-        let aggs = finalize(funcs, &merged)?;
-        group_parts.push(merged.group_columns);
+        let (group_columns, aggs) =
+            merge_partition(batches, n_keys, funcs, budget_bytes, store, 0)?;
+        group_parts.push(group_columns);
         agg_parts.push(aggs);
     }
 
@@ -342,6 +364,70 @@ pub fn combine_finalize_spilling(
         group_columns,
         agg_columns,
     })
+}
+
+/// Merge one spilled partition's packed partials into `(group_columns, agg_columns)`,
+/// recursively re-partitioning if it is too large to `combine` within `budget`.
+///
+/// A partition that fits (`bytes <= budget`, or the guard is off, or no keys to split on,
+/// or the recursion depth cap is hit) is combined + finalized directly. Otherwise it is
+/// re-routed through a fresh child store with a **depth-varying salt** — the mergeable
+/// algebra holds because equal keys still co-locate within each level, so merging the
+/// sub-partitions and concatenating yields the identical relation, just with peak memory
+/// bounded to one sub-partition. The depth cap backstops the pathological case (e.g. one
+/// key dominating a partition — where its constant-size state is already tiny, so a direct
+/// combine is safe).
+fn merge_partition(
+    batches: Vec<RecordBatch>,
+    n_keys: usize,
+    funcs: &[AggFunc],
+    budget: usize,
+    parent: &dyn SpillStore,
+    depth: u32,
+) -> Result<(Vec<ArrayRef>, Vec<ArrayRef>), RuntimeError> {
+    const MAX_DEPTH: u32 = 4;
+    let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+    if budget == 0 || bytes <= budget || n_keys == 0 || depth >= MAX_DEPTH {
+        let partials: Vec<Partial> = batches
+            .iter()
+            .map(|b| unpack_partial(b, n_keys, funcs))
+            .collect::<Result<_, _>>()?;
+        let merged = combine(&partials, funcs)?;
+        let aggs = finalize(funcs, &merged)?;
+        return Ok((merged.group_columns, aggs));
+    }
+
+    // Re-partition this over-large partition into ~`bytes/budget` sub-partitions under a
+    // fresh child store, with a nonzero salt (varying by depth) so the colliding keys
+    // spread rather than re-collide. The read-back batches are already in packed form.
+    let sub_p = bytes.div_ceil(budget.max(1)).clamp(2, 1 << 12);
+    let salt = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(depth as u64 + 1) | 1;
+    let mut child = parent.child(sub_p)?;
+    for b in &batches {
+        for (pi, sub) in route_salted(b, n_keys, sub_p, salt)? {
+            child.append(pi, &sub)?;
+        }
+    }
+    drop(batches); // release the over-large partition before merging its sub-partitions
+
+    let mut group_parts: Vec<Vec<ArrayRef>> = Vec::new();
+    let mut agg_parts: Vec<Vec<ArrayRef>> = Vec::new();
+    for pi in 0..sub_p {
+        let sub = child.read(pi)?;
+        if sub.is_empty() {
+            continue;
+        }
+        let (g, a) = merge_partition(sub, n_keys, funcs, budget, child.as_ref(), depth + 1)?;
+        group_parts.push(g);
+        agg_parts.push(a);
+    }
+    let group_columns = (0..n_keys)
+        .map(|c| concat_cols(group_parts.iter().map(|g| &g[c])))
+        .collect::<Result<_, _>>()?;
+    let agg_columns = (0..funcs.len())
+        .map(|c| concat_cols(agg_parts.iter().map(|a| &a[c])))
+        .collect::<Result<_, _>>()?;
+    Ok((group_columns, agg_columns))
 }
 
 /// Flatten a [`Partial`] into one batch: group columns first (`g0..`), then each
@@ -407,6 +493,20 @@ fn route(
     n_keys: usize,
     partitions: usize,
 ) -> Result<Vec<(usize, RecordBatch)>, RuntimeError> {
+    route_salted(packed, n_keys, partitions, 0)
+}
+
+/// [`route`] with a `salt` mixed into the key hash. The initial spill uses `salt == 0`;
+/// a recursive re-partition of an over-large partition ([`merge_partition`]) uses a
+/// nonzero, depth-varying salt so the keys that collided into one partition spread across
+/// the sub-partitions instead of re-colliding under the same hash. Equal keys still route
+/// together within a level (the salt is fixed for that level), so the grace algebra holds.
+fn route_salted(
+    packed: &RecordBatch,
+    n_keys: usize,
+    partitions: usize,
+    salt: u64,
+) -> Result<Vec<(usize, RecordBatch)>, RuntimeError> {
     if n_keys == 0 || partitions <= 1 {
         return Ok(vec![(0, packed.clone())]);
     }
@@ -421,9 +521,20 @@ fn route(
     // Fixed seeds so the same key routes identically across every chunk.
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
     let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); partitions];
+    let p = partitions as u64;
     for i in 0..packed.num_rows() {
         let h = state.hash_one(rows.row(i));
-        buckets[(h % partitions as u64) as usize].push(i as u32);
+        // salt == 0 is the initial spill: `h % p`, byte-for-byte the historical routing.
+        // A nonzero (recursive) salt re-mixes through a multiply-shift avalanche so keys
+        // that collided into one partition genuinely spread across the sub-partitions
+        // (a plain `h ^ salt` before `% p` could leave the bucket unchanged).
+        let bucket = if salt == 0 {
+            h % p
+        } else {
+            let mixed = (h ^ salt.rotate_left(31)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+            mixed % p
+        };
+        buckets[bucket as usize].push(i as u32);
     }
 
     let mut out = Vec::new();
@@ -549,7 +660,42 @@ mod tests {
             partials.push(partial(std::slice::from_ref(&k), &calls(&v), len).unwrap());
             off += len;
         }
-        combine_finalize_spilling(partials, &FUNCS, store).unwrap()
+        combine_finalize_spilling(partials, &FUNCS, store, 0).unwrap()
+    }
+
+    #[test]
+    fn recursive_spill_under_budget_equals_oracle() {
+        // Many distinct keys with a tiny per-partition budget: the merge phase must
+        // recursively re-partition over-large partitions (a fresh salted hash) and still
+        // reproduce the non-spilling oracle exactly — the skew-safety guarantee.
+        let n = 500usize;
+        let key_strs: Vec<String> = (0..n).map(|i| format!("k{}", i % 137)).collect();
+        let keys: ArrayRef = Arc::new(StringArray::from(
+            key_strs.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ));
+        let vals = i64s(&(0..n as i64).collect::<Vec<_>>());
+        let oracle =
+            crate::agg::group_aggregate(std::slice::from_ref(&keys), &calls(&vals), n).unwrap();
+
+        // Start with a single partition (P=1) and a 1-byte budget, so EVERY partition
+        // overflows and the guard must recurse to make progress.
+        let mut store = MemSpillStore::new(1);
+        let per = n.div_ceil(7);
+        let mut partials = Vec::new();
+        let mut off = 0;
+        while off < n {
+            let len = per.min(n - off);
+            let k = keys.slice(off, len);
+            let v = vals.slice(off, len);
+            partials.push(partial(std::slice::from_ref(&k), &calls(&v), len).unwrap());
+            off += len;
+        }
+        let got = combine_finalize_spilling(partials, &FUNCS, &mut store, 1).unwrap();
+        assert_eq!(
+            to_map(&got.group_columns[0], &got.agg_columns),
+            to_map(&oracle.group_columns[0], &oracle.agg_columns),
+            "recursive-spill result must equal the non-spilling oracle",
+        );
     }
 
     #[test]

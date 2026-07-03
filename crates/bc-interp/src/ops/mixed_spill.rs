@@ -120,7 +120,7 @@ pub(crate) fn try_bounded_mixed_spill(
             .collect::<Result<_, _>>()?;
         let p = cs_partitions(&partials, budget_bytes);
         let mut store = DiskSpillStore::with_codec(spill_dir.join("mixed-cs"), p, codec)?;
-        let res = combine_finalize_spilling(partials, &funcs, &mut store)?;
+        let res = combine_finalize_spilling(partials, &funcs, &mut store, budget_bytes)?;
         results.push((cs_idx, res.group_columns, res.agg_columns));
     }
 

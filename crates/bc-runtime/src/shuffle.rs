@@ -402,30 +402,57 @@ fn salted_hash(key_hash: u64, salt: u32) -> u64 {
 /// always agree within a run.
 #[inline]
 /// Per-row bucket ids for a single `Int64` key, hashing native values directly (no
-/// row encoding). `None` unless `keys` is exactly one `Int64` column — narrow integer
-/// types are normalized to `Int64` upstream, so this is the common key-shuffle shape.
-/// Null slots hash their (arbitrary) raw value; that is harmless — a null key still
-/// lands in *some* bucket consistently, and join matching rejects it separately.
+/// row encoding). `None` unless every key column is `Int64` (narrow ints are normalized
+/// to `Int64` upstream, so this covers the common single- and composite-integer shuffle
+/// shapes). Null slots hash their (arbitrary) raw value; that is harmless — a null key
+/// still lands in *some* bucket consistently, and join matching rejects it separately.
 fn partition_int_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32>> {
     use arrow::array::Int64Array;
-    if keys.len() != 1 || keys[0].data_type() != &DataType::Int64 {
+    if keys.is_empty() || !keys.iter().all(|k| k.data_type() == &DataType::Int64) {
         return None;
     }
-    let a = keys[0].as_any().downcast_ref::<Int64Array>()?;
-    let vals = a.values();
-    if vals.len() >= PAR_HASH_MIN_ROWS {
-        Some(
-            vals.par_iter()
-                .map(|&v| bucket_of(SEED.hash_one(v), num_partitions))
-                .collect(),
-        )
-    } else {
-        Some(
-            vals.iter()
-                .map(|&v| bucket_of(SEED.hash_one(v), num_partitions))
-                .collect(),
-        )
+    // Single Int64 key — hash the raw value directly (null slots hash their arbitrary raw
+    // value, harmless for a shuffle join since null keys never match).
+    if keys.len() == 1 {
+        let vals = keys[0].as_any().downcast_ref::<Int64Array>()?.values();
+        let hash1 = |v: &i64| bucket_of(SEED.hash_one(*v), num_partitions);
+        return Some(if vals.len() >= PAR_HASH_MIN_ROWS {
+            vals.par_iter().map(hash1).collect()
+        } else {
+            vals.iter().map(hash1).collect()
+        });
     }
+    // Composite Int64 key (e.g. a `(part, supplier)` join / group shuffle). Fold each
+    // column's raw value into one hasher per row — skips the `RowConverter` encode the
+    // general path runs. Like the single-key path, a null slot hashes its arbitrary raw
+    // value: BOTH shuffle sides are the same key type and so take this same path, so equal
+    // non-null keys still co-partition (the only invariant a join needs — null keys never
+    // match). This path is therefore used for join/group shuffles, not a null-sensitive
+    // DISTINCT (which dedups via the row-encoded `assign_groups`, where nulls compare equal).
+    let cols: Vec<&[i64]> = keys
+        .iter()
+        .map(|k| {
+            k.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .as_ref()
+        })
+        .collect();
+    let n = cols[0].len();
+    let hashn = |i: usize| -> u32 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = SEED.build_hasher();
+        for c in &cols {
+            h.write_i64(c[i]);
+        }
+        bucket_of(h.finish(), num_partitions)
+    };
+    Some(if n >= PAR_HASH_MIN_ROWS {
+        (0..n).into_par_iter().map(hashn).collect()
+    } else {
+        (0..n).map(hashn).collect()
+    })
 }
 
 fn bucket_of(hash: u64, num_partitions: usize) -> u32 {

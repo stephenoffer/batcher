@@ -13,8 +13,10 @@ bases structurally satisfy them. `Split` lives in `io.splits`.
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import IO, Any, ClassVar
 
@@ -25,6 +27,11 @@ from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.splits import FileSplit, RowGroupSplit, Split
 
 __all__ = ["FileSink", "FileSource", "pack_row_groups"]
+
+# How many files a streaming `iter_batches` decodes concurrently (bounded read-ahead).
+# Caps the parallel-read memory to ~this many files while overlapping I/O + decode so a
+# streaming consumer isn't throttled by a one-file-at-a-time read.
+_ITER_READAHEAD_FILES = 16
 
 
 def pack_row_groups(
@@ -100,19 +107,63 @@ class FileSource(ABC):
         return self._schema_cache
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        out: list[pa.RecordBatch] = []
-        for f in self._files():
+        files = self._files()
+
+        def _read_one(f: str) -> list[pa.RecordBatch]:
             with self._fs.open(f) as fh:
-                out.extend(
+                return list(
                     self._normalize(self._read_file(fh, self._file_proj(f, projection)), projection)
                 )
+
+        # Read the files concurrently: the decode runs in the C++ layer with the GIL
+        # released, so a many-small-files read (thousands of Parquet parts — the shape
+        # every distributed producer and object-store dataset lands in) no longer opens
+        # and parses them one at a time. `read()` already materializes the whole source,
+        # so holding all batches adds no memory beyond what it already returns. Order is
+        # preserved so a downstream that assumes file order is unaffected.
+        if len(files) <= 1:
+            return _read_one(files[0]) if files else []
+        from concurrent.futures import ThreadPoolExecutor
+
+        workers = min(len(files), (os.cpu_count() or 1) * 2)
+        out: list[pa.RecordBatch] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for batches in pool.map(_read_one, files):  # order preserved
+                out.extend(batches)
         return out
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        for f in self._files():
-            yield from self._normalize(
-                self._iter_file(f, self._file_proj(f, projection)), projection
-            )
+        files = self._files()
+        if len(files) <= 1:
+            for f in files:
+                yield from self._normalize(
+                    self._iter_file(f, self._file_proj(f, projection)), projection
+                )
+            return
+
+        # Bounded, order-preserving parallel read-ahead: keep ~`depth` files decoding
+        # concurrently (Parquet/Arrow decode releases the GIL) so a streaming consumer —
+        # a training loader's `iter_torch_batches`, a `read→map→write` — isn't throttled
+        # by a one-file-at-a-time read (the serial read, not compute, is the ceiling).
+        # Memory stays bounded to ~`depth` files (never the whole dataset), and files are
+        # yielded in order so a downstream that assumes file order is unaffected.
+        import itertools
+        from collections import deque
+
+        depth = min(len(files), max(2, min(os.cpu_count() or 4, _ITER_READAHEAD_FILES)))
+
+        def _read(f: str) -> list[pa.RecordBatch]:
+            return list(self._iter_file(f, self._file_proj(f, projection)))
+
+        remaining = iter(files)
+        with ThreadPoolExecutor(max_workers=depth) as pool:
+            pending = deque(pool.submit(_read, f) for f in itertools.islice(remaining, depth))
+            while pending:
+                fut = pending.popleft()
+                nxt = next(remaining, None)
+                if nxt is not None:
+                    pending.append(pool.submit(_read, nxt))
+                yield from self._normalize(iter(fut.result()), projection)
 
     def _file_proj(self, path: str, projection: list[str] | None) -> list[str] | None:
         """The columns to actually request from `path`. In non-strict mode a file may
@@ -168,8 +219,6 @@ class FileSource(ABC):
         # single file (the common small case) skips the pool entirely.
         if len(files) <= 1:
             return [s for f in files for s in self._file_splits(f, target_size)]
-        from concurrent.futures import ThreadPoolExecutor
-
         with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:
             per_file = pool.map(lambda f: self._file_splits(f, target_size), files)
         return [s for file_splits in per_file for s in file_splits]
@@ -338,12 +387,27 @@ class FileSink(ABC):
         if max_rows_per_file is None or table.num_rows <= max_rows_per_file:
             name = f"{directory}/part-{file_index:05d}{self.suffix}"
             return [self.write(table, name, resume=resume)]
-        out: list[WrittenFile] = []
-        for chunk_idx, start in enumerate(range(0, table.num_rows, max_rows_per_file)):
-            chunk = table.slice(start, max_rows_per_file)
+
+        # Write the parts concurrently: the columnar encode + compression (Parquet/
+        # Arrow/CSV) runs in the C++ layer with the GIL released, so a thread per part
+        # turns a serial N-file write into a parallel one (a directory write — Ray Data's
+        # default output shape — otherwise writes each shard back to back). Slices are
+        # zero-copy views over one already-resident table, so this adds no memory.
+        chunks = [
+            (chunk_idx, table.slice(start, max_rows_per_file))
+            for chunk_idx, start in enumerate(range(0, table.num_rows, max_rows_per_file))
+        ]
+
+        def _write_chunk(item: tuple[int, pa.Table]) -> WrittenFile:
+            chunk_idx, chunk = item
             name = f"{directory}/part-{file_index:05d}-{chunk_idx:05d}{self.suffix}"
-            out.append(self.write(chunk, name, resume=resume))
-        return out
+            return self.write(chunk, name, resume=resume)
+
+        if len(chunks) == 1:
+            return [_write_chunk(chunks[0])]
+        workers = min(len(chunks), os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(_write_chunk, chunks))  # order preserved
 
     def commit(self, manifest: WriteManifest, path: str) -> None:  # noqa: B027 (intentional no-op default)
         """Finalize a write. File sinks make data visible on write, so the base

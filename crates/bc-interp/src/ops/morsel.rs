@@ -91,10 +91,12 @@ fn split_batch(out: &mut Vec<RecordBatch>, b: &RecordBatch, target: bc_arrow::Mo
     // boundaries, so slice uniformly by rows and skip the O(rows) byte walk. This is
     // the common analytical case (a few short string/code columns alongside numerics) —
     // q1's `l_returnflag`/`l_linestatus` are single chars, so a morsel of `rows` is far
-    // under the byte budget. `get_array_memory_size` over-counts a *slice* (shared
-    // parent buffer), which only makes this guard conservative: it never wrongly skips
-    // the walk, it just occasionally does it when it could have been skipped.
-    let avg_row_bytes = b.get_array_memory_size() / n;
+    // under the byte budget. The size is measured **slice-aware** ([`sliced_batch_bytes`],
+    // O(columns)): a plain `get_array_memory_size` counts a slice's whole shared parent
+    // buffer, so a 16 k-row slice of a 60 M-row string column looks kilobytes-per-row and
+    // wrongly forces the O(rows) offset walk on every such morsel — the dominant cost of a
+    // projection/DISTINCT over sliced string columns at scale.
+    let avg_row_bytes = sliced_batch_bytes(b) / n;
     if avg_row_bytes.saturating_mul(target.rows) <= target.bytes {
         emit_uniform(out, b, n, target.rows);
         return;
@@ -121,6 +123,63 @@ fn split_batch(out: &mut Vec<RecordBatch>, b: &RecordBatch, target: bc_arrow::Mo
     }
     if rows_in > 0 {
         out.push(b.slice(start, rows_in));
+    }
+}
+
+/// The byte size of `b` accounting for slicing — unlike [`RecordBatch::get_array_memory_size`],
+/// which counts a sliced array's whole shared parent buffer. O(columns): fixed-width columns
+/// contribute `width × rows`; string/binary columns their slice's data span (last minus first
+/// offset) plus the offset slots; other variable-width columns fall back to the memory-size
+/// over-count (which only makes the byte guard more conservative for those rarer types).
+fn sliced_batch_bytes(b: &RecordBatch) -> usize {
+    b.columns().iter().map(sliced_column_bytes).sum()
+}
+
+fn sliced_column_bytes(col: &ArrayRef) -> usize {
+    let n = col.len();
+    if let Some(w) = bc_arrow::fixed_width(col.data_type()) {
+        return w * n;
+    }
+    match col.data_type() {
+        DataType::Utf8 => byte_slice_size::<i32>(
+            col.as_any()
+                .downcast_ref::<GenericStringArray<i32>>()
+                .map(|a| a.value_offsets()),
+        ),
+        DataType::LargeUtf8 => byte_slice_size::<i64>(
+            col.as_any()
+                .downcast_ref::<GenericStringArray<i64>>()
+                .map(|a| a.value_offsets()),
+        ),
+        DataType::Binary => byte_slice_size::<i32>(
+            col.as_any()
+                .downcast_ref::<GenericBinaryArray<i32>>()
+                .map(|a| a.value_offsets()),
+        ),
+        DataType::LargeBinary => byte_slice_size::<i64>(
+            col.as_any()
+                .downcast_ref::<GenericBinaryArray<i64>>()
+                .map(|a| a.value_offsets()),
+        ),
+        // List/Struct/etc.: the memory-size over-count on a slice is acceptable here (only
+        // shifts the guard toward the safe per-row walk for these less common columns).
+        _ => col.get_array_memory_size(),
+    }
+}
+
+/// Slice-aware byte size of a string/binary column from its offset buffer: the data span
+/// (`offsets[last] − offsets[first]`) plus the per-row offset slots. `None` (a failed
+/// downcast) can't happen given the caller's type match; it maps to 0 defensively.
+fn byte_slice_size<O: OffsetSizeTrait>(offsets: Option<&[O]>) -> usize {
+    match offsets {
+        Some(o) => {
+            let span = match (o.first(), o.last()) {
+                (Some(&f), Some(&l)) => (l - f).as_usize(),
+                _ => 0,
+            };
+            span + std::mem::size_of_val(o)
+        }
+        None => 0,
     }
 }
 

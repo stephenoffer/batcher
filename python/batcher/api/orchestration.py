@@ -403,7 +403,14 @@ def _run_relational(
             from batcher.api.terminal.profile import record_spill
 
             record_spill(prof, partitions)
-        spilled = spill_collect(plan, sources, partitions)
+        # Spill the *optimized* logical plan, not the raw one: the optimizer derives real
+        # join keys (a comma join, else a cartesian blow-up out-of-core) and lowers
+        # `COUNT(DISTINCT x)` to `COUNT(*)` over a `DISTINCT` — so the spilling executor
+        # dedups efficiently (hash-partitioned) instead of spilling a giant value list.
+        spill_logical = kyber.optimize_logical(
+            plan, sources=sources, hub=ctx.hub, source_stats=source_stats
+        )
+        spilled = spill_collect(spill_logical, sources, partitions)
         if spilled is not None:
             kyber.record_execution(ctx.hub, plan, spilled.num_rows)
             return spilled, decisions

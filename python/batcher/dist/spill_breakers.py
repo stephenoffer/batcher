@@ -272,8 +272,9 @@ def _spill_side(nat, sub_ir, key_names, source, n_buckets, store, tag, engine_co
 
 
 def supports_spilling_sort(sort: Sort) -> bool:
-    """External sort spill currently supports a single plain-column sort key."""
-    return len(sort.keys) == 1 and isinstance(sort.keys[0].expr, Col)
+    """Spill any key list whose leading key is a plain column: the range partition splits
+    on it (equal values share a bucket) and each bucket is sorted by the full key list."""
+    return len(sort.keys) >= 1 and isinstance(sort.keys[0].expr, Col)
 
 
 def execute_spilling_sort(
@@ -347,16 +348,19 @@ def stage_and_partition(source, map_ir, key_name, nulls_first, n_buckets, store,
         if arr.null_count:
             null_mask = arr.is_null().to_numpy(zero_copy_only=False)
             bucket_ids[null_mask] = null_bucket
+        # Cluster rows by bucket in one pass (stable argsort + `take`, then zero-copy slices).
+        counts = np.bincount(bucket_ids, minlength=n_buckets)
+        clustered = rb.take(pa.array(np.argsort(bucket_ids, kind="stable")))
+        offset = 0
         for b in range(n_buckets):
-            mask = bucket_ids == b
-            if not mask.any():
-                continue
-            sub = rb.filter(pa.array(mask))
-            w = writers.get(b)
-            if w is None:
-                w = store.writer(f"bucket_{b}")
-                writers[b] = w
-            w.write(sub)
+            c = int(counts[b])
+            if c:
+                w = writers.get(b)
+                if w is None:
+                    w = store.writer(f"bucket_{b}")
+                    writers[b] = w
+                w.write(clustered.slice(offset, c))
+            offset += c
     for b, w in writers.items():
         handles[b] = w.close()
     return handles
@@ -377,20 +381,19 @@ def stream_spilling_sort(
     import batcher._native as nat
 
     cfg_json = active_config().engine_config_json()
+    # Leading key drives the range partition; each bucket is sorted by the FULL key list.
     key = sort.keys[0]
     desc, nulls_first = key.descending, key.nulls_first
     n_buckets = _fd_safe(num_partitions)
 
     map_plan, sid = _relabel_single_source(sort.input)
     map_ir = json.dumps(map_plan.to_ir())
-    sort_ir = json.dumps(
-        {
-            "op": "sort",
-            "input": {"op": "scan", "source_id": 0},
-            "keys": [{"expr": key.expr.to_ir(), "descending": desc, "nulls_first": nulls_first}],
-            "limit": sort.limit,
-        }
-    )
+    keys_ir = [
+        {"expr": k.expr.to_ir(), "descending": k.descending, "nulls_first": k.nulls_first}
+        for k in sort.keys
+    ]
+    scan = {"op": "scan", "source_id": 0}
+    sort_ir = json.dumps({"op": "sort", "input": scan, "keys": keys_ir, "limit": sort.limit})
 
     work_dir, owns_dir = _work_dir(spill_dir, "batcher_sort_spill_")
     store = _make_store(work_dir)

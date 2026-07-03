@@ -21,7 +21,25 @@ if TYPE_CHECKING:
     from batcher.io.source import Source
     from batcher.plan.logical import LogicalPlan
 
-__all__ = ["metadata_aggregate_table", "metadata_count", "metadata_is_empty"]
+__all__ = [
+    "global_count_plan",
+    "metadata_aggregate_table",
+    "metadata_count",
+    "metadata_is_empty",
+]
+
+
+def global_count_plan(plan: LogicalPlan) -> LogicalPlan:
+    """Wrap `plan` in a keyless `COUNT(*)` aggregate (one output row, column ``n``).
+
+    Counting result rows this way — rather than materializing them and taking the length
+    — lets projection pushdown read only the columns the plan's filters/keys touch, and a
+    `COUNT(*)` directly over a `Filter` fuses into a single `count_if` pass.
+    """
+    from batcher.plan.expr_ir.constructors import count
+    from batcher.plan.logical import Aggregate, AggregateSpec
+
+    return Aggregate(plan, (), (AggregateSpec("n", count()),))
 
 
 def _metadata_answerable(plan: LogicalPlan, sources: list[Source]) -> bool:

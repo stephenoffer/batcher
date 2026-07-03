@@ -1,15 +1,51 @@
 //! COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the
-//! `bucket_values_into_list` helper shared with the median path.
+//! `bucket_values_into_list` helper shared with the median path and the single-pass
+//! whole-row `distinct_batch` dedup.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, Int64Array, ListArray, UInt32Array};
+use arrow::array::{Array, ArrayRef, AsArray, Int64Array, ListArray, RecordBatch, UInt32Array};
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::take;
 use arrow::datatypes::{Field, Int64Type};
+use rayon::prelude::*;
 
 use super::assign_groups;
 use crate::error::RuntimeError;
+
+/// Single-pass whole-row DISTINCT: hash-partition the batch's rows by *all* columns into
+/// `num_partitions` buckets (equal rows co-partition), then dedup each bucket independently
+/// across cores and concatenate the per-bucket distinct rows. Unlike the per-morsel
+/// `partial` + `combine` path, this hashes each row **once** — the win for a
+/// high-cardinality DISTINCT whose per-morsel partial reduces nothing yet is still hashed
+/// again in the combine. The caller gates this on null-free key columns (so the fast
+/// integer/byte partition co-locates equal rows) and an in-memory working set.
+pub fn distinct_batch(
+    batch: &RecordBatch,
+    num_partitions: usize,
+) -> Result<RecordBatch, RuntimeError> {
+    let ncols = batch.num_columns();
+    let key_idx: Vec<usize> = (0..ncols).collect();
+    let buckets = crate::shuffle::partition_by_keys(batch, &key_idx, num_partitions)?;
+    // Each bucket's distinct rows are its `assign_groups` representatives (first-seen);
+    // the buckets partition the key space, so their union is the global distinct set.
+    let per: Vec<Vec<ArrayRef>> = buckets
+        .par_iter()
+        .map(|b| {
+            let keys: Vec<ArrayRef> = b.columns().to_vec();
+            let (_ids, _n, group_cols) = assign_groups(&keys, b.num_rows())?;
+            Ok::<_, RuntimeError>(group_cols)
+        })
+        .collect::<Result<_, _>>()?;
+    let out_cols: Vec<ArrayRef> = (0..ncols)
+        .into_par_iter()
+        .map(|c| {
+            let arrs: Vec<&dyn Array> = per.iter().map(|g| g[c].as_ref()).collect();
+            Ok::<_, RuntimeError>(arrow::compute::concat(&arrs)?)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), out_cols)?)
+}
 
 /// Partial state for COUNT(DISTINCT): each group's distinct non-null values as one
 /// `List` column (row `g` = group `g`). Nulls are excluded (SQL semantics). The

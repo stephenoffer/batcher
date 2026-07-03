@@ -49,7 +49,7 @@ __all__ = ["Optimizer", "optimize", "optimize_traced"]
 # Memory-budgeting model (consumed by Carbonite admission). Materializing
 # operators ("breakers") hold ~all their rows; streaming operators hold ~one morsel.
 # The tunables (row footprint, morsel size, unknown-size threshold) live in `Config`.
-_BREAKER_KINDS = frozenset({"Aggregate", "Sort", "Distinct", "Join"})
+_BREAKER_KINDS = frozenset({"Aggregate", "Sort", "Distinct", "Join", "Window"})
 
 # CPU-light, IO/decode-bound streaming operators: one task running these waits on IO
 # more than it saturates a core, so it asks for a fractional CPU share (`cpu_share_io`)

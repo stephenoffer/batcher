@@ -132,8 +132,10 @@ def test_multiprocessing_factory_falls_back_and_is_correct():
     assert out.column("v").to_pylist() == [x * 2 for x in range(300)]
 
 
-def test_multiprocessing_non_pyarrow_format_falls_back_and_is_correct():
-    # A non-pyarrow batch_format needs an unpicklable closure → threads fallback.
+def test_multiprocessing_non_pyarrow_format_runs_on_processes_and_is_correct():
+    # A non-pyarrow batch_format runs on processes too: the numpy/pandas/torch
+    # conversion happens in the child from a picklable (fn, batch, fmt) payload — no
+    # closure to ship — so these formats get process parallelism, not a thread fallback.
     t = pa.table({"v": list(range(300))})
     out = (
         bt.from_arrow(t)

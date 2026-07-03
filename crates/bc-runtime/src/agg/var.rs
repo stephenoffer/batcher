@@ -58,6 +58,14 @@ pub(crate) fn var_state(
 }
 
 pub(crate) fn count_non_null(values: &ArrayRef, group_ids: &[u32], num_groups: usize) -> ArrayRef {
+    // Global (single-group) fast path: the global-aggregate partial passes an empty
+    // `group_ids` with `num_groups == 1` (every row is the one group), so the count is the
+    // whole column's non-null total — no per-row group-id buffer needed (the same
+    // single-group short-circuit `sum_acc`/`minmax_acc` take for a keyless COUNT/AVG).
+    if num_groups == 1 && group_ids.is_empty() {
+        let c = (values.len() - values.null_count()) as i64;
+        return Arc::new(Int64Array::from(vec![c]));
+    }
     let mut counts = vec![0i64; num_groups];
     if values.null_count() == 0 {
         // No-null fast path: every row counts, so skip the per-row validity bitmap

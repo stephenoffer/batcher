@@ -27,6 +27,7 @@ use crate::error::InterpError;
 
 mod external_sort;
 mod joins;
+mod materialize;
 mod mixed_spill;
 mod morsel;
 mod quantile_spill;
@@ -37,6 +38,7 @@ pub(crate) use joins::{
     asof_join_batches, columns_by_name, gather_join_output, join_batches, join_batches_with,
     key_indices, map_join_type,
 };
+pub(crate) use materialize::materialize;
 pub(crate) use mixed_spill::try_bounded_mixed_spill;
 pub(crate) use morsel::{morselize, remorselize};
 pub(crate) use quantile_spill::{
@@ -328,37 +330,6 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
 }
 
 // --- sort / limit / materialize ---------------------------------------------
-
-/// Concatenate morsels into one batch. Errors if there are none (no schema).
-pub(crate) fn materialize(batches: &[RecordBatch]) -> Result<RecordBatch, InterpError> {
-    use rayon::prelude::*;
-
-    let first = batches.first().ok_or(InterpError::EmptyJoinInput)?;
-    // A single batch (or empty/degenerate input) needs no copy.
-    if batches.len() == 1 {
-        return Ok(first.clone());
-    }
-    let schema = first.schema();
-    let ncols = schema.fields().len();
-    // Concatenating the morselized input back into one batch (the join/sort/asof
-    // breaker's first step) is a full copy of the side — on a wide fact table at
-    // morsel granularity (a 6M-row `lineitem` in ~366 morsels) it dominates the
-    // operator. `concat_batches` copies the columns one after another; each column's
-    // concat is independent, so fan them out across rayon workers — a wide breaker
-    // input now materializes ~`min(cols, cores)`× faster. Identical bytes to
-    // `concat_batches` (same per-column `concat`, same schema), just parallel.
-    if ncols <= 1 {
-        return Ok(concat_batches(&schema, batches)?);
-    }
-    let columns: Vec<ArrayRef> = (0..ncols)
-        .into_par_iter()
-        .map(|c| {
-            let cols: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
-            arrow::compute::concat(&cols)
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(RecordBatch::try_new(schema, columns)?)
-}
 
 /// Sort a single (already-materialized) batch by the given keys.
 pub(crate) fn sort_batch(
