@@ -1191,3 +1191,12 @@ preprocessing" failure, avoided). Tuning confirms the adaptive config is near-op
 contention + per-batch overhead). The last ~7% on the preprocessing pipeline is genuine
 CPU-decode boundedness; closing it further needs GPU-side (nvjpeg) decode, a separate lever.
 `benchmarks/gpu_backend/cluster_gpu_util.py`, `pipeline_gpu_util.py`.
+
+**GPU-side decode is not the answer.** Tested moving JPEG decode onto the GPU (torchvision
+nvjpeg, `decode_jpeg(device="cuda")`) to free the CPU — it measured **65% util, WORSE than the
+93.4% CPU-parallel-decode path**: per-image GPU decode creates sync gaps and the T4's JPEG
+hardware decoder can't match 16 CPU cores decoding in parallel. So the CPU-parallel-decode
+feeding Batcher already uses (morsel prefetch + per-stage worker fan-out) is the near-optimal
+way to keep the cluster's GPUs saturated for preprocessing-heavy pipelines — confirmed, not
+assumed. Net: the cluster runs at close-to-full GPU capacity (93% preprocessing / 100% compute),
+balanced across all devices, with the optimal feeding strategy.
