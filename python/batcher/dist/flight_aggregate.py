@@ -19,14 +19,19 @@ import json
 import pyarrow as pa
 
 from batcher.carbonite import ResourceManager
+from batcher.dist.adaptive_sizing import aggregate_reducer_count, record_aggregate_cardinality
 from batcher.dist.executor import (
     _apply_above,
     _empty_agg_table,
     _ensure_ray,
     _relabel_single_source,
 )
-from batcher.dist.executors.partition_io import partition_descriptors
-from batcher.dist.executors.ray_runtime import engine_config_json, release_placement
+from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
+from batcher.dist.executors.ray_runtime import (
+    engine_config_json,
+    release_placement,
+    shuffle_partitions,
+)
 from batcher.dist.flight_worker import _ticket
 from batcher.io.source import Source
 from batcher.plan.logical import Aggregate, LogicalPlan
@@ -115,11 +120,21 @@ def execute_aggregate_flight(
     # worker count to the fleet's, so every stage shuffles over the same actors);
     # otherwise spawn one we tear down. `owns` gates teardown.
     actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
-    n_reducers = 1 if n_keys == 0 else workers
+    n_reducers = 1 if n_keys == 0 else aggregate_reducer_count(agg, shuffle_partitions(workers))
 
     keep_actors = False  # set when a FlightMaterializedSource takes ownership of them
     try:
-        partitions = partition_descriptors(sources[sid], workers)
+        # Push the map prefix's projection + predicate into the per-worker read, so each
+        # mapper reads ONLY the columns/rows its plan needs straight from object storage —
+        # not the whole (wide) source. Without this a worker reads every column and the
+        # `map_ir` project discards the surplus *after* paying to fetch it: TPC-H lineitem
+        # has 16 columns but this agg needs 3, so the un-pushed read moved ~5x the bytes
+        # and dominated the scan (sf10 map barrier 18s → ~4s). Mirrors single-node
+        # projection/predicate pushdown; the `map_ir` filter re-checks, so pushdown is safe.
+        projection, predicate = source_pushdown(map_plan, sid)
+        partitions = partition_descriptors(
+            sources[sid], workers, projection=projection, predicate=predicate
+        )
 
         # MAP barrier: every mapper publishes ALL its buckets on its own Flight server.
         ray.get(
@@ -197,6 +212,7 @@ def execute_aggregate_flight(
             release_placement(pg)
 
     table = pa.Table.from_batches(batches) if batches else _empty_agg_table(agg)
+    record_aggregate_cardinality(agg, table.num_rows)
     return table if not above else _apply_above(above, table)
 
 

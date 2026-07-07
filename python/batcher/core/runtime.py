@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from batcher._internal.logging import get_logger
 from batcher.config import active_config
 from batcher.metadata import MetadataHub
-from batcher.metadata.backends import make_backend
+from batcher.metadata.backends import InProcessBackend, make_backend
 
 __all__ = ["default_hub", "reset_default_hub"]
+
+_log = get_logger("metadata")
 
 _hub: MetadataHub | None = None
 _hub_backend_key: tuple[str, str | None] | None = None
@@ -35,6 +38,30 @@ def default_hub() -> MetadataHub:
     meta = active_config().metadata
     key = (meta.backend, meta.uri)
     if _hub is None or key != _hub_backend_key:
-        _hub = MetadataHub(make_backend(meta.backend, meta.uri))
+        _hub = MetadataHub(_build_backend(meta.backend, meta.uri))
         _hub_backend_key = key
     return _hub
+
+
+def _build_backend(backend: str, uri: str | None):
+    """Construct the configured backend, degrading to in-process on failure.
+
+    A durable backend (object storage / SQLite / Redis) can fail to construct — a
+    missing optional dependency, an unreachable or misconfigured URI. Learned stats are
+    an optimization, never a correctness input, so a broken store must not fail every
+    query: fall back to the in-process store (this session still learns; only cross-run
+    persistence is lost) and log once instead of raising into the hot path.
+    """
+    if backend == "in_process":
+        return InProcessBackend()
+    try:
+        return make_backend(backend, uri)
+    except Exception:
+        _log.warning(
+            "metadata backend %r (uri=%r) unavailable; using an in-process store "
+            "(cross-run learning disabled this session)",
+            backend,
+            uri,
+            exc_info=True,
+        )
+        return InProcessBackend()

@@ -35,7 +35,19 @@ from batcher.carbonite.spill import TieredSpillStore
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source
 from batcher.io.source import Source
-from batcher.plan.logical import Aggregate, Join, LogicalPlan, Sort, Window
+from batcher.plan.expr_ir import col
+from batcher.plan.logical import (
+    Aggregate,
+    Distinct,
+    Filter,
+    Join,
+    Limit,
+    LogicalPlan,
+    Project,
+    Projection,
+    Sort,
+    Window,
+)
 
 __all__ = [
     "execute_spilling_aggregate",
@@ -76,6 +88,19 @@ def _make_store(work_dir: str) -> TieredSpillStore:
     )
 
 
+def _peel_to_breaker(plan: LogicalPlan) -> LogicalPlan | None:
+    """The spillable breaker under a chain of leading row-wise/limit ops, or `None`.
+
+    Peels `Project`/`Filter`/`Limit` and returns the underlying node if it is a spillable
+    breaker (`Distinct`/`Aggregate`/`Join`/`Sort`/`Window`) — the marker that an operator's
+    input must itself be spilled out-of-core rather than streamed per batch.
+    """
+    node = plan
+    while isinstance(node, (Project, Filter, Limit)):
+        node = node.input
+    return node if isinstance(node, (Distinct, Aggregate, Join, Sort, Window)) else None
+
+
 def spill_collect(
     plan: LogicalPlan, sources: list[Source], num_partitions: int = 16
 ) -> pa.Table | None:
@@ -88,7 +113,28 @@ def spill_collect(
     spill decision, so both route through one place.
     """
     if isinstance(plan, Aggregate):
+        # If the aggregate reads a spillable *breaker* (the optimizer lowers
+        # `COUNT(DISTINCT x)` to `COUNT(*)` over a `DISTINCT`), spill that inner breaker
+        # out-of-core first and aggregate its bounded result — far cheaper than the
+        # value-list spill, and correct (the streaming map path would run the breaker
+        # per-batch, which a `DISTINCT`/nested aggregate cannot be).
+        if _peel_to_breaker(plan.input) is not None:
+            inner = spill_collect(plan.input, sources, num_partitions)
+            if inner is None:
+                return None
+            from batcher.dist.executors.partition_io import _apply_above
+
+            return _apply_above([plan], inner)
         return execute_spilling_aggregate(plan, sources, num_partitions)
+    # DISTINCT is a group-by over every column with no aggregates, so it rides the same
+    # hash-partition-and-spill path — the fix for a high-cardinality `DISTINCT` (and the
+    # `COUNT(DISTINCT)` the planner lowers to `DISTINCT → COUNT`) failing fast under a tight
+    # memory envelope instead of completing out-of-core, which it must at PB scale.
+    if isinstance(plan, Distinct):
+        cols = plan.input.available_columns()
+        group_keys = tuple(Projection(alias=c, expr=col(c)) for c in cols)
+        equiv = Aggregate(input=plan.input, group_keys=group_keys, aggregates=())
+        return execute_spilling_aggregate(equiv, sources, num_partitions)
     # The ordering/binary breakers live in `spill_breakers` (imported lazily so this
     # module stays import-cycle-free: `spill_breakers` depends on this one's helpers).
     if isinstance(plan, (Join, Sort, Window)):
@@ -117,6 +163,24 @@ def spill_collect(
                 if batches:
                     return pa.Table.from_batches(batches)
                 return pa.table({c: [] for c in plan.available_columns()})
+    # Peel the row-wise / limit operators sitting *above* a spillable breaker (e.g. the
+    # output `Project` of a `COUNT(DISTINCT)`, whose raw plan is `Project → Aggregate`),
+    # spill the breaker out-of-core, then re-apply the peeled ops to its bounded result.
+    # Without this a `Project`/`Filter`/`Limit` on top made the whole plan look
+    # non-spillable, so a large query would fail fast under a tight memory envelope
+    # instead of completing out-of-core.
+    above: list[LogicalPlan] = []
+    node: LogicalPlan = plan
+    while isinstance(node, (Project, Filter, Limit)):
+        above.append(node)
+        node = node.input
+    if above:
+        inner = spill_collect(node, sources, num_partitions)
+        if inner is None:
+            return None
+        from batcher.dist.executors.partition_io import _apply_above
+
+        return _apply_above(above, inner)
     return None
 
 

@@ -1,21 +1,28 @@
-//! LSD radix sort for fixed-width integer / temporal sort keys.
+//! LSD radix sort for fixed-width integer / temporal / float sort keys.
 //!
-//! A full sort (no `LIMIT`) on an integer or temporal column is O(n·w) by radix
+//! A full sort (no `LIMIT`) on an integer, temporal, or float column is O(n·w) by radix
 //! (w = key bytes) versus the comparison sort's O(n log n) — a real win on the wide
-//! inputs the external (spilling) sort generates run-by-run. This is a *drop-in*
-//! permutation builder: it returns the same row indices a stable sort would, so the
-//! produced relation is identical to `arrow::compute::sort_to_indices`. It only ever
-//! engages where it is provably equivalent (a supported fixed-width key, full sort);
-//! every other case — floats (NaN ordering), strings, multi-key, top-N — returns
-//! `None` and the caller falls back to the comparison sort.
+//! inputs the external (spilling) sort generates run-by-run, and on the per-range sorts
+//! of the parallel sample-sort. This is a *drop-in* permutation builder: it returns the
+//! same relation a stable sort would, identical to `arrow::compute::sort_to_indices`.
+//! Floats use an order-preserving bit transform matching arrow's `total_cmp`; a column
+//! with a `NaN` (no single numeric position), a string/boolean key, a multi-key sort, or
+//! a top-N returns `None` and the caller falls back to the comparison sort.
 
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Date64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    Array, ArrayRef, Date32Array, Date64Array, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, TimeUnit};
+
+/// Above this row count the float radix declines (its random-scatter key array no longer
+/// fits cache and it loses to the comparison sort). Sized to ~L2: a `u64` key array of
+/// 2^18 rows is 2 MiB. Large float sorts arrive here only per-range (parallel sample-sort)
+/// or per-run (spill) — both below this — so a whole-array serial float sort never radixes.
+const FLOAT_RADIX_MAX_ROWS: usize = 1 << 18;
 
 /// Build the sort permutation by LSD radix, or `None` if the key type is unsupported.
 ///
@@ -72,7 +79,40 @@ fn ordered_keys(values: &ArrayRef) -> Option<Vec<u64>> {
             (0..a.len()).map(|i| a.value(i) as u64).collect()
         }};
     }
+    // IEEE-754 floats map to an order-preserving u64 matching arrow's `total_cmp`:
+    // negatives bit-invert, non-negatives flip only the sign bit. This places `-0.0`
+    // just below `+0.0` exactly as arrow's comparison sort does (so the value sequences
+    // agree bit-for-bit). NaN has no single numeric position, so a column containing one
+    // bails to the comparison sort (`None`) — keeping the radix path exactly arrow-equal.
+    //
+    // Float radix wins only on **cache-fitting** inputs: the LSD passes scatter by a
+    // random key byte, so once the key array spills L2 it thrashes and loses badly to
+    // the comparison sort (a 2M-row serial radix measured ~4× *slower*). It is reached
+    // on cache-sized work — the parallel sample-sort's per-range sorts and the spill
+    // runs — so above `FLOAT_RADIX_MAX_ROWS` it declines and the caller's comparison
+    // sort (or, for a large input, the parallel sample-sort) takes over.
+    macro_rules! float {
+        ($arr:ty) => {{
+            let a = values.as_any().downcast_ref::<$arr>()?;
+            if a.len() > FLOAT_RADIX_MAX_ROWS {
+                return None;
+            }
+            let nulls = values.nulls();
+            let mut keys = Vec::with_capacity(a.len());
+            for i in 0..a.len() {
+                let v = a.value(i) as f64;
+                if !nulls.is_some_and(|nb| nb.is_null(i)) && v.is_nan() {
+                    return None;
+                }
+                let b = v.to_bits();
+                keys.push(if b >> 63 == 1 { !b } else { b | (1u64 << 63) });
+            }
+            keys
+        }};
+    }
     let keys: Vec<u64> = match values.data_type() {
+        DataType::Float32 => float!(Float32Array),
+        DataType::Float64 => float!(Float64Array),
         DataType::Int8 => signed!(Int8Array),
         DataType::Int16 => signed!(Int16Array),
         DataType::Int32 => signed!(Int32Array),
@@ -142,6 +182,48 @@ mod tests {
     use arrow::compute::{sort_to_indices, take};
 
     use super::*;
+
+    #[test]
+    fn matches_arrow_float_with_nulls_signs_and_zeros() {
+        // Finite floats spanning negatives, ±0.0, ±inf, ties, and nulls — the radix
+        // float key must sort identically to arrow's comparison sort. (NaN bails to the
+        // comparison sort and is covered by `nan_present_bails`.)
+        let v: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(5.5),
+            None,
+            Some(-3.25),
+            Some(5.5),
+            Some(0.0),
+            Some(-0.0),
+            Some(f64::NEG_INFINITY),
+            Some(f64::INFINITY),
+            None,
+            Some(-3.25),
+            Some(1e308),
+        ]));
+        assert_radix_matches_arrow(v);
+        let f32v: ArrayRef = Arc::new(Float32Array::from(vec![
+            Some(2.0f32),
+            Some(-1.0),
+            None,
+            Some(0.0),
+            Some(-0.0),
+            Some(f32::INFINITY),
+        ]));
+        assert_radix_matches_arrow(f32v);
+    }
+
+    #[test]
+    fn nan_present_bails_to_comparison_sort() {
+        // A column with a NaN is not radix-sortable (no single numeric position), so the
+        // builder returns None and the caller uses arrow's comparison sort.
+        let v: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            Some(f64::NAN),
+            Some(2.0),
+        ]));
+        assert!(radix_sort_indices(&v, SortOptions::default()).is_none());
+    }
 
     /// Radix and arrow's comparison sort must produce the **same sorted column** for
     /// every option combination (the relation is identical even if a tie permutation
@@ -220,10 +302,13 @@ mod tests {
 
     #[test]
     fn unsupported_type_returns_none() {
-        let f: ArrayRef = Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0]));
-        assert!(radix_sort_indices(&f, SortOptions::default()).is_none());
+        // Strings/booleans have no fixed-width radix key, so the builder declines and the
+        // caller uses arrow's comparison sort. (Floats are now supported — see the float
+        // tests; a NaN-bearing float column declines via `nan_present_bails`.)
         let s: ArrayRef = Arc::new(arrow::array::StringArray::from(vec!["a", "b"]));
         assert!(radix_sort_indices(&s, SortOptions::default()).is_none());
+        let b: ArrayRef = Arc::new(arrow::array::BooleanArray::from(vec![true, false]));
+        assert!(radix_sort_indices(&b, SortOptions::default()).is_none());
     }
 
     #[test]

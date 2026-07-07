@@ -146,6 +146,16 @@ class IRNode(Expr):
             )
 
     def to_ir(self) -> dict[str, Any]:
+        # `to_ir` is a pure function of an immutable node, but the optimizer calls it
+        # heavily — canonical keys for CSE/dedup, plus recursive re-lowering as rules
+        # rewrite ancestors — and each call otherwise re-walks the whole subtree (a
+        # superlinear cost on large plans). Memoize the result on the node: `Expr` sets
+        # no `__slots__`, so every node has a `__dict__` to cache in, and the node is
+        # immutable after construction. Callers treat the IR as read-only (verified: no
+        # code mutates a `to_ir()` dict in place), so sharing the cached dict is safe.
+        cached = self.__dict__.get("_ir_cache")
+        if cached is not None:
+            return cached
         out: dict[str, Any] = {"e": self.tag}
         for f in fields(self):
             spec = f.metadata.get(_META)
@@ -157,6 +167,7 @@ class IRNode(Expr):
             if spec.omit is _Omit.IF_FALSY and not value:
                 continue
             out[spec.ir_key or f.name] = _encode(spec.kind, value)
+        self.__dict__["_ir_cache"] = out
         return out
 
 

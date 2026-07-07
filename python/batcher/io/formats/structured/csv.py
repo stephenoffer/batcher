@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import IO, Any
 
@@ -15,6 +17,12 @@ from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.splits import FileSplit, Split, read_aligned_range
 
 __all__ = ["CSVRangeSplit", "CSVSink", "CSVSource"]
+
+# Below this many rows a single-file CSV write stays serial: the thread-pool + buffer
+# overhead isn't worth it. Above it, encode row ranges concurrently (one range per core).
+_CSV_PARALLEL_MIN_ROWS = 200_000
+# Batches per core held in a streaming CSV write's parallel-encode window (bounds memory).
+_CSV_STREAM_WINDOW_PER_CORE = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +130,92 @@ class CSVSink(FileSink):
     def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:
         import pyarrow.csv as pacsv
 
-        pacsv.write_csv(table, fh)
+        # A single-file CSV write is otherwise a serial encode (pyarrow's writer is
+        # single-threaded) — the slow path that loses a directory-vs-file race to an
+        # engine that shards its write. But CSV is just row-wise text, so encode row
+        # ranges CONCURRENTLY (pyarrow's CSV encoder releases the GIL) into in-memory
+        # buffers — only the first carries the header — and write them back to back.
+        n = table.num_rows
+        workers = min(n // _CSV_PARALLEL_MIN_ROWS, os.cpu_count() or 1)
+        if workers <= 1:
+            pacsv.write_csv(table, fh)
+            return
+        rows = -(-n // workers)  # ceil
+        slices = [(i, table.slice(off, rows)) for i, off in enumerate(range(0, n, rows))]
+
+        def _encode(item: tuple[int, pa.Table]) -> pa.Buffer:
+            idx, chunk = item
+            sink = pa.BufferOutputStream()
+            pacsv.write_csv(chunk, sink, write_options=pacsv.WriteOptions(include_header=idx == 0))
+            return sink.getvalue()
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            buffers = list(pool.map(_encode, slices))  # order preserved
+        for buf in buffers:
+            fh.write(memoryview(buf))
+
+    def write_stream(self, batches, path, *, schema=None, resume=False):  # type: ignore[override]
+        """Stream to one CSV file with a **parallel** encode, in bounded memory.
+
+        The base streaming write appends one batch at a time through pyarrow's
+        single-threaded `CSVWriter` — the serial encode that loses a directory-vs-file
+        race. CSV rows are independent text, so instead accumulate a window of batches and
+        encode them CONCURRENTLY to byte buffers (pyarrow's CSV encoder releases the GIL;
+        only the first batch of the whole stream carries the header), writing each window
+        back to back. Peak memory is one window, not the whole result — still out-of-core.
+        """
+        from itertools import chain
+
+        from batcher.io.base import _safe_size
+        from batcher.io.manifest import WrittenFile
+
+        fs = resolve_filesystem(path)
+        if resume and fs.exists(path):
+            return WrittenFile(path=path, rows=0, bytes=_safe_size(fs, path))
+        it = iter(batches)
+        first = next(it, None)
+        rows = 0
+        with fs.atomic_writer(path) as fh:
+            if first is None:
+                self._write_file(schema.empty_table() if schema is not None else pa.table({}), fh)
+            else:
+                rows = self._encode_stream_parallel(chain([first], it), fh)
+        return WrittenFile(path=path, rows=rows, bytes=_safe_size(fs, path))
+
+    def _encode_stream_parallel(self, batches: Iterator[pa.RecordBatch], fh: IO[Any]) -> int:
+        import pyarrow.csv as pacsv
+
+        def _encode(item: tuple[int, pa.RecordBatch]) -> pa.Buffer:
+            idx, batch = item
+            sink = pa.BufferOutputStream()
+            pacsv.write_csv(
+                pa.table(batch), sink, write_options=pacsv.WriteOptions(include_header=idx == 0)
+            )
+            return sink.getvalue()
+
+        cores = os.cpu_count() or 1
+        window = max(1, cores * _CSV_STREAM_WINDOW_PER_CORE)
+        rows = 0
+        buf: list[pa.RecordBatch] = []
+        emitted = 0
+
+        def flush() -> int:
+            with ThreadPoolExecutor(max_workers=min(len(buf), cores)) as pool:
+                for out in pool.map(_encode, [(emitted + i, b) for i, b in enumerate(buf)]):
+                    fh.write(memoryview(out))
+            return len(buf)
+
+        for batch in batches:
+            if not batch.num_rows:
+                continue
+            buf.append(batch)
+            rows += batch.num_rows
+            if len(buf) >= window:
+                emitted += flush()
+                buf = []
+        if buf:
+            flush()
+        return rows
 
     def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
         import pyarrow.csv as pacsv

@@ -21,6 +21,15 @@ from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["ParquetDatasetSource", "ParquetFragmentSplit", "ParquetSink", "ParquetSource"]
 
+# Process-wide cache of per-file Parquet row counts, keyed by full path/URI. A footer
+# read is a ~80 ms object-store round trip; Parquet is write-once, so a file's row count
+# is immutable and safe to cache by path — the same "never read a footer twice" guarantee
+# the Rust reader's `meta_cache` gives the data plane. Without it, EVERY distributed
+# `collect` re-reads every source file's footer just to size the worker fan-out
+# (`learned_num_workers` → `total_source_rows`): measured ~0.9 s/collect on a 10-file sf10
+# groupby, dwarfing the 0.26 s shuffle it was sizing.
+_ROW_COUNT_CACHE: dict[str, int] = {}
+
 
 @dataclass(frozen=True, slots=True)
 class ParquetFragmentSplit:
@@ -162,8 +171,13 @@ class ParquetSource(FileSource):
     def _file_row_count(self, path: str) -> int | None:
         import pyarrow.parquet as pq
 
+        hit = _ROW_COUNT_CACHE.get(path)
+        if hit is not None:
+            return hit
         with self._fs.open(path) as fh:
-            return pq.ParquetFile(fh).metadata.num_rows
+            n = pq.ParquetFile(fh).metadata.num_rows
+        _ROW_COUNT_CACHE[path] = n
+        return n
 
     def _file_splits(self, path: str, target_size: int | None) -> list[Split]:
         return _parquet_row_group_splits(path, target_size)

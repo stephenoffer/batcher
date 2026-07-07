@@ -64,7 +64,38 @@ def resolve_adaptive(adaptive: bool | str, plan: LogicalPlan, sources: list[Sour
     """
     if adaptive != "auto":
         return bool(adaptive)
-    return _adaptive_would_help(plan, sources, hub)
+    # The cold heuristic (a join over a breaker-produced, guessed-size operand) fires on
+    # the first run. Once history exists, ALSO enable for any signature whose measured
+    # re-optimization actually *flipped* a plan often enough — a shape whose estimates the
+    # loop keeps correcting is worth the per-stage cost even if the structural gate misses
+    # it. Gating adaptivity only trades planning overhead, never the result.
+    return _adaptive_would_help(plan, sources, hub) or _learned_adaptive_helps(plan, hub)
+
+
+def _learned_adaptive_helps(plan: LogicalPlan, hub) -> bool:
+    """Whether the hub has learned that stage-by-stage re-opt historically helps `plan`."""
+    if hub is None:
+        return False
+    try:
+        from batcher.kyber.learned_tuning import learned_adaptive_helps
+        from batcher.kyber.signature import plan_signature
+
+        return learned_adaptive_helps(hub, plan_signature(plan))
+    except Exception:  # pragma: no cover - a learned read must never break routing
+        return False
+
+
+def _record_adaptive_flip(hub, plan: LogicalPlan, flipped: bool) -> None:
+    """Fold this adaptive run's flip outcome into the learned adaptive gate. Best-effort."""
+    if hub is None:
+        return
+    try:
+        from batcher.kyber.learned_tuning import record_adaptive_flip
+        from batcher.kyber.signature import plan_signature
+
+        record_adaptive_flip(hub, plan_signature(plan), flipped)
+    except Exception:  # pragma: no cover - recording must never break a query
+        return
 
 
 def _adaptive_would_help(plan: LogicalPlan, sources: list[Source], hub) -> bool:
@@ -208,7 +239,20 @@ def _execute_adaptive(
     """The adaptive stage loop (one attempt). `_fault_inject_stage` is a test hook
     invoked with the live fleet after each intermediate stage, to exercise cross-stage
     worker loss."""
+    from batcher import kyber
+
+    orig_plan = plan  # capture the signature key before the loop rewrites `plan`
+    flipped = False  # did any stage's measured size diverge from its estimate (a re-opt flip)?
     srcs = list(sources)
+    # Re-optimize each stage starting from the *optimized* logical structure, not the
+    # raw plan. A stage is a subtree rooted at a pipeline breaker; in the raw plan a
+    # join's condition can live in a `Filter` *above* that breaker (a comma/cross join
+    # whose `WHERE` equality has not yet been folded into the join keys), so splitting
+    # there would execute the join as a cartesian product. Folding keys, pushing
+    # predicates, and reordering joins over the whole plan first makes every breaker
+    # subtree self-contained — the per-stage loop then only refines cost-based choices
+    # with measured cardinalities. Holds for single-node and distributed alike.
+    plan = kyber.optimize_logical(plan, sources=srcs, hub=hub)
     decisions: list = []
     stages = 0
     intermediates: list = []  # partitioned-on-disk/Flight sources, cleaned up at the end
@@ -248,7 +292,15 @@ def _execute_adaptive(
             decisions.extend(decs)
             stages += 1
             if final:
+                _record_adaptive_flip(hub, orig_plan, flipped)
                 return AdaptiveResult(_as_table(result, target), decisions, stages)
+            # An intermediate whose measured size missed its estimate is exactly a stage
+            # where re-optimizing on the real cardinality can flip a downstream choice —
+            # learn that this signature benefits from staying adaptive.
+            if isinstance(result, pa.Table) and not _estimate_accurate(
+                result.num_rows, est_rows, reopt_error
+            ):
+                flipped = True
             # Splice a Scan over the breaker's result (exact-size) for the rest of the
             # plan. A `MaterializedSource` is scanned in place; a collected table is
             # re-wrapped as an in-memory source (the single-node / fallback path).
@@ -279,6 +331,7 @@ def _execute_adaptive(
             plan, srcs, hub, distributed, num_workers, transport, materialize=True
         )
         decisions.extend(decs)
+        _record_adaptive_flip(hub, orig_plan, flipped)
         return AdaptiveResult(_as_table(result, plan), decisions, stages + 1)
     finally:
         # The final result is a fully in-memory table, independent of the on-disk

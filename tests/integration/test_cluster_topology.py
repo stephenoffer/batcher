@@ -19,9 +19,11 @@ from batcher import dist  # noqa: E402  (after importorskip)
 
 @pytest.fixture(scope="module", autouse=True)
 def _ray_session():
-    ray.init(num_cpus=2, include_dashboard=False, logging_level="ERROR", ignore_reinit_error=True)
+    from conftest import init_test_ray, shutdown_test_ray
+
+    started = init_test_ray(2)
     yield
-    ray.shutdown()
+    shutdown_test_ray(started)
 
 
 @pytest.fixture
@@ -108,19 +110,27 @@ def test_autoscale_request_high_water_then_reclaims(monkeypatch):
     resets to 0 only when the LAST scope ends — so concurrent queries compose (a scope
     never lowers a sibling's floor) and a finished big query stops pinning the cluster
     scaled up (the autoscaler can reclaim the idle nodes)."""
-    from batcher.dist.executors import ray_runtime as rr
+    from batcher.dist.executors.ray_runtime import scaling
 
+    # The floor lifecycle lives in `scaling`; patch there so its same-module calls to
+    # `_apply_autoscale_floor` are intercepted. It now takes (cpus, gpus) — capture the
+    # CPU floor (the GPU floor stays 0 for these CPU-only scopes).
     applied: list[int] = []
-    monkeypatch.setattr(rr, "_apply_autoscale_floor", applied.append)
-    monkeypatch.setattr(rr, "_autoscale_active", 0)
-    monkeypatch.setattr(rr, "_autoscale_floor", 0)
 
-    rr.request_autoscale(100)  # scope A: scale to 100
-    rr.request_autoscale(50)  # scope B: max(100, 50) → still 100
+    def _capture(cpus, gpus=0):
+        applied.append(cpus)
+
+    monkeypatch.setattr(scaling, "_apply_autoscale_floor", _capture)
+    monkeypatch.setattr(scaling, "_autoscale_active", 0)
+    monkeypatch.setattr(scaling, "_autoscale_floor", 0)
+    monkeypatch.setattr(scaling, "_autoscale_gpu_floor", 0)
+
+    scaling.request_autoscale(100)  # scope A: scale to 100
+    scaling.request_autoscale(50)  # scope B: max(100, 50) → still 100
     assert applied == [100, 100]
-    rr.release_autoscale()  # A ends, B still in flight → floor unchanged (no reclaim)
+    scaling.release_autoscale()  # A ends, B still in flight → floor unchanged (no reclaim)
     assert applied == [100, 100]
-    rr.release_autoscale()  # last scope ends → reset to 0 so idle nodes are reclaimed
+    scaling.release_autoscale()  # last scope ends → reset to 0 so idle nodes are reclaimed
     assert applied == [100, 100, 0]
 
 

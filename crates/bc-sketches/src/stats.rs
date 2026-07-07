@@ -8,11 +8,7 @@
 
 use arrow::array::{Array, ArrayRef};
 
-use crate::{FrequentItems, HyperLogLog, KllSketch, Mergeable};
-
-/// Misra-Gries capacity for the heavy-values sketch: the monitored set is then
-/// guaranteed to contain every value with frequency `> N / (CAPACITY + 1)`.
-const HEAVY_CAPACITY: usize = 64;
+use crate::{HyperLogLog, KllSketch, Mergeable};
 
 /// Cheap, mergeable statistics for one column, computed in a single pass.
 #[derive(Clone)]
@@ -28,12 +24,6 @@ pub struct ColumnStats {
     distinct: HyperLogLog,
     /// Present only for numeric/temporal columns (quantiles need an ordered domain).
     quantiles: Option<KllSketch>,
-    /// Misra-Gries summary of the *heavy* (skewed) numeric values, keyed by
-    /// `f64::to_bits()`. Present only for numeric/temporal columns (same guard as
-    /// `quantiles`); `None` otherwise. Runtime-only: not persisted by
-    /// [`to_bytes`](Self::to_bytes), so it reconstructs as `None` after
-    /// [`from_bytes`](Self::from_bytes).
-    heavy: Option<FrequentItems<u64>>,
 }
 
 impl ColumnStats {
@@ -47,23 +37,12 @@ impl ColumnStats {
         kll.add_array(array); // no-op for non-numeric types
         let quantiles = (!kll.is_empty()).then_some(kll);
 
-        // Heavy (skewed) values: only meaningful for the same numeric/temporal
-        // domain the quantile sketch covers, so reuse that guard. Each non-null
-        // value is keyed by its raw `f64::to_bits()` so the optimizer can recover
-        // the exact heavy literals for skew-aware join/shuffle planning.
-        let heavy = quantiles.is_some().then(|| {
-            let mut fi = FrequentItems::new(HEAVY_CAPACITY);
-            Self::add_heavy(&mut fi, array);
-            fi
-        });
-
         Self {
             count: array.len(),
             null_count: array.null_count(),
             total_bytes: array.get_array_memory_size() as u64,
             distinct,
             quantiles,
-            heavy,
         }
     }
 
@@ -81,45 +60,6 @@ impl ColumnStats {
             0.0
         } else {
             self.total_bytes as f64 / self.count as f64
-        }
-    }
-
-    /// Feed every non-null numeric value of `array` into the heavy-values sketch,
-    /// keyed by `f64::to_bits()`. Mirrors `KllSketch::add_array`'s numeric guard;
-    /// a no-op for non-numeric arrays (which never reach here in practice).
-    fn add_heavy(fi: &mut FrequentItems<u64>, array: &ArrayRef) {
-        use arrow::compute::cast;
-        use arrow::datatypes::DataType;
-
-        if !matches!(
-            array.data_type(),
-            DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Date32
-                | DataType::Date64
-                | DataType::Timestamp(_, _)
-        ) {
-            return;
-        }
-        let Ok(f) = cast(array, &DataType::Float64) else {
-            return;
-        };
-        let Some(f) = f.as_any().downcast_ref::<arrow::array::Float64Array>() else {
-            return;
-        };
-        for i in 0..f.len() {
-            if f.is_valid(i) {
-                fi.add(f.value(i).to_bits());
-            }
         }
     }
 
@@ -144,23 +84,6 @@ impl ColumnStats {
     }
     pub fn max(&self) -> Option<f64> {
         self.quantiles.as_ref().and_then(|s| s.max())
-    }
-
-    /// Heavy (skewed) values of a numeric column: every value whose frequency
-    /// exceeds `fraction * count`, as `(value, count)` pairs sorted by count
-    /// descending. The counts are Misra-Gries *lower* bounds (undershoot by at
-    /// most `count / (capacity + 1)`). Empty for non-numeric columns or when no
-    /// value clears the threshold. These are exactly the literals worth salting
-    /// across sub-partitions so one skewed join/group key can't overload a reducer.
-    pub fn heavy_values(&self, fraction: f64) -> Vec<(f64, u64)> {
-        match &self.heavy {
-            Some(fi) => fi
-                .heavy_hitters(fraction)
-                .into_iter()
-                .map(|(bits, c)| (f64::from_bits(bits), c))
-                .collect(),
-            None => Vec::new(),
-        }
     }
 
     // ---- Selectivity helpers (cost-model building blocks) -----------------
@@ -238,10 +161,6 @@ impl ColumnStats {
     /// Serialize to a byte blob composing the inner sketches. Layout (LE):
     /// `[count: u64][null_count: u64][total_bytes: u64][hll_len: u64][hll…][has_kll: u8]`
     /// and, when the flag is 1, `[kll_len: u64][kll…]`.
-    ///
-    /// The heavy-values (Misra-Gries) sketch is **not** persisted — it is a
-    /// runtime-only summary with no wire format — so only distinct (HLL) and
-    /// quantiles (KLL) survive a roundtrip; `heavy` reconstructs as `None`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.count as u64).to_le_bytes());
@@ -310,9 +229,6 @@ impl ColumnStats {
             total_bytes,
             distinct,
             quantiles,
-            // Heavy-values sketch is runtime-only and not serialized; it cannot be
-            // reconstructed from the blob, so it is absent after deserialization.
-            heavy: None,
         })
     }
 }
@@ -327,11 +243,6 @@ impl Mergeable for ColumnStats {
         match (self.quantiles.as_mut(), other.quantiles.as_ref()) {
             (Some(a), Some(b)) => a.merge(b),
             (None, Some(b)) => self.quantiles = Some(b.clone()),
-            _ => {}
-        }
-        match (self.heavy.as_mut(), other.heavy.as_ref()) {
-            (Some(a), Some(b)) => a.merge(b),
-            (None, Some(b)) => self.heavy = Some(b.clone()),
             _ => {}
         }
     }
@@ -470,81 +381,6 @@ mod tests {
         // ~3 distinct values → ~1/3 each.
         assert!((stats.selectivity_eq() - 1.0 / 3.0).abs() < 0.1);
         assert_eq!(stats.null_fraction(), 0.0);
-    }
-
-    #[test]
-    fn heavy_values_finds_skew() {
-        // Value 7 is hot (5000 copies); 0..1000 each appear once.
-        let mut vals: Vec<i64> = vec![7; 5_000];
-        vals.extend(0..1_000);
-        let arr: ArrayRef = Arc::new(Int64Array::from(vals));
-        let stats = ColumnStats::from_array(&arr);
-        let n = 6_000u64;
-
-        let heavy = stats.heavy_values(0.25);
-        let (_, count) = heavy
-            .iter()
-            .copied()
-            .find(|(v, _)| *v == 7.0)
-            .unwrap_or_else(|| panic!("hot value 7 not reported: {heavy:?}"));
-
-        // Misra-Gries undershoots by at most N / (capacity + 1).
-        let slack = n / (HEAVY_CAPACITY as u64 + 1);
-        assert!(
-            count >= 5_000 - slack && count <= 5_000,
-            "count {count} outside [{}, 5000]",
-            5_000 - slack
-        );
-
-        // Sorted by count descending → the hot value leads.
-        assert_eq!(heavy.first().map(|(v, _)| *v), Some(7.0));
-
-        // A rare value must not be reported.
-        assert!(
-            !heavy.iter().any(|(v, _)| *v == 3.0),
-            "rare value 3 reported heavy: {heavy:?}"
-        );
-    }
-
-    #[test]
-    fn heavy_values_none_for_string() {
-        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "a", "a", "b"]));
-        let stats = ColumnStats::from_array(&arr);
-        assert!(stats.heavy_values(0.1).is_empty());
-    }
-
-    #[test]
-    fn heavy_values_empty_after_roundtrip() {
-        // Heavy is runtime-only: present before serialization, gone after.
-        let mut vals: Vec<i64> = vec![7; 5_000];
-        vals.extend(0..1_000);
-        let arr: ArrayRef = Arc::new(Int64Array::from(vals));
-        let stats = ColumnStats::from_array(&arr);
-        assert!(!stats.heavy_values(0.25).is_empty());
-
-        let back = ColumnStats::from_bytes(&stats.to_bytes()).expect("valid blob");
-        assert!(back.heavy_values(0.25).is_empty());
-        // Persisted summaries (distinct / quantiles) survive unchanged.
-        assert_eq!(back.min(), stats.min());
-        assert_eq!(back.max(), stats.max());
-    }
-
-    #[test]
-    fn heavy_values_merge_preserves_skew() {
-        // Split the hot value across two partitions; merge must keep it heavy.
-        let a_arr: ArrayRef = Arc::new(Int64Array::from(vec![7i64; 2_500]));
-        let mut b_vals: Vec<i64> = vec![7; 2_500];
-        b_vals.extend(0..1_000);
-        let b_arr: ArrayRef = Arc::new(Int64Array::from(b_vals));
-
-        let mut a = ColumnStats::from_array(&a_arr);
-        a.merge(&ColumnStats::from_array(&b_arr));
-
-        let heavy = a.heavy_values(0.25);
-        assert!(
-            heavy.iter().any(|(v, _)| *v == 7.0),
-            "hot value lost after merge: {heavy:?}"
-        );
     }
 
     #[test]

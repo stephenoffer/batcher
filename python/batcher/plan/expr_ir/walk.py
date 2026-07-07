@@ -14,6 +14,7 @@ from batcher.plan.expr_ir.core import (
     Cast,
     Coalesce,
     Expr,
+    InList,
     IsInf,
     IsNan,
     IsNotNull,
@@ -59,7 +60,24 @@ from batcher.plan.expr_ir.video import VideoFunc
 
 
 def referenced_columns(expr: Expr) -> set[str]:
-    """The set of input column names an expression reads."""
+    """The set of input column names an expression reads.
+
+    Memoized on the (immutable) node: the projection/pushdown/fusion rules call this
+    on the same expressions across every fixpoint iteration, and it otherwise re-walks
+    the whole subtree each time. The result is used only as a read-only operand
+    (``need |= referenced_columns(e)``, ``<=``, ``in`` — verified: no caller mutates it),
+    so sharing the cached set is safe. `Expr` sets no `__slots__`, so every node has a
+    `__dict__` to cache in.
+    """
+    cached = expr.__dict__.get("_c_refcols")
+    if cached is not None:
+        return cached
+    cols = _referenced_columns_impl(expr)
+    expr.__dict__["_c_refcols"] = cols
+    return cols
+
+
+def _referenced_columns_impl(expr: Expr) -> set[str]:
     if isinstance(expr, Col):
         return {expr.name}
     if isinstance(expr, Binary):
@@ -69,6 +87,7 @@ def referenced_columns(expr: Expr) -> set[str]:
         (
             Not,
             Cast,
+            InList,
             IsNull,
             IsNotNull,
             IsNan,
@@ -145,6 +164,8 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         return Not(remap_columns(expr.input, mapping))
     if isinstance(expr, Cast):
         return Cast(remap_columns(expr.input, mapping), expr.dtype, try_cast=expr.try_cast)
+    if isinstance(expr, InList):
+        return InList(remap_columns(expr.input, mapping), expr.values)
     if isinstance(expr, IsNull):
         return IsNull(remap_columns(expr.input, mapping))
     if isinstance(expr, IsNotNull):

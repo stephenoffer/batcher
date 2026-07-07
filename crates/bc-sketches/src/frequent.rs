@@ -94,7 +94,7 @@ impl<K: Hash + Eq + Clone> FrequentItems<K> {
             .filter(|(_, &c)| (c as f64) > threshold)
             .map(|(k, &c)| (k.clone(), c))
             .collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         out
     }
 

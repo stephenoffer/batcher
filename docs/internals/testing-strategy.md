@@ -25,6 +25,86 @@ mergeability test: `combine_finalize(partition(partial(pₖ)))` over all partiti
 must equal the single-node result, which is what guarantees one core, many cores,
 and many machines compute the same thing.
 
+## Property-based behavior testing
+
+The two oracles say *what* the right answer is; property-based tests decide *where to look
+for a wrong one*. They are a first-class layer alongside the oracles, not a substitute:
+instead of one enumerated input, Hypothesis generates thousands of random tables and
+pipelines and asserts an invariant holds on every draw, shrinking any failure to a minimal
+counterexample. This is the layer that guards work whose correctness lives in a
+*combination* — the full optimizer rule set, the metadata shortcuts, the adaptive and
+self-tuning paths — where the bug an example misses is exactly the one that matters. The
+suite lives in `tests/property/`; each file pins one invariant and drives it through an
+oracle.
+
+**Optimizer result-invariance** (`test_prop_optimizer_result_invariance.py`). Kyber's full
+154-rule set must change the *plan* and never the *answer*. Hypothesis builds a random typed
+table and a random valid pipeline (filters carrying redundant and absorbing boolean shapes,
+derived columns, group-by aggregates, distinct, sort, limit, union) and asserts
+
+```
+result(FULL 154 rules)  ==  result(NO rules)  ==  ds.collect()
+```
+
+on an order-independent multiset compare — and, when the pipeline is totally ordered, on row
+order too. Any rule, or any rule *interaction*, that alters a result falls out as a
+counterexample; that is a real correctness bug to minimize and fix, never to weaken away.
+
+**Confluence, termination, and determinism** (same file). Result-invariance says the rules
+are individually sound; confluence says they behave in *combination*. The test asserts the
+optimized IR at the production `fixpoint_iterations` cap equals the IR at a far larger cap —
+proof that the combined set reaches its plan fixpoint within the budget the engine actually
+runs, so no plan is silently *under*-optimized (truncated mid-convergence) as more rules are
+added — and that re-running is byte-identical, i.e. the rule system is confluent with a
+unique normal form. Re-optimizing an already-optimized plan is a fixpoint and re-executes to
+the identical rows. This is the guarantee that a growing, grouped-by-family rule set does not
+regress into the interference and oscillation a large uncoordinated pass list would.
+
+**Metadata fidelity and the EXACT firewall** (`test_prop_metadata_fidelity.py`). The
+metadata shortcuts answer `count` / `is_empty` / `min` / `max` / `n_unique` / `n_null` from
+Parquet footer statistics without scanning a row. Two things must hold on random typed data
+written to Parquet and read back: **fidelity** — whenever a shortcut fires, its answer equals
+both the engine-executed answer and DuckDB (a wrong footer-derived answer is a silent bug
+that never scans a row to get caught); and the **EXACT firewall** — past a filter the
+source's bounds are no longer exact for the result, so a shortcut that cannot *prove* its
+answer must decline and fall back to execution rather than return a stale pre-filter value.
+The test asserts both the decline on a genuinely partial filter and that the executed
+fallback still matches DuckDB.
+
+**Adaptive equals non-adaptive** (`test_prop_adaptive_equivalence.py`). Intra-query
+re-optimization re-plans each pipeline breaker on its *measured* cardinality, so a join's
+build side or broadcast choice can flip mid-query. The moat is that it plans *better*, never
+*differently*: on a random selective-filter-into-join — the shape where the measured count
+most diverges from the estimate — `adaptive=True`, `False`, and `"auto"` must produce the
+same rows (and for the inner join the shared result is cross-checked against DuckDB).
+
+**Adaptive-tuning result-invariance** (`test_prop_tuning_invariance.py`). Every self-tuning
+lever — morsel size, spill, shuffle partition count, adaptive morsel sizing, and the learned
+strategy choices behind them — is contractually result-invariant: it changes *how* a query
+runs, never *what* it returns. Hypothesis runs the same aggregate/distinct at opposite
+settings of each knob (a 1-row morsel vs 64k, spill forced vs in-memory, one partition vs
+seven) and asserts byte-identical results. This is the contract every adaptive-tuning
+optimization must hold — checked, not trusted.
+
+**The mergeable algebra** (`test_prop_mergeable_invariant.py`,
+`test_prop_partition_invariant.py`). Stateful operators are `partial → combine → finalize`
+with an associative-commutative `combine`; that is the single invariant that lets one
+implementation serve one core, many cores, and many machines. The tests assert an
+aggregate / distinct / sort-limit over one morsel equals the same over any random chunking
+of the input, and equals DuckDB. Because the native distributed primitives are directly
+callable, `test_prop_mergeable_invariant.py` also drives
+`combine_finalize(partition(partial(pₖ)))` over the raw Rust kernels and asserts it equals
+the single-node result — partition-independence proven at the primitive, not only through
+the Python path.
+
+**Why this layer earns its place.** These invariants caught real bugs during development that
+no example test would have surfaced: a transient crash under a concurrent plan edit, and an
+adaptive-vs-non-adaptive divergence that traced to a pre-existing empty-input engine
+limitation (the adaptive path short-circuits an empty subtree while the one-shot path hits
+the gap) — surfaced honestly and isolated, not papered over. A property that fails is a
+decision to surface, exactly like a differential mismatch; weakening it to go green is not an
+option.
+
 ## Test layout
 
 ```
@@ -33,7 +113,7 @@ tests/
 ├── differential/   cross-check results against DuckDB/Polars (the correctness spine)
 ├── integration/    end-to-end — I/O, adaptive re-optimization, distributed, spilling
 ├── io/             source and sink formats
-├── property/       Hypothesis invariants — merge associativity, IR round-trips, idempotence
+├── property/       Hypothesis invariants — optimizer, metadata, adaptive, mergeable
 └── docs/           executes the code examples in the docs, and the examples/ scripts
 ```
 
@@ -43,9 +123,14 @@ standalone script under the top-level `examples/` directory. Both fail the suite
 demonstrated API is removed or renamed, so usage coverage cannot rot.
 
 Markers are declared in `pyproject.toml`: `unit`, `differential`, `integration`,
-and `property`. Property tests (Hypothesis) are encouraged for algebraic invariants
-— merge associativity, encode/decode round-trips, optimizer idempotence — where one
-law covers a space no enumerated case can.
+`property`, and `docs`. Property tests (Hypothesis) are encouraged for algebraic
+invariants — merge associativity, encode/decode round-trips, optimizer idempotence — where
+one law covers a space no enumerated case can; the behavioral suite above
+(`tests/property/`) is where they now guard the optimizer, metadata, adaptive, and tuning
+work. Those files carry both `property` and `integration` (they drive the native engine),
+run under `just test-py`, and — unlike the rest of the integration suite — are counted in
+the coverage gate: `tests/property` is in `cov-gate`'s measured set (see below), so the
+random-search coverage of those paths is part of the ratchet.
 
 ## What each change must prove
 

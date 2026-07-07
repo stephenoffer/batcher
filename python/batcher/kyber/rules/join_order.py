@@ -36,7 +36,14 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, RuleCategory, plan_rule
 from batcher.plan.expr_ir import Col
-from batcher.plan.logical import Join, JoinOutputCol, LogicalPlan, Project, Projection
+from batcher.plan.logical import (
+    Join,
+    JoinOutputCol,
+    LogicalPlan,
+    Project,
+    Projection,
+    is_cartesian_key_pair,
+)
 from batcher.plan.visitor import children, with_children
 
 __all__ = ["reorder_joins"]
@@ -91,8 +98,15 @@ def _try_reorder(top: Join, ctx: OptimizerContext, visit) -> LogicalPlan | None:
     if edges is None or required is None:
         return None
 
-    # Reorder nested subtrees inside each leaf first, then rebuild this subtree.
-    leaves = [visit(leaf) for leaf in leaves]
+    # Reorder nested subtrees inside each leaf first, then prune each leaf to just the
+    # columns the rebuilt subtree needs (its keys + the required output). Seeing through
+    # transparent projections (above) discards the column-pruning projects the builder
+    # placed between joins, so without re-pruning here the rebuilt joins would read
+    # full-width leaves — re-materializing every dropped column (large strings, blobs)
+    # the projection pushdown had already eliminated. Projection pushdown runs before
+    # this phase and does not run again, so reorder must carry the pruning itself.
+    needed = _needed_cols(required, edges)
+    leaves = [_prune_leaf(visit(leaf), i, needed) for i, leaf in enumerate(leaves)]
     # Bushy-tree DP: exhaustive up to `_MAX_EXHAUSTIVE_LEAVES`, connected-subset DP
     # for larger sparse graphs, greedy fallback.
     if len(leaves) <= _MAX_EXHAUSTIVE_LEAVES:
@@ -102,28 +116,66 @@ def _try_reorder(top: Join, ctx: OptimizerContext, visit) -> LogicalPlan | None:
     return dp if dp is not None else _rebuild_greedy(leaves, edges, required, ctx)
 
 
+def _is_transparent(node: LogicalPlan) -> bool:
+    """Whether `node` is a pure pass-through projection (every output is a bare column).
+
+    Such a `Project` only renames/selects columns — it computes nothing — so an
+    inner-join subtree split across one is still a single reorderable subtree. The
+    join builder emits these between joins (e.g. the `.drop(__cross_key)` after each
+    comma join), and without seeing through them every join looks two-leaved and
+    reordering never engages. Column provenance is followed through the renames, and
+    reorder rebuilds the columns it needs from the leaves directly, so dropping the
+    intermediate projection is safe.
+    """
+    return isinstance(node, Project) and all(isinstance(it.expr, Col) for it in node.items)
+
+
+def _prune_leaf(leaf: LogicalPlan, leaf_idx: int, needed: set[ColRef]) -> LogicalPlan:
+    """Project `leaf` down to just the columns the rebuilt subtree needs from it.
+
+    Reordering carries only `needed` columns through the joins, but the *leaf inputs*
+    are otherwise read at full width (every scan column), re-materializing the columns
+    projection pushdown already pruned. Wrapping the leaf in a select-only projection
+    restores that pruning so a reordered join reads no more than an un-reordered one.
+    A no-op when the leaf already exposes exactly the needed columns.
+    """
+    keep = [c for c in leaf.available_columns() if (leaf_idx, c) in needed]
+    if len(keep) == len(leaf.available_columns()):
+        return leaf
+    return Project(leaf, tuple(Projection(c, Col(c)) for c in keep))
+
+
 def _collect_leaves(node: LogicalPlan, out: list[LogicalPlan]) -> None:
     if isinstance(node, Join) and node.join_type == "inner":
         _collect_leaves(node.left, out)
         _collect_leaves(node.right, out)
+    elif _is_transparent(node):
+        _collect_leaves(node.input, out)
     else:
         out.append(node)
 
 
 def _resolve(node: LogicalPlan, colname: str) -> tuple[LogicalPlan, str] | None:
     """Trace `colname` in `node`'s output down to the leaf (subplan, column) it
-    originates from, following the inner-join output provenance."""
+    originates from, following inner-join output provenance and transparent renames."""
     if isinstance(node, Join) and node.join_type == "inner":
         for o in node.output:
             if o.alias == colname:
                 child = node.left if o.side == "left" else node.right
                 return _resolve(child, o.name)
         return None  # column not found in this join's output (unexpected)
+    if _is_transparent(node):
+        for it in node.items:
+            if it.alias == colname:
+                return _resolve(node.input, it.expr.name)
+        return None  # column not produced by this projection (unexpected)
     return (node, colname)
 
 
 def _collect_edges(node: LogicalPlan, index: dict[int, int]) -> list[tuple[ColRef, ColRef]] | None:
     """Equi-join edges between logical columns, gathered over the whole subtree."""
+    if _is_transparent(node):
+        return _collect_edges(node.input, index)
     if not (isinstance(node, Join) and node.join_type == "inner"):
         return []
     left = _collect_edges(node.left, index)
@@ -136,6 +188,12 @@ def _collect_edges(node: LogicalPlan, index: dict[int, int]) -> list[tuple[ColRe
         ra = _resolve(node.right, rk)
         if la is None or ra is None:
             return None
+        # A cartesian pseudo-key (the `__cross_key` a comma/cross join lowers to) is the
+        # same constant on both sides — it connects nothing. Skipping it keeps the join
+        # graph honest, so reordering reflects real connectivity and never builds a cross
+        # product across two relations that only the pseudo-key "joined".
+        if is_cartesian_key_pair(la[0], la[1], ra[0], ra[1]):
+            continue
         edges.append(((index[id(la[0])], la[1]), (index[id(ra[0])], ra[1])))
     return edges
 
@@ -252,7 +310,13 @@ def _rebuild_dp(
                 if built is None:
                     continue  # the two sides share no edge under this split
                 jplan, jschema = built
-                total = left[2] + right[2] + cost.cost(jplan).total()
+                # Add only *this join's* operator cost to the two halves' already-
+                # accumulated costs (`cost.cost(jplan)` would re-walk and double-count the
+                # children that `left[2]`/`right[2]` already paid for — which penalizes
+                # deep subtrees super-linearly and can flip the optimum to a plan with a
+                # huge many-to-many intermediate). This is the standard additive DP
+                # recurrence: cost(S) = cost(S1) + cost(S2) + op_cost(join).
+                total = left[2] + right[2] + cost.op_cost(jplan).total()
                 if chosen is None or total < chosen[2]:
                     chosen = (jplan, jschema, total)
             if chosen is not None:
@@ -352,7 +416,9 @@ def _rebuild_dphyp(
                     built = _join_plans(left[0], left[1], right[0], right[1], edges)
                     if built is not None:
                         jplan, jschema = built
-                        total = left[2] + right[2] + cost.cost(jplan).total()
+                        # Just this join's op cost; the halves already carry their own
+                        # (see `_rebuild_dp` — `cost.cost` would double-count children).
+                        total = left[2] + right[2] + cost.op_cost(jplan).total()
                         if chosen is None or total < chosen[2]:
                             chosen = (jplan, jschema, total)
             if sub == 0:

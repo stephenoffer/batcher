@@ -17,6 +17,7 @@ bc-ir.workspace = true
 bc-interp.workspace = true
 bc-sketches.workspace = true
 bc-transport.workspace = true
+bc-io.workspace = true
 bc-resource.workspace = true
 arrow.workspace = true
 arrow-pyarrow.workspace = true

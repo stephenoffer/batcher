@@ -22,7 +22,7 @@ from typing import Any
 from batcher.config import CardinalityConfig, active_config
 from batcher.kyber.stats import columns as col_prop
 from batcher.kyber.stats.selectivity import predicate_selectivity
-from batcher.plan.expr_ir import Col
+from batcher.plan.expr_ir import Col, Lit
 from batcher.plan.logical import (
     Aggregate,
     AsofJoin,
@@ -86,6 +86,9 @@ class StatsEstimator:
         # a freed node's reused `id()` can never produce a stale hit.
         self._row_cache: dict[int, tuple[LogicalPlan, RelStats]] = {}
         self._sig_cache: dict[int, tuple[LogicalPlan, str]] = {}
+        # Merged column→ndv map (source-stats NDV seeded under learned NDV), built once
+        # on first access since `_ndv` is read on every selectivity / join estimate.
+        self._ndv_cache: dict[str, float] | None = None
 
     def estimate(self, node: LogicalPlan) -> RelStats:
         """Cardinality + column stats for `node`, memoized by node identity for the
@@ -121,9 +124,8 @@ class StatsEstimator:
             return self._estimate_filter(node)
         if isinstance(node, Project):
             child = self.estimate(node.input)
-            return RelStats(
-                child.rows, child.provenance, col_prop.project_columns(node.items, child)
-            )
+            columns = col_prop.project_columns(node.items, child, node.input.available_schema())
+            return RelStats(child.rows, child.provenance, columns)
         if isinstance(node, MapBatches):
             # Row-preserving (map_batches may change rows, but assume 1:1); the
             # opaque UDF means output columns are unknown.
@@ -138,18 +140,23 @@ class StatsEstimator:
             rows = child.rows * max(1, len(node.on))
             return RelStats(rows, child.provenance)
         if isinstance(node, Sample):
-            child = self.estimate(node.input).rows
+            child = self.estimate(node.input)
             # Fixed-count sample yields exactly min(n, input); fraction scales the input.
-            rows = min(child, float(node.n)) if node.n is not None else child * node.fraction
-            return RelStats(rows, Provenance.DEFAULT)
+            rows = (
+                min(child.rows, float(node.n)) if node.n is not None else child.rows * node.fraction
+            )
+            return RelStats(rows, Provenance.DEFAULT, col_prop.sample_columns(child))
         if isinstance(node, Aggregate):
             return self._estimate_aggregate(node)
         if isinstance(node, Sort):
             return self._estimate_sort(node)
         if isinstance(node, Window):
-            # Row-preserving: Window appends columns, never changes the row count.
+            # Row-preserving: Window appends columns, never changes the row count, so
+            # the input columns' stats (EXACT included) carry through untouched.
             child = self.estimate(node.input)
-            return RelStats(child.rows, child.provenance, dict(child.columns), child.sorted_by)
+            return RelStats(
+                child.rows, child.provenance, col_prop.window_columns(child), child.sorted_by
+            )
         if isinstance(node, Limit):
             return self._estimate_limit(node)
         if isinstance(node, Distinct):
@@ -185,6 +192,15 @@ class StatsEstimator:
 
     def _estimate_filter(self, node: Filter) -> RelStats:
         child = self.estimate(node.input)
+        # A constant-boolean predicate is provable without touching a row: `filter(TRUE)`
+        # keeps the child exactly (rows + all column stats, EXACT preserved), and
+        # `filter(FALSE)` is provably empty — an EXACT zero, the canonical empty marker,
+        # letting `count()`/`is_empty()` answer a contradiction-filtered subtree from
+        # metadata even over an otherwise-unknown source.
+        if isinstance(node.predicate, Lit) and isinstance(node.predicate.value, bool):
+            if node.predicate.value:
+                return child
+            return RelStats(0.0, Provenance.EXACT)
         sel = self._selectivity(node)
         # `prov` is LEARNED (measured selectivity) or DEFAULT (Selinger) — never
         # EXACT — so a filtered row count is never EXACT, however exact the child.
@@ -235,10 +251,13 @@ class StatsEstimator:
         if not node.group_keys:
             columns = col_prop.global_aggregate_columns(node, child)
             return RelStats(1.0, Provenance.EXACT, columns)  # global aggregate → one row
+        # A bare-`Col` group key carries its column's EXACT min/max forward as bounds
+        # (grouping selects the distinct values, so the extremes are unchanged).
+        key_cols = col_prop.grouped_aggregate_columns(node, child)
         if not self._exact_first:
             learned_rows = self._learned.get(self._sig(node), {}).get("rows")
             if learned_rows is not None:
-                return RelStats(float(learned_rows), Provenance.LEARNED)
+                return RelStats(float(learned_rows), Provenance.LEARNED, key_cols)
         ndv = self._ndv
         groups = 1.0
         for key in node.group_keys:
@@ -253,9 +272,9 @@ class StatsEstimator:
                 # Keep it a placeholder so it stays unbudgeted (a guess never fails a
                 # real query — the documented admission contract).
                 if child.rows >= self._cfg.unknown_rows:
-                    return RelStats(child.rows, Provenance.DEFAULT)
-                return RelStats(max(1.0, child.rows * 0.1), Provenance.DEFAULT)
-        return RelStats(max(1.0, min(groups, child.rows)), Provenance.LEARNED)
+                    return RelStats(child.rows, Provenance.DEFAULT, key_cols)
+                return RelStats(max(1.0, child.rows * 0.1), Provenance.DEFAULT, key_cols)
+        return RelStats(max(1.0, min(groups, child.rows)), Provenance.LEARNED, key_cols)
 
     def _estimate_distinct(self, node: Distinct) -> RelStats:
         """Dedup count ≈ distinct value combinations — the product of the columns'
@@ -285,19 +304,46 @@ class StatsEstimator:
         # `count()`/`is_empty()` answer 0 from metadata without executing the join.
         if _join_provably_empty(node.join_type, left, right):
             return RelStats(0.0, Provenance.EXACT)
+        # A preserved column's values carry through as downgraded *bounds* (a join
+        # removes/duplicates rows but invents no value); never EXACT.
+        columns = col_prop.join_columns(node, left, right)
         if not self._exact_first:
             learned_rows = self._learned.get(self._sig(node), {}).get("rows")
             if learned_rows is not None:
-                return RelStats(float(learned_rows), Provenance.LEARNED)
+                return RelStats(float(learned_rows), Provenance.LEARNED, columns)
         if node.join_type in {"semi", "anti"}:
-            return RelStats(left.rows, Provenance.DEFAULT)
+            return RelStats(left.rows, Provenance.DEFAULT, columns)
+        # PK–FK detection first: if one side's join key is (nearly) unique — its
+        # distinct count reaches its row count — then every row of the *other* side
+        # matches at most one row here, so under containment the result is ≈ the other
+        # side's rows. This is the dominant join shape (a fact table joined to a
+        # dimension on the dimension's primary key) and the Selinger ratio below gets
+        # it badly wrong for a *composite* PK: the fact side's key-combination ndv is
+        # over-estimated (its columns are correlated), which deflates `|L||R|/max(ndv)`
+        # — TPC-H Q9's `lineitem ⋈ partsupp ON (partkey, suppkey)` was estimated 8× low,
+        # steering the join order into a needless multi-million-row intermediate.
+        left_ndv = self._side_ndv(node.left_keys, left.rows)
+        right_ndv = self._side_ndv(node.right_keys, right.rows)
+        # Many-to-one (PK–FK) detection for *composite* keys. A composite key's
+        # combination ndv is the damped product capped at the side's rows; when it
+        # saturates (≈ rows) that side's key is plausibly unique, so the join is
+        # many-to-one and the FK side is preserved — the result is ≈ the larger input.
+        # The Selinger ratio below would instead *under*-estimate this badly (the fact
+        # side's correlated key columns inflate its combination ndv, deflating the
+        # divisor's effect), which steered TPC-H Q9 into a needless 6M-row intermediate.
+        # Single keys keep the ratio (their ndv is measured directly, so it is accurate);
+        # a non-saturated composite is a genuine many-to-many join the ratio models well.
+        if len(node.left_keys) >= 2 and _composite_pk_fk(
+            left.rows, right.rows, left_ndv, right_ndv
+        ):
+            return RelStats(max(left.rows, right.rows), Provenance.DEFAULT, columns)
         # Classic equi-join estimate: |L⋈R| ≈ |L|·|R| / max(ndv_lk, ndv_rk) when a
         # single key's distinct count is known. Without it, assume the key is
         # ~unique on the smaller side, so the result ≈ the larger side.
-        ndv = self._join_key_ndv(node, left.rows, right.rows)
-        if ndv is not None and ndv > 0:
-            return RelStats(left.rows * right.rows / ndv, Provenance.DEFAULT)
-        return RelStats(max(left.rows, right.rows), Provenance.DEFAULT)
+        ndvs = [v for v in (left_ndv, right_ndv) if v is not None and v > 0]
+        if ndvs:
+            return RelStats(left.rows * right.rows / max(ndvs), Provenance.DEFAULT, columns)
+        return RelStats(max(left.rows, right.rows), Provenance.DEFAULT, columns)
 
     # --- shared metadata accessors ----------------------------------------
     def _stats_for(self, source_id: int) -> SourceStatistics | None:
@@ -320,9 +366,27 @@ class StatsEstimator:
 
     @property
     def _ndv(self) -> dict[str, float]:
-        """Learned per-column distinct counts (column name → ndv), used to sharpen
-        equality selectivity to `1/ndv`. Empty until the metadata loop fills it."""
-        return self._learned.get("__column_ndv__", {})
+        """Per-column distinct counts (column name → ndv), used to sharpen equality
+        selectivity to `1/ndv` and to estimate join cardinality as `|L||R|/max(ndv)`.
+
+        Seeded from **source statistics** (footer / written-file HLL sketches carried by
+        `SourceStatistics.columns`) and overlaid with **learned** ndv from measured runs
+        (which wins, being workload-true). Source NDV is what gives a *cold* join — before
+        any run has been measured — an NDV-based cardinality instead of the
+        `max(left, right)` fallback that mis-estimates a low-NDV many-to-many join by
+        orders of magnitude and steers join order into huge intermediates.
+        """
+        if self._ndv_cache is None:
+            merged: dict[str, float] = {}
+            for st in self._source_stats or ():
+                if st is None:
+                    continue
+                for name, col in st.columns.items():
+                    if col.ndv is not None and col.ndv > 0:
+                        merged[name] = float(col.ndv)
+            merged.update(self._learned.get("__column_ndv__", {}))  # measured wins
+            self._ndv_cache = merged
+        return self._ndv_cache
 
     @property
     def _quantiles(self) -> dict[str, Any]:
@@ -363,53 +427,59 @@ class StatsEstimator:
         avg_known = sum(measured) / len(measured)
         return sum(widths.get(c, avg_known) for c in cols)
 
-    def _join_key_ndv(self, node: Join, left_rows: float, right_rows: float) -> float | None:
-        """`max(ndv)` over the join's two key *sets*, if either is fully known.
+    def _side_ndv(self, keys: tuple[str, ...], rows: float) -> float | None:
+        """Distinct count of one join side's key *set*, capped at its row count.
 
-        For a composite key, a side's distinct-combination count combines the
-        per-key ndvs with **exponential backoff** (largest at full weight, each
-        subsequent one dampened) rather than a raw product. The result lies between
-        `max_k ndv[k]` (the perfectly-correlated / functional-dependence floor — a
-        composite key is at least as distinct as its most-distinct column) and the
-        full product (the independence ceiling), and is capped at the side's rows —
-        a learned ndv reflects the *unfiltered* source, but a filtered input can't
-        carry more distinct keys than it has rows. The classic `|L|·|R| / max(ndv)`
-        estimate then uses whichever side is fully measured (max of the two when
-        both are). Returns `None` when neither side's full key set has learned
-        distinct counts, so the caller keeps its `max(rows)` fallback.
+        For a composite key, the per-key ndvs combine with **exponential backoff**
+        (largest at full weight, each subsequent one dampened) rather than a raw
+        product: real composite keys are usually correlated, so the independence
+        product overshoots. The result lies between `max_k ndv[k]` (the
+        perfectly-correlated / functional-dependence floor) and the full product (the
+        independence ceiling), capped at the side's rows — a learned ndv reflects the
+        *unfiltered* source, but a filtered input can't carry more distinct keys than
+        it has rows. Returns `None` when any key lacks a learned distinct count.
         """
-        if not node.left_keys or len(node.left_keys) != len(node.right_keys):
+        if not keys:
             return None
         ndv = self._ndv
-
-        def side_ndv(keys: list[str], rows: float) -> float | None:
-            if not all(k in ndv and ndv[k] > 0 for k in keys):
-                return None
-            # Damped combination: real composite keys are usually correlated, so the
-            # independence product overshoots. Sort distinct counts descending and
-            # apply diminishing exponents — interpolating between max (correlated)
-            # and product (independent).
-            per_key = sorted((ndv[k] for k in keys), reverse=True)
-            combined = 1.0
-            exponent = 1.0
-            for d in per_key:
-                combined *= d**exponent
-                exponent /= 2.0
-            return min(combined, rows)
-
-        candidates = [
-            c
-            for c in (
-                side_ndv(node.left_keys, left_rows),
-                side_ndv(node.right_keys, right_rows),
-            )
-            if c is not None
-        ]
-        return max(candidates) if candidates else None
+        if not all(k in ndv and ndv[k] > 0 for k in keys):
+            return None
+        per_key = sorted((ndv[k] for k in keys), reverse=True)
+        combined = 1.0
+        exponent = 1.0
+        for d in per_key:
+            combined *= d**exponent
+            exponent /= 2.0
+        return min(combined, rows)
 
     def input_sizes(self, node: Join) -> tuple[RelStats, RelStats]:
         """The estimated sizes of a join's two inputs (for build-side choice)."""
         return self.estimate(node.left), self.estimate(node.right)
+
+
+# A composite join key is treated as unique (a candidate key) when its distinct-count
+# estimate reaches this fraction of its rows — allowing for the ndv sketch's ~1% error
+# and a lightly-filtered dimension.
+_UNIQUE_KEY_NDV_RATIO = 0.95
+
+
+def _composite_pk_fk(
+    left_rows: float,
+    right_rows: float,
+    left_ndv: float | None,
+    right_ndv: float | None,
+) -> bool:
+    """Whether a composite-key join is many-to-one (one side's key plausibly unique).
+
+    True when either side's (capped) combination ndv saturates its row count — that
+    side's composite key is then ~unique, so each row of the other side matches at most
+    one, and the result is the FK side's rows (the caller uses `max(left, right)`).
+    """
+
+    def saturated(ndv: float | None, rows: float) -> bool:
+        return ndv is not None and rows > 0 and ndv >= _UNIQUE_KEY_NDV_RATIO * rows
+
+    return saturated(left_ndv, left_rows) or saturated(right_ndv, right_rows)
 
 
 def _join_provably_empty(join_type: str, left: RelStats, right: RelStats) -> bool:

@@ -82,7 +82,14 @@ impl KllSketch {
             self.max = x;
         }
         self.compactors[0].push(x);
-        self.compress();
+        // Only the bottom compactor grew, so a compaction cascade can be needed only
+        // when *it* overflows — checking that one length is far cheaper than walking
+        // every level on every value (the hot path over millions of rows). `compress`
+        // still re-checks all levels, so a level-0 compaction that overflows level 1
+        // is handled in the same call.
+        if self.compactors[0].len() >= self.capacity(0) {
+            self.compress();
+        }
     }
 
     /// Add every non-null numeric value of an Arrow array (ints, floats, dates,

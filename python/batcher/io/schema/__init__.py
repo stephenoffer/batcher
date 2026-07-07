@@ -5,8 +5,15 @@ from __future__ import annotations
 from batcher.io.schema.evolution import (
     SchemaDrift,
     normalize_batch,
+    reconcile_batches,
     schema_drift,
     unify_schemas,
 )
 
-__all__ = ["SchemaDrift", "normalize_batch", "schema_drift", "unify_schemas"]
+__all__ = [
+    "SchemaDrift",
+    "normalize_batch",
+    "reconcile_batches",
+    "schema_drift",
+    "unify_schemas",
+]

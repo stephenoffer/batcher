@@ -19,6 +19,7 @@ from batcher.plan.resource import FeasibilityVerdict, ResourceBounds, Scheduling
 
 if TYPE_CHECKING:
     from batcher.carbonite.base import ResourceContext
+    from batcher.metadata import MetadataHub
     from batcher.plan.physical import PhysicalPlan
 
 __all__ = [
@@ -27,7 +28,13 @@ __all__ = [
     "DefaultSchedulingPolicy",
     "StaticCreditFlowControl",
     "credit_ceiling",
+    "load_shuffle_window",
+    "record_shuffle_window",
 ]
+
+# Learned-parameter namespace for the converged AIMD credit window, keyed by a shuffle
+# channel's stable signature. One smoothed integer window per signature.
+_SHUFFLE_WINDOW_NS = "carbonite.shuffle_window"
 
 
 class BudgetingAdmission:
@@ -79,7 +86,16 @@ class BudgetingAdmission:
         # orders of magnitude larger than a morsel. A genuine breaker that materializes
         # more than this floor still exceeds it and routes to the spill path.
         envelope = max(envelope, ctx.config.execution.morsel_bytes)
-        peak = max((op.bounds.m_max_bytes for op in plan.ops), default=0)
+        # Blend each operator's plan estimate toward its measured peak (learned from
+        # `m_peak_bytes`) before taking the dominant breaker, so admission budgets
+        # against what the family really used — admitting a query the plan over-sized
+        # (avoiding a needless spill route) and catching one the plan under-sized
+        # (avoiding an OOM). Cold families pass through unchanged.
+        model = ctx.memory_model
+        if model is not None:
+            peak = model.plan_peak(plan.ops)
+        else:
+            peak = max((op.bounds.m_max_bytes for op in plan.ops), default=0)
         if peak <= envelope:
             return FeasibilityVerdict(feasible=True)
         # Over budget: offer the envelope as the per-operator bound so the engine can
@@ -144,14 +160,19 @@ class AIMDFlowControl:
     argument because the controller, not the caller, owns the evolving window.
     """
 
-    def __init__(self, config: Config | None = None) -> None:
+    def __init__(self, config: Config | None = None, *, initial_window: int | None = None) -> None:
         cfg = config or active_config()
         fc = cfg.flow_control
         self._alpha = max(1, fc.aimd_alpha)
         self._beta = fc.aimd_beta
         self._floor = 1
         self._ceiling = credit_ceiling(cfg)  # count + byte bound (C53)
-        self._window: float = float(min(max(fc.default_credits, self._floor), self._ceiling))
+        # A recurring shuffle warm-starts at the window its past runs converged to
+        # (`initial_window`, learned per shuffle signature) instead of re-climbing from
+        # `default_credits` every time — the AIMD control law still governs from there,
+        # so the window a channel actually uses is unchanged, only its starting point.
+        start = fc.default_credits if initial_window is None else initial_window
+        self._window: float = float(min(max(start, self._floor), self._ceiling))
 
     @property
     def window(self) -> int:
@@ -176,6 +197,42 @@ class AIMDFlowControl:
 
     def _clamp(self, w: float) -> int:
         return int(max(self._floor, min(self._ceiling, w)))
+
+
+def load_shuffle_window(hub: MetadataHub | None, signature: str) -> int | None:
+    """The learned converged credit window for a shuffle `signature`, or `None` if unseen.
+
+    Best-effort: any read failure (or a cold store) yields `None`, so the channel starts
+    at the configured default. Only the *starting* window is affected — flow control still
+    governs the window it actually uses — so this is purely a warm-start, never a result
+    or a correctness change.
+    """
+    if hub is None:
+        return None
+    try:
+        value = hub.get_keyed_param(_SHUFFLE_WINDOW_NS, signature)
+    except Exception:  # pragma: no cover - metadata must never break a query
+        return None
+    return int(value) if value is not None else None
+
+
+def record_shuffle_window(
+    hub: MetadataHub | None, signature: str, window: int, config: Config | None = None
+) -> None:
+    """Persist a shuffle channel's converged credit `window`, exp-smoothed across runs.
+
+    Best-effort and non-raising (mirrors `ml.gpu.record_gpu_utilization`): a recurring
+    shuffle's window is smoothed toward each run's converged value so the next run
+    warm-starts near it. Records nothing for a non-positive window."""
+    if hub is None or window <= 0:
+        return
+    try:
+        alpha = (config or active_config()).optimizer.learning_smoothing_alpha
+        prior = hub.get_keyed_param(_SHUFFLE_WINDOW_NS, signature)
+        smoothed = window if prior is None else alpha * window + (1.0 - alpha) * float(prior)
+        hub.put_keyed_param(_SHUFFLE_WINDOW_NS, signature, round(smoothed))
+    except Exception:  # pragma: no cover - metadata must never break a query
+        pass
 
 
 class DefaultSchedulingPolicy:
@@ -223,11 +280,30 @@ class DefaultSchedulingPolicy:
 
         # Per-task memory: the dominant breaker split across tasks, never below one
         # morsel and never above a fair share of the live budget. 0 (no hint) when
-        # Kyber could not size the plan.
-        peak = peak_operator_bytes(plan)
+        # Kyber could not size the plan. Blended toward the measured peak (learned from
+        # `m_peak_bytes`) when available, so each distributed worker gets a right-sized
+        # grant instead of one sized from the plan guess; cold families pass through.
+        model = ctx.memory_model
+        peak = model.plan_peak(plan.ops) if model is not None else peak_operator_bytes(plan)
         morsel_bytes = max(1, cfg.execution.morsel_rows * cfg.optimizer.row_bytes)
         if peak <= 0:
-            memory_bytes = 0
+            # Kyber could not size the plan — a cold start, an unbounded source, or a
+            # shape its estimator abstained on. Granting 0 here leaves each worker's
+            # spill budget unbounded (the engine makes no memory pool for a 0 budget),
+            # so a large unknown-size distributed query OOMs instead of spilling — the
+            # one case a regular user would have to rescue by hand (`num_workers` /
+            # `max_memory_bytes`). Carbonite protects even when Kyber can't measure:
+            # fall back to a conservative fair share of the budget so the worker SPILLS
+            # and the query "just works" (survives). It sharpens to the real footprint
+            # once a run measures it; a query that fits under the share never spills, so
+            # the only cost is mild over-spill on an un-estimable large query — far
+            # better than an OOM. A no-op when the budget is unknown (`available_bytes`
+            # <= 0, e.g. test stubs), preserving the old "no hint" behavior there.
+            memory_bytes = (
+                max(morsel_bytes, int(available_bytes * cfg.memory.soft_limit) // n_tasks)
+                if available_bytes > 0
+                else 0
+            )
         else:
             per_task = max(morsel_bytes, peak // n_tasks)
             fair_share = (
@@ -244,10 +320,26 @@ class DefaultSchedulingPolicy:
             default=cfg.execution.cpus_per_task,
         )
 
+        # Placement-strategy preference (resolved against the live cluster in `dist`).
+        # A small-shuffle breaker prefers PACK — co-locate the workers, no cross-node
+        # shuffle — but only when the gang plausibly fits one node: a fan-out wider than
+        # a node's cores cannot PACK, so it stays SPREAD. Carbonite has no live topology;
+        # `cpu_budget` (≈ one machine's cores) is the feasibility proxy, and `dist` makes
+        # the final call (it can downgrade SPREAD→PACK on a single-node cluster).
+        prefers_local = any(op.bounds.prefers_locality for op in plan.ops)
+        placement_strategy = "PACK" if prefers_local and n_tasks <= cpu_budget else "SPREAD"
+
+        # This is the *relational* (CPU shuffle) grant — `num_gpus` is 0 here, the GPU
+        # map/inference path sets its own. Record the intent to keep this fleet off GPU
+        # nodes; `dist` enforces it only when the live cluster has CPU-only capacity to
+        # host the fleet (a no-op on a homogeneous cluster), so a CPU shuffle never
+        # steals an inference stage's GPU-node cores on a mixed cluster.
         return SchedulingEnvelope(
             num_cpus=num_cpus,
             memory_bytes=int(memory_bytes),
             num_gpus=0.0,
             n_tasks=n_tasks,
             credits=cfg.flow_control.default_credits,
+            placement_strategy=placement_strategy,
+            prefer_cpu_only_nodes=True,
         )

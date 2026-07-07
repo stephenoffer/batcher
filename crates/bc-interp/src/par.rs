@@ -293,12 +293,21 @@ pub fn execute_parallel_with_metrics(
     // The plan walk that records metrics is itself single-threaded — only the
     // per-operator work fans out across rayon and is fully joined before each
     // `OpMetric` is recorded — so a plain `&mut ExecMetrics` is race-free.
-    let out = if opts.parallelism > 0 {
-        let pool = pool_for(opts.parallelism)?;
-        pool.install(|| exec(plan, sources, opts, &mut m, &mut ids))
+    // Always run inside a width-sized scoped pool — never rayon's *global* pool. On a Ray
+    // worker the global pool is built (lazily, at first use) before Ray pins the actor's
+    // CPU affinity, so it is fixed at ONE thread and every `par_iter` on it runs
+    // single-threaded — the silent throttle that made a distributed map ~Ncores× too slow.
+    // `parallelism == 0` ("all cores") therefore resolves to `available_parallelism`, which
+    // reads the now-applied affinity; a positive value pins the requested width. On a
+    // single node this is the same width as the global pool, so the result is unchanged.
+    let width = if opts.parallelism > 0 {
+        opts.parallelism
     } else {
-        exec(plan, sources, opts, &mut m, &mut ids)
-    }?;
+        std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1)
+    };
+    let out = pool_for(width)?.install(|| exec(plan, sources, opts, &mut m, &mut ids))?;
     Ok((out, m))
 }
 
@@ -313,7 +322,7 @@ pub fn execute_parallel_with_metrics(
 /// letting concurrent queries each spawn `parallelism` threads. Width is the cache
 /// key because `current_num_threads()` drives the hash-shuffle bucket count, so a
 /// query must run on a pool of exactly the width it asked for.
-fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpError> {
+pub(crate) fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpError> {
     static POOLS: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock::new();
     let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = pools
@@ -622,7 +631,12 @@ fn exec(
                                 p,
                                 sp.codec,
                             )?;
-                            let res = combine_finalize_spilling(partials, &funcs, &mut store)?;
+                            let res = combine_finalize_spilling(
+                                partials,
+                                &funcs,
+                                &mut store,
+                                sp.memory_budget_bytes,
+                            )?;
                             (res.group_columns, res.agg_columns)
                         }
                     }
@@ -689,7 +703,13 @@ fn exec(
                         }
                         Admit::InMemory(_reservation) => {
                             let combined = ops::materialize(&parts)?;
-                            vec![ops::sort_batch(&combined, keys, None)?]
+                            // Parallel sample-sort for a large single float-key full sort
+                            // (range-partition + per-range parallel sort); falls back to
+                            // the serial sort where it doesn't apply.
+                            match ops::parallel_sort_batch(&combined, keys, None)? {
+                                Some(sorted) => vec![sorted],
+                                None => vec![ops::sort_batch(&combined, keys, None)?],
+                            }
                         }
                     }
                 }
@@ -759,6 +779,12 @@ fn exec(
                     (out, false)
                 }
             };
+            // The window kernel emits its whole result as one (up to full-input-sized)
+            // batch. Left as-is, every downstream operator processes that lone batch on a
+            // single core (a col-ref Project over a 6M-row window output measured ~50 ms
+            // single-threaded). Re-morselize so the pipeline below the breaker fans back
+            // out across cores; the split is zero-copy Arrow slices. Same rows, same order.
+            let out = ops::remorselize(out, opts.morsel_target());
             push_metric(m, op_id, "window", rows_in, &out, t0, spill, "interp");
             Ok(out)
         }
@@ -911,6 +937,11 @@ fn exec(
             // Probe the large left side without shuffling it (no key partitioning).
             if *strategy == bc_ir::JoinStrategy::Broadcast {
                 let out = broadcast_join(&left, &right, left_keys, right_keys, *join_type, output)?;
+                // The broadcast probe emits only ~`probe_rows/build_rows` chunks (as few as
+                // a handful when the build side is large), which would run every downstream
+                // operator on those few big batches single-threaded. Re-morselize (zero-copy
+                // slices) so the pipeline below fans back out across cores.
+                let out = ops::remorselize(out, opts.morsel_target());
                 push_metric(m, op_id, "hash_join", rows_in, &out, t0, false, "interp");
                 return Ok(out);
             }
@@ -978,6 +1009,9 @@ fn exec(
                 .into_iter()
                 .flatten()
                 .collect();
+            // Even out the per-bucket output batches (a hot key makes one bucket far larger
+            // than the rest) so the downstream operators see balanced, core-sized morsels.
+            let out = ops::remorselize(out, opts.morsel_target());
             let backend = match (skewed_any, *strategy == bc_ir::JoinStrategy::SortMerge) {
                 (true, _) => "interp-skew",
                 (false, true) => "interp-smj",
@@ -1293,6 +1327,36 @@ fn distinct(
         return Err(InterpError::EmptyAggregateInput);
     }
     let schema = parts[0].schema();
+
+    // Single-pass fast path for a HIGH-cardinality, null-free, in-memory DISTINCT: hash
+    // each row once (partition by all columns, dedup per bucket) instead of the per-morsel
+    // `partial` + `combine` double-hash. Gated so it never regresses the other cases:
+    //   * high cardinality only — probed on the first morsel's distinct ratio; a
+    //     low-cardinality DISTINCT keeps `partial` (which collapses each morsel to a few
+    //     rows so `combine` is then trivial), avoiding a needless full-input shuffle.
+    //   * null-free key columns — the fast integer/byte partitioner hashes a null slot's
+    //     arbitrary raw value, which could split two equal null-bearing rows across buckets;
+    //     a nullable DISTINCT keeps the row-encoded `partial`/`combine` (nulls compare equal).
+    //   * in-memory — a spilling DISTINCT still streams through the grace `combine`.
+    let ncols = schema.fields().len();
+    let no_nulls = ncols > 0
+        && parts
+            .iter()
+            .all(|b| (0..ncols).all(|c| b.column(c).null_count() == 0));
+    let probe = ops::distinct_partial(&parts[0])?;
+    let sample_rows = parts[0].num_rows();
+    let sample_distinct = probe.group_columns.first().map_or(0, |a| a.len());
+    let high_card = sample_rows > 0 && (sample_distinct as f64) >= 0.5 * sample_rows as f64;
+    if no_nulls && high_card {
+        let bytes = batch_bytes(parts) as usize;
+        if matches!(admit(opts, op_id, bytes), Admit::InMemory(_)) {
+            let batch = ops::materialize(parts)?;
+            let p = rayon::current_num_threads().max(1);
+            let out = agg::distinct_batch(&batch, p)?;
+            return Ok((out, false));
+        }
+    }
+
     let partials: Vec<agg::Partial> = parts
         .par_iter()
         .map(ops::distinct_partial)
@@ -1307,7 +1371,7 @@ fn distinct(
             let dir = sp.dir.join(format!("distinct-{p}p"));
             let mut store = DiskSpillStore::with_codec(dir, p, sp.codec)?;
             // No aggregates: `&[]` makes this a pure dedup over the group columns.
-            let res = combine_finalize_spilling(partials, &[], &mut store)?;
+            let res = combine_finalize_spilling(partials, &[], &mut store, sp.memory_budget_bytes)?;
             (res.group_columns, true)
         }
         Admit::InMemory(_reservation) => (

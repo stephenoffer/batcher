@@ -35,6 +35,22 @@ class MetadataHub:
     def __init__(self, backend: MetadataBackend) -> None:
         self._backend = backend
         self._seq = 0
+        # Parsed-read cache. The optimizer re-reads the whole learned-stats and
+        # op-stats history on *every* query (twice — main optimize + the
+        # metadata-answer rewrite), re-running `json.loads` over every stored entry
+        # each time (35+ parses/query on a warm store). Those reads only change when
+        # this hub absorbs a write, so memoize the parsed result and invalidate it on
+        # any write. `_generation` bumps on every write (not just `record`, which is
+        # what `_seq`/`version` track); a cached read is valid while the generation is
+        # unchanged. This is the single biggest fixed per-query overhead on small
+        # queries — the control plane must not re-parse cold state it already holds.
+        self._generation = 0
+        self._keyed_cache: dict[str, tuple[int, dict[str, Any]]] = {}
+        self._op_stats_cache: tuple[int, dict[str, list[dict[str, Any]]]] | None = None
+
+    def _bump(self) -> None:
+        """Invalidate the parsed-read cache after a write."""
+        self._generation += 1
 
     # --- FeedbackSink ------------------------------------------------------
     def record(self, feedback: OperatorFeedback) -> None:
@@ -44,6 +60,7 @@ class MetadataHub:
             key = (int(feedback.op_id), self._seq)
             payload = json.dumps(dataclasses.asdict(feedback)).encode()
             self._backend.put(_OP_STATS, key, payload)
+            self._bump()
         except Exception:  # pragma: no cover - feedback must not break execution
             _log.warning("dropped operator feedback", exc_info=True)
 
@@ -69,6 +86,8 @@ class MetadataHub:
         The shape Kyber's cost calibration consumes: per-row/per-byte coefficients
         are fit per operator family (`scan`, `filter`, `hash_join`, ...), not per
         operator id. Best-effort; a malformed row is skipped, not raised."""
+        if self._op_stats_cache is not None and self._op_stats_cache[0] == self._generation:
+            return self._op_stats_cache[1]
         buckets: dict[str, list[dict[str, Any]]] = {}
         try:
             for _key, value in self._backend.scan(_OP_STATS, ()):
@@ -76,6 +95,7 @@ class MetadataHub:
                 buckets.setdefault(row.get("kind", ""), []).append(row)
         except Exception:  # pragma: no cover - calibration must not break planning
             _log.warning("could not scan op_stats", exc_info=True)
+        self._op_stats_cache = (self._generation, buckets)
         return buckets
 
     # --- learned parameters ------------------------------------------------
@@ -85,6 +105,7 @@ class MetadataHub:
 
     def save_params(self, namespace: str, params: dict[str, Any]) -> None:
         self._backend.put(_LEARNED_PARAMS, (namespace,), json.dumps(params).encode())
+        self._bump()
 
     # --- per-key learned parameters ----------------------------------------
     # Learned stats are stored one backend key per entry — `(namespace, entry_key)`
@@ -95,6 +116,9 @@ class MetadataHub:
     # legacy single-blob value (length-1 key) underneath the per-key entries so an
     # older store migrates without losing what it learned.
     def load_keyed_params(self, namespace: str) -> dict[str, Any]:
+        cached = self._keyed_cache.get(namespace)
+        if cached is not None and cached[0] == self._generation:
+            return cached[1]
         out: dict[str, Any] = {}
         legacy: dict[str, Any] = {}
         for key, value in self._backend.scan(_LEARNED_PARAMS, (namespace,)):
@@ -104,6 +128,7 @@ class MetadataHub:
                 legacy = json.loads(value)
         for k, v in legacy.items():
             out.setdefault(k, v)  # per-key entries win over the legacy blob
+        self._keyed_cache[namespace] = (self._generation, out)
         return out
 
     def get_keyed_param(self, namespace: str, key: str) -> Any | None:
@@ -115,3 +140,4 @@ class MetadataHub:
 
     def put_keyed_param(self, namespace: str, key: str, value: Any) -> None:
         self._backend.put(_LEARNED_PARAMS, (namespace, key), json.dumps(value).encode())
+        self._bump()

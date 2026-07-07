@@ -29,6 +29,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher._internal.prefetch import prefetch
 from batcher.ml.streaming_sampler import elastic_shard, epoch_order
 
 if TYPE_CHECKING:
@@ -65,6 +66,16 @@ def column_to_tensor(array: pa.Array) -> Any | None:
 
     if hasattr(array, "to_numpy_ndarray"):  # FixedShapeTensor extension array
         nd = array.to_numpy_ndarray()
+    elif pa.types.is_fixed_size_list(array.type) and pa.types.is_primitive(array.type.value_type):
+        # A fixed-width numeric vector column (a feature/embedding vector stored as
+        # FixedSizeList<T, W>) → a (n, W) tensor. `to_numpy` on a fixed-size-list yields an
+        # array of per-row arrays (object dtype); reshape the flat child buffer instead, so a
+        # feature column is a real 2-D tensor rather than being silently dropped.
+        w = array.type.list_size
+        child = array.flatten().to_numpy(zero_copy_only=False)
+        if child.dtype.kind not in "biuf":
+            return None
+        nd = child.reshape(-1, w)
     else:
         try:
             nd = array.to_numpy(zero_copy_only=False)
@@ -257,15 +268,15 @@ def iter_torch_batches(
     arrow_batches = dataset.iter_batches(batch_size)
     if local_shuffle_buffer_size:
         out_rows = batch_size or DEFAULT_BATCH_ROWS
-        arrow_batches = _local_shuffle(arrow_batches, local_shuffle_buffer_size, out_rows, seed)
-    numpy_stream = to_numpy_batches(arrow_batches, columns=columns)
+        numpy_stream = _shuffle_to_numpy(
+            arrow_batches, local_shuffle_buffer_size, out_rows, seed, columns
+        )
+    else:
+        numpy_stream = to_numpy_batches(arrow_batches, columns=columns)
     move = device if device not in (None, "cpu") else None
     to_torch = partial(arrays_to_torch, zero_copy=zero_copy)
     tensors = (_to_torch_out(a, to_torch, collate_fn, move, pin_memory) for a in numpy_stream)
-    if prefetch_batches and prefetch_batches > 0:
-        yield from _prefetch(tensors, prefetch_batches)
-    else:
-        yield from tensors
+    yield from prefetch(tensors, prefetch_batches if prefetch_batches else 0)
 
 
 def streaming_split(
@@ -383,21 +394,35 @@ def _mps_safe_dtype(tensor: Any) -> Any:
     return tensor
 
 
-def _local_shuffle(batches: Any, buffer_rows: int, out_rows: int, seed: int) -> Any:
-    """Shuffle within blocks of ~`buffer_rows`, emitting `out_rows`-sized batches.
+def _shuffle_to_numpy(
+    batches: Any, buffer_rows: int, out_rows: int, seed: int, columns: Any
+) -> Any:
+    """Local-shuffle a batch stream and yield ``{column: ndarray}`` batches directly.
 
-    A streaming approximation of a global shuffle: fill a block, permute it once
-    (vectorized Arrow `take`, no per-row Python), emit it in chunks, repeat.
+    A streaming approximation of a global shuffle: fill a block of ~`buffer_rows`, permute
+    it once, emit it in `out_rows` chunks, repeat. The shuffle happens in **NumPy space** —
+    the block's columns are converted to NumPy once (a feature/embedding vector becomes a
+    contiguous ``(n, width)`` array), then each emitted chunk is a single fancy-index gather.
+    This avoids the Arrow round-trip a `take`-then-reconvert shuffle pays (build a permuted
+    `Table`, re-lay-out nested fixed-size-list offsets, reconvert to NumPy — ~3-4 copies of a
+    wide column per block), which made the shuffled loader lose to Ray Data; here it is one
+    conversion + one gather. The consumer is `arrays_to_torch`, same as `to_numpy_batches`.
     """
     import numpy as np
     import pyarrow as pa
+
+    from batcher.ml.converters import _column_to_numpy
 
     rng = np.random.RandomState(seed)
 
     def _emit(chunks: list) -> Any:
         table = pa.Table.from_batches(chunks)
-        perm = pa.array(rng.permutation(table.num_rows))
-        yield from table.take(perm).to_batches(max_chunksize=out_rows)
+        names = list(table.column_names) if columns is None else list(columns)
+        cols = {name: _column_to_numpy(table.column(name)) for name in names}
+        perm = rng.permutation(table.num_rows)
+        for start in range(0, table.num_rows, out_rows):
+            idx = perm[start : start + out_rows]
+            yield {name: arr[idx] for name, arr in cols.items()}
 
     block: list = []
     rows = 0
@@ -409,33 +434,3 @@ def _local_shuffle(batches: Any, buffer_rows: int, out_rows: int, seed: int) -> 
             block, rows = [], 0
     if block:
         yield from _emit(block)
-
-
-def _prefetch(gen: Any, depth: int) -> Any:
-    """Pull from `gen` on a background thread into a bounded queue (overlap H2D/compute).
-
-    An exception raised by `gen` is re-raised in the consumer (never silently dropped,
-    which would truncate the training stream — a correctness bug)."""
-    import queue
-    import threading
-
-    q: queue.Queue = queue.Queue(maxsize=depth)
-    done = object()
-
-    def _worker() -> None:
-        try:
-            for item in gen:
-                q.put((None, item))
-        except Exception as exc:  # surface it to the consumer instead of truncating
-            q.put((exc, None))
-        finally:
-            q.put((None, done))
-
-    threading.Thread(target=_worker, daemon=True).start()
-    while True:
-        error, item = q.get()
-        if error is not None:
-            raise error
-        if item is done:
-            return
-        yield item

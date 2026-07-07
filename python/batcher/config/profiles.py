@@ -16,10 +16,31 @@ profile is idempotent.
 from __future__ import annotations
 
 import dataclasses
+import os
 
-from batcher.config.config import Config, DistributedConfig
+from batcher.config.config import (
+    AUTOSCALE_WAIT_AUTO,
+    Config,
+    DistributedConfig,
+    MetadataConfig,
+)
 
-__all__ = ["RESILIENCE_PROFILES", "apply_resilience_profile", "detect_spot_environment"]
+__all__ = [
+    "AUTOSCALE_WAIT_AUTO",
+    "AUTOSCALE_WAIT_DEFAULT_S",
+    "RESILIENCE_PROFILES",
+    "apply_resilience_profile",
+    "detect_autoscaling_environment",
+    "detect_managed_cluster",
+    "detect_spot_environment",
+    "resolve_autoscale_wait",
+]
+
+# Default bounded autoscale wait (seconds) turned on for an autoscaling-capable cluster —
+# the spot profile and the out-of-the-box auto-enable share this single value. Longer than
+# a cloud node's boot time so a genuinely-launching node is not abandoned; the
+# `autoscale_stall_s` grace window still bails fast on a fixed cluster that will not grow.
+AUTOSCALE_WAIT_DEFAULT_S = 180.0
 
 # Env vars whose presence marks a preemptible/spot node. The first group is an explicit
 # opt-in (set by the launcher/Dockerfile); the second is a node-lifecycle hint some
@@ -29,6 +50,13 @@ __all__ = ["RESILIENCE_PROFILES", "apply_resilience_profile", "detect_spot_envir
 _SPOT_TRUE = frozenset({"1", "true", "yes", "on", "spot", "preemptible", "preempt"})
 _SPOT_FLAG_VARS = ("BATCHER_SPOT", "RAY_SPOT")
 _SPOT_LIFECYCLE_VARS = ("RAY_NODE_TYPE_NAME", "NODE_LIFECYCLE", "INSTANCE_LIFECYCLE")
+
+# Explicit autoscaling opt-in/out flag (truthy → autoscaling; falsey → force fixed, even on
+# a managed cluster) and the managed-cluster markers that imply an autoscaling-capable
+# control plane. Anyscale sets these on every cluster; even a rare fixed-size one bails fast
+# via the stall window, so treating "managed cluster" as "can grow" is safe.
+_AUTOSCALE_FLAG_VARS = ("BATCHER_AUTOSCALE", "RAY_AUTOSCALING")
+_MANAGED_AUTOSCALE_VARS = ("ANYSCALE_SESSION_ID", "ANYSCALE_CLUSTER_ID")
 
 
 def detect_spot_environment() -> bool:
@@ -50,6 +78,57 @@ def detect_spot_environment() -> bool:
     )
 
 
+def detect_autoscaling_environment() -> bool:
+    """Best-effort detection of an autoscaling-capable cluster from cheap local signals.
+
+    An explicit `BATCHER_AUTOSCALE` (or `RAY_AUTOSCALING`) flag is authoritative in *both*
+    directions — truthy forces autoscaling on, falsey forces it off even on a managed
+    cluster (the power-user opt-out). Absent that, a spot node is autoscaling by definition,
+    and a managed-cluster marker (Anyscale) implies an autoscaler is present. No network
+    call — env vars only, like `detect_spot_environment`. Used to auto-enable the bounded
+    autoscale wait so a query fills the cluster it triggers a scale-up for, out of the box.
+    """
+    for var in _AUTOSCALE_FLAG_VARS:
+        raw = os.environ.get(var)
+        if raw is not None and raw.strip():
+            return raw.strip().lower() in _SPOT_TRUE
+    if detect_spot_environment():
+        return True
+    return detect_managed_cluster()
+
+
+def detect_managed_cluster() -> bool:
+    """Best-effort detection of a managed Ray control plane (Anyscale) from cheap local
+    signals.
+
+    When true and no Ray address is configured, batcher attaches to the *running* cluster
+    (`ray.init(address="auto")`) instead of starting a local single-node Ray — the fix for
+    a managed workspace that exports neither `RAY_ADDRESS` nor Ray's current-cluster pointer,
+    where a bare `ray.init()` would silently strand a distributed job on one node. Env-var
+    only (no network call), like `detect_spot_environment`; extend `_MANAGED_AUTOSCALE_VARS`
+    for other managed platforms.
+    """
+    return any(os.environ.get(v, "").strip() for v in _MANAGED_AUTOSCALE_VARS)
+
+
+def resolve_autoscale_wait(cfg: Config) -> Config:
+    """Resolve the `AUTOSCALE_WAIT_AUTO` sentinel to a concrete wait budget, so out of the
+    box a query fills the cluster it triggers a scale-up for with no tuning.
+
+    Only the sentinel (`-1`, the library default) is resolved — an explicit value wins,
+    including `0` to disable the wait even on an autoscaling cluster (the spot profile
+    likewise sets a concrete value upstream). The sentinel becomes the bounded default wait
+    on an autoscaling-capable cluster (`detect_autoscaling_environment`) and `0` (off) on a
+    fixed or non-cloud one, so the runtime only ever sees a concrete `>= 0` and single-node
+    / CI runs stay non-blocking. Pure scheduling — the result is identical either way; the
+    power-user opt-out is an explicit `autoscale_wait_s=0` or `BATCHER_AUTOSCALE=0`.
+    """
+    if cfg.distributed.autoscale_wait_s != AUTOSCALE_WAIT_AUTO:
+        return cfg
+    wait = AUTOSCALE_WAIT_DEFAULT_S if detect_autoscaling_environment() else 0.0
+    return cfg.replace(distributed=dataclasses.replace(cfg.distributed, autoscale_wait_s=wait))
+
+
 # The set of valid `DistributedConfig.resilience` values (validated in
 # `config.validation`). ``"default"`` is the identity profile.
 RESILIENCE_PROFILES: frozenset[str] = frozenset({"default", "spot"})
@@ -59,7 +138,11 @@ RESILIENCE_PROFILES: frozenset[str] = frozenset({"default", "spot"})
 # repeated preemption, a backoff base that spaces recovery so a preemption *wave* is
 # not retried in a tight loop, HTTP/2 keepalive on to detect a silently-dropped
 # connection well before the idle timeout, and one speculative backup so a
-# degraded-but-alive node cannot stall a shuffle barrier.
+# degraded-but-alive node cannot stall a shuffle barrier. `autoscale_wait_s` is turned
+# on because a spot cluster *is* an autoscaling one — a stage that over-asks should
+# briefly wait for the autoscaler to bring up replacement nodes (spot capacity churns)
+# rather than immediately clamping to the shrunken current capacity and running
+# under-provisioned. Longer than a node's boot time.
 _SPOT_DISTRIBUTED: dict[str, object] = {
     "actor_max_restarts": 4,
     "actor_max_task_retries": 3,
@@ -69,7 +152,51 @@ _SPOT_DISTRIBUTED: dict[str, object] = {
     "flight_keepalive_s": 20.0,
     "speculation_max_backups": 1,
     "fleet_max_attempts": 6,
+    "autoscale_wait_s": AUTOSCALE_WAIT_DEFAULT_S,
 }
+
+# Env vars naming a durable, cross-node location for learned stats, in priority order. The
+# first is batcher's explicit override (any fsspec URL); the second is a managed cluster's
+# persistent artifact storage, which survives cluster restarts and driver moves. On a spot
+# cluster the driver itself can be preempted and reschedule onto a different node, so an
+# in-process (or driver-local) store loses everything learned; pointing the store at shared
+# object storage is what makes "adapt from *past* runs" hold across the churn.
+_METADATA_URI_VARS = ("BATCHER_METADATA_URI", "ANYSCALE_ARTIFACT_STORAGE")
+
+
+def _durable_metadata_uri() -> str | None:
+    """A cross-node object-storage root for learned stats, discovered from the env.
+
+    Returns an explicit `BATCHER_METADATA_URI` (any fsspec URL) verbatim, or the managed
+    cluster's artifact-storage root with a `batcher-metadata` sub-prefix so batcher's objects
+    don't collide with other artifacts written under the same root. `None` when no shared
+    location is known — in which case the store stays in-process rather than pretend a
+    driver-local file is durable on a cluster where the driver can move.
+    """
+    for var in _METADATA_URI_VARS:
+        val = os.environ.get(var, "").strip()
+        if val:
+            root = val.rstrip("/")
+            return root if var == "BATCHER_METADATA_URI" else f"{root}/batcher-metadata"
+    return None
+
+
+def _spot_metadata(cfg: Config) -> Config:
+    """Upgrade a still-default in-process learned-stats store to durable object storage.
+
+    Only fires when the store is still the library default (`in_process`, no `uri`) so an
+    explicit choice is preserved, and only when a shared location is discoverable — so a
+    dev run with no object store keeps its zero-config in-process behavior.
+    """
+    default_meta = MetadataConfig()
+    if cfg.metadata.backend != default_meta.backend or cfg.metadata.uri is not None:
+        return cfg
+    uri = _durable_metadata_uri()
+    if uri is None:
+        return cfg
+    return cfg.replace(
+        metadata=dataclasses.replace(cfg.metadata, backend="object_storage", uri=uri)
+    )
 
 
 def apply_resilience_profile(cfg: Config) -> Config:
@@ -78,6 +205,9 @@ def apply_resilience_profile(cfg: Config) -> Config:
     Returns `cfg` unchanged for the ``"default"`` profile. For ``"spot"``, each
     managed field still at its library default is raised to the profile's value while
     a field the user set explicitly is preserved (``explicit > profile > default``).
+    This also upgrades a still-default in-process learned-stats store to durable object
+    storage when a shared location is discoverable (see `_durable_metadata_uri`), so
+    cross-run learning survives a preempted driver rescheduling onto another node.
     Idempotent — applying twice yields the same config.
 
     Examples:
@@ -102,6 +232,8 @@ def apply_resilience_profile(cfg: Config) -> Config:
         for name, value in _SPOT_DISTRIBUTED.items()
         if getattr(cfg.distributed, name) == getattr(baseline, name)
     }
-    if not overrides:
-        return cfg
-    return cfg.replace(distributed=dataclasses.replace(cfg.distributed, **overrides))
+    if overrides:
+        cfg = cfg.replace(distributed=dataclasses.replace(cfg.distributed, **overrides))
+    # Durable cross-run learning: only for a still-default store, and only when a shared
+    # location is discoverable (no-op otherwise, so single-node/dev runs are unchanged).
+    return _spot_metadata(cfg)

@@ -9,7 +9,8 @@ parquet to; dates are compared as timestamps (``sources`` normalizes date column
 
 from __future__ import annotations
 
-from registry import suite
+from registry import REGISTRY, Case, suite
+from suites.standard.tpch_ray import case_with_ray
 
 tpch = suite("tpch", dataset="tpch")
 
@@ -290,5 +291,10 @@ QUERIES: dict[str, str] = {
     """,
 }
 
+# Register each query as the SQL fanout plus a native Ray Data pipeline where one
+# exists (`tpch_ray`), so Ray Data — which has no SQL surface — still competes on the
+# queries it can express instead of showing `n/a` on all 22.
 for _name, _query in QUERIES.items():
-    tpch.sql(_name, _query)
+    REGISTRY.add(
+        Case(family="tpch", name=_name, dataset="tpch", build=case_with_ray(_name, _query))
+    )

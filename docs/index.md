@@ -264,7 +264,88 @@ Each tool stops somewhere; Batcher's aim is the whole range on one engine.
 
 Speed is measured correctness-first: the benchmark harness refuses to time a query
 whose result doesn't match DuckDB, and every operator is differential-tested against
-it. The numbers live in [`benchmarks/`](https://github.com/stephenoffer/batcher/tree/main/benchmarks).
+it.
+
+## Benchmarks
+
+Numbers, not adjectives — and every one is **correctness-gated**: the harness runs each query
+on every engine, checks they return the *identical* result (a sorted row multiset within float
+tolerance), and only *then* trusts the timing. A fast wrong answer is a bug, not a win. Setup:
+TPC-H `lineitem` (6M rows at scale 1, 60M at scale 10), read once into Arrow and shared
+byte-identically across engines; a 9-node / 128-CPU cluster; 8×T4 GPUs for the ML runs. Full
+methodology and per-scale tables: [performance guide](user-guide/performance.md).
+
+### Analytical SQL, single-node (vs DuckDB / Polars)
+
+Each cell is `batcher / fastest-competitor` wall time — **below 1.0 means Batcher is faster**
+(`0.40×` = 2.5× faster). Batcher wins the operator core, and the margin *holds or grows* from
+6M to 60M rows — it scales, it doesn't just start fast:
+
+| operator | sf1 (6M) | sf10 (60M) |
+|--------------------------------|:-------:|:--------:|
+| group-by sum, one key          | 0.45×   | 0.64×    |
+| group-by, two keys             | 0.53×   | 0.89×    |
+| filter → count                 | 0.32×   | **0.12×** |
+| sort → top-N (`LIMIT`)         | 0.69×   | 0.76×    |
+| window `rank()`                | 0.56×   | **0.40×** |
+| window running `sum()`         | 0.36×   | **0.32×** |
+| window `lag()`                 | 0.54×   | 0.50×    |
+
+At 60M rows `rank() OVER (PARTITION BY …)` is **~2.5× faster than DuckDB** and **~13× faster
+than Polars**. Under a tight memory budget where *both* engines spill to disk, Batcher stays
+alive and competitive — high-cardinality `DISTINCT` even flips to a **1.4× win** out-of-core.
+
+### Distributed data plane (vs Ray Data)
+
+In-process and native, Batcher pays none of Ray Data's per-operation task-scheduling and
+block/pandas-bridge cost (~300–4500 ms fixed, even on the cluster). Same query, same data,
+best-of-N wall time:
+
+| operation | batcher | Ray Data | speedup |
+|-----------------------------|--------:|---------:|:-------:|
+| group-by sum | 14 ms | 1,824 ms | **127×** |
+| global sum | 4 ms | 1,804 ms | **440×** |
+| filter → count | 7 ms | 310 ms | **46×** |
+| sort → top-20 (`LIMIT`) | 15 ms | 4,569 ms | **306×** |
+
+And on Ray Data's *own* streaming `map_batches` home turf — CPU inference, ETL, file I/O — where
+it should be strongest, Batcher still leads (warm shared process pool, zero-copy shared-memory
+input, GIL-releasing threads for NumPy/torch): `map_batches` transform **2.3×**, row-exploding
+`flat_map` **3.5×**, chained multi-stage map **3.2×**, Parquet read **21×**, `iter_torch_batches`
+training-data ingest **3.0×**.
+
+### GPU batch inference & ML (8×T4, vs Ray Data)
+
+Stage-overlapped streaming keeps the device fed (a CPU decode stage runs while the GPU forward
+of the previous morsel is still in flight), and session-warm pools load the model **once per
+session** instead of once per job:
+
+| GPU workload | batcher | Ray Data | vs Ray |
+|--------------|--------:|---------:|:------:|
+| **LLM batch inference** (gpt2 generate, 2048 prompts) | 814 prompt/s | 73 prompt/s | **11.1×** |
+| batch inference (ResNet-50, iterative) | 2576 img/s @ 78% util | 1257 @ 41% | **2.05×** |
+| batch embeddings (2048-d vectors) | 2502 img/s @ 80% util | 1267 @ 41% | **1.98×** |
+| zero-config `map_batches(Model, num_gpus=1)` | 2451 img/s @ 82% util | *hard-errors* | Ray refuses |
+
+Stage-overlap alone lifted a two-stage decode → ResNet-50 pipeline from **942 → 2504 img/s** and
+GPU utilization from **~30% → 81%** — same result, the device just stops idling through the CPU
+decode. Batcher reaches **≥80% sustained GPU utilization out of the box** and runs the
+zero-`batch_size` call Ray Data rejects outright. On a single maximally-large compute-bound job
+both saturate the same GPUs at the same FLOPs (≈ parity) — the honest ceiling.
+
+### Why the wins happen
+
+The speedups are structural, not tuning — each traces to a design choice you can read in the
+[architecture guide](architecture/index.md):
+
+- **In-process, native, over Arrow.** No task-scheduler or object-store hop per operation, so the
+  fixed cost that dominates Ray Data's small/medium queries (50–450×) simply isn't paid.
+- **Composite-key hashing + specialized kernels.** Two-key aggregation and `DISTINCT` hash their
+  composite keys directly instead of through a row encoder, so the win *grows* with row count.
+- **Warm model pools + stage-overlapped streaming.** GPU inference loads the model once per
+  session and overlaps CPU prep with the GPU forward — the 2–11× on real batch-inference shapes.
+- **Adaptive re-optimization.** Plans re-tune on measured cardinalities mid-query, so a bad
+  estimate corrects itself instead of stalling or OOMing — the thing a plan-once engine can't do.
 
 ```{toctree}
 :hidden:

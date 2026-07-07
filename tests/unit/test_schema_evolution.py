@@ -6,7 +6,7 @@ import pyarrow as pa
 import pytest
 
 from batcher._internal.errors import SchemaError
-from batcher.io.schema import normalize_batch, schema_drift, unify_schemas
+from batcher.io.schema import normalize_batch, reconcile_batches, schema_drift, unify_schemas
 
 
 def test_unify_union_promotes_and_unions_columns():
@@ -68,3 +68,22 @@ def test_schema_drift_reports_changes():
     assert drift.added == ("c",)
     assert drift.removed == ("b",)
     assert drift.type_changed == (("a", "int64", "double"),)
+
+
+def test_reconcile_batches_unions_drifting_schemas():
+    b1 = pa.RecordBatch.from_arrays([pa.array([1, 2], pa.int64())], names=["a"])
+    b2 = pa.RecordBatch.from_arrays(
+        [pa.array([3], pa.int64()), pa.array([9], pa.int64())], names=["a", "b"]
+    )
+    out = reconcile_batches([b1, b2])
+    tbl = pa.Table.from_batches(out)  # would raise without reconciliation
+    assert tbl.column_names == ["a", "b"]
+    assert tbl.column("a").to_pylist() == [1, 2, 3]
+    assert tbl.column("b").to_pylist() == [None, None, 9]
+
+
+def test_reconcile_batches_is_noop_when_uniform():
+    b1 = pa.RecordBatch.from_arrays([pa.array([1], pa.int64())], names=["a"])
+    b2 = pa.RecordBatch.from_arrays([pa.array([2], pa.int64())], names=["a"])
+    out = reconcile_batches([b1, b2])
+    assert out[0] is b1 and out[1] is b2  # same objects, no copy

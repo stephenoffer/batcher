@@ -18,18 +18,33 @@ Two scheduling shapes:
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import contextvars
+import os
+from collections import deque
 
 import pyarrow as pa
 
-from batcher.dist.executors.partition_io import partition_descriptors
+from batcher.dist.executors.partition_io import descriptor_rows, partition_descriptors
 from batcher.dist.executors.plan_analysis import _relabel_single_source
 from batcher.dist.executors.ray_runtime import _ensure_ray
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, MapBatches
 
-__all__ = ["resident_inference_pools", "stream_distributed_map"]
+# Smallest CPU share a task may request: a tiny partition gets a fraction of a core so
+# Ray packs many such tasks per core (high parallelism over many small files) instead of
+# each reserving a whole core. 1/8 core by default. Env-overridable.
+_MIN_TASK_CPU = max(0.01, float(os.environ.get("BATCHER_MIN_TASK_CPU", "0.125")))
+# How much heavier a per-batch UDF / inference stage is per row than a plain scan/filter.
+# A `map_batches` partition gets this many times the CPU a same-sized scan would — the
+# plan-level compute-skew factor (data skew is handled per-partition by `descriptor_rows`).
+_MAP_COMPUTE_WEIGHT = max(1.0, float(os.environ.get("BATCHER_MAP_COMPUTE_WEIGHT", "4.0")))
+# Hard ceiling on the per-actor submit-ahead depth (partitions an inference actor keeps in
+# flight). Matches `ml.gpu._INFLIGHT_DEPTH_MAX`; kept local to avoid an ml import in `dist`.
+_MAP_INFLIGHT_MAX = 16
+
+__all__ = ["release_inference_pools", "resident_inference_pools", "stream_distributed_map"]
 
 # A query-lifetime registry of inference actor pools, keyed by pipeline signature, so a
 # `map_batches`/inference pipeline's model loads ONCE per query and is reused across
@@ -40,6 +55,30 @@ __all__ = ["resident_inference_pools", "stream_distributed_map"]
 _INFERENCE_POOLS: contextvars.ContextVar[dict[tuple, list] | None] = contextvars.ContextVar(
     "batcher_inference_pools", default=None
 )
+
+# A SESSION-lifetime registry (module-global, not scoped) of warm inference pools, used
+# when `distributed.warm_inference_pools` is on and no `resident_inference_pools()` scope is
+# active. Keyed by pipeline signature so the same model loads once per session and is reused
+# across every `collect()` — the long-lived-actor win (Ray Data respawns the pool per
+# execution, paying the ~20x-first-batch cold start each time). Torn down at process exit or
+# by `release_inference_pools()`; a pool whose actors died is rebuilt on next use.
+_SESSION_POOLS: dict[tuple, list] = {}
+
+
+def release_inference_pools() -> None:
+    """Tear down all session-warm inference actor pools and free their GPUs.
+
+    Warm pools (``distributed.warm_inference_pools``, on by default) keep a model's actors
+    alive across ``collect()`` calls so it loads once per session. Call this to release those
+    GPUs before other GPU work, or when done with inference; it also runs automatically at
+    process exit. A no-op when no pools are warm. The next inference `collect()` rebuilds the
+    pool (paying the one-time load again)."""
+    _shutdown_pools(_SESSION_POOLS)
+
+
+# Free any session-warm GPU actors at process exit so a finished batch job never leaves GPUs
+# held on the cluster (best-effort — Ray may already be shutting down).
+atexit.register(release_inference_pools)
 
 
 @contextlib.contextmanager
@@ -89,31 +128,133 @@ def _new_map_actor(plan0: LogicalPlan, opts: dict):
     return cls.remote(plan0)
 
 
-def _resident_pool_for(plan0: LogicalPlan, opts: dict, size: int) -> list:
-    """The resident actor pool for `plan0` (built once on first use, reused after).
+def _resident_pool_for(plan0: LogicalPlan, opts: dict, size: int, registry: dict) -> list:
+    """The resident actor pool for `plan0` in `registry` (built once, reused after).
 
-    Caller guarantees a `resident_inference_pools()` scope is active. The model is built
-    in each actor's `__init__`, so reuse means it loads once per query, not per stage."""
-    registry = _INFERENCE_POOLS.get()
+    The model is built in each actor's `__init__`, so reuse means it loads once per
+    registry lifetime (a query scope, or the whole session for the warm registry). A pool
+    whose actors have died (preemption between reuses) is healed — dead actors are dropped
+    and respawned to the requested size — so a session-warm pool survives node churn."""
     sig = _pipeline_signature(plan0)
     pool = registry.get(sig)
-    if pool is None:
-        pool = [_new_map_actor(plan0, opts) for _ in range(max(1, size))]
-        registry[sig] = pool
+    pool = _healthy_actors(pool) if pool else []
+    if len(pool) < max(1, size):
+        pool = pool + [_new_map_actor(plan0, opts) for _ in range(max(1, size) - len(pool))]
+    registry[sig] = pool
     return pool
 
 
-def _run_resident_pool(plan0, partitions, opts, size):
-    """Map `partitions` through the query-resident pool for `plan0` (model loaded once),
-    preserving submission order. Returns ``(ordered_results, peak_gpu_util)``."""
+def _healthy_actors(pool: list) -> list:
+    """Drop actors that are no longer alive (a cheap liveness ping), keeping the survivors —
+    so a warm pool reused after a preemption doesn't dispatch to a dead actor."""
     import ray
-    from ray.util.actor_pool import ActorPool
 
-    actors = _resident_pool_for(plan0, opts, size)
-    pool = ActorPool(actors)
-    results = list(pool.map(lambda actor, part: actor.run.remote(part), list(partitions)))
+    alive = []
+    probes = {a: a.gpu_stats.remote() for a in pool}
+    for actor, ref in probes.items():
+        try:
+            ray.get(ref, timeout=10)
+            alive.append(actor)
+        except Exception:  # dead / unreachable — drop it (a replacement is spawned to size)
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+    return alive
+
+
+def _actor_inflight_depth() -> int:
+    """Per-actor submit-ahead depth for the inference actor pool.
+
+    The envelope's adapted depth (raised from measured GPU utilization by the conductor)
+    when a scheduling envelope is in force, else the config floor. Always in
+    ``[1, _MAP_INFLIGHT_MAX]``. Depth 1 is the historical one-partition-at-a-time behavior.
+    """
+    from batcher.config import active_config
+    from batcher.dist.executors.ray_runtime import current_envelope
+
+    env = current_envelope()
+    depth = env.inflight_depth if env is not None and env.inflight_depth > 0 else None
+    if depth is None:
+        depth = active_config().distributed.map_inflight_depth
+    return max(1, min(_MAP_INFLIGHT_MAX, int(depth)))
+
+
+def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
+    """Run `partitions` through a FIXED pool of `actors`, up to `depth` in flight per actor,
+    preserving partition order.
+
+    No spawn / heal / autoscale — the caller owns the pool lifetime (the resident / warm
+    path, whose actors are health-checked before reuse). At `depth == 1` this is one
+    partition per actor at a time (the `ActorPool.map` behavior it replaces); a higher depth
+    keeps each actor fed across the dispatch/gather round-trip. Results are index-addressed,
+    so the output is identical to depth 1 for any depth. Returns results in partition order.
+    """
+    import ray
+
+    parts = list(partitions)
+    n = len(parts)
+    results: list = [None] * n
+    if not actors or n == 0:
+        return results
+    slots = {a: max(1, depth) for a in actors}
+    inflight: dict = {}  # ref -> (actor, idx)
+    pending = deque(range(n))
+
+    def _assign() -> None:
+        while pending:
+            actor = next((a for a in actors if slots[a] > 0), None)
+            if actor is None:
+                break
+            idx = pending.popleft()
+            inflight[actor.run.remote(parts[idx])] = (actor, idx)
+            slots[actor] -= 1
+
+    _assign()
+    while inflight:
+        ready, _ = ray.wait(list(inflight), num_returns=1)
+        ref = ready[0]
+        actor, idx = inflight.pop(ref)
+        results[idx] = ray.get(ref)
+        slots[actor] += 1
+        _assign()
+    return results
+
+
+def _run_resident_pool(plan0, partitions, opts, size, registry):
+    """Map `partitions` through the resident pool for `plan0` in `registry` (model loaded
+    once), preserving submission order. Returns ``(ordered_results, peak_gpu_util)``."""
+    import ray
+
+    actors = _resident_pool_for(plan0, opts, size, registry)
+    results = _pipeline_actor_pool(actors, partitions, _actor_inflight_depth())
     samples = [s for s in ray.get([a.gpu_stats.remote() for a in actors]) if s is not None]
     return results, (max(samples) if samples else None)
+
+
+def _run_warm_pool(plan0, partitions, opts, lo, hi):
+    """Run `partitions` through the SESSION-warm pool for `plan0`, healing a lost pool.
+
+    On the rare case the warm pool loses actors mid-run (a node preempted after the liveness
+    check), it evicts the pool and re-runs on a fresh recovering per-call pool, so a warm
+    pool never turns a preemption into a failed query. The next inference call rebuilds the
+    warm pool. Returns ``(ordered_results, peak_gpu_util)``."""
+    from ray.exceptions import RayError
+
+    from batcher.dist.executors.ray_runtime import recovery_policy
+
+    try:
+        return _run_resident_pool(plan0, partitions, opts, hi, _SESSION_POOLS)
+    except RayError:
+        _evict_session_pool(plan0)
+        return _drive_actor_pool(plan0, partitions, opts, lo, hi, recovery_policy())
+
+
+def _evict_session_pool(plan0) -> None:
+    """Drop (and kill) the session-warm pool for `plan0` — after a preemption or on demand."""
+    import ray
+
+    for actor in _SESSION_POOLS.pop(_pipeline_signature(plan0), []):
+        with contextlib.suppress(Exception):
+            ray.kill(actor)
 
 
 def _map_resources(plan: LogicalPlan) -> tuple[float, bool, object, str | None]:
@@ -194,7 +335,14 @@ def _distributed_map(
     if env is not None and env.accelerator_type is not None:
         accelerator_type = env.accelerator_type
 
-    partitions = partition_descriptors(sources[sid], workers)
+    # Data/compute-driven task count: a tiny source → a few tasks; a large one → ~one task
+    # per core; a (single-threaded) UDF → more tasks (the way to parallelize it). The GPU
+    # actor-pool path keeps the worker count (its pool size, not the CPU task count) —
+    # `partition_descriptors` row-balances those partitions across every worker, so a source
+    # arriving as one large batch fans out evenly (one balanced slice per GPU actor) instead
+    # of landing whole on worker 0.
+    n_parts = workers if wants_pool else _adaptive_partition_count(sources[sid], plan, workers, hub)
+    partitions = partition_descriptors(sources[sid], n_parts)
 
     opts = _gpu_options(num_gpus, accelerator_type)
     if wants_pool:
@@ -207,27 +355,300 @@ def _distributed_map(
                 num_gpus, workers, len(partitions), accelerator_type
             )
             lo = hi = _resolve_pool_size(concurrency, len(partitions), default_pool)
-        # A query-resident pool (model loaded once, reused across stages) when a
-        # `resident_inference_pools()` scope is active; otherwise the per-call pool with
-        # autoscaling + preemption recovery.
-        if _INFERENCE_POOLS.get() is not None:
-            results, gpu_util = _run_resident_pool(plan0, partitions, opts, hi)
+            # A recurring inference pipeline that has consistently served fewer partitions than
+            # it built actors right-sizes its (auto) pool from that measured reuse, so a small
+            # job stops over-provisioning GPU actors. Only trims an auto-resolved size, never an
+            # explicit `concurrency`; pool size is pure parallelism, so the result is identical.
+            if concurrency is None:
+                from batcher.dist.adaptive_sizing import learned_actor_pool_size
+
+                learned = learned_actor_pool_size(hub, _pipeline_signature(plan0), hi)
+                if learned is not None:
+                    lo = hi = learned
+        _record_actor_pool_reuse(hub, plan0, len(partitions))
+        # Pick the pool lifetime: an explicit `resident_inference_pools()` scope (query
+        # lifetime) wins; else the SESSION-warm registry when `warm_inference_pools` is on
+        # (model loads once per session, reused across `collect()`s — the 2x win on repeated
+        # / iterative / cold-start-bound inference); else the per-call pool with autoscaling +
+        # preemption recovery (spawned and killed each call, the historical default).
+        from batcher.config import active_config
+
+        scope = _INFERENCE_POOLS.get()
+        warm = active_config().distributed.warm_inference_pools
+        if scope is not None:
+            results, gpu_util = _run_resident_pool(plan0, partitions, opts, hi, scope)
+        elif warm:
+            results, gpu_util = _run_warm_pool(plan0, partitions, opts, lo, hi)
         else:
             results, gpu_util = _drive_actor_pool(
                 plan0, partitions, opts, lo, hi, recovery_policy()
             )
         _record_gpu_feedback(hub, plan, gpu_util)
     else:
-        task = _map_udf_task.options(**opts) if opts else _map_udf_task
-        results = gather_map_results(
-            lambda idx: task.remote(plan0, partitions[idx]), len(partitions)
-        )
+        # Skew-aware adaptive CPU: each stateless task requests a CPU share sized to its
+        # own partition's data (x the plan's compute weight) — fractional for a tiny
+        # partition (packed many-per-core), several cores for a large one. A heavier
+        # (skewed) partition therefore gets proportionally more CPU than its peers.
+        shares = _adaptive_task_cpus(partitions, plan, hub)
+        # Resolve SPREAD vs Ray's locality-aware DEFAULT against the live cluster: SPREAD
+        # only where these right-sized (often sub-node) tasks would otherwise pack onto one
+        # node and idle the rest, DEFAULT (restoring argument locality) when packing isn't a
+        # risk or the cluster is large enough that DEFAULT's balancing suffices. On a
+        # heterogeneous cluster this also keeps a CPU-only map fleet off GPU nodes.
+        sched = _map_scheduling_options(env, shares)
+
+        def _launch(idx):
+            # Intra-task workers = this task's own CPU share (>=1); cluster-wide
+            # parallelism is the many tasks, not a full-width pool inside each one.
+            workers = max(1, round(shares[idx]))
+            return _map_udf_task.options(**{**opts, "num_cpus": shares[idx], **sched}).remote(
+                plan0, partitions[idx], workers
+            )
+
+        results = gather_map_results(_launch, len(partitions))
 
     batches: list[pa.RecordBatch] = []
     for r in results:
         if r:
             batches.extend(r)
-    return pa.Table.from_batches(batches) if batches else pa.table({})
+    _record_source_rows(hub, sources[sid], sum(b.num_rows for b in batches))
+    if not batches:
+        return pa.table({})
+    # Reconcile a UDF whose output schema drifts across partitions (e.g. one partition's
+    # rows carry extra fields) to one union schema, so the gather concatenates instead of
+    # failing — the same schema-drift tolerance the single-node path gives.
+    from batcher.io.schema.evolution import reconcile_batches
+
+    return pa.Table.from_batches(reconcile_batches(batches))
+
+
+def _record_source_rows(hub, source, rows: int) -> None:
+    """Persist a run's measured total rows for `source` so the next run's partition count can
+    seed from it when the footer count is unknown. Best-effort; never breaks a query."""
+    with contextlib.suppress(Exception):
+        from batcher.dist.adaptive_sizing import record_partition_rows
+
+        record_partition_rows(_learning_hub(hub), source.identity(), rows)
+
+
+def _record_actor_pool_reuse(hub, plan0, partitions: int) -> None:
+    """Persist how many partitions this inference pool served, so a recurring pipeline can
+    right-size its actor pool next run. Best-effort; never breaks a query."""
+    with contextlib.suppress(Exception):
+        from batcher.dist.adaptive_sizing import record_actor_pool_reuse
+
+        record_actor_pool_reuse(_learning_hub(hub), _pipeline_signature(plan0), partitions)
+
+
+def _spread_helps(shares: list[float]) -> bool:
+    """Whether SPREAD genuinely beats Ray's locality-aware DEFAULT for these map tasks.
+
+    True only when packing is a real risk on a modest cluster: below `map_spread_node_cap`
+    nodes (past it SPREAD's per-node scan is itself the scheduler bottleneck, and DEFAULT's
+    utilization balancing already spreads load), more tasks than nodes (so stacking would
+    actually idle nodes), and a mean per-task CPU share small enough
+    (< `map_spread_pack_share`) that DEFAULT would pack many onto one node. A single-node
+    cluster returns False (SPREAD == DEFAULT there — skip the spread bookkeeping). Falls
+    back to True on an unreadable topology, preserving the prior unconditional-SPREAD
+    behavior when the cluster shape can't be read.
+    """
+    from batcher.config import active_config
+    from batcher.dist.executors.ray_runtime.scaling import alive_node_count
+
+    dc = active_config().distributed
+    nodes = alive_node_count()  # snapshot-aware; 0 on unreadable topology
+    if nodes == 0:
+        return True  # topology unreadable → keep the old SPREAD behavior
+    if nodes <= 1 or nodes >= dc.map_spread_node_cap:
+        return False
+    n_tasks = len(shares)
+    if n_tasks <= nodes:
+        return False  # at most one task per node under DEFAULT anyway — no packing risk
+    mean_share = sum(shares) / n_tasks if shares else 1.0
+    return mean_share < dc.map_spread_pack_share
+
+
+def _map_scheduling_options(env, shares: list[float]) -> dict:
+    """Ray `.options(...)` scheduling-strategy fragment for stateless map/agg tasks.
+
+    Resolves SPREAD vs Ray's locality-aware DEFAULT against the live cluster (config
+    `map_spread`): ``"always"`` forces SPREAD (the historical unconditional behavior),
+    ``"never"`` forces DEFAULT, ``"auto"`` (default) keeps SPREAD only where
+    `_spread_helps` finds packing to be a real risk and otherwise uses DEFAULT
+    (locality-aware: prefers nodes already holding the task's args, then low utilization).
+    An explicit ``STRICT_SPREAD`` envelope preference always forces SPREAD. When the
+    envelope asks to stay off GPU nodes, a hard CPU-only node selector is merged in (a
+    no-op unless the cluster opts in and can host the fleet). Returns `{}` for DEFAULT
+    with no selector. Placement never changes which rows a partition holds, so the result
+    is identical for any choice.
+    """
+    from batcher.config import active_config
+    from batcher.dist.executors.ray_runtime import node_class_selector
+
+    mode = active_config().distributed.map_spread
+    if env is not None and env.placement_strategy == "STRICT_SPREAD":
+        opts: dict = {"scheduling_strategy": "SPREAD"}
+    elif mode == "always":
+        opts = {"scheduling_strategy": "SPREAD"}
+    elif mode == "never":
+        opts = {}
+    else:
+        opts = {"scheduling_strategy": "SPREAD"} if _spread_helps(shares) else {}
+    if env is not None and shares:
+        mean_share = sum(shares) / len(shares)
+        sel = node_class_selector(env.prefer_cpu_only_nodes, len(shares), mean_share)
+        if sel:
+            opts["resources"] = {**opts.get("resources", {}), **sel["resources"]}
+    return opts
+
+
+def _placeable_node_cores() -> float:
+    """Max CPUs a single task may request and still be placeable on every node — the
+    smallest alive node's core count (so a multi-CPU task fits anywhere). Falls back to
+    the driver's cpu count when topology is unavailable."""
+    try:
+        import ray
+
+        cores = [
+            float(n.get("Resources", {}).get("CPU", 0.0)) for n in ray.nodes() if n.get("Alive")
+        ]
+        cores = [c for c in cores if c > 0]
+        if cores:
+            return float(int(min(cores)))
+    except Exception:
+        pass
+    return float(os.cpu_count() or 4)
+
+
+def _cluster_cores() -> float:
+    """Total schedulable CPUs across alive nodes (the cap on useful task parallelism)."""
+    try:
+        import ray
+
+        return float(int(ray.cluster_resources().get("CPU", 0.0))) or float(os.cpu_count() or 4)
+    except Exception:
+        return float(os.cpu_count() or 4)
+
+
+def _learning_hub(hub=None):
+    """The MetadataHub to read learned sizing from — the one threaded in, else the
+    process-wide default (the same store Core records feedback to). Best-effort: any
+    failure to reach a hub yields `None`, so a learned read simply falls back to the
+    plan default."""
+    if hub is not None:
+        return hub
+    try:
+        from batcher.core import default_hub
+
+        return default_hub()
+    except Exception:  # pragma: no cover - learning is best-effort
+        return None
+
+
+def _plan_family(plan: LogicalPlan) -> str:
+    """The operator family key a plan's compute is dominated by, for learned per-family
+    sizing: a `map_batches`/UDF pipeline vs a plain relational scan."""
+    from batcher.core.udf import has_map_batches
+
+    return "map_batches" if has_map_batches(plan) else "scan"
+
+
+def _learned_weight_factor(plan: LogicalPlan, hub=None) -> float:
+    """A learned CPU-reservation multiplier for `plan`'s dominant family, or 1.0 when cold.
+
+    Reads the family's measured per-core busy fraction (`learned_cpu_weight_factor`): a family
+    that historically left its reserved cores idle (IO/GPU-bound) reserves proportionally fewer
+    cores next run, so the CPU share and task fan-out track how CPU-bound the work actually is —
+    a pure packing decision that never changes which rows a task holds."""
+    from batcher.dist.adaptive_sizing import learned_cpu_weight_factor
+
+    try:
+        factor = learned_cpu_weight_factor(_learning_hub(hub), _plan_family(plan))
+    except Exception:  # pragma: no cover - learning is best-effort
+        factor = None
+    return factor if factor is not None else 1.0
+
+
+def _source_total_rows(source) -> int | None:
+    """Total rows of a splittable source from footer-derived split counts (no data I/O),
+    or `None` when it can't be known cheaply (an in-memory/iterator source)."""
+    try:
+        splits = source.splits()
+    except Exception:
+        return None
+    total = 0
+    for s in splits:
+        rows = getattr(s, "rows", None)
+        if rows is None:
+            return None  # a split with no cheap count → don't guess
+        total += rows
+    return total if splits else None
+
+
+def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
+    """How many tasks to split a map/scan source into — data- and compute-driven.
+
+    `ceil(total_rows x compute_weight / rows_per_cpu)`, clamped to `[1, cluster_cores]`
+    and to the number of splits. So a tiny source runs as a few (even one) tasks while a
+    large one fans out to ~one task per core — and a per-batch UDF (weight > 1), being
+    single-threaded per task, fans out to MORE tasks (the way to parallelize it) rather
+    than reserving idle cores on fewer tasks.
+
+    When the source's row total isn't cheaply known from a footer, a *measured* total row
+    count learned from a prior run of the same source (`learned_partition_rows`) seeds the
+    fan-out instead of the blunt `fallback` worker count; a genuinely-cold source still
+    falls back. Partition count only shards rows, so any count is result-identical."""
+    import math
+
+    from batcher.config import active_config
+    from batcher.core.udf import has_map_batches
+    from batcher.dist.adaptive_sizing import learned_partition_rows
+
+    total = _source_total_rows(source)
+    if total is None:
+        with contextlib.suppress(Exception):
+            total = learned_partition_rows(_learning_hub(hub), source.identity())
+    if total is None:
+        return fallback
+    weight = _MAP_COMPUTE_WEIGHT if has_map_batches(plan) else 1.0
+    weight *= _learned_weight_factor(plan, hub)
+    rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
+    want = math.ceil((total * weight) / rows_per_cpu)
+    n = max(1, min(want, int(_cluster_cores())))
+    with contextlib.suppress(Exception):
+        n = min(n, max(1, len(source.splits())))  # never more tasks than splits
+    return n
+
+
+def _adaptive_task_cpus(partitions, plan, hub=None) -> list[float]:
+    """A per-task CPU share for each partition, sized to its data x the plan's compute
+    weight (see `_MIN_TASK_CPU` / `_MAP_COMPUTE_WEIGHT`).
+
+    Small partition → a fraction of a core (Ray packs many such tasks per core, so many
+    small files run with high parallelism instead of each grabbing a whole core); large
+    partition → multiple cores (up to one node). Because the share is per-partition, a
+    skewed (heavier) partition is given more CPU than its lighter peers — adaptive to
+    both data skew (row count) and plan-level compute skew (a `map_batches`/UDF stage is
+    weighted heavier per row than a plain scan).
+
+    The plan-level weight is further scaled by a *measured* per-core busy fraction learned for
+    this family (`_learned_weight_factor`): a family that ran CPU-underutilized reserves fewer
+    cores next run. Reserving fewer/more cores only changes packing, never the rows a task
+    processes, so the result is identical."""
+    from batcher.config import active_config
+    from batcher.core.udf import has_map_batches
+
+    node_cores = _placeable_node_cores()
+    # Rows one core processes in a reasonable slice — half the breaker target (which sizes
+    # a whole multi-core task), so a full target-sized partition asks for ~2 cores.
+    rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
+    weight = _MAP_COMPUTE_WEIGHT if has_map_batches(plan) else 1.0
+    weight *= _learned_weight_factor(plan, hub)
+    shares = []
+    for p in partitions:
+        want = (descriptor_rows(p) * weight) / rows_per_cpu
+        shares.append(round(max(_MIN_TASK_CPU, min(node_cores, want)), 3))
+    return shares
 
 
 def stream_distributed_map(plan: LogicalPlan, sources: list[Source], workers: int):
@@ -308,17 +729,20 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
     the backlog drains — demand-driven autoscaling (the `concurrency=(min, max)`
     contract); a fixed pool is ``min_size == max_size``.
 
-    The fault-tolerance part: on a `RayActorError` (a preempted GPU node) the dead
-    actor is dropped, its in-flight partition requeued, and the pool respawned toward
-    the floor — so the stage heals instead of crashing on the first loss (the old
-    `ActorPool.map` / unguarded `ray.get` raised). Bounded by `policy.max_attempts`
-    per partition; a deterministic UDF error (`RayTaskError`) surfaces immediately.
-    A map/inference UDF recomputes idempotently from its durable partition descriptor,
-    so a reassigned partition is neither lost nor duplicated. Returns
+    Each actor may keep up to `_actor_inflight_depth()` partitions in flight (submit-ahead)
+    so a GPU stays fed across the dispatch/gather round-trip; an actor is free to take work
+    while any of its slots is open and fully idle (all slots free) when a candidate to reap.
+    Depth 1 is the historical one-at-a-time behavior.
+
+    The fault-tolerance part: on a `RayActorError` (a preempted GPU node) the dead actor is
+    dropped and **every** partition it had in flight (up to `depth`) is requeued, and the
+    pool respawned toward the floor — so the stage heals instead of crashing on the first
+    loss (the old `ActorPool.map` / unguarded `ray.get` raised). Bounded by
+    `policy.max_attempts` per partition; a deterministic UDF error (`RayTaskError`) surfaces
+    immediately. A map/inference UDF recomputes idempotently from its durable partition
+    descriptor, so a reassigned partition is neither lost nor duplicated. Returns
     ``(ordered_results, peak_gpu_util)``.
     """
-    from collections import deque
-
     import ray
     from ray.exceptions import RayError, RayTaskError
 
@@ -327,31 +751,42 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
         return cls.remote(plan0)
 
     parts = list(partitions)
+    depth = max(1, min(_actor_inflight_depth(), len(parts) or 1))
     hi = max(1, min(max_size, len(parts)))
     lo = max(1, min(min_size, hi))
     actors = [_spawn() for _ in range(lo)]
-    idle = deque(actors)
+    slots = dict.fromkeys(actors, depth)  # free in-flight slots per actor
     pending = deque(range(len(parts)))  # partition indices awaiting assignment
     inflight: dict = {}  # ref -> (actor, idx)
     results: list = [None] * len(parts)
     attempts = [0] * len(parts)
     peak_util: float | None = None
+
+    def _assign() -> None:
+        while pending:
+            actor = next((a for a in actors if slots[a] > 0), None)
+            if actor is None:
+                break
+            idx = pending.popleft()
+            inflight[actor.run.remote(parts[idx])] = (actor, idx)
+            slots[actor] -= 1
+
     try:
         while pending or inflight:
-            while pending and idle:
-                idx = pending.popleft()
-                actor = idle.popleft()
-                inflight[actor.run.remote(parts[idx])] = (actor, idx)
-            action = _autoscale_action(len(pending), len(actors), len(idle), lo, hi)
+            _assign()
+            # An actor is a reap candidate only when *fully* idle (no in-flight partition).
+            fully_idle = [a for a in actors if slots[a] == depth]
+            action = _autoscale_action(len(pending), len(actors), len(fully_idle), lo, hi)
             if action == "up":
                 new = _spawn()
                 actors.append(new)
-                idle.append(new)
+                slots[new] = depth
                 continue  # assign the new actor on the next loop
-            if action == "down":
-                victim = idle.pop()
+            if action == "down" and fully_idle:
+                victim = fully_idle[-1]
                 peak_util = _max_opt(peak_util, _drain_gpu_stat(victim))
                 actors.remove(victim)
+                slots.pop(victim, None)
                 ray.kill(victim)
             if not inflight:
                 continue
@@ -360,22 +795,29 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
             actor, idx = inflight.pop(ref)
             try:
                 results[idx] = ray.get(ref)
-                idle.append(actor)  # the producing actor is free again
+                slots[actor] += 1  # the producing actor has a slot free again
             except RayTaskError:
                 raise  # a deterministic UDF error — resubmitting cannot help
             except RayError:
-                # The actor was lost (preemption). Drop it, requeue its partition, and
-                # respawn toward the floor so the pool heals instead of only shrinking.
+                # The actor was lost (preemption). Drop it and reclaim EVERY partition it
+                # had in flight — with depth>1 one death orphans up to `depth` of them —
+                # then respawn toward the floor so the pool heals instead of only shrinking.
+                orphaned = [i for (a, i) in inflight.values() if a is actor]
+                orphaned.append(idx)
+                for r in [r for r, (a, _) in inflight.items() if a is actor]:
+                    del inflight[r]
                 if actor in actors:
                     actors.remove(actor)
-                attempts[idx] += 1
-                if attempts[idx] > policy.max_attempts:
-                    raise
-                pending.appendleft(idx)
-                if len(actors) < lo:
+                slots.pop(actor, None)
+                for i in orphaned:
+                    attempts[i] += 1
+                    if attempts[i] > policy.max_attempts:
+                        raise
+                    pending.appendleft(i)
+                while len(actors) < lo:
                     new = _spawn()
                     actors.append(new)
-                    idle.append(new)
+                    slots[new] = depth
         for a in actors:
             peak_util = _max_opt(peak_util, _drain_gpu_stat(a))
         return results, peak_util
@@ -409,6 +851,39 @@ def _prebuild_factories(node: LogicalPlan) -> LogicalPlan:
     return prebuild_factories(node)
 
 
+def _lazy_partition_source(partition: dict):
+    """A lazy `IteratorSource` over a partition descriptor, or None if it is empty.
+
+    Yields the descriptor's batches one at a time (`iter_partition_descriptor`) — reading a
+    split manifest's row-groups from storage incrementally, or iterating a shipped batch list
+    — so a streaming plan overlaps the read with downstream compute. The schema is taken from
+    the manifest / first batch without a full read. The materializing path calls `.read()`,
+    which still lists everything, so non-streaming execution is byte-for-byte unchanged.
+    """
+    from batcher.dist.executors.partition_io import iter_partition_descriptor
+    from batcher.io.source import IteratorSource
+
+    schema = _descriptor_schema(partition)
+    if schema is None:
+        return None
+    return IteratorSource(lambda: iter_partition_descriptor(partition), schema)
+
+
+def _descriptor_schema(desc: dict):
+    """The Arrow schema a partition descriptor yields (projected), or None if it is empty."""
+    if "splits" in desc:
+        splits = desc.get("splits") or []
+        if not splits:
+            return None
+        schema = splits[0].schema()
+        projection = desc.get("projection")
+        if projection is not None:
+            schema = pa.schema([schema.field(c) for c in projection])
+        return schema
+    batches = desc.get("batches") or []
+    return batches[0].schema if batches else None
+
+
 class _MapActor:
     """A long-lived worker that builds its model once and maps many partitions.
 
@@ -416,20 +891,24 @@ class _MapActor:
     `num_gpus` request on the next run (the feedback half of GPU scheduling)."""
 
     def __init__(self, plan0: LogicalPlan) -> None:
-        # Build the (class) UDFs locally, once — the model load happens here.
-        self._plan = _prebuild_factories(plan0)
+        # Build the (class) UDFs locally, once — the model load happens here. The pool's
+        # size is the parallelism, so each actor runs its UDF serially (workers=1) rather
+        # than spawning a full-width intra-actor pool that would oversubscribe the node.
+        self._plan = _with_inference_workers(_prebuild_factories(plan0))
         self._gpu_util_max: float | None = None
 
     def run(self, partition: dict):
         from batcher import core
-        from batcher.dist.executors.partition_io import read_partition_descriptor
-        from batcher.io.source import InMemorySource
         from batcher.ml.gpu import sample_gpu_utilization
 
-        rows = read_partition_descriptor(partition)
-        if not rows:
+        # A LAZY source over the descriptor: the scan reads its splits (storage) / iterates
+        # its shipped batches incrementally, so `stream_linear_chain` overlaps reading chunk
+        # k+1 with the GPU forward on chunk k instead of the device idling through an eager
+        # whole-partition read (the ~60%->higher-util fix for a scan->GPU inference).
+        source = _lazy_partition_source(partition)
+        if source is None:
             return None
-        out = core.execute_with_udfs(self._plan, [InMemorySource(rows)])
+        out = core.execute_with_udfs(self._plan, [source])
         # Sample GPU load right after the forward pass (None on a GPU-less host).
         util = sample_gpu_utilization()
         if util is not None:
@@ -466,7 +945,55 @@ class _MapActor:
         return self._gpu_util_max
 
 
-def _map_udf_task(plan0, partition):
+# Threads a CPU (preprocess/decode) stage runs inside a GPU inference actor, so it keeps a
+# fast GPU stage fed (the guides' 2-4:1 CPU:GPU ratio). GPU stages always stay at 1 (one CUDA
+# context). Modest so several fractional-GPU actors per node don't grossly oversubscribe the
+# cores; a decode/normalize `fn` releases the GIL (PIL/cv2/NumPy/torch) so threads scale.
+_INFERENCE_CPU_WORKERS = max(1, int(os.environ.get("BATCHER_INFERENCE_CPU_WORKERS", "4")))
+
+
+def _with_inference_workers(plan):
+    """Set each map stage's `num_workers` for a GPU inference actor: a GPU stage keeps 1 (one
+    CUDA context), a CPU stage gets `_INFERENCE_CPU_WORKERS` so its decode/preprocess fans
+    across the node's spare cores and stays ahead of the GPU stage — the fix for a fast/small
+    model whose single-threaded decode would otherwise starve the device (util < 50%)."""
+    import dataclasses
+
+    from batcher.plan.logical import MapBatches
+    from batcher.plan.visitor import children, with_children
+
+    if isinstance(plan, MapBatches):
+        plan = dataclasses.replace(
+            plan, num_workers=1 if plan.num_gpus > 0 else _INFERENCE_CPU_WORKERS
+        )
+    kids = children(plan)
+    if kids:
+        return with_children(plan, [_with_inference_workers(c) for c in kids])
+    return plan
+
+
+def _with_map_workers(plan, n: int):
+    """Return `plan` with every `map_batches` stage's `num_workers` set to `n`.
+
+    Distributed parallelism comes from running many partition tasks across the cluster,
+    so a task must run its UDF with intra-task workers sized to *its own* CPU share — not
+    the driver-resolved all-local-cores count, which would make every task on every node
+    spawn a full-width thread/process pool and oversubscribe the cluster many times over.
+    """
+    import dataclasses
+
+    from batcher.plan.logical import MapBatches
+    from batcher.plan.visitor import children, with_children
+
+    if isinstance(plan, MapBatches):
+        plan = dataclasses.replace(plan, num_workers=n)
+    kids = children(plan)
+    if kids:
+        return with_children(plan, [_with_map_workers(c, n) for c in kids])
+    return plan
+
+
+def _map_udf_task(plan0, partition, workers: int = 1):
     from batcher import core
     from batcher.dist.executors.partition_io import read_partition_descriptor
     from batcher.io.source import InMemorySource
@@ -474,7 +1001,70 @@ def _map_udf_task(plan0, partition):
     rows = read_partition_descriptor(partition)
     if not rows:
         return None
-    out = core.execute_with_udfs(plan0, [InMemorySource(rows)])
+    out = core.execute_with_udfs(_with_map_workers(plan0, workers), [InMemorySource(rows)])
     if not out or sum(b.num_rows for b in out) == 0:
         return None
     return out
+
+
+def _map_agg_task(plan0, partition, group_keys_json, aggregates_json, workers: int = 1):
+    """Run the map/UDF prefix on a partition, then PARTIAL-aggregate its output.
+
+    The map (the expensive UDF) runs on the worker over its own partition, and only the
+    small partial-aggregate state leaves the worker — the driver does the cross-partition
+    `combine_finalize`. This distributes a `map_batches → aggregate` pipeline (Ray Data's
+    bread and butter) instead of running the whole UDF single-node on the driver."""
+    import batcher._native as nat
+    from batcher import core
+    from batcher.dist.executors.partition_io import read_partition_descriptor
+    from batcher.io.source import InMemorySource
+
+    rows = read_partition_descriptor(partition)
+    if not rows:
+        return None
+    out = core.execute_with_udfs(_with_map_workers(plan0, workers), [InMemorySource(rows)])
+    if not out or sum(b.num_rows for b in out) == 0:
+        return None
+    return nat.partial_aggregate(group_keys_json, aggregates_json, out)
+
+
+def _distributed_map_aggregate(above, agg, sources, workers):
+    """Distribute an aggregate over a linear `map_batches`/UDF pipeline.
+
+    Each worker maps its source partition through the UDF prefix and partial-aggregates
+    the result; the driver `combine_finalize`s the partials (mergeable two-phase) and
+    applies anything above the aggregate. The UDF — the costly part — runs across the
+    cluster, not single-node on the driver."""
+    import json
+
+    import pyarrow as pa
+
+    import batcher._native as nat
+    from batcher.dist.executors.partition_io import _apply_above, _empty_agg_table
+    from batcher.dist.executors.ray_runtime import current_envelope, gather_map_results
+
+    _ensure_ray(workers)
+    map_plan, sid = _relabel_single_source(agg.input)
+    gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys])
+    aj = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+    n_parts = _adaptive_partition_count(sources[sid], agg.input, workers)
+    partitions = partition_descriptors(sources[sid], n_parts)
+    # Skew-aware adaptive CPU per task (sized to the partition that runs the UDF here);
+    # placement resolves SPREAD vs locality-aware DEFAULT against the live cluster.
+    shares = _adaptive_task_cpus(partitions, agg.input)
+    sched = _map_scheduling_options(current_envelope(), shares)
+
+    def _launch(idx):
+        workers = max(1, round(shares[idx]))
+        return _map_agg_task.options(num_cpus=shares[idx], **sched).remote(
+            map_plan, partitions[idx], gk, aj, workers
+        )
+
+    partials = gather_map_results(_launch, len(partitions))
+    flat = [p for p in partials if p is not None]
+    if not flat:
+        table = _empty_agg_table(agg)
+    else:
+        out = nat.combine_finalize(gk, aj, flat)
+        table = pa.Table.from_batches([out]) if out is not None else _empty_agg_table(agg)
+    return table if not above else _apply_above(above, table)

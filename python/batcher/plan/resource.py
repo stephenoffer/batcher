@@ -24,12 +24,17 @@ class ResourceBounds:
     * `c_cpu_shares`    — CPU shares one task running this operator needs. A
       CPU-heavy breaker (hash/sort) saturates a core (`1.0`); a CPU-light,
       IO/decode-bound streaming op asks for a fraction so more tasks pack per node.
+    * `prefers_locality` — whether the operator's shuffle is small enough that
+      co-locating its workers (PACK) beats spreading them (SPREAD). Set by Kyber from
+      the estimated shuffle volume; consumed by Carbonite to pick a placement strategy
+      preference. A pure plan property — the live cluster decides the final strategy.
     """
 
     m_max_bytes: int
     c_max_credits: int
     n_max_parallelism: int
     c_cpu_shares: float = 1.0
+    prefers_locality: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +63,24 @@ class SchedulingEnvelope:
     * `n_tasks`      — worker/reducer fan-out, derived from estimated rows (replaces
                        a blind `os.cpu_count()`), clamped to the machine's budget.
     * `credits`      — initial shuffle credit window (flow-control bound).
+    * `placement_strategy` — preferred Ray placement-group strategy for the worker
+                       fleet (`SPREAD | PACK | STRICT_PACK | STRICT_SPREAD`). A
+                       *preference* derived from the plan; the distributed executor
+                       resolves it against the live cluster (e.g. downgrades SPREAD to
+                       PACK on a tiny cluster where spreading buys nothing).
+    * `prefer_cpu_only_nodes` — keep this (relational) fleet off GPU nodes when CPU-only
+                       nodes can host it, so a CPU shuffle never steals an inference
+                       stage's GPU-node cores. `dist` turns it into a node-label selector
+                       against the live topology; a no-op on a homogeneous cluster.
+    * `gpu_collective` — the GPU stage's UDF runs its own multi-GPU collective (NCCL/etc.)
+                       internally, so `dist` gang-schedules its actors co-located
+                       (STRICT_PACK). Batcher never touches a tensor — the Arrow contract
+                       at operator boundaries is unchanged; only placement is affected.
+    * `inflight_depth` — per-actor submit-ahead depth for a GPU/inference actor pool: how
+                       many partitions one actor may have in flight at once. `1` is the
+                       one-at-a-time default; `>1` keeps a GPU fed across the
+                       dispatch/gather round-trip. Set by the conductor from measured GPU
+                       utilization; consumed only by the `dist` actor-pool driver.
     """
 
     num_cpus: float = 1.0
@@ -72,3 +95,10 @@ class SchedulingEnvelope:
     # as `"NVIDIA_A100"`); `None` lets Ray pick any GPU. Passed straight to
     # `.options(accelerator_type=...)` for GPU map/inference stages.
     accelerator_type: str | None = None
+    # Scheduling hints resolved entirely in the `dist` layer (never serialized to the
+    # JSON IR / FFI). Defaults preserve today's behavior: SPREAD, no node-class
+    # preference, no collective co-location.
+    placement_strategy: str = "SPREAD"
+    prefer_cpu_only_nodes: bool = False
+    gpu_collective: bool = False
+    inflight_depth: int = 1

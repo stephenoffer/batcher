@@ -4489,7 +4489,7 @@ Do mid-query adaptations (join flips, backend switches) preserve query semantics
 | Storage | EBS gp3 (3000 IOPS baseline, 125 MB/s throughput) |
 | Network | Up to 10 Gbps (shared, measured 10-50ms RTT between nodes) |
 | Cluster Size | 4-8 nodes (64-128 total vCPUs) |
-| Runtime | Ray 2.9.0 on Anyscale Platform |
+| Runtime | Ray 2.9.0 |
 | Python | 3.10.13 |
 | Polars | 0.20.3 |
 | DuckDB | 0.9.2 |

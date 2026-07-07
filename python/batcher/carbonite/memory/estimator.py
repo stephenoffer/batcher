@@ -41,12 +41,21 @@ class OperatorMemoryEstimator:
     the credit and parallelism fields carry the same conservative defaults the
     bootstrap used so the flow-control and scheduling sides are unaffected until
     they grow their own estimates.
+
+    When a `LearnedMemoryModel` is present on the context (the hub has measured
+    `m_peak_bytes` for this operator family), each operator's plan estimate is
+    *blended* toward that measured reality before the dominant breaker is taken —
+    so admission, spill, and reserve all size against what the query really used,
+    not the plan guess alone. Cold families pass through unchanged, so on a cold
+    store the envelope equals the plan's own dominant breaker exactly.
     """
 
     def envelope(self, plan: PhysicalPlan, ctx: ResourceContext) -> ResourceBounds:
         fc = ctx.config.flow_control
+        model = ctx.memory_model
+        peak = model.plan_peak(plan.ops) if model is not None else peak_operator_bytes(plan)
         return ResourceBounds(
-            m_max_bytes=peak_operator_bytes(plan),
+            m_max_bytes=peak,
             c_max_credits=fc.default_credits,
             n_max_parallelism=ctx.config.execution.parallelism or 0,
         )

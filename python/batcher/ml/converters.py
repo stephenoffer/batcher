@@ -47,7 +47,16 @@ def arrays_to_torch(arrays: dict[str, np.ndarray], *, zero_copy: bool = False) -
                 return torch.from_dlpack(array)  # zero-copy view (read-only)
             except (TypeError, RuntimeError, BufferError, ValueError):
                 pass  # non-contiguous / unsupported → fall through to a copy
-        return torch.from_numpy(array.copy())
+        # Own writable memory decoupled from any read-only Arrow buffer — but avoid a
+        # redundant copy when the array is ALREADY an owned, writable, contiguous buffer
+        # (e.g. the result of a shuffle's fancy-index gather, or a decoded batch): a training
+        # loop may mutate it in place safely, and skipping the copy roughly halves the
+        # tensorize cost of a wide feature column.
+        if array.flags.owndata and array.flags.writeable and array.flags.c_contiguous:
+            return torch.from_numpy(array)
+        import numpy as np
+
+        return torch.from_numpy(np.ascontiguousarray(array).copy())
 
     return {name: _convert(array) for name, array in arrays.items() if array.dtype.kind in "biufc"}
 
@@ -70,7 +79,28 @@ def to_numpy_batches(
     """
     for batch in batches:
         names = list(batch.schema.names) if columns is None else list(columns)
-        yield {name: batch.column(name).to_numpy(zero_copy_only=False) for name in names}
+        yield {name: _column_to_numpy(batch.column(name)) for name in names}
+
+
+def _column_to_numpy(column: pa.Array) -> np.ndarray:
+    """One Arrow column → NumPy, restoring a fixed-shape-tensor **or** fixed-size-list
+    numeric column to its full ``(n, width...)`` array (image/embedding/feature-vector
+    columns) rather than an opaque per-row object array — so a feature/embedding column
+    feeds a training loop as a real 2-D tensor instead of being silently dropped. Plain
+    columns convert as before (zero-copy where possible)."""
+    import pyarrow as pa
+
+    from batcher.io.formats.ml.tensor import is_tensor_column
+
+    arr = column.combine_chunks() if isinstance(column, pa.ChunkedArray) else column
+    if is_tensor_column(arr):
+        return arr.to_numpy_ndarray()  # (n, *shape), shape from the tensor type
+    if pa.types.is_fixed_size_list(arr.type) and pa.types.is_primitive(arr.type.value_type):
+        w = arr.type.list_size
+        child = arr.flatten().to_numpy(zero_copy_only=False)
+        if child.dtype.kind in "biufc":  # numeric child → (n, W); else fall through
+            return child.reshape(-1, w)
+    return arr.to_numpy(zero_copy_only=False)
 
 
 def to_torch_iterable(

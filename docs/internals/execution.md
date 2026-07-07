@@ -97,6 +97,71 @@ does not fit in memory slows down rather than failing. None of this requires a
 different plan — spilling is a property of the runtime primitive, not a separate
 operator.
 
+## Answering from metadata (no scan)
+
+The fastest execution is none at all. Before a terminal runs the engine, the
+conductor asks Kyber whether the answer is *provably* derivable from the sources'
+declared statistics — a Parquet/ORC footer, a lakehouse manifest, a SQL catalog —
+which the IO layer already opens for schema and split planning. When it is, the
+terminal returns the answer without touching a row.
+
+The layer covers the terminals whose result a footer can carry:
+
+- `count()` / `is_empty()` — from the relation's exact row count (an ORC `nrows`, a
+  summed Parquet footer), through row-preserving projections, and across the
+  mergeable operators that keep an exact count (an empty-side join, `limit(0)`, a
+  UNION of exact counts).
+- Global (keyless) aggregates — `min` / `max` from footer bounds, `count(*)`,
+  `count(col)` from `rows − null_count`, `sum` from a catalog's recorded total,
+  `n_unique` / `count_distinct` from an exact distinct count, and `bool_and` /
+  `bool_or` from a boolean column's exact min/max.
+- Per-column existence and null facets — `null_count`, `has_nulls`, `all_null`.
+- Filtered counts — `WHERE col IS NULL` is exactly the recorded null count,
+  `col IS NOT NULL` is `rows − null_count`, and a provably out-of-range predicate
+  (`col > max`, `col = v` outside `[min, max]` or absent from the column's
+  membership bloom) is exactly `0`. A predicate that only *partially* overlaps the
+  column's range needs a histogram, so it is **not** answered — it falls back.
+- `describe()` / `summary()` — a per-column snapshot assembled from whichever
+  facets are exact, omitting the rest so the caller runs the real describe for what
+  is missing.
+- A provably-empty plan — `_collect` short-circuits a contradiction filter,
+  `limit(0)`, an always-false predicate, or an empty-side join to a correct-schema,
+  zero-row table with no scan.
+
+### The firewall: exact or fall back
+
+A wrong metadata answer is not a slow query — it is *silent corruption*. So the
+whole layer is gated on one rule: an exact answer is produced only from statistics
+that are `Provenance.EXACT` **end to end**. Footer min/max (on numeric, temporal,
+boolean, and decimal columns), null counts, and exact row counts are EXACT; a
+byte-truncated string bound, a filtered/limited column (whose min/max survive only
+as *bounds*), a sketch-derived distinct count, and a learned prior are **not**. An
+inexact statistic never answers an exact terminal — it may only inform cost or back
+an explicitly-named `approx_*` terminal (`approx_n_unique`, an approximate
+quantile). Provenance can only ever be *weakened* as stats propagate through the
+plan (via the single `weakest`/`downgrade` combiner), so nothing can silently
+over-claim, and every shortcut returns `None` — meaning "execute normally" — the
+moment it cannot prove exactness. A metadata answer is therefore an optimization
+that can never change a result.
+
+This is proven, not asserted: property tests generate random data and assert the
+metadata answer equals the executed answer equals DuckDB across the covered
+terminals. One correctness fix the discipline caught: Parquet's `distinct_count` is
+only an *estimate*, but it had been tagged EXACT — which would have let it answer an
+exact `count_distinct` wrongly. It is now `SKETCH`, kept only on already-inexact
+columns to inform cost and `approx_count_distinct`.
+
+```python
+# docs: run
+import batcher as bt
+
+ds = bt.from_pydict({"x": [1, 2, 3, 4, 5]})
+# Answered from the source's exact row count — no scan.
+assert ds.count() == 5
+# Provably empty: the predicate is out of range, so is_empty() short-circuits.
+assert ds.filter(bt.col("x") > 100).is_empty()
+```
+
 ## Running a query
 
 Execution is lazy. Operations build a plan; nothing runs until a terminal call.

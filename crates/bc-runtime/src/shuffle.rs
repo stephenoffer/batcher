@@ -16,8 +16,15 @@ use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, StringArray, UInt
 use arrow::compute::{cast, take};
 use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
+use rayon::prelude::*;
 
 use crate::error::RuntimeError;
+
+/// Below this row count the hash pass runs serially: rayon's fan-out/join costs more
+/// than it saves on a small batch (and most morsels are small). A shuffle of millions
+/// of rows — a join build/probe side or a distributed map partition — clears it and
+/// fans the hash across every core.
+const PAR_HASH_MIN_ROWS: usize = 1 << 16;
 
 // Fixed seeds → deterministic partitioning within a process (so the two sides of
 // a join hash identically). Not for security; collision resistance is irrelevant.
@@ -58,9 +65,15 @@ pub fn partition_by_key_arrays(
     let n = batch.num_rows();
 
     // One hash pass → the bucket id per row. An empty key set routes every row to
-    // bucket 0 (hashing an empty row is ill-defined).
+    // bucket 0 (hashing an empty row is ill-defined). A single integer key hashes its
+    // native values directly, skipping the `RowConverter` encoding the general path
+    // needs — the bucket id is a deterministic function of the key value either way,
+    // and both sides of a join shuffle dispatch on the same key type, so equal keys
+    // still co-partition (the invariant the distributed/parallel join relies on).
     let part_of: Vec<u32> = if keys.is_empty() {
         vec![0u32; n]
+    } else if let Some(part) = partition_int_key(keys, num_partitions) {
+        part
     } else {
         let fields: Vec<SortField> = keys
             .iter()
@@ -68,9 +81,16 @@ pub fn partition_by_key_arrays(
             .collect();
         let converter = RowConverter::new(fields)?;
         let rows = converter.convert_columns(keys)?;
-        (0..n)
-            .map(|i| bucket_of(SEED.hash_one(rows.row(i)), num_partitions))
-            .collect()
+        if n >= PAR_HASH_MIN_ROWS {
+            (0..n)
+                .into_par_iter()
+                .map(|i| bucket_of(SEED.hash_one(rows.row(i)), num_partitions))
+                .collect()
+        } else {
+            (0..n)
+                .map(|i| bucket_of(SEED.hash_one(rows.row(i)), num_partitions))
+                .collect()
+        }
     };
 
     scatter_into_buckets(batch, &part_of, num_partitions)
@@ -88,27 +108,61 @@ fn scatter_into_buckets(
     num_partitions: usize,
 ) -> Result<Vec<RecordBatch>, RuntimeError> {
     let n = part_of.len();
-    let mut offsets = vec![0u32; num_partitions + 1];
-    for &b in part_of {
-        offsets[b as usize + 1] += 1;
-    }
-    for b in 0..num_partitions {
-        offsets[b + 1] += offsets[b];
-    }
-    let mut scatter = vec![0u32; n];
-    let mut cursor = offsets[..num_partitions].to_vec();
-    for (i, &b) in part_of.iter().enumerate() {
-        let pos = &mut cursor[b as usize];
-        scatter[*pos as usize] = i as u32;
-        *pos += 1;
+    // Small input: serial counting sort, one contiguous scatter buffer.
+    if n < PAR_HASH_MIN_ROWS {
+        let mut offsets = vec![0u32; num_partitions + 1];
+        for &b in part_of {
+            offsets[b as usize + 1] += 1;
+        }
+        for b in 0..num_partitions {
+            offsets[b + 1] += offsets[b];
+        }
+        let mut scatter = vec![0u32; n];
+        let mut cursor = offsets[..num_partitions].to_vec();
+        for (i, &b) in part_of.iter().enumerate() {
+            let pos = &mut cursor[b as usize];
+            scatter[*pos as usize] = i as u32;
+            *pos += 1;
+        }
+        return (0..num_partitions)
+            .map(|b| {
+                take_rows(
+                    batch,
+                    &scatter[offsets[b] as usize..offsets[b + 1] as usize],
+                )
+            })
+            .collect();
     }
 
+    // Large input: stable parallel counting sort. Each row-range chunk builds its own
+    // per-bucket index lists in parallel; concatenating those lists in chunk order
+    // (each chunk's already ascending) reproduces the serial scatter's exact per-bucket
+    // ordering. The per-bucket gather then runs across every core — the partitioner
+    // under both the single-node hash join and the distributed shuffle.
+    let nthreads = rayon::current_num_threads().max(1);
+    let chunk = n.div_ceil(nthreads).max(1);
+    let per_chunk: Vec<Vec<Vec<u32>>> = part_of
+        .par_chunks(chunk)
+        .enumerate()
+        .map(|(ci, slice)| {
+            let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); num_partitions];
+            let base = (ci * chunk) as u32;
+            for (j, &b) in slice.iter().enumerate() {
+                buckets[b as usize].push(base + j as u32);
+            }
+            buckets
+        })
+        .collect();
+
     (0..num_partitions)
+        .into_par_iter()
         .map(|b| {
-            take_rows(
-                batch,
-                &scatter[offsets[b] as usize..offsets[b + 1] as usize],
-            )
+            let total: usize = per_chunk.iter().map(|c| c[b].len()).sum();
+            let mut idx = Vec::with_capacity(total);
+            for c in &per_chunk {
+                idx.extend_from_slice(&c[b]);
+            }
+            take_rows(batch, &idx)
         })
         .collect()
 }
@@ -134,6 +188,29 @@ pub fn range_partition_by_key(
     nulls_first: bool,
     descending: bool,
 ) -> Result<Vec<RecordBatch>, RuntimeError> {
+    range_partition_by_key_array(
+        batch,
+        batch.column(key_index),
+        boundaries,
+        n_buckets,
+        nulls_first,
+        descending,
+    )
+}
+
+/// Like [`range_partition_by_key`], but the leading sort key is supplied directly as an
+/// array rather than by column index — so a *computed* `ORDER BY` key (or the
+/// single-node parallel sample-sort, whose key comes from an expression eval) can
+/// range-partition without first appending the key to `batch`. `key` must have
+/// `batch.num_rows()` rows.
+pub fn range_partition_by_key_array(
+    batch: &RecordBatch,
+    key_col: &ArrayRef,
+    boundaries: &[f64],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<RecordBatch>, RuntimeError> {
     assert!(n_buckets >= 1);
     if n_buckets == 1 {
         return Ok(vec![batch.clone()]);
@@ -150,7 +227,6 @@ pub fn range_partition_by_key(
     // Arrow would happily parse a string like "12" to 12.0, which would disagree with
     // the single-node *lexical* string sort — exactly what the old `to_numpy()` on a
     // string column refused to do.
-    let key_col = batch.column(key_index);
     if !key_col.data_type().is_numeric() {
         return Err(RuntimeError::NonNumericRangeKey {
             dtype: key_col.data_type().to_string(),
@@ -176,6 +252,56 @@ pub fn range_partition_by_key(
                     boundaries.partition_point(|&b| b <= v)
                 };
                 id as u32
+            }
+        })
+        .collect();
+
+    scatter_into_buckets(batch, &part_of, n_buckets)
+}
+
+/// Like [`range_partition_by_key_array`], but for an **integer** leading key compared
+/// **exactly** as `i64` (boundaries are `i64` quantiles) — no `f64` cast, so a key beyond
+/// `2^53` is routed without precision loss. Any signed/unsigned integer width is widened
+/// to `i64` (order-preserving). The single-node parallel sample-sort uses this for an
+/// integer `ORDER BY` leading key; floats keep [`range_partition_by_key_array`].
+pub fn range_partition_by_i64_key(
+    batch: &RecordBatch,
+    key_col: &ArrayRef,
+    boundaries: &[i64],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<RecordBatch>, RuntimeError> {
+    assert!(n_buckets >= 1);
+    if n_buckets == 1 {
+        return Ok(vec![batch.clone()]);
+    }
+    let front = if descending { n_buckets - 1 } else { 0 };
+    let null_bucket = if nulls_first {
+        front
+    } else {
+        n_buckets - 1 - front
+    } as u32;
+
+    if !matches!(key_col.data_type(), t if t.is_integer()) {
+        return Err(RuntimeError::NonNumericRangeKey {
+            dtype: key_col.data_type().to_string(),
+        });
+    }
+    let key = cast(key_col, &DataType::Int64)?;
+    let key = key
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .ok_or_else(|| RuntimeError::NonNumericRangeKey {
+            dtype: key_col.data_type().to_string(),
+        })?;
+
+    let part_of: Vec<u32> = (0..batch.num_rows())
+        .map(|i| {
+            if key.is_null(i) {
+                null_bucket
+            } else {
+                boundaries.partition_point(|&b| b <= key.value(i)) as u32
             }
         })
         .collect();
@@ -275,6 +401,60 @@ fn salted_hash(key_hash: u64, salt: u32) -> u64 {
 /// hash's high-entropy bits. Deterministic, so equal keys (and both join sides)
 /// always agree within a run.
 #[inline]
+/// Per-row bucket ids for a single `Int64` key, hashing native values directly (no
+/// row encoding). `None` unless every key column is `Int64` (narrow ints are normalized
+/// to `Int64` upstream, so this covers the common single- and composite-integer shuffle
+/// shapes). Null slots hash their (arbitrary) raw value; that is harmless — a null key
+/// still lands in *some* bucket consistently, and join matching rejects it separately.
+fn partition_int_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32>> {
+    use arrow::array::Int64Array;
+    if keys.is_empty() || !keys.iter().all(|k| k.data_type() == &DataType::Int64) {
+        return None;
+    }
+    // Single Int64 key — hash the raw value directly (null slots hash their arbitrary raw
+    // value, harmless for a shuffle join since null keys never match).
+    if keys.len() == 1 {
+        let vals = keys[0].as_any().downcast_ref::<Int64Array>()?.values();
+        let hash1 = |v: &i64| bucket_of(SEED.hash_one(*v), num_partitions);
+        return Some(if vals.len() >= PAR_HASH_MIN_ROWS {
+            vals.par_iter().map(hash1).collect()
+        } else {
+            vals.iter().map(hash1).collect()
+        });
+    }
+    // Composite Int64 key (e.g. a `(part, supplier)` join / group shuffle). Fold each
+    // column's raw value into one hasher per row — skips the `RowConverter` encode the
+    // general path runs. Like the single-key path, a null slot hashes its arbitrary raw
+    // value: BOTH shuffle sides are the same key type and so take this same path, so equal
+    // non-null keys still co-partition (the only invariant a join needs — null keys never
+    // match). This path is therefore used for join/group shuffles, not a null-sensitive
+    // DISTINCT (which dedups via the row-encoded `assign_groups`, where nulls compare equal).
+    let cols: Vec<&[i64]> = keys
+        .iter()
+        .map(|k| {
+            k.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .as_ref()
+        })
+        .collect();
+    let n = cols[0].len();
+    let hashn = |i: usize| -> u32 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = SEED.build_hasher();
+        for c in &cols {
+            h.write_i64(c[i]);
+        }
+        bucket_of(h.finish(), num_partitions)
+    };
+    Some(if n >= PAR_HASH_MIN_ROWS {
+        (0..n).into_par_iter().map(hashn).collect()
+    } else {
+        (0..n).map(hashn).collect()
+    })
+}
+
 fn bucket_of(hash: u64, num_partitions: usize) -> u32 {
     if num_partitions.is_power_of_two() {
         (hash & (num_partitions as u64 - 1)) as u32

@@ -13,8 +13,10 @@ bases structurally satisfy them. `Split` lives in `io.splits`.
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import IO, Any, ClassVar
 
@@ -25,6 +27,11 @@ from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.splits import FileSplit, RowGroupSplit, Split
 
 __all__ = ["FileSink", "FileSource", "pack_row_groups"]
+
+# How many files a streaming `iter_batches` decodes concurrently (bounded read-ahead).
+# Caps the parallel-read memory to ~this many files while overlapping I/O + decode so a
+# streaming consumer isn't throttled by a one-file-at-a-time read.
+_ITER_READAHEAD_FILES = 16
 
 
 def pack_row_groups(
@@ -100,19 +107,63 @@ class FileSource(ABC):
         return self._schema_cache
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        out: list[pa.RecordBatch] = []
-        for f in self._files():
+        files = self._files()
+
+        def _read_one(f: str) -> list[pa.RecordBatch]:
             with self._fs.open(f) as fh:
-                out.extend(
+                return list(
                     self._normalize(self._read_file(fh, self._file_proj(f, projection)), projection)
                 )
+
+        # Read the files concurrently: the decode runs in the C++ layer with the GIL
+        # released, so a many-small-files read (thousands of Parquet parts — the shape
+        # every distributed producer and object-store dataset lands in) no longer opens
+        # and parses them one at a time. `read()` already materializes the whole source,
+        # so holding all batches adds no memory beyond what it already returns. Order is
+        # preserved so a downstream that assumes file order is unaffected.
+        if len(files) <= 1:
+            return _read_one(files[0]) if files else []
+        from concurrent.futures import ThreadPoolExecutor
+
+        workers = min(len(files), (os.cpu_count() or 1) * 2)
+        out: list[pa.RecordBatch] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for batches in pool.map(_read_one, files):  # order preserved
+                out.extend(batches)
         return out
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        for f in self._files():
-            yield from self._normalize(
-                self._iter_file(f, self._file_proj(f, projection)), projection
-            )
+        files = self._files()
+        if len(files) <= 1:
+            for f in files:
+                yield from self._normalize(
+                    self._iter_file(f, self._file_proj(f, projection)), projection
+                )
+            return
+
+        # Bounded, order-preserving parallel read-ahead: keep ~`depth` files decoding
+        # concurrently (Parquet/Arrow decode releases the GIL) so a streaming consumer —
+        # a training loader's `iter_torch_batches`, a `read→map→write` — isn't throttled
+        # by a one-file-at-a-time read (the serial read, not compute, is the ceiling).
+        # Memory stays bounded to ~`depth` files (never the whole dataset), and files are
+        # yielded in order so a downstream that assumes file order is unaffected.
+        import itertools
+        from collections import deque
+
+        depth = min(len(files), max(2, min(os.cpu_count() or 4, _ITER_READAHEAD_FILES)))
+
+        def _read(f: str) -> list[pa.RecordBatch]:
+            return list(self._iter_file(f, self._file_proj(f, projection)))
+
+        remaining = iter(files)
+        with ThreadPoolExecutor(max_workers=depth) as pool:
+            pending = deque(pool.submit(_read, f) for f in itertools.islice(remaining, depth))
+            while pending:
+                fut = pending.popleft()
+                nxt = next(remaining, None)
+                if nxt is not None:
+                    pending.append(pool.submit(_read, nxt))
+                yield from self._normalize(iter(fut.result()), projection)
 
     def _file_proj(self, path: str, projection: list[str] | None) -> list[str] | None:
         """The columns to actually request from `path`. In non-strict mode a file may
@@ -143,7 +194,16 @@ class FileSource(ABC):
             yield normalize_batch(b, target)
 
     def row_count(self) -> int | None:
-        counts = [self._file_row_count(f) for f in self._files()]
+        files = self._files()
+        # Each `_file_row_count` reads a footer (a ~80ms object-store round trip for
+        # Parquet, cached after the first read); over a many-file dataset the serial loop
+        # dominates a distributed query's driver phase, so read them concurrently on a
+        # small pool — exactly as `splits()` does. A single file skips the pool.
+        if len(files) <= 1:
+            counts = [self._file_row_count(f) for f in files]
+        else:
+            with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:
+                counts = list(pool.map(self._file_row_count, files))
         return None if any(c is None for c in counts) else sum(counts)  # type: ignore[misc]
 
     def identity(self) -> str:
@@ -159,10 +219,18 @@ class FileSource(ABC):
             from batcher.io.splits import WholeSourceSplit
 
             return [WholeSourceSplit(self)]
-        splits: list[Split] = []
-        for f in self._files():
-            splits.extend(self._file_splits(f, target_size))
-        return splits
+        files = self._files()
+        # `_file_splits` reads each file's footer (a ~100ms object-store round trip for
+        # Parquet); over a many-file dataset that serial loop dominates a distributed
+        # query's driver phase (TPC-H sf100: 100 files ≈ 12s of otherwise-idle driver
+        # time while the workers wait). Read the footers concurrently on a small pool —
+        # order is preserved so a downstream that assumes file order is unaffected. A
+        # single file (the common small case) skips the pool entirely.
+        if len(files) <= 1:
+            return [s for f in files for s in self._file_splits(f, target_size)]
+        with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:
+            per_file = pool.map(lambda f: self._file_splits(f, target_size), files)
+        return [s for file_splits in per_file for s in file_splits]
 
     # ---- override points --------------------------------------------------
     @abstractmethod
@@ -328,12 +396,27 @@ class FileSink(ABC):
         if max_rows_per_file is None or table.num_rows <= max_rows_per_file:
             name = f"{directory}/part-{file_index:05d}{self.suffix}"
             return [self.write(table, name, resume=resume)]
-        out: list[WrittenFile] = []
-        for chunk_idx, start in enumerate(range(0, table.num_rows, max_rows_per_file)):
-            chunk = table.slice(start, max_rows_per_file)
+
+        # Write the parts concurrently: the columnar encode + compression (Parquet/
+        # Arrow/CSV) runs in the C++ layer with the GIL released, so a thread per part
+        # turns a serial N-file write into a parallel one (a directory write — Ray Data's
+        # default output shape — otherwise writes each shard back to back). Slices are
+        # zero-copy views over one already-resident table, so this adds no memory.
+        chunks = [
+            (chunk_idx, table.slice(start, max_rows_per_file))
+            for chunk_idx, start in enumerate(range(0, table.num_rows, max_rows_per_file))
+        ]
+
+        def _write_chunk(item: tuple[int, pa.Table]) -> WrittenFile:
+            chunk_idx, chunk = item
             name = f"{directory}/part-{file_index:05d}-{chunk_idx:05d}{self.suffix}"
-            out.append(self.write(chunk, name, resume=resume))
-        return out
+            return self.write(chunk, name, resume=resume)
+
+        if len(chunks) == 1:
+            return [_write_chunk(chunks[0])]
+        workers = min(len(chunks), os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(_write_chunk, chunks))  # order preserved
 
     def commit(self, manifest: WriteManifest, path: str) -> None:  # noqa: B027 (intentional no-op default)
         """Finalize a write. File sinks make data visible on write, so the base
@@ -378,13 +461,13 @@ def _safe_size(fs: Any, path: str) -> int:
 
 def _parquet_row_group_splits(path: str, target_size: int | None) -> list[Split]:
     """Build `RowGroupSplit`s for a single Parquet file (used by ParquetSource)."""
-    import pyarrow.parquet as pq
+    from batcher.io.splits import _parquet_footer
 
-    fs = resolve_filesystem(path)
-    with fs.open(path) as fh:
-        meta = pq.ParquetFile(fh).metadata
-        sizes = [meta.row_group(i).total_byte_size for i in range(meta.num_row_groups)]
-        rows = [meta.row_group(i).num_rows for i in range(meta.num_row_groups)]
-        runs = pack_row_groups(meta.num_row_groups, sizes, target_size)
+    # The cached footer avoids re-reading the metadata here AND on the worker that later
+    # reads these splits (a ~100ms object-store round trip per call); see `_parquet_footer`.
+    meta = _parquet_footer(path)
+    sizes = [meta.row_group(i).total_byte_size for i in range(meta.num_row_groups)]
+    rows = [meta.row_group(i).num_rows for i in range(meta.num_row_groups)]
+    runs = pack_row_groups(meta.num_row_groups, sizes, target_size)
     # Carry the footer-derived row count so balancing never re-opens the file.
     return [RowGroupSplit(path, run, sum(rows[i] for i in run)) for run in runs]

@@ -17,10 +17,10 @@ working for the Flight and spill paths.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
-import tempfile
 
 import pyarrow as pa
 
@@ -44,6 +44,7 @@ from batcher.dist.executors.ray_runtime import _ensure_ray as _ensure_ray
 from batcher.dist.executors.ray_runtime import _rmtree as _rmtree
 from batcher.dist.executors.ray_runtime import (
     _single_node,
+    await_autoscale,
     clamp_workers,
     engine_config_json,
     release_autoscale,
@@ -51,6 +52,7 @@ from batcher.dist.executors.ray_runtime import (
     reset_scheduling_envelope,
     resolve_transport,
     set_scheduling_envelope,
+    topology_scope,
 )
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
@@ -110,12 +112,66 @@ def execute_distributed(
     # the autoscaler for the cores this query wants (released in the `finally` so a
     # one-off big job doesn't pin the cluster scaled-up), clamp the fan-out to
     # schedulable capacity, and pick the transport from the resulting topology.
-    num_cpus = envelope.num_cpus if envelope is not None else 1.0
+    num_cpus, num_gpus = (envelope.num_cpus, envelope.num_gpus) if envelope else (1.0, 0.0)
     token = set_scheduling_envelope(envelope)
-    request_autoscale(math.ceil(workers * num_cpus))
+    import os as _oz
+    import time as _tz
+
+    _pz = _oz.environ.get("BATCHER_SORT_PROFILE")
+    _z0 = _tz.perf_counter()
+    request_autoscale(math.ceil(workers * num_cpus), workers * num_gpus)
     try:
         _ensure_ray(workers)
-        clamped = clamp_workers(workers, num_cpus)
+        # Wait (bounded, growth-detected) for the autoscaler to bring the cluster toward
+        # the cores this query asked for BEFORE sizing the fan-out — otherwise the
+        # worker-per-node fill below reads the pre-scale (small) topology and the query
+        # never uses the nodes it triggered (the wait inside `clamp_workers` can't help
+        # once the fill has made `workers == capacity`). A fixed cluster / unavailable
+        # capacity bails fast via the stall window; disabled by `autoscale_wait_s <= 0`.
+        # Pure scheduling — the result is identical whether it waits or not.
+        if num_workers is None:
+            await_autoscale(math.ceil(workers * num_cpus), workers * num_gpus)
+        # On a multi-node cluster, fan out to exactly ONE worker per node, each owning
+        # that node's cores — the cluster-filling, evenly-distributed shape. This (a) uses
+        # every node for any non-trivial query (max, even utilization — more workers than
+        # nodes can't add CPU parallelism since cores are the limit, but each node-worker
+        # saturates its cores via morsel parallelism + spill), (b) keeps shuffle fan-out
+        # minimal (one bucket stream per node, not per core), and (c) gives the reused
+        # session fleet a stable, adequate size independent of which query first spawned
+        # it — the data-driven count would size the fleet to the first (maybe tiny) query
+        # and then under-provision a later big one. An explicit `num_workers` overrides it;
+        # a single node falls back to the data-driven `_even_cpu_share` path below.
+        fill = None if num_workers is not None else _cluster_fill_workers()
+        if fill is not None:
+            desired, (workers, num_cpus) = workers, fill
+            mem = (
+                int(envelope.memory_bytes * max(1, desired) / workers)
+                if envelope is not None and envelope.memory_bytes
+                else (envelope.memory_bytes if envelope is not None else 0)
+            )
+            envelope = (
+                dataclasses.replace(envelope, n_tasks=workers, num_cpus=num_cpus, memory_bytes=mem)
+                if envelope is not None
+                else SchedulingEnvelope(num_cpus=num_cpus, n_tasks=workers)
+            )
+            reset_scheduling_envelope(token)
+            token = set_scheduling_envelope(envelope)
+        # Ray is up, so the live topology is readable: give each worker an EVEN SHARE of
+        # the cluster's CPUs (capped at one node's cores), not the single core Carbonite's
+        # per-operator `num_cpus` models — a `_FlightWorker` runs the multi-core executor
+        # over a whole partition and a managed cgroup would pin it to 1 core, throttling
+        # the scan ~Ncores×. MUST run after `_ensure_ray` (`ray.nodes()` is empty before).
+        share = _even_cpu_share(workers)
+        if share > num_cpus:
+            envelope = (
+                dataclasses.replace(envelope, num_cpus=share)
+                if envelope is not None
+                else SchedulingEnvelope(num_cpus=share, n_tasks=workers)
+            )
+            num_cpus = share
+            reset_scheduling_envelope(token)
+            token = set_scheduling_envelope(envelope)
+        clamped = clamp_workers(workers, num_cpus, num_gpus)
         # Carbonite sized the per-task memory hint against its *desired* fan-out;
         # once the cluster clamp reduces (or the data-driven want exceeds) it, each
         # real task holds a larger share. Rescale the soft memory hint to the actual
@@ -126,13 +182,86 @@ def execute_distributed(
             token = set_scheduling_envelope(envelope)
             _ensure_ray(clamped)
         workers = clamped
-        transport = resolve_transport(transport, workers)
-        return _dispatch(
-            plan, sources, workers, transport, hub, materialize=materialize, metrics_out=metrics_out
-        )
+        # The worker count and cluster size are now settled (autoscale-wait + clamp done),
+        # so snapshot the topology once for the whole placement/transport/shuffle phase
+        # instead of paying a fresh `ray.nodes()` RPC at each of its ~5 read sites — the
+        # O(nodes)-per-read amplification that bites at thousands of nodes.
+        with topology_scope():
+            transport = resolve_transport(transport, workers)
+            if _pz:
+                print(f"[sort] execute_distributed PRE-dispatch {_tz.perf_counter() - _z0:.1f}s", flush=True)
+            return _dispatch(
+                plan,
+                sources,
+                workers,
+                transport,
+                hub,
+                materialize=materialize,
+                metrics_out=metrics_out,
+            )
     finally:
         release_autoscale()  # let the autoscaler reclaim what this query scaled up
         reset_scheduling_envelope(token)
+
+
+def _worker_node_cpus() -> list[float]:
+    """CPU counts of the nodes eligible to run distributed workers.
+
+    Excludes the Ray **head** node (marker ``node:__internal_head__``) when at least one
+    other node exists: the head runs the GCS / dashboard / job supervisor, and scheduling
+    data operators on it causes contention and instability (Ray Data hits this — the
+    guides' "set `num_cpus=0` on the head" rule). Many managed clusters already give the
+    head 0 CPU, so the `> 0` filter handles it there; excluding by marker makes Batcher
+    correct on a raw Ray cluster whose head has cores too — "works on any cluster type". A
+    single-node cluster (head only) keeps the head, since it must run the work.
+    """
+    import ray
+
+    alive = [n for n in ray.nodes() if n.get("Alive")]
+    non_head = [n for n in alive if "node:__internal_head__" not in n.get("Resources", {})]
+    nodes = non_head if non_head else alive  # keep the head only if it's the whole cluster
+    return [c for c in (float(n.get("Resources", {}).get("CPU", 0.0)) for n in nodes) if c > 0]
+
+
+def _cluster_fill_workers() -> tuple[int, float] | None:
+    """The cluster-filling fan-out: one worker per (non-head) node, each owning that node's
+    cores.
+
+    Returns `(workers, num_cpus)` on a genuine multi-node cluster — `workers` = the live
+    worker-node count, `num_cpus` = the smallest node's cores (so the per-worker grant is
+    placeable on every node, SPREAD-safe). Returns `None` on a single node or when the
+    topology is unreadable, so the caller keeps the data-driven `_even_cpu_share` sizing.
+    Ray must already be initialized (`ray.nodes()` is empty before).
+    """
+    try:
+        node_cpus = _worker_node_cpus()
+        if len(node_cpus) <= 1:
+            return None
+        return len(node_cpus), float(int(min(node_cpus)))
+    except Exception:
+        return None
+
+
+def _even_cpu_share(workers: int) -> float:
+    """CPUs to grant each distributed worker so the fan-out isn't single-core-starved.
+
+    Two hard constraints: the grant must be **placeable on every node** (capped at
+    `min(node cores)`, since workers are SPREAD across nodes) and must not over-subscribe
+    (capped at `floor(total / workers)`). Within those, hand each worker as many cores as
+    possible (`>= 1`) so its parallel scan-read + fold use the node, not one cgroup-pinned
+    core. The grant is deliberately *uniform* — skew is handled orthogonally (LPT-balanced
+    splits in `_balance`; salted hot join keys in `join_par`). Returns 1.0 (historical
+    default) when topology is unavailable.
+    """
+    try:
+        node_cpus = _worker_node_cpus()
+        if not node_cpus or workers <= 0:
+            return 1.0
+        placeable = float(int(min(node_cpus)))  # fits the smallest node (SPREAD-safe)
+        non_oversubscribing = float(sum(node_cpus) // workers)  # workers x grant <= cluster
+        return max(1.0, min(placeable, non_oversubscribing))
+    except Exception:
+        return 1.0
 
 
 def _rescale_envelope(
@@ -143,8 +272,6 @@ def _rescale_envelope(
     The per-task memory hint was `peak // desired`; with `actual` tasks each holds
     `peak // actual`, so scale the hint by `desired / actual` (and update `n_tasks`).
     """
-    import dataclasses
-
     actual = max(1, actual)
     memory_bytes = int(envelope.memory_bytes * desired / actual) if envelope.memory_bytes else 0
     return dataclasses.replace(envelope, n_tasks=actual, memory_bytes=memory_bytes)
@@ -164,6 +291,10 @@ def _is_splittable_source(source: Source) -> bool:
     return bool(splits) and not (len(splits) == 1 and isinstance(splits[0], WholeSourceSplit))
 
 
+# Max `LIMIT k` for the shuffle-free distributed top-N (driver merges `workers x k` rows).
+_TOPN_MAX_ROWS = 1_000_000
+
+
 def _fusable_join_aggregate(agg: Aggregate) -> bool:
     """Whether `agg` is an aggregate over an inner join, grouped by (a superset of) the
     join key — so it can be distributed by reusing the join's co-partitioning.
@@ -180,6 +311,19 @@ def _fusable_join_aggregate(agg: Aggregate) -> bool:
         return False
     group_cols = {gk.expr.name for gk in agg.group_keys if isinstance(gk.expr, Col)}
     return bool(j.left_keys) and set(j.left_keys) <= group_cols
+
+
+def _aggregate_over_join(agg: Aggregate) -> bool:
+    """Whether `agg` is an aggregate over a join of two single sources (any join type or
+    group keys) — the general case `_fusable_join_aggregate` does not cover.
+
+    Distributed as partial-aggregate-per-reducer + a driver-side `combine_finalize` of the
+    small partials (the mergeable two-phase): the join is aggregated *on the workers* and
+    only group-cardinality-many partial rows reach the driver, instead of collecting the
+    whole join to the head to aggregate it single-node (the 70s→~1s join fix).
+    """
+    j = agg.input
+    return isinstance(j, Join) and _single_source(j.left) and _single_source(j.right)
 
 
 def _dispatch(
@@ -215,11 +359,19 @@ def _dispatch(
             from batcher.dist.executors.map import _distributed_map
 
             return _distributed_map(plan, sources, workers, hub)
-        # map + relational breaker: not distributable yet → single-node UDF path.
-        from batcher import core
+        # An aggregate over a linear map/UDF pipeline: distribute the UDF across workers,
+        # partial-aggregate on each, combine on the driver (the Ray Data map_batches→agg
+        # shape). The UDF runs cluster-wide instead of single-node on the driver.
+        agg_split = _split_at(plan, Aggregate)
+        if agg_split is not None:
+            above, agg = agg_split
+            sub = agg.input
+            if has_map_batches(sub) and _is_linear_map_pipeline(sub) and _single_source(sub):
+                from batcher.dist.executors.map import _distributed_map_aggregate
 
-        batches = core.execute_with_udfs(plan, sources)
-        return pa.Table.from_batches(batches) if batches else pa.table({})
+                return _distributed_map_aggregate(above, agg, sources, workers)
+        # Any other map+breaker shape has no distributed path yet.
+        return _unsupported(plan, sources, "a map_batches/UDF pipeline feeding this operator")
 
     # Breaker-free scan/filter/project over a SPLITTABLE source (Parquet row-groups,
     # lakehouse fragments): fan the read out so each worker reads its own splits in
@@ -237,15 +389,39 @@ def _dispatch(
     agg_split = _split_at(plan, Aggregate)
     if agg_split is not None:
         above, agg = agg_split
+        # Aggregate over a DISTINCT (the `count_distinct → distinct + count` rewrite, or a
+        # user `distinct().agg(...)`) must be caught BEFORE the map/shuffle aggregate path:
+        # that path runs `agg.input` as a per-partition map prefix, but a DISTINCT has GLOBAL
+        # semantics — run map-local, each partition dedups independently and the reducer sums
+        # the per-partition counts, double-counting any value spanning two source partitions
+        # (the COUNT(DISTINCT) overcount). Distribute the DISTINCT first (globally deduped),
+        # then aggregate over its result. NOTE (perf): a high-cardinality DISTINCT collects the
+        # deduped rows to the driver for the outer aggregate — correct, but slow for a 15M-key
+        # COUNT(DISTINCT); the correct-and-fast form is a 2nd distributed stage (future work).
+        # Scoped to a direct `Distinct` input: OTHER breakers (nested aggregate / sort) keep
+        # the map-local path, which is correct for the composable aggregates that dominate.
+        if (
+            isinstance(agg.input, Distinct)
+            and _single_source(agg.input)
+            and not _has_breaker(agg.input.input)
+        ):
+            from batcher.dist.executors.distinct import _distributed_distinct
+
+            return _distributed_distinct(
+                [*above, agg], agg.input, sources, workers, transport, materialize=materialize
+            )
+        # The map/shuffle aggregate path: run `agg.input` as the per-partition map prefix, then
+        # partial-aggregate + shuffle + combine. Correct over a breaker-free prefix and over a
+        # NESTED aggregate/sort whose per-partition result composes under this aggregate (the
+        # dominant case); a `Distinct` prefix was already redirected above. A join input has two
+        # sources, so `_single_source` skips it to the join handlers below.
         if _single_source(agg.input):
             if transport == "flight":
                 from batcher.dist.flight_aggregate import execute_aggregate_flight
 
-                # When a query-lifetime `ShuffleFleet` is ambient (the adaptive loop
-                # installed one), `materialize=False` keeps the stage's result on the
-                # fleet's workers and returns a `FlightMaterializedSource` the next
-                # stage reads in place — no driver collect. With no fleet the operator
-                # spawns its own and collects, exactly as before.
+                # `materialize=False` (when an adaptive-loop fleet is ambient) keeps the
+                # result on the workers as a `FlightMaterializedSource` the next stage
+                # reads in place — no driver collect; else it spawns + collects as before.
                 return execute_aggregate_flight(
                     above, agg, sources, workers, materialize=materialize
                 )
@@ -254,14 +430,26 @@ def _dispatch(
             return _distributed_aggregate(
                 above, agg, sources, workers, hub, materialize=materialize, metrics_out=metrics_out
             )
-        # Aggregate directly over an inner join, grouped by (a superset of) the join
-        # key: reuse the join's co-partitioning to aggregate per bucket — no second
-        # shuffle, and the full join never lands on the driver (exchange elimination).
-        # The disk co-partition shuffle handles this; Flight keeps the fallback.
-        if transport != "flight" and _fusable_join_aggregate(agg):
+        # Aggregate over an inner join grouped by ⊇ the join key: fold each reducer's bucket
+        # to groups (exchange elimination) — full join never collects on head.
+        if _fusable_join_aggregate(agg):
+            if transport == "flight":
+                from batcher.dist.flight_join import execute_join_flight
+
+                return execute_join_flight(above, agg.input, sources, workers, fused_agg=agg)
             from batcher.dist.executors.join import _distributed_join_aggregate
 
             return _distributed_join_aggregate(above, agg, agg.input, sources, workers)
+        # General aggregate over a (non-key-aligned, or non-inner) join: distribute via
+        # partial-per-reducer + driver combine over Flight, so the join is aggregated on
+        # the workers instead of collected whole to the driver (the disk path falls
+        # through to a single-node-local collect, where there is no network to save).
+        if transport == "flight" and _aggregate_over_join(agg):
+            from batcher.dist.flight_join import execute_join_flight
+
+            return execute_join_flight(
+                above, agg.input, sources, workers, fused_agg=agg, combine_partials=True
+            )
 
     join_split = _split_at(plan, Join)
     if join_split is not None:
@@ -298,8 +486,11 @@ def _dispatch(
             and not _has_breaker(sort.input)
         ):
             if transport == "flight":
-                from batcher.dist.flight_sort import execute_sort_flight
+                from batcher.dist.flight_sort import execute_sort_flight, execute_topn_flight
 
+                # Small `ORDER BY ... LIMIT k` → mergeable top-N (no shuffle); else full sort.
+                if sort.limit is not None and sort.limit <= _TOPN_MAX_ROWS:
+                    return execute_topn_flight(above, sort, sources, workers)
                 return execute_sort_flight(above, sort, sources, workers)
             from batcher.dist.executors.sort import _distributed_sort
 
@@ -345,7 +536,38 @@ def _dispatch(
 
         return _distributed_union(above, union, sources, workers, transport)
 
-    # Unsupported shape → multi-core single-node engine.
+    # No distributed path matched this shape.
+    return _unsupported(plan, sources, "an unsupported operator combination")
+
+
+def _unsupported(plan: LogicalPlan, sources: list[Source], reason: str):
+    """Either fail loudly (the silent-single-node antipattern) or run a legitimately
+    single-node-only plan on one node.
+
+    Silent single-node fallback for a plan that *should* be distributed is an
+    antipattern: it masks a missing distributed path behind a quiet perf cliff (the whole
+    job on one node) and an OOM risk. So when any input is a **splittable** storage source
+    (real distributed data), raise loudly with the shape — the gap must be fixed, not
+    hidden. When every source is in-memory / non-splittable there is no distributed data
+    to speak of, so executing it on one node is the correct plan, not a fallback.
+
+    The splittable check is scoped to the sources **this plan actually reads**
+    (`_source_ids`), not the whole ambient `sources` list: a later adaptive stage — e.g. a
+    trailing `project` over an in-memory intermediate materialized by an earlier stage —
+    reads only that in-memory source and is correctly a single-node local transform, even
+    though the original splittable scan source is still present in `sources` (unused here).
+    Without this scoping such a tail stage would wrongly raise as "unsupported."
+    """
+    read_ids = _source_ids(plan)
+    if any(_is_splittable_source(sources[i]) for i in read_ids if i < len(sources)):
+        from batcher._internal.errors import PlanError
+
+        raise PlanError(
+            "distributed execution has no path for this plan shape "
+            f"({reason}); refusing to silently fall back to single-node on distributed "
+            "data. File/extend the distributed operator, or run with distributed=False "
+            "to force single-node explicitly."
+        )
     return _single_node(plan, sources)
 
 
@@ -394,7 +616,9 @@ def _distributed_asof(
     left_proj, left_pred = source_pushdown(left_plan, 0)
     right_proj, right_pred = source_pushdown(right_plan, 0)
 
-    work_dir = tempfile.mkdtemp(prefix="batcher_asof_")
+    from batcher.dist.shuffle_io import distributed_work_dir
+
+    work_dir = distributed_work_dir("batcher_asof_")
     try:
         left_parts = _partition_source(
             sources[left_sid], workers, work_dir, tag="L", projection=left_proj, predicate=left_pred

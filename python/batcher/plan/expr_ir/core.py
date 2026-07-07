@@ -1775,6 +1775,27 @@ class Binary(IRNode):
     right: Expr = child()
 
 
+class InList(Expr):
+    """`input IN (values)` — membership in a constant set (the folded form of an
+    `(x = v0) OR (x = v1) OR …` chain). `values` are Python scalars of one type
+    (int / str / date) matching the input column; lowered to a hash-set lookup."""
+
+    __slots__ = ("input", "values")
+
+    def __init__(self, input: Expr, values: tuple) -> None:
+        """Wrap a membership test over a constant `values` set."""
+        self.input = input
+        self.values = tuple(values)
+
+    def to_ir(self) -> dict[str, Any]:
+        """Lower to ``{"e": "in_list", "input": …, "set": [<tagged literal>, …]}``."""
+        return {
+            "e": ExprTag.IN_LIST,
+            "input": self.input.to_ir(),
+            "set": [Lit(v).to_ir()["value"] for v in self.values],
+        }
+
+
 @expr_node
 class Not(IRNode):
     """Logical negation of a boolean sub-expression."""

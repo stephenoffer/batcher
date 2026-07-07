@@ -46,6 +46,35 @@ def test_spill_grouped_matches_in_memory():
     assert _norm(spilled) == _norm(in_memory)
 
 
+@pytest.mark.parametrize("num_partitions", [1, 4, 16])
+def test_spill_distinct_matches_in_memory(num_partitions):
+    # DISTINCT is a group-by over every column with no aggregates; the out-of-core path
+    # (a `Distinct` top op) must reproduce the in-memory dedup. Regression for a
+    # high-cardinality DISTINCT failing fast under memory pressure instead of spilling.
+    factory, schema, table = _streaming_dataset()
+    spilled = (
+        bt.from_batches(factory, schema)
+        .distinct()
+        .collect(spill=True, num_partitions=num_partitions)
+    )
+    in_memory = bt.from_arrow(table).distinct().collect()
+    assert _norm(spilled) == _norm(in_memory)
+
+
+def test_spill_count_distinct_matches_in_memory():
+    # COUNT(DISTINCT) lowers to `Project → Aggregate` (an output projection above the
+    # breaker); the out-of-core path must peel the projection, spill the aggregate, and
+    # re-apply — not fail fast because the top op is a Project.
+    factory, schema, table = _streaming_dataset()
+    spilled = (
+        bt.from_batches(factory, schema)
+        .agg(c=col("k").n_unique())
+        .collect(spill=True, num_partitions=16)
+    )
+    in_memory = bt.from_arrow(table).agg(c=col("k").n_unique()).collect()
+    assert _norm(spilled) == _norm(in_memory)
+
+
 @pytest.mark.parametrize("num_partitions", [1, 4, 64])
 def test_spill_partition_count_invariant(num_partitions):
     # The result must not depend on the number of spill buckets.
@@ -315,6 +344,21 @@ def test_spill_sort_key_order(descending, num_partitions):
     # full row multiset (tie order among equal keys may differ).
     assert spilled.column("k").to_pylist() == in_memory.column("k").to_pylist()
     assert _norm(spilled) == _norm(in_memory)
+
+
+@pytest.mark.parametrize("num_partitions", [1, 4, 16])
+def test_spill_multikey_sort_matches_in_memory(num_partitions):
+    # A multi-key ORDER BY spills by range-partitioning the leading key and sorting each
+    # bucket by the full key list. Regression for a multi-key sort failing fast under
+    # memory pressure (the spill path previously supported only a single key).
+    factory, schema, table = _sort_dataset(key_range=40)
+    spilled = (
+        bt.from_batches(factory, schema)
+        .sort("k", "v", descending=[True, False])
+        .collect(spill=True, num_partitions=num_partitions)
+    )
+    in_memory = bt.from_arrow(table).sort("k", "v", descending=[True, False]).collect()
+    assert spilled.to_pylist() == in_memory.to_pylist()
 
 
 def test_spill_sort_top_n():

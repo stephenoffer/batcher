@@ -18,7 +18,7 @@ rule), and `.claude/rules/testing.md` (the DuckDB differential oracle).
 | A new expression IR node (a new wire shape) | `plan/expr_ir/func_nodes.py` (or `nodes.py`/`core.py`) | `IRNode` + `child`/`scalar`/`literal` |
 | A typed-accessor method (`.str.slug`, `.dt.iso_year`) | `plan/expr_ir/namespaces/<family>.py` | the namespace class / dispatch table |
 | A new function *name* for an existing node | `plan/expr_ir/fn_names.py` | the family vocabulary |
-| A Kyber optimizer rule | `kyber/rules/<family>.py` | `@rule` + `transform_up` |
+| A Kyber optimizer rule | `kyber/rules/<family>.py` or `kyber/rules/extra/<family>.py` | `@rule` + `transform_up` |
 | An IO format (a reader/writer) | `io/formats/<category>/<fmt>.py` | `FileSource`/`FileSink` + `@SOURCES.register` |
 | A relational operator | Rust `bc-runtime` + `plan/nodes/` | see the `add-relational-operator` skill |
 
@@ -133,13 +133,25 @@ A rule is a pure `node → node | None` (or `plan → plan`) function. Drop it i
 matching family module, decorate it, and the driver discovers it — no pipeline edit.
 
 ```python
-# kyber/rules/<family>.py
+# kyber/rules/extra/<family>.py
 @rule(name="drop_noop_filter", phase=Phase.NORMALIZE, matches=(Filter,))
 def drop_noop_filter(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
     if _is_constant_true(node.predicate):
         return node.input      # rewritten node…
     return None                # …or None for "no change"
 ```
+
+Pick the family by what the rule rewrites (boolean/CASE algebra, sargable
+normalization, join shape, set-ops, aggregate, window, empty-relation folding,
+EXACT-metadata-driven skips, …). The core families sit directly in `kyber/rules/`;
+the ~14 extended families live in the `kyber/rules/extra/` subpackage — it exists
+because `rules/` reached the 12-files-per-directory structure cap (the subpackage is
+allowlisted in `tools/lint_structure.py`). If your family has no home yet, add a new
+`extra/<family>.py` and register it with one import line in `rules/extra/__init__.py`;
+importing that package runs the module's `@rule` decorators. A rule must be
+**idempotent** — return `None` once there is nothing left to rewrite (i.e. never
+match its own output), so the fixpoint iteration terminates and the whole set stays
+confluent.
 
 For a **whole-plan** rewrite, do not hand-roll the per-node `isinstance` ladder — the
 structural recursion (and the identity-preserving rebuild the fixpoint detector relies
@@ -157,7 +169,11 @@ def rewrite_predicate(plan: LogicalPlan) -> LogicalPlan:
 Invariants: a rule **decides, never executes** (no engine calls, no metric
 collection — that is Core's lane). Every rule needs a `tests/unit/` plan-shape test
 proving the rewrite is *semantics-preserving* and a `tests/differential/` test
-showing the optimized query still matches DuckDB. See the `add-kyber-optimizer-pass`
+showing the optimized query still matches DuckDB. Your rule then joins the whole set
+under `tests/property/test_prop_optimizer_result_invariance.py`, which
+property-tests that the full 154-rule set is result-invariant and converges to a
+deterministic fixpoint — so a rule that interferes with another (or fails to reach a
+fixpoint) fails there even when its own tests pass. See the `add-kyber-optimizer-pass`
 skill for the full treatment.
 
 ## Add an IO format

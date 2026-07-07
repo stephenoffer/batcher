@@ -61,8 +61,10 @@ from batcher.plan.logical import (
 
 __all__ = [
     "combine_conjuncts",
+    "combine_disjuncts",
     "map_node_expressions",
     "split_conjuncts",
+    "split_disjuncts",
     "substitute_columns",
     "transform_expr_up",
 ]
@@ -81,15 +83,47 @@ def split_conjuncts(expr: Expr) -> list[Expr]:
 
 
 def combine_conjuncts(exprs: list[Expr]) -> Expr:
-    """Combine a non-empty list of expressions back into a left-deep `AND` chain.
+    """Combine a non-empty list of expressions into a **balanced** `AND` tree.
 
-    The inverse of `split_conjuncts`; raises on an empty list (there is no neutral
-    predicate to return without inventing a literal)."""
+    The inverse of `split_conjuncts`. The tree is balanced — depth O(log n) rather than
+    the naive left-deep O(n) — so a long predicate (a fused chain of hundreds of filters,
+    a large `IN` list, a generated boolean) never nests deep enough to exceed the engine's
+    recursion limit when the IR is deserialized in the data plane, nor Python's own limit
+    when `split_conjuncts` walks it back. `AND` is associative + commutative, so balancing
+    preserves the predicate exactly (the conjuncts' left-to-right order is kept). Raises on
+    an empty list (there is no neutral predicate to return without inventing a literal)."""
     if not exprs:
         raise ValueError("combine_conjuncts requires at least one expression")
+    while len(exprs) > 1:
+        # Pairwise-fold one level at a time (a bottom-up balanced tree); an odd tail
+        # carries forward. log2(n) passes ⇒ a tree of depth ceil(log2(n)).
+        exprs = [
+            Binary("and", exprs[i], exprs[i + 1]) if i + 1 < len(exprs) else exprs[i]
+            for i in range(0, len(exprs), 2)
+        ]
+    return exprs[0]
+
+
+def split_disjuncts(expr: Expr) -> list[Expr]:
+    """Flatten a top-level `OR` chain into its disjuncts (a non-OR yields `[expr]`).
+
+    The inverse of `combine_disjuncts`; the `OR` analogue of `split_conjuncts`, used to
+    factor a conjunct common to every branch of a disjunction out of the `OR`."""
+    if isinstance(expr, Binary) and expr.op == "or":
+        return split_disjuncts(expr.left) + split_disjuncts(expr.right)
+    return [expr]
+
+
+def combine_disjuncts(exprs: list[Expr]) -> Expr:
+    """Combine a non-empty list of expressions into a left-deep `OR` chain.
+
+    The inverse of `split_disjuncts`; raises on an empty list (no neutral disjunct
+    exists without inventing a literal)."""
+    if not exprs:
+        raise ValueError("combine_disjuncts requires at least one expression")
     out = exprs[0]
     for e in exprs[1:]:
-        out = Binary("and", out, e)
+        out = Binary("or", out, e)
     return out
 
 
@@ -110,78 +144,63 @@ def substitute_columns(expr: Expr, mapping: dict[str, Expr]) -> Expr:
 def transform_expr_up(expr: Expr, rule: ExprRule) -> Expr:
     """Bottom-up expression rewrite: rebuild children first, then apply `rule` to
     the rebuilt node. A `rule` only has to handle one node given already-rewritten
-    children — the structural recursion lives here, once."""
-    if isinstance(expr, Binary):
-        rebuilt: Expr = Binary(
-            expr.op,
-            transform_expr_up(expr.left, rule),
-            transform_expr_up(expr.right, rule),
-        )
-    elif isinstance(expr, Not):
-        rebuilt = Not(transform_expr_up(expr.input, rule))
-    elif isinstance(expr, Cast):
-        rebuilt = Cast(transform_expr_up(expr.input, rule), expr.dtype, try_cast=expr.try_cast)
-    elif isinstance(expr, IsNull):
-        rebuilt = IsNull(transform_expr_up(expr.input, rule))
-    elif isinstance(expr, IsNotNull):
-        rebuilt = IsNotNull(transform_expr_up(expr.input, rule))
-    elif isinstance(expr, IsNan):
-        rebuilt = IsNan(transform_expr_up(expr.input, rule))
-    elif isinstance(expr, IsInf):
-        rebuilt = IsInf(transform_expr_up(expr.input, rule))
-    elif isinstance(expr, MathExpr):
-        rebuilt = MathExpr(expr.fn, transform_expr_up(expr.input, rule))
-    elif isinstance(expr, DateFunc):
-        rebuilt = DateFunc(expr.fn, transform_expr_up(expr.input, rule))
-    elif isinstance(expr, DateTrunc):
-        rebuilt = DateTrunc(transform_expr_up(expr.input, rule), expr.unit)
-    elif isinstance(expr, ListFunc):
-        rebuilt = ListFunc(expr.fn, transform_expr_up(expr.input, rule))
-    elif isinstance(expr, ListGet):
-        rebuilt = ListGet(transform_expr_up(expr.input, rule), expr.index)
-    elif isinstance(expr, ListContains):
-        rebuilt = ListContains(transform_expr_up(expr.input, rule), expr.value)
-    elif isinstance(expr, ListSlice):
-        rebuilt = ListSlice(transform_expr_up(expr.input, rule), expr.offset, expr.length)
-    elif isinstance(expr, StructField):
-        rebuilt = StructField(transform_expr_up(expr.input, rule), expr.field)
-    elif isinstance(expr, ListJoin):
-        rebuilt = ListJoin(transform_expr_up(expr.input, rule), expr.separator)
-    elif isinstance(expr, StrFunc):
-        rebuilt = StrFunc(
-            expr.fn,
-            transform_expr_up(expr.input, rule),
-            pattern=expr.pattern,
-            replacement=expr.replacement,
-            start=expr.start,
-            length=expr.length,
-        )
-    elif isinstance(expr, ImageFunc):
-        rebuilt = ImageFunc(
-            expr.fn, transform_expr_up(expr.input, rule), width=expr.width, height=expr.height
-        )
-    elif isinstance(expr, Coalesce):
-        rebuilt = Coalesce([transform_expr_up(e, rule) for e in expr.inputs])
-    elif isinstance(expr, Greatest):
-        rebuilt = Greatest([transform_expr_up(e, rule) for e in expr.inputs])
-    elif isinstance(expr, Least):
-        rebuilt = Least([transform_expr_up(e, rule) for e in expr.inputs])
-    elif isinstance(expr, Array):
-        rebuilt = Array([transform_expr_up(e, rule) for e in expr.elements])
-    elif isinstance(expr, NullIf):
-        rebuilt = NullIf(transform_expr_up(expr.left, rule), transform_expr_up(expr.right, rule))
-    elif isinstance(expr, Math2Expr):
-        rebuilt = Math2Expr(
-            expr.fn, transform_expr_up(expr.left, rule), transform_expr_up(expr.right, rule)
-        )
-    elif isinstance(expr, Case):
-        rebuilt = Case(
-            [(transform_expr_up(c, rule), transform_expr_up(t, rule)) for c, t in expr.branches],
-            transform_expr_up(expr.otherwise, rule),
-        )
-    else:
-        rebuilt = expr  # Col, Lit and other leaves have no sub-expressions
+    children — the structural recursion lives here, once.
+
+    Dispatch is an O(1) exact-type lookup (`_EXPR_REBUILD`) rather than a long
+    ``isinstance`` ladder: this runs for every node of every rule of every fixpoint
+    iteration, and leaves (`Col`/`Lit` — the bulk of nodes) previously paid the full
+    ladder before falling through. A node type absent from the table is a leaf with no
+    sub-expressions (these concrete IR node types are never subclassed, so exact-type
+    dispatch matches the old ``isinstance`` semantics)."""
+    rebuild = _EXPR_REBUILD.get(type(expr))
+    rebuilt = rebuild(expr, rule) if rebuild is not None else expr
     return rule(rebuilt)
+
+
+# Exact-type → child-rebuild dispatch for `transform_expr_up`. Each entry rebuilds one
+# node from its recursively-rewritten children, mirroring the former isinstance ladder
+# one-for-one. Leaves (Col, Lit, AggExpr, …) are intentionally absent (rebuilt as-is).
+_EXPR_REBUILD: dict[type, Callable[[Expr, ExprRule], Expr]] = {
+    Binary: lambda e, r: Binary(e.op, transform_expr_up(e.left, r), transform_expr_up(e.right, r)),
+    Not: lambda e, r: Not(transform_expr_up(e.input, r)),
+    Cast: lambda e, r: Cast(transform_expr_up(e.input, r), e.dtype, try_cast=e.try_cast),
+    IsNull: lambda e, r: IsNull(transform_expr_up(e.input, r)),
+    IsNotNull: lambda e, r: IsNotNull(transform_expr_up(e.input, r)),
+    IsNan: lambda e, r: IsNan(transform_expr_up(e.input, r)),
+    IsInf: lambda e, r: IsInf(transform_expr_up(e.input, r)),
+    MathExpr: lambda e, r: MathExpr(e.fn, transform_expr_up(e.input, r)),
+    DateFunc: lambda e, r: DateFunc(e.fn, transform_expr_up(e.input, r)),
+    DateTrunc: lambda e, r: DateTrunc(transform_expr_up(e.input, r), e.unit),
+    ListFunc: lambda e, r: ListFunc(e.fn, transform_expr_up(e.input, r)),
+    ListGet: lambda e, r: ListGet(transform_expr_up(e.input, r), e.index),
+    ListContains: lambda e, r: ListContains(transform_expr_up(e.input, r), e.value),
+    ListSlice: lambda e, r: ListSlice(transform_expr_up(e.input, r), e.offset, e.length),
+    StructField: lambda e, r: StructField(transform_expr_up(e.input, r), e.field),
+    ListJoin: lambda e, r: ListJoin(transform_expr_up(e.input, r), e.separator),
+    StrFunc: lambda e, r: StrFunc(
+        e.fn,
+        transform_expr_up(e.input, r),
+        pattern=e.pattern,
+        replacement=e.replacement,
+        start=e.start,
+        length=e.length,
+    ),
+    ImageFunc: lambda e, r: ImageFunc(
+        e.fn, transform_expr_up(e.input, r), width=e.width, height=e.height
+    ),
+    Coalesce: lambda e, r: Coalesce([transform_expr_up(x, r) for x in e.inputs]),
+    Greatest: lambda e, r: Greatest([transform_expr_up(x, r) for x in e.inputs]),
+    Least: lambda e, r: Least([transform_expr_up(x, r) for x in e.inputs]),
+    Array: lambda e, r: Array([transform_expr_up(x, r) for x in e.elements]),
+    NullIf: lambda e, r: NullIf(transform_expr_up(e.left, r), transform_expr_up(e.right, r)),
+    Math2Expr: lambda e, r: Math2Expr(
+        e.fn, transform_expr_up(e.left, r), transform_expr_up(e.right, r)
+    ),
+    Case: lambda e, r: Case(
+        [(transform_expr_up(c, r), transform_expr_up(t, r)) for c, t in e.branches],
+        transform_expr_up(e.otherwise, r),
+    ),
+}
 
 
 def map_node_expressions(node: LogicalPlan, rule: ExprRule) -> LogicalPlan:

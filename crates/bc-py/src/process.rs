@@ -16,15 +16,59 @@ use bc_resource::MemoryPool;
 /// drops, blocking-to-drain) dozens of runtimes — thread churn and GC pauses. One
 /// lazily-built shared runtime keeps the thread pool bounded no matter how many
 /// servers/clients a worker process creates.
+///
+/// **Thread count governs shuffle-reduce throughput.** A reducer gathers many mapper
+/// streams concurrently, and each stream's Arrow IPC decode is CPU-bound work that runs
+/// on these worker threads; too few threads pins concurrent decode to a couple of cores
+/// and caps inbound shuffle bandwidth well below the NIC. So the pool is sized to the
+/// host's parallelism (clamped), not a fixed 2. It stays *bounded* — idle tokio workers
+/// park rather than spin, so headroom is cheap — and is overridable via
+/// `BATCHER_SHUFFLE_RT_THREADS` for hosts packing many actors per node (where a smaller
+/// per-process pool avoids oversubscription across co-resident actors).
 pub(crate) fn shared_runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(shuffle_runtime_threads())
             .enable_all()
             .build()
             .expect("build shared tokio runtime")
     })
+}
+
+/// Worker-thread count for the shuffle runtime: `BATCHER_SHUFFLE_RT_THREADS` when set
+/// (and > 0), else the host's available parallelism clamped by the transfer's CPU cost.
+///
+/// The `[4, 8]` bound comes from measurement on a real cross-node cluster: a reducer
+/// gathering many mapper streams of *uncompressed* IPC saturates its NIC at ~4–8
+/// concurrent decode threads; below that it is decode-CPU-starved, and above 8 lightweight
+/// decode regresses on context-switch/cache contention.
+///
+/// **Wire compression changes that calculus.** Compress (producer) + decompress (consumer)
+/// is several-fold heavier per stream than plain decode, and it is what lets effective
+/// throughput exceed line rate — but only if enough threads run it in parallel; at 8
+/// threads ZSTD is CPU-starved and can't realize its ratio. Batcher runs one worker per
+/// node (it owns every core, so there is no co-resident-actor oversubscription), so when a
+/// codec is active the pool is sized to the cores (capped at 32) to parallelize
+/// compression. `BATCHER_SHUFFLE_RT_THREADS` still overrides for unusual node shapes.
+fn shuffle_runtime_threads() -> usize {
+    if let Ok(v) = std::env::var("BATCHER_SHUFFLE_RT_THREADS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // A codec is active by default; size to the cores for parallel (de)compression. Plain
+    // uncompressed decode keeps the measured [4, 8] sweet spot.
+    if bc_transport::compression().is_some() {
+        cores.clamp(4, 32)
+    } else {
+        cores.clamp(4, 8)
+    }
 }
 
 /// The one process-wide [`MemoryPool`] backing the runtime spill backstop. Shared

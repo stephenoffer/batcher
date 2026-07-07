@@ -15,18 +15,24 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from batcher.plan.expr_ir import Col, Lit
-from batcher.plan.logical import Aggregate, Projection
+from batcher.plan.expr_ir import Cast, Col, Lit
+from batcher.plan.logical import Aggregate, Join, Projection
+from batcher.plan.schema import SchemaRef
 from batcher.plan.stats import ColumnStat, Provenance, RelStats, weakest
+from batcher.plan.types import DTYPE_REGISTRY
 
 __all__ = [
     "distinct_columns",
     "filter_columns",
     "global_aggregate_columns",
+    "grouped_aggregate_columns",
+    "join_columns",
     "limit_columns",
     "project_columns",
+    "sample_columns",
     "scan_columns",
     "union_columns",
+    "window_columns",
 ]
 
 
@@ -66,13 +72,20 @@ def scan_columns(
     return cols
 
 
-def project_columns(items: tuple[Projection, ...], child: RelStats) -> dict[str, ColumnStat]:
+def project_columns(
+    items: tuple[Projection, ...],
+    child: RelStats,
+    input_schema: SchemaRef | None = None,
+) -> dict[str, ColumnStat]:
     """Project/select output column stats.
 
     A `col(x)` output carries `x`'s stats through under its alias (exact stays
     exact — projection touches no values); a literal becomes a constant column
-    (`min == max == value`, ndv 1, no nulls, `EXACT`); any other expression is
-    dropped (its output distribution is unknown).
+    (`min == max == value`, ndv 1, no nulls, `EXACT`); an *identity* `cast` (the
+    target type equals the column's own type — the redundant cast the FFI boundary
+    already performed on a narrow numeric) is a no-op that carries the source stats
+    through unchanged (`input_schema` supplies the source type); any other
+    expression is dropped (its output distribution is unknown).
     """
     out: dict[str, ColumnStat] = {}
     for item in items:
@@ -85,7 +98,33 @@ def project_columns(items: tuple[Projection, ...], child: RelStats) -> dict[str,
             out[item.alias] = ColumnStat(
                 min=value, max=value, null_count=0, ndv=1, provenance=Provenance.EXACT
             )
+        elif isinstance(item.expr, Cast):
+            carried = _identity_cast_column(item.expr, input_schema, child)
+            if carried is not None:
+                out[item.alias] = carried
     return out
+
+
+def _identity_cast_column(
+    cast: Cast, input_schema: SchemaRef | None, child: RelStats
+) -> ColumnStat | None:
+    """The carried stat for a `Cast(Col(x), T)` that is a provable no-op, else None.
+
+    Only an *identity* cast — `T` equal to `x`'s own (post-widening) type — is
+    treated as value-preserving: it changes nothing, so `x`'s full `ColumnStat`
+    (including `EXACT` min/max/ndv) carries through under the output alias. Any
+    value-changing cast (a widening/narrowing/opaque conversion, or a `try_cast`
+    that can turn a failed conversion into a null) is dropped — its output
+    distribution can no longer be vouched for from the input's stats.
+    """
+    if cast.try_cast or not isinstance(cast.input, Col):
+        return None
+    if input_schema is None or not input_schema.has(cast.input.name):
+        return None
+    target = DTYPE_REGISTRY.get(cast.dtype)
+    if target is None or not input_schema.field(cast.input.name).type.equals(target):
+        return None
+    return child.columns.get(cast.input.name)
 
 
 def filter_columns(child: RelStats) -> dict[str, ColumnStat]:
@@ -109,6 +148,21 @@ def limit_columns(child: RelStats) -> dict[str, ColumnStat]:
     """Limit output column stats: like a filter, min/max are retained as bounds
     but downgraded (a prefix of rows may exclude the extremes)."""
     return filter_columns(child)
+
+
+def sample_columns(child: RelStats) -> dict[str, ColumnStat]:
+    """Sample output column stats: a sample is a row-shrinking operator, so min/max
+    survive only as *bounds* and are downgraded from `EXACT` (the sampled subset may
+    drop the extremes), exactly like a filter/limit."""
+    return filter_columns(child)
+
+
+def window_columns(child: RelStats) -> dict[str, ColumnStat]:
+    """Window output column stats: a `Window` is strictly row-count preserving and
+    only *appends* function columns, so every input column's stats carry through
+    unchanged — `EXACT` survives (no value is added, removed, or reordered). The
+    appended function columns are left unknown (omitted)."""
+    return dict(child.columns)
 
 
 def distinct_columns(child: RelStats) -> dict[str, ColumnStat]:
@@ -182,6 +236,7 @@ def global_aggregate_columns(node: Aggregate, child: RelStats) -> dict[str, Colu
       - `min(col)` / `max(col)` = col.min / col.max         (needs exact col bound)
       - `sum(col)`            = col.total_sum               (needs a recorded sum)
       - `count_distinct(col)` = col.ndv                     (needs *exact* ndv only)
+      - `bool_and`/`bool_or`  = (col.min is True)/(col.max is True)  (boolean col, exact min/max)
 
     Anything not exactly derivable is omitted, so a downstream reader sees only
     answerable aggregates (provenance `EXACT`).
@@ -196,6 +251,12 @@ def global_aggregate_columns(node: Aggregate, child: RelStats) -> dict[str, Colu
     return out
 
 
+# SQL/DataFrame spellings of the two boolean aggregates (`every`/`some` are the
+# ANSI-SQL aliases of `bool_and`/`bool_or`). All resolve to the same min/max derivation.
+_BOOL_AND_FUNCS = frozenset({"bool_and", "every"})
+_BOOL_OR_FUNCS = frozenset({"bool_or", "some"})
+
+
 def _derive_scalar_aggregate(func: str, input_expr, child: RelStats):
     """The exact scalar value of one global aggregate, or None if not derivable."""
     col_name = input_expr.name if isinstance(input_expr, Col) else None
@@ -204,6 +265,8 @@ def _derive_scalar_aggregate(func: str, input_expr, child: RelStats):
         return int(child.rows) if child.rows_exact else None
     if func == "count":
         # count(col) = rows - nulls(col); needs exact rows and an exact null count.
+        # When null_count is a known 0 this is exactly `child.rows` — the common
+        # "count a non-null column" case answered without any per-row work.
         if not child.rows_exact or col_name is None:
             return None
         stat = child.columns.get(col_name)
@@ -220,10 +283,91 @@ def _derive_scalar_aggregate(func: str, input_expr, child: RelStats):
     if func == "max":
         return stat.max
     if func == "sum":
+        # An exact recorded total (a catalog/format `total_sum`). SQL `sum` over a
+        # group with no non-null value is NULL, so a provably-empty relation is not
+        # derivable — return None to fall back rather than claim a spurious 0.
+        if child.rows_exact and child.rows == 0:
+            return None
         return stat.total_sum
     if func == "count_distinct":
+        # SQL `count(distinct col)` excludes NULL; the `ndv` contract is likewise the
+        # number of distinct *non-null* values (what a footer/HLL counts), so an EXACT
+        # ndv is the answer directly. Only EXACT ndv is trusted (a SKETCH HLL count is
+        # rejected above by the provenance gate) — otherwise fall back.
         return None if stat.ndv is None else int(stat.ndv)
+    if func in _BOOL_AND_FUNCS or func in _BOOL_OR_FUNCS:
+        return _derive_bool_aggregate(func, stat, child)
     return None
+
+
+def _derive_bool_aggregate(func: str, stat: ColumnStat, child: RelStats):
+    """`bool_and`/`bool_or` (SQL `every`/`some`) of a boolean column from EXACT min/max.
+
+    Over a boolean column, `bool_and` is true iff *every* non-null value is true —
+    exactly `min == True` (False sorts below True); `bool_or` is true iff *any* is —
+    exactly `max == True`. Both ignore NULLs (SQL semantics), and the footer min/max
+    already exclude nulls. An all-null or empty group has no min/max to derive from
+    and SQL returns NULL there, so this returns None (fall back) in that case.
+    """
+    if not isinstance(stat.min, bool) or not isinstance(stat.max, bool):
+        return None  # not a boolean column (or no non-null values recorded)
+    # An all-null / empty group returns SQL NULL — not derivable as an exact bool.
+    if child.rows_exact and stat.null_count is not None and child.rows - stat.null_count <= 0:
+        return None
+    return bool(stat.min) if func in _BOOL_AND_FUNCS else bool(stat.max)
+
+
+def grouped_aggregate_columns(node: Aggregate, child: RelStats) -> dict[str, ColumnStat]:
+    """Column stats for a *grouped* aggregate's GROUP BY key outputs.
+
+    A bare-`Col` group key appears verbatim in the output, holding exactly the set
+    of *distinct* key values of the input. Grouping invents no value and drops no
+    extreme, so the key column's `min`/`max` carry through as **EXACT** bounds at the
+    child's provenance (like `Distinct`). `null_count` is dropped (duplicate nulls
+    collapse to one group) and `ndv` is not claimed here: the number of groups is only
+    an *estimate*, so tagging it EXACT would let `count_distinct` answer from a guess.
+    Per-group aggregate outputs are not constant, so only the keys are derived.
+    """
+    out: dict[str, ColumnStat] = {}
+    for key in node.group_keys:
+        if isinstance(key.expr, Col):
+            src = child.columns.get(key.expr.name)
+            if src is not None:
+                out[key.alias] = ColumnStat(
+                    min=src.min,
+                    max=src.max,
+                    null_count=None,
+                    ndv=None,
+                    provenance=src.provenance,  # extremes preserved → EXACT survives
+                    bloom=src.bloom,  # grouping adds no value → absence proof holds
+                )
+    return out
+
+
+def join_columns(node: Join, left: RelStats, right: RelStats) -> dict[str, ColumnStat]:
+    """Column stats for a join's output: each side's values as downgraded *bounds*.
+
+    A join only removes rows from a side or repeats them (an FK match), never invents
+    a new value, so a preserved column's `min`/`max` stay valid *bounds* — but the
+    extremes may be dropped and provenance must fall from `EXACT` (a join is a
+    row-shrinking/duplicating operator). `null_count`/`ndv` are dropped (a match may
+    duplicate rows or an outer join add nulls, changing both). The membership bloom
+    survives — a value absent from a side stays absent in any join output of it.
+    """
+    out: dict[str, ColumnStat] = {}
+    for o in node.output:
+        side = left if o.side == "left" else right
+        src = side.columns.get(o.name)
+        if src is not None:
+            out[o.alias] = ColumnStat(
+                min=src.min,
+                max=src.max,
+                null_count=None,
+                ndv=None,
+                provenance=weakest(src.provenance, Provenance.DEFAULT),
+                bloom=src.bloom,
+            )
+    return out
 
 
 def _safe_min(values: list):

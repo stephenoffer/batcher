@@ -132,8 +132,10 @@ def test_multiprocessing_factory_falls_back_and_is_correct():
     assert out.column("v").to_pylist() == [x * 2 for x in range(300)]
 
 
-def test_multiprocessing_non_pyarrow_format_falls_back_and_is_correct():
-    # A non-pyarrow batch_format needs an unpicklable closure → threads fallback.
+def test_multiprocessing_non_pyarrow_format_runs_on_processes_and_is_correct():
+    # A non-pyarrow batch_format runs on processes too: the numpy/pandas/torch
+    # conversion happens in the child from a picklable (fn, batch, fmt) payload — no
+    # closure to ship — so these formats get process parallelism, not a thread fallback.
     t = pa.table({"v": list(range(300))})
     out = (
         bt.from_arrow(t)
@@ -150,3 +152,68 @@ def test_multiprocessing_single_batch_is_sequential():
     t = pa.table({"v": [1, 2, 3]})
     out = bt.from_arrow(t).map_batches(_double, num_workers=4, multiprocessing=True).collect()
     assert out.column("v").to_pylist() == [2, 4, 6]
+
+
+# --- adaptive auto strategy: light vectorized -> threads, heavy pure-Python -> processes ---
+
+
+def _np_sqrt(batch: pa.RecordBatch) -> pa.RecordBatch:
+    # A vectorized (GIL-releasing, cheap-per-row) transform — the common map_batches shape.
+    import numpy as np
+
+    x = batch.column("v").to_numpy(zero_copy_only=False).astype("float64")
+    return pa.RecordBatch.from_arrays([pa.array(np.sqrt(x * x + 1.0))], names=["v"])
+
+
+def _heavy_py_pid(batch: pa.RecordBatch) -> pa.RecordBatch:
+    # A GIL-bound, cpu-heavy pure-Python per-row transform — the case processes are for.
+    out = []
+    for v in batch.column("v").to_pylist():
+        s = 0.0
+        for _ in range(200):
+            s = (s + v) * 1.0000001
+        out.append(s)
+    pid = pa.array([os.getpid()] * batch.num_rows, type=pa.int64())
+    return pa.RecordBatch.from_arrays([pa.array(out), pid], names=["v", "pid"])
+
+
+def _np_sqrt_pid(batch: pa.RecordBatch) -> pa.RecordBatch:
+    import numpy as np
+
+    x = batch.column("v").to_numpy(zero_copy_only=False).astype("float64")
+    pid = pa.array([os.getpid()] * batch.num_rows, type=pa.int64())
+    return pa.RecordBatch.from_arrays([pa.array(np.sqrt(x * x + 1.0)), pid], names=["v", "pid"])
+
+
+@pytest.mark.skipif((os.cpu_count() or 1) < 2, reason="needs multiple cores")
+def test_auto_light_vectorized_fn_runs_on_threads():
+    # A cheap vectorized `fn` (no `multiprocessing=`) must stay on threads even past the
+    # process-auto row threshold: threads keep input+output in shared memory (no result
+    # pickle), which is strictly faster than a process pool for a GIL-releasing transform.
+    n = 1_200_000
+    t = pa.table({"v": list(range(n))})
+    out = bt.from_arrow(t).map_batches(_np_sqrt_pid, num_workers=4).collect()
+    pids = set(out.column("pid").to_pylist())
+    assert pids == {os.getpid()}  # ran on the driver's threads, never a child process
+
+
+@pytest.mark.skipif((os.cpu_count() or 1) < 2, reason="needs multiple cores")
+def test_auto_heavy_python_fn_runs_on_processes():
+    # A GIL-bound, cpu-heavy pure-Python `fn` over enough rows must auto-route to processes
+    # (no `multiprocessing=` flag) so it uses every core instead of one GIL.
+    n = 1_200_000
+    t = pa.table({"v": list(range(n))})
+    out = bt.from_arrow(t).map_batches(_heavy_py_pid, num_workers=4).collect()
+    pids = set(out.column("pid").to_pylist())
+    assert os.getpid() not in pids and len(pids) >= 2  # spread across child processes
+
+
+def test_auto_light_fn_matches_sequential():
+    # The coarsened thread path is a relation-level no-op: identical result to sequential.
+    import numpy as np
+
+    n = 1_200_000
+    t = pa.table({"v": list(range(n))})
+    seq = bt.from_arrow(t).map_batches(_np_sqrt, num_workers=1).collect()
+    par = bt.from_arrow(t).map_batches(_np_sqrt, num_workers=8).collect()
+    assert np.allclose(seq.column("v").to_numpy(), par.column("v").to_numpy())

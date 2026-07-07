@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 
 import pyarrow as pa
 
@@ -43,6 +42,49 @@ _BLOOM_SAFE = frozenset({"inner", "semi"})
 # probe mappers; a larger build side just raises the false-positive rate (still
 # correct, only less pruning).
 _BLOOM_EXPECTED_ITEMS = 1 << 20
+
+# `"auto"` bloom engagement thresholds. The bloom pays off when the probe (left) side
+# is much larger than the build (right) side — a selective fact⋈dimension — and the
+# probe is big enough to repay building + shipping the bloom. Below these it is pure
+# overhead, so `"auto"` keeps the plain shuffle.
+_BLOOM_AUTO_PROBE_RATIO = 4.0  # probe rows ≥ 4× build rows
+_BLOOM_AUTO_MIN_PROBE_ROWS = 1 << 20  # ~1M probe rows before a bloom is worth building
+
+
+def _bloom_engaged(policy: bool | str, join: Join, sources: list[Source]) -> bool:
+    """Resolve the `runtime_bloom_join` policy to a concrete on/off for this join.
+
+    ``True``/``False`` force it; ``"auto"`` (the default) defers to a cardinality
+    estimate so the bloom engages only where it pays — no user tuning.
+    """
+    if policy is True or policy is False:
+        return policy
+    return _bloom_beneficial(join, sources)
+
+
+def _bloom_beneficial(join: Join, sources: list[Source]) -> bool:
+    """Whether a runtime bloom is estimated to pay off for this shuffle join.
+
+    The bloom prunes the probe (left) side using the build (right) side's keys, so it
+    wins when the probe is much larger than the build (`_BLOOM_AUTO_PROBE_RATIO`) and
+    large enough to repay building it (`_BLOOM_AUTO_MIN_PROBE_ROWS`). Best-effort and
+    result-neutral: an unknown estimate reads as "not beneficial" (keep the plain
+    shuffle), and being wrong only trades performance, never correctness.
+    """
+    from batcher.config import active_config
+    from batcher.kyber.cardinality import CardinalityEstimator
+
+    try:
+        est = CardinalityEstimator(sources, {}, active_config().optimizer.cardinality)
+        probe = est.estimate(join.left).rows
+        build = est.estimate(join.right).rows
+    except Exception:
+        return False
+    return (
+        build > 0
+        and probe >= build * _BLOOM_AUTO_PROBE_RATIO
+        and probe >= _BLOOM_AUTO_MIN_PROBE_ROWS
+    )
 
 
 def _join_reducer_ir(join: Join) -> dict:
@@ -113,7 +155,9 @@ def _shuffle_join(
     left_proj, left_pred = source_pushdown(left_plan, 0)
     right_proj, right_pred = source_pushdown(right_plan, 0)
 
-    work_dir = tempfile.mkdtemp(prefix="batcher_join_")
+    from batcher.dist.shuffle_io import distributed_work_dir
+
+    work_dir = distributed_work_dir("batcher_join_")
     keep_dir = False  # set when a MaterializedSource takes ownership of work_dir
     try:
         left_parts = _partition_source(
@@ -184,16 +228,19 @@ def _shuffle_join(
         salt = salt if hot else 0  # no hot key → plain co-partition
 
         # Runtime bloom reduction: build a bloom over the (smaller) build/right side's
-        # keys and prune the probe/left side before its shuffle. Opt-in; inner/semi
-        # (where dropping a non-matching probe row is a no-op). Multi-key safe — the
-        # bloom is built and probed over the row-encoded key *tuple* (the shared
-        # `key_rows` encoding in `bc_py::bloom`), so composite keys prune exactly as
-        # single keys do; corresponding left/right key order makes the encodings align.
+        # keys and prune the probe/left side before its shuffle. Inner/semi (where
+        # dropping a non-matching probe row is a no-op). Multi-key safe — the bloom is
+        # built and probed over the row-encoded key *tuple* (the shared `key_rows`
+        # encoding in `bc_py::bloom`), so composite keys prune exactly as single keys do;
+        # corresponding left/right key order makes the encodings align. The engage
+        # decision is the cardinality-driven `"auto"` policy by default (True/False force
+        # it) — so a selective fact⋈dimension gets the bloom with no user tuning while a
+        # balanced join keeps the plain shuffle.
         use_bloom = (
-            runtime_bloom_join()
-            and join.join_type in _BLOOM_SAFE
+            join.join_type in _BLOOM_SAFE
             and bool(join.left_keys)
             and len(join.left_keys) == len(join.right_keys)
+            and _bloom_engaged(runtime_bloom_join(), join, sources)
         )
 
         # Map tasks are pure functions of their partition → straggler-backup-safe.
@@ -367,7 +414,9 @@ def _broadcast_join(
     ):
         return _shuffle_join(above, join, sources, workers)
 
-    work_dir = tempfile.mkdtemp(prefix="batcher_bcast_")
+    from batcher.dist.shuffle_io import distributed_work_dir
+
+    work_dir = distributed_work_dir("batcher_bcast_")
     try:
         right_path = os.path.join(work_dir, "broadcast_right.arrow")
         write_ipc(right_full, right_path)
@@ -615,6 +664,22 @@ def _join_reduce_task(join_ir, left_paths, right_paths, work_dir, reducer_id, en
         right: list = []
         for p in right_paths:
             right.extend(read_ipc(p))
+        # An inner equi-join needs rows on BOTH sides; a reducer whose co-partitioned
+        # bucket is empty on one side (a key present in only one input — routine under
+        # skew or a high reducer count) produces no rows, so it contributes nothing to
+        # the join or to an aggregate fused above it. Short-circuit rather than hand the
+        # native engine a schema-less empty input, which it cannot type the result from.
+        # Strictly inner `hash_join`: a left/right/full join keeps the non-empty side's
+        # unmatched rows, and this same reducer also runs `asof_join` (left-style — every
+        # left row is emitted with a null match even when the right bucket is empty).
+        top = _json.loads(join_ir)
+        join_node = top.get("input", top) if top.get("op") == "aggregate" else top
+        if (
+            join_node.get("op") == "hash_join"
+            and join_node.get("join_type", "inner") == "inner"
+            and (not any(b.num_rows for b in left) or not any(b.num_rows for b in right))
+        ):
+            return (None, 0)
         result = nat.execute_plan(join_ir, [left, right], engine_config)
 
     rows = sum(b.num_rows for b in result) if result else 0

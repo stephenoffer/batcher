@@ -113,6 +113,8 @@ try:
             token: str = "",
             idle_timeout_ms: int = 0,
             keepalive_ms: int = 0,
+            connections_per_peer: int = 0,
+            compression: int = 1,
             plan_id: int = _DEFAULT_PLAN_ID,
             shm: bool = False,
             preemption: bool = False,
@@ -139,8 +141,9 @@ try:
             # a dead peer is detected, and set keepalive to catch a dropped connection
             # promptly. A long GC pause under a generous idle window is not misread as
             # death. 0 keeps the process default.
-            if idle_timeout_ms or keepalive_ms:
-                nat.set_flight_transport_config(idle_timeout_ms, keepalive_ms)
+            nat.set_flight_transport_config(
+                idle_timeout_ms, keepalive_ms, connections_per_peer, compression
+            )
 
             self.id = worker_id
             # The node's routable IP, so this worker's Flight server advertises a
@@ -327,7 +330,17 @@ try:
                 return ("ok", None)
             return ("ok", nat.execute_plan(win_ir, [rows], self._engine_config))
 
-        def reduce_join(self, join_ir, addrs, reducer_id, left_schema, right_schema):
+        def reduce_join(
+            self,
+            join_ir,
+            addrs,
+            reducer_id,
+            left_schema,
+            right_schema,
+            gk=None,
+            aj=None,
+            finalize=True,
+        ):
             import batcher._native as nat
 
             # A join needs its bucket's whole left and right side, so it holds them
@@ -344,11 +357,34 @@ try:
             if not left and not right:
                 return ("ok", None)
             # Schema-bearing empties so an outer join can null-extend the missing side.
-            return (
-                "ok",
-                nat.execute_plan(
-                    join_ir, [left or [left_schema], right or [right_schema]], self._engine_config
-                ),
+            joined = nat.execute_plan(
+                join_ir, [left or [left_schema], right or [right_schema]], self._engine_config
+            )
+            if gk is not None:
+                # Fused post-join aggregate (only a small bucket leaves the worker — the
+                # full join never reaches the driver). `finalize=True` when group keys ⊇
+                # join key (each group is whole in this bucket, so finalize here; driver
+                # concatenates disjoint groups); `finalize=False` otherwise (a group spans
+                # buckets, so emit PARTIAL state and let the driver `combine_finalize`).
+                partial = nat.partial_aggregate(gk, aj, joined)
+                if finalize:
+                    out = nat.combine_finalize(gk, aj, [partial])
+                    joined = [out] if out is not None else []
+                else:
+                    joined = [partial] if partial is not None else []
+            return ("ok", joined)
+
+        def local_topn(self, plan_ir, partition):
+            """Run `plan_ir` (the map prefix + sort + limit) on this worker's own split and
+            return its local top-N rows — no shuffle. For a top-N (`ORDER BY ... LIMIT k`)
+            the global answer is the top-N of the union of per-worker top-Ns, so each
+            worker reads its split, applies the single-node top-N heap, and ships only k
+            rows; the driver merges. Reads the split directly (never on the driver)."""
+            import batcher._native as nat
+            from batcher.dist.executors.partition_io import read_partition_descriptor
+
+            return nat.execute_plan(
+                plan_ir, [read_partition_descriptor(partition)], self._engine_config
             )
 
         def sample_quantiles(self, map_ir, key_name, probs, partition):
@@ -434,7 +470,7 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     from batcher.dist.executors.ray_runtime import (
         create_worker_placement,
         current_envelope,
-        placement_actor_options,
+        fleet_actor_options,
     )
 
     dc = active_config().distributed
@@ -450,6 +486,8 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     # setter. 0 keepalive = off.
     idle_ms = int(dc.flight_idle_timeout_s * 1000)
     keepalive_ms = int((dc.flight_keepalive_s or 0) * 1000)
+    connections_per_peer = int(dc.flight_connections_per_peer or 0)
+    compression = {"none": 0, "lz4": 1, "zstd": 2}.get(dc.flight_compression, 1)
     # Same-node shared-memory transfer, decided on the driver and shipped to every
     # worker (which can't see the driver's config_context). Gated on the native probe so
     # it is never enabled where no shared directory exists (it would just churn fallbacks).
@@ -463,9 +501,23 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     # protected without setting it by hand.
     preemption = dc.resilience == "spot"
     pg = create_worker_placement(workers, current_envelope())
+    # Resolve the fleet-uniform actor options once (they read the live topology), then vary
+    # only the per-bundle index — so spawning W workers is O(W), not O(W x nodes).
+    opts = fleet_actor_options(pg, workers)
     actors = [
-        _FlightWorker.options(**placement_actor_options(pg, i)).remote(
-            i, credits, cfg_json, adaptive, token, idle_ms, keepalive_ms, plan_id, shm, preemption
+        _FlightWorker.options(**opts[i]).remote(
+            i,
+            credits,
+            cfg_json,
+            adaptive,
+            token,
+            idle_ms,
+            keepalive_ms,
+            connections_per_peer,
+            compression,
+            plan_id,
+            shm,
+            preemption,
         )
         for i in range(workers)
     ]

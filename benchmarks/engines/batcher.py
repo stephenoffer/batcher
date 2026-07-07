@@ -8,6 +8,7 @@ query with sqlglot and lowers it to the same plan IR the DataFrame API produces.
 from __future__ import annotations
 
 import dataclasses
+import os
 
 import pyarrow as pa
 
@@ -20,6 +21,14 @@ from .base import Engine, SqlRunner
 # write (on by default for observability) doesn't add I/O noise to the benchmark timing.
 _cfg = active_config()
 set_config(_cfg.replace(observability=dataclasses.replace(_cfg.observability, event_log=False)))
+
+# Execution mode for these in-memory benchmarks. Default single-node: Batcher's
+# in-process path is its low-overhead strength and the honest counterpart to Ray Data
+# running distributed on the cluster. ``collect(distributed="auto")`` would otherwise
+# fan a tiny in-memory query across every worker node (which lack the package) — that
+# is neither faster nor what the operator-mix is measuring. Flip with
+# ``BENCH_BATCHER_DISTRIBUTED=1`` to exercise the distributed path explicitly.
+_DISTRIBUTED: bool | str = "auto" if os.environ.get("BENCH_BATCHER_DISTRIBUTED") == "1" else False
 
 
 class BatcherEngine(Engine):
@@ -41,4 +50,4 @@ class BatcherEngine(Engine):
         session = bt.Session()
         for name, tbl in tables.items():
             session.register(name, tbl)
-        return lambda query: session.sql(query).collect()
+        return lambda query: session.sql(query).collect(distributed=_DISTRIBUTED)

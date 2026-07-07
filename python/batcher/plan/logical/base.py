@@ -9,6 +9,7 @@ via `to_ir()`; types of derived columns are resolved by the engine.
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
@@ -19,6 +20,36 @@ if TYPE_CHECKING:
     from batcher.plan.schema import SchemaRef
 
 __all__ = ["LogicalPlan"]
+
+# Sentinel distinguishing "not yet cached" from a cached `None` (an `available_schema`
+# that legitimately returns "unknown").
+_UNSET: Any = object()
+
+
+def _memoize_noarg(fn, slot: str):
+    """Wrap a no-argument pure method so its result is cached per node instance.
+
+    Plan nodes are immutable, so `to_ir`/`available_schema` are pure functions of the
+    node — but the optimizer calls them repeatedly (canonical keys, fixpoint change
+    detection, type inference) and each recurses over the whole subtree. Caching in the
+    instance `__dict__` (present because the `LogicalPlan` base sets no `__slots__`, even
+    though frozen subclasses do) collapses that to one computation per node. Writing to
+    `__dict__` bypasses the frozen `__setattr__`; the cached value is treated as read-only
+    (verified: nothing mutates a `to_ir()` dict or a `SchemaRef` in place).
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self):
+        cache = self.__dict__
+        val = cache.get(slot, _UNSET)
+        if val is not _UNSET:
+            return val
+        val = fn(self)
+        cache[slot] = val
+        return val
+
+    wrapper._memoized = True  # type: ignore[attr-defined]
+    return wrapper
 
 
 def _validate_refs(expr: Expr, available: set[str], *, what: str) -> None:
@@ -36,6 +67,17 @@ def _validate_refs(expr: Expr, available: set[str], *, what: str) -> None:
 
 class LogicalPlan:
     """Base class for logical plan nodes."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        # Memoize the pure, no-arg structural methods each concrete node defines. Runs
+        # once when the subclass is created (and again, harmlessly, when
+        # `@dataclass(slots=True)` re-creates it — the `_memoized` guard makes that a
+        # no-op). Only wraps a method the subclass actually overrides.
+        super().__init_subclass__(**kwargs)
+        for name in ("to_ir", "available_schema"):
+            fn = cls.__dict__.get(name)
+            if fn is not None and not getattr(fn, "_memoized", False):
+                setattr(cls, name, _memoize_noarg(fn, f"_c_{name}"))
 
     def to_ir(self) -> dict[str, Any]:  # pragma: no cover - overridden
         raise NotImplementedError

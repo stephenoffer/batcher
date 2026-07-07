@@ -53,95 +53,120 @@ pub(crate) fn merge_median(
     bucket_values_into_list(&Int64Array::from(elem_groups), &values, num_groups)
 }
 
-/// Median per group: sort the value list and take the middle (averaging the two
-/// middle values for an even count). Always yields Float64; empty groups → null.
+/// Median per group: the middle value (averaging the two middle for an even count).
+/// Always yields Float64; empty groups → null. (Median is the `q=0.5` quantile.)
 pub(crate) fn finalize_median(state: &ArrayRef) -> Result<ArrayRef, RuntimeError> {
+    finalize_select(state, "median", quickselect_median)
+}
+
+/// Continuous quantile per group at `q` in [0,1] (`percentile_cont`): linearly
+/// interpolate at position `q·(n-1)`. Always yields Float64; empty groups → null.
+pub(crate) fn finalize_quantile(state: &ArrayRef, q: f64) -> Result<ArrayRef, RuntimeError> {
+    finalize_select(state, "quantile", move |v| quickselect_quantile(v, q))
+}
+
+/// Shared finalize for median/quantile: each group's value list is independent, so the
+/// per-group selection runs across cores. The selection itself is **quickselect**
+/// (`select_nth_unstable_by`, O(n) average) instead of a full O(n log n) sort — median
+/// and quantile need only the value(s) at a fixed rank, not the whole order. Identical
+/// result to sorting then indexing (quickselect places the k-th smallest at index k with
+/// all lesser elements before it). Always Float64; an empty group → null.
+fn finalize_select(
+    state: &ArrayRef,
+    func: &str,
+    pick: impl Fn(&mut [f64]) -> f64 + Sync,
+) -> Result<ArrayRef, RuntimeError> {
+    use rayon::prelude::*;
+
     let list = state.as_list::<i32>();
+    let results: Vec<Option<f64>> = (0..list.len())
+        .into_par_iter()
+        .map(|row| -> Result<Option<f64>, RuntimeError> {
+            let mut v = group_values_f64(&list.value(row), func)?;
+            Ok((!v.is_empty()).then(|| pick(&mut v)))
+        })
+        .collect::<Result<_, _>>()?;
+
     let mut out = Float64Builder::with_capacity(list.len());
-    for row in 0..list.len() {
-        let vals = list.value(row);
-        let mut v: Vec<f64> = match vals.data_type() {
-            DataType::Int64 => {
-                let a = vals.as_primitive::<Int64Type>();
-                (0..a.len())
-                    .filter(|&i| a.is_valid(i))
-                    .map(|i| a.value(i) as f64)
-                    .collect()
-            }
-            DataType::Float64 => {
-                let a = vals.as_primitive::<Float64Type>();
-                (0..a.len())
-                    .filter(|&i| a.is_valid(i))
-                    .map(|i| a.value(i))
-                    .collect()
-            }
-            other => {
-                return Err(RuntimeError::UnsupportedAggregate {
-                    func: "median".to_string(),
-                    dtype: other.to_string(),
-                })
-            }
-        };
-        if v.is_empty() {
-            out.append_null();
-            continue;
+    for r in results {
+        match r {
+            Some(x) => out.append_value(x),
+            None => out.append_null(),
         }
-        // `total_cmp` is a total order over f64, so a NaN value sorts deterministically
-        // instead of panicking the way `partial_cmp(..).unwrap()` would on a NaN input.
-        v.sort_by(f64::total_cmp);
-        let n = v.len();
-        let m = if n % 2 == 1 {
-            v[n / 2]
-        } else {
-            (v[n / 2 - 1] + v[n / 2]) / 2.0
-        };
-        out.append_value(m);
     }
     Ok(Arc::new(out.finish()))
 }
 
-/// Continuous quantile per group at `q` in [0,1] (`percentile_cont`): sort the
-/// non-null values and linearly interpolate at position `q·(n-1)`. Always yields
-/// Float64; empty groups → null. (Median is the q=0.5 special case.)
-pub(crate) fn finalize_quantile(state: &ArrayRef, q: f64) -> Result<ArrayRef, RuntimeError> {
-    let list = state.as_list::<i32>();
-    let mut out = Float64Builder::with_capacity(list.len());
-    for row in 0..list.len() {
-        let vals = list.value(row);
-        let mut v: Vec<f64> = match vals.data_type() {
-            DataType::Int64 => {
-                let a = vals.as_primitive::<Int64Type>();
-                (0..a.len())
-                    .filter(|&i| a.is_valid(i))
-                    .map(|i| a.value(i) as f64)
-                    .collect()
-            }
-            DataType::Float64 => {
-                let a = vals.as_primitive::<Float64Type>();
-                (0..a.len())
-                    .filter(|&i| a.is_valid(i))
-                    .map(|i| a.value(i))
-                    .collect()
-            }
-            other => {
-                return Err(RuntimeError::UnsupportedAggregate {
-                    func: "quantile".to_string(),
-                    dtype: other.to_string(),
-                })
-            }
-        };
-        if v.is_empty() {
-            out.append_null();
-            continue;
+/// One group's non-null values as `f64` (Int64 widened). The list state is Int64 or
+/// Float64 element lists; any other element type is an unsupported aggregate.
+fn group_values_f64(vals: &ArrayRef, func: &str) -> Result<Vec<f64>, RuntimeError> {
+    match vals.data_type() {
+        DataType::Int64 => {
+            let a = vals.as_primitive::<Int64Type>();
+            Ok((0..a.len())
+                .filter(|&i| a.is_valid(i))
+                .map(|i| a.value(i) as f64)
+                .collect())
         }
-        // `total_cmp` is a total order over f64, so a NaN value sorts deterministically
-        // instead of panicking the way `partial_cmp(..).unwrap()` would on a NaN input.
-        v.sort_by(f64::total_cmp);
-        let pos = q.clamp(0.0, 1.0) * (v.len() - 1) as f64;
-        let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
-        out.append_value(v[lo] + (v[hi] - v[lo]) * (pos - lo as f64));
+        DataType::Float64 => {
+            let a = vals.as_primitive::<Float64Type>();
+            Ok((0..a.len())
+                .filter(|&i| a.is_valid(i))
+                .map(|i| a.value(i))
+                .collect())
+        }
+        other => Err(RuntimeError::UnsupportedAggregate {
+            func: func.to_string(),
+            dtype: other.to_string(),
+        }),
     }
-    Ok(Arc::new(out.finish()))
+}
+
+/// Median of `v` via quickselect — partition so the n/2-th smallest sits at index n/2
+/// (`total_cmp`, so NaN orders deterministically). For an even count the lower-middle is
+/// the max of the now-lesser partition, exactly the sorted `v[n/2-1]`.
+fn quickselect_median(v: &mut [f64]) -> f64 {
+    let n = v.len();
+    let (lo, mid, _) = v.select_nth_unstable_by(n / 2, f64::total_cmp);
+    if n % 2 == 1 {
+        *mid
+    } else {
+        let lower = lo.iter().copied().fold(f64::NEG_INFINITY, |a, b| {
+            if a.total_cmp(&b).is_lt() {
+                b
+            } else {
+                a
+            }
+        });
+        (lower + *mid) / 2.0
+    }
+}
+
+/// Continuous quantile of `v` at `q` via quickselect on the bracketing ranks: select the
+/// `floor(q·(n-1))`-th smallest; the next rank (when `q` falls between two) is the min of
+/// the resulting greater partition. Matches the sort-then-interpolate result.
+fn quickselect_quantile(v: &mut [f64], q: f64) -> f64 {
+    let n = v.len();
+    let pos = q.clamp(0.0, 1.0) * (n - 1) as f64;
+    let lo_i = pos.floor() as usize;
+    let frac = pos - lo_i as f64;
+    let (_, lo_ref, greater) = v.select_nth_unstable_by(lo_i, f64::total_cmp);
+    let lo_val = *lo_ref;
+    let hi_val = if frac == 0.0 || greater.is_empty() {
+        lo_val
+    } else {
+        greater.iter().copied().fold(
+            f64::INFINITY,
+            |a, b| {
+                if b.total_cmp(&a).is_lt() {
+                    b
+                } else {
+                    a
+                }
+            },
+        )
+    };
+    lo_val + (hi_val - lo_val) * frac
 }
 
 /// Mode per group: the most frequent value in each group's list (same list state
@@ -299,6 +324,46 @@ mod tests {
     }
 
     #[test]
+    fn quickselect_matches_sorted_oracle() {
+        // quickselect median/quantile must equal sorting then indexing, for odd/even
+        // counts, negatives, and duplicates — across many random vectors and quantiles.
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for trial in 0..400 {
+            let n = 1 + (rng() as usize % 257);
+            let mut v: Vec<f64> = (0..n).map(|_| (rng() % 1000) as f64 - 500.0).collect();
+            let mut sorted = v.clone();
+            sorted.sort_by(f64::total_cmp);
+            // median oracle
+            let om = if n % 2 == 1 {
+                sorted[n / 2]
+            } else {
+                (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+            };
+            assert_eq!(
+                super::quickselect_median(&mut v.clone()),
+                om,
+                "median trial {trial} n={n}"
+            );
+            // quantile oracle at a few q
+            for &q in &[0.0, 0.1, 0.25, 0.5, 0.9, 1.0] {
+                let pos = q * (n - 1) as f64;
+                let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+                let oq = sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64);
+                assert_eq!(
+                    super::quickselect_quantile(&mut v, q),
+                    oq,
+                    "quantile q={q} trial {trial} n={n}"
+                );
+            }
+        }
+    }
+
     fn median_and_quantile_with_nan_do_not_panic() {
         // A NaN in the value list previously panicked via partial_cmp(..).unwrap().
         let values: ArrayRef = Arc::new(Float64Array::from(vec![1.0, f64::NAN, 3.0, 2.0]));

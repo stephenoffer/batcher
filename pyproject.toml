@@ -182,7 +182,7 @@ modules = ["batcher.kyber", "batcher.carbonite", "batcher.core"]
 # `batcher._native` submodule, outside the independence set, so it needs no ignore.)
 ignore_imports = [
     "batcher.core.executor -> batcher",
-    "batcher.core.udf -> batcher",
+    "batcher.core.udf.execute -> batcher",
     "batcher.core.stats -> batcher",
     "batcher.core.streaming -> batcher",
 ]

@@ -120,6 +120,7 @@ class FlightShuffleServer:
         finalize: bool,
         credits: int | None = None,
         token: str | None = None,
+        shm: bool = False,
     ) -> tuple[pa.RecordBatch | None, list[int]]:
         """Concurrently fetch + `combine` the aggregate partials from every source.
 
@@ -130,12 +131,21 @@ class FlightShuffleServer:
         partial when `finalize` is false), or `None` when `unreachable` is non-empty
         (those sources hit a retryable fault → the driver recomputes and retries) or
         every bucket was empty. `combine` is associative, so the concurrent fold equals
-        a serial one.
+        a serial one. When `shm` is set, same-node sources are read zero-copy from shared
+        memory (with a Flight fallback) *inside* the concurrent set, so cross-node fetches
+        still fan out.
         """
         src = [(addr, str(ticket)) for addr, ticket in sources]
         if credits is None:
             return _gather_combine(
-                self._srv, client._client, group_keys_json, aggregates_json, src, fan_in, finalize
+                self._srv,
+                client._client,
+                group_keys_json,
+                aggregates_json,
+                src,
+                fan_in,
+                finalize,
+                shm=shm,
             )
         return _gather_combine(
             self._srv,
@@ -147,6 +157,7 @@ class FlightShuffleServer:
             finalize,
             credits,
             token,
+            shm,
         )
 
     def gather_concat(
@@ -156,17 +167,20 @@ class FlightShuffleServer:
         fan_in: int,
         credits: int | None = None,
         token: str | None = None,
+        shm: bool = False,
     ) -> tuple[list[pa.RecordBatch], list[int]]:
         """Concurrently fetch every source's raw batches into one list (window/sort/join).
 
         Like `gather_combine` but without a fold — the reducer needs the whole bucket
         and re-orders it downstream. Returns `(batches, unreachable)`; a non-empty
-        `unreachable` leaves the batches partial (the driver recomputes and retries).
+        `unreachable` leaves the batches partial (the driver recomputes and retries). When
+        `shm` is set, same-node sources are read zero-copy from shared memory (Flight
+        fallback) within the concurrent set.
         """
         src = [(addr, str(ticket)) for addr, ticket in sources]
         if credits is None:
-            return _gather_concat(self._srv, client._client, src, fan_in)
-        return _gather_concat(self._srv, client._client, src, fan_in, credits, token)
+            return _gather_concat(self._srv, client._client, src, fan_in, shm=shm)
+        return _gather_concat(self._srv, client._client, src, fan_in, credits, token, shm)
 
 
 class ShuffleClient:

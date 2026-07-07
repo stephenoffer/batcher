@@ -19,20 +19,15 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, Int64Array, UInt32Array};
-use arrow::datatypes::{
-    ArrowPrimitiveType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
-};
-use arrow::row::{RowConverter, SortField};
-use hashbrown::hash_table::Entry;
-use hashbrown::HashTable;
+use arrow::array::{Array, ArrayRef, Int64Array};
+use rayon::prelude::*;
 
 use crate::error::RuntimeError;
 
 mod accum;
 mod argextreme;
 mod distinct;
+mod fused;
 mod hll;
 mod median;
 mod qsketch;
@@ -43,6 +38,7 @@ mod var;
 
 use accum::{bitfold_acc, bool_acc, concat_col, minmax_acc, product_acc, require, sum_acc};
 use argextreme::{arg_extreme_state, merge_arg_extreme};
+pub use distinct::distinct_batch;
 use distinct::{bucket_values_into_list, distinct_state, finalize_count_distinct, merge_distinct};
 use hll::{approx_distinct_state, finalize_approx_distinct, merge_approx_distinct};
 use median::{
@@ -50,7 +46,7 @@ use median::{
     merge_median,
 };
 use qsketch::{approx_quantile_state, finalize_approx_quantile, merge_approx_quantile};
-use radix::assign_groups_radix;
+pub(crate) use radix::assign_groups;
 use stats::{
     covar_state, finalize_corr, finalize_covar, finalize_kurtosis, finalize_skewness, moment_state,
 };
@@ -245,26 +241,30 @@ pub fn partial(
     calls: &[AggCall],
     num_rows: usize,
 ) -> Result<Partial, RuntimeError> {
+    // Global aggregate (no GROUP BY): every row is one group, so each aggregate's partial
+    // state is the whole-column reduction — computable with arrow's SIMD kernels and, for
+    // those, WITHOUT the `vec![0u32; num_rows]` group-id buffer the grouped path allocates
+    // (and zeroes) per morsel but never reads on the single-group fast paths. That
+    // allocation dominated a global `SUM`/`MIN`/`MAX`/`COUNT` (measured ~2 ms at 6 M rows).
+    if group_keys.is_empty() {
+        return accum::global_partial(calls, num_rows);
+    }
+
     let (group_ids, num_groups, group_columns) = assign_groups(group_keys, num_rows)?;
+
+    // Fused fast path: the simple scalar aggregates (sum/count/min/max/mean) read
+    // `group_ids` *once* in a single fused scan instead of once per aggregate. It
+    // fills `slots[idx]` for the calls it fused (positions match `calls`) and leaves
+    // the rest `None` for the per-call loop below — so the result is identical, just
+    // with fewer passes over `group_ids`. A no-op when <2 calls are fusable.
+    let mut slots: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
+    fused::run_fused(calls, &group_ids, num_groups, &mut slots)?;
+
     let mut states = Vec::with_capacity(calls.len());
-    for call in calls {
-        let state = match call.func {
-            // Two-input: arg_min/arg_max need both the value and the ordering key.
-            AggFunc::ArgMin | AggFunc::ArgMax => arg_extreme_state(
-                require(call.values.as_ref(), call.func)?,
-                require(call.key.as_ref(), call.func)?,
-                &group_ids,
-                num_groups,
-                matches!(call.func, AggFunc::ArgMax),
-            )?,
-            // covar/corr are two-input: `values` is x, `key` carries y.
-            AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => covar_state(
-                require(call.values.as_ref(), call.func)?,
-                require(call.key.as_ref(), call.func)?,
-                &group_ids,
-                num_groups,
-            )?,
-            _ => accumulate(call.func, call.values.as_ref(), &group_ids, num_groups)?,
+    for (idx, call) in calls.iter().enumerate() {
+        let state = match slots[idx].take() {
+            Some(fused_state) => fused_state, // already computed in the fused scan
+            None => accum::accumulate_call(call, &group_ids, num_groups)?,
         };
         states.push(state);
     }
@@ -272,130 +272,6 @@ pub fn partial(
         group_columns,
         states,
     })
-}
-
-/// Assign each row a dense group id, returning the ids, the group count, and the
-/// distinct group-key columns (in first-seen order).
-pub(crate) fn assign_groups(
-    group_keys: &[ArrayRef],
-    num_rows: usize,
-) -> Result<(Vec<u32>, usize, Vec<ArrayRef>), RuntimeError> {
-    if group_keys.is_empty() {
-        // Global aggregate: a single group over all rows.
-        return Ok((vec![0; num_rows], 1, Vec::new()));
-    }
-    // Fast path: a single integer key column hashes its native values directly,
-    // skipping the RowConverter encoding pass (a per-row allocation + copy) that the
-    // general path needs for multi-column / variable-length / float keys. Integers are
-    // exact under raw hashing — floats (NaN, ±0.0) and strings keep the RowConverter,
-    // which imposes a correct total order. This is the common GROUP BY <int id> case.
-    if group_keys.len() == 1 {
-        use arrow::datatypes::DataType;
-        let arr = &group_keys[0];
-        match arr.data_type() {
-            DataType::Int8 => return assign_groups_int::<Int8Type>(arr, num_rows),
-            DataType::Int16 => return assign_groups_int::<Int16Type>(arr, num_rows),
-            DataType::Int32 => return assign_groups_int::<Int32Type>(arr, num_rows),
-            DataType::Int64 => return assign_groups_int::<Int64Type>(arr, num_rows),
-            DataType::UInt8 => return assign_groups_int::<UInt8Type>(arr, num_rows),
-            DataType::UInt16 => return assign_groups_int::<UInt16Type>(arr, num_rows),
-            DataType::UInt32 => return assign_groups_int::<UInt32Type>(arr, num_rows),
-            DataType::UInt64 => return assign_groups_int::<UInt64Type>(arr, num_rows),
-            _ => {}
-        }
-    }
-    let fields: Vec<SortField> = group_keys
-        .iter()
-        .map(|a| SortField::new(a.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields)?;
-    let rows = converter.convert_columns(group_keys)?;
-
-    // Group via a raw hash table keyed by *row index* — we store only the
-    // first-seen row of each group and compare encoded rows directly, avoiding
-    // the per-row owned-key allocation an `IndexMap<OwnedRow, _>` would incur.
-    // Size for the worst case (all rows distinct): the table holds at most
-    // `num_rows` entries, so pre-sizing avoids the rehash cascade a small initial
-    // capacity forces on a high-cardinality group-by (the hot per-morsel path).
-    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
-    let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
-    let mut group_ids = Vec::with_capacity(num_rows);
-
-    for i in 0..num_rows {
-        let row_i = rows.row(i);
-        let hash = state.hash_one(row_i);
-        let gid = match table.entry(
-            hash,
-            |&g| rows.row(reps[g as usize] as usize) == row_i,
-            |&g| state.hash_one(rows.row(reps[g as usize] as usize)),
-        ) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let gid = reps.len() as u32;
-                reps.push(i as u32);
-                e.insert(gid);
-                gid
-            }
-        };
-        group_ids.push(gid);
-    }
-
-    let num_groups = reps.len();
-    let group_columns = converter.convert_rows(reps.iter().map(|&i| rows.row(i as usize)))?;
-    Ok((group_ids, num_groups, group_columns))
-}
-
-/// Single-integer-key `assign_groups`: hash the native values directly (no row
-/// encoding). Nulls form one group (SQL semantics); the output key column is the
-/// representative rows `take`n from the input, so type and the null carry through.
-fn assign_groups_int<T>(
-    arr: &ArrayRef,
-    num_rows: usize,
-) -> Result<(Vec<u32>, usize, Vec<ArrayRef>), RuntimeError>
-where
-    T: ArrowPrimitiveType,
-    T::Native: std::hash::Hash + Eq,
-{
-    let a = arr.as_primitive::<T>();
-    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
-    let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
-    let mut group_ids = Vec::with_capacity(num_rows);
-    let mut null_gid: Option<u32> = None;
-
-    for i in 0..num_rows {
-        if a.is_null(i) {
-            let gid = *null_gid.get_or_insert_with(|| {
-                let g = reps.len() as u32;
-                reps.push(i as u32);
-                g
-            });
-            group_ids.push(gid);
-            continue;
-        }
-        let v = a.value(i);
-        let hash = state.hash_one(v);
-        // The table holds only non-null groups, so a rep is always a valid value.
-        let gid = match table.entry(
-            hash,
-            |&g| a.value(reps[g as usize] as usize) == v,
-            |&g| state.hash_one(a.value(reps[g as usize] as usize)),
-        ) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let gid = reps.len() as u32;
-                reps.push(i as u32);
-                e.insert(gid);
-                gid
-            }
-        };
-        group_ids.push(gid);
-    }
-
-    let num_groups = reps.len();
-    let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
-    Ok((group_ids, num_groups, group_columns))
 }
 
 /// The row count above which `combine` groups in parallel (hash-radix). Below it the
@@ -549,8 +425,12 @@ pub fn combine_with(
 
     let n_keys = parts[0].group_columns.len();
 
-    // Concatenate the group-key columns and each aggregate's state columns.
+    // Concatenate the group-key columns and each aggregate's state columns. On a
+    // high-cardinality combine (e.g. an all-distinct DISTINCT) each partial contributes
+    // ~its whole morsel, so this concatenation is a multi-million-row copy per column —
+    // fan the per-column concats across cores rather than running them one after another.
     let group_concat: Vec<ArrayRef> = (0..n_keys)
+        .into_par_iter()
         .map(|i| concat_col(parts.iter().map(|p| &p.group_columns[i])))
         .collect::<Result<_, _>>()?;
     // Number of partial rows to regroup. With group keys it's the key-column
@@ -569,23 +449,41 @@ pub fn combine_with(
             .sum(),
     };
 
-    // High-cardinality combine (the distinct / many-group case) regroups a large
-    // concatenation; parallelize it via hash-radix when it's big enough to amortize.
-    // The serial path stays for global aggregates (no key columns) and small inputs.
-    let (group_ids, num_groups, merged_group_columns) =
-        if total_rows > radix_parallel_threshold && !group_concat.is_empty() {
-            let partitions = rayon::current_num_threads().clamp(2, 64);
-            assign_groups_radix(&group_concat, total_rows, partitions)?
-        } else {
-            assign_groups(&group_concat, total_rows)?
-        };
+    // Concatenate every aggregate's partial-state columns once (each func may carry
+    // several — e.g. mean's sum+count). Shared by both regroup paths below.
+    let state_concats: Vec<Vec<ArrayRef>> = (0..funcs.len())
+        .map(|a| {
+            (0..parts[0].states[a].len())
+                .map(|c| concat_col(parts.iter().map(|p| &p.states[a][c])))
+                .collect::<Result<_, _>>()
+        })
+        .collect::<Result<_, _>>()?;
 
+    // High-cardinality combine (the distinct / many-group case) regroups a large
+    // concatenation. Above the threshold, hash-radix partitions by key and groups AND
+    // merges each partition independently across threads (partitions are key-disjoint,
+    // so no cross-partition merge) — parallelizing the otherwise-serial merge scan that
+    // dominates a many-group combine. Below it, and for global aggregates (no keys), the
+    // serial path wins (the radix machinery is pure overhead on a small/single group).
+    if total_rows > radix_parallel_threshold && !group_concat.is_empty() {
+        let partitions = rayon::current_num_threads().clamp(2, 64);
+        let (group_columns, states) =
+            radix::combine_radix(&group_concat, &state_concats, funcs, total_rows, partitions)?;
+        return Ok(Partial {
+            group_columns,
+            states,
+        });
+    }
+
+    let (group_ids, num_groups, merged_group_columns) = assign_groups(&group_concat, total_rows)?;
     let mut states = Vec::with_capacity(funcs.len());
     for (a, &func) in funcs.iter().enumerate() {
-        let state_concat: Vec<ArrayRef> = (0..parts[0].states[a].len())
-            .map(|c| concat_col(parts.iter().map(|p| &p.states[a][c])))
-            .collect::<Result<_, _>>()?;
-        states.push(merge_state(func, &state_concat, &group_ids, num_groups)?);
+        states.push(radix::merge_state(
+            func,
+            &state_concats[a],
+            &group_ids,
+            num_groups,
+        )?);
     }
     Ok(Partial {
         group_columns: merged_group_columns,
@@ -628,108 +526,131 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
     Ok(out)
 }
 
-// --- partial / merge state production ----------------------------------------
-
-/// Merge already-partial state columns into one group via the function's
-/// associative reducer (single-pass, reusing `accumulate`). Counts/sums merge by
-/// summing the partial states; min/max by min/max; mean by summing both the
-/// partial sums and the partial counts.
-fn merge_state(
-    func: AggFunc,
-    state: &[ArrayRef],
-    group_ids: &[u32],
-    num_groups: usize,
-) -> Result<Vec<ArrayRef>, RuntimeError> {
-    Ok(match func {
-        AggFunc::CountStar | AggFunc::Count | AggFunc::Sum => {
-            accumulate(AggFunc::Sum, Some(&state[0]), group_ids, num_groups)?
-        }
-        // Distinct sets merge by unioning the per-group value lists (dedup again).
-        AggFunc::CountDistinct => vec![merge_distinct(&state[0], group_ids, num_groups)?],
-        AggFunc::Median
-        | AggFunc::Quantile(_)
-        | AggFunc::ListAgg
-        | AggFunc::Mode
-        | AggFunc::Histogram => {
-            vec![merge_median(&state[0], group_ids, num_groups)?]
-        }
-        AggFunc::Min => accumulate(AggFunc::Min, Some(&state[0]), group_ids, num_groups)?,
-        AggFunc::Max => accumulate(AggFunc::Max, Some(&state[0]), group_ids, num_groups)?,
-        // Boolean state re-folds via the same AND/OR reducer (associative).
-        AggFunc::BoolAnd | AggFunc::BoolOr => {
-            accumulate(func, Some(&state[0]), group_ids, num_groups)?
-        }
-        // Product / bitwise state re-folds via the same associative op.
-        AggFunc::Product | AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => {
-            accumulate(func, Some(&state[0]), group_ids, num_groups)?
-        }
-        // Per-group HLL sketches union across partitions.
-        AggFunc::ApproxCountDistinct => {
-            vec![merge_approx_distinct(&state[0], group_ids, num_groups)?]
-        }
-        // Per-group KLL sketches merge across partitions.
-        AggFunc::ApproxQuantile(_) => {
-            vec![merge_approx_quantile(&state[0], group_ids, num_groups)?]
-        }
-        // 2-column (key, value) state: keep the extreme-key pair per group.
-        AggFunc::ArgMin | AggFunc::ArgMax => merge_arg_extreme(
-            state,
-            group_ids,
-            num_groups,
-            matches!(func, AggFunc::ArgMax),
-        )?,
-        AggFunc::Mean => vec![
-            accumulate(AggFunc::Sum, Some(&state[0]), group_ids, num_groups)?
-                .into_iter()
-                .next()
-                .unwrap(),
-            accumulate(AggFunc::Sum, Some(&state[1]), group_ids, num_groups)?
-                .into_iter()
-                .next()
-                .unwrap(),
-        ],
-        // (sum, sumsq, count) all merge by summing.
-        AggFunc::Var | AggFunc::Stddev => (0..3)
-            .map(|c| {
-                accumulate(AggFunc::Sum, Some(&state[c]), group_ids, num_groups)
-                    .map(|mut v| v.swap_remove(0))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        // The sum-of-powers state columns (5 for skew/kurt, 6 for covar/corr) all
-        // merge by summing — the property that makes these mergeable.
-        AggFunc::Skewness | AggFunc::Kurtosis => sum_each_column(state, group_ids, num_groups)?,
-        AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => {
-            sum_each_column(state, group_ids, num_groups)?
-        }
-    })
-}
-
-/// Merge each partial-state column by summing it across partitions (the shared
-/// reducer for every sum-of-powers aggregate). Column 0 is an Int64 count; summing
-/// it stays Int64, the Float64 moment columns stay Float64.
-fn sum_each_column(
-    state: &[ArrayRef],
-    group_ids: &[u32],
-    num_groups: usize,
-) -> Result<Vec<ArrayRef>, RuntimeError> {
-    (0..state.len())
-        .map(|c| {
-            accumulate(AggFunc::Sum, Some(&state[c]), group_ids, num_groups)
-                .map(|mut v| v.swap_remove(0))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::array::{AsArray, Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::Int64Type;
+    use arrow::row::{RowConverter, SortField};
+    use hashbrown::hash_table::Entry;
+    use hashbrown::HashTable;
 
     fn i64s(v: &[i64]) -> ArrayRef {
         Arc::new(Int64Array::from(v.to_vec()))
     }
     fn strs(v: &[&str]) -> ArrayRef {
         Arc::new(StringArray::from(v.to_vec()))
+    }
+
+    /// The native-value fast paths (single string, multi-column) must assign exactly the
+    /// same groups — same partition of rows, same group count — as the row-encoder
+    /// fallback. Verified by comparing the group *partition* each path induces (the
+    /// group ids are dense but their numbering may differ, so compare the equivalence
+    /// relation: two rows share a group under one iff they do under the other).
+    fn same_partition(a: &[u32], b: &[u32]) {
+        assert_eq!(a.len(), b.len(), "row count");
+        for i in 0..a.len() {
+            for j in 0..a.len() {
+                assert_eq!(
+                    a[i] == a[j],
+                    b[i] == b[j],
+                    "rows {i},{j} disagree on co-grouping"
+                );
+            }
+        }
+    }
+
+    fn via_row_encoder(keys: &[ArrayRef], n: usize) -> (Vec<u32>, usize) {
+        let fields: Vec<SortField> = keys
+            .iter()
+            .map(|a| SortField::new(a.data_type().clone()))
+            .collect();
+        let conv = RowConverter::new(fields).unwrap();
+        let rows = conv.convert_columns(keys).unwrap();
+        let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
+        let mut table: HashTable<u32> = HashTable::with_capacity(n.max(1));
+        let mut reps: Vec<u32> = Vec::new();
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let row_i = rows.row(i);
+            let h = state.hash_one(row_i);
+            let gid = match table.entry(
+                h,
+                |&g| rows.row(reps[g as usize] as usize) == row_i,
+                |&g| state.hash_one(rows.row(reps[g as usize] as usize)),
+            ) {
+                Entry::Occupied(e) => *e.get(),
+                Entry::Vacant(e) => {
+                    let g = reps.len() as u32;
+                    reps.push(i as u32);
+                    e.insert(g);
+                    g
+                }
+            };
+            ids.push(gid);
+        }
+        (ids, reps.len())
+    }
+
+    #[test]
+    fn string_fast_path_matches_row_encoder() {
+        // A single Utf8 key with a null and repeats — the byte fast path must induce the
+        // same group partition as the row-encoder oracle (group ids may be renumbered).
+        let keys: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("b"),
+            Some("a"),
+            None,
+            Some("b"),
+            None,
+        ])) as ArrayRef];
+        let n = keys[0].len();
+        let (fast_ids, fast_n, _) = assign_groups(&keys, n).unwrap();
+        let (slow_ids, slow_n) = via_row_encoder(&keys, n);
+        assert_eq!(fast_n, slow_n, "group count");
+        same_partition(&fast_ids, &slow_ids);
+    }
+
+    #[test]
+    fn int64_multi_fast_path_matches_row_encoder() {
+        // Two Int64 key columns with repeats and a repeated composite pair — the
+        // multi-column fast path must induce the same group partition (and reps, so the
+        // same group-key columns) as the row-encoder oracle.
+        let k0 = i64s(&[1, 2, 1, 3, 2, 1]);
+        let k1 = i64s(&[7, 8, 7, 9, 8, 8]); // (1,7) repeats; (1,8) is its own group
+        let keys = vec![k0, k1];
+        let n = keys[0].len();
+        let (fast_ids, fast_n, fast_cols) = assign_groups(&keys, n).unwrap();
+        let (slow_ids, slow_n) = via_row_encoder(&keys, n);
+        assert_eq!(fast_n, slow_n, "group count");
+        same_partition(&fast_ids, &slow_ids);
+        // The representative key columns carry the first-seen distinct pairs:
+        // (1,7), (2,8), (3,9), (1,8) in first-seen order.
+        assert_eq!(fast_cols.len(), 2);
+        let c0 = fast_cols[0].as_primitive::<Int64Type>();
+        let c1 = fast_cols[1].as_primitive::<Int64Type>();
+        let pairs: Vec<(i64, i64)> = (0..fast_n).map(|g| (c0.value(g), c1.value(g))).collect();
+        assert_eq!(pairs, vec![(1, 7), (2, 8), (3, 9), (1, 8)]);
+    }
+
+    #[test]
+    fn multi_raw_mixed_fast_path_matches_row_encoder() {
+        // Mixed Int64 + Utf8 composite key (the `GROUP BY <id>, <status>` shape) with
+        // repeats — the raw mixed multi-key path must induce the same group partition and
+        // first-seen representative columns as the row-encoder oracle.
+        let k0 = i64s(&[1, 2, 1, 3, 2, 1]);
+        let k1: ArrayRef = Arc::new(StringArray::from(vec!["x", "y", "x", "y", "y", "z"]));
+        let keys = vec![k0, k1]; // (1,x) repeats; (1,z) is its own group; (2,y) repeats
+        let n = keys[0].len();
+        let (fast_ids, fast_n, fast_cols) = assign_groups(&keys, n).unwrap();
+        let (slow_ids, slow_n) = via_row_encoder(&keys, n);
+        assert_eq!(fast_n, slow_n, "group count");
+        same_partition(&fast_ids, &slow_ids);
+        // First-seen distinct pairs: (1,x), (2,y), (3,y), (1,z).
+        let c0 = fast_cols[0].as_primitive::<Int64Type>();
+        let c1 = fast_cols[1].as_string::<i32>();
+        let pairs: Vec<(i64, &str)> = (0..fast_n).map(|g| (c0.value(g), c1.value(g))).collect();
+        assert_eq!(pairs, vec![(1, "x"), (2, "y"), (3, "y"), (1, "z")]);
     }
 
     const FUNCS: [AggFunc; 5] = [
@@ -809,37 +730,114 @@ mod tests {
         assert_eq!(ids[3], ids[5]);
     }
 
+    /// Sum each group via the parallel radix `combine` (partials → combine with a tiny
+    /// threshold that forces the radix path) and via the single-node serial oracle, and
+    /// assert the per-group sums are identical. This exercises grouping *and* the
+    /// parallel per-partition merge — the whole `combine_radix` path.
+    fn assert_radix_combine_sum_matches(keys: &[ArrayRef], values: &ArrayRef, n: usize) {
+        use std::collections::BTreeMap;
+        let key_rendered = |cols: &[ArrayRef], r: usize| -> String {
+            cols.iter()
+                .map(|c| {
+                    if c.is_null(r) {
+                        "∅".to_string()
+                    } else if let Some(a) = c.as_any().downcast_ref::<Int64Array>() {
+                        a.value(r).to_string()
+                    } else {
+                        c.as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value(r)
+                            .to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        let sum_map = |gc: &[ArrayRef], ac: &[ArrayRef]| -> BTreeMap<String, i64> {
+            let s = ac[0].as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..s.len())
+                .map(|r| (key_rendered(gc, r), s.value(r)))
+                .collect()
+        };
+
+        // Serial oracle: one whole-input group_aggregate.
+        let call = AggCall::with_key(AggFunc::Sum, Some(values.clone()), None);
+        let oracle = group_aggregate(keys, std::slice::from_ref(&call), n).unwrap();
+        let oracle_map = sum_map(&oracle.group_columns, &oracle.agg_columns);
+
+        // Parallel path: split into chunks, partial each, then combine (threshold 1 →
+        // radix). Mirrors how the executor combines per-morsel partials.
+        let chunks = 11usize;
+        let step = n.div_ceil(chunks);
+        let partials: Vec<Partial> = (0..n)
+            .step_by(step)
+            .map(|off| {
+                let len = step.min(n - off);
+                let ck: Vec<ArrayRef> = keys.iter().map(|k| k.slice(off, len)).collect();
+                let cv = values.slice(off, len);
+                let call = AggCall::with_key(AggFunc::Sum, Some(cv), None);
+                partial(&ck, std::slice::from_ref(&call), len).unwrap()
+            })
+            .collect();
+        let merged = combine_with(&partials, &[AggFunc::Sum], 1).unwrap();
+        let agg = finalize(&[AggFunc::Sum], &merged).unwrap();
+        let radix_map = sum_map(&merged.group_columns, &agg);
+
+        assert_eq!(
+            radix_map, oracle_map,
+            "radix combine sums must match the oracle"
+        );
+    }
+
     #[test]
-    fn radix_groups_equal_serial_on_large_input() {
-        // 250k rows over 5000 distinct keys — crosses RADIX_PARALLEL_THRESHOLD, so this
-        // is the path `combine` takes for a high-cardinality distinct/group-by.
+    fn radix_combine_matches_serial_on_high_cardinality() {
+        // 250k rows over 5000 distinct int keys — crosses the radix threshold.
         let n = 250_000usize;
-        let vals: Vec<i64> = (0..n).map(|i| (i % 5000) as i64).collect();
-        let key: ArrayRef = Arc::new(Int64Array::from(vals.clone()));
-        let keys = std::slice::from_ref(&key);
+        let key: ArrayRef = Arc::new(Int64Array::from(
+            (0..n).map(|i| (i % 5000) as i64).collect::<Vec<_>>(),
+        ));
+        let vals: ArrayRef = Arc::new(Int64Array::from(
+            (0..n).map(|i| (i % 7) as i64).collect::<Vec<_>>(),
+        ));
+        assert_radix_combine_sum_matches(std::slice::from_ref(&key), &vals, n);
+    }
 
-        let (ids_s, ng_s, cols_s) = assign_groups(keys, n).unwrap();
-        let (ids_r, ng_r, cols_r) = assign_groups_radix(keys, n, 8).unwrap();
-        assert_eq!(ng_s, 5000);
-        assert_eq!(ng_r, 5000); // same number of groups as serial
+    #[test]
+    fn radix_combine_handles_null_keys_like_serial() {
+        // Nulls scattered across the input must all merge into the one null group.
+        let n = 200_001usize;
+        let key: ArrayRef = Arc::new(Int64Array::from(
+            (0..n)
+                .map(|i| {
+                    if i % 7 == 0 {
+                        None
+                    } else {
+                        Some((i % 9000) as i64)
+                    }
+                })
+                .collect::<Vec<Option<i64>>>(),
+        ));
+        let vals: ArrayRef = Arc::new(Int64Array::from(
+            (0..n).map(|i| (i % 5 + 1) as i64).collect::<Vec<_>>(),
+        ));
+        assert_radix_combine_sum_matches(std::slice::from_ref(&key), &vals, n);
+    }
 
-        let key_set = |c: &ArrayRef| {
-            let a = c.as_any().downcast_ref::<Int64Array>().unwrap();
-            (0..a.len())
-                .map(|i| a.value(i))
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        assert_eq!(key_set(&cols_s[0]), key_set(&cols_r[0])); // same distinct keys
-
-        // Round-trip: each row's assigned group key equals its input key (both paths).
-        let check = |ids: &[u32], cols: &ArrayRef| {
-            let g = cols.as_any().downcast_ref::<Int64Array>().unwrap();
-            for (i, &v) in vals.iter().enumerate() {
-                assert_eq!(g.value(ids[i] as usize), v);
-            }
-        };
-        check(&ids_s, &cols_s[0]);
-        check(&ids_r, &cols_r[0]);
+    #[test]
+    fn radix_combine_matches_serial_on_multikey() {
+        // Two-column key forces the general RowConverter bucketing path.
+        let n = 250_000usize;
+        let a: ArrayRef = Arc::new(Int64Array::from(
+            (0..n).map(|i| (i % 500) as i64).collect::<Vec<_>>(),
+        ));
+        let b: ArrayRef = Arc::new(StringArray::from(
+            (0..n).map(|i| format!("g{}", i % 400)).collect::<Vec<_>>(),
+        ));
+        let vals: ArrayRef = Arc::new(Int64Array::from(
+            (0..n).map(|i| (i % 9) as i64).collect::<Vec<_>>(),
+        ));
+        assert_radix_combine_sum_matches(&[a, b], &vals, n);
     }
 
     /// `bool_and`/`bool_or` must satisfy the same partial→combine→finalize ==

@@ -40,7 +40,8 @@ def _distributed_distinct(
     if transport == "flight":
         from batcher.dist.flight_aggregate import execute_aggregate_flight
 
-        # Flight collects in the adaptive loop (cross-stage Flight materialize needs a
-        # shared actor fleet; deferred). The disk path keeps the result partitioned.
-        return execute_aggregate_flight(above, agg, sources, workers)
+        # DISTINCT is a group-by with no aggregates, so it rides the aggregate's
+        # `materialize=False` path: with an ambient fleet the deduped result stays on the
+        # workers (a `FlightMaterializedSource`) instead of collecting on the head.
+        return execute_aggregate_flight(above, agg, sources, workers, materialize=materialize)
     return _distributed_aggregate(above, agg, sources, workers, materialize=materialize)

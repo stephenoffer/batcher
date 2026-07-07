@@ -20,8 +20,13 @@ def _alias_of(p) -> str:
         return p.alias
     if isinstance(p, exp.Column):
         return p.name
-    # derive a name from the expression text
-    return p.sql().replace(" ", "_").replace("(", "_").replace(")", "").replace("*", "star")
+    # No explicit `AS`: derive the output name from the expression, matching the
+    # convention of the reference engines (DuckDB/Polars) so a column the user did not
+    # alias lines up across engines — `sum(l_quantity)`, `count_star()` — rather than a
+    # bespoke `SUM_l_quantity`. `count(*)` is DuckDB's special `count_star()`.
+    if isinstance(p, exp.Count) and isinstance(p.this, exp.Star):
+        return "count_star()"
+    return p.sql().lower()
 
 
 def _has_aggregate(node) -> bool:

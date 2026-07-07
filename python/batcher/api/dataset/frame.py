@@ -615,14 +615,21 @@ class Dataset:
         *,
         batch_size: int | None = None,
         output_columns: list[str] | None = None,
-        num_workers: int = 1,
+        num_workers: int | str = "auto",
         num_gpus: float = 0.0,
         concurrency: int | None = None,
         batch_format: str = "pyarrow",
         multiprocessing: bool = False,
+        max_errored_rows: int = 0,
     ) -> Dataset:
         """Apply a Python function to each batch — `ds.ml.map_batches`, kept
         top-level for the familiar spelling (see `ds.ml` for the full ML surface).
+
+        `num_workers` defaults to ``"auto"`` — the per-batch calls fan across all
+        local cores, so a batch transform is parallel by default rather than
+        single-threaded (the Ray Data foot-gun). Threads only speed up a
+        GIL-releasing `fn` (Arrow/NumPy/torch); pass ``multiprocessing=True`` for a
+        CPU-bound pure-Python `fn`. An explicit int wins.
 
         Examples:
             .. doctest::
@@ -644,6 +651,7 @@ class Dataset:
             concurrency=concurrency,
             batch_format=batch_format,
             multiprocessing=multiprocessing,
+            max_errored_rows=max_errored_rows,
         )
 
     def offload_blobs(
@@ -1685,6 +1693,7 @@ class Dataset:
         num_partitions: int | None = None,
         adaptive: bool | str = "auto",
         transport: str = "auto",
+        backend: str = "cpu",
     ) -> pa.Table:
         """Execute the plan and materialize the result as a `pyarrow.Table`.
 
@@ -1695,9 +1704,15 @@ class Dataset:
         it and `num_partitions` overrides the bucket count. `adaptive="auto"` turns on
         intra-query re-optimization only when a join's input size is a pure estimate
         (so measured cardinality could change a build-side/join-order choice), and
-        stays one-shot otherwise; `True`/`False` force it. The result is identical
-        whichever way it runs. Raises `PlanError` if the dataset is unbounded (a
-        streaming source) — use `iter_batches()` / `write()`.
+        stays one-shot otherwise; `True`/`False` force it. `backend` selects where a
+        supported shape runs: `"cpu"` (default) the native engine, `"gpu"` forces the GPU
+        (cuDF) for any supported shape, and `"auto"` lets Kyber's cost policy decide — GPU
+        only when the estimated input is large enough to amortize the device overhead and
+        fits the cluster's GPU memory (sharding across GPUs when it exceeds one), else the
+        CPU engine. Any unsupported shape or a GPU-less cluster falls back to the CPU engine,
+        so every value is safe to request and the result is identical whichever way it runs.
+        Raises `PlanError` if the dataset is unbounded (a streaming source) — use
+        `iter_batches()` / `write()`.
 
         Examples:
             .. doctest::
@@ -1718,6 +1733,7 @@ class Dataset:
             adaptive=adaptive,
             transport=transport,
             cache=self._cache,
+            backend=backend,
         )
 
     def explain(self, analyze: bool = False, *, format: str = "text") -> str:
@@ -1748,9 +1764,7 @@ class Dataset:
                 >>> len(ds.filter(bt.col("x") > 1).explain(analyze=True)) > 0
                 True
         """
-        return _explain(
-            self._plan, self._sources, self.columns, analyze=analyze, fmt=format
-        )
+        return _explain(self._plan, self._sources, self.columns, analyze=analyze, fmt=format)
 
     def stats(self) -> RunStats:
         """Execute (single-node) and return measured per-operator `RunStats`.
@@ -1829,13 +1843,257 @@ class Dataset:
         """
         return list(self.schema.types)
 
+    def _require_column(self, column: str, op: str) -> None:
+        """Validate that `column` is an output column, else raise `PlanError`."""
+        available = self._plan.available_columns()
+        if column not in available:
+            raise PlanError(f"{op}(): unknown column {_unknown_cols({column}, available)}")
+
+    def _exec_scalar(self, agg_expr: Expr) -> Any:
+        """Execute a single global aggregate and return its one scalar value."""
+        res = self.agg(**{"__bc_scalar__": agg_expr}).to_pydict()["__bc_scalar__"]
+        return res[0] if res else None
+
+    def _exec_null_total(self, column: str) -> tuple[int, int]:
+        """Execute `(null_count, row_count)` for `column` in one aggregate pass."""
+        from batcher.api.functions import count
+
+        res = self.agg(__bc_n__=count(), __bc_c__=Col(column).count()).to_pydict()
+        total = res["__bc_n__"][0] if res["__bc_n__"] else 0
+        nonnull = res["__bc_c__"][0] if res["__bc_c__"] else 0
+        return int(total) - int(nonnull), int(total)
+
+    def min(self, column: str) -> Any:
+        """The minimum value of `column` (SQL ``MIN``), answered from metadata when exact.
+
+        A scalar terminal: when an EXACT footer/manifest bound is available (a Parquet
+        scan, a rename/sort/distinct over one) the answer comes straight from the
+        metadata with no scan; otherwise a single ``MIN`` aggregate runs. Nulls are
+        ignored; an all-null or empty `column` yields ``None`` — always identical to
+        executing.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The minimum value, or ``None`` for an empty/all-null column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [3, 1, 2]}).min("x")
+                1
+        """
+        self._require_column(column, "min")
+        from batcher.api.terminal.metadata_answer import metadata_min
+
+        answer = metadata_min(self._plan, self._sources, column)
+        return answer if answer is not None else self._exec_scalar(Col(column).min())
+
+    def max(self, column: str) -> Any:
+        """The maximum value of `column` (SQL ``MAX``), answered from metadata when exact.
+
+        The upper-bound mirror of `min`: an EXACT footer bound answers with no scan,
+        else one ``MAX`` aggregate runs. Nulls are ignored; empty/all-null yields ``None``.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The maximum value, or ``None`` for an empty/all-null column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [3, 1, 2]}).max("x")
+                3
+        """
+        self._require_column(column, "max")
+        from batcher.api.terminal.metadata_answer import metadata_max
+
+        answer = metadata_max(self._plan, self._sources, column)
+        return answer if answer is not None else self._exec_scalar(Col(column).max())
+
+    def n_unique(self, column: str) -> int:
+        """The exact number of distinct values in `column` (SQL ``COUNT(DISTINCT)``).
+
+        Answered from metadata only when an **exact** distinct count is known (never a
+        sketch — use `approx_n_unique` for the fast approximate answer); otherwise an
+        exact ``COUNT(DISTINCT)`` runs. Nulls are not counted as a distinct value.
+
+        Args:
+            column: The column whose distinct values to count.
+
+        Returns:
+            The number of distinct non-null values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 1, 2, 3, 3]}).n_unique("x")
+                3
+        """
+        self._require_column(column, "n_unique")
+        from batcher.api.terminal.metadata_answer import metadata_n_unique
+
+        answer = metadata_n_unique(self._plan, self._sources, column)
+        return answer if answer is not None else int(self._exec_scalar(Col(column).n_unique()))
+
+    def n_null(self, column: str) -> int:
+        """The exact number of null values in `column` (``count(*) - count(column)``).
+
+        Answered from metadata when an EXACT per-column null count is known (a Parquet/
+        ORC footer records it), else computed in one aggregate pass. The scalar,
+        single-column counterpart of `null_count` (which returns one row for every
+        column).
+
+        Args:
+            column: The column whose nulls to count.
+
+        Returns:
+            The number of null values in `column`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, None, 3, None]}).n_null("x")
+                2
+        """
+        self._require_column(column, "n_null")
+        from batcher.api.terminal.metadata_answer import metadata_null_count
+
+        answer = metadata_null_count(self._plan, self._sources, column)
+        return answer if answer is not None else self._exec_null_total(column)[0]
+
+    def has_nulls(self, column: str) -> bool:
+        """Whether `column` contains at least one null, answered from metadata when exact.
+
+        A no-scan answer when an EXACT null count is known, else a single aggregate.
+
+        Args:
+            column: The column to test.
+
+        Returns:
+            ``True`` if `column` has any null value.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, None, 3]}).has_nulls("x")
+                True
+                >>> bt.from_pydict({"x": [1, 2, 3]}).has_nulls("x")
+                False
+        """
+        self._require_column(column, "has_nulls")
+        from batcher.api.terminal.metadata_answer import metadata_has_nulls
+
+        answer = metadata_has_nulls(self._plan, self._sources, column)
+        return answer if answer is not None else self._exec_null_total(column)[0] > 0
+
+    def all_null(self, column: str) -> bool:
+        """Whether every value of `column` is null, answered from metadata when exact.
+
+        ``True`` only for a non-empty column whose null count equals its row count (an
+        empty dataset is not reported all-null). No-scan when EXACT counts are known.
+
+        Args:
+            column: The column to test.
+
+        Returns:
+            ``True`` if `column` is non-empty and entirely null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, pyarrow as pa
+                >>> t = pa.table({"x": pa.array([None, None], type=pa.int64())})
+                >>> bt.from_arrow(t).all_null("x")
+                True
+                >>> bt.from_pydict({"x": [1, None]}).all_null("x")
+                False
+        """
+        self._require_column(column, "all_null")
+        from batcher.api.terminal.metadata_answer import metadata_all_null
+
+        answer = metadata_all_null(self._plan, self._sources, column)
+        if answer is not None:
+            return answer
+        nulls, total = self._exec_null_total(column)
+        return total > 0 and nulls == total
+
+    def any(self) -> bool:
+        """Whether the result has at least one row (the complement of `is_empty`).
+
+        Answered from metadata when the row count is provably known, else a single-row
+        probe (which the streaming path reads without scanning the whole source).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3]}).any()
+                True
+                >>> bt.from_pydict({"x": [1]}).filter(bt.col("x") > 10).any()
+                False
+        """
+        return not self.is_empty()
+
+    @property
+    def has_rows(self) -> bool:
+        """Whether the result has at least one row — property form of `any`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3]}).has_rows
+                True
+        """
+        return not self.is_empty()
+
+    def approx_n_unique(self, column: str) -> int | None:
+        """Approximate number of distinct values in `column` (HyperLogLog).
+
+        Opt-in and explicitly approximate — the fast analog of `n_unique`. Answered
+        from a learned sketch ndv with no scan when available, else an HLL pass over the
+        data. Returns ``None`` only when neither is possible.
+
+        Args:
+            column: The column whose distinct values to estimate.
+
+        Returns:
+            The approximate distinct count, or ``None`` if unavailable.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": list(range(1000)) * 2})
+                >>> ds.approx_n_unique("x") is not None
+                True
+        """
+        self._require_column(column, "approx_n_unique")
+        from batcher.api.terminal.metadata_answer import metadata_approx_n_unique
+
+        answer = metadata_approx_n_unique(self._plan, self._sources, column)
+        if answer is not None:
+            return answer
+        res = self._exec_scalar(Col(column).approx_count_distinct())
+        return int(res) if res is not None else None
+
     def approx_quantile(self, column: str, q: float) -> float | None:
         """Approximate quantile `q` (in ``[0, 1]``) of a numeric `column`.
 
-        Opt-in and explicitly approximate — a TDigest sketch, tail-accurate
-        (p99/p999) and far cheaper than the exact sort `quantile` would need.
-        Returns ``None`` for a non-numeric or empty column. Use the exact
-        aggregate when precision matters.
+        Opt-in and explicitly approximate. Answered from the hub's learned quantile
+        grid (a KLL sketch from a past run) with no scan when available; otherwise a
+        TDigest is streamed over the data — tail-accurate (p99/p999) and far cheaper
+        than the exact sort `quantile` would need. Returns ``None`` for a non-numeric
+        or empty column. Use the exact aggregate when precision matters.
 
         Examples:
             .. doctest::
@@ -1845,12 +2103,57 @@ class Dataset:
                 >>> ds.approx_quantile("x", 0.5) is not None
                 True
         """
+        if not 0.0 <= q <= 1.0:
+            raise PlanError(f"approx_quantile(q) requires q in [0, 1], got {q}")
+        self._require_column(column, "approx_quantile")
+        from batcher.api.terminal.metadata_answer import metadata_learned_quantile
+
+        learned = metadata_learned_quantile(column, q)
+        if learned is not None:
+            return learned
         from batcher.api.orchestration import approx_quantile
 
         # Stream just the target column (projected, so only it crosses the boundary)
         # through the mergeable TDigest — the driver never holds the whole column, and a
         # distributed plan streams it back one bounded bucket at a time.
         return approx_quantile(self.select(column).iter_batches(), column, q)
+
+    def approx_median(self, column: str) -> float | None:
+        """Approximate median of a numeric `column` — `approx_quantile(column, 0.5)`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": list(range(1, 101))})
+                >>> ds.approx_median("x") is not None
+                True
+        """
+        return self.approx_quantile(column, 0.5)
+
+    def approx_percentile(self, column: str, p: float) -> float | None:
+        """Approximate percentile `p` (in ``[0, 100]``) of a numeric `column`.
+
+        The percentile spelling of `approx_quantile` (``p=99`` is ``q=0.99``).
+
+        Args:
+            column: The numeric column.
+            p: The percentile in ``[0, 100]``.
+
+        Returns:
+            The approximate percentile value, or ``None`` if unavailable.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": list(range(1, 101))})
+                >>> ds.approx_percentile("x", 90) is not None
+                True
+        """
+        if not 0.0 <= p <= 100.0:
+            raise PlanError(f"approx_percentile(p) requires p in [0, 100], got {p}")
+        return self.approx_quantile(column, p / 100.0)
 
     def iter_batches(
         self,
@@ -1890,7 +2193,7 @@ class Dataset:
             self._sources,
             self.columns,
             batch_size=batch_size,
-            distributed=_resolve_distributed(distributed),
+            distributed=_resolve_distributed(distributed, self._plan, self._sources),
             num_workers=num_workers,
             transport=transport,
         )

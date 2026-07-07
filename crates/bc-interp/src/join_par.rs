@@ -18,7 +18,7 @@
 
 use arrow::array::RecordBatch;
 use bc_runtime::agg::spill::{DiskSpillStore, SpillStore};
-use bc_runtime::shuffle;
+use bc_runtime::{join, shuffle};
 use rayon::prelude::*;
 
 use crate::error::InterpError;
@@ -206,10 +206,30 @@ pub(crate) fn broadcast_join(
                 output.to_vec(),
             )
         };
-    let p = rayon::current_num_threads().max(1);
-    split_rows(probe, p)
-        .par_iter()
-        .map(|chunk| ops::join_batches(chunk, build, pkeys, bkeys, jt, &out, JoinStrategy::Hash))
+    // Build the (replicated) build-side hash table ONCE, then probe `probe` across `p`
+    // parallel row-range chunks against that single shared table (rather than rebuilding
+    // it per chunk — the old path's cost). Split the probe into ~one chunk per core so a
+    // large probe is fully parallel; bound the count by the probe's morsel count so chunks
+    // never shrink below a morsel (tiny chunks are pure scheduling overhead). The table is
+    // built once, so chunk count governs *only* probe parallelism — it is independent of
+    // the build size (the old `probe/build` cap throttled a 6 M-row probe to a handful of
+    // chunks whenever the build was large). Each chunk gathers its own output batch; the
+    // chunks concatenate to the full relation. Result-invariant: chunking only splits the probe.
+    let max_chunks = (probe.num_rows() / bc_arrow::DEFAULT_MORSEL_ROWS).max(1);
+    let p = rayon::current_num_threads().max(1).min(max_chunks);
+    let probe_keys = ops::columns_by_name(probe, pkeys)?;
+    let build_keys = ops::columns_by_name(build, bkeys)?;
+    let tuning = bc_arrow::RuntimeTuning::default();
+    let idxs = join::broadcast_hash_join_indices(
+        &probe_keys,
+        &build_keys,
+        ops::map_join_type(jt),
+        p,
+        tuning.bloom_fp_rate,
+        tuning.bloom_min_build_rows,
+    )?;
+    idxs.par_iter()
+        .map(|idx| ops::gather_join_output(probe, build, idx, &out))
         .collect()
 }
 
@@ -266,24 +286,6 @@ pub(crate) fn skew_salting_eligible(join_type: bc_ir::JoinType) -> bool {
         join_type,
         JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti | JoinType::Right
     )
-}
-
-/// Split a batch into at most `parts` contiguous, near-equal row-range slices
-/// (zero-copy). Empty batches yield a single empty slice.
-fn split_rows(batch: &RecordBatch, parts: usize) -> Vec<RecordBatch> {
-    let n = batch.num_rows();
-    if n == 0 || parts <= 1 {
-        return vec![batch.clone()];
-    }
-    let per = n.div_ceil(parts);
-    let mut out = Vec::with_capacity(parts);
-    let mut off = 0;
-    while off < n {
-        let len = per.min(n - off);
-        out.push(batch.slice(off, len));
-        off += len;
-    }
-    out
 }
 
 #[cfg(test)]

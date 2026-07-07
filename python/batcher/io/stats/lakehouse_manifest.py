@@ -6,21 +6,36 @@ these during split planning. This module aggregates them into a
 `SourceStatistics` with no data scan.
 
 Row counts from a manifest are authoritative → `exact_rows=True`. Column
-min/max are aggregated across files and tagged `DEFAULT` (usable for zone-map
-pruning and selectivity, but not as an exact `min()`/`max()` answer): a file's
-recorded bounds may be writer-truncated for strings, and aggregation across
-files only widens the range. Null counts are summed and stay non-exact for the
-same reason.
+statistics carry provenance by kind:
+
+  - **Partition columns** (``partition.<col>``): the value is the literal
+    partition key, constant within each file and never truncated, so its
+    aggregated min/max is `EXACT` — a Hive-style partition column that takes one
+    value across the table has ``min == max`` exactly, letting a filter on it be
+    answered from the manifest.
+  - **Numeric/temporal/bool data columns**: Delta records the *true* per-file
+    min/max/null-count for these (only string/binary stats are truncated), so
+    when **every** file recorded the stat the cross-file aggregate (min of mins,
+    max of maxs, sum of null-counts) is still `EXACT`. A NaN float bound is
+    dropped as unordered.
+  - **String/binary data columns**, or any column some file left unrecorded:
+    `DEFAULT` — a valid pruning/zone-map bound, but never an exact `min()`/`max()`.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from batcher.io.stats.columnar_footer import is_exact_minmax_type
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
 
 __all__ = ["delta_statistics"]
+
+_PARTITION_PREFIX = "partition."
+_MIN_PREFIX = "min."
+_MAX_PREFIX = "max."
+_NULL_PREFIX = "null_count."
 
 
 def delta_statistics(add_actions: Any) -> SourceStatistics | None:
@@ -28,12 +43,15 @@ def delta_statistics(add_actions: Any) -> SourceStatistics | None:
 
     `add_actions` is the Arrow table returned by
     `DeltaTable.get_add_actions(flatten=True)` — one row per data file with a
-    `num_records` column and, when the table collects stats, `min.<col>` /
-    `max.<col>` / `null_count.<col>` columns. Returns the exact total row count
-    always, and per-column bounds when present. Best-effort: any failure yields
-    None so the caller falls back to a plain row count.
+    `num_records` column, optional `partition.<col>` partition values, and, when
+    the table collects stats, `min.<col>` / `max.<col>` / `null_count.<col>`
+    columns. Returns the exact total row count always, exact bounds for partition
+    and numeric columns where every file recorded them, and pruning-grade bounds
+    otherwise. Best-effort: any failure yields None so the caller falls back to a
+    plain row count.
     """
     try:
+        import pyarrow as pa
         import pyarrow.compute as pc
     except Exception:
         return None
@@ -42,42 +60,118 @@ def delta_statistics(add_actions: Any) -> SourceStatistics | None:
         if "num_records" not in names:
             return None
         total = int(pc.sum(add_actions.column("num_records")).as_py() or 0)
-        columns = _delta_columns(add_actions, names, pc)
+        columns = _delta_columns(add_actions, names, pa, pc)
         return SourceStatistics(row_count=total, columns=columns, exact_rows=True)
     except Exception:
         return None
 
 
-def _delta_columns(add_actions: Any, names: list[str], pc: Any) -> dict[str, ColumnStat]:
-    """Per-column min/max/null_count aggregated across files (pruning-grade)."""
+def _delta_columns(add_actions: Any, names: list[str], pa: Any, pc: Any) -> dict[str, ColumnStat]:
+    """Per-column stats aggregated across files, with kind-specific provenance."""
     cols: dict[str, ColumnStat] = {}
-    min_cols = {n[len("min.") :]: n for n in names if n.startswith("min.")}
-    max_cols = {n[len("max.") :]: n for n in names if n.startswith("max.")}
-    null_cols = {n[len("null_count.") :]: n for n in names if n.startswith("null_count.")}
+    # Partition columns first — their literal value is exact and outranks any
+    # data-column stat of the same name.
+    partition_cols = {
+        n[len(_PARTITION_PREFIX) :]: n for n in names if n.startswith(_PARTITION_PREFIX)
+    }
+    for col, src in partition_cols.items():
+        stat = _partition_stat(add_actions, src, pc)
+        if stat is not None:
+            cols[col] = stat
+    min_cols = {n[len(_MIN_PREFIX) :]: n for n in names if n.startswith(_MIN_PREFIX)}
+    max_cols = {n[len(_MAX_PREFIX) :]: n for n in names if n.startswith(_MAX_PREFIX)}
+    null_cols = {n[len(_NULL_PREFIX) :]: n for n in names if n.startswith(_NULL_PREFIX)}
     for col in set(min_cols) | set(max_cols) | set(null_cols):
-        cmin = _agg(add_actions, min_cols.get(col), pc, "min")
-        cmax = _agg(add_actions, max_cols.get(col), pc, "max")
-        cnull = _agg(add_actions, null_cols.get(col), pc, "sum")
-        if cmin is None and cmax is None and cnull is None:
-            continue
-        cols[col] = ColumnStat(
-            min=cmin,
-            max=cmax,
-            null_count=float(cnull) if cnull is not None else None,
-            provenance=Provenance.DEFAULT,  # bounds only — file stats may be truncated
+        if col in cols:
+            continue  # a partition column already carries an exact value
+        stat = _data_column_stat(
+            add_actions, min_cols.get(col), max_cols.get(col), null_cols.get(col), pa, pc
         )
+        if stat is not None:
+            cols[col] = stat
     return cols
 
 
-def _agg(table: Any, column: str | None, pc: Any, how: str):
-    if column is None:
-        return None
+def _partition_stat(add_actions: Any, src: str, pc: Any) -> ColumnStat | None:
+    """Exact min/max for a partition column (its value is the literal key)."""
     try:
-        col = table.column(column)
-        if how == "min":
-            return pc.min(col).as_py()
-        if how == "max":
-            return pc.max(col).as_py()
-        return pc.sum(col).as_py()
+        col = add_actions.column(src)
+        cmin = pc.min(col).as_py()
+        cmax = pc.max(col).as_py()
     except Exception:
         return None
+    if cmin is None and cmax is None:
+        return None
+    # The partition value is constant within a file and untruncated across the
+    # manifest → the aggregate is the true extreme.
+    return ColumnStat(min=cmin, max=cmax, provenance=Provenance.EXACT)
+
+
+def _data_column_stat(
+    add_actions: Any,
+    min_name: str | None,
+    max_name: str | None,
+    null_name: str | None,
+    pa: Any,
+    pc: Any,
+) -> ColumnStat | None:
+    """Aggregate a data column's per-file min/max/null-count across the manifest.
+
+    `EXACT` only when the column is a non-truncatable type *and* every file
+    recorded the bound (a missing per-file stat would only widen the aggregate,
+    breaking exactness). A NaN float bound is dropped as unordered.
+    """
+    cmin, min_complete = _agg_bound(add_actions, min_name, pc, "min")
+    cmax, max_complete = _agg_bound(add_actions, max_name, pc, "max")
+    cnull, null_complete = _agg_bound(add_actions, null_name, pc, "sum")
+    if cmin is None and cmax is None and cnull is None:
+        return None
+    exact_type = _exact_data_type(add_actions, min_name or max_name, pa)
+    nan = _is_nan(cmin) or _is_nan(cmax)
+    if nan:
+        cmin, cmax = None, None
+    bounds_exact = exact_type and min_complete and max_complete and not nan
+    return ColumnStat(
+        min=cmin,
+        max=cmax,
+        # Exact null count only when the type is exact and every file recorded it.
+        null_count=float(cnull) if (cnull is not None and null_complete and exact_type) else None,
+        provenance=Provenance.EXACT if bounds_exact else Provenance.DEFAULT,
+    )
+
+
+def _agg_bound(add_actions: Any, name: str | None, pc: Any, how: str) -> tuple[Any, bool]:
+    """(`aggregated value`, `complete?`) for one add-action column.
+
+    `complete` is True when no file left the stat null — the precondition for the
+    aggregate to be an exact extreme/sum rather than a mere bound.
+    """
+    if name is None:
+        return None, False
+    try:
+        col = add_actions.column(name)
+        complete = col.null_count == 0
+        if how == "min":
+            return pc.min(col).as_py(), complete
+        if how == "max":
+            return pc.max(col).as_py(), complete
+        return pc.sum(col).as_py(), complete
+    except Exception:
+        return None, False
+
+
+def _exact_data_type(add_actions: Any, name: str | None, pa: Any) -> bool:
+    """Whether the add-action stat column `name` has a non-truncatable value type."""
+    if name is None:
+        return False
+    try:
+        field = add_actions.schema.field(name)
+    except Exception:
+        return False
+    return is_exact_minmax_type(field.type) and not pa.types.is_null(field.type)
+
+
+def _is_nan(value: Any) -> bool:
+    import math
+
+    return isinstance(value, float) and math.isnan(value)

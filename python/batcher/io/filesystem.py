@@ -163,7 +163,15 @@ class _ArrowFileSystem:
     def expand(self, path: str, *, suffix: str) -> list[str]:
         if any(ch in path for ch in "*?["):
             return self._glob(path)
+        # A trailing slash on an object-store directory (``s3://bucket/dir/``) makes
+        # pyarrow's `get_file_info` return `NotFound` — object stores have no real
+        # directories, so the key ``dir/`` does not exist as an object. Strip it (but
+        # never the lone root ``/``) so a directory URI written either way resolves to
+        # the same listing. Harmless on local/`file://` paths (a dir resolves the same
+        # with or without the slash).
         in_path = self._p(path)
+        if len(in_path) > 1:
+            in_path = in_path.rstrip("/")
         info = self._fs.get_file_info(in_path)
         if info.type == pafs.FileType.Directory:
             sel = pafs.FileSelector(in_path, recursive=False)
@@ -324,8 +332,17 @@ def resolve_filesystem(path: str) -> FileSystem:
         return _fsspec_backed(scheme, path)
     # The prefix is `scheme://authority`; compute it from the path with any `?query`
     # (config like endpoint_override) removed, since pyarrow's in_path excludes both.
+    # `from_uri` also strips a trailing slash from `in_path` (``…/dir/`` → ``…/dir``),
+    # so subtracting `len(in_path)` from the *un*-trimmed base mis-slices the prefix by
+    # the slash (``s3://`` → ``s3://r``) and every later `_p()` drops a real character.
+    # Strip the trailing slash off `base` before the suffix math so the two align.
     base = path.split("?", 1)[0]
-    prefix = base[: len(base) - len(in_path)]
+    trimmed = base.rstrip("/")
+    prefix = (
+        trimmed[: len(trimmed) - len(in_path)]
+        if in_path and trimmed.endswith(in_path)
+        else base[: len(base) - len(in_path)]
+    )
     canonical = _SCHEME_ALIASES.get(scheme, scheme)
     is_object_store = canonical in _OBJECT_STORE_SCHEMES
     return _ArrowFileSystem(

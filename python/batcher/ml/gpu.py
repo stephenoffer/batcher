@@ -19,6 +19,9 @@ pure.
 
 from __future__ import annotations
 
+import functools
+import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from batcher.config import active_config
@@ -28,6 +31,7 @@ if TYPE_CHECKING:
     from batcher.plan.logical import LogicalPlan
 
 __all__ = [
+    "autocast_call",
     "detect_backend",
     "gpu_aware_pool_default",
     "gpu_feedback_key",
@@ -35,6 +39,8 @@ __all__ = [
     "load_gpu_utilization",
     "max_actors_per_gpu",
     "recommend_gpu_fraction",
+    "recommend_inference_dtype",
+    "recommend_inflight_depth",
     "recommend_num_gpus",
     "recommend_quantization",
     "record_gpu_utilization",
@@ -110,6 +116,10 @@ _PACK_BELOW = 0.5
 _SATURATED_ABOVE = 0.9
 # Don't fragment a GPU finer than this (avoids requesting unschedulable slivers).
 _MIN_FRACTION = 0.25
+# Bounds on the adaptive per-actor submit-ahead depth (how many partitions an inference
+# actor keeps in flight). A starved GPU (low measured utilization) submits deeper to
+# overlap the dispatch/gather round-trip; a saturated one keeps the shallow default.
+_INFLIGHT_DEPTH_MAX = 16
 # Per-vendor VRAM a process reserves for its runtime context before any model loads —
 # the overhead that makes packing many tiny models less dense than naive math. MPS
 # shares unified memory (no separate context reserve); TPU/CPU have none.
@@ -406,6 +416,45 @@ def recommend_quantization(backend: str | None = None) -> str | None:
         return None
 
 
+# NVIDIA compute capability with native BF16 tensor cores: Ampere (8.0+, A100/A10G)
+# and up. BF16 keeps FP32's exponent range, so it is the numerically-safe half-precision
+# default there. Turing/Volta (7.x, T4/V100) have fast FP16 tensor cores but emulate BF16,
+# so they take FP16. Below 7.0 (Pascal) half-precision has no tensor-core speedup — keep FP32.
+_NATIVE_BF16_CAPABILITY = (8, 0)
+_FAST_FP16_CAPABILITY = (7, 0)
+
+
+def recommend_inference_dtype(backend: str | None = None) -> str | None:
+    """A safe half-precision dtype name for model inference on the current GPU, or `None`.
+
+    Inference is numerically forgiving (no gradients to accumulate error), so half
+    precision roughly doubles compute-bound throughput at negligible quality loss — the
+    single lever that turns a compute-bound job from parity into a win. Returns
+    ``"bfloat16"`` on Ampere+ (native BF16, FP32 exponent range — the safe default),
+    ``"float16"`` on Turing/Volta and Apple MPS (fast FP16, no native BF16), and `None`
+    (keep FP32) on older/CPU/probe-failure so the model never silently loses precision
+    where half gives no speedup. The per-GPU default Ray Data users otherwise set by hand.
+    """
+    b = backend or detect_backend()
+    try:
+        import torch
+
+        if b in ("cuda", "rocm"):
+            if not torch.cuda.is_available():
+                return None
+            capability = tuple(torch.cuda.get_device_capability())
+            if capability >= _NATIVE_BF16_CAPABILITY:
+                return "bfloat16"
+            if capability >= _FAST_FP16_CAPABILITY:
+                return "float16"
+            return None
+        if b == "mps":
+            return "float16"
+    except Exception:
+        return None
+    return None
+
+
 def recommend_num_gpus(util_fraction: float | None, requested: float) -> float:
     """Adapt a per-task `num_gpus` request from measured utilization.
 
@@ -423,6 +472,27 @@ def recommend_num_gpus(util_fraction: float | None, requested: float) -> float:
     if requested < 1.0 and util_fraction > _SATURATED_ABOVE:
         return 1.0
     return requested
+
+
+def recommend_inflight_depth(util_fraction: float | None, default: int) -> int:
+    """Adapt an inference actor's per-actor submit-ahead depth from measured utilization.
+
+    A shallow pipeline leaves a GPU idle across the dispatch/gather round-trip; submitting
+    several partitions ahead keeps it fed (Ray Data's `max_tasks_in_flight` lever). The
+    depth is raised only from a *prior* low-utilization measurement, so a first run (no
+    measurement) is unchanged:
+
+    * `None` utilization or util ``>= _SATURATED_ABOVE`` → keep `default` (GPU already fed).
+    * util ``< _PACK_BELOW`` (starved) → ``default * 4``, capped at `_INFLIGHT_DEPTH_MAX`.
+    * otherwise (partly fed) → ``default * 2``, capped.
+
+    Always at least `default` (never shrinks below the configured floor).
+    """
+    base = max(1, default)
+    if util_fraction is None or util_fraction >= _SATURATED_ABOVE:
+        return base
+    factor = 4 if util_fraction < _PACK_BELOW else 2
+    return max(base, min(_INFLIGHT_DEPTH_MAX, base * factor))
 
 
 def gpu_feedback_key(plan: LogicalPlan) -> str:
@@ -475,3 +545,129 @@ def record_gpu_utilization(hub: MetadataHub | None, key: str, util_fraction: flo
         hub.save_params(_NAMESPACE, stats)
     except Exception:  # pragma: no cover - feedback must never break execution
         pass
+
+
+# --- Auto mixed-precision (the tensor-core ~2x hardware lever) ---------------------------
+
+# Whether autocast measurably speeds a given model up — stable per callable, probed once.
+_AUTOCAST_VERDICT: dict[str, bool] = {}
+# Sample rows and the speedup a model must show for autocast (half precision) to be kept: it
+# is not bit-identical, so it is only worth applying when it is a real tensor-core win.
+_AUTOCAST_PROBE_ROWS = 64
+_AUTOCAST_MIN_SPEEDUP = 1.15
+
+
+def autocast_call(call: Callable) -> Callable:
+    """Wrap a per-batch GPU model `call` so its forward runs under `torch.autocast` — but only
+    when a probe shows autocast actually speeds this model up.
+
+    The accelerator's fast half type (`recommend_inference_dtype` — BF16 on Ampere+, FP16 on
+    Turing/Volta/MPS) casts the matmuls/convs onto the tensor cores (~1.5-2x) while autocast
+    keeps reductions/softmax in FP32 for stability. Unlike `torch.compile` this needs no model
+    object, so it optimizes an opaque `map_batches(model, num_gpus=...)` call.
+
+    Half precision is not bit-identical, so it is applied ONLY where it pays off: on the first
+    batch the model is timed FP32 vs autocast on a small slice, and autocast is kept only if it
+    is meaningfully faster (a compute-bound conv/matmul forward — image/vision/embedding). A
+    forward that autocast does not accelerate — an autoregressive generation loop is launch- and
+    memory-bound, not tensor-core-bound — stays FP32, so its exact output is preserved. The
+    verdict is cached per model. This keeps "correctness before speed": FP16 is used only when it
+    is a genuine speedup, never as a silent output change with no benefit.
+
+    Returns `call` unchanged when it can't apply — `distributed.autocast_inference` off, a CPU
+    host, a GPU with no fast half type, or torch absent. Config is read each call so a job can
+    pin FP32 (bit-exact repro); the device/dtype probe is cached (stable per worker).
+    """
+    if not active_config().distributed.autocast_inference:
+        return call
+    ctx = _autocast_device_dtype()
+    if ctx is None:
+        return call
+    device_type, dtype = ctx
+    key = _autocast_key(call)
+
+    @functools.wraps(call)
+    def _cast(batch):
+        import torch
+
+        use = _AUTOCAST_VERDICT.get(key) if key is not None else None
+        if use is None:
+            use = _autocast_speeds_up(call, batch, device_type, dtype)
+            if key is not None:
+                _AUTOCAST_VERDICT[key] = use
+        if not use:
+            return call(batch)
+        with torch.autocast(device_type=device_type, dtype=dtype):
+            return call(batch)
+
+    return _cast
+
+
+def _autocast_key(call: Callable) -> str | None:
+    """A stable cache key for a model call's autocast verdict (function or callable instance)."""
+    obj = getattr(call, "__self__", call)  # bound method -> its instance; else the callable
+    target = obj if hasattr(obj, "__qualname__") else type(obj)  # a class UDF instance -> its type
+    mod = getattr(target, "__module__", None)
+    qual = getattr(target, "__qualname__", None)
+    return f"{mod}.{qual}" if mod and qual else None
+
+
+def _autocast_speeds_up(call: Callable, batch, device_type: str, dtype: Any) -> bool:
+    """Time `call` FP32 vs autocast on a slice; True if autocast is >= the required speedup.
+
+    On any failure (a model that errors under autocast, an odd batch type) returns False — the
+    safe, output-preserving FP32 path. The probe's outputs are discarded (timing only)."""
+    try:
+        import torch
+
+        rows = getattr(batch, "num_rows", 0)
+        probe = batch.slice(0, min(rows, _AUTOCAST_PROBE_ROWS)) if rows else batch
+
+        def _fp32() -> None:
+            call(probe)
+
+        def _fp16() -> None:
+            with torch.autocast(device_type=device_type, dtype=dtype):
+                call(probe)
+
+        _fp32()  # warm (weights resident, cudnn/cublas kernels selected)
+        _fp16()
+        if device_type == "cuda":
+            torch.cuda.synchronize()
+        t_fp32 = _best_time(_fp32, device_type)
+        t_fp16 = _best_time(_fp16, device_type)
+        return t_fp16 > 0 and (t_fp32 / t_fp16) >= _AUTOCAST_MIN_SPEEDUP
+    except Exception:
+        return False
+
+
+def _best_time(fn: Callable[[], None], device_type: str) -> float:
+    """Best-of-3 wall time for `fn`, syncing CUDA so GPU work is actually measured."""
+    best = float("inf")
+    for _ in range(3):
+        t0 = time.perf_counter()
+        fn()
+        if device_type == "cuda":
+            import torch
+
+            torch.cuda.synchronize()
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+
+@functools.cache
+def _autocast_device_dtype() -> tuple[str, Any] | None:
+    """The `(device_type, torch.dtype)` for autocast on this worker, or None if inapplicable."""
+    try:
+        import torch
+
+        backend = detect_backend()
+        if backend == "cpu":
+            return None
+        dtype_name = recommend_inference_dtype(backend)
+        if dtype_name is None:
+            return None
+        device_type = torch_device(backend).split(":")[0]  # 'cuda' / 'xpu' / 'mps'
+        return device_type, getattr(torch, dtype_name)
+    except Exception:
+        return None

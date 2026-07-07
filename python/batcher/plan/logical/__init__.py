@@ -35,7 +35,11 @@ from batcher.plan.logical.relational import (
     Unpivot,
     WatermarkDedup,
 )
-from batcher.plan.logical.transforms import is_streamable, remap_sources
+from batcher.plan.logical.transforms import (
+    is_cartesian_key_pair,
+    is_streamable,
+    remap_sources,
+)
 from batcher.plan.logical.window import Window, WindowFrame, WindowFuncSpec
 
 __all__ = [
@@ -64,6 +68,7 @@ __all__ = [
     "Window",
     "WindowFrame",
     "WindowFuncSpec",
+    "is_cartesian_key_pair",
     "is_streamable",
     "remap_sources",
 ]

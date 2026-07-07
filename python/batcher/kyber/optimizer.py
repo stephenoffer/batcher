@@ -49,7 +49,7 @@ __all__ = ["Optimizer", "optimize", "optimize_traced"]
 # Memory-budgeting model (consumed by Carbonite admission). Materializing
 # operators ("breakers") hold ~all their rows; streaming operators hold ~one morsel.
 # The tunables (row footprint, morsel size, unknown-size threshold) live in `Config`.
-_BREAKER_KINDS = frozenset({"Aggregate", "Sort", "Distinct", "Join"})
+_BREAKER_KINDS = frozenset({"Aggregate", "Sort", "Distinct", "Join", "Window"})
 
 # CPU-light, IO/decode-bound streaming operators: one task running these waits on IO
 # more than it saturates a core, so it asks for a fractional CPU share (`cpu_share_io`)
@@ -126,9 +126,16 @@ def _annotate_ops(
             # ~`target_rows` of the data it *shuffles* — its input volume, not its
             # (possibly tiny) grouped output. Streaming ops inherit the pipeline's
             # width (0 = unset). Carbonite clamps the request to the cpu budget.
+            prefers_local = False
             if known and kind in _BREAKER_KINDS:
                 in_rows = sum(estimator.estimate(c).rows for c in children(node)) or rows
                 n_par = max(1, math.ceil(in_rows / target_rows))
+                # A breaker whose shuffle volume is small enough to keep node-local
+                # (≤ the broadcast threshold — the existing "small enough to not pay
+                # the network" knob) prefers PACK over SPREAD: co-locating its few
+                # workers avoids a cross-node shuffle that buys nothing. Large shuffles
+                # keep SPREAD so the network load distributes. dist makes the final call.
+                prefers_local = int(in_rows * width) <= config.optimizer.broadcast_max_bytes
             else:
                 n_par = 0
             # Desired credit window: enough in-flight batch slots to cover one task's
@@ -150,6 +157,7 @@ def _annotate_ops(
                         c_max_credits=c_max,
                         n_max_parallelism=n_par,
                         c_cpu_shares=c_cpu,
+                        prefers_locality=prefers_local,
                     ),
                     inputs=(),
                     properties=PlanProperties(est_rows=rows, provenance=est.provenance),
@@ -177,7 +185,11 @@ def _applicable(rules: list[Rule], present: frozenset[type]) -> list[Rule]:
 
 
 def _run_phase(
-    plan: LogicalPlan, rules: list[Rule], ctx: OptimizerContext, max_iterations: int
+    plan: LogicalPlan,
+    rules: list[Rule],
+    ctx: OptimizerContext,
+    max_iterations: int,
+    present: frozenset[type] | None = None,
 ) -> tuple[LogicalPlan, dict | None]:
     """Run one phase's rules, up to `max_iterations` (1 = once, >1 = to fixpoint).
 
@@ -200,7 +212,8 @@ def _run_phase(
     """
     if not rules:
         return plan, None
-    present = _present(plan)
+    if present is None:  # standalone callers (tests) don't precompute it
+        present = _present(plan)
     current_ir = None  # lazily computed, only on the identity-says-changed path
     changed = False
     for _ in range(max_iterations):
@@ -323,11 +336,18 @@ class Optimizer:
         plan = logical
         last_ir: dict | None = None
         fixpoint = self._config.optimizer.fixpoint_iterations
+        # The node-type set drives each phase's rule pattern-index. It only changes when
+        # a phase rewrites the plan, so compute it once and refresh after a real change
+        # rather than re-walking the whole tree at the start of every phase (7 walks → ~1
+        # per actual rewrite). Threaded into `_run_phase`, which still refreshes it across
+        # its own fixpoint iterations.
+        present = _present(plan)
         for phase in Phase:  # IntEnum iterates in declared (ascending) order
             max_iter = fixpoint if phase in _FIXPOINT_PHASES else 1
-            plan, ir = _run_phase(plan, self._by_phase[phase], ctx, max_iter)
+            plan, ir = _run_phase(plan, self._by_phase[phase], ctx, max_iter, present)
             if ir is not None:  # a no-op phase leaves the plan (and its IR) unchanged
                 last_ir = ir
+                present = _present(plan)  # refresh once for the next phase
         return plan, last_ir
 
     def optimize(self, logical: LogicalPlan) -> PhysicalPlan:
@@ -338,6 +358,20 @@ class Optimizer:
 
         Identical to `optimize` but surfaces the `BuildSideDecision`s the SELECTION
         phase recorded on `ctx.notes` — what the adaptive executor reports per stage.
+        """
+        phys, _logical, decisions = self.optimize_full(logical)
+        return phys, decisions
+
+    def optimize_full(
+        self, logical: LogicalPlan
+    ) -> tuple[PhysicalPlan, LogicalPlan, list[BuildSideDecision]]:
+        """Optimize once, returning the physical plan, the optimized **logical** plan,
+        and the per-join build-side decisions — from a single pipeline run.
+
+        The distributed and out-of-core executors read the optimized *logical* structure
+        (derived join keys, pushed predicates) while admission/costing read the physical
+        plan. Both fall out of one `_run`, so a caller that needs both no longer runs the
+        whole optimizer twice (the old `optimize_traced` + `optimize_logical` pair).
         """
         ctx = self._context()
         plan, ir = self._run(logical, ctx)
@@ -353,7 +387,7 @@ class Optimizer:
             source_projections=required_columns_per_source(plan),
             source_predicates=required_predicates_per_source(plan),
         )
-        return phys, ctx.notes.get("build_side_decisions", [])
+        return phys, plan, ctx.notes.get("build_side_decisions", [])
 
     def logical_rewrite(self, logical: LogicalPlan) -> LogicalPlan:
         """Run only the logical rewrite phases, returning the rewritten plan.
@@ -423,3 +457,34 @@ def optimize_traced(
 ) -> tuple[PhysicalPlan, list[BuildSideDecision]]:
     """Convenience wrapper around `Optimizer.optimize_traced`."""
     return Optimizer(config, sources, hub, source_stats=source_stats).optimize_traced(logical)
+
+
+def optimize_full(
+    logical: LogicalPlan,
+    config: Config | None = None,
+    sources: list | None = None,
+    hub: MetadataHub | None = None,
+    source_stats: list | None = None,
+) -> tuple[PhysicalPlan, LogicalPlan, list[BuildSideDecision]]:
+    """Convenience wrapper around `Optimizer.optimize_full` (physical + logical + decisions)."""
+    return Optimizer(config, sources, hub, source_stats=source_stats).optimize_full(logical)
+
+
+def optimize_logical(
+    logical: LogicalPlan,
+    config: Config | None = None,
+    sources: list | None = None,
+    hub: MetadataHub | None = None,
+    source_stats: list | None = None,
+) -> LogicalPlan:
+    """Run every optimizer phase but return the optimized **logical** plan, not its IR.
+
+    The adaptive executor splits a plan at its pipeline breakers and re-optimizes each
+    stage with measured cardinalities. It must start from the optimized logical
+    structure — join conditions derived from `WHERE` equalities, predicates pushed,
+    joins reordered — or a stage subtree taken from the *raw* plan can omit the filter
+    that constrains a cross join and execute a cartesian product. This is that
+    structure (the same `_run` `optimize`/`optimize_traced` use, stopping before the
+    PhysicalPlan wrapping so the loop can still splice `Scan`s into it).
+    """
+    return Optimizer(config, sources, hub, source_stats=source_stats).logical_rewrite(logical)

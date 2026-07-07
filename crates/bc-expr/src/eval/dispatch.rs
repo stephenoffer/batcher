@@ -17,6 +17,7 @@ use crate::eval::date::{
     eval_window_buckets, eval_window_start, parse_dtype,
 };
 use crate::eval::generate::eval_sequence;
+use crate::eval::in_list::eval_in_list;
 use crate::eval::list::{
     eval_array, eval_list, eval_list_binary, eval_list_contains, eval_list_get, eval_list_join,
     eval_list_position, eval_make_struct, eval_struct_field, rebuild_list, require_list,
@@ -136,6 +137,7 @@ impl Expr {
                 eval_video(*func, &arr)
             }
             Expr::Coalesce { inputs } => eval_coalesce(inputs, batch),
+            Expr::InList { input, set } => eval_in_list(&input.eval(batch)?, set),
             Expr::Array { elements } => eval_array(elements, batch),
             Expr::Sequence { start, stop, step } => {
                 let (s, e, d) = (start.eval(batch)?, stop.eval(batch)?, step.eval(batch)?);

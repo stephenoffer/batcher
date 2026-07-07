@@ -40,6 +40,12 @@ _CALIB_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, tuple, CostCoeff
     weakref.WeakKeyDictionary()
 )
 
+# Re-fit the cost coefficients only after this many *new* feedback rows accrue (the hub
+# version bumps once per recorded operator). A small query records a handful of rows, so
+# this refits roughly every few-to-ten queries — fresh enough for a cost heuristic while
+# keeping per-query planning overhead flat instead of growing with session history.
+_RECALIBRATE_AFTER = 64
+
 # Each calibratable operator `kind` (the native `ExecMetrics` tag) maps to the cost
 # coefficient its dominant per-row term scales, plus the `basis(rows_in, rows_out)`
 # that term multiplies. `hash_build_row` is fit from `aggregate` (the purest hash-build
@@ -70,13 +76,23 @@ def _basis(kind: str, rows_in: float, rows_out: float) -> float:
 def _samples(rows: list[dict]) -> list[tuple[float, float, float]]:
     """Usable `(rows_in, rows_out, t_op_ms)` triples — positive rows and time only.
 
-    `rows_in` falls back to `rows_out` (scans report them equal); a sample with no
-    positive basis or no positive time carries no signal and is dropped.
+    The input-bound families (filter/distinct/aggregate/hash_join) fit against
+    *input* rows, so an accurate `rows_in` is load-bearing: fitting a selective
+    filter's per-row cost against its (small) output would overstate the coefficient.
+    Prefer the directly measured `n_input`; for a row persisted before that field
+    existed, reconstruct it from `n_actual / selectivity` (the inverse of how
+    `selectivity` was recorded); finally fall back to `rows_out` (a source op reports
+    input == output). A sample with no positive basis or no positive time is dropped.
     """
     out: list[tuple[float, float, float]] = []
     for r in rows:
-        rin = float(r.get("rows_in", 0) or r.get("n_actual", 0))
-        rout = float(r.get("n_actual", r.get("rows_out", 0)))
+        rout = float(r.get("n_actual", r.get("rows_out", 0)) or 0.0)
+        measured_in = r.get("n_input") or r.get("rows_in")
+        if measured_in:
+            rin = float(measured_in)
+        else:
+            sel = float(r.get("selectivity", 0.0) or 0.0)
+            rin = rout / sel if sel > 0.0 else rout
         t = float(r.get("t_op_ms", 0.0))
         if t > 0.0 and (rin > 0.0 or rout > 0.0):
             out.append((rin or rout, rout or rin, t))
@@ -109,9 +125,19 @@ def calibrate(hub: MetadataHub | None, config: Config | None = None) -> CostCoef
         cfg.optimizer.learning_smoothing_alpha,
         cfg.optimizer.cost_calibration_clamp,
     )
+    # Throttle: a cost fit is a statistical estimate that barely moves with one more
+    # sample among many, so reuse it until enough *new* feedback accrues rather than
+    # re-scanning the whole op-stats history on every `collect()` (the hub version bumps
+    # per recorded operator, so an exact-version cache would miss every query — turning a
+    # stream of small queries into O(queries²) calibration work). Staleness only affects
+    # plan *cost*, never results, so a slightly old fit is safe.
     version = hub.version
     cached = _CALIB_CACHE.get(hub)
-    if cached is not None and cached[0] == version and cached[1] == fingerprint:
+    if (
+        cached is not None
+        and cached[1] == fingerprint
+        and 0 <= version - cached[0] < _RECALIBRATE_AFTER
+    ):
         return cached[2]
     try:
         coeffs = _calibrate(hub.op_stats_by_kind(), defaults, cfg)

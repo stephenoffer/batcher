@@ -8,7 +8,14 @@ lifecycle state, so they import nothing from the rest of the package.
 
 from __future__ import annotations
 
+import contextlib
+from collections import deque
+
 from batcher.config import active_config
+
+# Fallback in-flight cap for the map submission window when the live cluster size is
+# unreadable (Ray down / test stubs) — bounds a high-fan-out job without a topology read.
+_DEFAULT_PENDING_WINDOW = 1024
 
 
 def speculation_policy():
@@ -16,15 +23,38 @@ def speculation_policy():
 
     Default `max_backups=0` (speculation off → the barrier is a plain `ray.get`),
     so distributed results are unchanged unless a config explicitly enables it.
+
+    The straggler *factor* (how many multiples of the median task time before a backup fires) is
+    tuned from the measured task-time spread of prior shuffle stages (`_learned_straggler_factor`):
+    a stage whose tasks finish uniformly gets a higher factor (rarely back up), a heavy-tailed one
+    a lower factor (back up sooner). A cold store keeps the config default. Speculation only
+    duplicates a slow task and keeps whichever copy finishes first, so the result is unchanged
+    regardless of the factor.
     """
     from batcher.carbonite.resilience import SpeculationPolicy
 
     d = active_config().distributed
     return SpeculationPolicy(
-        straggler_factor=d.speculation_straggler_factor,
+        straggler_factor=_learned_straggler_factor(d.speculation_straggler_factor),
         min_finished_frac=d.speculation_min_finished_frac,
         max_backups=d.speculation_max_backups,
     )
+
+
+def _learned_straggler_factor(default: float) -> float:
+    """The learned straggler factor from measured shuffle-family task-time variance, else
+    `default`. Best-effort read of the process-wide MetadataHub; any failure returns `default`."""
+    try:
+        from batcher.core import default_hub
+        from batcher.dist.adaptive_sizing import learned_straggler_factor
+
+        for family in ("aggregate", "hash_join", "sort", "window"):
+            learned = learned_straggler_factor(default_hub(), family)
+            if learned is not None:
+                return learned
+    except Exception:  # pragma: no cover - learning is best-effort
+        pass
+    return default
 
 
 def skew_join_salt() -> tuple[int, float]:
@@ -37,13 +67,15 @@ def skew_join_salt() -> tuple[int, float]:
     return int(d.skew_join_salt), float(d.skew_join_fraction)
 
 
-def runtime_bloom_join() -> bool:
-    """Whether to apply the runtime bloom-filter join reduction (opt-in, default off).
+def runtime_bloom_join() -> bool | str:
+    """The runtime bloom-filter join policy: ``True``/``False``/``"auto"``.
 
-    When on, a shuffle join prunes the probe side by a bloom built over the build
+    When engaged, a shuffle join prunes the probe side by a bloom built over the build
     side's keys before shuffling. Always correct; a network-volume optimization for
-    selective joins (see `DistributedConfig.runtime_bloom_join`)."""
-    return bool(active_config().distributed.runtime_bloom_join)
+    selective joins. ``"auto"`` (the default) defers the per-join decision to a
+    cardinality estimate (see `dist.executors.join._bloom_beneficial`); ``True``/
+    ``False`` force it on/off (see `DistributedConfig.runtime_bloom_join`)."""
+    return active_config().distributed.runtime_bloom_join
 
 
 def recovery_policy():
@@ -121,7 +153,31 @@ def actor_fault_options() -> dict:
     }
 
 
-def gather_map_results(submit, n: int, policy=None) -> list:
+def _pending_window() -> int:
+    """The max map tasks kept in flight at once — a submit-ahead cap.
+
+    Submitting every partition task up front floods Ray's scheduler / object store at high
+    fan-out (the "too many pending tasks" anti-pattern). The window is `max_pending_tasks`
+    when the user pinned one, else `pending_window_factor x` the cluster's schedulable
+    cores — generous enough that ordinary fan-outs still submit everything at once (the
+    caller clamps to `min(window, n)`, so `n <= window` is the unchanged fast path) while a
+    100k-partition job stays bounded. Never below 1; falls back to `_DEFAULT_PENDING_WINDOW`
+    when the cluster size is unreadable (Ray down / test stubs), so the cap still engages.
+    """
+    d = active_config().distributed
+    if d.max_pending_tasks > 0:
+        return max(1, d.max_pending_tasks)
+    cores = 0.0
+    with contextlib.suppress(Exception):
+        import ray
+
+        cores = float(ray.cluster_resources().get("CPU", 0.0))
+    if cores <= 0:
+        return max(1, _DEFAULT_PENDING_WINDOW)
+    return max(1, int(cores) * max(1, d.pending_window_factor))
+
+
+def gather_map_results(submit, n: int, policy=None, *, max_pending: int | None = None) -> list:
     """Gather `n` partition results, resubmitting any whose task died to preemption.
 
     `submit(idx)` launches partition `idx` and returns a Ray ``ObjectRef``; it is
@@ -131,20 +187,43 @@ def gather_map_results(submit, n: int, policy=None) -> list:
     error (`RayTaskError`) re-raises immediately rather than wasting attempts on a
     fault a rerun cannot fix.
 
+    Submissions are bounded to an in-flight **window** (`max_pending` when given, else
+    `_pending_window()`) so a high-fan-out stage does not flood Ray's scheduler /
+    object store with pending tasks: at most `window` tasks are outstanding, and a slot
+    is refilled from the queue each time one completes. When `n <= window` every task is
+    submitted before the first wait — byte-identical to the old submit-all behavior, so
+    ordinary queries are unchanged. A preempted partition is requeued at the front so it
+    keeps priority for a slot and cannot be starved past `max_attempts`.
+
     This is the map/inference analogue of the shuffle recompute loop
     (`ShuffleRecovery`): a stateless map partition has no published lineage, but it
     *is* its own lineage — a map/inference UDF recomputes idempotently from its durable
     partition descriptor, so a resubmit neither loses nor duplicates output. Without
     this loop a single preemption fails the whole stage (a plain ``ray.get`` raises).
-    Returns results in partition order.
+    Returns results in partition order (assembly is index-addressed, so the submit
+    order never affects the output).
     """
     import ray
     from ray.exceptions import RayError, RayTaskError
 
     policy = policy or recovery_policy()
+    if n <= 0:
+        return []
+    window = max_pending if (max_pending and max_pending > 0) else _pending_window()
+    window = max(1, min(window, n))
     results: list = [None] * n
-    inflight = {submit(idx): idx for idx in range(n)}
     attempts = [0] * n
+    pending: deque[int] = deque(range(n))  # indices awaiting (re)submission, in order
+    inflight: dict = {}  # ref -> idx
+
+    def _fill() -> None:
+        # Top the window back up. When window >= n this submits every partition before
+        # the first wait (the unchanged fast path); otherwise it keeps <= window in flight.
+        while pending and len(inflight) < window:
+            idx = pending.popleft()
+            inflight[submit(idx)] = idx
+
+    _fill()
     while inflight:
         done, _ = ray.wait(list(inflight), num_returns=1)
         ref = done[0]
@@ -154,9 +233,11 @@ def gather_map_results(submit, n: int, policy=None) -> list:
         except RayTaskError:
             raise  # a deterministic UDF error — resubmitting cannot help
         except RayError:
-            # Worker / actor / node loss (preemption). Resubmit onto a survivor.
+            # Worker / actor / node loss (preemption). Requeue at the front so the
+            # survivor-resubmit keeps priority for the next free slot.
             attempts[idx] += 1
             if attempts[idx] > policy.max_attempts:
                 raise
-            inflight[submit(idx)] = idx
+            pending.appendleft(idx)
+        _fill()
     return results

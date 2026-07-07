@@ -20,11 +20,11 @@ pytest.importorskip("batcher._native", reason="native engine not built")
 
 @pytest.fixture(scope="module", autouse=True)
 def _ray_session():
-    import ray
+    from conftest import init_test_ray, shutdown_test_ray
 
-    ray.init(num_cpus=4, include_dashboard=False, logging_level="ERROR", ignore_reinit_error=True)
+    started = init_test_ray(4)
     yield
-    ray.shutdown()
+    shutdown_test_ray(started)
 
 
 def _data():

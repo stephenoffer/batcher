@@ -39,6 +39,7 @@ bc-sketches = { path = "crates/bc-sketches" }
 bc-codegen = { path = "crates/bc-codegen" }
 bc-interp = { path = "crates/bc-interp" }
 bc-transport = { path = "crates/bc-transport" }
+bc-io = { path = "crates/bc-io" }
 
 # Shared utility deps.
 thiserror = "2"

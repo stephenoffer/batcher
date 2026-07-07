@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from batcher.carbonite.memory.learned import LearnedMemoryModel
     from batcher.config import Config
     from batcher.plan.physical import PhysicalPlan
     from batcher.plan.resource import FeasibilityVerdict, ResourceBounds, SchedulingEnvelope
@@ -42,12 +43,18 @@ class ResourceContext:
     decision — admission, spill, reserve — reasons about the *same* number rather
     than re-sampling live free RAM at each point (which drifts and made the three
     decisions disagree). `None` for a standalone policy with no manager; the policy
-    then samples its own. (When Carbonite gains learned stats or a buffer-pool
-    handle, those read-only handles join this context — no signature churn.)
+    then samples its own.
+
+    `memory_model` is the learned per-family memory model fit from the hub's measured
+    `m_peak_bytes` (see `carbonite.memory.learned`): the read-only handle by which a
+    policy blends its plan estimate toward measured reality. `None` when no hub is
+    wired (a standalone policy, or api not yet threading one) — every policy then falls
+    back to the plan estimate, so sizing is byte-for-byte the plan-only behavior.
     """
 
     config: Config
     envelope_bytes: int | None = None
+    memory_model: LearnedMemoryModel | None = None
 
 
 class AdmissionPolicy(Protocol):

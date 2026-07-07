@@ -11,13 +11,15 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.errors import BackendError, PlanError
 from batcher.api.orchestration import with_auto_config
 from batcher.api.terminal.metadata_answer import (
     metadata_aggregate_table,
     metadata_count,
+    metadata_empty_table,
     metadata_is_empty,
 )
+from batcher.api.terminal.routing import resolve_distributed as _resolve_distributed
 from batcher.io.manifest import WriteManifest
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
@@ -39,27 +41,6 @@ __all__ = [
 ]
 
 
-def _resolve_distributed(distributed: bool | str) -> bool:
-    """Resolve ``distributed="auto"``: use the cluster iff already connected to a
-    multi-node one, else stay single-node.
-
-    Never forces a Ray init for a local query — if Ray isn't up, "auto" is local.
-    An explicit ``True``/``False`` always wins (the user's override).
-    """
-    if distributed != "auto":
-        return bool(distributed)
-    try:
-        import ray
-
-        if not ray.is_initialized():
-            return False
-        from batcher import dist
-
-        return dist.cluster_topology()["nodes"] > 1
-    except Exception:
-        return False
-
-
 @with_auto_config
 def _collect(
     plan: LogicalPlan,
@@ -73,6 +54,7 @@ def _collect(
     transport: str = "auto",
     cache: bool = False,
     source_stats: list | None = None,
+    backend: str = "cpu",
 ) -> pa.Table:
     """Execute the plan and materialize the result as a `pyarrow.Table`.
 
@@ -85,11 +67,14 @@ def _collect(
     result to materialize. This guards every materializing terminal (`collect`,
     `count`, `to_*`, `show`), so they fail fast instead of hanging.
     """
+    import os as _ce_os
+    import time as _ce_time
+
+    _cep = _ce_os.environ.get("BATCHER_SORT_PROFILE")
+    _ce0 = _ce_time.perf_counter()
     from batcher.io.source import is_bounded
 
     if any(not is_bounded(s) for s in sources):
-        from batcher._internal.errors import PlanError
-
         raise PlanError(
             "this operation materializes the full result, but the dataset has an "
             "unbounded (streaming) source. Consume it with iter_batches() or write "
@@ -100,9 +85,9 @@ def _collect(
     # during execution. A non-aggregate collect skips this entirely (the attempt
     # returns at its cheap structural guard). `count()`/`is_empty()` pass theirs in.
     if source_stats is None:
-        from batcher.plan.logical import Aggregate
+        from batcher.api.terminal.metadata_answer import is_global_aggregate
 
-        if isinstance(plan, Aggregate) and not plan.group_keys:
+        if is_global_aggregate(plan):
             from batcher import core
             from batcher.api.orchestration import collect_source_stats
 
@@ -110,13 +95,31 @@ def _collect(
     metadata = metadata_aggregate_table(plan, sources, source_stats)
     if metadata is not None:
         return metadata
+    # Provably-empty short-circuit: a scan-free empty table (contradiction / limit(0) /
+    # empty-side join) when metadata proves zero rows (see `metadata_empty_table`).
+    if (empty := metadata_empty_table(plan, sources, source_stats)) is not None:
+        return empty
+    # GPU backend. `backend="gpu"` forces the GPU for any supported shape (honoring the user past
+    # the small-input threshold, but Kyber still routes single-device vs sharded by working-set
+    # size); `backend="auto"` lets Kyber's cost policy decide GPU vs CPU fully. Anything else — an
+    # unsupported shape, a GPU-less cluster, or data Kyber routes to the CPU — silently uses the
+    # CPU engine, so both are always safe. Same result, different *where*.
+    if backend not in ("cpu", "gpu", "auto"):
+        raise PlanError(f"backend must be 'cpu', 'gpu', or 'auto', got {backend!r}")
+    if backend in ("gpu", "auto"):
+        from batcher import core
+        from batcher.api.terminal.gpu_backend import try_gpu_collect
+
+        gpu_result = try_gpu_collect(plan, sources, core.default_hub(), force=(backend == "gpu"))
+        if gpu_result is not None:
+            return gpu_result
     # Opt-in: offload large-payload columns out of line around breakers (the blobs ride
     # through as tiny handles). Inserted before execution routing so the resulting
     # `map_batches` stages take the same mixed-executor path as an explicit offload.
     from batcher.api.terminal.blob_offload import maybe_insert_blob_offload
 
     plan = maybe_insert_blob_offload(plan)
-    distributed = _resolve_distributed(distributed)
+    distributed = _resolve_distributed(distributed, plan, sources)
     # Resolve `adaptive="auto"` to a concrete decision before the fast-path checks
     # below ("auto" is a truthy string). Join-less plans short-circuit to False without
     # touching source stats, so the common path pays nothing.
@@ -161,16 +164,15 @@ def _collect(
         ).table
 
     if spill and not distributed:
-        from batcher import core
+        from batcher import core, kyber
         from batcher.api.orchestration import auto_num_partitions
         from batcher.dist.spill import spill_collect
 
-        partitions = (
-            num_partitions
-            if num_partitions is not None
-            else auto_num_partitions(plan, sources, core.default_hub())
-        )
-        spilled = spill_collect(plan, sources, partitions)
+        hub = core.default_hub()
+        partitions = num_partitions or auto_num_partitions(plan, sources, hub)
+        # Spill the optimized plan (COUNT(DISTINCT)→COUNT over DISTINCT; derived join keys).
+        opt_lp = kyber.optimize_logical(plan, sources=sources, hub=hub)
+        spilled = spill_collect(opt_lp, sources, partitions)
         if spilled is not None:
             return spilled
         # Other plan shapes have no spilling path → fall through to in-memory.
@@ -192,9 +194,23 @@ def _collect(
         source_stats=source_stats,
         profile=event_log_collector(),
     )
+    import os as _ct_os
+
+    _ctp = _ct_os.environ.get("BATCHER_SORT_PROFILE")
+    if _ctp:
+        print(f"[collect] pre-execute routing {_ce_time.perf_counter() - _ce0:.1f}s", flush=True)
     t0 = time.perf_counter()
     table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
-    write_event_log(ctx.profile, total_ms=(time.perf_counter() - t0) * 1000.0, rows=table.num_rows)
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    _ce_post = _ce_time.perf_counter()
+    if _ctp:
+        print(f"[collect] executor.execute {total_ms / 1000:.1f}s -> {table.num_rows} rows", flush=True)
+    write_event_log(ctx.profile, total_ms=total_ms, rows=table.num_rows)
+    from batcher.api.terminal.gpu_backend import record_cpu_crossover  # adaptive-crossover sample
+
+    record_cpu_crossover(plan, sources, ctx.hub, total_ms)  # gated to a GPU cluster; else no-op
+    if _ctp:
+        print(f"[collect] post-execute tail {_ce_time.perf_counter() - _ce_post:.1f}s", flush=True)
     return table
 
 
@@ -232,21 +248,39 @@ def _shared_source_stats(plan: LogicalPlan, sources: list[Source]) -> list | Non
     return collect_source_stats(sources, core.default_hub())
 
 
-def _count(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> int:
-    """Return the number of result rows, from metadata when provable, else execute.
+def _count(plan: LogicalPlan, sources: list[Source], _columns: list[str]) -> int:
+    """Return the number of result rows — from metadata when provable, else a `COUNT(*)`.
 
-    Metadata-first: a plan whose row count is exactly derivable without execution
-    (`limit(n)`, a global aggregate, an empty source, counts through row-preserving
-    operators) is answered from `SourceStatistics` alone. Otherwise it falls back to
-    a full `_collect`, which is always correct — and, crucially, executes the *same*
-    plan shape, so its measured per-operator cardinalities feed the learning loop
-    (e.g. a filter's selectivity) under the plan's own signature.
+    Metadata answers a derivable count (`limit(n)`, a global aggregate, empty source,
+    row-preserving operators) with no execution. Otherwise a global `COUNT(*)` runs (via
+    `global_count_plan`): projection pushdown reads only the filter/key columns and a count
+    over a `Filter` fuses into one `count_if` pass, so no result rows are materialized.
     """
+    from batcher.api.terminal.metadata_answer import global_count_plan
+
     source_stats = _shared_source_stats(plan, sources)
     answer = metadata_count(plan, sources, source_stats)
     if answer is not None:
+        _record_count_selectivity(plan, sources, answer)
         return answer
-    return _collect(plan, sources, columns, source_stats=source_stats).num_rows
+    table = _collect(global_count_plan(plan), sources, ["n"], source_stats=source_stats)
+    count = int(table.column("n")[0].as_py()) if table.num_rows else 0
+    _record_count_selectivity(plan, sources, count)
+    return count
+
+
+def _record_count_selectivity(plan: LogicalPlan, sources: list[Source], count: int) -> None:
+    """Warm the learned-selectivity cache from a measured `count()`.
+
+    A `count()` over a `Filter` is an *exact* measurement of the filter's surviving-row
+    count — which `record_selectivity` turns into a per-signature selectivity ratio
+    (`count / scan rows`) that sharpens later plans of the same shape. The execution path
+    records feedback off the aggregate-*wrapped* count plan (whose Filter is hidden under
+    the `Aggregate`), so this closes that gap directly with the original filter plan.
+    Best-effort; never raises into the terminal."""
+    from batcher import core, kyber
+
+    kyber.record_selectivity(core.default_hub(), plan, sources, count)
 
 
 def _is_empty(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> bool:
@@ -412,14 +446,16 @@ def _write(
         num_files,
         target_bytes_per_file,
     ):
+        from batcher._internal.prefetch import prefetch
+        from batcher.api.terminal.map_stream import peek_stream
         from batcher.api.terminal.stream import _iter_batches
 
-        written = sink.write_stream(
-            _iter_batches(plan, sources, columns),
-            path,
-            schema=_schema(plan, sources, columns),
-            resume=resume,
+        # Peek the first batch for the schema (else an opaque `map_batches` forces an
+        # extra zero-row pass), then overlap read→transform with the write off-thread.
+        schema, stream = peek_stream(
+            _iter_batches(plan, sources, columns), lambda: _schema(plan, sources, columns)
         )
+        written = sink.write_stream(prefetch(stream), path, schema=schema, resume=resume)
         manifest = WriteManifest((written,))
         sink.commit(manifest, path)
         return manifest

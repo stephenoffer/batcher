@@ -109,8 +109,10 @@ pub(crate) fn asof_join_batches(
 
 /// Build a join's output batch by gathering each output column from its side with
 /// the computed indices (`take` yields null for a null index). Shared by the equi
-/// and ASOF joins so their output assembly cannot drift.
-fn gather_join_output(
+/// and ASOF joins (and the broadcast executor's per-chunk gather) so output assembly
+/// cannot drift. `left`/`right` are the index domains: a [`JoinSide::Left`] output
+/// column gathers from `left` with `idx.left`, [`JoinSide::Right`] from `right`.
+pub(crate) fn gather_join_output(
     left: &RecordBatch,
     right: &RecordBatch,
     idx: &join::JoinIndices,

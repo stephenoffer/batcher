@@ -2,14 +2,20 @@
 
 Kyber turns a logical plan into a better logical plan, then into a physical one. It
 is an ordered list of rule- and cost-based passes (plan in, plan out), grouped by
-family in `kyber/rules/` and registered through a `@rule` decorator into a
-`RuleRegistry`. The architecture is built to grow to many rules, but the shipped set
-is deliberately small, and every rule is proven semantics-preserving. Kyber decides;
-it never executes and never collects runtime metadata.
+family in `kyber/rules/` (and its `kyber/rules/extra/` subpackage) and registered
+through a `@rule` decorator into a `RuleRegistry`. Every rule is proven
+semantics-preserving in isolation, and the *combination* is property-tested for
+result-invariance and confluence. Kyber decides; it never executes and never
+collects runtime metadata.
 
-This is a direct reaction to what the rewrite replaced: a "127 passes, 519 rules"
-optimizer whose size was the problem, not the achievement. A rule earns its place by
-making a query measurably better, not by padding a catalog.
+This is a deliberate reaction to what the rewrite replaced: a "127 passes, 519
+rules" optimizer whose sprawl — a god-pass here, a one-file-per-rule catalog there —
+was the problem, not the achievement. The ~154 rules Kyber ships today are *not* a
+return to that bloat. They are the sanctioned "many small things" pattern: small,
+node-local rewrites grouped by family (one module per family a user names in one
+breath), discovered by a registry, each earning its place by making a query
+measurably better — and, unlike v1, each individually proven correct and the whole
+set proven not to interfere (see *Correctness of the rule set* below).
 
 ## The phased pipeline
 
@@ -34,9 +40,11 @@ flow.
 
 ## Shipped rules
 
-The rules registered today are node-local transformations: a rule matches an
-operator type and returns a rewritten subtree (or the input unchanged). Grouped by
-the family module they live in:
+Most rules are node-local transformations: a rule matches an operator type and
+returns a rewritten subtree (or the input unchanged); the driver supplies the
+bottom-up traversal and fixpoint iteration. The few holistic and cost-based rewrites
+(column pruning, join reordering, build-side selection) reason over the whole tree
+at once. The core families live in `kyber/rules/`:
 
 - `normalize`: `constant_folding`, `expr_simplification`, `eliminate_identity_project`,
   `merge_projections`, `prune_true_filter`, `eliminate_sort_before_aggregate`.
@@ -52,9 +60,68 @@ the family module they live in:
 - `selection`: `adaptive_build_side`, the cost-based choice of which join input
   builds the hash table.
 
+### The `extra/` families
+
+The bulk of the rule count lives in `kyber/rules/extra/`, a subpackage of
+grouped-by-family modules. It exists because the parent `rules/` directory hit the
+12-files-per-directory structure cap; the subpackage keeps each family a small,
+self-contained module (allowlisted in `tools/lint_structure.py` as the sanctioned
+large-rule-set pattern) rather than flattening names into a god file. Each rule is
+node-local and individually differential-tested against DuckDB.
+
+| Family module | What it rewrites |
+|---|---|
+| `boolean_algebra` | boolean / CASE / COALESCE / NULL algebra: annihilators (`x AND FALSE`), idempotence, absorption, complementation on total predicates, `NOT` through a comparison, `x = TRUE → x`, single/duplicate `IN` lists |
+| `sargable` | strips arithmetic wrappers so `col + k = lit` becomes a bare `col = lit − k` that zone-map pruning and source pushdown can use |
+| `arith_algebra` | integer constant reassociation and factoring inside a `Filter`/`Project` |
+| `temporal_sargable` | temporal-extraction predicates (`year(ts) = 2020`) → sargable `[lo, hi)` ranges on the raw column |
+| `predicate_infer` | inference over a `Filter`'s top-level conjunction — contradictions, redundant conjuncts, implied bounds |
+| `join_extra` | structural join rewrites that fire on join *shape*, not statistics (a join whose result is provably fixed) |
+| `setops` | `UNION` / `DISTINCT` structural simplifications |
+| `topn_limit` | `LIMIT` / `OFFSET` shapes the base limit rules don't already cover |
+| `agg_extra` | local `Aggregate` / `GROUP BY` simplifications |
+| `projection_scan` | projection, ordering, and scan/schema cleanups |
+| `window_rules` | canonicalize a `Window`'s partition/order keys and prune dead window output |
+| `empty_relation` | fold a provably-empty subtree (constant-`FALSE` filter, empty input to `Project`/grouped `Aggregate`/`Window`) to the canonical `Limit(x, 0)` marker |
+| `adaptive_meta` | simplifications a provably-EXACT *cardinality* unlocks (dead limits, empty inputs) |
+| `metadata_adaptive` | simplifications EXACT per-column metadata unlocks: skip a `Sort` over ≤ 1 row, prune constant sort keys, drop a `Distinct` over a proven-unique column, decide a `col OP col` filter from both columns' bounds |
+
+The two metadata families are gated on `Provenance.EXACT` proof only — a
+learned/sketch estimate can never drive them, because dropping a `Distinct` or `Sort`
+on a wrong guess is silent data corruption.
+
 Adding a rule means dropping a function into the right family module and decorating
 it with `@rule(name=..., phase=..., matches=...)`; the registry discovers it. See
-the `add-kyber-optimizer-pass` recipe.
+the `add-kyber-optimizer-pass` recipe and [Extending Batcher](extending.md).
+
+### Correctness of the rule set
+
+A large rule set is only safe if two things hold: each rule preserves results, and
+no two rules interfere in combination. Kyber proves both mechanically.
+
+- **Each rule, individually.** Every rewrite carries a `tests/unit/` plan-shape test
+  (the *plan* changes) and a `tests/differential/` test (the *answer* still matches
+  DuckDB), across nulls, empties, and type edges.
+- **The whole set, in combination.** `tests/property/test_prop_optimizer_result_invariance.py`
+  (Hypothesis) generates a random table and a random-but-valid pipeline and asserts
+  `result(full 154 rules) == result(no rules) == ds.collect()` under an
+  order-independent multiset compare — the subtle rule interaction an example misses
+  falls out as a counterexample. The same suite proves **confluence/termination**:
+  the combined set converges to a deterministic plan fixpoint within the *production*
+  `optimizer.fixpoint_iterations` budget, so the rules provably don't oscillate or
+  fight each other.
+
+Two correctness constraints bound what the algebraic families may safely do, and the
+rules are written to respect them:
+
+- **Wrapping i64 arithmetic.** The engine's integer `+`/`−`/`×` wrap on overflow
+  (bit-for-bit with the Cranelift JIT), so `sargable`/`arith_algebra` only reduce
+  `=`/`<>` (a bijection of ℤ/2⁶⁴, wrap-invariant), never an *ordered* comparison
+  (wrapping breaks monotonicity), and every folded literal is guarded to stay in i64.
+- **Three-valued (Kleene) logic.** `NULL AND FALSE = FALSE`, `NULL OR TRUE = TRUE`,
+  and a null comparison is null. `boolean_algebra` proves each law under all three
+  values (`T`/`F`/`N`) and guards anything that would only hold for non-null operands
+  (e.g. `x AND NOT x → FALSE` fires only on never-null predicates like `is_null`).
 
 ## Cost and cardinality
 

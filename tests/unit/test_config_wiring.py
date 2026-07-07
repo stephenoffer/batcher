@@ -193,6 +193,78 @@ def test_validate_rejects_bad_values():
         Config().replace(distributed=DistributedConfig(flight_idle_timeout_s=0)).validate()
 
 
+def test_validate_covers_every_section():
+    """Validation reaches all public knobs: a footgun in any section raises ConfigError,
+    while every section's defaults pass (so zero-config "just works")."""
+    import pytest
+
+    from batcher._internal.errors import ConfigError
+    from batcher.config import (
+        CardinalityConfig,
+        DistributedConfig,
+        ExecutionConfig,
+        FlowControlConfig,
+        MetadataConfig,
+        ObservabilityConfig,
+        OptimizerConfig,
+        PIDConfig,
+    )
+
+    # Out-of-box: defaults across every section validate.
+    Config().validate()
+
+    bad_cases = {
+        "backpressure": Config().replace(
+            flow_control=FlowControlConfig(backpressure_low=0.9, backpressure_high=0.4)
+        ),
+        "aimd_beta": Config().replace(flow_control=FlowControlConfig(aimd_beta=2.0)),
+        "shuffle_fan_in": Config().replace(flow_control=FlowControlConfig(shuffle_fan_in=1)),
+        "bloom_fp_rate": Config().replace(execution=ExecutionConfig(bloom_fp_rate=0.0)),
+        "sort_merge_fanin": Config().replace(execution=ExecutionConfig(sort_merge_fanin=1)),
+        "transport": Config().replace(distributed=DistributedConfig(transport="grpc")),
+        "speculation_min_finished_frac": Config().replace(
+            distributed=DistributedConfig(speculation_min_finished_frac=0.0)
+        ),
+        "target_bytes_per_task": Config().replace(
+            optimizer=OptimizerConfig(target_bytes_per_task=0)
+        ),
+        "join thresholds": Config().replace(
+            optimizer=OptimizerConfig(join_dp_max_tables=20, greedy_max_tables=10)
+        ),
+        "eq_selectivity": Config().replace(
+            optimizer=OptimizerConfig(cardinality=CardinalityConfig(eq_selectivity=5.0))
+        ),
+        "pid gains": Config().replace(pid=PIDConfig(kp=-1.0)),
+        "max_step_fraction": Config().replace(pid=PIDConfig(max_step_fraction=1.5)),
+        "metadata.backend": Config().replace(metadata=MetadataConfig(backend="postgres")),
+        "decay_per_day": Config().replace(metadata=MetadataConfig(decay_per_day=2.0)),
+        "log_level": Config().replace(observability=ObservabilityConfig(log_level="LOUD")),
+        "log_format": Config().replace(observability=ObservabilityConfig(log_format="xml")),
+    }
+    for cfg in bad_cases.values():
+        with pytest.raises(ConfigError):
+            cfg.validate()
+
+
+def test_open_override_is_still_validated_via_env():
+    """The open system: any knob is overridable by a deep-nested env var — and that
+    path is validated too, so an out-of-range override fails clearly at load time."""
+    import pytest
+
+    from batcher._internal.errors import ConfigError
+
+    # A good deep-nested override reaches the knob.
+    good = Config.from_env(
+        {"BATCHER_OPTIMIZER_CARDINALITY_EQ_SELECTIVITY": "0.3"}, base=Config()
+    )
+    assert good.optimizer.cardinality.eq_selectivity == 0.3
+    # A bad one is caught at the env-load entry point (from_env → _resolved → validate).
+    with pytest.raises(ConfigError):
+        Config.from_env(
+            {"BATCHER_OPTIMIZER_CARDINALITY_EQ_SELECTIVITY": "5.0"}, base=Config()
+        )
+
+
 def test_set_config_validates(monkeypatch):
     """set_config / config_context reject bad config at the entry point."""
     import pytest

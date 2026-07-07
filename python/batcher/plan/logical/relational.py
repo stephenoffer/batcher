@@ -456,6 +456,13 @@ class MapBatches(LogicalPlan):
     # when the `fn` is not process-safe (a factory/class, a GPU `fn`, or a non-pyarrow
     # `batch_format`). No effect on the distributed path (Ray actors already isolate).
     multiprocessing: bool = False
+    # Dirty-data tolerance: the maximum number of ROWS whose per-row `fn` call may raise
+    # before the query fails. 0 (the default) = strict (any error propagates). When > 0, a
+    # batch that raises is bisected to isolate the offending rows; a failing single row is
+    # dropped (up to this budget) and the rest of the batch proceeds — so a corrupt image /
+    # malformed JSON / bad record doesn't kill a long inference job (the guides' universal
+    # ``max_errored_blocks`` need). Executed in Python; no IR change.
+    max_errored_rows: int = 0
 
     def to_ir(self) -> dict[str, Any]:
         raise NotImplementedError("map_batches is executed in Python, not lowered to the engine IR")

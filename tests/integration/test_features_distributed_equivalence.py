@@ -60,3 +60,40 @@ def test_filter_aggregate_distributed_equals_single_node():
     g = bt.from_arrow(t).filter(col("v") > 200).group_by("k").agg(n=count(), s=col("v").sum())
     single, dist = _both(g, "k")
     assert single == dist
+
+
+def test_enrich_join_over_splittable_source_distributed_equals_single_node(tmp_path):
+    """The feature-engineering *enrich* shape over real (splittable) distributed data:
+    join fact rows back to a per-key aggregate of the SAME source, then a derived column.
+
+    The adaptive loop stages this as aggregate → materialize → join → project. The final
+    projection reads only the in-memory materialized intermediate, so it is a single-node
+    local transform even though the original splittable Parquet source is still ambient —
+    a regression guard for `_unsupported` wrongly rejecting that tail stage (which broke the
+    whole enrich pipeline on distributed data). Requires a splittable source: an in-memory
+    `from_arrow` source never exercises the raise path."""
+    import pyarrow.parquet as pq
+
+    d = tmp_path / "txns"
+    d.mkdir()
+    n, accts = 6000, 300
+    for s in range(6):
+        acct = [(s * 1000 + i) % accts for i in range(n // 6)]
+        amt = [float((s * 7 + i) % 50 + 1) for i in range(n // 6)]
+        pq.write_table(pa.table({"acct": acct, "amt": amt}), d / f"part-{s}.parquet")
+
+    def pipe():
+        ds = bt.read.parquet(str(d))
+        stats = ds.group_by("acct").agg(avg=col("amt").mean(), n=col("amt").count())
+        return ds.join(stats, on="acct", how="inner").with_columns(
+            risk=col("avg") * 2.0 + 0.05 * col("n")
+        )
+
+    single = pipe().collect().sort_by([("acct", "ascending"), ("amt", "ascending")]).to_pydict()
+    dist = (
+        pipe()
+        .collect(distributed=True, num_workers=4)
+        .sort_by([("acct", "ascending"), ("amt", "ascending")])
+        .to_pydict()
+    )
+    assert single == dist

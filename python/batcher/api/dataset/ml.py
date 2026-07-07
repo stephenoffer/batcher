@@ -80,6 +80,7 @@ class DatasetML:
         accelerator_type: str | None = None,
         model_memory_gb: float = 0.0,
         multiprocessing: bool = False,
+        max_errored_rows: int = 0,
     ) -> Dataset:
         """Apply a Python function to each batch.
 
@@ -110,6 +111,12 @@ class DatasetML:
         resource layer budget host RAM per worker (OOM protection) and VRAM-pack small
         models onto a shared GPU, and lets Kyber cost inference by model size. Together
         they schedule a heterogeneous CPU+GPU pipeline across Ray (`distributed=True`).
+
+        `max_errored_rows` gives dirty-data tolerance: with it set (default 0 = strict), a
+        batch whose `fn` raises is bisected to isolate the offending rows, and a failing row
+        is *dropped* (up to this many, per worker) so a corrupt image / malformed record
+        doesn't kill a long inference job — the guides' ``max_errored_blocks`` need. Beyond
+        the budget the error propagates, so a real bug on clean data still fails fast.
 
         Warns (`PerformanceWarning`) when a GPU stage (`num_gpus > 0`) is given a
         plain function rather than a class/factory: a function is rebuilt on every
@@ -168,6 +175,7 @@ class DatasetML:
                 accelerator_type=accelerator_type,
                 model_memory_gb=model_memory_gb,
                 multiprocessing=multiprocessing,
+                max_errored_rows=max_errored_rows,
             )
         )
 

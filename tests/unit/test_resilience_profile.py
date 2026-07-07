@@ -14,7 +14,7 @@ import pytest
 
 from batcher.carbonite.resilience import PreemptionMonitor
 from batcher.config import Config, DistributedConfig
-from batcher.config.profiles import apply_resilience_profile
+from batcher.config.profiles import AUTOSCALE_WAIT_AUTO, apply_resilience_profile
 from batcher.config.validation import validate_config
 
 
@@ -41,6 +41,155 @@ def test_spot_profile_hardens_the_budgets():
     assert d.flight_keepalive_s is not None  # keepalive on
     assert d.speculation_max_backups >= 1  # one straggler backup
     assert d.fleet_max_attempts > DistributedConfig().fleet_max_attempts  # more fleet retries
+
+
+def test_spot_profile_enables_autoscale_wait():
+    # A spot cluster is an autoscaling one: the profile turns on a bounded wait so a
+    # stage that over-asks briefly waits for replacement nodes instead of clamping to
+    # the shrunken current capacity and running under-provisioned.
+    cfg = apply_resilience_profile(_with_resilience(resilience="spot"))
+    assert cfg.distributed.autoscale_wait_s > 0.0
+    # The default profile leaves it at the "auto" sentinel — the config layer resolves
+    # that per-environment (a bounded wait on an autoscaling cluster, off on a fixed one).
+    assert apply_resilience_profile(Config()).distributed.autoscale_wait_s == AUTOSCALE_WAIT_AUTO
+
+
+def test_spot_profile_upgrades_metadata_to_object_storage(monkeypatch):
+    # A discoverable shared location upgrades the still-default in-process store to
+    # durable object storage, so learning survives a driver moving between spot nodes.
+    monkeypatch.setenv("BATCHER_METADATA_URI", "s3://bkt/prefix")
+    cfg = apply_resilience_profile(_with_resilience(resilience="spot"))
+    assert cfg.metadata.backend == "object_storage"
+    assert cfg.metadata.uri == "s3://bkt/prefix"
+
+
+def test_spot_profile_uses_managed_artifact_storage(monkeypatch):
+    # Absent an explicit BATCHER_METADATA_URI, a managed cluster's persistent artifact
+    # storage is discovered and namespaced so batcher's objects don't collide with others.
+    monkeypatch.delenv("BATCHER_METADATA_URI", raising=False)
+    monkeypatch.setenv("ANYSCALE_ARTIFACT_STORAGE", "s3://org/artifacts/")
+    cfg = apply_resilience_profile(_with_resilience(resilience="spot"))
+    assert cfg.metadata.backend == "object_storage"
+    assert cfg.metadata.uri == "s3://org/artifacts/batcher-metadata"
+
+
+def test_spot_metadata_no_location_stays_in_process(monkeypatch):
+    # With no shared location, the store stays in-process rather than pretend a
+    # driver-local file is durable on a cluster where the driver can move.
+    monkeypatch.delenv("BATCHER_METADATA_URI", raising=False)
+    monkeypatch.delenv("ANYSCALE_ARTIFACT_STORAGE", raising=False)
+    cfg = apply_resilience_profile(_with_resilience(resilience="spot"))
+    assert cfg.metadata.backend == "in_process"
+    assert cfg.metadata.uri is None
+
+
+def test_spot_metadata_respects_explicit_backend(monkeypatch):
+    # A user who pinned a backend keeps it — the profile never overrides an explicit choice.
+    import dataclasses as _dc
+
+    monkeypatch.setenv("BATCHER_METADATA_URI", "s3://bkt/prefix")
+    base = _with_resilience(resilience="spot")
+    pinned = base.replace(metadata=_dc.replace(base.metadata, backend="sqlite"))
+    cfg = apply_resilience_profile(pinned)
+    assert cfg.metadata.backend == "sqlite"
+
+
+_AUTOSCALE_ENV_VARS = (
+    "BATCHER_AUTOSCALE",
+    "RAY_AUTOSCALING",
+    "BATCHER_SPOT",
+    "RAY_SPOT",
+    "RAY_NODE_TYPE_NAME",
+    "NODE_LIFECYCLE",
+    "INSTANCE_LIFECYCLE",
+    "ANYSCALE_SESSION_ID",
+    "ANYSCALE_CLUSTER_ID",
+)
+
+
+@pytest.fixture
+def _clean_autoscale_env(monkeypatch):
+    """A cluster with no autoscaling/spot/managed signal — the fixed-cluster baseline."""
+    for var in _AUTOSCALE_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
+def test_detect_autoscaling_off_on_fixed_cluster(_clean_autoscale_env):
+    from batcher.config.profiles import detect_autoscaling_environment
+
+    assert detect_autoscaling_environment() is False
+
+
+def test_detect_autoscaling_managed_cluster(_clean_autoscale_env):
+    # An Anyscale marker implies an autoscaler is present.
+    from batcher.config.profiles import detect_autoscaling_environment
+
+    _clean_autoscale_env.setenv("ANYSCALE_SESSION_ID", "ses_abc")
+    assert detect_autoscaling_environment() is True
+
+
+def test_detect_autoscaling_flag_is_authoritative_both_ways(_clean_autoscale_env):
+    # The explicit flag overrides even a managed-cluster marker — the power-user opt-out.
+    from batcher.config.profiles import detect_autoscaling_environment
+
+    _clean_autoscale_env.setenv("ANYSCALE_SESSION_ID", "ses_abc")
+    _clean_autoscale_env.setenv("BATCHER_AUTOSCALE", "0")
+    assert detect_autoscaling_environment() is False
+    _clean_autoscale_env.setenv("BATCHER_AUTOSCALE", "1")
+    assert detect_autoscaling_environment() is True
+
+
+def test_detect_autoscaling_spot_implies_autoscaling(_clean_autoscale_env):
+    from batcher.config.profiles import detect_autoscaling_environment
+
+    _clean_autoscale_env.setenv("BATCHER_SPOT", "1")
+    assert detect_autoscaling_environment() is True
+
+
+def test_resolve_autoscale_wait_auto_enables_on_autoscaling(_clean_autoscale_env):
+    from batcher.config.profiles import AUTOSCALE_WAIT_DEFAULT_S, resolve_autoscale_wait
+
+    _clean_autoscale_env.setenv("ANYSCALE_SESSION_ID", "ses_abc")
+    # A still-default (sentinel) config auto-enables the bounded wait — no tuning.
+    assert Config().distributed.autoscale_wait_s == AUTOSCALE_WAIT_AUTO
+    resolved = resolve_autoscale_wait(Config())
+    assert resolved.distributed.autoscale_wait_s == AUTOSCALE_WAIT_DEFAULT_S
+
+
+def test_resolve_autoscale_wait_off_on_fixed_cluster(_clean_autoscale_env):
+    # The sentinel resolves to a concrete `0` (non-blocking) on a fixed cluster, so the
+    # runtime never sees `-1` and single-node stays immediate.
+    from batcher.config.profiles import resolve_autoscale_wait
+
+    assert resolve_autoscale_wait(Config()).distributed.autoscale_wait_s == 0.0
+
+
+def test_resolve_autoscale_wait_honors_explicit_off(_clean_autoscale_env):
+    # An explicit `0` is honored even on an autoscaling cluster (distinct from the sentinel).
+    from batcher.config.profiles import resolve_autoscale_wait
+
+    _clean_autoscale_env.setenv("ANYSCALE_SESSION_ID", "ses_abc")
+    cfg = _with_resilience(autoscale_wait_s=0.0)
+    assert resolve_autoscale_wait(cfg).distributed.autoscale_wait_s == 0.0
+
+
+def test_resolve_autoscale_wait_honors_explicit_budget(_clean_autoscale_env):
+    from batcher.config.profiles import resolve_autoscale_wait
+
+    _clean_autoscale_env.setenv("ANYSCALE_SESSION_ID", "ses_abc")
+    cfg = _with_resilience(autoscale_wait_s=42.0)
+    assert resolve_autoscale_wait(cfg).distributed.autoscale_wait_s == 42.0
+
+
+def test_spot_profile_beats_autoscale_default(_clean_autoscale_env):
+    # Spot resolves through the profile (concrete 180) before the auto step sees it, so the
+    # two mechanisms don't double-apply; the spot value stands.
+    from batcher.config.profiles import AUTOSCALE_WAIT_DEFAULT_S, resolve_autoscale_wait
+
+    _clean_autoscale_env.setenv("BATCHER_SPOT", "1")
+    spotted = apply_resilience_profile(_with_resilience(resilience="spot"))
+    assert resolve_autoscale_wait(spotted).distributed.autoscale_wait_s == AUTOSCALE_WAIT_DEFAULT_S
 
 
 def test_explicit_override_wins_over_profile():

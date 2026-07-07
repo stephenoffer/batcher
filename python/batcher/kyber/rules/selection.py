@@ -23,7 +23,13 @@ import dataclasses
 
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.cost import CostModel
+from batcher.kyber.learned_tuning import (
+    learned_broadcast_max_bytes,
+    learned_join_strategy,
+    learned_sort_merge_min_rows,
+)
 from batcher.kyber.pass_base import OptimizerContext
+from batcher.kyber.signature import plan_signature
 from batcher.plan.logical import (
     Join,
     JoinOutputCol,
@@ -31,6 +37,7 @@ from batcher.plan.logical import (
     Scan,
     Union,
 )
+from batcher.plan.visitor import children, with_children
 
 __all__ = ["BuildSideDecision", "adaptive_build_side", "build_side_rule"]
 
@@ -45,7 +52,12 @@ __all__ = ["BuildSideDecision", "adaptive_build_side", "build_side_rule"]
 # When neither side is broadcast-small but both exceed this, prefer a sort-merge
 # join (no hash table over a huge build side). Also a performance knob — every
 # strategy yields the same relation.
-SORT_MERGE_MIN_ROWS = 1_000_000.0
+# Build-side row floor above which a hash table is large enough that sort-merge's
+# bounded-memory merge is worth its encoding cost. Set high because hash beats SMJ
+# until the build genuinely strains memory: a build of this many narrow-key rows is a
+# multi-GB hash table. Below it (the common case, including selective joins whose small
+# side is still > 1M rows) a hash join over the smaller side wins.
+SORT_MERGE_MIN_ROWS = 50_000_000.0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -62,15 +74,26 @@ def adaptive_build_side(
     plan: LogicalPlan,
     estimator: CardinalityEstimator,
     cost_model: CostModel | None = None,
+    *,
+    broadcast_max_bytes: int | None = None,
+    sort_merge_min_rows: float | None = None,
 ) -> tuple[LogicalPlan, list[BuildSideDecision]]:
     """Rewrite inner joins so the cheaper-to-build input is the build side.
 
     `cost_model` defaults to a model over the same estimator with the configured
     coefficients, so cost always drives the decision even when called outside the
-    optimizer context (e.g. the adaptive re-optimization loop)."""
+    optimizer context (e.g. the adaptive re-optimization loop).
+
+    `broadcast_max_bytes` / `sort_merge_min_rows` override the strategy thresholds —
+    `build_side_rule` passes the values *learned* from measured timings (see
+    `kyber.learned_tuning`); when `None` the static config default and module floor
+    stand, so every existing caller is unchanged. Thresholds only pick among
+    equivalent physical algorithms, so learning them never changes the result."""
     decisions: list[BuildSideDecision] = []
     cost = cost_model or CostModel(estimator)
-    return _rewrite(plan, estimator, cost, decisions, _broadcast_max_bytes()), decisions
+    max_bytes = broadcast_max_bytes if broadcast_max_bytes is not None else _broadcast_max_bytes()
+    smr = sort_merge_min_rows if sort_merge_min_rows is not None else SORT_MERGE_MIN_ROWS
+    return _rewrite(plan, estimator, cost, decisions, max_bytes, smr), decisions
 
 
 def _broadcast_max_bytes() -> int:
@@ -86,12 +109,44 @@ def _broadcast_max_bytes() -> int:
 
 def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
     """Cost-based join build-side selection. Needs estimated input sizes (sources),
-    and records its decisions on the context for explain/telemetry."""
+    and records its decisions on the context for explain/telemetry.
+
+    The broadcast byte threshold and the sort-merge row floor are taken from what the
+    hub has *learned* from measured broadcast-vs-shuffle and hash-vs-sort-merge timings
+    (falling back to the static defaults cold); then any per-signature learned
+    join-strategy arm overrides the cost-model choice. All three are choices among
+    equivalent physical algorithms, so the result is invariant."""
     if not ctx.sources:
         return plan
-    plan, decisions = adaptive_build_side(plan, ctx.estimator, ctx.costs())
+    learned_bmax = learned_broadcast_max_bytes(ctx.hub)
+    max_bytes = learned_bmax if learned_bmax is not None else _broadcast_max_bytes()
+    learned_smr = learned_sort_merge_min_rows(ctx.hub, SORT_MERGE_MIN_ROWS)
+    smr = learned_smr if learned_smr is not None else SORT_MERGE_MIN_ROWS
+    plan, decisions = adaptive_build_side(
+        plan, ctx.estimator, ctx.costs(), broadcast_max_bytes=max_bytes, sort_merge_min_rows=smr
+    )
+    plan = _apply_learned_strategies(plan, ctx.hub)
     ctx.notes["build_side_decisions"] = decisions
     return plan
+
+
+def _apply_learned_strategies(node: LogicalPlan, hub) -> LogicalPlan:
+    """Override each join's strategy with the per-signature bandit arm the hub learned.
+
+    A regret-minimizing bandit over `{hash, broadcast, sort_merge}` converges to the
+    algorithm measured fastest for a join of this shape on *this* hardware, correcting a
+    mis-ranked static cost guess. Every arm emits the identical relation (the engine
+    falls back to hash for any it cannot honor), so this is a pure performance override.
+    A cold signature yields `None` and the cost-model choice stands, so the plan is
+    unchanged until there is evidence."""
+    if hub is None:  # no learned store → skip the per-join signature work entirely
+        return node
+    node = with_children(node, [_apply_learned_strategies(c, hub) for c in children(node)])
+    if isinstance(node, Join):
+        arm = learned_join_strategy(hub, plan_signature(node))
+        if arm is not None and arm != node.strategy:
+            return dataclasses.replace(node, strategy=arm)
+    return node
 
 
 def _rewrite(
@@ -100,17 +155,18 @@ def _rewrite(
     cost: CostModel,
     decisions: list,
     max_bytes: int,
+    smr: float,
 ) -> LogicalPlan:
     if isinstance(node, Scan):
         return node
     if isinstance(node, Union):
         return Union(
-            tuple(_rewrite(i, est, cost, decisions, max_bytes) for i in node.inputs),
+            tuple(_rewrite(i, est, cost, decisions, max_bytes, smr) for i in node.inputs),
             node.distinct,
         )
     if isinstance(node, Join):
-        left = _rewrite(node.left, est, cost, decisions, max_bytes)
-        right = _rewrite(node.right, est, cost, decisions, max_bytes)
+        left = _rewrite(node.left, est, cost, decisions, max_bytes, smr)
+        right = _rewrite(node.right, est, cost, decisions, max_bytes, smr)
         node = Join(
             left, right, node.left_keys, node.right_keys, node.join_type, node.output, node.strategy
         )
@@ -118,35 +174,69 @@ def _rewrite(
         # Build-side swap is only valid for inner joins (associative/commutative).
         # Compare the cost of this orientation against the swapped one; children are
         # identical between them, so the per-join `op_cost` is the deciding term.
+        # Build-side swap is only valid for inner joins (associative/commutative).
+        # Compare the cost of this orientation against the swapped one; children are
+        # identical between them, so the per-join `op_cost` is the deciding term.
+        # (A left/right join's `A LEFT JOIN B == B RIGHT JOIN A` rename was tried to
+        # build the smaller *preserved* side, but it regressed: building the small side
+        # forces probing the large one, and the scattered probe lookups cost more than
+        # the larger but cache-friendlier build. The current cost model's build:probe
+        # ratio mis-ranks that, so the rename is withheld until the model is calibrated.)
         cost_delta = 0.0
         swap = False
-        if node.join_type == "inner":
-            swapped = _swap(node)
-            here = cost.op_cost(node).total()
-            there = cost.op_cost(swapped).total()
-            cost_delta = here - there
-            swap = there < here
-            if swap:
-                node = swapped
-        # After any swap, the right input is the build side. Broadcast it when it is
-        # small enough to replicate — cheaper than shuffling the probe side. Valid
-        # for every join type (the engine probes the left, replicating the right).
-        build_rows = min(l_est.rows, r_est.rows) if swap else r_est.rows
-        # Size the build side in bytes (rows × measured per-row width), so wide
+        broadcast = False
+        # Size *both* sides in bytes (rows × measured per-row width) up front, so wide
         # payloads aren't broadcast on a misleadingly small row count.
-        build_bytes = build_rows * cost.row_bytes(node.right)
-        broadcast = build_bytes <= max_bytes
+        left_bytes = l_est.rows * cost.row_bytes(node.left)
+        right_bytes = r_est.rows * cost.row_bytes(node.right)
+        if node.join_type == "inner":
+            # Broadcast-first: replicating the *smaller* side as the build and probing
+            # the larger in parallel (no shuffle of the big side) is the dominant
+            # strategy whenever the small side fits the byte threshold — what DuckDB /
+            # Spark do. Decide it from the two sides' bytes directly, independent of the
+            # marginal cpu-delta swap below: a mis-ranked cost delta must never forfeit a
+            # clearly-beneficial broadcast. The old code only ever checked the *right*
+            # side, so when the cost model failed to swap and the small side was the
+            # left/probe, broadcast was missed and the join fell back to shuffling the
+            # 6M-row build (TPC-H Q5's orders⋈lineitem: 419 ms shuffle vs 78 ms broadcast).
+            if min(left_bytes, right_bytes) <= max_bytes:
+                # Build the smaller side (the runtime builds the right); swap when it is
+                # the left. Inner joins are associative/commutative, so this is safe.
+                swap = left_bytes < right_bytes
+                if swap:
+                    node = _swap(node)
+                broadcast = True
+            else:
+                # Neither side is broadcast-small: pick the cheaper build orientation by
+                # cost (build the smaller of two large sides; shuffle either way).
+                swapped = _swap(node)
+                here = cost.op_cost(node).total()
+                there = cost.op_cost(swapped).total()
+                cost_delta = here - there
+                swap = there < here
+                if swap:
+                    node = swapped
+        else:
+            # Non-inner joins are not commutative — the build is always the right input.
+            # Broadcast it when it is small enough to replicate (the engine probes left).
+            broadcast = right_bytes <= max_bytes
+        # After any swap, the right input is the build side.
+        build_rows = min(l_est.rows, r_est.rows) if swap else r_est.rows
         if broadcast:
             node = dataclasses.replace(node, strategy="broadcast")
-        elif l_est.rows >= SORT_MERGE_MIN_ROWS and r_est.rows >= SORT_MERGE_MIN_ROWS:
-            # Two large inputs, neither small enough to broadcast: sort-merge avoids
-            # building a hash table over a huge side (Spark's default large-join).
-            # NOTE: preferring sort-merge for *already-ordered* inputs was tried and
-            # reverted — benchmarking showed SMJ's RowConverter encoding overhead loses
-            # to the hash join even when its sort is skipped, so it was a regression.
-            # The engine's skip-sort fast-path (`bc-runtime` `sort_indices_if_unsorted`)
-            # still makes this size-driven SMJ cheaper when its inputs happen to arrive
-            # sorted; only the planner *preference* was withdrawn.
+        elif build_rows >= smr:
+            # Sort-merge only when the *build* side (the one hashed, after the swap) is
+            # itself so large that a hash table over it is memory-prohibitive — then
+            # SMJ's bounded-memory merge wins despite its RowConverter encoding cost.
+            # Gating on the build side (not both inputs) is the key: a hash join builds
+            # only the smaller side and streams the larger one, so a 6M ⋈ 1.5M join
+            # hashes 1.5M (fits easily) and beats sorting *both* 6M and 1.5M. The old
+            # "both sides large" gate mis-chose SMJ for selective joins whose small side
+            # was merely over a million rows (TPC-H Q18's top join: 219ms SMJ sorting 6M
+            # lineitem to emit 399 rows, where a hash probe is ~30ms).
+            # NOTE: preferring SMJ for *already-ordered* inputs was tried and reverted —
+            # SMJ's encoding overhead loses to hash even when its sort is skipped; only
+            # the genuinely-too-big-to-hash build keeps it.
             node = dataclasses.replace(node, strategy="sort_merge")
         decisions.append(
             BuildSideDecision(
@@ -157,7 +247,7 @@ def _rewrite(
     # Single-input nodes: rewrite the child in place.
     if hasattr(node, "input"):
         return dataclasses.replace(
-            node, input=_rewrite(node.input, est, cost, decisions, max_bytes)
+            node, input=_rewrite(node.input, est, cost, decisions, max_bytes, smr)
         )
     return node
 

@@ -190,7 +190,7 @@ cluster** profile in [profiles](profiles.md).
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `ray_address` | `None` | Ray cluster address. `None` attaches to a running cluster when `RAY_ADDRESS` is set, else starts a local one. |
+| `ray_address` | `None` | Ray cluster address. `None` attaches to a running cluster when `RAY_ADDRESS` is set **or a managed control plane (Anyscale) is detected** — so a distributed query on a managed workspace fans out across the cluster with no config, instead of stranding on a local single-node Ray; it falls back to a local start only when no cluster is reachable. Set an explicit address to override. |
 | `namespace` | `"batcher"` | Ray namespace for batcher's shuffle actors, so they are isolatable. |
 | `runtime_env` | `None` | `runtime_env` dict shipped to workers so `batcher` + its native extension are present cluster-wide. |
 | `transport` | `"auto"` | Shuffle transport. `"auto"` picks Flight on a multi-node cluster, disk on a single node / shared filesystem; `"flight"`/`"disk"` force it. |
@@ -225,6 +225,33 @@ output is recomputed from its (durable) source partition and re-fetched.
 | `skew_join_salt` | `0` | Spread a hot join key's rows across this many reducers (`0` disables skew-aware salting). |
 | `skew_join_fraction` | `0.10` | A value is "hot" when it exceeds this fraction of a side's rows. |
 | `shuffle_token` | `None` | Shared secret authenticating Flight shuffle fetches. Also read from `BATCHER_SHUFFLE_TOKEN`. |
+
+### Cluster saturation & autoscaling
+
+Out of the box the distributed engine fills the whole cluster with no tuning: it
+**attaches to the running cluster** (even on a managed workspace that exports no
+`RAY_ADDRESS`), fans out to **one worker per node**, gives each worker an **even share of
+that node's cores** (so morsel parallelism saturates every core), and scales the shuffle
+reducer count with the worker count. On an autoscaling-capable cluster it also asks the autoscaler for the
+cores a query wants and — crucially — **waits (bounded) for the new nodes to arrive before
+sizing the fan-out**, so a big query runs on the grown cluster instead of clamping to the
+pre-scale size and leaving the new capacity for the next job.
+
+The autoscale wait auto-enables when an autoscaling cluster is detected (Anyscale, a spot
+node, or `BATCHER_AUTOSCALE=1`) and stays off on a fixed / single-node cluster, so the
+default needs no configuration. Power users override any of it explicitly.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `num_workers` | `None` (auto) | Explicit worker fan-out. `None` auto-sizes to one-per-node (multi-node) or all cores (single node) and enables the autoscale wait; an explicit value pins the fan-out and skips the wait. |
+| `autoscale_wait_s` | `-1` (auto) | Seconds to wait for autoscaler-launched nodes before sizing the fan-out. `-1` resolves to a bounded wait on an autoscaling cluster and to `0` (off) on a fixed one; `0` disables it even on an autoscaling cluster; a positive value caps the budget. |
+| `autoscale_poll_s` | `5.0` | Poll interval while waiting for capacity to arrive. |
+| `autoscale_stall_s` | `90.0` | Grace window: give up the wait once capacity has been flat this long (a fixed cluster, or spot capacity that cannot be had) — so it never blocks the whole budget on nodes that will not arrive. Any capacity gain resets it. Sized longer than a node's boot time. |
+| `max_shuffle_partitions` | `2048` | Cap on shuffle reducers, so the reducer count scales with the cluster but an all-to-all exchange stays bounded (not O(nodes²)) at thousands of nodes. `0` disables the cap. |
+
+The `BATCHER_AUTOSCALE` env var is authoritative in both directions — `1` forces the wait
+on, `0` forces it off even on a managed cluster. The wait is pure scheduling: the result is
+identical whether it waits or not.
 
 Invalid values (a negative retry count, `soft_limit` above `hard_limit`, a
 non-positive timeout) raise `ConfigError` at the config entry point

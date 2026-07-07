@@ -82,6 +82,118 @@ Ray object store. Which transport runs is one knob:
 The disk shuffle's working directory is driver-local, so `"auto"` will not pick it
 across nodes unless you also set `config.distributed.shared_filesystem`.
 
+### Same-node zero-copy fast path (automatic)
+
+Within a shuffle, a reducer's sources fall into three tiers, and Carbonite picks the
+cheapest for each one with **no configuration** — it just works:
+
+| Source | Path | Cost |
+|--------|------|------|
+| Same process | `DIRECT_MEMORY` — read straight from the local store | no copy, no socket |
+| **Same node, different process** | `SHARED_MEMORY` — mmap a 64-byte-aligned Arrow IPC file, decoded **zero-copy** | ~a memcpy; **≈23× a loopback Flight hop** |
+| Another node | `NETWORK` — credit-bounded Arrow Flight | one gRPC stream |
+
+The common GPU-cluster shape packs several worker actors per node, so many of a
+reducer's fetches are same-node-but-cross-process — exactly the tier the shared-memory
+path accelerates. It is **on by default** (`config.distributed.shared_memory_transfer`)
+and safe to leave on because it is:
+
+- **Adaptive / self-limiting.** The mmap file is a second copy (in tmpfs = RAM) on top
+  of the in-memory store Flight serves remote reducers from, so a mapper **skips** the
+  mirror whenever the node is under memory pressure (`PressureLevel.SPILL`+). The reducer
+  then falls back to Flight. On a churning spot node — where recompute transiently
+  doubles live state — the fast path steps aside rather than risking OOM.
+- **Concurrency-preserving.** Same-node buckets are read from shared memory *inside* the
+  concurrent gather, so cross-node buckets still fan out in parallel — you get the 23× on
+  the same-node fraction with no loss of cross-node throughput.
+- **Result-preserving.** A shm miss (bucket not mirrored, another node, shm unavailable)
+  transparently falls back to Flight, which is bit-identical, so single-node == distributed
+  holds regardless.
+
+Measured on a real cluster: a single-node multi-actor gather (8 producers → 1 reducer)
+runs at **33.6 GB/s with shared memory vs 4.5 GB/s over loopback Flight** (7.5× through
+the full concurrent gather; ~23× point-to-point).
+
+### Cross-node throughput scales with the cluster
+
+A single reducer's inbound rate is bounded by its NIC (~2.7 GB/s = ~22 Gbps on a T4
+node, i.e. line rate); the 10× is in the **aggregate** all-to-all, where every node
+reduces at once. Measured aggregate shuffle throughput: **2.0 → 6.9 → 15.2 GB/s at 2 → 4
+→ 8 nodes** — it grows with the node count, because the mergeable `partial → combine →
+finalize` algebra plus credit flow control keep per-node memory bounded no matter how
+wide the cluster. The shuffle runtime's worker-thread pool is **auto-sized to the host's
+cores** (clamped to keep concurrent-decode throughput near the NIC without
+oversubscribing many-actor nodes); override with `BATCHER_SHUFFLE_RT_THREADS` only for an
+unusual node shape.
+
+## Self-tuning from measured metadata
+
+The contract loop does not just protect the current query — it *learns* from it.
+Core measures what every operator actually did (rows in/out, wall time, per-core CPU
+busy fraction, and peak bytes) and records it into the `MetadataHub`; Carbonite then
+sizes the next run against that measured reality instead of a cold plan estimate.
+Every decision here is **result-invariant**: it changes how much memory a query
+reserves, when it spills, and how big a morsel is — never what the query returns.
+That invariance is property-tested (tuned run == untuned run), which is what lets
+the sizing learn aggressively; the worst a stale learned value can do is cost
+throughput.
+
+### The learned memory model
+
+Carbonite's headline learner is the `LearnedMemoryModel`. It closes a specific gap:
+Core records each operator's *actual* peak memory (`m_peak_bytes`), but historically
+every sizing decision — admission, spill, reservation, morsel — sized from Kyber's
+plan estimate alone and never consulted what the operator really used. The model is
+the memory analog of Kyber's cost calibration: from the measured peaks it fits a
+per-operator-family **bytes-per-input-row** figure (a *ratio*, not an absolute peak,
+so it is size-general — a 1M-row aggregate and a 10-row one share one coefficient),
+and each sizing decision blends the plan's byte estimate toward that measured figure,
+clamped so a noisy sample can never wildly move sizing.
+
+That single blended peak feeds every memory decision through one `_peak_bytes(plan)`:
+`should_spill` routes a query out-of-core when its *measured* footprint won't fit,
+`recommend_spill_partitions` shards the spilled state so each bucket stays bounded,
+`recommend_spill_compression` compresses a large IO-bound state, and admission and
+`reserve` account against reality. Morsel sizing tightens too: the widest learned
+per-row width caps the morsel row count so a workload of wide rows (large strings,
+embeddings, blob handles) keeps its true byte working set within budget. On a cold
+store the model is an empty pass-through — every method defers to the plan estimate,
+so a first run is byte-for-byte the pre-learning behavior.
+
+### Learned flow control
+
+The credit machinery learns the same way. `grant_credits(signature=…)` warm-starts a
+recurring shuffle channel from the window past runs of that shape converged on (a
+learned credit window), rather than the static `default_credits`. The AIMD controller
+still governs the window actually used from live backpressure — with hysteresis
+between `backpressure_high` and `backpressure_low` so a channel does not oscillate —
+so learning only moves the *starting point*; the converged window is persisted back
+after the run to seed the next one. Single-node-equals-distributed equivalence is
+untouched, because a credit window only bounds in-flight batches, never the result.
+
+### The sibling tuning layers
+
+Carbonite owns the memory and resource half of a larger, coherent self-tuning system;
+the other halves live in their own subsystems and are wired together by `api`:
+
+- **Kyber — `learned_tuning`** picks *physical strategy* from measured runs: a UCB1
+  bandit over equivalent join algorithms (hash / broadcast / sort-merge), learned
+  broadcast-byte and sort-merge-row thresholds (an OLS line crossover), learned
+  build-side and partition priors, and whether partial pre-aggregation pays off — see
+  [Kyber optimizer](kyber.md).
+- **Core / Dist — `adaptive_sizing`** tunes *distributed scheduling*: learned
+  UDF/inference actor-pool size, GPU batch caps, source partition count, per-task CPU
+  share, shuffle reducer fan-out, and straggler-speculation aggressiveness — each a
+  pure scheduling knob under the mergeable algebra.
+- **`api` — `tuning`** is the conductor half: it *activates* the read-side decisions
+  each subsystem exposes and *records* the measured outcomes back, closing every
+  feedback loop (join bandit, group-reduction, converged credit window) so the
+  learning actually accrues — see the adaptive re-optimization loop in
+  [Execution engine](execution.md).
+
+All of them share the one rule above: they tune performance and scheduling, and a
+cold `MetadataHub` reproduces the untuned behavior exactly.
+
 ## Tuning
 
 Carbonite reads its knobs from `Config`. Derive a new config to change one:

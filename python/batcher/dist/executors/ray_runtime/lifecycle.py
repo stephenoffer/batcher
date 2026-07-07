@@ -28,7 +28,7 @@ from batcher.plan.logical import LogicalPlan
 
 from .policies import actor_fault_options, fault_options
 from .scaling import cluster_topology
-from .scheduling import current_envelope, task_options
+from .scheduling import current_envelope, set_job_ships_batcher, task_options
 
 
 def engine_config_json() -> str:
@@ -63,7 +63,7 @@ def engine_config_json() -> str:
 # Names of the module-level Ray task functions, keyed by the module they live in.
 # `_ensure_ray` rebinds each `<module>.<name> = ray.remote(<module>.<name>)`.
 _TASK_FUNCS: dict[str, tuple[str, ...]] = {
-    "batcher.dist.executors.map": ("_map_udf_task", "_MapActor"),
+    "batcher.dist.executors.map": ("_map_udf_task", "_map_agg_task", "_MapActor"),
     "batcher.dist.executors.aggregate": ("_map_task", "_reduce_task"),
     "batcher.dist.executors.join": (
         "_join_map_task",
@@ -86,16 +86,28 @@ _wrapped_resources: tuple | None = None
 _wrap_lock = threading.Lock()
 
 
-def _ray_init_kwargs(workers: int) -> dict:
+def _ray_init_kwargs(
+    workers: int, *, force_attach: bool = False, force_local: bool = False
+) -> dict:
     """`ray.init(**kwargs)` for the active config — attach to a cluster or spin local.
 
     Attach to a *running* cluster when an address is configured (`Config` or the
-    `RAY_ADDRESS` env var Ray itself honors), shipping `batcher` + its native
-    extension via `runtime_env` so workers can run the data plane. Only when no
-    address is given do we start a *local* cluster capped at `workers` CPUs (the
-    single-node / test path); against a real cluster we leave fan-out to the
-    scheduler/autoscaler and never pin `num_cpus`."""
+    `RAY_ADDRESS` env var Ray itself honors) OR a managed control plane is detected
+    (`detect_managed_cluster` — e.g. an Anyscale workspace), shipping `batcher` + its
+    native extension via `runtime_env` so workers can run the data plane. On a managed
+    workspace that exports neither `RAY_ADDRESS` nor Ray's current-cluster pointer, a bare
+    `ray.init()` would silently start a *local* single-node Ray and strand a distributed job
+    on one node — so a managed signal routes to `address="auto"` here, and `_ensure_ray`
+    falls back to a local start only if no cluster turns out to be reachable. Only when no
+    address is configured *and* no cluster is detected/reachable do we start a *local*
+    cluster capped at `workers` CPUs (the single-node / test path); against a real cluster we
+    leave fan-out to the scheduler/autoscaler and never pin `num_cpus`.
+
+    `force_attach` forces the discoverable-cluster attach (`address="auto"`); `force_local`
+    forces the local start (the reachability fallback). Both take precedence over detection."""
     import os
+
+    from batcher.config.profiles import detect_managed_cluster
 
     dc = active_config().distributed
     kwargs: dict = {
@@ -104,22 +116,133 @@ def _ray_init_kwargs(workers: int) -> dict:
         "ignore_reinit_error": True,
         "namespace": dc.namespace,
     }
-    if dc.ray_address:
+    attach = not force_local and (
+        force_attach or os.environ.get("RAY_ADDRESS") or detect_managed_cluster()
+    )
+    if not force_local and dc.ray_address:
         kwargs["address"] = dc.ray_address
-    elif os.environ.get("RAY_ADDRESS"):
+    elif attach:
         kwargs["address"] = "auto"
     else:
         kwargs["num_cpus"] = workers
-    if dc.runtime_env:
+        # Only a locally started Ray accepts an object-store size; attaching to an
+        # existing cluster (the branches above) would be rejected by Ray.
+        if dc.object_store_memory_bytes is not None:
+            kwargs["object_store_memory"] = int(dc.object_store_memory_bytes)
+    # Ship the data plane to workers. An explicit `runtime_env` wins; otherwise, when
+    # attaching to a *cluster* (not a local single-process Ray), auto-ship the batcher
+    # package if it is a source/editable install the worker image won't already carry —
+    # the flight workers import `batcher` + its native extension to run, and die with
+    # `ModuleNotFoundError` without it. A no-op for a normal site-packages install.
+    if dc.runtime_env is not None:
         kwargs["runtime_env"] = dc.runtime_env
+    elif "address" in kwargs:
+        shipped = _self_ship_runtime_env()
+        if shipped is not None:
+            kwargs["runtime_env"] = shipped
     return kwargs
 
 
+def _self_ship_runtime_env() -> dict | None:
+    """A Ray `runtime_env` that uploads the driver's batcher package to workers.
+
+    Returns `{"py_modules": [<batcher pkg dir>]}` so the driver's *exact* batcher
+    package (abi3 native extension included) runs on every worker — Ray caches the
+    upload in the object store, so it is a one-time ~10MB transfer per package
+    content, not per query. This is correctness-first: a driver that pip-installed
+    batcher and attached to an arbitrary cluster cannot assume that cluster's image
+    carries a *compatible* batcher, and shipping guarantees driver==worker code. (The
+    old heuristic skipped shipping for any site-/dist-packages install, which produced
+    a silent `ModuleNotFoundError` on workers for the common local-install →
+    remote-cluster case.)
+
+    The env also pins `pip: None`. Batcher ships its own package here and relies on each
+    worker's base environment for every other dependency (Batcher's "ship my code, trust
+    the cluster image" contract). Pinning `pip` off makes that explicit and, critically,
+    stops a managed runtime-env hook (some platforms inject the workspace's
+    `requirements.txt` as the job's pip) from re-installing dependencies per job — a
+    redundant round-trip that also hard-fails when that list names a local editable such as
+    `batcher-engine` itself (unresolvable on any index, and already shipped here via
+    `py_modules`). A worker's base env already carries the workspace deps, so nothing is
+    lost; a job that genuinely needs extra per-worker pip deps sets `distributed.runtime_env`
+    (the explicit-override branch above), which wins outright.
+
+    Returns `{"pip": None}` (neutralize the injected pip, ship nothing) when
+    `distributed.trust_cluster_image` is set — a production image that bakes a matching
+    batcher into every node and wants to skip the upload.
+    """
+    import os
+
+    import batcher
+
+    if active_config().distributed.trust_cluster_image:
+        return {"pip": None}
+    pkg = os.path.dirname(os.path.abspath(batcher.__file__))
+    return {"py_modules": [pkg], "pip": None}
+
+
+def _neutralize_broken_runtime_env_hook() -> None:
+    """Drop a `RAY_RUNTIME_ENV_HOOK`/`RAY_RUNTIME_ENV_PLUGINS` whose module is missing.
+
+    A deployment env may export a runtime-env hook (some managed platforms'
+    `cgroup_runtime_plugin`) that Ray imports during `ray.init`. When Batcher runs
+    *outside* that runtime the module is absent and `ray.init` raises
+    `ModuleNotFoundError` before any work starts. A hook pointing at an
+    unimportable module is broken regardless of context, so removing it is strictly
+    safer than crashing — and a no-op where the module is present (a real cluster)."""
+    import importlib.util
+    import os
+
+    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
+        value = os.environ.get(var)
+        if not value:
+            continue
+        # The leading dotted path before the first `.` / `[` names the module to import
+        # (`mod._hook`, or `[{"class": "mod.Plugin"}]` JSON). Probe just the base module.
+        head = value.lstrip("[{\"' ").split(".")[0].split("[")[0]
+        if head and importlib.util.find_spec(head) is None:
+            os.environ.pop(var, None)
+
+
+# Once we've decided whether the job ships batcher (on the first `_ensure_ray`), the
+# answer is fixed for the process — a later `_ensure_ray` must not flip it just because
+# Ray now reports initialized.
+_ship_decided = False
+
+
 def _ensure_ray(workers: int) -> None:
+    global _ship_decided
     import ray
 
     if not ray.is_initialized():
-        ray.init(**_ray_init_kwargs(workers))
+        _neutralize_broken_runtime_env_hook()
+        try:
+            ray.init(**_ray_init_kwargs(workers))
+        except ValueError as e:
+            # A cluster is already running but no address was configured (a managed
+            # workspace that doesn't export `RAY_ADDRESS`): Ray auto-attaches and then
+            # rejects the local-only `num_cpus`/object-store hints. Retry as a plain
+            # attach so the distributed path works on the cluster instead of failing.
+            if "existing cluster" not in str(e):
+                raise
+            ray.init(**_ray_init_kwargs(workers, force_attach=True))
+        except ConnectionError:
+            # A managed-cluster signal routed us to `address="auto"` but no cluster is
+            # actually reachable (e.g. a local dev run inside a workspace whose cluster is
+            # down): start a local single-node Ray instead of failing the job outright.
+            if not ray.is_initialized():
+                ray.init(**_ray_init_kwargs(workers, force_local=True))
+        # Batcher initialized Ray: a local cluster shares the driver's modules and a
+        # remote one carries the self-shipped runtime_env, so the job makes batcher
+        # importable — no per-remote shipping needed.
+        set_job_ships_batcher(True)
+        _ship_decided = True
+    elif not _ship_decided:
+        # A foreign `ray.init` ran before batcher (e.g. the user attached to the
+        # cluster themselves): batcher couldn't set the job runtime_env, so it must
+        # ship its package on each remote instead. A no-op when trust_cluster_image.
+        set_job_ships_batcher(False)
+        _ship_decided = True
     _wrap_tasks(ray, task_options(current_envelope()))
 
 

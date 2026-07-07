@@ -9,8 +9,50 @@ use arrow::array::{
 use arrow::compute::concat;
 use arrow::datatypes::{DataType, Decimal128Type, Float64Type, Int64Type};
 
-use super::AggFunc;
+use super::{accumulate, arg_extreme_state, covar_state, AggCall, AggFunc, Partial};
 use crate::error::RuntimeError;
+
+/// Produce the partial-state columns for one aggregate call. The two-input functions
+/// (`arg_min`/`arg_max` carry an ordering key; `covar`/`corr` carry a second value) go to
+/// their dedicated builders; every single-input function goes to [`accumulate`].
+pub(super) fn accumulate_call(
+    call: &AggCall,
+    group_ids: &[u32],
+    num_groups: usize,
+) -> Result<Vec<ArrayRef>, RuntimeError> {
+    match call.func {
+        AggFunc::ArgMin | AggFunc::ArgMax => arg_extreme_state(
+            require(call.values.as_ref(), call.func)?,
+            require(call.key.as_ref(), call.func)?,
+            group_ids,
+            num_groups,
+            matches!(call.func, AggFunc::ArgMax),
+        ),
+        AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => covar_state(
+            require(call.values.as_ref(), call.func)?,
+            require(call.key.as_ref(), call.func)?,
+            group_ids,
+            num_groups,
+        ),
+        _ => accumulate(call.func, call.values.as_ref(), group_ids, num_groups),
+    }
+}
+
+/// Global (no-`GROUP BY`) partial aggregation: every row is the single group 0. The scalar
+/// reductions (`sum`/`min`/`max`/`count`/`mean`) hit their `num_groups == 1` kernels; the
+/// rest scatter into the one group through a shared zero-id buffer. Group columns are empty
+/// (a global aggregate has no key), matching the grouped `partial`'s `Partial` shape.
+pub(crate) fn global_partial(calls: &[AggCall], num_rows: usize) -> Result<Partial, RuntimeError> {
+    let zeros = vec![0u32; num_rows];
+    let mut states = Vec::with_capacity(calls.len());
+    for call in calls {
+        states.push(accumulate_call(call, &zeros, 1)?);
+    }
+    Ok(Partial {
+        group_columns: Vec::new(),
+        states,
+    })
+}
 
 pub(crate) fn sum_acc(
     values: &ArrayRef,
@@ -18,16 +60,52 @@ pub(crate) fn sum_acc(
     num_groups: usize,
     func: AggFunc,
 ) -> Result<ArrayRef, RuntimeError> {
+    // Global-sum fast path: when there is a single group every row maps to it, so the
+    // group sum equals the whole-column sum — arrow's SIMD reduction kernels beat the
+    // scalar scatter loop below (the dominant cost of a global `SUM`/`COUNT`-derived
+    // aggregate, and of every distributed `combine` that folds a handful of partials).
+    // Null-only / empty input yields a null sum (SQL semantics), matching `masked_*`.
+    if num_groups == 1 {
+        match values.data_type() {
+            DataType::Int64 => {
+                let s = arrow::compute::sum_checked(values.as_primitive::<Int64Type>())
+                    .map_err(|_| RuntimeError::SumOverflow)?;
+                return Ok(Arc::new(masked_i64(
+                    vec![s.unwrap_or(0)],
+                    vec![s.is_some()],
+                )));
+            }
+            DataType::Float64 => {
+                let s = arrow::compute::sum(values.as_primitive::<Float64Type>());
+                return Ok(Arc::new(masked_f64(
+                    vec![s.unwrap_or(0.0)],
+                    vec![s.is_some()],
+                )));
+            }
+            // Decimal keeps the scatter loop below (exact i128 accumulation, scale-aware).
+            _ => {}
+        }
+    }
     match values.data_type() {
         DataType::Int64 => {
             let arr = values.as_primitive::<Int64Type>();
             let mut sums = vec![0i64; num_groups];
+            // Checked add throughout: a silent i64 wrap would be a wrong answer. (DuckDB
+            // promotes BIGINT sums to 128-bit; we error rather than corrupt until that
+            // wider-output promotion lands.)
+            if arr.null_count() == 0 {
+                // No-null fast path: gather straight from the values slice, skipping the
+                // per-row validity branch and the per-row `valid` write (every group is
+                // non-empty and all-valid) — mirrors the Float64 path below.
+                for (&g, &v) in group_ids.iter().zip(arr.values()) {
+                    let slot = &mut sums[g as usize];
+                    *slot = slot.checked_add(v).ok_or(RuntimeError::SumOverflow)?;
+                }
+                return Ok(Arc::new(masked_i64(sums, vec![true; num_groups])));
+            }
             let mut valid = vec![false; num_groups];
             for (i, &g) in group_ids.iter().enumerate() {
                 if arr.is_valid(i) {
-                    // Checked: a silent i64 wrap would be a wrong answer. (DuckDB
-                    // promotes BIGINT sums to 128-bit; we error rather than corrupt
-                    // until that wider-output promotion lands.)
                     let slot = &mut sums[g as usize];
                     *slot = slot
                         .checked_add(arr.value(i))
@@ -40,20 +118,22 @@ pub(crate) fn sum_acc(
         DataType::Float64 => {
             let arr = values.as_primitive::<Float64Type>();
             let mut sums = vec![0f64; num_groups];
-            let mut valid = vec![false; num_groups];
             if arr.null_count() == 0 {
                 // No-null fast path: gather straight from the values slice, skipping
-                // the per-row validity branch. This is the dominant SUM/AVG path.
+                // both the per-row validity branch *and* the per-row `valid` write —
+                // every group is non-empty (it exists because a row mapped to it) and
+                // has only non-null values, so all groups are valid. Removing the 6M
+                // redundant bool writes (per aggregate) is the dominant SUM/AVG path.
                 for (&g, &v) in group_ids.iter().zip(arr.values()) {
                     sums[g as usize] += v;
-                    valid[g as usize] = true;
                 }
-            } else {
-                for (i, &g) in group_ids.iter().enumerate() {
-                    if arr.is_valid(i) {
-                        sums[g as usize] += arr.value(i);
-                        valid[g as usize] = true;
-                    }
+                return Ok(Arc::new(masked_f64(sums, vec![true; num_groups])));
+            }
+            let mut valid = vec![false; num_groups];
+            for (i, &g) in group_ids.iter().enumerate() {
+                if arr.is_valid(i) {
+                    sums[g as usize] += arr.value(i);
+                    valid[g as usize] = true;
                 }
             }
             Ok(Arc::new(masked_f64(sums, valid)))

@@ -101,9 +101,11 @@ def test_nested_same_type_cast_collapsed():
 
     ds = bt.from_pydict({"a": [1, 2, 3]})
     q = ds.with_columns(c=col("a").cast("int64").cast("int64"))
-    # The doubled cast collapses: only one cast tag remains in the lowered IR.
+    # The doubled cast never survives as two: `expr_simplification` collapses the pair
+    # to one, and `drop_self_cast_in_projection` removes even that one when the schema
+    # proves `a` is already int64 (an identity cast). Either way, at most one remains.
     blob = json.dumps(_ir(q))
-    assert blob.count('"cast"') == 1
+    assert blob.count('"cast"') <= 1
 
 
 # --- B10 or_to_in_and_range ---------------------------------------------------

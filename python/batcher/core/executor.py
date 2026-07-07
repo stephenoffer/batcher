@@ -88,6 +88,7 @@ def _record_op_feedback(sink: FeedbackSink, ops: list[dict], batch_size: int) ->
                 cpu_utilization=cpu_utilization(
                     op.get("cpu_ns", 0), op.get("elapsed_ns", 0), op.get("threads", 1)
                 ),
+                n_input=int(rows_in),
             )
         )
 

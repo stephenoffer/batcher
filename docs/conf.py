@@ -118,6 +118,9 @@ exclude_patterns = [
     # Standalone formal paper, rendered to PDF by internals/generate_pdf.py rather
     # than as a site page. It carries its own internal cross-reference scheme.
     "internals/mathematical_foundations.md",
+    # Design proposal (RFC), not a published page — kept in-tree for contributors,
+    # excluded from the site build until/unless its proposals are accepted.
+    "internals/rfc-gpu-transport.md",
 ]
 
 # -- Options for HTML output -------------------------------------------------

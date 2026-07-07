@@ -24,7 +24,6 @@ use arrow::array::{Array, ArrayRef, AsArray, Float64Array, Int64Array, StringArr
 use arrow::compute::{lexsort_to_indices, take, SortColumn, SortOptions};
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use arrow::row::{RowConverter, Rows, SortField};
-use rayon::prelude::*;
 
 use crate::error::RuntimeError;
 
@@ -86,15 +85,13 @@ impl WindowFn {
         }
     }
 
-    fn is_ranking(self) -> bool {
+    /// Reducing aggregate functions (one value per partition). Without an ORDER BY or
+    /// explicit frame these are whole-partition aggregates — computable as a plain
+    /// group-by broadcast (the fast path in [`window_with`]).
+    fn is_aggregate(self) -> bool {
         matches!(
             self,
-            WindowFn::RowNumber
-                | WindowFn::Rank
-                | WindowFn::DenseRank
-                | WindowFn::PercentRank
-                | WindowFn::CumeDist
-                | WindowFn::Ntile
+            WindowFn::Sum | WindowFn::Avg | WindowFn::Min | WindowFn::Max | WindowFn::Count
         )
     }
 
@@ -156,23 +153,94 @@ pub fn window_with(
     num_rows: usize,
     parallel_row_threshold: usize,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
-    // Group row indices into partitions (first-seen order is irrelevant; we
-    // scatter results back to original positions regardless).
-    let partitions = assign_partitions(partition_keys, num_rows)?;
-
-    // Order each partition once (shared by all ranking functions). The partitions
-    // are independent, so for large inputs the sorts run across cores.
-    let ordered: Vec<Vec<usize>> = if num_rows >= parallel_row_threshold && partitions.len() > 1 {
-        partitions
-            .par_iter()
-            .map(|p| order_partition(p, order_keys))
-            .collect::<Result<_, _>>()?
-    } else {
-        partitions
+    // Parallelize across CORES by hash-partitioning rows on the PARTITION BY keys:
+    // equal keys co-partition, so every window partition lands wholly inside one
+    // bucket and each bucket is an independent window over a disjoint row set. Run the
+    // serial kernel per bucket on rayon, then scatter every function's column back to
+    // original row order. This spreads the dominant per-partition cost — the ordering
+    // sort behind ranking / running-aggregate / value / framed functions — across all
+    // cores (the serial kernel left it single-threaded).
+    //
+    // Parallelized for two shapes: (1) an ORDER BY window (each partition pays a sort
+    // that dwarfs the partition + scatter-back plumbing), and (2) a *frameless
+    // whole-partition aggregate* (`sum() OVER (PARTITION BY k)`, empty order). The
+    // frameless case is a group-by + broadcast, and on a high-cardinality key its single
+    // pass over the whole input hits a cache-cold million-entry hash table — bucketing by
+    // key across cores makes each bucket's table cache-resident and the assign/broadcast
+    // parallel (measured ~340 ms → tens of ms at 6 M rows / 1.5 M groups). Skip below the
+    // row threshold and when there is no PARTITION BY (a single global partition can't be
+    // split; the serial group-id fast path handles it). A frameless window that mixes a
+    // non-aggregate (a value function with no order) also stays serial.
+    let nthreads = rayon::current_num_threads();
+    let frameless_agg = order_keys.is_empty()
+        && funcs
             .iter()
-            .map(|p| order_partition(p, order_keys))
-            .collect::<Result<_, _>>()?
-    };
+            .all(|c| c.frame.is_none() && c.func.is_aggregate());
+    let worth_parallel = !partition_keys.is_empty()
+        && (!order_keys.is_empty() || frameless_agg)
+        && num_rows >= parallel_row_threshold
+        && nthreads > 1;
+    if !worth_parallel {
+        return window_serial(partition_keys, order_keys, funcs, num_rows);
+    }
+    crate::window_parallel::window_parallel(partition_keys, order_keys, funcs, num_rows, nthreads)
+}
+
+pub(crate) fn window_serial(
+    partition_keys: &[ArrayRef],
+    order_keys: &[(ArrayRef, SortOptions)],
+    funcs: &[WindowCall],
+    num_rows: usize,
+) -> Result<Vec<ArrayRef>, RuntimeError> {
+    // Fast path: PARTITION BY with no ORDER BY and only plain aggregates (no frame, no
+    // ranking / value functions) is exactly "group-by the partition keys, aggregate,
+    // broadcast back to each row". Assign dense group ids once via the shared native
+    // fast paths (`agg::assign_groups`) and reduce + broadcast in linear passes — far
+    // cheaper than materializing per-partition index lists and gathering by scattered
+    // index, and it parallelizes the grouping. The result is identical (the order within
+    // a partition never affects a whole-partition aggregate).
+    if order_keys.is_empty()
+        && !partition_keys.is_empty()
+        && funcs
+            .iter()
+            .all(|c| c.frame.is_none() && c.func.is_aggregate())
+    {
+        let (group_ids, num_groups, _) = crate::agg::assign_groups(partition_keys, num_rows)?;
+        return funcs
+            .iter()
+            .map(|call| {
+                crate::window_partition_agg::broadcast_partition_aggregate(
+                    call.func,
+                    &group_ids,
+                    num_groups,
+                    call.values.as_ref(),
+                )
+            })
+            .collect();
+    }
+
+    // Build the per-partition ordered row-index lists (`ordered`) and — only for the
+    // no-ORDER-BY aggregate broadcast below — the unordered partitions.
+    //
+    // With order keys, a *single* lexsort by `(partition_keys ++ order_keys)` yields the
+    // rows grouped by partition (partition keys lead the sort) and ordered within each by
+    // the order keys, so splitting the sorted indices into contiguous partition runs gives
+    // exactly the same `ordered` structure that grouping-then-sorting-each-partition does —
+    // but from one big sort instead of a million tiny per-partition sorts (a
+    // near-unique PARTITION BY like `l_orderkey` produces ~1.5 M 4-row partitions, whose
+    // per-partition sort + index-list overhead dominated). Peer/tie semantics are unchanged
+    // (ties on the order keys are still peers via `order_rows`), so every ranking / running
+    // / value function computes an identical per-row result. Without order keys there is
+    // nothing to sort, so just group.
+    let partitions: Vec<Vec<usize>>;
+    let ordered: Vec<Vec<usize>>;
+    if order_keys.is_empty() {
+        partitions = assign_partitions(partition_keys, num_rows)?;
+        ordered = partitions.clone();
+    } else {
+        ordered = ordered_partitions_by_global_sort(partition_keys, order_keys, num_rows)?;
+        partitions = Vec::new(); // unused when order keys are present (see the match below)
+    }
 
     // Encode the order keys once into arrow's row format. Peer/tie checks then cost
     // one byte comparison by row index instead of re-encoding per comparison.
@@ -211,9 +279,12 @@ pub fn window_with(
             )?,
             // With an ORDER BY, an aggregate window is a *running* (cumulative)
             // aggregate over the ordered partition; without one it's whole-partition.
-            f if order_keys.is_empty() => {
-                partition_aggregate(f, &partitions, call.values.as_ref(), num_rows)?
-            }
+            f if order_keys.is_empty() => crate::window_partition_agg::partition_aggregate(
+                f,
+                &partitions,
+                call.values.as_ref(),
+                num_rows,
+            )?,
             f => running_aggregate(
                 f,
                 &ordered,
@@ -289,34 +360,77 @@ fn assign_partitions(
     Ok(partitions)
 }
 
-/// Order the rows of one partition by the order keys, returning the partition's
-/// original row indices in sorted order. With no order keys, keeps input order.
-fn order_partition(
-    partition: &[usize],
+/// Per-partition, order-sorted row-index lists built from ONE global lexsort.
+///
+/// Sorts all rows by `(partition_keys ascending, then order_keys with their options)`.
+/// Partition keys leading the sort make each partition's rows contiguous in the sorted
+/// order, and the order keys sort within; splitting the sorted indices at partition-key
+/// boundaries therefore yields each partition's rows in order-key order — identical to
+/// grouping first then sorting each partition, but with a single sort instead of one per
+/// (often tiny) partition. Callers use this only when `order_keys` is non-empty.
+fn ordered_partitions_by_global_sort(
+    partition_keys: &[ArrayRef],
     order_keys: &[(ArrayRef, SortOptions)],
-) -> Result<Vec<usize>, RuntimeError> {
-    if order_keys.is_empty() || partition.len() <= 1 {
-        return Ok(partition.to_vec());
-    }
-    // Gather each order-key column down to this partition's rows, then lexsort.
-    let take_idx = Int64Array::from_iter_values(partition.iter().map(|&i| i as i64));
-    let sort_columns: Vec<SortColumn> = order_keys
+    num_rows: usize,
+) -> Result<Vec<Vec<usize>>, RuntimeError> {
+    // Sort columns: partition keys first (ascending — grouping is order-agnostic), then
+    // the order keys with their own ASC/DESC + nulls placement, and finally the original
+    // row index as the last ascending key. The index tie-break makes the sort a *total*
+    // order, so rows tied on the partition + order keys land in original-row order — which
+    // (a) is a stable, deterministic choice for `row_number`'s otherwise-unspecified order
+    // among peers, and (b) is identical whether this runs over the whole input or over one
+    // hash bucket of it, so the parallel per-bucket path matches the serial kernel exactly.
+    let mut sort_columns: Vec<SortColumn> = partition_keys
         .iter()
-        .map(|(arr, opts)| {
-            let local = arrow::compute::take(arr.as_ref(), &take_idx, None)?;
-            Ok::<_, RuntimeError>(SortColumn {
-                values: local,
-                options: Some(*opts),
-            })
+        .map(|a| SortColumn {
+            values: a.clone(),
+            options: None,
         })
-        .collect::<Result<_, _>>()?;
-    let local_order = lexsort_to_indices(&sort_columns, None)?;
-    // Map the local (within-partition) order back to original row indices.
-    Ok(local_order
-        .values()
+        .collect();
+    for (arr, opts) in order_keys {
+        sort_columns.push(SortColumn {
+            values: arr.clone(),
+            options: Some(*opts),
+        });
+    }
+    let row_index: ArrayRef = Arc::new(Int64Array::from_iter_values(0..num_rows as i64));
+    sort_columns.push(SortColumn {
+        values: row_index,
+        options: None,
+    });
+    let sorted = lexsort_to_indices(&sort_columns, None)?;
+    let sorted = sorted.values();
+
+    // No PARTITION BY: every row is one partition, already globally ordered by the sort.
+    if partition_keys.is_empty() {
+        return Ok(vec![sorted.iter().map(|&r| r as usize).collect()]);
+    }
+
+    // Encode the partition keys once so a run boundary is one byte-row comparison by index
+    // (nulls compare equal here, so a null partition key forms one partition — SQL).
+    let pfields: Vec<SortField> = partition_keys
         .iter()
-        .map(|&li| partition[li as usize])
-        .collect())
+        .map(|a| SortField::new(a.data_type().clone()))
+        .collect();
+    let pconv = RowConverter::new(pfields)?;
+    let prows = pconv.convert_columns(partition_keys)?;
+
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::with_capacity(0);
+    for (pos, &ri) in sorted.iter().enumerate() {
+        let ri = ri as usize;
+        if pos > 0 {
+            let prev = sorted[pos - 1] as usize;
+            if prows.row(ri) != prows.row(prev) {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(ri);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
 }
 
 /// `row_number`: 1..n in order, unique per row. Scattered to original positions.
@@ -645,151 +759,10 @@ fn running_str_minmax(
 
 /// Whole-partition aggregate: compute one value per partition and broadcast it to
 /// every row of that partition (same value regardless of order — v1 semantics).
-fn partition_aggregate(
-    func: WindowFn,
-    partitions: &[Vec<usize>],
+pub(crate) fn require(
     values: Option<&ArrayRef>,
-    num_rows: usize,
-) -> Result<ArrayRef, RuntimeError> {
-    debug_assert!(!func.is_ranking());
-    if func == WindowFn::Count {
-        // count: number of non-null input values per partition (Int64).
-        let values = require(values, func)?;
-        let mut out = vec![0i64; num_rows];
-        for part in partitions {
-            let c = part.iter().filter(|&&i| values.is_valid(i)).count() as i64;
-            for &i in part {
-                out[i] = c;
-            }
-        }
-        return Ok(Arc::new(Int64Array::from(out)));
-    }
-
-    let values = require(values, func)?;
-    match values.data_type() {
-        DataType::Int64 => agg_numeric_i64(func, partitions, values, num_rows),
-        DataType::Float64 => agg_numeric_f64(func, partitions, values, num_rows),
-        DataType::Utf8 if matches!(func, WindowFn::Min | WindowFn::Max) => {
-            agg_str_minmax(func, partitions, values, num_rows)
-        }
-        other => Err(RuntimeError::UnsupportedWindow {
-            func: func.name().to_string(),
-            dtype: other.to_string(),
-        }),
-    }
-}
-
-fn agg_numeric_i64(
     func: WindowFn,
-    partitions: &[Vec<usize>],
-    values: &ArrayRef,
-    num_rows: usize,
-) -> Result<ArrayRef, RuntimeError> {
-    let arr = values.as_primitive::<Int64Type>();
-    // sum/min/max stay Int64; avg becomes Float64.
-    if func == WindowFn::Avg {
-        let mut out: Vec<Option<f64>> = vec![None; num_rows];
-        for part in partitions {
-            let (mut sum, mut cnt) = (0f64, 0i64);
-            for &i in part {
-                if arr.is_valid(i) {
-                    sum += arr.value(i) as f64;
-                    cnt += 1;
-                }
-            }
-            let v = (cnt > 0).then(|| sum / cnt as f64);
-            for &i in part {
-                out[i] = v;
-            }
-        }
-        return Ok(Arc::new(Float64Array::from(out)));
-    }
-    let mut out: Vec<Option<i64>> = vec![None; num_rows];
-    for part in partitions {
-        let mut acc: Option<i64> = None;
-        for &i in part {
-            if arr.is_valid(i) {
-                let v = arr.value(i);
-                acc = Some(match (func, acc) {
-                    (_, None) => v,
-                    (WindowFn::Sum, Some(a)) => a + v,
-                    (WindowFn::Min, Some(a)) => a.min(v),
-                    (WindowFn::Max, Some(a)) => a.max(v),
-                    (_, Some(a)) => a,
-                });
-            }
-        }
-        for &i in part {
-            out[i] = acc;
-        }
-    }
-    Ok(Arc::new(Int64Array::from(out)))
-}
-
-fn agg_numeric_f64(
-    func: WindowFn,
-    partitions: &[Vec<usize>],
-    values: &ArrayRef,
-    num_rows: usize,
-) -> Result<ArrayRef, RuntimeError> {
-    let arr = values.as_primitive::<Float64Type>();
-    let mut out: Vec<Option<f64>> = vec![None; num_rows];
-    for part in partitions {
-        let (mut acc, mut cnt): (Option<f64>, i64) = (None, 0);
-        for &i in part {
-            if arr.is_valid(i) {
-                let v = arr.value(i);
-                cnt += 1;
-                acc = Some(match (func, acc) {
-                    (_, None) => v,
-                    (WindowFn::Sum | WindowFn::Avg, Some(a)) => a + v,
-                    (WindowFn::Min, Some(a)) => a.min(v),
-                    (WindowFn::Max, Some(a)) => a.max(v),
-                    (_, Some(a)) => a,
-                });
-            }
-        }
-        let final_v = match func {
-            WindowFn::Avg => acc.map(|s| s / cnt as f64),
-            _ => acc,
-        };
-        for &i in part {
-            out[i] = final_v;
-        }
-    }
-    Ok(Arc::new(Float64Array::from(out)))
-}
-
-fn agg_str_minmax(
-    func: WindowFn,
-    partitions: &[Vec<usize>],
-    values: &ArrayRef,
-    num_rows: usize,
-) -> Result<ArrayRef, RuntimeError> {
-    let arr = values.as_any().downcast_ref::<StringArray>().expect("utf8");
-    let is_min = func == WindowFn::Min;
-    let mut out: Vec<Option<String>> = vec![None; num_rows];
-    for part in partitions {
-        let mut acc: Option<&str> = None;
-        for &i in part {
-            if arr.is_valid(i) {
-                let v = arr.value(i);
-                acc = Some(match acc {
-                    None => v,
-                    Some(a) if (is_min && v < a) || (!is_min && v > a) => v,
-                    Some(a) => a,
-                });
-            }
-        }
-        let owned = acc.map(|s| s.to_string());
-        for &i in part {
-            out[i] = owned.clone();
-        }
-    }
-    Ok(Arc::new(StringArray::from(out)))
-}
-
-fn require(values: Option<&ArrayRef>, func: WindowFn) -> Result<&ArrayRef, RuntimeError> {
+) -> Result<&ArrayRef, RuntimeError> {
     values.ok_or_else(|| RuntimeError::MissingWindowInput {
         func: func.name().to_string(),
     })
@@ -823,6 +796,97 @@ mod tests {
     fn floats(a: &ArrayRef) -> Vec<f64> {
         let x = a.as_any().downcast_ref::<Float64Array>().unwrap();
         (0..x.len()).map(|i| x.value(i)).collect()
+    }
+
+    /// The bucket-parallel path (`window_with` with a low row threshold) must produce
+    /// exactly what the serial kernel does, for ordered windows across many partitions
+    /// — ranking, running aggregate, and a positional (lag) function. Partitioning by
+    /// key and scattering back must not change any per-row result.
+    #[test]
+    fn parallel_matches_serial_ordered() {
+        let n = 600usize;
+        // ~40 partitions (key = i % 40), each ordered by a shuffled value.
+        let part = i64s(&(0..n as i64).map(|i| i % 40).collect::<Vec<_>>());
+        let ord = i64s(
+            &(0..n as i64)
+                .map(|i| (i * 7 + 13) % 100)
+                .collect::<Vec<_>>(),
+        );
+        let vals = i64s(&(0..n as i64).map(|i| i * 2 - 5).collect::<Vec<_>>());
+        let order = [asc(ord)];
+        let cases: Vec<WindowCall> = vec![
+            WindowCall {
+                func: WindowFn::Rank,
+                values: None,
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::RowNumber,
+                values: None,
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::Sum,
+                values: Some(vals.clone()),
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::Lag,
+                values: Some(vals.clone()),
+                offset: 1,
+                frame: None,
+            },
+        ];
+        // Null-aware read (Lag yields nulls at each partition's first row; the raw
+        // value in a null slot is unspecified, so compare validity + value together).
+        let opt_ints = |a: &ArrayRef| -> Vec<Option<i64>> {
+            let x = a.as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..x.len())
+                .map(|i| x.is_valid(i).then(|| x.value(i)))
+                .collect()
+        };
+        for call in cases {
+            let funcs = [call];
+            // threshold 1 forces the parallel path; usize::MAX keeps the serial oracle.
+            let par = window_with(&[part.clone()], &order, &funcs, n, 1).unwrap();
+            let ser = window_serial(&[part.clone()], &order, &funcs, n).unwrap();
+            assert_eq!(
+                opt_ints(&par[0]),
+                opt_ints(&ser[0]),
+                "parallel != serial for {:?}",
+                funcs[0].func
+            );
+        }
+    }
+
+    /// The bucket-parallel path must also match the serial fast path for a *frameless*
+    /// whole-partition aggregate (no ORDER BY) — the case now routed through
+    /// `window_parallel` so a high-cardinality `sum() OVER (PARTITION BY k)` bucket the
+    /// key across cores. Every row of a partition must still get that partition's total.
+    #[test]
+    fn parallel_matches_serial_frameless_aggregate() {
+        let n = 800usize;
+        let part = i64s(&(0..n as i64).map(|i| i % 50).collect::<Vec<_>>());
+        let vals = i64s(&(0..n as i64).map(|i| i * 3 - 7).collect::<Vec<_>>());
+        for func in [WindowFn::Sum, WindowFn::Min, WindowFn::Max, WindowFn::Count] {
+            let funcs = [WindowCall {
+                func,
+                values: Some(vals.clone()),
+                offset: 1,
+                frame: None,
+            }];
+            // threshold 1 forces the parallel bucket path; usize::MAX keeps the oracle.
+            let par = window_with(&[part.clone()], &[], &funcs, n, 1).unwrap();
+            let ser = window_serial(&[part.clone()], &[], &funcs, n).unwrap();
+            assert_eq!(
+                ints(&par[0]),
+                ints(&ser[0]),
+                "parallel != serial for {func:?}"
+            );
+        }
     }
 
     #[test]
