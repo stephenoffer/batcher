@@ -17,10 +17,31 @@ import functools
 import os
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import TYPE_CHECKING
 
 from batcher.config import Config, active_config
 
-__all__ = ["PressureLevel", "PressureMonitor", "total_memory_bytes"]
+if TYPE_CHECKING:
+    from batcher.metadata import MetadataHub
+
+__all__ = [
+    "PressureLevel",
+    "PressureMonitor",
+    "hysteresis_alpha_from_flap",
+    "load_flap_rate",
+    "record_flap_rate",
+    "total_memory_bytes",
+]
+
+# Learned-parameter namespace + key for the measured pressure-level flap rate (fraction
+# of samples that reversed direction). One process-wide figure; the hysteresis adapts to it.
+_FLAP_NS = "carbonite.pressure_flap"
+_FLAP_KEY = "rate"
+# The static default de-escalation weight (kept in sync with `PressureMonitor._EWMA_ALPHA`).
+_DEFAULT_ALPHA = 0.5
+# How strongly a high flap rate stiffens the hysteresis: a fully-flapping history (rate 1.0)
+# cuts the de-escalation weight to `1 - _FLAP_STIFFEN` of the default (a much stickier level).
+_FLAP_STIFFEN = 0.8
 
 
 class PressureLevel(IntEnum):
@@ -155,15 +176,26 @@ class PressureMonitor:
     `MemoryConfig` (default 0.85 / 0.90).
     """
 
-    # Smoothing factor for the de-escalation hysteresis (weight on the newest reading).
-    # 0.5 relaxes the level over a few samples; escalation is never smoothed.
+    # Default smoothing factor for the de-escalation hysteresis (weight on the newest
+    # reading). 0.5 relaxes the level over a few samples; escalation is never smoothed.
     _EWMA_ALPHA = 0.5
 
-    def __init__(self, config: Config | None = None) -> None:
+    def __init__(
+        self, config: Config | None = None, *, hysteresis_alpha: float | None = None
+    ) -> None:
         self._config = config or active_config()
         # Exponentially-weighted history of the used fraction, for the asymmetric
         # hysteresis in `level()`. `None` until the first reading.
         self._ewma: float | None = None
+        # De-escalation smoothing weight. Lower = the level lingers longer on a falling
+        # edge (heavier hysteresis), which the manager sets from a *measured* flap rate:
+        # a channel that has been observed to flap SPILL↔NORMAL gets a stickier level so
+        # its shuffle credit window stops oscillating. Clamped to (0, 1]; `None` keeps the
+        # static default. Purely damps *when* the engine spills/throttles — never a result.
+        if hysteresis_alpha is None:
+            self._alpha = self._EWMA_ALPHA
+        else:
+            self._alpha = min(1.0, max(1e-3, hysteresis_alpha))
 
     def snapshot(self) -> MemorySnapshot:
         """Take a current reading of total/available memory and budget usage."""
@@ -216,7 +248,7 @@ class PressureMonitor:
         raw = self._engine_used_fraction()
         prev = self._ewma if self._ewma is not None else raw
         used = max(raw, prev)  # escalate on raw, de-escalate on the lagging average
-        self._ewma = self._EWMA_ALPHA * raw + (1.0 - self._EWMA_ALPHA) * prev
+        self._ewma = self._alpha * raw + (1.0 - self._alpha) * prev
         if used >= mem.hard_limit:
             return PressureLevel.CRITICAL
         if used >= mem.soft_limit:
@@ -269,3 +301,53 @@ class PressureMonitor:
             proc = _proc_meminfo_available()
             return min(proc, total) if proc is not None else total
         return min(int(psutil.virtual_memory().available), total)
+
+
+def hysteresis_alpha_from_flap(flap_rate: float | None) -> float | None:
+    """The de-escalation smoothing weight implied by a measured `flap_rate`, or `None`.
+
+    `flap_rate` is the fraction of observed pressure samples that reversed direction
+    (measured by Core, persisted via `record_flap_rate`). A quiet history (rate 0, or
+    `None` for a cold store) keeps the static default weight (returns `None` → the
+    monitor's default); a flappy history stiffens it toward `default x (1 - _FLAP_STIFFEN)`
+    so the level lingers on falling edges and the shuffle credit window stops oscillating.
+    Pure: it only damps *when* the engine spills/throttles, never a result.
+    """
+    if flap_rate is None:
+        return None
+    rate = min(1.0, max(0.0, flap_rate))
+    return _DEFAULT_ALPHA * (1.0 - _FLAP_STIFFEN * rate)
+
+
+def load_flap_rate(hub: MetadataHub | None) -> float | None:
+    """The measured pressure-flap rate recorded to `hub`, or `None` (cold / unavailable).
+
+    Best-effort: any read failure yields `None`, so the hysteresis keeps its static
+    default and behavior is unchanged."""
+    if hub is None:
+        return None
+    try:
+        value = hub.get_keyed_param(_FLAP_NS, _FLAP_KEY)
+    except Exception:  # pragma: no cover - metadata must never break a query
+        return None
+    return float(value) if value is not None else None
+
+
+def record_flap_rate(
+    hub: MetadataHub | None, flap_rate: float, config: Config | None = None
+) -> None:
+    """Persist a measured pressure-flap rate, exp-smoothed across runs. Best-effort.
+
+    Core measures how often the pressure level reversed direction over a run and reports
+    it here; the value is smoothed so a single noisy run doesn't jerk the hysteresis. A
+    scheduling signal only — never a result."""
+    if hub is None:
+        return
+    try:
+        rate = min(1.0, max(0.0, flap_rate))
+        alpha = (config or active_config()).optimizer.learning_smoothing_alpha
+        prior = hub.get_keyed_param(_FLAP_NS, _FLAP_KEY)
+        smoothed = rate if prior is None else alpha * rate + (1.0 - alpha) * float(prior)
+        hub.put_keyed_param(_FLAP_NS, _FLAP_KEY, smoothed)
+    except Exception:  # pragma: no cover - metadata must never break a query
+        pass

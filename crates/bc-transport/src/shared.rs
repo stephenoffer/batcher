@@ -18,10 +18,15 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
+use std::ptr::NonNull;
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
+use arrow::buffer::Buffer;
+use arrow::ipc::convert::fb_to_schema;
+use arrow::ipc::reader::{read_footer_length, FileDecoder};
+use arrow::ipc::root_as_footer;
+use arrow::ipc::writer::FileWriter;
 use memmap2::Mmap;
 
 /// The directory same-node workers exchange shm partitions through, or `None` when no
@@ -72,12 +77,22 @@ pub fn publish_shared(addr: &str, ticket: &str, batches: &[RecordBatch]) -> std:
     let path = shm_path(addr, ticket).ok_or_else(|| std::io::Error::other("no shm directory"))?;
     let tmp = path.with_extension("arrow.tmp");
     {
+        // Arrow IPC **file** format (with a footer of per-batch block offsets), 64-byte aligned,
+        // so a same-node reader mmaps it and decodes each block ZERO-COPY — the arrays point
+        // straight into the mmap instead of the reader copying every buffer out (`fetch_shared`).
         let file = File::create(&tmp)?;
-        let mut writer =
-            StreamWriter::try_new(file, &batches[0].schema()).map_err(std::io::Error::other)?;
+        let opts = arrow::ipc::writer::IpcWriteOptions::try_new(
+            64,
+            false,
+            arrow::ipc::MetadataVersion::V5,
+        )
+        .map_err(std::io::Error::other)?;
+        let mut writer = FileWriter::try_new_with_options(file, &batches[0].schema(), opts)
+            .map_err(std::io::Error::other)?;
         for b in batches {
             writer.write(b).map_err(std::io::Error::other)?;
         }
+        writer.finish().map_err(std::io::Error::other)?;
         let mut file = writer.into_inner().map_err(std::io::Error::other)?;
         file.flush()?;
     }
@@ -100,12 +115,57 @@ pub fn fetch_shared(addr: &str, ticket: &str) -> std::io::Result<Option<Vec<Reco
     // SAFETY: the file is published atomically (write-temp-then-rename) and never
     // mutated in place, so the mapping's bytes don't change under us while we read.
     let mmap = unsafe { Mmap::map(&file)? };
-    let reader = StreamReader::try_new(&mmap[..], None).map_err(std::io::Error::other)?;
-    let mut out = Vec::new();
-    for batch in reader {
-        out.push(batch.map_err(std::io::Error::other)?);
+    if mmap.len() < 10 {
+        return Ok(None); // too short to hold an IPC-file trailer — treat as a miss
     }
-    Ok(Some(out))
+    read_mmap_zero_copy(mmap)
+        .map(Some)
+        .map_err(std::io::Error::other)
+}
+
+/// Decode the IPC-file `mmap` into batches whose buffers point INTO the mmap (zero-copy).
+///
+/// The mmap is wrapped as an Arrow [`Buffer`] whose owner is the `Mmap` itself (via `Arc`), so
+/// the mapping stays alive exactly as long as any decoded array references it — the batches can
+/// outlive this call and the file handle safely. Each footer block is decoded in place; a
+/// 64-byte-aligned writer (`publish_shared`) keeps numeric buffers zero-copy (the decoder only
+/// copies a buffer that is mis-aligned for its type, which does not occur here).
+fn read_mmap_zero_copy(mmap: Mmap) -> Result<Vec<RecordBatch>, arrow::error::ArrowError> {
+    let len = mmap.len();
+    let ptr = NonNull::new(mmap.as_ptr() as *mut u8)
+        .ok_or_else(|| arrow::error::ArrowError::IoError("null mmap".into(), null_io()))?;
+    // SAFETY: `ptr`/`len` describe the live mapping; the `Mmap` is moved into the Buffer (as its
+    // allocation owner) and dropped only when the last referencing array is dropped, so the
+    // memory outlives every decoded batch. `Arc::new(mmap)` coerces to `Arc<dyn Allocation>`.
+    let buffer = unsafe { Buffer::from_custom_allocation(ptr, len, Arc::new(mmap)) };
+
+    let trailer_start = len - 10;
+    let footer_len = read_footer_length(buffer[trailer_start..].try_into().unwrap())?;
+    let footer = root_as_footer(&buffer[trailer_start - footer_len..trailer_start])
+        .map_err(|e| arrow::error::ArrowError::IpcError(format!("bad shm footer: {e}")))?;
+    let schema = Arc::new(fb_to_schema(footer.schema().unwrap()));
+    let mut decoder = FileDecoder::new(schema, footer.version());
+    for block in footer.dictionaries().iter().flatten() {
+        let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+        let data = buffer.slice_with_length(block.offset() as usize, block_len);
+        decoder.read_dictionary(block, &data)?;
+    }
+    let mut out = Vec::new();
+    if let Some(rbs) = footer.recordBatches() {
+        for i in 0..rbs.len() {
+            let block = rbs.get(i);
+            let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+            let data = buffer.slice_with_length(block.offset() as usize, block_len);
+            if let Some(b) = decoder.read_record_batch(block, &data)? {
+                out.push(b);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn null_io() -> std::io::Error {
+    std::io::Error::from(std::io::ErrorKind::InvalidData)
 }
 
 /// Remove every shm file a worker published under `addr` (called at plan teardown so a
@@ -120,8 +180,10 @@ pub fn clear_shared(addr: &str) {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, RecordBatch};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{
+        Array, Float64Array, Int64Array, RecordBatch, StringArray, StringDictionaryBuilder,
+    };
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 
     use super::*;
 
@@ -161,5 +223,54 @@ mod tests {
         assert!(fetch_shared(addr, "t").unwrap().is_some());
         clear_shared(addr);
         assert!(fetch_shared(addr, "t").unwrap().is_none());
+    }
+
+    /// The zero-copy decode must reproduce non-numeric layouts exactly: variable-length
+    /// (utf8 offsets + data), validity bitmaps (nulls), and multiple columns — not just the
+    /// single fixed-width buffer the primary round-trip covers. This is the correctness bar
+    /// for enabling shared memory by default.
+    #[test]
+    fn roundtrips_strings_nulls_and_mixed_columns() {
+        let addr = "host_4:55504";
+        let ticket = "9/0/1/2/0";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let s = StringArray::from(vec![Some("alpha"), None, Some(""), Some("δ-wide")]);
+        let n = Int64Array::from(vec![Some(1), Some(-2), None, Some(4)]);
+        let f = Float64Array::from(vec![1.5, 2.5, 3.5, 4.5]);
+        let want =
+            RecordBatch::try_new(schema, vec![Arc::new(s), Arc::new(n), Arc::new(f)]).unwrap();
+
+        publish_shared(addr, ticket, std::slice::from_ref(&want)).unwrap();
+        let got = fetch_shared(addr, ticket).unwrap().expect("published");
+        assert_eq!(got, vec![want]);
+        clear_shared(addr);
+    }
+
+    /// Dictionary-encoded columns exercise the `read_dictionary` footer path (dictionary
+    /// blocks decoded before the record batches) — a distinct code path from plain arrays.
+    #[test]
+    fn roundtrips_dictionary_encoded_column() {
+        let addr = "host_5:55505";
+        let ticket = "9/0/2/2/0";
+        let mut b = StringDictionaryBuilder::<Int32Type>::new();
+        for v in ["red", "green", "red", "blue", "green", "red"] {
+            b.append_value(v);
+        }
+        let dict = b.finish();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            dict.data_type().clone(),
+            false,
+        )]));
+        let want = RecordBatch::try_new(schema, vec![Arc::new(dict)]).unwrap();
+
+        publish_shared(addr, ticket, std::slice::from_ref(&want)).unwrap();
+        let got = fetch_shared(addr, ticket).unwrap().expect("published");
+        assert_eq!(got, vec![want]);
+        clear_shared(addr);
     }
 }

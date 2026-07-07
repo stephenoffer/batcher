@@ -43,14 +43,32 @@ def resolve_distributed(
             return False
         if plan is not None and _plan_has_gpu_stage(plan):
             return True  # GPU work must reach the cluster's accelerators regardless of size
+        from batcher.config import active_config
+
+        min_rows = active_config().distributed.distribute_min_rows
+        # Prefer the *measured* size this exact shape produced on past runs over a first-run
+        # source estimate: a recurring query that proved small stays single-node (dodging the
+        # fan-out tax) even when a source can't cheaply report a row count, and one that proved
+        # large distributes. Cold (or no plan) → the source-estimate path below, unchanged.
+        learned = _learned_size(plan)
+        if learned is not None:
+            return learned >= min_rows
         if sources is None:
             return True
         rows = _estimated_input_rows(sources)
-        from batcher.config import active_config
-
-        return rows is None or rows >= active_config().distributed.distribute_min_rows
+        return rows is None or rows >= min_rows
     except Exception:
         return False
+
+
+def _learned_size(plan: LogicalPlan | None) -> float | None:
+    """The measured output rows learned for `plan`'s signature, or `None` cold. Best-effort."""
+    if plan is None:
+        return None
+    from batcher import core
+    from batcher.api.tuning import learned_output_rows
+
+    return learned_output_rows(core.default_hub(), plan)
 
 
 def _plan_has_gpu_stage(plan: LogicalPlan) -> bool:

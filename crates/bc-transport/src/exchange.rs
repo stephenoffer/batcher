@@ -271,7 +271,26 @@ pub(crate) async fn credit_exchange(
     credits: u32,
     token: Option<&str>,
 ) -> TransportResult<Vec<RecordBatch>> {
-    match credit_exchange_inner(client, ticket, credits, token).await {
+    credit_exchange_shard(client, ticket, credits, token, 0, 1).await
+}
+
+/// As [`credit_exchange`], but fetches only the `shard`-th of `nshards` interleaved
+/// slices of the ticket's batches (batch index `i` where `i % nshards == shard`).
+/// `nshards == 1` fetches the whole bucket and is byte-identical to the un-sharded
+/// path. Used by [`ClientPool::fetch_secured_striped`] to pull one large bucket over
+/// several TCP connections at once (one flow per shard), lifting a single-peer transfer
+/// past the per-flow NIC cap. The union of all shards is the whole bucket; order within
+/// the bucket is not preserved (the reducer re-orders/combines downstream, exactly as it
+/// already must across sources).
+pub(crate) async fn credit_exchange_shard(
+    client: &mut FlightClient,
+    ticket: &ShuffleTicket,
+    credits: u32,
+    token: Option<&str>,
+    shard: u32,
+    nshards: u32,
+) -> TransportResult<Vec<RecordBatch>> {
+    match credit_exchange_inner(client, ticket, credits, token, shard, nshards).await {
         Err(ref e) if is_ticket_not_found(e) => Ok(Vec::new()),
         other => other,
     }
@@ -282,6 +301,8 @@ async fn credit_exchange_inner(
     ticket: &ShuffleTicket,
     credits: u32,
     token: Option<&str>,
+    shard: u32,
+    nshards: u32,
 ) -> TransportResult<Vec<RecordBatch>> {
     let credits = credits.max(1);
     let ticket_str = ticket.to_string();
@@ -292,11 +313,16 @@ async fn credit_exchange_inner(
     let (grant_tx, grant_rx) = tokio::sync::mpsc::channel::<FlightData>(64);
 
     // First message: name the ticket (path[0]) + the auth token (path[1], empty when
-    // unused) and seed the initial credit window.
+    // unused) and seed the initial credit window. path[2] carries the shard selector
+    // `shard/nshards` only when sharding (>1), so an un-sharded fetch is wire-identical.
+    let mut path = vec![ticket_str.clone(), token.unwrap_or("").to_string()];
+    if nshards > 1 {
+        path.push(format!("{shard}/{nshards}"));
+    }
     let first = FlightData {
         flight_descriptor: Some(FlightDescriptor {
             r#type: arrow_flight::flight_descriptor::DescriptorType::Path as i32,
-            path: vec![ticket_str.clone(), token.unwrap_or("").to_string()],
+            path,
             ..Default::default()
         }),
         app_metadata: encode_credits(credits).into(),
@@ -348,16 +374,75 @@ async fn credit_exchange_inner(
     Ok(batches)
 }
 
-/// A consumer-side pool that reuses one gRPC channel per peer address across
-/// fetches, instead of reconnecting every time.
+/// A lazily-grown set of gRPC channels to one peer, striping concurrent fetches
+/// across up to `max` TCP connections.
 ///
-/// tonic channels multiplex many streams over one HTTP/2 connection, so a cached
-/// channel serves a peer's whole shuffle. Reconnect cost is paid once per peer,
-/// not once per partition — the difference between O(edges) and O(nodes)
-/// connection setups, which is what lets the shuffle scale to a large cluster.
+/// One tonic channel is one HTTP/2 connection is one TCP flow. A single flow is
+/// capped below a cloud NIC's line rate, so a peer that a reducer fetches from
+/// concurrently is served over several connections to reach line rate. The pool
+/// grows only under concurrency (each fetch that finds fewer than `max` channels
+/// builds one more), so a cold peer keeps a single connection and a hot peer stripes
+/// — connection cost stays `O(peers)` in the common case, `O(peers x max)` at worst.
+struct PeerChannels {
+    /// The peer's connections; grown lazily up to `max`, then round-robined. A tokio
+    /// mutex (not std) because a channel is *built* under the lock (an `.await`).
+    channels: tokio::sync::Mutex<Vec<tonic::transport::Channel>>,
+    /// Round-robin cursor over the built channels.
+    next: std::sync::atomic::AtomicUsize,
+    max: usize,
+    addr: String,
+}
+
+impl PeerChannels {
+    fn new(addr: String, max: usize) -> Self {
+        Self {
+            channels: tokio::sync::Mutex::new(Vec::new()),
+            next: std::sync::atomic::AtomicUsize::new(0),
+            max: max.max(1),
+            addr,
+        }
+    }
+
+    /// A channel to the peer: build a fresh connection while the pool is below `max`
+    /// (so concurrent fetches each open their own flow), otherwise round-robin an
+    /// existing one. Building holds the async lock, so the pool never overshoots `max`.
+    async fn acquire(&self) -> TransportResult<tonic::transport::Channel> {
+        let mut chans = self.channels.lock().await;
+        if chans.len() < self.max {
+            let channel = FlightClient::build_channel(&self.addr).await?;
+            chans.push(channel.clone());
+            return Ok(channel);
+        }
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % chans.len();
+        Ok(chans[i].clone())
+    }
+
+    /// Drop every connection (the peer restarted, so they are all stale); the next
+    /// `acquire` rebuilds from scratch.
+    async fn reset(&self) {
+        self.channels.lock().await.clear();
+    }
+
+    async fn len(&self) -> usize {
+        self.channels.lock().await.len()
+    }
+}
+
+/// A consumer-side pool that stripes a peer's fetches across a small set of gRPC
+/// connections, reused across fetches instead of reconnecting every time.
+///
+/// tonic channels multiplex many streams over one HTTP/2 connection; a *single* such
+/// connection is one TCP flow and a cloud NIC caps a single flow below line rate, so
+/// each peer gets a lazily-grown [`PeerChannels`] pool (up to
+/// [`connections_per_peer`]) to use the whole link under concurrency. Reconnect cost
+/// is still paid per peer, not per partition — `O(peers)` connections for a cold
+/// shuffle, `O(peers x connections_per_peer)` for a throughput-bound one — which is
+/// what lets the shuffle both scale to a large cluster and saturate the NIC.
+///
+/// [`connections_per_peer`]: crate::connections_per_peer
 #[derive(Default)]
 pub struct ClientPool {
-    channels: dashmap::DashMap<String, tonic::transport::Channel>,
+    peers: dashmap::DashMap<String, Arc<PeerChannels>>,
 }
 
 impl ClientPool {
@@ -366,30 +451,41 @@ impl ClientPool {
         Self::default()
     }
 
-    /// Number of peer addresses with a live cached channel (telemetry/tests).
+    /// Number of peer addresses with a live connection pool (telemetry/tests). Counts
+    /// *peers*, not connections — striping to one peer stays a single entry here.
     pub fn connection_count(&self) -> usize {
-        self.channels.len()
+        self.peers.len()
+    }
+
+    /// Total open connections across all peers (telemetry/tests) — reflects striping.
+    pub async fn channel_count(&self) -> usize {
+        let peers: Vec<_> = self.peers.iter().map(|e| e.value().clone()).collect();
+        let mut total = 0;
+        for p in peers {
+            total += p.len().await;
+        }
+        total
+    }
+
+    fn peer(&self, addr: &str) -> Arc<PeerChannels> {
+        // `entry` briefly holds a shard lock but does no await, so it is safe. A
+        // concurrent first-fetch to the same peer resolves to one shared pool.
+        self.peers
+            .entry(addr.to_string())
+            .or_insert_with(|| Arc::new(PeerChannels::new(addr.to_string(), crate::connections_per_peer())))
+            .clone()
     }
 
     async fn channel(&self, addr: &str) -> TransportResult<tonic::transport::Channel> {
-        if let Some(existing) = self.channels.get(addr) {
-            return Ok(existing.clone());
-        }
-        // Build outside the map lock (connect is async; a DashMap entry guard can't
-        // be held across an await). A concurrent first-fetch to the same peer may
-        // also build one; `or_insert` keeps whichever lands first and drops the
-        // loser, so a peer never ends up with two retained channels (N20).
-        let channel = FlightClient::build_channel(addr).await?;
-        let entry = self.channels.entry(addr.to_string()).or_insert(channel);
-        Ok(entry.clone())
+        self.peer(addr).acquire().await
     }
 
     /// Fetch `ticket` from `addr` over a credit-gated stream on a *pooled* channel.
     ///
-    /// If the cached channel is stale (the peer restarted, so the connection is
-    /// dead), the first attempt fails with a transport/connect error; the channel is
-    /// then evicted and the fetch is retried once on a fresh connection (C49). A
-    /// `NotFound` (empty bucket) is not a connection fault and is returned as-is.
+    /// If the cached connections are stale (the peer restarted), the first attempt
+    /// fails with a transport/connect error; the peer's pool is then reset and the
+    /// fetch is retried once on a fresh connection (C49). A `NotFound` (empty bucket)
+    /// is not a connection fault and is returned as-is.
     pub async fn fetch_with_credits(
         &self,
         addr: &str,
@@ -411,14 +507,47 @@ impl ClientPool {
         let mut client = FlightClient::from_channel(channel);
         match credit_exchange(&mut client, ticket, credits, token).await {
             Err(e) if is_connection_error(&e) => {
-                // Drop the dead channel and redial once.
-                self.channels.remove(addr);
+                // Drop the dead connections and redial once.
+                self.peer(addr).reset().await;
                 let channel = self.channel(addr).await?;
                 let mut client = FlightClient::from_channel(channel);
                 credit_exchange(&mut client, ticket, credits, token).await
             }
             other => other,
         }
+    }
+
+    /// Fetch one bucket from `addr` split across `stripe` interleaved shards fetched
+    /// concurrently, each on its own pooled connection — so a *single* large per-peer
+    /// transfer runs as `stripe` parallel TCP flows and clears the per-flow NIC cap.
+    ///
+    /// This is what makes the striping reach Batcher's real reduce path: it runs one
+    /// Flight endpoint per node, so a reducer pulls each node's whole bucket over one
+    /// stream; sharding turns that one stream into `stripe` flows. `stripe <= 1` is
+    /// exactly [`Self::fetch_secured`]. The per-shard credit window is `credits/stripe`
+    /// (min 1), so the total in-flight memory bound is unchanged. The shards' union is
+    /// the whole bucket; within-bucket order is not preserved (the reducer re-orders or
+    /// commutatively combines downstream, as it already must across sources). A shard
+    /// fault propagates so the gather's recovery layer recomputes the source.
+    pub async fn fetch_secured_striped(
+        &self,
+        addr: &str,
+        ticket: &ShuffleTicket,
+        credits: u32,
+        token: Option<&str>,
+        stripe: u32,
+    ) -> TransportResult<Vec<RecordBatch>> {
+        if stripe <= 1 {
+            return self.fetch_secured(addr, ticket, credits, token).await;
+        }
+        let per_shard = (credits / stripe).max(1);
+        let fetches = (0..stripe).map(|shard| async move {
+            let channel = self.channel(addr).await?;
+            let mut client = FlightClient::from_channel(channel);
+            credit_exchange_shard(&mut client, ticket, per_shard, token, shard, stripe).await
+        });
+        let shards = futures::future::try_join_all(fetches).await?;
+        Ok(shards.into_iter().flatten().collect())
     }
 }
 

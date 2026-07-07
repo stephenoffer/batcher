@@ -12,7 +12,7 @@ compares:
 - **Daft native** — its fast multithreaded local engine on the driver node (16 cores).
 - **batcher single-node** — the same 16-core driver, for the speedup reference.
 
-The head node has 0 schedulable task CPUs (Anyscale reserves it), so Daft-native and
+The head node has 0 schedulable task CPUs (many managed clusters reserve it), so Daft-native and
 batcher-single-node run on the head's 16 physical cores while batcher-distributed uses
 the 8 worker nodes — the whole point: bring 128 CPUs to bear.
 

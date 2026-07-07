@@ -20,6 +20,7 @@ from batcher.io.base import FileSink, FileSource
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.splits import Split
+from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["ORCSink", "ORCSource", "ORCStripeSplit"]
 
@@ -129,6 +130,15 @@ class ORCSource(FileSource):
         with self._fs.open(path) as fh:
             nstripes = orc.ORCFile(fh).nstripes
         return [ORCStripeSplit(path, i) for i in range(nstripes)]
+
+    def statistics(self) -> SourceStatistics | None:
+        """Exact row count from the ORC footers (no data scan)."""
+        from batcher.io.stats import orc_statistics
+
+        try:
+            return orc_statistics(self._fs, self._files())
+        except Exception:
+            return None
 
 
 @SINKS.register("orc")

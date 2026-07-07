@@ -24,8 +24,17 @@ if TYPE_CHECKING:
 __all__ = [
     "global_count_plan",
     "metadata_aggregate_table",
+    "metadata_all_null",
+    "metadata_approx_n_unique",
     "metadata_count",
+    "metadata_empty_table",
+    "metadata_has_nulls",
     "metadata_is_empty",
+    "metadata_learned_quantile",
+    "metadata_max",
+    "metadata_min",
+    "metadata_n_unique",
+    "metadata_null_count",
 ]
 
 
@@ -80,7 +89,14 @@ def metadata_count(
 
     try:
         stats = _source_stats(sources, source_stats)
-        return kyber.answer_count(plan, sources, stats, core.default_hub())
+        hub = core.default_hub()
+        # The general structural count first (whole-relation exact rows); then the
+        # filtered-count shapes it can't make exact (WHERE col IS NULL → null_count,
+        # WHERE col > max → 0, …) answered directly from the child's EXACT column stats.
+        result = kyber.answer_count(plan, sources, stats, hub)
+        if result is not None:
+            return result
+        return kyber.answer_filter_count(plan, sources, stats, hub)
     except Exception:  # the metadata shortcut must never break a runnable query
         return None
 
@@ -95,9 +111,32 @@ def metadata_is_empty(
 
     try:
         stats = _source_stats(sources, source_stats)
-        return kyber.answer_is_empty(plan, sources, stats, core.default_hub())
+        hub = core.default_hub()
+        # Structural emptiness first (EXACT zero rows); then the filtered-emptiness
+        # shapes it can't prove (WHERE col > max, WHERE col = <out-of-range>, …).
+        result = kyber.answer_is_empty(plan, sources, stats, hub)
+        if result is not None:
+            return result
+        return kyber.answer_filter_is_empty(plan, sources, stats, hub)
     except Exception:  # the metadata shortcut must never break a runnable query
         return None
+
+
+def metadata_empty_table(
+    plan: LogicalPlan, sources: list[Source], source_stats: list | None = None
+) -> pa.Table | None:
+    """An empty result table (correct schema, zero rows) when metadata proves the plan
+    empty, else None — a scan-free answer for a contradiction filter, `limit(0)`, an
+    always-false predicate, or an empty-side join.
+
+    Gated on a schema inferable without execution (`available_schema`), so it never
+    triggers a zero-row run; an un-inferable schema returns None and the caller executes
+    (which also yields the empty result).
+    """
+    inferred = plan.available_schema()
+    if inferred is None:
+        return None
+    return inferred.arrow.empty_table() if metadata_is_empty(plan, sources, source_stats) else None
 
 
 # Aggregate functions whose result can *ever* be derived from EXACT source
@@ -108,7 +147,22 @@ def metadata_is_empty(
 # non-derivable is the dominant fixed cost on a small global-aggregate query (e.g.
 # `SELECT sum(x) FROM t`). Conservative: a func in this set is only a *candidate* —
 # `answer_aggregate` stays the EXACT-gated authority on whether it truly answers.
-_METADATA_DERIVABLE_AGGS = frozenset({"count", "count_star", "count_distinct", "min", "max"})
+_METADATA_DERIVABLE_AGGS = frozenset(
+    {
+        "count",
+        "count_star",
+        "count_distinct",
+        "min",
+        "max",
+        # `sum` is derivable when a catalog records an EXACT total; `bool_and`/`bool_or`
+        # are derivable from an EXACT min/max on a boolean column. These are only
+        # *candidates* — `answer_aggregate` stays the EXACT-gated authority and returns
+        # None (→ execute) whenever the child stats can't actually derive them.
+        "sum",
+        "bool_and",
+        "bool_or",
+    }
+)
 
 
 def is_global_aggregate(plan: LogicalPlan) -> bool:
@@ -159,3 +213,108 @@ def metadata_aggregate_table(
     if answer is None:
         return None
     return pa.table({alias: [value] for alias, value in answer.items()})
+
+
+def _scalar_answer(kyber_fn, column: str, plan: LogicalPlan, sources, source_stats):
+    """Run one EXACT-gated scalar column shortcut (`min`/`max`/`null_count`/…), or None.
+
+    Shares the guard/collect/never-raise scaffolding the count and aggregate shortcuts
+    use: it is skipped for a plan the stats machinery can't handle, reuses any
+    already-collected source stats, and swallows every error so a runnable query is
+    never broken by the optimisation. `kyber_fn` is the matching `answer_*` decision.
+    """
+    if not _metadata_answerable(plan, sources):
+        return None
+    from batcher import core
+
+    try:
+        stats = _source_stats(sources, source_stats)
+        return kyber_fn(column, plan, sources, stats, core.default_hub())
+    except Exception:  # the metadata shortcut must never break a runnable query
+        return None
+
+
+def metadata_min(plan: LogicalPlan, sources: list[Source], column: str, source_stats=None):
+    """Exact `min(column)` from metadata, or None to execute."""
+    from batcher.kyber.metadata_answer import answer_min
+
+    return _scalar_answer(answer_min, column, plan, sources, source_stats)
+
+
+def metadata_max(plan: LogicalPlan, sources: list[Source], column: str, source_stats=None):
+    """Exact `max(column)` from metadata, or None to execute."""
+    from batcher.kyber.metadata_answer import answer_max
+
+    return _scalar_answer(answer_max, column, plan, sources, source_stats)
+
+
+def metadata_null_count(
+    plan: LogicalPlan, sources: list[Source], column: str, source_stats=None
+) -> int | None:
+    """Exact null count of `column` from metadata, or None to execute."""
+    from batcher.kyber.metadata_answer import answer_null_count
+
+    return _scalar_answer(answer_null_count, column, plan, sources, source_stats)
+
+
+def metadata_n_unique(
+    plan: LogicalPlan, sources: list[Source], column: str, source_stats=None
+) -> int | None:
+    """Exact distinct count of `column` from an EXACT ndv, or None to execute."""
+    from batcher.kyber.metadata_answer import answer_n_unique
+
+    return _scalar_answer(answer_n_unique, column, plan, sources, source_stats)
+
+
+def metadata_has_nulls(
+    plan: LogicalPlan, sources: list[Source], column: str, source_stats=None
+) -> bool | None:
+    """Whether `column` has any null, from metadata, or None to execute."""
+    from batcher.kyber.metadata_answer import answer_has_nulls
+
+    return _scalar_answer(answer_has_nulls, column, plan, sources, source_stats)
+
+
+def metadata_all_null(
+    plan: LogicalPlan, sources: list[Source], column: str, source_stats=None
+) -> bool | None:
+    """Whether every value of `column` is null, from metadata, or None to execute."""
+    from batcher.kyber.metadata_answer import answer_all_null
+
+    return _scalar_answer(answer_all_null, column, plan, sources, source_stats)
+
+
+def metadata_approx_n_unique(
+    plan: LogicalPlan, sources: list[Source], column: str, source_stats=None
+) -> int | None:
+    """Approximate distinct count of `column` from a sketch ndv, or None to execute.
+
+    Explicitly approximate (accepts a SKETCH-provenance HLL ndv the exact `n_unique`
+    path rejects), so it only ever backs an `approx_*` terminal.
+    """
+    if not _metadata_answerable(plan, sources):
+        return None
+    from batcher import core
+    from batcher.kyber.metadata_answer import approx_count_distinct
+
+    try:
+        stats = _source_stats(sources, source_stats)
+        return approx_count_distinct(column, plan, sources, stats, core.default_hub())
+    except Exception:  # the metadata shortcut must never break a runnable query
+        return None
+
+
+def metadata_learned_quantile(column: str, q: float) -> float | None:
+    """Approximate quantile `q` of `column` from the hub's learned grid, or None.
+
+    A pure hub lookup (no plan estimation): explicitly approximate, backed by the
+    `__column_quantiles__` boundaries a past run measured. None when nothing has been
+    learned for `column`, so the caller streams an exact-ish sketch instead.
+    """
+    from batcher import core
+    from batcher.kyber.metadata_answer import answer_learned_quantile
+
+    try:
+        return answer_learned_quantile(column, q, core.default_hub())
+    except Exception:  # the metadata shortcut must never break a runnable query
+        return None

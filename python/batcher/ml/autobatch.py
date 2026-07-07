@@ -19,7 +19,53 @@ inference pool feeds it measured throughput and (when available) VRAM.
 
 from __future__ import annotations
 
-__all__ = ["ThroughputController"]
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from batcher.metadata import MetadataHub
+
+__all__ = ["ThroughputController", "learned_batch_size", "record_batch_size"]
+
+# Hub namespace the settled per-model throughput-optimal batch size persists under, keyed by a
+# stable model signature. Seeding the hill-climb from it lets a recurring inference job start at
+# (or near) last run's plateau instead of climbing from the cold default every time. The batch
+# size only shards rows, so a learned start is byte-identical to a cold one — only faster to
+# converge.
+_LEARN_NS = "udf_throughput_batch"
+
+
+def learned_batch_size(hub: MetadataHub | None, signature: str | None) -> int | None:
+    """The learned throughput-optimal batch size for a model signature, or `None` when unseen.
+
+    Best-effort read of the persisted plateau; a cold store or hub error yields `None`, so the
+    caller keeps its default initial size."""
+    if hub is None or signature is None:
+        return None
+    try:
+        s = hub.get_keyed_param(_LEARN_NS, signature) or {}
+    except Exception:  # pragma: no cover - learning must never break a query
+        return None
+    v = s.get("size")
+    return int(v) if isinstance(v, (int, float)) and v >= 1 else None
+
+
+def record_batch_size(hub: MetadataHub | None, signature: str | None, size: int) -> None:
+    """Persist a model's settled throughput-optimal batch `size`, exp-smoothed across runs.
+
+    Best-effort — never raises into the inference loop."""
+    if hub is None or signature is None or size < 1:
+        return
+    try:
+        from batcher.config import active_config
+
+        s = hub.get_keyed_param(_LEARN_NS, signature) or {}
+        alpha = float(active_config().optimizer.learning_smoothing_alpha)
+        prior = s.get("size")
+        new = float(size)
+        smoothed = new if prior is None else alpha * new + (1.0 - alpha) * float(prior)
+        hub.put_keyed_param(_LEARN_NS, signature, {"size": smoothed})
+    except Exception:  # pragma: no cover - learning must never break a query
+        return
 
 
 class ThroughputController:
@@ -29,6 +75,13 @@ class ThroughputController:
     current size and returns the next size to try. VRAM is a hard *constraint*
     (over the cap → shrink); throughput is the *objective* (grow while it rises,
     settle at the plateau). Bounds-clamped to ``[min_rows, max_rows]``.
+
+    When a `hub` and a model `signature` are supplied, the climb **warm-starts** from the
+    plateau a prior run learned (`learned_batch_size`) and persists each new best back
+    (`record_batch_size`), so a recurring inference job converges in a few batches instead of
+    re-climbing from the cold default. Both are optional — omitted (the default), the controller
+    is exactly the pure, hub-free hill-climb it was, so a caller that does not opt in is
+    unchanged. The learned seed only changes the *starting* size, never the result.
     """
 
     def __init__(
@@ -41,6 +94,8 @@ class ThroughputController:
         grow: float = 1.5,
         shrink: float = 0.7,
         plateau_ratio: float = 1.02,
+        hub: MetadataHub | None = None,
+        signature: str | None = None,
     ) -> None:
         if min_rows < 1 or max_rows < min_rows:
             raise ValueError("require 1 <= min_rows <= max_rows")
@@ -52,7 +107,12 @@ class ThroughputController:
         self._grow = grow
         self._shrink = shrink
         self._plateau = plateau_ratio
-        self._cur = float(min(max(initial, min_rows), max_rows))
+        self._hub = hub
+        self._signature = signature
+        # Warm-start the climb from the learned plateau when one exists (clamped to bounds).
+        learned = learned_batch_size(hub, signature)
+        seed = learned if learned is not None else initial
+        self._cur = float(min(max(seed, min_rows), max_rows))
         self._best_throughput: float | None = None
         self._best_size: float | None = None
 
@@ -73,6 +133,9 @@ class ThroughputController:
         if improving:
             self._best_throughput = t
             self._best_size = self._cur
+            # Persist the new plateau so the next run warm-starts here (best-effort, no-op
+            # unless a hub + signature was supplied).
+            record_batch_size(self._hub, self._signature, round(self._cur))
             # Predictive VRAM guard: a multiplicative grow scales the batch — and
             # roughly VRAM — by `grow`, which could overshoot the cap in a *single*
             # step before the reactive shrink (above) ever sees it. So only grow when
@@ -89,3 +152,11 @@ class ThroughputController:
     def current(self) -> int:
         """The current batch-size target (clamped, rounded to a whole row count)."""
         return int(min(self._max, max(self._min, round(self._cur))))
+
+    def best_size(self) -> int:
+        """The best (throughput-optimal) size observed so far — the settled plateau.
+
+        Falls back to the current size before any observation. This is the value the learned
+        store persists so a future run can warm-start the climb."""
+        best = self._best_size if self._best_size is not None else self._cur
+        return int(min(self._max, max(self._min, round(best))))

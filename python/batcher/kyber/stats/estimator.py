@@ -22,7 +22,7 @@ from typing import Any
 from batcher.config import CardinalityConfig, active_config
 from batcher.kyber.stats import columns as col_prop
 from batcher.kyber.stats.selectivity import predicate_selectivity
-from batcher.plan.expr_ir import Col
+from batcher.plan.expr_ir import Col, Lit
 from batcher.plan.logical import (
     Aggregate,
     AsofJoin,
@@ -124,9 +124,8 @@ class StatsEstimator:
             return self._estimate_filter(node)
         if isinstance(node, Project):
             child = self.estimate(node.input)
-            return RelStats(
-                child.rows, child.provenance, col_prop.project_columns(node.items, child)
-            )
+            columns = col_prop.project_columns(node.items, child, node.input.available_schema())
+            return RelStats(child.rows, child.provenance, columns)
         if isinstance(node, MapBatches):
             # Row-preserving (map_batches may change rows, but assume 1:1); the
             # opaque UDF means output columns are unknown.
@@ -141,18 +140,23 @@ class StatsEstimator:
             rows = child.rows * max(1, len(node.on))
             return RelStats(rows, child.provenance)
         if isinstance(node, Sample):
-            child = self.estimate(node.input).rows
+            child = self.estimate(node.input)
             # Fixed-count sample yields exactly min(n, input); fraction scales the input.
-            rows = min(child, float(node.n)) if node.n is not None else child * node.fraction
-            return RelStats(rows, Provenance.DEFAULT)
+            rows = (
+                min(child.rows, float(node.n)) if node.n is not None else child.rows * node.fraction
+            )
+            return RelStats(rows, Provenance.DEFAULT, col_prop.sample_columns(child))
         if isinstance(node, Aggregate):
             return self._estimate_aggregate(node)
         if isinstance(node, Sort):
             return self._estimate_sort(node)
         if isinstance(node, Window):
-            # Row-preserving: Window appends columns, never changes the row count.
+            # Row-preserving: Window appends columns, never changes the row count, so
+            # the input columns' stats (EXACT included) carry through untouched.
             child = self.estimate(node.input)
-            return RelStats(child.rows, child.provenance, dict(child.columns), child.sorted_by)
+            return RelStats(
+                child.rows, child.provenance, col_prop.window_columns(child), child.sorted_by
+            )
         if isinstance(node, Limit):
             return self._estimate_limit(node)
         if isinstance(node, Distinct):
@@ -188,6 +192,15 @@ class StatsEstimator:
 
     def _estimate_filter(self, node: Filter) -> RelStats:
         child = self.estimate(node.input)
+        # A constant-boolean predicate is provable without touching a row: `filter(TRUE)`
+        # keeps the child exactly (rows + all column stats, EXACT preserved), and
+        # `filter(FALSE)` is provably empty — an EXACT zero, the canonical empty marker,
+        # letting `count()`/`is_empty()` answer a contradiction-filtered subtree from
+        # metadata even over an otherwise-unknown source.
+        if isinstance(node.predicate, Lit) and isinstance(node.predicate.value, bool):
+            if node.predicate.value:
+                return child
+            return RelStats(0.0, Provenance.EXACT)
         sel = self._selectivity(node)
         # `prov` is LEARNED (measured selectivity) or DEFAULT (Selinger) — never
         # EXACT — so a filtered row count is never EXACT, however exact the child.
@@ -238,10 +251,13 @@ class StatsEstimator:
         if not node.group_keys:
             columns = col_prop.global_aggregate_columns(node, child)
             return RelStats(1.0, Provenance.EXACT, columns)  # global aggregate → one row
+        # A bare-`Col` group key carries its column's EXACT min/max forward as bounds
+        # (grouping selects the distinct values, so the extremes are unchanged).
+        key_cols = col_prop.grouped_aggregate_columns(node, child)
         if not self._exact_first:
             learned_rows = self._learned.get(self._sig(node), {}).get("rows")
             if learned_rows is not None:
-                return RelStats(float(learned_rows), Provenance.LEARNED)
+                return RelStats(float(learned_rows), Provenance.LEARNED, key_cols)
         ndv = self._ndv
         groups = 1.0
         for key in node.group_keys:
@@ -256,9 +272,9 @@ class StatsEstimator:
                 # Keep it a placeholder so it stays unbudgeted (a guess never fails a
                 # real query — the documented admission contract).
                 if child.rows >= self._cfg.unknown_rows:
-                    return RelStats(child.rows, Provenance.DEFAULT)
-                return RelStats(max(1.0, child.rows * 0.1), Provenance.DEFAULT)
-        return RelStats(max(1.0, min(groups, child.rows)), Provenance.LEARNED)
+                    return RelStats(child.rows, Provenance.DEFAULT, key_cols)
+                return RelStats(max(1.0, child.rows * 0.1), Provenance.DEFAULT, key_cols)
+        return RelStats(max(1.0, min(groups, child.rows)), Provenance.LEARNED, key_cols)
 
     def _estimate_distinct(self, node: Distinct) -> RelStats:
         """Dedup count ≈ distinct value combinations — the product of the columns'
@@ -288,12 +304,15 @@ class StatsEstimator:
         # `count()`/`is_empty()` answer 0 from metadata without executing the join.
         if _join_provably_empty(node.join_type, left, right):
             return RelStats(0.0, Provenance.EXACT)
+        # A preserved column's values carry through as downgraded *bounds* (a join
+        # removes/duplicates rows but invents no value); never EXACT.
+        columns = col_prop.join_columns(node, left, right)
         if not self._exact_first:
             learned_rows = self._learned.get(self._sig(node), {}).get("rows")
             if learned_rows is not None:
-                return RelStats(float(learned_rows), Provenance.LEARNED)
+                return RelStats(float(learned_rows), Provenance.LEARNED, columns)
         if node.join_type in {"semi", "anti"}:
-            return RelStats(left.rows, Provenance.DEFAULT)
+            return RelStats(left.rows, Provenance.DEFAULT, columns)
         # PK–FK detection first: if one side's join key is (nearly) unique — its
         # distinct count reaches its row count — then every row of the *other* side
         # matches at most one row here, so under containment the result is ≈ the other
@@ -317,14 +336,14 @@ class StatsEstimator:
         if len(node.left_keys) >= 2 and _composite_pk_fk(
             left.rows, right.rows, left_ndv, right_ndv
         ):
-            return RelStats(max(left.rows, right.rows), Provenance.DEFAULT)
+            return RelStats(max(left.rows, right.rows), Provenance.DEFAULT, columns)
         # Classic equi-join estimate: |L⋈R| ≈ |L|·|R| / max(ndv_lk, ndv_rk) when a
         # single key's distinct count is known. Without it, assume the key is
         # ~unique on the smaller side, so the result ≈ the larger side.
         ndvs = [v for v in (left_ndv, right_ndv) if v is not None and v > 0]
         if ndvs:
-            return RelStats(left.rows * right.rows / max(ndvs), Provenance.DEFAULT)
-        return RelStats(max(left.rows, right.rows), Provenance.DEFAULT)
+            return RelStats(left.rows * right.rows / max(ndvs), Provenance.DEFAULT, columns)
+        return RelStats(max(left.rows, right.rows), Provenance.DEFAULT, columns)
 
     # --- shared metadata accessors ----------------------------------------
     def _stats_for(self, source_id: int) -> SourceStatistics | None:

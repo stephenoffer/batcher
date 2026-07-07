@@ -76,6 +76,28 @@ _CPU_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, int, dict[str, flo
 # `calibration._RECALIBRATE_AFTER`): keeps per-query planning overhead flat.
 _REFRESH_AFTER = 64
 
+# Confidence gate: a family's median is trusted only when its samples are concentrated —
+# a spread (here max−min, the widest, most conservative measure) below this fraction of
+# the median. A bursty/multi-modal family (e.g. a filter that is regex-heavy on some runs
+# and trivial on others) reads as an untrustworthy mean, so we suppress it and keep the
+# static prior rather than sizing `num_cpus` off a number that predicts neither mode.
+_MAX_REL_SPREAD = 1.0
+# Exp-smoothing weight blending a freshly recomputed family median toward the previously
+# learned one, so a settled per-task grant does not jump between refreshes on timing noise.
+_SMOOTH_ALPHA = 0.5
+
+
+def _is_confident(xs: list[float]) -> bool:
+    """Whether utilization samples `xs` are concentrated enough to trust their median.
+
+    A single sample is trivially confident; otherwise the spread must be within
+    ``_MAX_REL_SPREAD`` of the median. Constant samples (spread 0) always pass.
+    """
+    if len(xs) <= 1:
+        return True
+    med = _median(xs)
+    return med <= 0.0 or (max(xs) - min(xs)) <= _MAX_REL_SPREAD * med
+
 
 def class_ir_tag(class_name: str) -> str | None:
     """The native metrics `kind` tag for a `LogicalPlan` class name, if measured."""
@@ -113,12 +135,18 @@ def load_cpu_utilization(hub: MetadataHub | None, config: Config | None = None) 
         and 0 <= version - cached[0] < _REFRESH_AFTER
     ):
         return cached[2]
+    # The previously learned map (if any) is the smoothing anchor: a refreshed median is
+    # blended toward its prior value so a family's grant tracks a stable trend, not noise.
+    prior = cached[2] if cached is not None else {}
     try:
         out: dict[str, float] = {}
         for tag, rows in hub.op_stats_by_kind().items():
             utils = [u for r in rows if (u := float(r.get("cpu_utilization", 0.0) or 0.0)) > 0.0]
-            if len(utils) >= min_samples:
-                out[tag] = _median(utils)
+            # Confidence gate: enough samples AND concentrated enough to trust the median.
+            if len(utils) >= min_samples and _is_confident(utils):
+                med = _median(utils)
+                p = prior.get(tag)
+                out[tag] = med if p is None else _SMOOTH_ALPHA * med + (1.0 - _SMOOTH_ALPHA) * p
     except Exception:  # pragma: no cover - planning must never break on bad feedback
         out = {}
     _CPU_CACHE[hub] = (version, min_samples, out)

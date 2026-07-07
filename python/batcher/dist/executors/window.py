@@ -14,7 +14,6 @@ breaker-free single source; anything else falls back to single-node.
 from __future__ import annotations
 
 import json
-import tempfile
 
 import pyarrow as pa
 
@@ -53,7 +52,9 @@ def _distributed_window(
     win_json = json.dumps(win_ir)
     n_reducers = shuffle_partitions(workers)
 
-    work_dir = tempfile.mkdtemp(prefix="batcher_winshuffle_")
+    from batcher.dist.shuffle_io import distributed_work_dir
+
+    work_dir = distributed_work_dir("batcher_winshuffle_")
     try:
         partitions = _partition_source(sources[source_id], workers, work_dir)
         pol = speculation_policy()

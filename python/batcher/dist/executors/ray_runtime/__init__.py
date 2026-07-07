@@ -29,15 +29,20 @@ from .policies import (
     speculation_policy,
 )
 from .scaling import (
+    alive_node_count,
+    await_autoscale,
     clamp_workers,
     cluster_topology,
+    node_class_selector,
     release_autoscale,
     request_autoscale,
     shuffle_partitions,
+    topology_scope,
 )
 from .scheduling import (
     create_worker_placement,
     current_envelope,
+    fleet_actor_options,
     placement_actor_options,
     release_placement,
     reset_scheduling_envelope,
@@ -51,6 +56,8 @@ __all__ = [
     "_single_node",
     "_wrap_tasks",
     "actor_fault_options",
+    "alive_node_count",
+    "await_autoscale",
     "clamp_workers",
     "cluster_topology",
     "create_worker_placement",
@@ -58,7 +65,9 @@ __all__ = [
     "draining_workers",
     "engine_config_json",
     "fault_options",
+    "fleet_actor_options",
     "gather_map_results",
+    "node_class_selector",
     "placement_actor_options",
     "recovery_policy",
     "release_autoscale",
@@ -72,4 +81,5 @@ __all__ = [
     "skew_join_salt",
     "speculation_policy",
     "task_options",
+    "topology_scope",
 ]

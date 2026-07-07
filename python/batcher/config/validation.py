@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import ConfigError
-from batcher.config.profiles import RESILIENCE_PROFILES
+from batcher.config.profiles import AUTOSCALE_WAIT_AUTO, RESILIENCE_PROFILES
 
 if TYPE_CHECKING:
     from batcher.config.config import Config
@@ -97,12 +97,17 @@ def validate_config(cfg: Config) -> None:
         f"distributed.placement_timeout_s must be positive, got {d.placement_timeout_s}",
     )
     _check(
-        d.autoscale_wait_s >= 0,
-        f"distributed.autoscale_wait_s must be >= 0, got {d.autoscale_wait_s}",
+        d.autoscale_wait_s >= 0 or d.autoscale_wait_s == AUTOSCALE_WAIT_AUTO,
+        f"distributed.autoscale_wait_s must be >= 0 (or {AUTOSCALE_WAIT_AUTO} for auto), "
+        f"got {d.autoscale_wait_s}",
     )
     _check(
         d.autoscale_poll_s > 0,
         f"distributed.autoscale_poll_s must be positive, got {d.autoscale_poll_s}",
+    )
+    _check(
+        d.autoscale_stall_s >= 0,
+        f"distributed.autoscale_stall_s must be >= 0, got {d.autoscale_stall_s}",
     )
     _check(
         d.fleet_max_attempts >= 1,
@@ -230,6 +235,36 @@ def validate_config(cfg: Config) -> None:
         d.object_store_memory_bytes is None or d.object_store_memory_bytes > 0,
         f"distributed.object_store_memory_bytes must be positive or None, "
         f"got {d.object_store_memory_bytes}",
+    )
+    _check(
+        d.max_pending_tasks >= 0,
+        f"distributed.max_pending_tasks must be >= 0 (0 = derive), got {d.max_pending_tasks}",
+    )
+    _check(
+        d.pending_window_factor >= 1,
+        f"distributed.pending_window_factor must be >= 1, got {d.pending_window_factor}",
+    )
+    _check(
+        d.map_spread in {"auto", "always", "never"},
+        f"distributed.map_spread must be one of {{'auto', 'always', 'never'}}, "
+        f"got {d.map_spread!r}",
+    )
+    _check(
+        d.runtime_bloom_join in (True, False, "auto"),
+        "distributed.runtime_bloom_join must be True, False, or 'auto', "
+        f"got {d.runtime_bloom_join!r}",
+    )
+    _check(
+        d.map_spread_node_cap >= 1,
+        f"distributed.map_spread_node_cap must be >= 1, got {d.map_spread_node_cap}",
+    )
+    _check(
+        d.map_spread_pack_share > 0,
+        f"distributed.map_spread_pack_share must be positive, got {d.map_spread_pack_share}",
+    )
+    _check(
+        d.map_inflight_depth >= 1,
+        f"distributed.map_inflight_depth must be >= 1, got {d.map_inflight_depth}",
     )
 
     # Optimizer — task sizing, join-planning thresholds, learning, cardinality.

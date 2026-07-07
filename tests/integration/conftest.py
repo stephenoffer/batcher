@@ -1,6 +1,6 @@
 """Shared setup for the distributed integration tests.
 
-Bringing up Ray for a test has to survive a *managed* environment (Anyscale,
+Bringing up Ray for a test has to survive a *managed* environment (some platforms,
 Kubernetes) that exports a runtime-env hook pointing at a plugin module absent
 from this process (e.g. ``cgroup_runtime_plugin``), which makes a bare
 ``ray.init`` raise ``ModuleNotFoundError`` before any test runs — and that

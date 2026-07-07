@@ -408,6 +408,26 @@ impl FlightShuffleServer {
     }
 }
 
+impl Drop for FlightShuffleServer {
+    /// Retire published partitions when the Python object is collected.
+    ///
+    /// A published batch is a zero-copy view of a pyarrow array whose release callback
+    /// needs the GIL. The store is shared (via `Arc`) with the background serve task, so
+    /// after this object is gone the task still holds the batches and only frees them when
+    /// the runtime reaps the aborted task — on a tokio worker thread. If that happens after
+    /// the interpreter has finalized, acquiring the GIL turns into a thread-exit that
+    /// unwinds through Rust and aborts the process (`std::terminate`). pyo3 runs this drop
+    /// under the GIL, so clearing the store here releases the pyarrow buffers now; the
+    /// serve task's leftover `Arc` then drops an empty store, touching no Python state.
+    fn drop(&mut self) {
+        // Guard against the (not-expected) case of being dropped on a runtime thread, where
+        // `block_on` would panic; skipping is no worse than the pre-fix behavior.
+        if tokio::runtime::Handle::try_current().is_err() {
+            shared_runtime().block_on(self.exchange.clear());
+        }
+    }
+}
+
 /// Fetch a shuffle partition from a remote `FlightShuffleServer` over a
 /// credit-bounded `DoExchange` stream (bypassing any object store).
 ///
@@ -430,15 +450,30 @@ fn flight_fetch(
     Ok(batches.into_iter().map(PyArrowType).collect())
 }
 
-/// Set the process-wide Flight transport timeouts from the control plane.
+/// Set the process-wide Flight transport tunables from the control plane.
 ///
 /// `idle_timeout_ms` bounds the gap between batches before a peer is treated as
 /// dead (`0` keeps the current value); `keepalive_ms` is the HTTP/2 keepalive ping
-/// interval (`0` off). Called once per worker process when its Flight server starts.
+/// interval (`0` off); `connections_per_peer` bounds how many TCP connections a
+/// consumer stripes a peer's fetches across (`0` keeps the current value) — raising it
+/// past a single flow is what lets a cross-node fetch reach a cloud NIC's line rate
+/// instead of the per-flow cap; `compression` is the shuffle wire codec (0 none / 1 lz4
+/// / 2 zstd, `None` keeps the current value) — moving fewer bytes over a NIC-bound link
+/// lifts effective throughput past line rate for the compressible data a real shuffle
+/// carries. Called once per worker process when its Flight server starts.
 #[pyfunction]
-#[pyo3(signature = (idle_timeout_ms, keepalive_ms=0))]
-fn set_flight_transport_config(idle_timeout_ms: u64, keepalive_ms: u64) {
+#[pyo3(signature = (idle_timeout_ms, keepalive_ms=0, connections_per_peer=0, compression=None))]
+fn set_flight_transport_config(
+    idle_timeout_ms: u64,
+    keepalive_ms: u64,
+    connections_per_peer: u64,
+    compression: Option<u64>,
+) {
     bc_transport::set_transport_timeouts(idle_timeout_ms, keepalive_ms);
+    bc_transport::set_connections_per_peer(connections_per_peer);
+    if let Some(code) = compression {
+        bc_transport::set_compression(code);
+    }
 }
 
 /// Whether a same-node shared-memory transfer directory is usable on this host (so the

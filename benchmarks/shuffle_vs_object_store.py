@@ -110,7 +110,13 @@ def main() -> None:
                 best_t, best_out, extra = t, out, rest
         return best_t, best_out, extra
 
-    ray.init(num_cpus=4, include_dashboard=False, logging_level="ERROR", ignore_reinit_error=True)
+    ray.init(
+        num_cpus=4,
+        include_dashboard=False,
+        logging_level="ERROR",
+        ignore_reinit_error=True,
+        runtime_env={"pip": None},  # drop the workspace's unresolvable inherited pip env
+    )
     try:
         ray_t, _, _ = best_of(lambda p: (*_bench_ray_object_store(p), None))
         net_t, _, net_rest = best_of(_bench_carbonite_network)

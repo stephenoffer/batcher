@@ -111,6 +111,28 @@ pub use ticket::ShuffleTicket;
 /// exchange when the caller does not specify one.
 pub const DEFAULT_CREDITS: u32 = 4;
 
+/// HTTP/2 per-stream receive window for a bulk Arrow transfer.
+///
+/// tonic/hyper default this to **64 KiB**, which is the classic gRPC bulk-throughput
+/// cliff: a single stream can only have `window` bytes outstanding per round-trip, so
+/// a 1 MiB shuffle morsel needs ~16 flow-control round-trips just to cross the wire —
+/// on a cross-node link that collapses throughput to `window / RTT`. Sizing the stream
+/// window well above the morsel (and the credit window's bytes) lets a whole batch — and
+/// several batches ahead of it — stream without stalling on window updates. The app-level
+/// **credit** governor (not this window) is what bounds resident batches, so enlarging the
+/// transport window changes throughput, not the memory bound.
+pub const H2_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// HTTP/2 whole-connection receive window.
+///
+/// A pooled [`FlightClient`] multiplexes every concurrent fetch to a peer over a single
+/// HTTP/2 connection, so the *connection* window is shared across all in-flight streams;
+/// at the 64 KiB default it throttles the entire fan-out regardless of per-stream tuning.
+/// Sized to hold several full-window streams at once (`>= fan_in x` [`H2_STREAM_WINDOW`]
+/// in the common case) so the aggregate reduce-side gather stays wire-bound, not
+/// window-bound.
+pub const H2_CONNECTION_WINDOW: u32 = 128 * 1024 * 1024;
+
 /// Errors surfaced by the transport's client/server helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -155,6 +177,15 @@ mod tunables {
     /// HTTP/2 keepalive ping interval (ms); `0` = off (tonic default). Detects a
     /// silently-dropped peer connection faster than the idle timeout alone.
     static KEEPALIVE_MS: AtomicU64 = AtomicU64::new(0);
+    /// Max TCP connections a pooled consumer opens to one peer. A single HTTP/2
+    /// connection is one TCP flow, and a cloud NIC caps a *single* flow well below
+    /// line rate (e.g. AWS ~5 Gbps of a 10 Gbps NIC), so funneling every fetch to a
+    /// peer through one connection leaves half the link idle. Striping concurrent
+    /// fetches across a few connections lifts aggregate throughput to line rate. The
+    /// pool grows lazily to this bound only when a peer actually sees concurrent
+    /// fetches, so a cold/rarely-hit peer still costs one connection. Default 4 (two
+    /// saturate a 10 Gbps NIC; four gives headroom for 25 Gbps instances).
+    static CONNECTIONS_PER_PEER: AtomicU64 = AtomicU64::new(4);
 
     /// Set the process-wide transport timeouts. `idle_ms == 0` keeps the current
     /// idle timeout; `keepalive_ms == 0` disables keepalive.
@@ -163,6 +194,47 @@ mod tunables {
             FETCH_IDLE_TIMEOUT_MS.store(idle_ms, Ordering::Relaxed);
         }
         KEEPALIVE_MS.store(keepalive_ms, Ordering::Relaxed);
+    }
+
+    /// Set the per-peer connection bound (see [`CONNECTIONS_PER_PEER`]). `0` keeps the
+    /// current value; clamped to at least 1 on read. Settable once per worker process
+    /// from the control plane (Carbonite), like the timeouts.
+    pub fn set_connections_per_peer(n: u64) {
+        if n > 0 {
+            CONNECTIONS_PER_PEER.store(n, Ordering::Relaxed);
+        }
+    }
+
+    /// The current per-peer connection bound (always >= 1).
+    pub fn connections_per_peer() -> usize {
+        CONNECTIONS_PER_PEER.load(Ordering::Relaxed).max(1) as usize
+    }
+
+    /// Wire compression codec for shuffle batches, as a code: 0 = none, 1 = LZ4-frame,
+    /// 2 = Zstd. The producer compresses each batch's Arrow buffers before they cross
+    /// the wire; the consumer auto-decompresses (the codec is carried in the IPC message
+    /// metadata). A cross-node fetch is NIC-bound at ~line rate, so moving *fewer* bytes
+    /// is the only way past that ceiling — and real shuffle data (sorted runs, repeated
+    /// group keys, dictionary strings, nulls) compresses several-fold, unlike the object
+    /// store's uncompressed blocks. Default LZ4-frame: ~GB/s/core, so it keeps up with the
+    /// link and gives up fast on incompressible data (near-free there).
+    static COMPRESSION: AtomicU64 = AtomicU64::new(1);
+
+    /// Set the shuffle wire-compression codec (0 none / 1 lz4 / 2 zstd). Values outside
+    /// that range are ignored (keep current). Settable per worker from Carbonite.
+    pub fn set_compression(code: u64) {
+        if code <= 2 {
+            COMPRESSION.store(code, Ordering::Relaxed);
+        }
+    }
+
+    /// The current compression codec for the Flight encoder, or `None` (no compression).
+    pub fn compression() -> Option<arrow::ipc::CompressionType> {
+        match COMPRESSION.load(Ordering::Relaxed) {
+            1 => Some(arrow::ipc::CompressionType::LZ4_FRAME),
+            2 => Some(arrow::ipc::CompressionType::ZSTD),
+            _ => None,
+        }
     }
 
     /// The current fetch idle timeout.
@@ -179,7 +251,10 @@ mod tunables {
     }
 }
 
-pub use tunables::{fetch_idle_timeout, keepalive, set_transport_timeouts};
+pub use tunables::{
+    compression, connections_per_peer, fetch_idle_timeout, keepalive, set_compression,
+    set_connections_per_peer, set_transport_timeouts,
+};
 
 impl From<tonic::Status> for TransportError {
     fn from(status: tonic::Status) -> Self {
@@ -237,7 +312,7 @@ impl FlightServer {
             store: self.store,
             token: self.token,
         });
-        Server::builder()
+        tuned_server()
             .add_service(svc)
             .serve(addr)
             .await
@@ -276,7 +351,7 @@ impl FlightServer {
             token: self.token,
         });
         let handle = tokio::spawn(async move {
-            Server::builder()
+            tuned_server()
                 .add_service(svc)
                 .serve_with_incoming(incoming)
                 .await
@@ -284,6 +359,20 @@ impl FlightServer {
 
         Ok((local_addr, ServerHandle { task: handle }))
     }
+}
+
+/// A tonic [`Server`] builder with the bulk-transfer HTTP/2 windows applied.
+///
+/// The producer streams shuffle data client-bound, so the *consumer's* receive window
+/// (set on the channel in [`FlightClient::build_channel`]) governs the data direction;
+/// these server-side windows govern the consumer→producer control stream and any
+/// server-received data, and keep both peers off the 64 KiB default so no direction is
+/// silently window-throttled. `tcp_nodelay` avoids Nagle-delaying credit acks.
+fn tuned_server() -> Server {
+    Server::builder()
+        .initial_stream_window_size(Some(H2_STREAM_WINDOW))
+        .initial_connection_window_size(Some(H2_CONNECTION_WINDOW))
+        .tcp_nodelay(true)
 }
 
 /// Keeps a background Flight server alive; dropping it aborts the server task.
@@ -330,7 +419,15 @@ impl FlightClient {
             format!("http://{addr}")
         };
         let mut endpoint = Channel::from_shared(uri.into_bytes())
-            .map_err(|e| TransportError::Io(format!("invalid uri: {e}")))?;
+            .map_err(|e| TransportError::Io(format!("invalid uri: {e}")))?
+            // Bulk Arrow transfer: enlarge the HTTP/2 receive windows off their 64 KiB
+            // default so a 1 MiB morsel streams without ~16 flow-control round-trips, and a
+            // pooled channel's multiplexed fan-out isn't throttled by the connection window
+            // (the primary cross-node throughput fix). `tcp_nodelay` keeps the tiny credit
+            // grants from being Nagle-delayed. Resident batches stay bounded by credits.
+            .initial_stream_window_size(Some(crate::H2_STREAM_WINDOW))
+            .initial_connection_window_size(Some(crate::H2_CONNECTION_WINDOW))
+            .tcp_nodelay(true);
         // Keepalive pings detect a silently-dropped peer connection (a crashed node
         // whose TCP never RSTs) faster than the between-batch idle timeout, so the
         // fetch surfaces a retryable fault promptly instead of hanging a full window.
@@ -678,26 +775,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_pool_reuses_one_channel_per_peer() {
-        // Two fetches to the same peer must share a single cached gRPC channel —
-        // the property that turns O(edges) reconnects into O(peers) at scale.
+    async fn client_pool_pools_per_peer_and_stripes_bounded() {
+        // Fetches to one peer share a single per-peer pool (one entry, so O(edges)
+        // reconnects collapse to O(peers) at scale), and the pool stripes across at
+        // most `connections_per_peer` TCP connections to use the whole NIC — never
+        // an unbounded connection per partition.
+        crate::set_connections_per_peer(4);
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
-        let t1 = ShuffleTicket::new(8, 0, 0, 0, 0);
-        let t2 = ShuffleTicket::new(8, 0, 0, 1, 0);
-        producer.publish(&t1, seq_batches(0, 4)).await;
-        producer.publish(&t2, seq_batches(100, 4)).await;
+        let tickets: Vec<_> = (0..6).map(|d| ShuffleTicket::new(8, 0, 0, d, 0)).collect();
+        for (d, t) in tickets.iter().enumerate() {
+            producer.publish(t, seq_batches(d as i64 * 100, 4)).await;
+        }
 
         let pool = ClientPool::new();
-        let b1 = pool.fetch_with_credits(&addr, &t1, 2).await.unwrap();
-        let b2 = pool.fetch_with_credits(&addr, &t2, 2).await.unwrap();
-        assert_eq!(b1.len(), 4);
-        assert_eq!(b2.len(), 4);
+        for (d, t) in tickets.iter().enumerate() {
+            // Data integrity across striped connections: whichever connection carries a
+            // fetch, the bytes must be exactly what was published for that ticket.
+            let got = pool.fetch_with_credits(&addr, t, 2).await.unwrap();
+            assert_eq!(got.len(), 4, "every batch delivered");
+            for (i, b) in got.iter().enumerate() {
+                let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                assert_eq!(col.value(0), d as i64 * 100 + i as i64, "value misrouted");
+            }
+        }
+        assert_eq!(pool.connection_count(), 1, "one peer => one pool entry");
         assert_eq!(
-            pool.connection_count(),
-            1,
-            "both fetches reused one channel"
+            pool.channel_count().await,
+            4,
+            "six fetches stripe across at most connections_per_peer (4) connections",
         );
+    }
+
+    #[tokio::test]
+    async fn striped_fetch_reconstructs_whole_bucket_over_many_connections() {
+        // One big bucket fetched over `stripe` shards (one TCP connection each) must
+        // return EVERY batch exactly once — the union of interleaved shards is the whole
+        // bucket, regardless of order. This is what makes striping help Batcher's
+        // one-endpoint-per-node reduce: a single per-peer bucket streams as several flows.
+        const N: i64 = 21; // not a multiple of the stripe, so shards are uneven
+        const STRIPE: u32 = 4;
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(9, 0, 0, 0, 0);
+        producer.publish(&ticket, seq_batches(0, N)).await;
+
+        let pool = ClientPool::new();
+        let got = pool
+            .fetch_secured_striped(&addr, &ticket, 8, None, STRIPE)
+            .await
+            .unwrap();
+
+        // Every value 0..N present exactly once (order not guaranteed across shards).
+        let mut vals: Vec<i64> = got
+            .iter()
+            .map(|b| b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0))
+            .collect();
+        vals.sort_unstable();
+        assert_eq!(vals, (0..N).collect::<Vec<_>>(), "union of shards == whole bucket");
+        // The shards opened `STRIPE` parallel connections to the one peer.
+        assert_eq!(pool.channel_count().await, STRIPE as usize, "one flow per shard");
+
+        // stripe <= 1 is exactly the un-sharded fetch (whole bucket, in order).
+        let whole = pool
+            .fetch_secured_striped(&addr, &ticket, 8, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(whole.len() as i64, N);
+    }
+
+    #[tokio::test]
+    async fn every_compression_codec_roundtrips_exactly() {
+        // Each wire codec (none / lz4 / zstd) must deliver batches byte-for-byte equal to
+        // what was published — the consumer auto-decompresses from the IPC metadata.
+        const N: i64 = 30;
+        for code in [0u64, 1, 2] {
+            crate::set_compression(code);
+            let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+            let addr = producer.addr().to_string();
+            let ticket = ShuffleTicket::new(11, 0, 0, code as u32, 0);
+            producer.publish(&ticket, seq_batches(0, N)).await;
+
+            let got = ShuffleExchange::fetch_with_credits(&addr, &ticket, 4)
+                .await
+                .unwrap();
+            assert_eq!(got.len() as i64, N, "codec {code}: batch count");
+            for (i, b) in got.iter().enumerate() {
+                let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                assert_eq!(col.value(0), i as i64, "codec {code}: value at {i}");
+            }
+        }
+        crate::set_compression(1); // restore the default for other tests
     }
 
     #[tokio::test]

@@ -2,8 +2,8 @@
 
 Scheduling data operators on the head (GCS / dashboard / job supervisor) causes contention
 and instability — the guides' "set num_cpus=0 on the head" rule. Batcher excludes the head
-by its `node:__internal_head__` marker so it is correct on ANY cluster type, not only an
-Anyscale cluster that already gives the head 0 CPU. A single-node cluster keeps the head.
+by its `node:__internal_head__` marker so it is correct on ANY cluster type, not only a
+managed cluster that already gives the head 0 CPU. A single-node cluster keeps the head.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def test_head_with_cores_is_excluded(monkeypatch):
     assert ex._cluster_fill_workers() == (3, 16.0)
 
 
-def test_anyscale_zero_cpu_head_already_excluded(monkeypatch):
+def test_zero_cpu_head_already_excluded(monkeypatch):
     _nodes(monkeypatch, [(0.0, True), (16.0, False), (16.0, False)])
     assert ex._worker_node_cpus() == [16.0, 16.0]
     assert ex._cluster_fill_workers() == (2, 16.0)

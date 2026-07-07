@@ -19,6 +19,7 @@ import json
 import pyarrow as pa
 
 from batcher.carbonite import ResourceManager
+from batcher.dist.adaptive_sizing import aggregate_reducer_count, record_aggregate_cardinality
 from batcher.dist.executor import (
     _apply_above,
     _empty_agg_table,
@@ -119,7 +120,7 @@ def execute_aggregate_flight(
     # worker count to the fleet's, so every stage shuffles over the same actors);
     # otherwise spawn one we tear down. `owns` gates teardown.
     actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
-    n_reducers = 1 if n_keys == 0 else shuffle_partitions(workers)
+    n_reducers = 1 if n_keys == 0 else aggregate_reducer_count(agg, shuffle_partitions(workers))
 
     keep_actors = False  # set when a FlightMaterializedSource takes ownership of them
     try:
@@ -211,6 +212,7 @@ def execute_aggregate_flight(
             release_placement(pg)
 
     table = pa.Table.from_batches(batches) if batches else _empty_agg_table(agg)
+    record_aggregate_cardinality(agg, table.num_rows)
     return table if not above else _apply_above(above, table)
 
 

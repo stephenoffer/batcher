@@ -194,7 +194,16 @@ class FileSource(ABC):
             yield normalize_batch(b, target)
 
     def row_count(self) -> int | None:
-        counts = [self._file_row_count(f) for f in self._files()]
+        files = self._files()
+        # Each `_file_row_count` reads a footer (a ~80ms object-store round trip for
+        # Parquet, cached after the first read); over a many-file dataset the serial loop
+        # dominates a distributed query's driver phase, so read them concurrently on a
+        # small pool — exactly as `splits()` does. A single file skips the pool.
+        if len(files) <= 1:
+            counts = [self._file_row_count(f) for f in files]
+        else:
+            with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:
+                counts = list(pool.map(self._file_row_count, files))
         return None if any(c is None for c in counts) else sum(counts)  # type: ignore[misc]
 
     def identity(self) -> str:

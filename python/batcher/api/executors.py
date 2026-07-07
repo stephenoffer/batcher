@@ -171,6 +171,7 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
         gpu_vram_gb,
         load_gpu_utilization,
         recommend_gpu_fraction,
+        recommend_inflight_depth,
         recommend_num_gpus,
     )
     from batcher.plan.resource import SchedulingEnvelope
@@ -191,7 +192,19 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
     vram = gpu_vram_gb() if model_gb > 0 and requested_gpus >= 1.0 else None
     if vram:
         base_gpus = recommend_gpu_fraction(model_gb, vram)
-    num_gpus = recommend_num_gpus(load_gpu_utilization(hub, gpu_feedback_key(plan)), base_gpus)
+    util = load_gpu_utilization(hub, gpu_feedback_key(plan))
+    num_gpus = recommend_num_gpus(util, base_gpus)
+
+    # Per-actor submit-ahead depth: raise it from a prior low-utilization measurement so a
+    # starved GPU is kept fed across the dispatch/gather round-trip (the ml layer owns the
+    # heuristic; `dist` only turns the number into pipeline slots). Adaptation only ever
+    # increases the configured floor, so a first run is unchanged.
+    dc = cfg.distributed
+    inflight_depth = (
+        recommend_inflight_depth(util, dc.map_inflight_depth)
+        if dc.map_inflight_adaptive
+        else max(1, dc.map_inflight_depth)
+    )
 
     n_tasks = num_workers or (cfg.execution.parallelism or os.cpu_count() or 4)
     # A CPU-only map stage (no GPU) is usually IO/decode-bound preprocessing — request
@@ -205,6 +218,7 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
         n_tasks=max(1, n_tasks),
         credits=cfg.flow_control.default_credits,
         accelerator_type=accelerator_type,
+        inflight_depth=inflight_depth,
     )
 
 

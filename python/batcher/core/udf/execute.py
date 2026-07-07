@@ -13,29 +13,19 @@ Arrow the whole way (zero-copy from the engine into the UDF and back).
 from __future__ import annotations
 
 import dataclasses
-import pickle
-import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pyarrow as pa
 
 from batcher.config import active_config
+from batcher.core.udf import strategy as strat
 from batcher.io.schema.evolution import reconcile_batches
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 from batcher.plan.schema import SchemaRef
 from batcher.plan.visitor import children, with_children
 
 __all__ = ["build_udf_callable", "execute_with_udfs", "has_map_batches", "prebuild_factories"]
-
-# When a `map_batches` `fn` runs across processes with no explicit `batch_size`, split
-# the input into ~this many coarse batches per worker: enough for load balance, coarse
-# enough that the per-batch pickle/IPC to the child is amortized (morsel-sized batches
-# make that transfer dominate — measured an order of magnitude slower).
-_PROC_BATCHES_PER_WORKER = 3
-# The smallest batch worth handing a process worker: below this the pickle/IPC per batch
-# outweighs the work, so tinier batches are coalesced up to at least this many rows.
-_PROC_MIN_BATCH_ROWS = 65_536
 
 
 def prebuild_factories(node: LogicalPlan) -> LogicalPlan:
@@ -96,7 +86,7 @@ def execute_with_udfs(plan: LogicalPlan, sources: list) -> list[pa.RecordBatch]:
     contract; only the scheduling overlaps). Non-linear plans (joins/unions between maps)
     and the GPU-autobatch / multiprocessing strategies keep the materializing path.
     """
-    from batcher.core.udf_stream import linear_map_chain, stream_eligible, stream_linear_chain
+    from batcher.core.udf.stream import linear_map_chain, stream_eligible, stream_linear_chain
 
     chain = linear_map_chain(plan)
     if chain is not None and stream_eligible(chain[1]):
@@ -184,6 +174,50 @@ def _to_json(op: LogicalPlan) -> str:
     return json.dumps(op.to_ir())
 
 
+def _rechunk(batches: list[pa.RecordBatch], target: int) -> list[pa.RecordBatch]:
+    """Coalesce/split `batches` into batches of ~`target` rows, streaming and copy-bounded.
+
+    pyarrow's ``Table.to_batches(max_chunksize=n)`` only *splits* an oversized chunk; it
+    never *merges* undersized ones — so re-chunking a finely batched input (the common case:
+    a morsel-sized native scan feeding a per-batch Python `fn`) up to a coarse `target`
+    silently no-ops, leaving hundreds of tiny batches that make the fixed per-call overhead
+    (FFI + framework conversion + schema build) dominate. This walks the input once, merging
+    consecutive small batches until they reach `target` (and splitting any single batch above
+    it), so the transient concatenation is bounded to ~one `target`-sized batch instead of a
+    full-table materialization. A relation-level no-op: same rows in the same order, only the
+    batching changes.
+    """
+    if target <= 0 or not batches:
+        return batches
+    if len(batches) == 1 and batches[0].num_rows <= target:
+        return batches  # nothing to split and nothing to merge
+    out: list[pa.RecordBatch] = []
+    buf: list[pa.RecordBatch] = []
+    buf_rows = 0
+
+    def flush() -> None:
+        nonlocal buf, buf_rows
+        if not buf:
+            return
+        out.append(buf[0] if len(buf) == 1 else pa.concat_batches(buf))
+        buf, buf_rows = [], 0
+
+    for b in batches:
+        if b.num_rows == 0:
+            continue
+        if b.num_rows >= target:
+            flush()  # keep order: emit the pending run before this large batch
+            for start in range(0, b.num_rows, target):
+                out.append(b.slice(start, target))
+            continue
+        buf.append(b)
+        buf_rows += b.num_rows
+        if buf_rows >= target:
+            flush()
+    flush()
+    return out
+
+
 def _apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordBatch]:
     """Apply a `map_batches` function, optionally rebatching to `batch_size` and
     running the per-batch calls across `num_workers` threads (order preserved).
@@ -205,10 +239,10 @@ def _apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordB
         return _apply_udf_autobatch(op, batches)
 
     total = sum(b.num_rows for b in current)
-    use_processes = _wants_processes(op, total)
+    use_processes = strat.wants_processes(op, total, current)
     morsel = max(1, active_config().execution.morsel_rows)
     if op.batch_size is not None:
-        batches = pa.Table.from_batches(current).to_batches(max_chunksize=op.batch_size)
+        batches = _rechunk(current, op.batch_size)
     elif use_processes:
         # A process-pool `fn` pays a per-batch pickle/IPC round-trip to the child, so
         # morsel-sized batches make that overhead dominate (measured: an order of
@@ -219,33 +253,39 @@ def _apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordB
         # the current batching is actually bad: too few to fill the pool, any batch large
         # enough to unbalance a worker / bloat one IPC payload, or any morsel-tiny batch.
         cap = max(morsel, -(-total // max(1, op.num_workers)))  # ~one worker's share
-        floor = min(cap, max(morsel, _PROC_MIN_BATCH_ROWS))
+        floor = min(cap, max(morsel, strat.PROC_MIN_BATCH_ROWS))
         sizes = [b.num_rows for b in current]
         already_coarse = (
             len(current) >= op.num_workers and max(sizes) <= cap and min(sizes) >= floor
         )
         if not already_coarse:
-            target = max(floor, -(-total // max(1, op.num_workers * _PROC_BATCHES_PER_WORKER)))
-            batches = pa.Table.from_batches(current).to_batches(max_chunksize=target)
+            target = max(floor, -(-total // max(1, op.num_workers * strat.PROC_BATCHES_PER_WORKER)))
+            batches = _rechunk(current, target)
     else:
-        # A plain-function transform with no explicit `batch_size` is bounded to the
-        # engine morsel size, so a downloading / row-exploding `fn` never receives the
-        # whole partition as one batch (the unbounded-batch OOM — Ray Data's #1 cause;
-        # an in-memory or wide-row source can hand a single multi-million-row batch
-        # straight to the `fn`). Re-chunk only when an upstream batch actually exceeds
-        # the morsel — a relation-level no-op (same rows, smaller chunks; map_batches is
-        # per-batch by contract) that leaves an already-morselized pipeline untouched.
-        if any(b.num_rows > morsel for b in current):
-            batches = pa.Table.from_batches(current).to_batches(max_chunksize=morsel)
+        # A threaded CPU `fn` with no explicit `batch_size`: rebatch to a COARSE target,
+        # not the morsel. The morsel (16,384) minimizes cache footprint for the vectorized
+        # relational kernels, but a per-batch Python call pays a fixed overhead (FFI +
+        # framework conversion + schema build) that morsel-sized batches make dominate.
+        # The target is one coarse batch per worker (parallel fill) with a floor that
+        # amortizes the per-call overhead and a cap that bounds a row-exploding / wide-row
+        # `fn` — so the whole partition is never handed over as one unbounded batch (the
+        # OOM Ray Data's `batch_size=None` default hits). A relation-level no-op: same
+        # rows, per-batch by contract; only the chunking changes.
+        target = strat.thread_batch_target(op, total, op.num_workers, morsel, current)
+        sizes = [b.num_rows for b in current]
+        too_coarse = max(sizes, default=0) > target
+        too_fine = len(current) > op.num_workers and min(sizes, default=0) < target
+        if too_coarse or too_fine:
+            batches = _rechunk(current, target)
 
-    strategy = _map_strategy(op, len(batches), use_processes)
+    strategy = strat.map_strategy(op, len(batches), use_processes)
     if strategy == "processes":
         # Run the per-batch calls across processes so a CPU-bound pure-Python `fn`
         # (which the GIL would serialize across threads) uses multiple cores. Any
         # process failure (an `fn` that turns out not to be process-safe) falls back
         # to threads — never a dropped batch.
         try:
-            from batcher.core.udf_processes import run_map_processes
+            from batcher.core.udf.processes import run_map_processes
 
             results = run_map_processes(
                 build_udf_callable(op.fn), batches, op.num_workers, op.batch_format
@@ -256,13 +296,17 @@ def _apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordB
             # spawn refuse to start a child. Remember that (`_disable_processes`) so the
             # fallback happens once here and every later call goes straight to threads,
             # instead of re-failing (and re-warning) on every batch/window.
-            _disable_processes(exc)
+            strat.disable_processes(exc)
             strategy = "threads"
 
     if strategy != "processes":
         # Build the model once for this whole call (a class `fn` is a load-once factory).
         fn = build_udf_callable(op.fn)
         call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
+        if op.num_gpus > 0:
+            from batcher.ml.gpu import autocast_call
+
+            call = autocast_call(call)  # tensor-core half precision (no-op when off/CPU)
         if op.max_errored_rows > 0:
             # Dirty-data tolerance: isolate and skip corrupt rows (up to the budget) instead
             # of crashing — a single-stage inference / preprocess over messy data survives.
@@ -305,10 +349,12 @@ def _apply_udf_autobatch(op: MapBatches, batches: list[pa.RecordBatch]) -> list[
     built once and shared across the `num_workers` dispatch slots (a GPU stage resolves to
     one). The seed is conservative (climbs up); a future VRAM-aware seed sharpens the start.
     """
+    from batcher.ml.gpu import autocast_call
     from batcher.ml.inference import InferencePool
 
     fn = build_udf_callable(op.fn)
     call = fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)
+    call = autocast_call(call)  # tensor-core half precision (GPU stage; no-op when off/CPU)
 
     def worker(batch: pa.RecordBatch) -> pa.RecordBatch:
         coerced = _coerce_udf_result(call(batch))
@@ -321,109 +367,6 @@ def _apply_udf_autobatch(op: MapBatches, batches: list[pa.RecordBatch]) -> list[
         lambda: worker, num_workers=op.num_workers, target_batch_rows=256, objective="throughput"
     )
     return list(pool.run(iter(batches)))
-
-
-# A CPU-bound `map_batches` big enough to amortize the process-pool startup auto-runs
-# across processes (the Ray Data default), so a plain `ds.map_batches(fn)` uses every
-# core instead of one GIL — threads cap a pure-Python `fn` at one core and a NumPy `fn`
-# at the GIL-handoff ceiling. Below this row count the thread path (no pool spawn) wins,
-# so small queries keep their low fixed overhead.
-_PROC_AUTO_MIN_ROWS = 1_000_000
-
-
-# Set once if the process pool proves unusable this session (e.g. a non-import-safe
-# entrypoint that forkserver/spawn cannot fork a child from). After that every stage
-# stays on threads without re-attempting (and re-warning) a doomed pool per batch.
-_PROCESSES_DISABLED = False
-
-
-def _disable_processes(exc: BaseException) -> None:
-    """Disable the process path for the rest of the session, warning once."""
-    global _PROCESSES_DISABLED
-    if not _PROCESSES_DISABLED:
-        _PROCESSES_DISABLED = True
-        warnings.warn(
-            f"map_batches process pool unavailable ({exc!r}); using threads for the rest "
-            "of this session (for a CPU-bound pure-Python fn, run under an "
-            "`if __name__ == '__main__':` guard so a worker process can start)",
-            stacklevel=3,
-        )
-
-
-def _wants_processes(op: MapBatches, total_rows: int) -> bool:
-    """Whether to run this `map_batches` across processes (vs threads).
-
-    Processes when the user opted in (`op.multiprocessing`) or — adaptively — when a
-    process-capable CPU `fn` is handed enough rows that spreading it across cores beats
-    the GIL-bound thread path despite the pool-startup cost. A GPU / class / non-pyarrow
-    / unpicklable `fn` never qualifies (see `_process_capable`), nor does anything once
-    the pool has proven unusable this session. The runtime still falls back to threads if
-    a process actually fails, so this never drops a batch.
-    """
-    if op.num_workers <= 1 or _PROCESSES_DISABLED:
-        return False
-    if op.multiprocessing:
-        return _process_safe(op)
-    return total_rows >= _PROC_AUTO_MIN_ROWS and _process_capable(op)
-
-
-def _map_strategy(op: MapBatches, n_batches: int, use_processes: bool) -> str:
-    """Pick how to run the per-batch calls: ``sequential``, ``threads``, or ``processes``.
-
-    `use_processes` is the pre-computed intent (`_wants_processes`); a single batch or a
-    single worker collapses to sequential, everything else to threads.
-    """
-    if n_batches <= 1 or op.num_workers <= 1:
-        return "sequential"
-    return "processes" if use_processes else "threads"
-
-
-def _process_capable(op: MapBatches) -> bool:
-    """Whether `op.fn` *can* run in a process pool (a quiet predicate, no warning).
-
-    A factory/class would reload the model per child (and risk OOM); a GPU `fn` wants
-    one CUDA context; a lambda/closure `fn` cannot be pickled to a spawned child. Any
-    `batch_format` is fine — the numpy/pandas/torch conversion runs in the child from
-    the picklable ``(fn, batch, fmt)`` payload (`_proc_call`), no closure required.
-    """
-    return not isinstance(op.fn, type) and op.num_gpus <= 0 and _is_picklable(op.fn)
-
-
-def _process_safe(op: MapBatches) -> bool:
-    """Whether `op.fn` can run in a process pool; warn-once and reject otherwise.
-
-    The warning variant of `_process_capable`, used when the user *explicitly* asked for
-    `multiprocessing=True` — so an ignored request is surfaced, not silently downgraded.
-    """
-    if isinstance(op.fn, type):
-        return _reject("a factory/class fn would reload per process")
-    if op.num_gpus > 0:
-        return _reject("a GPU fn must keep a single process/CUDA context")
-    if not _is_picklable(op.fn):
-        return _reject("the fn is not picklable (a lambda or closure)")
-    return True
-
-
-_REJECTED: set[str] = set()
-
-
-def _reject(reason: str) -> bool:
-    """Warn once per distinct reason that processes were declined, then return False."""
-    if reason not in _REJECTED:
-        _REJECTED.add(reason)
-        warnings.warn(
-            f"map_batches multiprocessing not used ({reason}); using threads",
-            stacklevel=3,
-        )
-    return False
-
-
-def _is_picklable(obj: object) -> bool:
-    try:
-        pickle.dumps(obj)
-        return True
-    except Exception:
-        return False
 
 
 def _formatted(fn: Any, fmt: str) -> Any:

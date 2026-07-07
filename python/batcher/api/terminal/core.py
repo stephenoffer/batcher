@@ -16,6 +16,7 @@ from batcher.api.orchestration import with_auto_config
 from batcher.api.terminal.metadata_answer import (
     metadata_aggregate_table,
     metadata_count,
+    metadata_empty_table,
     metadata_is_empty,
 )
 from batcher.api.terminal.routing import resolve_distributed as _resolve_distributed
@@ -66,6 +67,11 @@ def _collect(
     result to materialize. This guards every materializing terminal (`collect`,
     `count`, `to_*`, `show`), so they fail fast instead of hanging.
     """
+    import os as _ce_os
+    import time as _ce_time
+
+    _cep = _ce_os.environ.get("BATCHER_SORT_PROFILE")
+    _ce0 = _ce_time.perf_counter()
     from batcher.io.source import is_bounded
 
     if any(not is_bounded(s) for s in sources):
@@ -89,6 +95,10 @@ def _collect(
     metadata = metadata_aggregate_table(plan, sources, source_stats)
     if metadata is not None:
         return metadata
+    # Provably-empty short-circuit: a scan-free empty table (contradiction / limit(0) /
+    # empty-side join) when metadata proves zero rows (see `metadata_empty_table`).
+    if (empty := metadata_empty_table(plan, sources, source_stats)) is not None:
+        return empty
     # GPU backend. `backend="gpu"` forces the GPU for any supported shape (honoring the user past
     # the small-input threshold, but Kyber still routes single-device vs sharded by working-set
     # size); `backend="auto"` lets Kyber's cost policy decide GPU vs CPU fully. Anything else — an
@@ -184,13 +194,23 @@ def _collect(
         source_stats=source_stats,
         profile=event_log_collector(),
     )
+    import os as _ct_os
+
+    _ctp = _ct_os.environ.get("BATCHER_SORT_PROFILE")
+    if _ctp:
+        print(f"[collect] pre-execute routing {_ce_time.perf_counter() - _ce0:.1f}s", flush=True)
     t0 = time.perf_counter()
     table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
     total_ms = (time.perf_counter() - t0) * 1000.0
+    _ce_post = _ce_time.perf_counter()
+    if _ctp:
+        print(f"[collect] executor.execute {total_ms / 1000:.1f}s -> {table.num_rows} rows", flush=True)
     write_event_log(ctx.profile, total_ms=total_ms, rows=table.num_rows)
     from batcher.api.terminal.gpu_backend import record_cpu_crossover  # adaptive-crossover sample
 
     record_cpu_crossover(plan, sources, ctx.hub, total_ms)  # gated to a GPU cluster; else no-op
+    if _ctp:
+        print(f"[collect] post-execute tail {_ce_time.perf_counter() - _ce_post:.1f}s", flush=True)
     return table
 
 
@@ -241,9 +261,26 @@ def _count(plan: LogicalPlan, sources: list[Source], _columns: list[str]) -> int
     source_stats = _shared_source_stats(plan, sources)
     answer = metadata_count(plan, sources, source_stats)
     if answer is not None:
+        _record_count_selectivity(plan, sources, answer)
         return answer
     table = _collect(global_count_plan(plan), sources, ["n"], source_stats=source_stats)
-    return int(table.column("n")[0].as_py()) if table.num_rows else 0
+    count = int(table.column("n")[0].as_py()) if table.num_rows else 0
+    _record_count_selectivity(plan, sources, count)
+    return count
+
+
+def _record_count_selectivity(plan: LogicalPlan, sources: list[Source], count: int) -> None:
+    """Warm the learned-selectivity cache from a measured `count()`.
+
+    A `count()` over a `Filter` is an *exact* measurement of the filter's surviving-row
+    count — which `record_selectivity` turns into a per-signature selectivity ratio
+    (`count / scan rows`) that sharpens later plans of the same shape. The execution path
+    records feedback off the aggregate-*wrapped* count plan (whose Filter is hidden under
+    the `Aggregate`), so this closes that gap directly with the original filter plan.
+    Best-effort; never raises into the terminal."""
+    from batcher import core, kyber
+
+    kyber.record_selectivity(core.default_hub(), plan, sources, count)
 
 
 def _is_empty(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> bool:

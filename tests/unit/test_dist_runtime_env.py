@@ -34,7 +34,9 @@ def _with_distributed(**overrides):
 def test_self_ship_uploads_a_source_install(monkeypatch):
     monkeypatch.setattr("batcher.__file__", "/repo/python/batcher/__init__.py")
     env = lifecycle._self_ship_runtime_env()
-    assert env == {"py_modules": ["/repo/python/batcher"]}
+    # Ships the driver's package and pins pip off — workers use their base env for other
+    # deps, and a managed hook can't inject an unresolvable per-job pip (e.g. batcher-engine).
+    assert env == {"py_modules": ["/repo/python/batcher"], "pip": None}
 
 
 def test_self_ship_uploads_a_site_packages_install_too(monkeypatch):
@@ -46,15 +48,17 @@ def test_self_ship_uploads_a_site_packages_install_too(monkeypatch):
         "batcher.__file__", "/opt/conda/lib/python3.12/site-packages/batcher/__init__.py"
     )
     assert lifecycle._self_ship_runtime_env() == {
-        "py_modules": ["/opt/conda/lib/python3.12/site-packages/batcher"]
+        "py_modules": ["/opt/conda/lib/python3.12/site-packages/batcher"],
+        "pip": None,
     }
 
 
 def test_self_ship_skipped_only_when_cluster_image_is_trusted(monkeypatch, restore_config):
-    # The one opt-out: a production image that bakes a matching batcher into every node.
+    # The one opt-out: a production image that bakes a matching batcher into every node. No
+    # upload, but pip is still pinned off so a managed hook can't inject a broken per-job pip.
     monkeypatch.setattr("batcher.__file__", "/repo/python/batcher/__init__.py")
     _with_distributed(trust_cluster_image=True)
-    assert lifecycle._self_ship_runtime_env() is None
+    assert lifecycle._self_ship_runtime_env() == {"pip": None}
 
 
 def test_init_kwargs_attach_auto_ships_when_runtime_env_unset(monkeypatch, restore_config):
@@ -63,7 +67,7 @@ def test_init_kwargs_attach_auto_ships_when_runtime_env_unset(monkeypatch, resto
     kwargs = lifecycle._ray_init_kwargs(workers=4)
     assert kwargs["address"] == "auto"
     assert "num_cpus" not in kwargs  # never pin CPUs against a real cluster
-    assert kwargs["runtime_env"] == {"py_modules": ["/repo/python/batcher"]}
+    assert kwargs["runtime_env"] == {"py_modules": ["/repo/python/batcher"], "pip": None}
 
 
 def test_explicit_runtime_env_wins_over_auto_ship(monkeypatch, restore_config):

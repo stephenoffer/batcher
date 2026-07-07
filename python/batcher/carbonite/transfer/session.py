@@ -15,6 +15,9 @@ what makes Carbonite a transfer sublibrary rather than glue inside the engine.
 
 from __future__ import annotations
 
+import atexit
+import contextlib
+import weakref
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -50,6 +53,34 @@ def _process_client() -> ShuffleClient:
     if _shared_client is None:
         _shared_client = ShuffleClient()
     return _shared_client
+
+
+# Every live session, so a process-exit hook can retire the pyarrow-backed batches
+# their Flight servers still hold *while the interpreter is alive*. A published
+# partition is a zero-copy view of a pyarrow array whose release callback needs the
+# GIL; if a tokio serve thread drops it *after* Python has begun finalizing, the
+# GIL acquire turns into a thread-exit that unwinds through Rust and aborts the
+# process (`std::terminate`). Clearing here — on the main thread, GIL held, before
+# finalization — drops that data first, so no background thread touches the GIL at
+# shutdown. WeakSet ⇒ an already-collected session drops out on its own.
+_live_sessions: weakref.WeakSet = weakref.WeakSet()
+_atexit_registered = False
+
+
+def _drain_live_sessions() -> None:
+    """Evict every live session's published partitions at interpreter exit."""
+    for session in list(_live_sessions):
+        with contextlib.suppress(Exception):  # best-effort teardown must never raise
+            session.clear()
+
+
+def _register_session(session: ShuffleSession) -> None:
+    """Track `session` for exit-time draining, registering the hook once."""
+    global _atexit_registered
+    _live_sessions.add(session)
+    if not _atexit_registered:
+        atexit.register(_drain_live_sessions)
+        _atexit_registered = True
 
 
 def _host(addr: str) -> str:
@@ -97,6 +128,15 @@ class ShuffleSession:
         # the static path — and distributed==single-node equivalence — is unchanged.
         self._flow_control = flow_control
         self._pressure = pressure
+        # Shared memory writes a second (tmpfs) copy of each bucket, so it must be
+        # pressure-aware. If shm is on but no monitor was supplied (the non-adaptive
+        # path), attach one purely to gate the shm mirror — it drives no flow control
+        # (that needs `flow_control`), so behavior is otherwise unchanged.
+        if shm and self._pressure is None:
+            from batcher.carbonite.memory.pressure import PressureMonitor
+
+            self._pressure = PressureMonitor()
+        _register_session(self)
 
     def _window(self) -> int | None:
         """The credit window for the next fetch — adaptive when a controller is set."""
@@ -127,11 +167,29 @@ class ShuffleSession:
         """Expose `batches` under `ticket` for reducers to fetch.
 
         When shared memory is on, also mirror the bucket to an mmap'd file so a
-        same-node reducer in another process reads it without a gRPC hop.
+        same-node reducer in another process reads it without a gRPC hop — unless the
+        node is under memory pressure, where the extra tmpfs copy is skipped (the
+        reducer falls back to Flight, which stays correct).
         """
         self._server.publish(ticket, batches)
-        if self._shm and batches:
+        if self._shm and batches and self._shm_mirror_ok():
             self._server.publish_shared(ticket, batches)
+
+    def _shm_mirror_ok(self) -> bool:
+        """Whether to mirror this bucket to shared memory now.
+
+        The shm file is a *second* copy of the bucket (in tmpfs = RAM) on top of the
+        in-memory store Flight serves remote reducers from, so under memory pressure it
+        is skipped to protect a tight node from OOM — the case that matters on churning
+        spot clusters, where recompute transiently doubles live state. Without a pressure
+        monitor (the non-adaptive path) it is always allowed; the ample-memory common
+        case keeps the same-node fast path.
+        """
+        if self._pressure is None:
+            return True
+        from batcher.carbonite.memory.pressure import PressureLevel
+
+        return self._pressure.level() < PressureLevel.SPILL
 
     def fetch(self, addr: str, ticket: ShuffleTicket) -> list[pa.RecordBatch]:
         """Fetch one partition from `addr`, choosing the cheapest transfer mode.
@@ -197,12 +255,10 @@ class ShuffleSession:
         cost at scale. The combine spec (`group_keys_json`/`aggregates_json`) is supplied
         by the relational layer; the session stays operator-agnostic. Returns
         `(payload, unreachable)` — a non-empty `unreachable` is the `("retry", srcs)`
-        signal. When same-node shared memory is enabled it falls back to the serial,
-        shm-aware path (the concurrent native gather streams same-node buckets over
-        Flight rather than mmap).
+        signal. When same-node shared memory is enabled, same-node sources are read
+        zero-copy from shared memory *inside* the concurrent gather (Flight fallback on a
+        miss), so cross-node fetches still fan out in parallel.
         """
-        if self._shm:
-            return self._gather_combine_serial(group_keys_json, aggregates_json, sources, finalize)
         payload, unreachable = self._server.gather_combine(
             _process_client(),
             group_keys_json,
@@ -212,6 +268,7 @@ class ShuffleSession:
             finalize,
             credits=self._window(),
             token=self._token,
+            shm=self._shm,
         )
         self._fetches += len(sources)
         self._observe_backpressure()
@@ -227,59 +284,19 @@ class ShuffleSession:
 
         Like `gather`, but fetches concurrently (bounded by `fan_in`) and returns the
         lost-source indices instead of raising, so the reducer can report `("retry",
-        srcs)`. Falls back to the serial, shm-aware path when shared memory is enabled.
+        srcs)`. When shared memory is enabled, same-node sources are read zero-copy from
+        shared memory within the concurrent gather (Flight fallback on a miss).
         """
-        if self._shm:
-            return self._gather_concat_serial(sources)
         rows, unreachable = self._server.gather_concat(
-            _process_client(), sources, fan_in, credits=self._window(), token=self._token
+            _process_client(),
+            sources,
+            fan_in,
+            credits=self._window(),
+            token=self._token,
+            shm=self._shm,
         )
         self._fetches += len(sources)
         self._observe_backpressure()
-        return rows, unreachable
-
-    def _gather_combine_serial(
-        self, gk: str, aj: str, sources: list[tuple[str, ShuffleTicket]], finalize: bool
-    ) -> tuple[pa.RecordBatch | None, list[int]]:
-        """Serial shm-aware fold: fetch each source through the locality selector
-        (honoring same-node shared memory) and `combine` incrementally, tracking lost
-        sources. Equivalent result to the concurrent native gather (combine is
-        associative), only slower — used when shm is on."""
-        # `from batcher._native import …` (not `import batcher._native`) so the
-        # dependency is on the compiled submodule — which Carbonite may drive to govern
-        # the data plane — not the `batcher` root package (which would pull in `api` and
-        # break the kyber/carbonite/core independence contract).
-        from batcher._native import RetryableShuffleError, combine, combine_finalize
-
-        running, unreachable = None, []
-        for idx, (addr, ticket) in enumerate(sources):
-            try:
-                batches = self.fetch(addr, ticket)
-            except RetryableShuffleError:
-                unreachable.append(idx)
-                continue
-            if batches:
-                merged = batches if running is None else [running, *batches]
-                running = combine(gk, aj, merged)
-        if unreachable:
-            return (None, unreachable)
-        if running is None:
-            return (None, [])
-        return (combine_finalize(gk, aj, [running]) if finalize else running, [])
-
-    def _gather_concat_serial(
-        self, sources: list[tuple[str, ShuffleTicket]]
-    ) -> tuple[list[pa.RecordBatch], list[int]]:
-        """Serial shm-aware concat: fetch each source's bucket, tracking lost ones."""
-        from batcher._native import RetryableShuffleError
-
-        rows: list[pa.RecordBatch] = []
-        unreachable = []
-        for idx, (addr, ticket) in enumerate(sources):
-            try:
-                rows += self.fetch(addr, ticket)
-            except RetryableShuffleError:
-                unreachable.append(idx)
         return rows, unreachable
 
     @property

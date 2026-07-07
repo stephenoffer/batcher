@@ -9,10 +9,84 @@ reclaim the idle nodes after the last scope ends).
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import math
 import threading
 
 from batcher.config import active_config
+
+
+class _Topology:
+    """A one-shot snapshot of the live cluster shape (alive node records + resources)."""
+
+    __slots__ = ("alive_nodes", "resources")
+
+    def __init__(self, alive_nodes: list[dict], resources: dict) -> None:
+        self.alive_nodes = alive_nodes
+        self.resources = resources
+
+
+# The topology snapshot in force for the current scheduling phase, if any. A distributed
+# query reads the cluster shape from several places (transport choice, placement strategy,
+# node-class selector, spread heuristic) — each an O(nodes) `ray.nodes()` RPC. Inside a
+# `topology_scope()` they share ONE read. Ambient (a ContextVar) so it reaches those helpers
+# without threading a snapshot through every call. Left unset (None) → every reader reads
+# live, exactly as before.
+_TOPOLOGY: contextvars.ContextVar[_Topology | None] = contextvars.ContextVar(
+    "batcher_topology_snapshot", default=None
+)
+
+
+def _read_topology() -> _Topology:
+    import ray
+
+    return _Topology([n for n in ray.nodes() if n.get("Alive", True)], ray.cluster_resources())
+
+
+@contextlib.contextmanager
+def topology_scope():
+    """Snapshot the live cluster shape once for the enclosed scheduling phase.
+
+    Collapses the ~5 `ray.nodes()`/`cluster_resources()` reads a distributed query's
+    placement/transport phase makes into a single one. MUST be entered only *after* the
+    autoscale-wait and worker clamp have settled the cluster size — those poll the live
+    topology and must never see a stale snapshot; within this scope the size is fixed, so a
+    snapshot is faithful. A read failure inside falls back to live reads (the snapshot is
+    best-effort). Nesting reuses the outer snapshot.
+    """
+    if _TOPOLOGY.get() is not None:
+        yield  # already inside a scope — reuse it
+        return
+    try:
+        snap = _read_topology()
+    except Exception:
+        yield  # topology unreadable → readers fall back to live
+        return
+    token = _TOPOLOGY.set(snap)
+    try:
+        yield
+    finally:
+        _TOPOLOGY.reset(token)
+
+
+def _alive_nodes() -> list[dict]:
+    """Alive node records — from the active snapshot if any, else a live `ray.nodes()`."""
+    snap = _TOPOLOGY.get()
+    if snap is not None:
+        return snap.alive_nodes
+    import ray
+
+    return [n for n in ray.nodes() if n.get("Alive", True)]
+
+
+def alive_node_count() -> int:
+    """The number of alive nodes — snapshot-aware, so a placement/spread check does not
+    trigger its own `ray.nodes()` RPC when a `topology_scope()` is active. Returns 0 on an
+    unreadable topology (callers treat that as 'unknown')."""
+    try:
+        return len(_alive_nodes())
+    except Exception:
+        return 0
 
 
 def shuffle_partitions(workers: int) -> int:
@@ -22,25 +96,52 @@ def shuffle_partitions(workers: int) -> int:
     An exchange creates `mappers * reducers` streams; leaving the reducer count equal to the
     worker fan-out (one per node) makes it O(nodes^2), which collapses at 10k+ nodes. The
     reducer count only needs to balance keys and keep each reducer's state in memory, so it
-    is capped: regular clusters (≤ the cap) are unchanged, huge clusters stay bounded. Any
+    is capped: regular clusters (≤ the cap) are unchanged, huge clusters stay bounded.
+
+    When prior runs have measured the shuffle families' real input volume, a learned reducer
+    count (`learned_shuffle_fanout`) trims the fan-out for a shuffle whose measured data needs
+    fewer, fuller buckets than one-per-worker — never above `workers`, so it only ever reduces
+    the stream count. A cold store (no measured history) keeps the worker fan-out unchanged. Any
     reducer count is result-correct under the mergeable algebra, so this only affects scaling.
     Always at least 1; the cap is disabled when the config value is 0.
     """
     cap = active_config().distributed.max_shuffle_partitions
     n = max(1, workers)
+    n = _learned_shuffle_fanout(n)
     return n if cap <= 0 else min(n, cap)
+
+
+def _learned_shuffle_fanout(workers: int) -> int:
+    """The learned reducer count for a shuffle over `workers` mappers, else `workers`.
+
+    Best-effort read of the process-wide MetadataHub's measured shuffle-family input volume; any
+    failure (no hub, cold store) returns `workers` unchanged."""
+    try:
+        from batcher.core import default_hub
+        from batcher.dist.adaptive_sizing import learned_shuffle_fanout
+
+        learned = learned_shuffle_fanout(default_hub(), None, workers)
+        return learned if learned is not None else workers
+    except Exception:  # pragma: no cover - learning is best-effort
+        return workers
 
 
 def cluster_topology() -> dict:
     """Live cluster shape: alive node count + total CPUs/GPUs. Ray must be up.
 
-    Read on demand (not cached) so it stays correct as the autoscaler grows or
-    shrinks the cluster — `ray.nodes()`/`ray.cluster_resources()` are cheap RPCs.
+    Read on demand (not cached) so it stays correct as the autoscaler grows or shrinks the
+    cluster — `ray.nodes()`/`ray.cluster_resources()` are cheap RPCs — unless a
+    `topology_scope()` is active (the placement/transport phase), where every reader shares
+    one snapshot.
     """
-    import ray
+    snap = _TOPOLOGY.get()
+    if snap is not None:
+        nodes, resources = snap.alive_nodes, snap.resources
+    else:
+        import ray
 
-    nodes = [n for n in ray.nodes() if n.get("Alive", True)]
-    resources = ray.cluster_resources()
+        nodes = [n for n in ray.nodes() if n.get("Alive", True)]
+        resources = ray.cluster_resources()
     return {
         "nodes": max(1, len(nodes)),
         "cpus": float(resources.get("CPU", 0.0)),
@@ -58,10 +159,8 @@ def node_classes() -> list[dict]:
     topology is unreadable (the caller then keeps its homogeneous defaults).
     """
     try:
-        import ray
-
         out: list[dict] = []
-        for n in ray.nodes():
+        for n in _alive_nodes():
             if not n.get("Alive", True):
                 continue
             res = n.get("Resources", {})
@@ -96,6 +195,39 @@ def cpu_only_can_host(workers: int, num_cpus: float) -> bool:
         return False  # homogeneous / GPU-less → no restriction (use all nodes)
     cpu_only_cores = sum(c["cpus"] for c in classes if c["gpus"] <= 0)
     return cpu_only_cores >= workers * max(num_cpus, 1e-9)
+
+
+# A marker amount of the CPU-node custom resource — enough to *require* a labelled node
+# without bounding how many tasks pack onto it (an affinity marker, not a capacity limit).
+_CPU_NODE_EPS = 0.001
+
+
+def node_class_selector(prefer_cpu_only: bool, workers: int, num_cpus: float) -> dict:
+    """Ray resource fragment that HARD-restricts a fleet to CPU-only nodes, or ``{}``.
+
+    Returns ``{"resources": {cpu_node_resource: _CPU_NODE_EPS}}`` — a requirement only
+    nodes advertising the custom resource can satisfy — when the fleet asked to stay off
+    GPU nodes (`prefer_cpu_only`), the config gate is on (`heterogeneous_node_isolation`),
+    AND the live cluster's CPU-only nodes can actually host `workers x num_cpus` cores
+    (`cpu_only_can_host`). Empty otherwise — a homogeneous / GPU-less cluster, an
+    unreadable topology, the gate off, or CPU-only nodes too small — so the restriction
+    can never make a query unschedulable (it then falls back to Ray's best-effort
+    GPU-node avoidance, today's behavior).
+
+    A custom resource is used rather than a node id / `NodeAffinitySchedulingStrategy`
+    because it is a node *property* re-advertised when the autoscaler replaces a node, so
+    the restriction survives spot churn; and because "GPU-absence" cannot be expressed as
+    a soft node-label match. It is *additive* to Ray's soft `RAY_scheduler_avoid_gpu_nodes`
+    — it makes the exclusion hard, so a CPU shuffle cannot steal an idle GPU node's cores.
+    """
+    if not prefer_cpu_only:
+        return {}
+    dc = active_config().distributed
+    if not dc.heterogeneous_node_isolation:
+        return {}
+    if not cpu_only_can_host(workers, num_cpus):
+        return {}
+    return {"resources": {dc.cpu_node_resource: _CPU_NODE_EPS}}
 
 
 def clamp_workers(workers: int, num_cpus: float = 1.0, num_gpus: float = 0.0) -> int:
@@ -200,6 +332,33 @@ def release_autoscale() -> None:
             _apply_autoscale_floor(0, 0)
 
 
+def await_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
+    """Block (bounded, growth-detected) until the autoscaler grows the cluster toward
+    `target_cpus` cores (and `target_gpus` GPUs).
+
+    Called *before* the fan-out is sized to the cluster, so a query that triggered a
+    scale-up (`request_autoscale`) fills the SCALED-UP cluster rather than the pre-scale
+    one — the load-bearing step for out-of-the-box cluster saturation. Without it, the
+    worker-per-node fill reads the current (small) topology and the query never uses the
+    nodes it asked for; the wait inside `clamp_workers` can't fix that because the fill
+    has already made `workers == capacity`.
+
+    A no-op when the wait is disabled (`autoscale_wait_s <= 0`), Ray is down, or the
+    cluster already covers the target. On a fixed cluster (or spot capacity the autoscaler
+    cannot get) it returns quickly via `_await_autoscale`'s stall-window bail, so it never
+    blocks the whole budget on nodes that will not arrive. Pure scheduling — the result is
+    identical whether it waits or not.
+    """
+    if active_config().distributed.autoscale_wait_s <= 0 or target_cpus <= 0:
+        return
+    import ray
+
+    if not ray.is_initialized():
+        return
+    topo = cluster_topology()
+    _await_autoscale(target_cpus, int(topo["cpus"]), target_gpus, float(topo["gpus"]))
+
+
 def _await_autoscale(
     target_cpus: int, avail: int, target_gpus: float = 0.0, avail_gpus: float = 0.0
 ) -> int:
@@ -211,8 +370,10 @@ def _await_autoscale(
     scale-up runs on the bigger cluster. A GPU stage waits for the GPUs to arrive too, not
     just the cores (otherwise it would clamp to the 0 GPUs visible before the GPU node is
     up). A no-op (returns `avail` immediately) when the wait is disabled or the cluster
-    already fits, so a fixed cluster never blocks on a scale-up that cannot happen. Stops
-    the instant capacity is sufficient.
+    already fits. Stops the instant capacity is sufficient, and — via the
+    `autoscale_stall_s` grace window — also stops early once capacity has been flat that
+    long (a fixed cluster, or spot capacity the autoscaler cannot get), so it never blocks
+    the whole budget on nodes that will not arrive.
     """
     dc = active_config().distributed
     if dc.autoscale_wait_s <= 0 or (avail >= target_cpus and avail_gpus >= target_gpus):
@@ -221,6 +382,13 @@ def _await_autoscale(
 
     deadline = time.monotonic() + dc.autoscale_wait_s
     poll = max(0.1, dc.autoscale_poll_s)
+    # Give up early once capacity has been flat for the grace window: the autoscaler is
+    # done (fixed cluster) or cannot satisfy the request (spot capacity unavailable), so
+    # the rest of the budget would block on nodes that will not arrive. Any capacity gain
+    # resets the window — a cluster that is still growing keeps its full wait.
+    grace = max(dc.autoscale_stall_s, poll * 2)
+    best = (avail, avail_gpus)
+    last_growth = time.monotonic()
     while time.monotonic() < deadline:
         time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
         topo = cluster_topology()
@@ -228,4 +396,9 @@ def _await_autoscale(
         avail_gpus = float(topo["gpus"])
         if avail >= target_cpus and avail_gpus >= target_gpus:
             break
+        if (avail, avail_gpus) > best:
+            best = (avail, avail_gpus)
+            last_growth = time.monotonic()
+        elif time.monotonic() - last_growth >= grace:
+            break  # no new capacity for the grace window — nothing more is coming
     return avail

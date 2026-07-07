@@ -86,10 +86,18 @@ def execute_topn_flight(
     # Driver merge plan: top-N over the concatenated per-worker top-Ns (scan 0).
     merge_ir = _sort_ir(sort.keys, sort.limit, {"op": "scan", "source_id": 0})
 
-    projection, predicate = source_pushdown(map_plan, sid)
-    parts = partition_descriptors(sources[sid], workers, projection=projection, predicate=predicate)
     actors, pg, _addrs, workers, owns = acquire_fleet(workers, _shuffle_credits(), cfg_json)
     try:
+        # Partition to the fleet's ACTUAL worker count. `acquire_fleet` may hand back a
+        # reused session fleet whose size differs from the requested `workers` (it reassigns
+        # `workers` to that size), so `parts` must be built here, after the fleet is known —
+        # otherwise parts and actors mismatch: a larger fleet indexes past `parts`, a smaller
+        # one silently drops the tail partitions' rows (a wrong result). `execute_sort_flight`
+        # already orders it this way.
+        projection, predicate = source_pushdown(map_plan, sid)
+        parts = partition_descriptors(
+            sources[sid], workers, projection=projection, predicate=predicate
+        )
         results = ray.get([actors[i].local_topn.remote(local_ir, parts[i]) for i in range(workers)])
     finally:
         if owns:
@@ -121,7 +129,14 @@ def execute_sort_flight(
     source partition on a survivor)."""
     import ray
 
+    import os as _os0
+    import time as _tt0
+
+    _profE = _os0.environ.get("BATCHER_SORT_PROFILE")
+    _enter = _tt0.perf_counter()
     _ensure_ray(workers)
+    if _profE:
+        print(f"[sort] _ensure_ray {_tt0.perf_counter() - _enter:.1f}s", flush=True)
     cfg_json = engine_config_json()  # driver config → shipped to worker actors
 
     key = sort.keys[0]  # caller guarantees a plain-column leading key
@@ -142,10 +157,17 @@ def execute_sort_flight(
     )
     credits = _shuffle_credits()
 
+    import os as _os
+    import time as _tt
+
+    _prof0 = _os.environ.get("BATCHER_SORT_PROFILE")
+    _ps = _tt.perf_counter()
     # Borrow the query-lifetime fleet if installed (every Flight operator must, or a
     # second placement group deadlocks against the fleet's bundles); else spawn our own.
     actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = shuffle_partitions(workers)
+    if _prof0:
+        print(f"[sort] acquire_fleet {_tt.perf_counter() - _ps:.1f}s", flush=True)
     try:
         # Push the map prefix's projection + predicate into the read so each worker
         # fetches only the columns/rows it needs (the sort keys + carried output), not
@@ -156,7 +178,12 @@ def execute_sort_flight(
             sources[sid], workers, projection=projection, predicate=predicate
         )
 
+        import os
+        import time as _t
+
+        _prof = os.environ.get("BATCHER_SORT_PROFILE")
         # SAMPLE: each worker samples its own split's leading-key distribution.
+        _s = _t.perf_counter()
         grids = ray.get(
             [
                 actors[i].sample_quantiles.remote(map_ir, key_name, _SAMPLE_PROBS, parts[i])
@@ -164,8 +191,11 @@ def execute_sort_flight(
             ]
         )
         boundaries = merge_boundaries(grids, workers)
+        if _prof:
+            print(f"[sort] SAMPLE {_t.perf_counter() - _s:.1f}s", flush=True)
 
         # MAP: range-partition each split by the boundaries and publish raw rows.
+        _s = _t.perf_counter()
         ray.get(
             [
                 actors[i].range_publish.remote(
@@ -174,11 +204,14 @@ def execute_sort_flight(
                 for i in range(workers)
             ]
         )
+        if _prof:
+            print(f"[sort] MAP(range_publish) {_t.perf_counter() - _s:.1f}s", flush=True)
 
         if _fault_inject:
             for i in _fault_inject:
                 ray.kill(actors[i])
 
+        _s = _t.perf_counter()
         results = _sort_reduce_with_recovery(
             actors,
             list(addrs),
@@ -192,6 +225,8 @@ def execute_sort_flight(
             n_buckets,
             workers,
         )
+        if _prof:
+            print(f"[sort] REDUCE(gather+sort) {_t.perf_counter() - _s:.1f}s", flush=True)
     finally:
         if owns:
             for a in actors:
@@ -201,6 +236,7 @@ def execute_sort_flight(
 
     # Concatenate the ranges in leading-key order (reversed for a descending sort) —
     # each bucket is globally ordered relative to the others, so no final merge.
+    _pc = _tt.perf_counter()
     order = range(workers - 1, -1, -1) if desc else range(workers)
     out: list[pa.RecordBatch] = []
     for r in order:
@@ -208,8 +244,12 @@ def execute_sort_flight(
     table = (
         pa.Table.from_batches(out) if out else pa.table({c: [] for c in sort.available_columns()})
     )
+    if _prof0:
+        print(f"[sort] driver_concat {_tt.perf_counter() - _pc:.1f}s ({table.num_rows} rows)", flush=True)
     if sort.limit is not None:
         table = table.slice(0, sort.limit)
+    if _prof0:
+        print(f"[sort] execute_sort_flight TOTAL {_tt.perf_counter() - _enter:.1f}s", flush=True)
     return table if not above else _apply_above(above, table)
 
 

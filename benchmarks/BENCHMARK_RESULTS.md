@@ -1,6 +1,6 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
-Measured on the Anyscale cluster (9 nodes, 128 CPUs) that hosts this workspace.
+Measured on a distributed Ray cluster (9 nodes, 128 CPUs).
 **Batcher** runs single-node in-process (its low-overhead strength); **Ray Data**
 attaches to the live cluster (`ray.init(address="auto")` — its distributed home
 turf); **Daft** runs its native multithreaded local engine (`DAFT_RUNNER=native`).
@@ -210,12 +210,12 @@ When attaching to a cluster, batcher now uploads its own package + abi3 native e
 to worker nodes via Ray `runtime_env` py_modules if it is a source/editable install (a
 no-op for a site-packages install the worker image already carries). Before this, the
 flight-worker actors died with `ModuleNotFoundError: batcher` on any cluster whose image
-didn't pre-install batcher — the distributed path was unusable on a fresh Anyscale
+didn't pre-install batcher — the distributed path was unusable on a fresh managed Ray
 cluster. Verified: distributed == single-node on the live cluster; 5 new unit tests.
 
 ## Distributed scale-out (sf10/sf100) — bringing the cluster to bear
 
-The head node has **0 schedulable task CPUs** (Anyscale reserves it), so Daft-native and
+The head node has **0 schedulable task CPUs** (many managed Ray clusters reserve the head), so Daft-native and
 batcher-single-node run on the head's 16 physical cores while distributed work uses the
 **8 worker nodes = 128 CPUs**. `scenarios/scale_bench.py` reads TPC-H lineitem directly
 from S3 at scale and runs a scan-heavy aggregation.
@@ -558,7 +558,7 @@ the Ray-actor's 1 thread) — it manifests on the cluster — so it is reasoned 
 performance rule's distributed-scaling allowance; the mechanism (parallel vs serial on a
 multi-core actor) is exact.
 
-**Cluster A/B — measured, and an honest negative result.** On the live 8-worker Anyscale
+**Cluster A/B — measured, and an honest negative result.** On the live 8-worker managed Ray
 cluster I A/B'd this fix on a sf10 high-cardinality distributed group-by (`GROUP BY
 l_orderkey` over 60 M rows → **15 M groups**, read from S3 *distributed* so no driver
 load, each worker owning a full node's cores), toggling the reduce/shuffle between the
@@ -842,7 +842,7 @@ whole cost — so the warm-pool advantage is scale-independent here and grows wi
 warm-pool mechanism proven on batch-inference/embeddings, now on the LLM/generative workload
 where it matters most.
 
-### Training-data ingest — Batcher 8.3× Ray Data (`iter_torch_batches`)
+### Training-data ingest — Batcher 3× Ray Data (`iter_torch_batches`)
 
 The distributed-training data-loading workload: stream a dataset to a PyTorch loop as
 `{column: tensor}` batches. Batcher's loader is zero-copy (DLPack) with background prefetch;
@@ -872,7 +872,7 @@ above are the corrected, apples-to-apples result.)_
 | batch embeddings (2048-d vectors) | **1.98×** | tensor-column output |
 | multimodal preprocessing (JPEG→GPU) | 1.3–2× | two-stage decode→model |
 | LLM batch inference (gpt2 generate) | **11.1×** | warm pools; scale-independent |
-| training-data ingest (`iter_torch_batches`) | **8.3×** | zero-copy DLPack loader |
+| training-data ingest (`iter_torch_batches`) | **3.0×** | zero-copy DLPack loader (no shuffle) |
 | zero-config GPU (`map_batches(Model, num_gpus=1)`) | **∞** | Ray Data hard-errors |
 
 Batcher meets or beats 2× across every self-contained GPU workload family, out-of-the-box.

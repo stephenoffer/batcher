@@ -33,3 +33,15 @@ def test_distributed_topn_ascending_with_ties_equals_single_node():
     single_keys = ds.collect().to_pydict()["k"]
     multi_keys = ds.collect(distributed=True, num_workers=4).to_pydict()["k"]
     assert single_keys == multi_keys  # leading-key order identical (ties may reorder v)
+
+
+def test_distributed_topn_reuses_fleet_across_changing_worker_counts():
+    # The session fleet is sized on first use and reused; a later top-N with a DIFFERENT
+    # num_workers must still be correct. The per-worker partitioning has to follow the
+    # fleet's actual size, or parts/actors mismatch — a larger fleet indexes past the
+    # partitions (crash), a smaller one silently drops the tail partitions' rows.
+    ds = bt.from_arrow(_T).sort("k").limit(37)
+    single = ds.collect().to_pydict()["k"]
+    for nw in (4, 4, 3, 4, 2, 5):
+        multi = ds.collect(distributed=True, num_workers=nw).to_pydict()["k"]
+        assert multi == single, f"num_workers={nw} disagreed with single-node"

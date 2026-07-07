@@ -141,6 +141,14 @@ impl GatherErr {
 /// Co-located sources (`addr == own_addr`) read the local store with no socket. Remote
 /// fetches run on the shared runtime, bounded by a `fan_in` semaphore so no more than
 /// `fan_in` are in flight at once. A fatal fault aborts; a retryable one is collected.
+#[allow(clippy::too_many_arguments)]
+/// The node identity of a shuffle address — its host, dropping the `:port`. Advertised
+/// addresses are `{node_ip}:{port}`, so equal hosts ⇒ same node (⇒ shm is reachable).
+fn host_of(addr: &str) -> &str {
+    addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     own: &FlightShuffleServer,
     pool: Arc<bc_transport::ClientPool>,
@@ -148,14 +156,38 @@ async fn drive(
     credits: u32,
     fan_in: usize,
     token: Option<String>,
+    shm: bool,
     mut on_batches: impl FnMut(Vec<RecordBatch>) -> Result<(), InterpError>,
 ) -> Result<Vec<usize>, GatherErr> {
     let mut unreachable = Vec::new();
 
     // Co-located buckets first — a cheap in-process read, no network, no permit.
     let own_addr = own.exchange.advertised_addr();
+    let own_host = host_of(own_addr);
     let mut set: JoinSet<(usize, Result<Vec<RecordBatch>, TransportError>)> = JoinSet::new();
     let sem = Arc::new(Semaphore::new(fan_in.max(1)));
+
+    // How many TCP flows to split EACH peer's bucket across. Batcher runs one Flight
+    // endpoint per node, so a reducer pulls each node's whole bucket over a single
+    // stream — one TCP flow, capped below the NIC's line rate. When there are few
+    // distinct remote peers (the small-cluster / autoscaling-ramp / skew case), split
+    // each bucket across several connections to use the whole link; when there are many
+    // peers the gather is already flow-parallel across them, so don't over-connect.
+    // `ceil(fan_in / distinct_peers)` keeps total concurrent streams ~`fan_in`, clamped
+    // to the per-peer connection bound.
+    let distinct_remote = sources
+        .iter()
+        .filter(|(a, _)| a.as_str() != own_addr)
+        .map(|(a, _)| a.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let stripe = if distinct_remote == 0 {
+        1
+    } else {
+        (bc_transport::connections_per_peer() as u32)
+            .min((fan_in.max(1)).div_ceil(distinct_remote) as u32)
+            .max(1)
+    };
     for (idx, (addr, ticket)) in sources.iter().enumerate() {
         if addr.as_str() == own_addr {
             let batches = own
@@ -168,6 +200,12 @@ async fn drive(
             }
             continue;
         }
+        // Same node, different process: a zero-copy shared-memory mmap read beats a
+        // loopback Flight hop by ~20x. Try it inside the concurrent set (so cross-node
+        // fetches still fan out in parallel) and fall back to Flight on a miss — the
+        // producer may not have mirrored this bucket (shm off, or skipped under memory
+        // pressure), which is a benign, result-preserving fallback.
+        let try_shm = shm && host_of(addr) == own_host;
         let (pool, sem, addr, ticket, token) = (
             pool.clone(),
             sem.clone(),
@@ -178,8 +216,17 @@ async fn drive(
         set.spawn(async move {
             // Hold a permit for the whole fetch so at most `fan_in` stream concurrently.
             let _permit = sem.acquire_owned().await;
+            if try_shm {
+                let (a, t) = (addr.clone(), ticket.to_string());
+                // shm read is blocking file I/O + decode → off the async reactor.
+                if let Ok(Ok(Some(batches))) =
+                    tokio::task::spawn_blocking(move || bc_transport::fetch_shared(&a, &t)).await
+                {
+                    return (idx, Ok(batches));
+                }
+            }
             let res = pool
-                .fetch_secured(&addr, &ticket, credits, token.as_deref())
+                .fetch_secured_striped(&addr, &ticket, credits, token.as_deref(), stripe)
                 .await;
             (idx, res)
         });
@@ -210,7 +257,7 @@ async fn drive(
 /// fetch+combine loop, with peak memory bounded by `fan_in` in-flight fetches plus the
 /// one running state.
 #[pyfunction]
-#[pyo3(signature = (server, client, group_keys_json, aggregates_json, sources, fan_in, finalize, credits=bc_transport::DEFAULT_CREDITS, token=None))]
+#[pyo3(signature = (server, client, group_keys_json, aggregates_json, sources, fan_in, finalize, credits=bc_transport::DEFAULT_CREDITS, token=None, shm=false))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gather_combine(
     py: Python<'_>,
@@ -223,6 +270,7 @@ pub(crate) fn gather_combine(
     finalize: bool,
     credits: u32,
     token: Option<String>,
+    shm: bool,
 ) -> PyResult<(Option<PyArrowType<RecordBatch>>, Vec<usize>)> {
     let group_keys = parse_group_keys(group_keys_json)?;
     let aggregates = parse_aggregates(aggregates_json)?;
@@ -240,7 +288,8 @@ pub(crate) fn gather_combine(
                 running = Some(bc_interp::dist::combine(&group_keys, &aggregates, &merged)?);
                 Ok(())
             };
-            let unreachable = drive(server, pool, &sources, credits, fan_in, token, fold).await?;
+            let unreachable =
+                drive(server, pool, &sources, credits, fan_in, token, shm, fold).await?;
             if !unreachable.is_empty() {
                 return Ok((None, unreachable)); // incomplete → driver recomputes + retries
             }
@@ -264,7 +313,8 @@ pub(crate) fn gather_combine(
 /// downstream. Returns `(batches, unreachable)`; a non-empty `unreachable` leaves the
 /// batches partial (the driver recomputes and retries), matching `gather_combine`.
 #[pyfunction]
-#[pyo3(signature = (server, client, sources, fan_in, credits=bc_transport::DEFAULT_CREDITS, token=None))]
+#[pyo3(signature = (server, client, sources, fan_in, credits=bc_transport::DEFAULT_CREDITS, token=None, shm=false))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gather_concat(
     py: Python<'_>,
     server: &FlightShuffleServer,
@@ -273,6 +323,7 @@ pub(crate) fn gather_concat(
     fan_in: usize,
     credits: u32,
     token: Option<String>,
+    shm: bool,
 ) -> PyResult<(Vec<PyArrowType<RecordBatch>>, Vec<usize>)> {
     let sources = parse_sources(sources)?;
     let pool = client.pool.clone();
@@ -285,7 +336,7 @@ pub(crate) fn gather_concat(
                 Ok(())
             };
             let unreachable =
-                drive(server, pool, &sources, credits, fan_in, token, collect).await?;
+                drive(server, pool, &sources, credits, fan_in, token, shm, collect).await?;
             Ok((rows, unreachable))
         })
     });

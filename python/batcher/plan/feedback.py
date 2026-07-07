@@ -48,6 +48,13 @@ class OperatorFeedback:
     # 1.0, an IO-bound one stays low. 0.0 means unmeasured (an older engine that
     # reports no `cpu_ns`), which the adaptive CPU-share loop treats as "no signal".
     cpu_utilization: float = 0.0
+    # Actual *input* rows the operator consumed. Cost calibration fits the per-row
+    # coefficients of the input-bound families (filter, distinct, aggregate,
+    # hash_join) against this, not `n_actual` (output rows) — a selective filter's
+    # cost scales with what it read, not what it kept. 0 means unmeasured (an older
+    # engine, or a source op with no input), in which case calibration reconstructs
+    # it from `n_actual / selectivity`.
+    n_input: int = 0
 
 
 @runtime_checkable

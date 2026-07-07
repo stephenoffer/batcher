@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
+use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow::compute::SortOptions;
 use arrow::compute::{
     concat_batches, filter_record_batch, lexsort_to_indices, sort_to_indices, take, SortColumn,
@@ -340,67 +340,105 @@ pub(crate) fn sort_batch(
     if batch.num_rows() == 0 {
         return Ok(batch.clone());
     }
-    // Single-key sort uses arrow's specialized per-type `sort_to_indices` (a
-    // dedicated primitive path) rather than the general multi-column `lexsort`.
-    let indices = if let [k] = keys {
+    let indices = sort_indices(batch, keys, limit)?;
+    take_batch(batch, &indices)
+}
+
+/// The permutation that sorts `batch` by `keys` (the first `limit` rows for a top-N). Shared
+/// by the serial [`sort_batch`] and the [`parallel_sort_batch`] gather so both order rows
+/// identically — the parallel path only parallelizes the *take*, never the comparison.
+fn sort_indices(
+    batch: &RecordBatch,
+    keys: &[SortKey],
+    limit: Option<usize>,
+) -> Result<arrow::array::UInt32Array, InterpError> {
+    let indices = if limit.is_some() {
+        // A `limit` makes this a top-N: arrow returns only the first `limit` indices via a
+        // *partial* sort (far cheaper than fully sorting then slicing) — but that partial
+        // sort is UNSTABLE, so which tied rows survive and in what order is arbitrary and
+        // input-size-dependent. That makes single-node and the distributed range-sort (whose
+        // per-bucket reduce runs this same top-N over a differently-sized slice) disagree on
+        // ties. Append the original row position as a final ascending tie-break key: ties now
+        // resolve to input order, so the top-N is deterministic and identical to a stable
+        // sort-then-slice — single-node == every partitioning. One extra unique key over the
+        // same O(n log k) partial sort; the radix/parallel fast paths are full-sort only.
+        let mut sort_columns = eval_sort_columns(batch, keys)?;
+        let row_index = Arc::new(UInt64Array::from_iter_values(0..batch.num_rows() as u64));
+        sort_columns.push(SortColumn {
+            values: row_index,
+            options: Some(SortOptions {
+                descending: false,
+                nulls_first: false,
+            }),
+        });
+        lexsort_to_indices(&sort_columns, limit)?
+    } else if let [k] = keys {
+        // Single-key *full* sort uses arrow's specialized per-type `sort_to_indices` (a
+        // dedicated primitive path) rather than the general multi-column `lexsort`.
         let opts = SortOptions {
             descending: k.descending,
             nulls_first: k.nulls_first,
         };
         let vals = k.expr.eval(batch)?;
-        // Radix fast path for a *full* sort (no top-N partial sort to beat) on a
-        // fixed-width integer/temporal key: O(n) vs the comparison sort's O(n log n),
-        // producing the identical relation. Falls back for limits / other types.
-        let radix = limit
-            .is_none()
-            .then(|| radix_sort::radix_sort_indices(&vals, opts))
-            .flatten();
-        match radix {
+        // Radix fast path on a fixed-width integer/temporal key: O(n) vs the comparison
+        // sort's O(n log n), producing the identical relation. Falls back for other types.
+        match radix_sort::radix_sort_indices(&vals, opts) {
             Some(idx) => idx,
-            None => sort_to_indices(&vals, Some(opts), limit)?,
+            None => sort_to_indices(&vals, Some(opts), None)?,
         }
     } else {
-        let sort_columns: Vec<SortColumn> = keys
-            .iter()
-            .map(|k| {
-                Ok(SortColumn {
-                    values: k.expr.eval(batch)?,
-                    options: Some(SortOptions {
-                        descending: k.descending,
-                        nulls_first: k.nulls_first,
-                    }),
-                })
-            })
-            .collect::<Result<_, InterpError>>()?;
-        // A `limit` makes this a top-N: arrow returns only the first `limit`
-        // indices via a partial sort, far cheaper than fully sorting then slicing.
-        lexsort_to_indices(&sort_columns, limit)?
+        lexsort_to_indices(&eval_sort_columns(batch, keys)?, None)?
     };
+    Ok(indices)
+}
+
+/// Gather `batch`'s rows in `indices` order (a single-threaded take of every column).
+fn take_batch(
+    batch: &RecordBatch,
+    indices: &arrow::array::UInt32Array,
+) -> Result<RecordBatch, InterpError> {
     let columns = batch
         .columns()
         .iter()
-        .map(|c| take(c.as_ref(), &indices, None))
+        .map(|c| take(c.as_ref(), indices, None))
         .collect::<Result<Vec<ArrayRef>, _>>()?;
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
+
+/// Evaluate each sort key against `batch` into an arrow `SortColumn` (values + options).
+fn eval_sort_columns(batch: &RecordBatch, keys: &[SortKey]) -> Result<Vec<SortColumn>, InterpError> {
+    keys.iter()
+        .map(|k| {
+            Ok(SortColumn {
+                values: k.expr.eval(batch)?,
+                options: Some(SortOptions {
+                    descending: k.descending,
+                    nulls_first: k.nulls_first,
+                }),
+            })
+        })
+        .collect()
 }
 
 /// Rows below which the single-node sample-sort stays serial — the sampling + range
 /// partition + concat overhead only pays off on a large full sort.
 const PARALLEL_SORT_MIN_ROWS: usize = 1 << 17;
 
-/// Parallel single-node full sort by sample-sort: range-partition the rows by the
-/// leading key (sampled quantile boundaries), sort each range in parallel, and
-/// concatenate in key order — no final merge, because the ranges are globally ordered
-/// relative to each other. This is the single-node form of the distributed range sort
-/// (`dist/flight_sort.py`), so one implementation serves both.
+/// Parallel single-node full sort by sample-sort: range-partition the rows by the leading key
+/// (sampled quantile boundaries), sort each range in parallel, and concatenate in key order —
+/// no final merge, because the ranges are globally ordered relative to each other. Each range
+/// sorts (and gathers) a contiguous, cache-resident subset in parallel, which is why this beats
+/// a single global permutation + one random-access gather (that gather is memory-bandwidth
+/// bound and cache-hostile across the whole table). This is the single-node form of the
+/// distributed range sort (`dist/flight_sort.py`), so one implementation serves both.
 ///
-/// Returns `None` (caller falls back to the serial [`sort_batch`]) unless it applies: a
-/// full sort (no `LIMIT` — top-N is already cheap), a large input, and a **float or
-/// integer leading key** (the bucket boundaries route it *exactly* — floats by `f64`,
-/// integers by `i64`; a string leading key falls back). Multi-key sorts are supported:
-/// rows are bucketed by the leading key (equal leading keys never span a boundary, so
-/// they stay in one range), then each range is sorted by the *full* key list — so a plain
-/// concatenation in leading-key order is the globally sorted multi-key relation, no merge.
+/// Returns `None` (caller uses the serial [`sort_batch`]) unless it applies: a full sort (no
+/// `LIMIT` — top-N is already cheap), a large input, and a **float or integer leading key**
+/// (the boundaries route it exactly — floats by `f64`, integers by `i64`; a string leading key
+/// falls back). Multi-key sorts are supported: rows bucket by the leading key (equal leading
+/// keys never span a boundary), then each range sorts by the full key list, so a plain
+/// concatenation in leading-key order is the globally sorted multi-key relation.
 pub(crate) fn parallel_sort_batch(
     batch: &RecordBatch,
     keys: &[SortKey],
@@ -416,9 +454,6 @@ pub(crate) fn parallel_sort_batch(
     }
     let key = k0.expr.eval(batch)?;
     let parts = rayon::current_num_threads().clamp(2, 64);
-
-    // Range-partition by the leading key — exactly (f64 for floats, i64 for integers).
-    // A string/other leading key can't be range-partitioned here, so fall back.
     let buckets = if matches!(key.data_type(), DataType::Float64 | DataType::Float32) {
         let key_f64 = arrow::compute::cast(&key, &DataType::Float64)?;
         let keyv = key_f64
@@ -456,14 +491,10 @@ pub(crate) fn parallel_sort_batch(
     } else {
         return Ok(None);
     };
-
-    // Each range sorts by the *full* key list in parallel.
     let sorted: Vec<RecordBatch> = buckets
         .par_iter()
         .map(|b| sort_batch(b, keys, None))
         .collect::<Result<_, InterpError>>()?;
-
-    // Ascending → ranges 0..P; descending → reversed (range P-1 holds the largest keys).
     let ordered: Vec<&RecordBatch> = if k0.descending {
         sorted.iter().rev().collect()
     } else {
@@ -489,11 +520,7 @@ fn sample_boundaries_f64(key: &arrow::array::Float64Array, parts: usize) -> Opti
     }
     sample.sort_unstable_by(|a, b| a.total_cmp(b));
     let m = sample.len();
-    Some(
-        (1..parts)
-            .map(|j| sample[(j * m / parts).min(m - 1)])
-            .collect(),
-    )
+    Some((1..parts).map(|j| sample[(j * m / parts).min(m - 1)]).collect())
 }
 
 /// Sample `parts-1` ascending i64 quantile boundaries from an integer key column (the
@@ -512,11 +539,7 @@ fn sample_boundaries_i64(key: &arrow::array::Int64Array, parts: usize) -> Option
     }
     sample.sort_unstable();
     let m = sample.len();
-    Some(
-        (1..parts)
-            .map(|j| sample[(j * m / parts).min(m - 1)])
-            .collect(),
-    )
+    Some((1..parts).map(|j| sample[(j * m / parts).min(m - 1)]).collect())
 }
 
 /// Window over a single (already-materialized) batch, at the default parallel-row

@@ -60,6 +60,14 @@ def task_options(env: SchedulingEnvelope | None) -> dict:
             opts["num_gpus"] = env.num_gpus
             if env.accelerator_type is not None:
                 opts["accelerator_type"] = env.accelerator_type
+        # Hard-restrict a CPU-only fleet to CPU-only nodes when the cluster opts in and can
+        # host it (a no-op otherwise). Keeps a CPU shuffle from stealing an inference
+        # stage's GPU-node cores; additive to Ray's soft GPU-node avoidance.
+        from batcher.dist.executors.ray_runtime.scaling import node_class_selector
+
+        sel = node_class_selector(env.prefer_cpu_only_nodes, env.n_tasks, env.num_cpus)
+        if sel:
+            opts["resources"] = {**opts.get("resources", {}), **sel["resources"]}
     rt = worker_runtime_env()
     if rt is not None:
         opts["runtime_env"] = rt
@@ -119,13 +127,40 @@ def worker_runtime_env() -> dict | None:
     return _WORKER_RT_ENV
 
 
-def _bundle(env: SchedulingEnvelope | None) -> dict:
-    """One placement-group bundle = the resources for a single worker slot."""
+def _fleet_node_class_resources(env: SchedulingEnvelope | None) -> dict:
+    """The node-class selector's bundle resources for a whole fleet — computed **once**.
+
+    `node_class_selector` reads the live topology (`ray.nodes()`), so it MUST NOT be called
+    per bundle/per worker: at W workers on N nodes that is an O(W x N) cost (thousands of
+    `ray.nodes()` RPCs on the driver). The selector is fleet-uniform, so a caller building a
+    W-bundle placement group or launching W actors computes this once and reuses it.
+    """
+    if env is None:
+        return {}
+    from batcher.dist.executors.ray_runtime.scaling import node_class_selector
+
+    sel = node_class_selector(env.prefer_cpu_only_nodes, env.n_tasks, env.num_cpus)
+    return sel.get("resources", {}) if sel else {}
+
+
+def _bundle(env: SchedulingEnvelope | None, node_class: dict | None = None) -> dict:
+    """One placement-group bundle = the resources for a single worker slot.
+
+    `node_class` is the precomputed fleet node-class selector (see
+    `_fleet_node_class_resources`); it is threaded in rather than recomputed here so a
+    W-bundle fleet reads the topology once, not W times. Falls back to computing it for a
+    lone-bundle caller that passes nothing.
+    """
     bundle: dict = {"CPU": env.num_cpus if env else 1.0}
     if env and env.num_gpus > 0:
         bundle["GPU"] = env.num_gpus
     if env and env.memory_bytes > 0:
         bundle["memory"] = int(env.memory_bytes)
+    # A PG bundle is matched by resource, so the CPU-only restriction must live in the
+    # bundle (not just `.options`) for the gang to land on CPU-only nodes.
+    extra = _fleet_node_class_resources(env) if node_class is None else node_class
+    if extra:
+        bundle.update(extra)
     return bundle
 
 
@@ -140,15 +175,17 @@ def _resolve_placement_strategy(env: SchedulingEnvelope | None) -> str:
     reports a single alive node. A PACK-family preference is honored as-is. Defaults to
     SPREAD with no envelope.
     """
+    # A GPU-collective stage runs its own multi-GPU collective (NCCL/etc.) internally, so
+    # its actors must be co-located — gang-schedule them STRICT_PACK regardless of the
+    # shuffle-volume preference. (STRICT_PACK on a single node is a no-op.)
+    if env is not None and env.gpu_collective:
+        return "STRICT_PACK"
     pref = env.placement_strategy if env is not None else "SPREAD"
     if pref in ("PACK", "STRICT_PACK"):
         return pref
-    try:
-        import ray
+    from batcher.dist.executors.ray_runtime.scaling import alive_node_count
 
-        nodes = sum(1 for n in ray.nodes() if n.get("Alive", True))
-    except Exception:
-        nodes = 0
+    nodes = alive_node_count()  # snapshot-aware: no extra `ray.nodes()` RPC inside a scope
     return "PACK" if nodes == 1 else pref
 
 
@@ -170,9 +207,11 @@ def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     import ray
     from ray.util.placement_group import placement_group, remove_placement_group
 
-    pg = placement_group(
-        [_bundle(env) for _ in range(workers)], strategy=_resolve_placement_strategy(env)
-    )
+    # Resolve the topology-dependent bits ONCE for the whole fleet (each reads `ray.nodes()`);
+    # building W bundles must not re-read the cluster W times (O(workers x nodes)).
+    node_class = _fleet_node_class_resources(env)
+    strategy = _resolve_placement_strategy(env)
+    pg = placement_group([_bundle(env, node_class) for _ in range(workers)], strategy=strategy)
     ready, _ = ray.wait([pg.ready()], timeout=_placement_timeout_s())
     if not ready:
         with contextlib.suppress(Exception):
@@ -181,14 +220,19 @@ def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     return pg
 
 
-def placement_actor_options(pg, index: int) -> dict:
+def placement_actor_options(pg, index: int, base: dict | None = None) -> dict:
     """Actor `.options(...)` placing worker `index` on bundle `index` of `pg`.
 
     Carries the envelope's per-task resources and binds the actor to its bundle via
     `PlacementGroupSchedulingStrategy`; with no PG it falls back to the plain
     resource options (default scheduling).
+
+    `base` is the fleet-uniform `task_options(...)` result computed **once** by the caller
+    (`fleet_actor_options`): `task_options` reads the live topology for the node-class
+    selector, so recomputing it per worker is an O(workers x nodes) cost at scale. Falls
+    back to computing it here for a lone-actor caller that passes nothing.
     """
-    opts = task_options(current_envelope())
+    opts = dict(base) if base is not None else task_options(current_envelope())
     if pg is None:
         return opts
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -197,6 +241,17 @@ def placement_actor_options(pg, index: int) -> dict:
         placement_group=pg, placement_group_bundle_index=index
     )
     return opts
+
+
+def fleet_actor_options(pg, workers: int) -> list[dict]:
+    """Per-worker actor `.options(...)` for a whole fleet, resolving the shared parts once.
+
+    `task_options(current_envelope())` reads the live topology (node-class selector) and is
+    fleet-uniform, so it is computed a single time here and only the per-bundle index varies
+    — turning a W-actor launch from O(workers x nodes) topology reads into one.
+    """
+    base = task_options(current_envelope())
+    return [placement_actor_options(pg, i, base) for i in range(workers)]
 
 
 def release_placement(pg) -> None:

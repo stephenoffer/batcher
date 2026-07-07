@@ -76,6 +76,11 @@ class SchedulingEnvelope:
                        internally, so `dist` gang-schedules its actors co-located
                        (STRICT_PACK). Batcher never touches a tensor — the Arrow contract
                        at operator boundaries is unchanged; only placement is affected.
+    * `inflight_depth` — per-actor submit-ahead depth for a GPU/inference actor pool: how
+                       many partitions one actor may have in flight at once. `1` is the
+                       one-at-a-time default; `>1` keeps a GPU fed across the
+                       dispatch/gather round-trip. Set by the conductor from measured GPU
+                       utilization; consumed only by the `dist` actor-pool driver.
     """
 
     num_cpus: float = 1.0
@@ -96,3 +101,4 @@ class SchedulingEnvelope:
     placement_strategy: str = "SPREAD"
     prefer_cpu_only_nodes: bool = False
     gpu_collective: bool = False
+    inflight_depth: int = 1

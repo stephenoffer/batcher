@@ -137,6 +137,33 @@ print(resilient_cluster.distributed.task_max_retries)
 # 4
 ```
 
+## Cluster saturation (tuning the autoscale wait)
+
+Out of the box the engine already fills the cluster — one worker per node, an even share
+of each node's cores, reducers scaled to the fan-out — and on an autoscaling cluster it
+waits (bounded) for autoscaler-launched nodes before sizing the fan-out, so a big query
+runs on the grown cluster. That wait auto-enables when an autoscaling cluster is detected
+(Anyscale / spot / `BATCHER_AUTOSCALE=1`); the recipe below only tunes it. Set
+`autoscale_wait_s=0` to opt out on a fixed cluster, or raise it when nodes boot slowly.
+
+```python
+base = Config()
+saturating = base.replace(
+    distributed=dataclasses.replace(
+        base.distributed,
+        autoscale_wait_s=300.0,  # wait up to 5 min for a slow-booting node pool
+        autoscale_poll_s=5.0,  # check capacity every 5 s
+        autoscale_stall_s=120.0,  # give up 2 min after capacity stops growing
+    ),
+)
+
+print(saturating.distributed.autoscale_wait_s)
+# 300.0
+```
+
+Pin the fan-out instead (skipping the wait entirely) by passing `num_workers=` to the
+terminal call, e.g. `ds.collect(num_workers=16)`.
+
 ## Reusing a recipe
 
 A recipe is an ordinary `Config`. Define it once, then activate it process-wide with

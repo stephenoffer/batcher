@@ -185,16 +185,35 @@ def stream_distributed_pipeline(
     n_consumers = _consumer_pool_size(gpu_stage, workers, n)
     gpu_opts = _gpu_options(gpu_stage.num_gpus, gpu_stage.accelerator_type)
 
-    producers = [_ProducerActor.remote(cpu_stage.sub_plan, credits) for _ in range(n_producers)]
     consumer_cls = _MapActor.options(**gpu_opts) if gpu_opts else _MapActor
-    consumers = [consumer_cls.remote(gpu_stage.sub_plan) for _ in range(n_consumers)]
+
+    def _spawn_producer():
+        return _ProducerActor.remote(cpu_stage.sub_plan, credits)
+
+    def _spawn_consumer():
+        return consumer_cls.remote(gpu_stage.sub_plan)
+
+    producers = [_spawn_producer() for _ in range(n_producers)]
+    consumers = [_spawn_consumer() for _ in range(n_consumers)]
+    # Every actor ever spawned (including preemption replacements) is killed at the end;
+    # the recovery loop mutates `producers`/`consumers` in place to hold the live pools.
+    alive: set = {*producers, *consumers}
     try:
-        results = _run_streamed(producers, consumers, partitions, new_plan_id(), credits)
+        results = _run_streamed(
+            producers,
+            consumers,
+            partitions,
+            new_plan_id(),
+            credits,
+            spawn_producer=_spawn_producer,
+            spawn_consumer=_spawn_consumer,
+            alive=alive,
+        )
         # The GPU consumers measured their utilization; record it so the next run's
         # `num_gpus` request adapts (the feedback half of GPU scheduling).
         _record_consumer_feedback(consumers, plan, hub)
     finally:
-        for actor in (*producers, *consumers):
+        for actor in alive:
             with contextlib.suppress(Exception):
                 ray.kill(actor)
 
@@ -216,7 +235,28 @@ def _record_consumer_feedback(consumers, plan: LogicalPlan, hub) -> None:
     _record_gpu_feedback(hub, plan, max(samples) if samples else None)
 
 
-def _run_streamed(producers, consumers, partitions, plan_id, credits):
+def _worker_loss_errors() -> tuple[type[BaseException], ...]:
+    """Ray exception types that signal a lost actor/task (safe to recover), built lazily
+    so `ray` stays an optional import."""
+    try:
+        import ray as _ray
+
+        return (_ray.exceptions.RayActorError, _ray.exceptions.RayTaskError)
+    except Exception:  # pragma: no cover - ray optional
+        return ()
+
+
+def _run_streamed(
+    producers,
+    consumers,
+    partitions,
+    plan_id,
+    credits,
+    *,
+    spawn_producer=None,
+    spawn_consumer=None,
+    alive: set | None = None,
+):
     """Stream partitions morsel by morsel through the producer and consumer pools.
 
     Each producer streams one partition at a time, publishing a morsel only while it
@@ -225,23 +265,53 @@ def _run_streamed(producers, consumers, partitions, plan_id, credits):
     the morsel (freeing a credit) and lets the producer publish the next. So CPU and
     GPU overlap, and a producer's resident output never exceeds `credits` morsels
     regardless of partition size. Returns `{(partition_idx, seq): output_batches}`.
+
+    Fault tolerance (spot preemption). Actors are stateful, so a lost actor is
+    recovered by lineage recompute, not lost:
+
+    - A **consumer** that dies mid-morsel had not released that morsel (release runs only
+      after a successful fetch), so the morsel is still on its producer's Flight server —
+      re-dispatch it to a fresh consumer. A deterministic `RayTaskError` (a UDF bug, not a
+      preemption) is bounded by `recovery_max_attempts` so it surfaces instead of looping.
+    - A **producer** that dies takes its in-flight partition (open iterator + published
+      morsels) with it, so re-run that whole partition on a fresh producer from its durable
+      descriptor. Output morsels are keyed by `(pidx, seq)` and the sub-plan is
+      deterministic, so the re-run reproduces the same keys/values — `results` overwrites
+      idempotently and stays complete. In-flight fetches from the dead producer fail and
+      are discarded (their partition is being re-run).
+
+    `spawn_producer`/`spawn_consumer` mint replacement actors (registered in `alive` for
+    teardown); with neither provided (single-actor tests) a loss re-raises.
     """
     from batcher.carbonite.transfer import ShuffleTicket
+    from batcher.config import active_config
+
+    loss_errors = _worker_loss_errors()
+    max_attempts = max(1, active_config().distributed.recovery_max_attempts)
 
     free_producers = deque(producers)
     pending_parts = deque(enumerate(partitions))  # (partition_idx, descriptor)
     state: dict = {}  # producer -> per-partition streaming state
     addr_of: dict = {}  # producer -> its (stable) Flight address
+    dead_producers: set = set()  # producers lost to preemption (their morsels are void)
     open_inflight: dict = {}  # ref -> producer
     publish_inflight: dict = {}  # ref -> (producer, partition_idx, seq, ticket)
-    consume_inflight: dict = {}  # ref -> (consumer, producer, key)
+    consume_inflight: dict = {}  # ref -> (consumer, producer, key, addr, ticket)
     free_consumers = deque(consumers)
-    ready: deque = deque()  # (addr, ticket, producer, key) awaiting a free consumer
+    ready: deque = deque()  # (addr, ticket, producer, key, attempts) awaiting a consumer
     results: dict = {}
+    part_attempts: dict = {}  # pidx -> re-run count (bounds a deterministic producer crash)
 
     def start_part(prod) -> None:
         pidx, desc = pending_parts.popleft()
-        state[prod] = {"pidx": pidx, "seq": 0, "outstanding": 0, "done": False, "open": False}
+        state[prod] = {
+            "pidx": pidx,
+            "desc": desc,
+            "seq": 0,
+            "outstanding": 0,
+            "done": False,
+            "open": False,
+        }
         open_inflight[prod.open.remote(desc)] = prod
 
     def recycle(prod) -> None:
@@ -251,10 +321,51 @@ def _run_streamed(producers, consumers, partitions, plan_id, credits):
         else:
             free_producers.append(prod)
 
-    while free_producers and pending_parts:
-        start_part(free_producers.popleft())
+    def replace_consumer(dead) -> None:
+        """Drop a lost consumer and, if we can, add a fresh one so pool size holds."""
+        with contextlib.suppress(ValueError):
+            free_consumers.remove(dead)
+        with contextlib.suppress(ValueError):
+            consumers.remove(dead)
+        if spawn_consumer is not None:
+            fresh = spawn_consumer()
+            if alive is not None:
+                alive.add(fresh)
+            consumers.append(fresh)
+            free_consumers.append(fresh)
+
+    def lose_producer(dead, *, exc) -> None:
+        """Re-queue a lost producer's partition for a full deterministic re-run."""
+        if dead in dead_producers:
+            return
+        dead_producers.add(dead)
+        st = state.pop(dead, None)
+        with contextlib.suppress(ValueError):
+            free_producers.remove(dead)
+        with contextlib.suppress(ValueError):
+            producers.remove(dead)
+        # Drop this producer's ready-but-unconsumed morsels — its Flight server is gone.
+        for item in [i for i in ready if i[2] is dead]:
+            ready.remove(item)
+        if st is not None:
+            pidx = st["pidx"]
+            part_attempts[pidx] = part_attempts.get(pidx, 0) + 1
+            if part_attempts[pidx] > max_attempts:
+                raise exc  # a partition that keeps killing its producer is not recoverable
+            pending_parts.append((pidx, st["desc"]))
+        if spawn_producer is not None:
+            fresh = spawn_producer()
+            if alive is not None:
+                alive.add(fresh)
+            producers.append(fresh)
+            free_producers.append(fresh)
 
     while True:
+        # Assign any pending partitions (initial fan-out and recovery re-runs) to free
+        # producers at the top of every iteration, so a re-queued partition restarts.
+        while free_producers and pending_parts:
+            start_part(free_producers.popleft())
+
         # Issue a publish for every opened producer that has production-window headroom
         # and no publish already in flight (one outstanding publish per producer).
         publishing = {p for p, _pi, _s, _t in publish_inflight.values()}
@@ -269,10 +380,10 @@ def _run_streamed(producers, consumers, partitions, plan_id, credits):
 
         # Assign ready morsels to free consumers.
         while ready and free_consumers:
-            addr, ticket, prod, key = ready.popleft()
+            addr, ticket, prod, key, attempts = ready.popleft()
             consumer = free_consumers.popleft()
             ref = consumer.run_split.remote(addr, ticket)
-            consume_inflight[ref] = (consumer, prod, key)
+            consume_inflight[ref] = (consumer, prod, key, addr, ticket, attempts)
 
         waitset = list(open_inflight) + list(publish_inflight) + list(consume_inflight)
         if not waitset:
@@ -281,26 +392,50 @@ def _run_streamed(producers, consumers, partitions, plan_id, credits):
         ref = done[0]
         if ref in open_inflight:
             prod = open_inflight.pop(ref)
-            addr_of[prod] = ray.get(ref)
+            try:
+                addr_of[prod] = ray.get(ref)
+            except loss_errors as exc:
+                lose_producer(prod, exc=exc)
+                continue
             if prod in state:
                 state[prod]["open"] = True
         elif ref in publish_inflight:
             prod, pidx, seq, ticket = publish_inflight.pop(ref)
-            st = state[prod]
-            if ray.get(ref):
+            try:
+                more = ray.get(ref)
+            except loss_errors as exc:
+                lose_producer(prod, exc=exc)
+                continue
+            st = state.get(prod)
+            if st is None:  # producer was lost between issue and completion
+                continue
+            if more:
                 st["outstanding"] += 1
-                ready.append((addr_of[prod], ticket, prod, (pidx, seq)))
+                ready.append((addr_of[prod], ticket, prod, (pidx, seq), 0))
             else:
                 st["done"] = True
                 if st["outstanding"] == 0:
                     recycle(prod)
         else:
-            consumer, prod, key = consume_inflight.pop(ref)
-            results[key] = ray.get(ref)
+            consumer, prod, key, addr, ticket, attempts = consume_inflight.pop(ref)
+            try:
+                out = ray.get(ref)
+            except loss_errors as exc:
+                # The consumer (or its fetch from a now-dead producer) failed. Replace the
+                # consumer; if the producer is still alive the morsel is still published,
+                # so re-dispatch it (bounded); if the producer died, its partition is being
+                # re-run, so drop this morsel.
+                replace_consumer(consumer)
+                if prod not in dead_producers and prod in state:
+                    if attempts + 1 > max_attempts:
+                        raise exc
+                    ready.append((addr, ticket, prod, key, attempts + 1))
+                continue
+            results[key] = out
             free_consumers.append(consumer)
             st = state.get(prod)
-            ticket = ShuffleTicket(plan_id, _STAGE_ID, key[0], key[1])
-            prod.release.remote(ticket)  # free one production credit
+            if prod not in dead_producers:
+                prod.release.remote(ticket)  # free one production credit
             if st is not None:
                 st["outstanding"] -= 1
                 if st["done"] and st["outstanding"] == 0:

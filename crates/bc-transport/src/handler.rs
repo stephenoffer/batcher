@@ -188,6 +188,19 @@ impl FlightService for FlightHandler {
             }
         }
 
+        // Optional shard selector in path[2] as "shard/nshards": serve only every
+        // nshards-th batch starting at shard, so a consumer can pull one bucket over
+        // several connections at once (one flow per shard). Absent/malformed ⇒ whole
+        // bucket (0/1), keeping the un-sharded path unchanged.
+        let (shard, nshards) = first
+            .flight_descriptor
+            .as_ref()
+            .and_then(|d| d.path.get(2))
+            .and_then(|s| s.split_once('/'))
+            .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
+            .filter(|&(s, n)| n >= 1 && s < n)
+            .unwrap_or((0, 1));
+
         let (batches, gauge) = self
             .store
             .get_with_gauge(&ticket)
@@ -241,7 +254,17 @@ impl FlightService for FlightHandler {
             .first()
             .map(|b| b.schema())
             .unwrap_or_else(|| Arc::new(Schema::empty()));
-        let batch_vec = (*batches).clone();
+        // Serve only this shard's interleaved slice (whole bucket when nshards == 1).
+        let batch_vec: Vec<_> = if nshards == 1 {
+            (*batches).clone()
+        } else {
+            batches
+                .iter()
+                .skip(shard)
+                .step_by(nshards)
+                .cloned()
+                .collect()
+        };
 
         // Build a credit-gated source stream: await one credit per batch before
         // letting it flow into the Flight encoder. Acquiring *before* yielding is
@@ -264,7 +287,19 @@ impl FlightService for FlightHandler {
             }
         };
 
+        // Compress each batch's Arrow buffers on the wire (the consumer auto-decompresses
+        // from the codec in the IPC metadata). A cross-node fetch is NIC-bound, so sending
+        // fewer bytes is what lifts effective throughput past line rate for the compressible
+        // data a real shuffle carries. Falls back to no compression if the codec can't be
+        // applied (keeps the transfer correct).
+        let mut opts = arrow::ipc::writer::IpcWriteOptions::default();
+        if let Some(codec) = crate::compression() {
+            if let Ok(compressed) = opts.clone().try_with_compression(Some(codec)) {
+                opts = compressed;
+            }
+        }
         let stream = FlightDataEncoderBuilder::new()
+            .with_options(opts)
             .with_schema(schema)
             .build(gated)
             .map_err(|e| Status::internal(format!("flight encode error: {e}")));

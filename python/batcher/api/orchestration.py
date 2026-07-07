@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, TypeVar
 
@@ -235,36 +234,9 @@ def partitions_from_physical(opt: PhysicalPlan) -> int | None:
     return _clamp_partitions(max(widths))
 
 
-def auto_num_partitions(plan: LogicalPlan, sources: list[Source], hub: MetadataHub | None) -> int:
-    """Data-sized spill partition count for `plan` (used when the user gives none).
-
-    Estimates the plan's input cardinality with Kyber's `CardinalityEstimator`
-    (sharpened by any learned stats in `hub`) and targets ~`target_rows_per_task`
-    rows per partition — the same sizing rule Kyber uses for breaker parallelism.
-    Falls back to `DEFAULT_PARTITIONS` when the size is unknown.
-    """
-    from batcher.kyber import load_learned_stats
-    from batcher.kyber.cardinality import CardinalityEstimator
-
-    try:
-        learned = load_learned_stats(hub) if hub is not None else None
-        est = CardinalityEstimator(sources=sources, learned=learned)
-        rows = est.estimate(plan).rows
-        opt = active_config().optimizer
-        target = opt.target_rows_per_task
-        if rows <= 0 or target <= 0:
-            return DEFAULT_PARTITIONS
-        row_parts = math.ceil(rows / target)
-        # Also shard by bytes so a few wide rows (GB blobs/embeddings) don't land a
-        # huge partition on one task: take the larger of the row- and byte-derived
-        # counts. Width is the flat default until measured, so narrow data is
-        # unaffected (byte_parts <= row_parts there).
-        width = est.row_width(plan, opt.row_bytes)
-        byte_target = max(1, opt.target_bytes_per_task)
-        byte_parts = math.ceil(rows * width / byte_target)
-        return _clamp_partitions(max(row_parts, byte_parts))
-    except Exception:  # pragma: no cover - sizing must never break a query
-        return DEFAULT_PARTITIONS
+# `auto_num_partitions` (the data-sized spill/shuffle partition count, learned-seeded) is an
+# adaptive-sizing decision, so it lives in `api.tuning`; re-exported here for its callers.
+from batcher.api.tuning import auto_num_partitions  # noqa: E402
 
 
 def run_relational(
@@ -299,7 +271,10 @@ def run_relational(
 
     scope: contextlib.AbstractContextManager = contextlib.nullcontext()
     if active_config().execution.adaptive_morsel_sizing:
-        adapted = carbonite.ResourceManager().recommended_config()
+        # Pass the hub so the morsel target reflects the *learned* per-family peak memory
+        # (Carbonite's `LearnedMemoryModel` over recorded `m_peak_bytes`), not just live
+        # pressure — result-invariant (a morsel only batches data).
+        adapted = carbonite.ResourceManager(hub=ctx.hub).recommended_config()
         if adapted is not None:
             scope = config_context(adapted)
     with scope:
@@ -315,28 +290,49 @@ def _run_relational(
     materialize: bool = True,
 ) -> tuple[pa.Table | Source, list[BuildSideDecision]]:
     """The Kyber → Carbonite → Core body, run under the (possibly adapted) config."""
+    import time
+
     from batcher import carbonite, core, kyber
     from batcher._internal.logging import ensure_configured, get_logger
 
     ensure_configured()
+    _t0 = time.perf_counter()  # wall clock for the join-strategy bandit's per-run reward
     # Per-source statistics (footer/manifest/catalog) let the optimizer's zone-map
     # and null-driven rules prune predicates and skip files before execution. Reuse
     # the conductor's already-collected stats when present (the metadata-answer
     # attempt for a missed count()/is_empty() collected them), so a terminal op reads
     # each source's footer once across both passes.
+    import os as _rp_os
+
+    _rpp = _rp_os.environ.get("BATCHER_SORT_PROFILE")
+    _rpt = time.perf_counter()
     source_stats = (
         ctx.source_stats if ctx.source_stats is not None else collect_source_stats(sources, ctx.hub)
     )
-    opt, decisions = kyber.optimize_traced(
+    if _rpp:
+        print(f"[rr] collect_source_stats {time.perf_counter() - _rpt:.1f}s", flush=True)
+        _rpt = time.perf_counter()
+    # One optimizer run yields both the physical plan (admission/costing) and the
+    # optimized *logical* plan (the distributed / out-of-core executors read its derived
+    # join keys + pushed predicates). Computing both here avoids re-running the entire
+    # pipeline a second time via `optimize_logical` on those paths.
+    opt, logical_opt, decisions = kyber.optimize_full(
         plan, sources=sources, hub=ctx.hub, source_stats=source_stats
     )
+    if _rpp:
+        print(f"[rr] kyber.optimize_full {time.perf_counter() - _rpt:.1f}s", flush=True)
+        _rpt = time.perf_counter()
     prof = ctx.profile
     if prof is not None:
         from batcher.api.terminal.profile import record_plan
 
         record_plan(prof, opt, plan, distributed, decisions)
 
-    rm = carbonite.ResourceManager()
+    # Hub-backed so admission/spill/reservation size from the learned per-family peak
+    # memory (measured `m_peak_bytes`), not the plan estimate alone — closing the "peak
+    # measured but never consumed" gap. Result-invariant: a spill/reservation choice only
+    # changes where data lives, never the answer.
+    rm = carbonite.ResourceManager(hub=ctx.hub)
     verdict = rm.validate(opt)
     get_logger("api").debug("optimized %d ops; feasible=%s", len(opt.ops), verdict.feasible)
     if prof is not None:
@@ -354,37 +350,56 @@ def _run_relational(
 
     if distributed:
         from batcher import dist
+        from batcher.api.tuning import distributed_grant, record_distributed
 
-        envelope = rm.scheduling_envelope(opt, ctx.num_workers)
+        # Learned scheduling: size worker fan-out from the measured data volume (when the user
+        # gave none) and warm-start the shuffle credit window from what this signature converged
+        # on last time. Both are pure scheduling levers (AIMD still governs the window used, the
+        # mergeable algebra makes any worker count identical), so a cold hub grants the default.
+        if _rpp:
+            print(f"[rr] carbonite.validate {time.perf_counter() - _rpt:.1f}s", flush=True)
+            _rpt = time.perf_counter()
+        workers, envelope = distributed_grant(rm, opt, plan, sources, ctx)
+        if _rpp:
+            print(f"[rr] distributed_grant {time.perf_counter() - _rpt:.1f}s", flush=True)
+            _rpt = time.perf_counter()
         # Distribute the OPTIMIZED logical plan, not the raw one: the distributed executor
         # reads join keys / pushed predicates straight off the LogicalPlan, and a comma
         # join (`FROM a, b WHERE a.k=b.k`) is raw-lowered as a cartesian inner join on a
         # constant `__cross_key` with the equality stranded in a Filter above it. Run raw,
         # every row hashes to one bucket (a cross product) and the shuffle collapses onto a
-        # single reducer; `optimize_logical` derives the real `a.k=b.k` join keys first (the
-        # same structure the adaptive path already distributes). Single-node was unaffected
-        # because it executes `opt`'s IR, which carries the derived keys.
-        logical = kyber.optimize_logical(
-            plan, sources=sources, hub=ctx.hub, source_stats=source_stats
-        )
+        # single reducer; the optimized logical plan derives the real `a.k=b.k` join keys
+        # first (the same structure the adaptive path already distributes). Single-node was
+        # unaffected because it executes `opt`'s IR, which carries the derived keys.
+        logical = logical_opt
         # Profiling: collect the workers' map sub-plan metrics (their own profile section).
         wm: list = []
         result = dist.execute_distributed(
             logical,
             sources,
-            ctx.num_workers,
+            workers,
             transport=ctx.transport,
             envelope=envelope,
             hub=ctx.hub,
             materialize=materialize,
             metrics_out=wm if prof is not None else None,
         )
+        if _rpp:
+            print(f"[rr] execute_distributed {time.perf_counter() - _rpt:.1f}s", flush=True)
+            _rpt = time.perf_counter()
         if prof is not None:
             prof.worker_metrics = wm
         # Core collects metadata on every path so later plans improve with use.
         from batcher.api.terminal._metadata import collect_source_metadata
 
         collect_source_metadata(ctx.hub, sources)
+        if _rpp:
+            print(f"[rr] collect_source_metadata {time.perf_counter() - _rpt:.1f}s", flush=True)
+        # Close the loops: persist the shuffle window used and feed the join-strategy bandit.
+        record_distributed(
+            ctx.hub, plan, logical_opt, decisions, envelope.credits,
+            (time.perf_counter() - _t0) * 1000.0,
+        )
         return result, decisions
 
     # Carbonite decides out-of-core: if the estimated working set won't fit the
@@ -396,9 +411,15 @@ def _run_relational(
     if must_spill or rm.should_spill(opt):
         from batcher.dist.spill import spill_collect
 
-        # Shard the out-of-core spill by data volume (Kyber's per-breaker fan-out),
-        # not a blind constant, so a bigger group-by/join uses more, smaller buckets.
-        partitions = partitions_from_physical(opt) or DEFAULT_PARTITIONS
+        # Shard the out-of-core spill by data volume: prefer the learned recommendation
+        # (from measured per-family peak memory), then Kyber's per-breaker fan-out, then a
+        # constant — so a bigger group-by/join uses more, smaller buckets. Partition count
+        # only shards the spill; the merged result is identical (mergeable algebra).
+        partitions = (
+            rm.recommend_spill_partitions(opt)
+            or partitions_from_physical(opt)
+            or DEFAULT_PARTITIONS
+        )
         if prof is not None:
             from batcher.api.terminal.profile import record_spill
 
@@ -407,10 +428,13 @@ def _run_relational(
         # join keys (a comma join, else a cartesian blow-up out-of-core) and lowers
         # `COUNT(DISTINCT x)` to `COUNT(*)` over a `DISTINCT` — so the spilling executor
         # dedups efficiently (hash-partitioned) instead of spilling a giant value list.
-        spill_logical = kyber.optimize_logical(
-            plan, sources=sources, hub=ctx.hub, source_stats=source_stats
-        )
-        spilled = spill_collect(spill_logical, sources, partitions)
+        # Reuse the logical plan already optimized above rather than re-running the pipeline.
+        # Force the learned spill codec (large IO-bound state compresses; small state does not);
+        # IPC self-describes its codec, so the un-spilled result is byte-identical either way.
+        from batcher.api.tuning import spill_compression_scope
+
+        with spill_compression_scope(rm, opt):
+            spilled = spill_collect(logical_opt, sources, partitions)
         if spilled is not None:
             kyber.record_execution(ctx.hub, plan, spilled.num_rows)
             return spilled, decisions
@@ -464,4 +488,15 @@ def _run_relational(
 
     learn_column_stats(ctx.hub, resolved)
     kyber.record_selectivity(ctx.hub, plan, sources, table.num_rows)
+    # Close the conductor's tuning loops from this run's measured outcomes (breaker volume →
+    # partition count, group reduction → pre-aggregation, join wall time → the bandit). Each
+    # only steers a later performance choice, so recording is result-invariant.
+    from batcher.api.tuning import record_run_feedback, total_source_rows
+
+    record_run_feedback(
+        ctx.hub, plan, logical_opt, decisions,
+        out_rows=table.num_rows,
+        input_rows=total_source_rows(sources),
+        wall_ms=(time.perf_counter() - _t0) * 1000.0,
+    )
     return table, decisions

@@ -8,6 +8,7 @@ single-node run and the non-overlapped distributed map.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 
 import pytest
@@ -136,3 +137,152 @@ def _one_row(i: int):
     import pyarrow as pa
 
     return pa.RecordBatch.from_pydict({"id": [i], "x": [i]})
+
+
+@ray.remote
+class _DyingConsumer:
+    """A consumer stand-in that always fails its fetch — simulates a preempted GPU node.
+
+    The recovery loop must replace it with a spawned consumer and re-dispatch the morsel
+    (which is still on the producer's Flight server), losing no data.
+    """
+
+    def run_split(self, addr, ticket):
+        raise RuntimeError("simulated consumer preemption")
+
+    def gpu_stats(self):
+        return None
+
+
+@ray.remote
+class _DyingProducer:
+    """A producer stand-in whose partition open fails — simulates a preempted CPU node.
+
+    The recovery loop must re-queue the whole partition onto a spawned producer and
+    reproduce every `(pidx, seq)` morsel deterministically.
+    """
+
+    def addr(self):
+        return "dead"
+
+    def open(self, partition):
+        raise RuntimeError("simulated producer preemption")
+
+    def publish_next(self, ticket):
+        return False
+
+    def release(self, ticket):
+        return None
+
+    def peak_retained(self):
+        return 0
+
+
+def _stage_setup(rows: int, credits: int):
+    from batcher.config import Config, DistributedConfig, FlowControlConfig
+    from batcher.dist.executors.partition_io import partition_descriptors
+    from batcher.dist.executors.plan_analysis import split_at_first_pool_boundary
+    from batcher.dist.executors.ray_runtime import _ensure_ray
+    from batcher.io.source import InMemorySource
+
+    cfg = Config().replace(
+        distributed=DistributedConfig(stream_inference=True),
+        flow_control=FlowControlConfig(default_credits=credits),
+    )
+    ctx = config_context(cfg)
+    ctx.__enter__()
+    ds = bt.from_pydict({"id": list(range(rows)), "x": list(range(rows))})
+    plan = ds.ml.map_batches(_double).ml.map_batches(_AddOne)._plan
+    cpu_stage, gpu_stage = split_at_first_pool_boundary(plan)
+    _ensure_ray(1)
+    src = InMemorySource([_one_row(i) for i in range(rows)])
+    partitions = partition_descriptors(src, 1)
+    return ctx, cpu_stage, gpu_stage, partitions
+
+
+def _collect_ys(results) -> list[int]:
+    return sorted(v for _k, out in results.items() if out for b in out for v in b.to_pydict()["y"])
+
+
+def test_streamed_recovers_from_consumer_preemption():
+    # A consumer lost mid-stream: its morsel is re-dispatched to a spawned replacement,
+    # so every row still lands with the correct value.
+    from batcher.dist.executors.map import _MapActor
+    from batcher.dist.flight_worker import new_plan_id
+    from batcher.dist.streaming.pipeline import _ProducerActor, _run_streamed
+
+    rows, credits = 40, 2
+    ctx, cpu_stage, gpu_stage, partitions = _stage_setup(rows, credits)
+    producer = _ProducerActor.remote(cpu_stage.sub_plan, credits)
+    dying = _DyingConsumer.remote()
+    alive = {producer, dying}
+
+    def spawn_consumer():
+        a = _MapActor.remote(gpu_stage.sub_plan)
+        alive.add(a)
+        return a
+
+    def spawn_producer():
+        a = _ProducerActor.remote(cpu_stage.sub_plan, credits)
+        alive.add(a)
+        return a
+
+    try:
+        results = _run_streamed(
+            [producer],
+            [dying],
+            partitions,
+            new_plan_id(),
+            credits,
+            spawn_producer=spawn_producer,
+            spawn_consumer=spawn_consumer,
+            alive=alive,
+        )
+        assert _collect_ys(results) == [i * 2 + 1 for i in range(rows)]
+    finally:
+        for actor in alive:
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+        ctx.__exit__(None, None, None)
+
+
+def test_streamed_recovers_from_producer_preemption():
+    # A producer lost while opening its partition: the whole partition re-runs on a
+    # spawned replacement and reproduces every morsel deterministically.
+    from batcher.dist.executors.map import _MapActor
+    from batcher.dist.flight_worker import new_plan_id
+    from batcher.dist.streaming.pipeline import _ProducerActor, _run_streamed
+
+    rows, credits = 40, 2
+    ctx, cpu_stage, gpu_stage, partitions = _stage_setup(rows, credits)
+    dying = _DyingProducer.remote()
+    consumer = _MapActor.remote(gpu_stage.sub_plan)
+    alive = {dying, consumer}
+
+    def spawn_consumer():
+        a = _MapActor.remote(gpu_stage.sub_plan)
+        alive.add(a)
+        return a
+
+    def spawn_producer():
+        a = _ProducerActor.remote(cpu_stage.sub_plan, credits)
+        alive.add(a)
+        return a
+
+    try:
+        results = _run_streamed(
+            [dying],
+            [consumer],
+            partitions,
+            new_plan_id(),
+            credits,
+            spawn_producer=spawn_producer,
+            spawn_consumer=spawn_consumer,
+            alive=alive,
+        )
+        assert _collect_ys(results) == [i * 2 + 1 for i in range(rows)]
+    finally:
+        for actor in alive:
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+        ctx.__exit__(None, None, None)

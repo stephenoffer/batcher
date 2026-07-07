@@ -113,6 +113,8 @@ try:
             token: str = "",
             idle_timeout_ms: int = 0,
             keepalive_ms: int = 0,
+            connections_per_peer: int = 0,
+            compression: int = 1,
             plan_id: int = _DEFAULT_PLAN_ID,
             shm: bool = False,
             preemption: bool = False,
@@ -139,8 +141,9 @@ try:
             # a dead peer is detected, and set keepalive to catch a dropped connection
             # promptly. A long GC pause under a generous idle window is not misread as
             # death. 0 keeps the process default.
-            if idle_timeout_ms or keepalive_ms:
-                nat.set_flight_transport_config(idle_timeout_ms, keepalive_ms)
+            nat.set_flight_transport_config(
+                idle_timeout_ms, keepalive_ms, connections_per_peer, compression
+            )
 
             self.id = worker_id
             # The node's routable IP, so this worker's Flight server advertises a
@@ -467,7 +470,7 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     from batcher.dist.executors.ray_runtime import (
         create_worker_placement,
         current_envelope,
-        placement_actor_options,
+        fleet_actor_options,
     )
 
     dc = active_config().distributed
@@ -483,6 +486,8 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     # setter. 0 keepalive = off.
     idle_ms = int(dc.flight_idle_timeout_s * 1000)
     keepalive_ms = int((dc.flight_keepalive_s or 0) * 1000)
+    connections_per_peer = int(dc.flight_connections_per_peer or 0)
+    compression = {"none": 0, "lz4": 1, "zstd": 2}.get(dc.flight_compression, 1)
     # Same-node shared-memory transfer, decided on the driver and shipped to every
     # worker (which can't see the driver's config_context). Gated on the native probe so
     # it is never enabled where no shared directory exists (it would just churn fallbacks).
@@ -496,9 +501,23 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     # protected without setting it by hand.
     preemption = dc.resilience == "spot"
     pg = create_worker_placement(workers, current_envelope())
+    # Resolve the fleet-uniform actor options once (they read the live topology), then vary
+    # only the per-bundle index — so spawning W workers is O(W), not O(W x nodes).
+    opts = fleet_actor_options(pg, workers)
     actors = [
-        _FlightWorker.options(**placement_actor_options(pg, i)).remote(
-            i, credits, cfg_json, adaptive, token, idle_ms, keepalive_ms, plan_id, shm, preemption
+        _FlightWorker.options(**opts[i]).remote(
+            i,
+            credits,
+            cfg_json,
+            adaptive,
+            token,
+            idle_ms,
+            keepalive_ms,
+            connections_per_peer,
+            compression,
+            plan_id,
+            shm,
+            preemption,
         )
         for i in range(workers)
     ]

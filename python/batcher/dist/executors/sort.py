@@ -15,7 +15,6 @@ leading key must be a plain column to range-partition on).
 from __future__ import annotations
 
 import json
-import tempfile
 
 import pyarrow as pa
 
@@ -27,7 +26,7 @@ from batcher.dist.executors.ray_runtime import (
     engine_config_json,
     shuffle_partitions,
 )
-from batcher.dist.shuffle_io import read_ipc
+from batcher.dist.shuffle_io import distributed_work_dir, read_ipc
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Sort
 
@@ -66,7 +65,7 @@ def _distributed_sort(
     )
     n_buckets = shuffle_partitions(workers)
 
-    work_dir = tempfile.mkdtemp(prefix="batcher_dsort_")
+    work_dir = distributed_work_dir("batcher_dsort_")
     try:
         # Partition the source into per-worker map inputs (no data read on driver).
         partitions = _partition_source(sources[sid], workers, work_dir)

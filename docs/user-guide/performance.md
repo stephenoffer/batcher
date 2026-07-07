@@ -325,6 +325,26 @@ row-exploding `flat_map → agg` that materializes 480 M rows on one node instea
 ~**5.8× faster** distributed, where each partition reduces before anything leaves it.
 Full numbers and the reproduction harness are in `benchmarks/BENCHMARK_RESULTS.md`.
 
+### Distributed shuffle & data movement (automatic)
+
+A distributed `group_by` / `join` / `sort` moves its data over Carbonite's Arrow Flight
+transport — never the Ray object store — and picks the cheapest path for each fetch
+**with no configuration**. Same-process buckets are read in place; same-node,
+cross-process buckets (the common case when a node runs several worker actors) are read
+**zero-copy from shared memory** — a memory-mapped Arrow IPC file — which measured
+**≈23× faster than a loopback Flight hop** (1.2 → 27 GB/s point-to-point on a real
+cluster), and **7.5×** through a full concurrent gather. It is on by default and
+self-limiting: a mapper skips the shared-memory copy under memory pressure (falling back
+to Flight), so it never risks OOM on a tight or churning spot node, and a miss is always
+bit-identical to the network path.
+
+Cross-node, a single reducer saturates its NIC (~22 Gbps on a T4 node), so throughput
+scales with the **whole cluster**: measured aggregate all-to-all shuffle of **2.0 → 6.9 →
+15.2 GB/s at 2 → 4 → 8 nodes**. The mergeable `partial → combine → finalize` algebra and
+credit-based flow control keep per-node memory bounded as the cluster grows, so the same
+path holds from a few nodes to thousands, including autoscaling spot fleets. None of this
+is a knob you set — it adapts to the cluster shape on its own.
+
 ### GPU data-plane backend (vs Ray Data + cuDF)
 
 A supported relational query can run on the GPU (cuDF) instead of the CPU engine by
@@ -350,6 +370,12 @@ fast, morsel-parallel) CPU engine; anything unsupported or a GPU-less cluster tr
 falls back. The GPU worker reads its shard straight from storage — the source is never
 funnelled through the driver.
 
+The crossover itself is **learned**, not fixed. Each GPU or CPU group-by run records its
+(estimated rows, wall time) to the MetadataHub; Kyber fits a cost line per backend and
+solves for their intersection, so the threshold self-corrects to the hardware — a faster
+GPU or a wider table moves it on its own (Core measures, Kyber consumes). Until enough runs
+are seen it uses the measured default (`distributed.gpu_min_rows`, ~10 M rows on an 8×T4).
+
 Measured on an 8×T4 cluster, a `read_parquet → group_by → sum` at **100 M rows**, each
 result correctness-gated against the CPU engine:
 
@@ -364,6 +390,43 @@ Data has no GPU aggregate, so a user rebuilds one from `map_batches` and pays it
 bridge on top. At small sizes the picture inverts (at 4 M rows the GPU loses ~5× to the CPU
 engine), which is exactly why `auto` gates on size. See
 `benchmarks/gpu_backend/relational_vs_raydata.py`.
+
+### GPU batch inference & ML workloads (vs Ray Data)
+
+The relational GPU path above is one use of the device; the larger one is ML — batch
+inference, embeddings, LLM generation, and training-data ingest through `map_batches`.
+Batcher runs these as **stage-overlapped streaming** (a CPU decode/prep stage keeps the GPU
+forward fed instead of idling it) with **session-warm model pools** (the model loads once per
+session, not once per job). Measured distributed over **8×T4**, each result correctness-gated
+(prediction / generated-text / tensor agreement across engines) before any timing is trusted
+(`benchmarks/cluster/gpu_*.py`):
+
+| workload (8×T4) | batcher | Ray Data | batcher vs Ray |
+|-----------------|--------:|---------:|:--------------:|
+| **LLM batch inference** (gpt2 generate, 2048 prompts) | 814 prompt/s (2.5 s) | 73 prompt/s (28 s) | **11.1×** |
+| **training-data ingest** (`iter_torch_batches`, zero-copy DLPack) | 1.06 M rows/s | 281 K rows/s | **3.0×** |
+| **batch inference** (ResNet-50 classify, iterative) | 2576 img/s @ 78% util | 1257 @ 41% | **2.05×** |
+| **batch embeddings** (2048-d feature vectors) | 2502 img/s @ 80% util | 1267 @ 41% | **1.98×** |
+| **zero-config GPU** (`map_batches(Model, num_gpus=1)`, no `batch_size`) | 2451 img/s @ 82% util | *hard-errors* | Ray refuses |
+
+The wins are the general `map_batches`-inference mechanism, not one model:
+
+- **Stage-overlap streaming** lifted a two-stage decode → ResNet-50 pipeline from **942 → 2504
+  img/s** and GPU utilization from **~30% → 81%** — the device stays fed instead of idling
+  through the CPU decode. Result-identical to the materializing path; single-node == distributed.
+- **Session-warm pools** (`distributed.warm_inference_pools`, on by default) load the model once
+  per session; Ray Data respawns its actor pool and reloads the model on every `collect()`. That
+  is where the 2×–11× shows up — the realistic notebook / batch-inference-service / many-datasets
+  pattern — and it grows with model size (the LLM's multi-GB load is paid once, not per run).
+- **Zero-config**: `map_batches(Model, num_gpus=1)` with no `batch_size` is where out-of-the-box
+  utilization is won or lost. Ray Data hard-errors (`must provide batch_size`); Batcher picks a
+  VRAM-safe default, streams it with stage overlap, and self-corrects on a CUDA OOM by halving the
+  batch — **82% util at 2451 img/s** with zero knobs.
+
+On a *single maximally-large* compute-bound job both engines saturate the same GPUs at the same
+FLOPs (131k images: batcher 2504 vs Ray 2383 img/s ≈ parity, both ≥78% util) — the honest ceiling;
+2× there needs fewer FLOPs (FP16 / quantization), not a faster data plane. Full methodology and
+per-scale numbers: `benchmarks/BENCHMARK_RESULTS.md`.
 
 ## Reading a query plan
 

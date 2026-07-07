@@ -103,14 +103,16 @@ def register_builtin_rules(registry: RuleRegistry) -> None:
     now expressed as phased rules. They double as the reference examples for the
     rule model:
 
-      - NORMALIZE: constant folding, expression simplification (whole-tree, confluent)
-      - PUSHDOWN:  predicate pushdown (Filter), projection/column pruning
-      - FUSION:    top-N fusion (Sort+Limit → partial sort)
-      - SELECTION: adaptive join build-side (cost-based, records its decision)
+      - NORMALIZE:    constant folding, expression simplification (whole-tree, confluent)
+      - PUSHDOWN:     predicate pushdown (Filter), projection/column pruning
+      - JOIN_REORDER: cost-based join ordering (DPccp/DPhyp with a greedy fallback,
+                      registered as `join_reorder` from `rules.join_order`)
+      - FUSION:       top-N fusion (Sort+Limit → partial sort)
+      - SELECTION:    adaptive join build-side (cost-based, records its decision)
 
-    The JOIN_REORDER phase is intentionally empty today — it is the seam where the
-    cost-based join-ordering memo lands (DPccp/greedy/genetic), sharing the same
-    cardinality estimator and cost model.
+    The join-ordering memo shares the same cardinality estimator and cost model as
+    every other cost-based rule; a genetic enumerator for very wide join graphs is a
+    future extension of that same seam.
     """
     # Imported lazily so the registry module has no import cycle with the rule
     # bodies, and so importing `registry` is cheap.

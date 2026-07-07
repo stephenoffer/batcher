@@ -98,7 +98,7 @@ def _ray_init_kwargs(workers: int, *, force_attach: bool = False) -> dict:
 
     `force_attach` overrides the local branch to attach to a discoverable cluster
     (`address="auto"`, no local-only `num_cpus`/object-store hints): a managed
-    workspace (e.g. Anyscale) can run a cluster *without* setting `RAY_ADDRESS`, so a
+    managed workspace can run a cluster *without* setting `RAY_ADDRESS`, so a
     plain `ray.init` auto-connects and then rejects those hints — `_ensure_ray`
     retries here when Ray reports exactly that conflict."""
     import os
@@ -147,23 +147,35 @@ def _self_ship_runtime_env() -> dict | None:
     a silent `ModuleNotFoundError` on workers for the common local-install →
     remote-cluster case.)
 
-    Returns `None` only when `distributed.trust_cluster_image` is set — a production
-    image that bakes a matching batcher into every node and wants to skip the upload.
+    The env also pins `pip: None`. Batcher ships its own package here and relies on each
+    worker's base environment for every other dependency (Batcher's "ship my code, trust
+    the cluster image" contract). Pinning `pip` off makes that explicit and, critically,
+    stops a managed runtime-env hook (some platforms inject the workspace's
+    `requirements.txt` as the job's pip) from re-installing dependencies per job — a
+    redundant round-trip that also hard-fails when that list names a local editable such as
+    `batcher-engine` itself (unresolvable on any index, and already shipped here via
+    `py_modules`). A worker's base env already carries the workspace deps, so nothing is
+    lost; a job that genuinely needs extra per-worker pip deps sets `distributed.runtime_env`
+    (the explicit-override branch above), which wins outright.
+
+    Returns `{"pip": None}` (neutralize the injected pip, ship nothing) when
+    `distributed.trust_cluster_image` is set — a production image that bakes a matching
+    batcher into every node and wants to skip the upload.
     """
     import os
 
     import batcher
 
     if active_config().distributed.trust_cluster_image:
-        return None
+        return {"pip": None}
     pkg = os.path.dirname(os.path.abspath(batcher.__file__))
-    return {"py_modules": [pkg]}
+    return {"py_modules": [pkg], "pip": None}
 
 
 def _neutralize_broken_runtime_env_hook() -> None:
     """Drop a `RAY_RUNTIME_ENV_HOOK`/`RAY_RUNTIME_ENV_PLUGINS` whose module is missing.
 
-    A deployment env may export a runtime-env hook (e.g. Anyscale's
+    A deployment env may export a runtime-env hook (some managed platforms'
     `cgroup_runtime_plugin`) that Ray imports during `ray.init`. When Batcher runs
     *outside* that runtime the module is absent and `ray.init` raises
     `ModuleNotFoundError` before any work starts. A hook pointing at an

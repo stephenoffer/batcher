@@ -76,13 +76,23 @@ def _basis(kind: str, rows_in: float, rows_out: float) -> float:
 def _samples(rows: list[dict]) -> list[tuple[float, float, float]]:
     """Usable `(rows_in, rows_out, t_op_ms)` triples — positive rows and time only.
 
-    `rows_in` falls back to `rows_out` (scans report them equal); a sample with no
-    positive basis or no positive time carries no signal and is dropped.
+    The input-bound families (filter/distinct/aggregate/hash_join) fit against
+    *input* rows, so an accurate `rows_in` is load-bearing: fitting a selective
+    filter's per-row cost against its (small) output would overstate the coefficient.
+    Prefer the directly measured `n_input`; for a row persisted before that field
+    existed, reconstruct it from `n_actual / selectivity` (the inverse of how
+    `selectivity` was recorded); finally fall back to `rows_out` (a source op reports
+    input == output). A sample with no positive basis or no positive time is dropped.
     """
     out: list[tuple[float, float, float]] = []
     for r in rows:
-        rin = float(r.get("rows_in", 0) or r.get("n_actual", 0))
-        rout = float(r.get("n_actual", r.get("rows_out", 0)))
+        rout = float(r.get("n_actual", r.get("rows_out", 0)) or 0.0)
+        measured_in = r.get("n_input") or r.get("rows_in")
+        if measured_in:
+            rin = float(measured_in)
+        else:
+            sel = float(r.get("selectivity", 0.0) or 0.0)
+            rin = rout / sel if sel > 0.0 else rout
         t = float(r.get("t_op_ms", 0.0))
         if t > 0.0 and (rin > 0.0 or rout > 0.0):
             out.append((rin or rout, rout or rin, t))

@@ -46,7 +46,12 @@ def test_gpu_backend_falls_back_to_cpu_on_gpuless_host():
     # No GPU on the test host -> backend="gpu" must transparently equal backend="cpu".
     ds = bt.from_pydict({"k": [1, 1, 2, 3, 2], "v": [10.0, 20.0, 5.0, 7.0, 9.0]})
     q = ds.group_by("k").agg(s=col("v").sum(), c=col("v").count())
-    assert q.collect(backend="gpu").to_pydict() == q.collect(backend="cpu").to_pydict()
+
+    def _rows(tbl):
+        d = tbl.to_pydict()
+        return sorted(zip(*d.values(), strict=True))  # group-by output order is unspecified
+
+    assert _rows(q.collect(backend="gpu")) == _rows(q.collect(backend="cpu"))
 
 
 def test_gpu_task_opts_carry_spot_preemption_retry_budget():

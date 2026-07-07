@@ -9,7 +9,6 @@ mergeable primitives are reused verbatim, so the result equals single-node.
 from __future__ import annotations
 
 import json
-import tempfile
 
 import pyarrow as pa
 
@@ -63,7 +62,9 @@ def _distributed_aggregate(
     # still re-checks the filter, so this is a pure I/O optimization).
     projection, predicate = source_pushdown(map_plan, 0)
 
-    work_dir = tempfile.mkdtemp(prefix="batcher_shuffle_")
+    from batcher.dist.shuffle_io import distributed_work_dir
+
+    work_dir = distributed_work_dir("batcher_shuffle_")
     keep_dir = False  # set when a MaterializedSource takes ownership of work_dir
     try:
         # Resolve and partition the single source into `workers` map inputs.
@@ -147,6 +148,7 @@ def _record_worker_metrics(hub, metrics_jsons, metrics_out=None) -> None:
     also appended to it — the channel the conductor's `QueryProfile` uses to surface the
     distributed map sub-plan (a separate op-id space, shown as its own section). Best-effort
     — never breaks a query."""
+    import contextlib
     import json
 
     from batcher.config import active_config
@@ -160,10 +162,8 @@ def _record_worker_metrics(hub, metrics_jsons, metrics_out=None) -> None:
 
             core.record_exec_metrics(hub, metrics_json, morsel_rows)
         if metrics_out is not None:
-            try:
+            with contextlib.suppress(ValueError, TypeError):
                 metrics_out.append(json.loads(metrics_json).get("ops", []))
-            except (ValueError, TypeError):
-                pass
 
 
 def _map_task(

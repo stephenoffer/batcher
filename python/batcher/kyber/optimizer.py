@@ -359,6 +359,20 @@ class Optimizer:
         Identical to `optimize` but surfaces the `BuildSideDecision`s the SELECTION
         phase recorded on `ctx.notes` — what the adaptive executor reports per stage.
         """
+        phys, _logical, decisions = self.optimize_full(logical)
+        return phys, decisions
+
+    def optimize_full(
+        self, logical: LogicalPlan
+    ) -> tuple[PhysicalPlan, LogicalPlan, list[BuildSideDecision]]:
+        """Optimize once, returning the physical plan, the optimized **logical** plan,
+        and the per-join build-side decisions — from a single pipeline run.
+
+        The distributed and out-of-core executors read the optimized *logical* structure
+        (derived join keys, pushed predicates) while admission/costing read the physical
+        plan. Both fall out of one `_run`, so a caller that needs both no longer runs the
+        whole optimizer twice (the old `optimize_traced` + `optimize_logical` pair).
+        """
         ctx = self._context()
         plan, ir = self._run(logical, ctx)
         phys = PhysicalPlan(
@@ -373,7 +387,7 @@ class Optimizer:
             source_projections=required_columns_per_source(plan),
             source_predicates=required_predicates_per_source(plan),
         )
-        return phys, ctx.notes.get("build_side_decisions", [])
+        return phys, plan, ctx.notes.get("build_side_decisions", [])
 
     def logical_rewrite(self, logical: LogicalPlan) -> LogicalPlan:
         """Run only the logical rewrite phases, returning the rewritten plan.
@@ -443,6 +457,17 @@ def optimize_traced(
 ) -> tuple[PhysicalPlan, list[BuildSideDecision]]:
     """Convenience wrapper around `Optimizer.optimize_traced`."""
     return Optimizer(config, sources, hub, source_stats=source_stats).optimize_traced(logical)
+
+
+def optimize_full(
+    logical: LogicalPlan,
+    config: Config | None = None,
+    sources: list | None = None,
+    hub: MetadataHub | None = None,
+    source_stats: list | None = None,
+) -> tuple[PhysicalPlan, LogicalPlan, list[BuildSideDecision]]:
+    """Convenience wrapper around `Optimizer.optimize_full` (physical + logical + decisions)."""
+    return Optimizer(config, sources, hub, source_stats=source_stats).optimize_full(logical)
 
 
 def optimize_logical(

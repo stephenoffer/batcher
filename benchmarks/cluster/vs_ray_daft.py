@@ -322,7 +322,16 @@ def main() -> int:
 
     if not ray.is_initialized():
         os.environ.setdefault("RAY_ADDRESS", "auto")
-        ray.init(address="auto", logging_level="ERROR", log_to_driver=False)
+        # Drop the workspace's inherited pip runtime-env: it lists a local editable
+        # (`batcher-engine`) that no index can resolve, so the per-worker pip build hard-fails
+        # and no task runs. The cluster base env already carries the deps. (Mirrors
+        # `engines/ray.py`; batcher's own dist path pins `pip: None` the same way.)
+        ray.init(
+            address="auto",
+            logging_level="ERROR",
+            log_to_driver=False,
+            runtime_env={"pip": None},
+        )
     print(f"cluster: {ray.cluster_resources().get('CPU')} CPU, {len(ray.nodes())} nodes")
     print(f"TPC-H sf{scale}, best-of-{runs}\n")
 

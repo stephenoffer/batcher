@@ -465,7 +465,11 @@ class MetadataConfig:
     (plans improve within a session) but discards them on exit. To carry learning
     across restarts, set `backend="sqlite"` — with no `uri` it persists to a per-user
     file (``$BATCHER_HOME`` or ``~/.batcher/metadata.db``), so cross-run learning is a
-    single line with no path to manage.
+    single line with no path to manage. On a spot/autoscaling cluster the ``"spot"``
+    resilience profile auto-upgrades a still-default in-process store to shared object
+    storage when a location is discoverable (``BATCHER_METADATA_URI``, any fsspec URL, or a
+    managed cluster's ``ANYSCALE_ARTIFACT_STORAGE``), so learning survives a preempted driver
+    moving nodes (see `batcher.config.profiles`).
 
     Examples:
         .. doctest::
@@ -481,6 +485,14 @@ class MetadataConfig:
     # an ephemeral SQLite store.
     uri: str | None = None
     decay_per_day: float = 0.1  # confidence half-life ~ a week
+
+
+# Sentinel `autoscale_wait_s` meaning "auto": the config layer resolves it to a bounded
+# wait on an autoscaling-capable cluster and to `0` (off) on a fixed one
+# (`profiles.resolve_autoscale_wait`). It keeps `0` a first-class explicit "off" that a
+# power user can set and have honored — distinct from "never configured". Resolved before
+# the value reaches the runtime, which only ever sees a concrete `>= 0`.
+AUTOSCALE_WAIT_AUTO: float = -1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -576,6 +588,21 @@ class DistributedConfig:
     # cluster may need to autoscale up).
     flight_idle_timeout_s: float = 60.0
     flight_keepalive_s: float | None = None
+    # Max TCP connections a reducer stripes one peer's shuffle fetches across. One gRPC
+    # channel is one HTTP/2 connection is one TCP flow, and a cloud NIC caps a *single*
+    # flow well below line rate (e.g. AWS ~5 Gbps of a 10 Gbps NIC), so funneling a
+    # peer's whole shuffle through one connection halves cross-node throughput. The
+    # consumer pool grows to this bound only under concurrent fetches to the same peer,
+    # so a cold peer still costs one connection. Default 4 saturates a 10–25 Gbps NIC;
+    # 1 restores the single-connection behavior.
+    flight_connections_per_peer: int = 4
+    # Wire compression for shuffle batches: "none", "lz4", or "zstd". A cross-node fetch
+    # is NIC-bound, so compressing the Arrow buffers before they cross the wire is the
+    # only way past line rate — and real shuffle data (sorted runs, repeated group keys,
+    # dictionary strings, nulls) compresses several-fold, unlike the object store's
+    # uncompressed blocks. "lz4" (~GB/s/core, gives up fast on incompressible data) is a
+    # near-free default; "zstd" trades CPU for a higher ratio; "none" disables it.
+    flight_compression: str = "lz4"
     placement_timeout_s: float = 60.0
     # Bounded wait for the Ray autoscaler to grow the cluster before clamping a query's
     # worker fan-out. When a query wants more workers than the cluster can schedule now,
@@ -583,12 +610,22 @@ class DistributedConfig:
     # waits up to this many seconds — polling every `autoscale_poll_s` — for the new
     # nodes to arrive, so a big job actually *uses* the scaled-up cluster instead of
     # running under-provisioned and only the next job benefiting. Stops early the moment
-    # capacity covers the request. `0.0` (the default) keeps the non-blocking behavior
-    # (hint then clamp to current capacity) — set it (e.g. 180s, longer than node boot)
-    # on a genuine autoscaling cluster; leave it 0 on a fixed cluster so a query that
-    # over-asks never waits for scale-up that can't happen.
-    autoscale_wait_s: float = 0.0
+    # capacity covers the request (and the `autoscale_stall_s` grace window bails fast when
+    # capacity goes flat). The default is `AUTOSCALE_WAIT_AUTO` (-1) = "auto": the config
+    # layer resolves it to a bounded wait on an autoscaling-capable cluster (detected via
+    # env — Anyscale / spot / `BATCHER_AUTOSCALE=1`) and to `0` (off) on a fixed one, so
+    # saturation needs no tuning. Set it explicitly to override — `0` disables the wait
+    # (honored even on an autoscaling cluster), a positive value caps the budget.
+    autoscale_wait_s: float = AUTOSCALE_WAIT_AUTO
     autoscale_poll_s: float = 5.0
+    # Grace window for the autoscale wait: while waiting (`autoscale_wait_s > 0`), stop
+    # early once cluster capacity has stayed flat for this many seconds — the autoscaler
+    # has nothing more to add (a fixed cluster) or cannot satisfy the request (e.g. spot
+    # `InsufficientInstanceCapacity`), so blocking the rest of the budget for nodes that
+    # will not arrive only delays the query. Any capacity gain resets the window (more may
+    # follow). Sized longer than a node's boot time so a genuinely-launching node is not
+    # abandoned before it joins.
+    autoscale_stall_s: float = 90.0
     # Skew-aware join salting for a huge x huge hot key. When a single join key is
     # dominated by a few "hot" values, those rows otherwise co-partition onto one
     # reducer and overload it (memory + the output explosion + a straggler). With
@@ -604,15 +641,20 @@ class DistributedConfig:
     # A value is "hot" when it exceeds this fraction of a side's rows. Lower → more
     # keys salted. Only consulted when `skew_join_salt > 0`.
     skew_join_fraction: float = 0.10
-    # Runtime bloom-filter join reduction (sideways information passing). When on, a
-    # shuffle join builds a bloom over the small (build/right) side's keys and uses it
-    # to drop provably-non-matching rows of the large (probe/left) side *before* they
-    # are shuffled — cutting network volume for selective fact⋈dimension joins.
-    # Always correct (the bloom has no false negatives, so only non-matching rows are
-    # dropped). Opt-in (default off) because it serializes the build side's map ahead
-    # of the probe's to ready the bloom — a win when the probe is much larger and the
-    # join selective, an overhead on balanced joins. Inner/semi single-key joins only.
-    runtime_bloom_join: bool = False
+    # Runtime bloom-filter join reduction (sideways information passing). A shuffle
+    # join builds a bloom over the small (build/right) side's keys and uses it to drop
+    # provably-non-matching rows of the large (probe/left) side *before* they are
+    # shuffled — cutting network volume for selective fact⋈dimension joins. Always
+    # correct (the bloom has no false negatives, so only non-matching rows are dropped);
+    # inner/semi joins only. It serializes the build side's map ahead of the probe's to
+    # ready the bloom — a win when the probe is much larger and the join selective, an
+    # overhead on balanced joins — so the choice is cardinality-driven:
+    #   "auto" (default) — engage only when Kyber estimates the probe is much larger
+    #       than the build (see `dist.executors.join._bloom_beneficial`); zero config,
+    #       the metadata-driven default.
+    #   True  — always engage (for a known-selective workload).
+    #   False — never engage (pin the plain shuffle).
+    runtime_bloom_join: bool | str = "auto"
     # Shared-secret token authenticating Flight shuffle fetches (N5). When set, a
     # peer must present it to fetch a partition, so a process that can merely reach
     # the port cannot exfiltrate shuffle data. None (default) disables the check —
@@ -621,11 +663,16 @@ class DistributedConfig:
     shuffle_token: str | None = None
     # Same-node shared-memory shuffle transfer. When on, a mapper mirrors each bucket to
     # a memory-mapped Arrow IPC file (Linux tmpfs `/dev/shm` when available, else a temp
-    # dir) and a same-node reducer in another process reads it via mmap — no gRPC, no
-    # loopback TCP (the plasma-class same-node fast path). Off by default: no shm writes,
-    # behavior unchanged. Best-effort and result-preserving — a shm miss falls back to
-    # Flight, which is bit-identical — so single-node==distributed holds either way.
-    shared_memory_transfer: bool = False
+    # dir) and a same-node reducer in another process reads it via mmap ZERO-COPY — no
+    # gRPC, no loopback TCP (the plasma-class same-node fast path). Measured 23x over
+    # loopback Flight on a real cluster (1.2 -> 27 GB/s cross-process, same node). On by
+    # default: the common GPU-cluster shape packs several actors per node, so many shuffle
+    # fetches are same-node. It is safe to default on because it is (a) *pressure-gated* —
+    # the mapper skips the second tmpfs copy when the node is under memory pressure, so it
+    # cannot OOM a tight/churning spot node — and (b) best-effort and result-preserving: a
+    # shm miss (bucket not mirrored, another node, or shm unavailable) falls back to
+    # Flight, which is bit-identical, so single-node==distributed holds either way.
+    shared_memory_transfer: bool = True
     # Locality-aware reducer placement. When on, a reducer whose bucket is concentrated
     # on one node is hosted on an actor on that node, so the bulk of its fetches become
     # same-node (shared-memory/direct) hits instead of network transfers. Result-
@@ -697,6 +744,17 @@ class DistributedConfig:
     # GPU-gated and fallback-safe (eager on CPU / non-CNN / compile failure / off). On by
     # default; a tiny vision job that can't amortize the warm-up can set this False.
     torch_compile: bool = True
+    # Auto mixed-precision for a GPU inference stage: run the model's forward under
+    # `torch.autocast` in the accelerator's fast half type (`recommend_inference_dtype` —
+    # BF16 on Ampere+, FP16 on Turing/Volta/MPS) so the matmuls/convs hit the tensor cores at
+    # ~1.5-2x throughput, while autocast keeps reductions/softmax in FP32 for stability
+    # (measured: label agreement ~0.9999 vs FP32). Unlike `torch_compile` this needs no model
+    # object — it wraps the opaque per-batch call — so it also optimizes a plain
+    # `map_batches(model, num_gpus=...)`, the raw-model path that otherwise runs FP32. Ray Data
+    # leaves this to the user (`torch_dtype`); Batcher applies it by default. GPU-gated and
+    # fallback-safe (no-op on CPU / a GPU without fast half / when torch is absent / on any
+    # failure). Set False to force FP32 (bit-exact repro, or a model that needs full precision).
+    autocast_inference: bool = True
     # Ship cuDF (RAPIDS) to the `backend="gpu"` worker tasks so the GPU group-by uses cuDF's
     # mature kernels (~3x the hand-rolled torch fallback, and the engine behind Polars-GPU).
     # cuDF's pip install is cached per node after the first task; numpy stays pinned so returned
@@ -751,6 +809,59 @@ class DistributedConfig:
     # while very large clusters stay bounded. Mergeable algebra makes any reducer count
     # correct (result-identical), so this is purely a scaling knob. 0 disables the cap.
     max_shuffle_partitions: int = 2048
+    # Submit-ahead cap on concurrent map/inference partition tasks (`gather_map_results`).
+    # Seeding Ray with every partition at once floods the scheduler / object store at high
+    # fan-out (the "too many pending tasks" anti-pattern). `0` (default) derives the window
+    # from live capacity — `pending_window_factor x` schedulable cores — so ordinary
+    # fan-outs still submit everything up front (window >= n is byte-identical to the old
+    # behavior) while a 100k-partition job stays bounded. A positive value pins the cap
+    # explicitly. Result-identical either way (assembly is index-addressed; only the number
+    # of in-flight tasks changes). Set very large to force the old submit-all behavior.
+    max_pending_tasks: int = 0
+    pending_window_factor: int = 4
+    # Stateless map-task placement strategy. `"auto"` (default) resolves SPREAD vs Ray's
+    # locality-aware DEFAULT against the live cluster: it keeps SPREAD only where packing
+    # is a real risk (many sub-core tasks that DEFAULT would stack onto one node, idling
+    # the rest) and prefers DEFAULT otherwise — restoring argument-locality on small
+    # clusters and avoiding SPREAD's O(nodes) scheduler cost past `map_spread_node_cap`
+    # nodes. `"always"` forces SPREAD (the previous unconditional behavior); `"never"`
+    # forces DEFAULT. Placement never changes which rows a partition holds, so the result
+    # is identical for any choice — this is a scheduling knob only.
+    map_spread: str = "auto"
+    # Above this many alive nodes, `"auto"` map placement prefers DEFAULT: SPREAD evaluates
+    # every node per task and becomes the scheduler bottleneck at scale, where DEFAULT's
+    # utilization balancing already spreads load.
+    map_spread_node_cap: int = 100
+    # Per-task CPU share below which `"auto"` map placement treats packing as a real risk
+    # and keeps SPREAD (sub-half-core tasks would otherwise stack many-per-node under
+    # DEFAULT). At or above it, near-whole-core tasks fill nodes naturally, so DEFAULT wins.
+    map_spread_pack_share: float = 0.5
+    # Keep a relational (CPU) fleet off GPU nodes with a HARD node-class selector. Ray's
+    # built-in GPU-node avoidance (`RAY_scheduler_avoid_gpu_nodes`) is best-effort — a CPU
+    # shuffle task can still land on an idle GPU node and hold its cores from an inference
+    # stage. When this is on AND the live cluster's CPU-only nodes can host the fleet
+    # (`cpu_only_can_host`), `dist` requires a tiny amount of the `cpu_node_resource` custom
+    # resource so the fleet is *hard*-restricted to nodes that advertise it (a node property
+    # re-advertised on respawn, so it survives spot/autoscaler node replacement, unlike
+    # ephemeral node IDs). Off by default: the selector is emitted only on a cluster that
+    # advertises `cpu_node`, and never when it would make the fleet unschedulable — so a
+    # cluster that doesn't opt in is unchanged (Ray's soft avoidance). Result-identical
+    # (placement only). Deploy-time: label CPU-only nodes with `resources={"cpu_node": N}`.
+    heterogeneous_node_isolation: bool = False
+    # The custom resource CPU-only nodes advertise for `heterogeneous_node_isolation`.
+    cpu_node_resource: str = "cpu_node"
+    # Submit-ahead depth per GPU/inference actor — how many partitions an actor may have in
+    # flight at once. `1` (default) is the old one-at-a-time behavior. A depth > 1 keeps a
+    # GPU fed across the dispatch/gather round-trip (Ray Data's `max_tasks_in_flight`
+    # guidance: shallow pipelines leave GPUs idle, depth 8-16 can multiply utilization).
+    # Bounded by `_MAP_INFLIGHT_MAX` in the executor. Result-identical (assembly is
+    # index-addressed; only pipeline depth changes).
+    map_inflight_depth: int = 1
+    # Let measured GPU utilization RAISE the per-actor depth above `map_inflight_depth`
+    # (bounded): a stage whose prior runs recorded low utilization submits deeper to fill
+    # the GPU; a near-saturated stage keeps the shallow default. On by default; only ever
+    # increases depth from a *prior* measurement, so a first run is unchanged.
+    map_inflight_adaptive: bool = True
     # Named fault-tolerance profile. ``"default"`` keeps the conservative budgets above
     # (tuned for a stable on-demand cluster — minimal retries, no keepalive, no
     # straggler speculation). ``"spot"`` hardens them as a bundle for a churning
@@ -997,14 +1108,20 @@ def _overlay_dict(obj: Config, data: dict[str, object]) -> Config:
 
 def _resolved(cfg: Config) -> Config:
     """Auto-select the spot profile on a preemptible node, apply the resilience profile,
-    then validate — the single resolution chokepoint every config entry point shares so
-    auto-detection, the profile, and range checks run in lockstep regardless of how the
-    config was built. A user-chosen `resilience` is never overridden (explicit wins)."""
-    from batcher.config.profiles import apply_resilience_profile, detect_spot_environment
+    auto-enable the bounded autoscale wait on an autoscaling cluster, then validate — the
+    single resolution chokepoint every config entry point shares so auto-detection, the
+    profile, and range checks run in lockstep regardless of how the config was built. A
+    user-chosen `resilience` / `autoscale_wait_s` is never overridden (explicit wins)."""
+    from batcher.config.profiles import (
+        apply_resilience_profile,
+        detect_spot_environment,
+        resolve_autoscale_wait,
+    )
 
     if cfg.distributed.resilience == "default" and detect_spot_environment():
         cfg = cfg.replace(distributed=replace(cfg.distributed, resilience="spot"))
-    return apply_resilience_profile(cfg).validate()
+    cfg = resolve_autoscale_wait(apply_resilience_profile(cfg))
+    return cfg.validate()
 
 
 # Active-config plumbing -------------------------------------------------------

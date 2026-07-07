@@ -3,7 +3,8 @@
 One module per metadata family, each a pure extraction function a connector's
 `statistics()` calls:
 
-  - `columnar_footer`   : Parquet/ORC/Arrow footer column min/max/null/count
+  - `columnar_footer`   : Parquet column min/max/null/count + ORC row counts
+  - `pruning`           : per-row-group zone-map bounds for file/row-group pruning
   - `lakehouse_manifest`: Delta/Iceberg manifest record counts + column bounds
   - `free_counts`       : NumPy ``.npy`` header row counts
   - `sql_catalog`       : SQL warehouse system-catalog row counts
@@ -15,14 +16,23 @@ never a per-row scan. The neutral `SourceStatistics` they return lives in
 
 from __future__ import annotations
 
-from batcher.io.stats.columnar_footer import parquet_statistics
+from batcher.io.stats.columnar_footer import orc_statistics, parquet_statistics
 from batcher.io.stats.free_counts import numpy_statistics
 from batcher.io.stats.lakehouse_manifest import delta_statistics
+from batcher.io.stats.pruning import (
+    RowGroupBounds,
+    parquet_row_group_bounds,
+    surviving_rows_for_range,
+)
 from batcher.io.stats.sql_catalog import catalog_row_count
 
 __all__ = [
+    "RowGroupBounds",
     "catalog_row_count",
     "delta_statistics",
     "numpy_statistics",
+    "orc_statistics",
+    "parquet_row_group_bounds",
     "parquet_statistics",
+    "surviving_rows_for_range",
 ]

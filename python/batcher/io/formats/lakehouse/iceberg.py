@@ -24,6 +24,7 @@ from batcher.io.catalog import CatalogSpec, resolve_catalog
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.splits import Split, WholeSourceSplit
+from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["IcebergSink", "IcebergSource", "IcebergTableSplit"]
 
@@ -142,6 +143,21 @@ class IcebergSource:
             return None
         total = snapshot.summary.get("total-records")
         return int(total) if total is not None else None
+
+    def statistics(self) -> SourceStatistics | None:
+        """Exact row count from the current snapshot summary, or None if absent.
+
+        Iceberg's snapshot summary maintains ``total-records`` transactionally, so
+        it answers `count()` from the manifest with no scan. Column bounds are not
+        surfaced here — decoding per-datafile lower/upper bounds (field-id keyed,
+        byte-encoded) across pyiceberg versions is fragile; a range predicate is
+        pushed into `plan_files` instead. Best-effort: any failure yields None.
+        """
+        try:
+            rows = self.row_count()
+        except Exception:
+            return None
+        return None if rows is None else SourceStatistics(row_count=rows, exact_rows=True)
 
     def read_incremental(
         self, from_snapshot_id: int, to_snapshot_id: int | None = None

@@ -27,9 +27,16 @@ from batcher.kyber.metadata_answer import (
     answer_is_empty,
     approx_count_distinct,
 )
+from batcher.kyber.metadata_filter_count import (
+    answer_filter_any,
+    answer_filter_count,
+    answer_filter_is_empty,
+)
+from batcher.kyber.metadata_summary import answer_column_summary
 from batcher.kyber.optimizer import (
     Optimizer,
     optimize,
+    optimize_full,
     optimize_logical,
     optimize_traced,
 )
@@ -37,11 +44,16 @@ from batcher.kyber.optimizer import (
 __all__ = [
     "Optimizer",
     "answer_aggregate",
+    "answer_column_summary",
     "answer_count",
+    "answer_filter_any",
+    "answer_filter_count",
+    "answer_filter_is_empty",
     "answer_is_empty",
     "approx_count_distinct",
     "load_learned_stats",
     "optimize",
+    "optimize_full",
     "optimize_logical",
     "optimize_traced",
     "record_column_stats",

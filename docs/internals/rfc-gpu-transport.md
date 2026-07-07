@@ -100,7 +100,7 @@ survive a driver restart or be shared across drivers.
 **Trade-off (why deferred).** Going detached enables cross-driver reuse but:
 - adds **leak risk** — detached actors outlive the driver and need explicit, reliable
   teardown (a crashed driver leaves a running fleet + placement group);
-- conflicts with the operational constraint that the Anyscale head must not be
+- conflicts with the operational constraint that the cluster head must not be
   `ray stop`-ed (recovery is via `restart_ray.sh`), so an orphaned fleet is costly;
 - needs get-or-create + version-fencing so two drivers don't borrow a fleet spawned
   with an incompatible engine config.

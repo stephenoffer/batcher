@@ -23,7 +23,13 @@ import dataclasses
 
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.cost import CostModel
+from batcher.kyber.learned_tuning import (
+    learned_broadcast_max_bytes,
+    learned_join_strategy,
+    learned_sort_merge_min_rows,
+)
 from batcher.kyber.pass_base import OptimizerContext
+from batcher.kyber.signature import plan_signature
 from batcher.plan.logical import (
     Join,
     JoinOutputCol,
@@ -31,6 +37,7 @@ from batcher.plan.logical import (
     Scan,
     Union,
 )
+from batcher.plan.visitor import children, with_children
 
 __all__ = ["BuildSideDecision", "adaptive_build_side", "build_side_rule"]
 
@@ -67,15 +74,26 @@ def adaptive_build_side(
     plan: LogicalPlan,
     estimator: CardinalityEstimator,
     cost_model: CostModel | None = None,
+    *,
+    broadcast_max_bytes: int | None = None,
+    sort_merge_min_rows: float | None = None,
 ) -> tuple[LogicalPlan, list[BuildSideDecision]]:
     """Rewrite inner joins so the cheaper-to-build input is the build side.
 
     `cost_model` defaults to a model over the same estimator with the configured
     coefficients, so cost always drives the decision even when called outside the
-    optimizer context (e.g. the adaptive re-optimization loop)."""
+    optimizer context (e.g. the adaptive re-optimization loop).
+
+    `broadcast_max_bytes` / `sort_merge_min_rows` override the strategy thresholds —
+    `build_side_rule` passes the values *learned* from measured timings (see
+    `kyber.learned_tuning`); when `None` the static config default and module floor
+    stand, so every existing caller is unchanged. Thresholds only pick among
+    equivalent physical algorithms, so learning them never changes the result."""
     decisions: list[BuildSideDecision] = []
     cost = cost_model or CostModel(estimator)
-    return _rewrite(plan, estimator, cost, decisions, _broadcast_max_bytes()), decisions
+    max_bytes = broadcast_max_bytes if broadcast_max_bytes is not None else _broadcast_max_bytes()
+    smr = sort_merge_min_rows if sort_merge_min_rows is not None else SORT_MERGE_MIN_ROWS
+    return _rewrite(plan, estimator, cost, decisions, max_bytes, smr), decisions
 
 
 def _broadcast_max_bytes() -> int:
@@ -91,12 +109,44 @@ def _broadcast_max_bytes() -> int:
 
 def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
     """Cost-based join build-side selection. Needs estimated input sizes (sources),
-    and records its decisions on the context for explain/telemetry."""
+    and records its decisions on the context for explain/telemetry.
+
+    The broadcast byte threshold and the sort-merge row floor are taken from what the
+    hub has *learned* from measured broadcast-vs-shuffle and hash-vs-sort-merge timings
+    (falling back to the static defaults cold); then any per-signature learned
+    join-strategy arm overrides the cost-model choice. All three are choices among
+    equivalent physical algorithms, so the result is invariant."""
     if not ctx.sources:
         return plan
-    plan, decisions = adaptive_build_side(plan, ctx.estimator, ctx.costs())
+    learned_bmax = learned_broadcast_max_bytes(ctx.hub)
+    max_bytes = learned_bmax if learned_bmax is not None else _broadcast_max_bytes()
+    learned_smr = learned_sort_merge_min_rows(ctx.hub, SORT_MERGE_MIN_ROWS)
+    smr = learned_smr if learned_smr is not None else SORT_MERGE_MIN_ROWS
+    plan, decisions = adaptive_build_side(
+        plan, ctx.estimator, ctx.costs(), broadcast_max_bytes=max_bytes, sort_merge_min_rows=smr
+    )
+    plan = _apply_learned_strategies(plan, ctx.hub)
     ctx.notes["build_side_decisions"] = decisions
     return plan
+
+
+def _apply_learned_strategies(node: LogicalPlan, hub) -> LogicalPlan:
+    """Override each join's strategy with the per-signature bandit arm the hub learned.
+
+    A regret-minimizing bandit over `{hash, broadcast, sort_merge}` converges to the
+    algorithm measured fastest for a join of this shape on *this* hardware, correcting a
+    mis-ranked static cost guess. Every arm emits the identical relation (the engine
+    falls back to hash for any it cannot honor), so this is a pure performance override.
+    A cold signature yields `None` and the cost-model choice stands, so the plan is
+    unchanged until there is evidence."""
+    if hub is None:  # no learned store → skip the per-join signature work entirely
+        return node
+    node = with_children(node, [_apply_learned_strategies(c, hub) for c in children(node)])
+    if isinstance(node, Join):
+        arm = learned_join_strategy(hub, plan_signature(node))
+        if arm is not None and arm != node.strategy:
+            return dataclasses.replace(node, strategy=arm)
+    return node
 
 
 def _rewrite(
@@ -105,17 +155,18 @@ def _rewrite(
     cost: CostModel,
     decisions: list,
     max_bytes: int,
+    smr: float,
 ) -> LogicalPlan:
     if isinstance(node, Scan):
         return node
     if isinstance(node, Union):
         return Union(
-            tuple(_rewrite(i, est, cost, decisions, max_bytes) for i in node.inputs),
+            tuple(_rewrite(i, est, cost, decisions, max_bytes, smr) for i in node.inputs),
             node.distinct,
         )
     if isinstance(node, Join):
-        left = _rewrite(node.left, est, cost, decisions, max_bytes)
-        right = _rewrite(node.right, est, cost, decisions, max_bytes)
+        left = _rewrite(node.left, est, cost, decisions, max_bytes, smr)
+        right = _rewrite(node.right, est, cost, decisions, max_bytes, smr)
         node = Join(
             left, right, node.left_keys, node.right_keys, node.join_type, node.output, node.strategy
         )
@@ -173,7 +224,7 @@ def _rewrite(
         build_rows = min(l_est.rows, r_est.rows) if swap else r_est.rows
         if broadcast:
             node = dataclasses.replace(node, strategy="broadcast")
-        elif build_rows >= SORT_MERGE_MIN_ROWS:
+        elif build_rows >= smr:
             # Sort-merge only when the *build* side (the one hashed, after the swap) is
             # itself so large that a hash table over it is memory-prohibitive — then
             # SMJ's bounded-memory merge wins despite its RowConverter encoding cost.
@@ -196,7 +247,7 @@ def _rewrite(
     # Single-input nodes: rewrite the child in place.
     if hasattr(node, "input"):
         return dataclasses.replace(
-            node, input=_rewrite(node.input, est, cost, decisions, max_bytes)
+            node, input=_rewrite(node.input, est, cost, decisions, max_bytes, smr)
         )
     return node
 

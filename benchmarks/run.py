@@ -47,6 +47,7 @@ def _parse_size(text: str) -> int:
     num = s[: -1 if unit else len(s)] or s
     return int(float(num) * _SIZE_UNITS[unit])
 
+
 # Engine-comparison datasets (run through the correctness-gated compare()).
 BENCHMARKS = ("tpch", "tpcds", "clickbench", "operators")
 # Standalone benchmarks with their own reporting, dispatched by this single runner.
@@ -153,6 +154,49 @@ def _run_aux(which: str, args: argparse.Namespace) -> int:
     return shuffle_vs_object_store.main()
 
 
+def _warn_if_debug_build() -> None:
+    """Loudly warn when Batcher looks built in debug mode (a huge, silent perf trap).
+
+    ``maturin develop`` (and ``just build``) build the Rust engine UNOPTIMIZED — 3-30x
+    slower than a release build, with debug bounds/overflow checks in every hot loop.
+    Benchmarking that build makes Batcher look far slower than it is (e.g. an aggregate
+    reading ~8x slower than DuckDB that actually *beats* it on release). Since the timing
+    is only meaningful on a release engine, calibrate once against a trivial in-memory
+    reduction and warn if throughput is in debug territory — the numbers below are then
+    not to be trusted until rebuilt with ``maturin develop --release`` (``just
+    build-release``). Best-effort: never blocks the run.
+    """
+    import time
+
+    import pyarrow as pa
+
+    try:
+        n = 4_000_000
+        tbl = pa.table({"x": pa.array(range(n), type=pa.int64())})
+        ds = bt.from_arrow(tbl)
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            ds.agg(s=bt.col("x").sum()).collect()
+            best = min(best, time.perf_counter() - t0)
+    except Exception:
+        return
+    # Release sums 4M i64 in well under 20 ms even on modest cores; a debug build takes
+    # 100 ms+. The 60 ms gate sits in the wide gap between them, so it flags debug without
+    # false-positiving on slow hardware.
+    if best > 0.060:
+        print(
+            "\n" + "!" * 78,
+            f"\nWARNING: Batcher looks built in DEBUG mode (a {best * 1000:.0f} ms 4M-row sum;"
+            " release is <20 ms).",
+            "\n         The engine is 3-30x slower unoptimized — these timings are NOT"
+            " trustworthy.",
+            "\n         Rebuild with:  maturin develop --release   (or: just build-release)\n",
+            "!" * 78 + "\n",
+            sep="",
+        )
+
+
 def main() -> int:
     args = _parse_args()
 
@@ -168,6 +212,7 @@ def main() -> int:
     engines = engines_mod.resolve([n.strip() for n in names])
     print(f"Batcher benchmark suite  (engine {bt.engine_version()})")
     print(f"engines: {', '.join(e.name for e in engines)}\n")
+    _warn_if_debug_build()
 
     datasets = BENCHMARKS if args.benchmark == "all" else (args.benchmark,)
     all_results = []

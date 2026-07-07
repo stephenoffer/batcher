@@ -19,7 +19,7 @@ from .base import Engine
 def _neutralize_broken_runtime_env_hook() -> None:
     """Drop a ``RAY_RUNTIME_ENV_HOOK``/``RAY_RUNTIME_ENV_PLUGINS`` whose module is missing.
 
-    A host env (e.g. Anyscale's ``cgroup_runtime_plugin``) may export a runtime-env
+    A managed host env (e.g. a ``cgroup_runtime_plugin``) may export a runtime-env
     hook Ray imports during ``ray.init``; outside that runtime the module is absent
     and init crashes. A hook pointing at an unimportable module is broken regardless,
     so removing it is strictly safer — and a no-op where the module is present.
@@ -36,6 +36,20 @@ def _neutralize_broken_runtime_env_hook() -> None:
             os.environ.pop(var, None)
 
 
+def _worker_runtime_env() -> dict:
+    """Drop an unresolvable local editable (``batcher-engine``) from the inherited pip env.
+
+    Some managed platforms inject the workspace's ``requirements.txt`` as the default runtime-env
+    ``pip`` block, inherited by every task/actor. When that list contains the local
+    editable ``batcher-engine`` (not on any index), the per-worker pip build hard-fails
+    and Ray Data cannot launch a single task. Ray Data's own dependencies already live
+    in the cluster's base env, so nulling ``pip`` for the comparison is both correct and
+    the representative setup (workers run the stock Ray Data image). Mirrors
+    ``_neutralize_broken_runtime_env_hook`` — a broken inherited env is a no-op to strip.
+    """
+    return {"pip": None}
+
+
 def _ensure_ray() -> None:
     import os
 
@@ -43,7 +57,7 @@ def _ensure_ray() -> None:
 
     if not ray.is_initialized():
         _neutralize_broken_runtime_env_hook()
-        # Attach to the existing cluster (Anyscale / a running Ray head). Ray Data is a
+        # Attach to the existing cluster (a running Ray head). Ray Data is a
         # distributed engine; benchmarking it on the real multi-node cluster it is built
         # for is the representative comparison. ``BENCH_RAY_ADDRESS`` overrides the
         # target; the default "auto" discovers the local head. We do NOT spin up an
@@ -54,6 +68,7 @@ def _ensure_ray() -> None:
             ignore_reinit_error=True,
             configure_logging=False,
             log_to_driver=False,
+            runtime_env=_worker_runtime_env(),
         )
         # Silence Ray Data's per-dataset progress/execution logging so the benchmark
         # output stays readable (these are INFO logs, not part of the measured work).
