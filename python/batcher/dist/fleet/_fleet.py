@@ -27,6 +27,8 @@ import contextlib
 import contextvars
 import threading
 
+from batcher._internal.errors import ResourceError
+
 __all__ = [
     "ShuffleFleet",
     "acquire_fleet",
@@ -57,13 +59,37 @@ def _spawn_fleet_with_addrs(workers: int, credits: int, cfg_json: str, plan_id: 
     """
     import ray
 
+    from batcher.config import active_config
     from batcher.dist.executors.ray_runtime import release_placement
     from batcher.dist.flight_worker import spawn_flight_workers
 
     actors, pg = spawn_flight_workers(workers, credits, cfg_json, plan_id)
     ok = False
     try:
-        addrs = list(ray.get([a.addr.remote() for a in actors]))
+        # Bounded wait for every worker to advertise its Flight address. An un-placeable
+        # actor (the request outran the schedulable node count) or one lost to a spot
+        # preemption mid-spawn would otherwise leave `ray.get` blocking FOREVER — the whole
+        # query hangs on fleet startup. Instead, wait up to the placement timeout and
+        # proceed with whichever workers came up, killing the stragglers: the mergeable
+        # shuffle algebra makes any (>=1) worker count result-identical, so a smaller fleet
+        # is a scheduling degradation, never a wrong answer.
+        addr_refs = [a.addr.remote() for a in actors]
+        timeout = max(1.0, active_config().distributed.placement_timeout_s)
+        ready, pending = ray.wait(addr_refs, num_returns=len(addr_refs), timeout=timeout)
+        if pending:
+            ready_set = set(ready)
+            for a, ref in zip(actors, addr_refs, strict=True):
+                if ref not in ready_set:
+                    with contextlib.suppress(Exception):
+                        ray.kill(a)  # a straggler that never came up — reclaim its slot
+            actors = [a for a, ref in zip(actors, addr_refs, strict=True) if ref in ready_set]
+            addr_refs = ready
+        if not actors:  # nothing came up at all — a real, actionable failure, not a hang
+            raise ResourceError(
+                f"no distributed worker became available within {timeout:.0f}s "
+                "(cluster over-subscribed or unschedulable); retry or reduce num_workers"
+            )
+        addrs = list(ray.get(addr_refs))
         ok = True
         return actors, pg, addrs
     finally:

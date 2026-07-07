@@ -190,7 +190,7 @@ cluster** profile in [profiles](profiles.md).
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `ray_address` | `None` | Ray cluster address. `None` attaches to a running cluster when `RAY_ADDRESS` is set, else starts a local one. |
+| `ray_address` | `None` | Ray cluster address. `None` attaches to a running cluster when `RAY_ADDRESS` is set **or a managed control plane (Anyscale) is detected** — so a distributed query on a managed workspace fans out across the cluster with no config, instead of stranding on a local single-node Ray; it falls back to a local start only when no cluster is reachable. Set an explicit address to override. |
 | `namespace` | `"batcher"` | Ray namespace for batcher's shuffle actors, so they are isolatable. |
 | `runtime_env` | `None` | `runtime_env` dict shipped to workers so `batcher` + its native extension are present cluster-wide. |
 | `transport` | `"auto"` | Shuffle transport. `"auto"` picks Flight on a multi-node cluster, disk on a single node / shared filesystem; `"flight"`/`"disk"` force it. |
@@ -228,10 +228,11 @@ output is recomputed from its (durable) source partition and re-fetched.
 
 ### Cluster saturation & autoscaling
 
-Out of the box the distributed engine fills the whole cluster with no tuning: it fans
-out to **one worker per node**, gives each worker an **even share of that node's cores**
-(so morsel parallelism saturates every core), and scales the shuffle reducer count with
-the worker count. On an autoscaling-capable cluster it also asks the autoscaler for the
+Out of the box the distributed engine fills the whole cluster with no tuning: it
+**attaches to the running cluster** (even on a managed workspace that exports no
+`RAY_ADDRESS`), fans out to **one worker per node**, gives each worker an **even share of
+that node's cores** (so morsel parallelism saturates every core), and scales the shuffle
+reducer count with the worker count. On an autoscaling-capable cluster it also asks the autoscaler for the
 cores a query wants and — crucially — **waits (bounded) for the new nodes to arrive before
 sizing the fan-out**, so a big query runs on the grown cluster instead of clamping to the
 pre-scale size and leaving the new capacity for the next job.

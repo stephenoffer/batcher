@@ -35,9 +35,9 @@ def _agg_over_distinct(ds) -> bool:
     if split is None:
         return False
     _above, agg = split
-    # The map-local aggregate path is guarded by `not _has_breaker(agg.input)`; a DISTINCT
-    # input must trip that guard (so the dispatch falls through to the distinct handler).
-    return isinstance(agg.input, Distinct) and _has_breaker(agg.input)
+    # Only a DIRECT `Distinct` input is redirected off the map-local path; other breakers
+    # (nested aggregate / sort) keep it. The dispatch condition is `isinstance(_, Distinct)`.
+    return isinstance(agg.input, Distinct)
 
 
 def test_lone_count_distinct_routes_through_distinct():
@@ -59,3 +59,24 @@ def test_plain_groupby_still_uses_maplocal_path():
     assert split is not None
     _above, agg = split
     assert not _has_breaker(agg.input)  # breaker-free ⇒ map-local aggregate path is correct
+
+
+def test_nested_aggregate_keeps_maplocal_path():
+    # An aggregate over an aggregate (a composable nested sum) must NOT be redirected to the
+    # distinct handler — it keeps the map-local aggregate path (regression: an over-broad
+    # `not _has_breaker` guard once sent it to `_unsupported`).
+    ds = bt.from_arrow(_T).group_by("g").agg(s=col("x").sum()).agg(t=col("s").sum())
+    split = _split_at(_opt(ds), Aggregate)
+    assert split is not None
+    _above, agg = split
+    assert not isinstance(agg.input, Distinct)  # single-source, non-distinct ⇒ normal path
+
+
+def test_sort_limit_aggregate_keeps_maplocal_path():
+    # `sort().limit().agg()` — the aggregate's input is a breaker (Limit/Sort) but not a
+    # Distinct, so it stays on the normal aggregate path rather than erroring.
+    ds = bt.from_arrow(_T).sort("x").limit(1).agg(s=col("x").sum())
+    split = _split_at(_opt(ds), Aggregate)
+    assert split is not None
+    _above, agg = split
+    assert not isinstance(agg.input, Distinct)

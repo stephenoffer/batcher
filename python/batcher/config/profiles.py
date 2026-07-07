@@ -31,6 +31,7 @@ __all__ = [
     "RESILIENCE_PROFILES",
     "apply_resilience_profile",
     "detect_autoscaling_environment",
+    "detect_managed_cluster",
     "detect_spot_environment",
     "resolve_autoscale_wait",
 ]
@@ -93,6 +94,20 @@ def detect_autoscaling_environment() -> bool:
             return raw.strip().lower() in _SPOT_TRUE
     if detect_spot_environment():
         return True
+    return detect_managed_cluster()
+
+
+def detect_managed_cluster() -> bool:
+    """Best-effort detection of a managed Ray control plane (Anyscale) from cheap local
+    signals.
+
+    When true and no Ray address is configured, batcher attaches to the *running* cluster
+    (`ray.init(address="auto")`) instead of starting a local single-node Ray — the fix for
+    a managed workspace that exports neither `RAY_ADDRESS` nor Ray's current-cluster pointer,
+    where a bare `ray.init()` would silently strand a distributed job on one node. Env-var
+    only (no network call), like `detect_spot_environment`; extend `_MANAGED_AUTOSCALE_VARS`
+    for other managed platforms.
+    """
     return any(os.environ.get(v, "").strip() for v in _MANAGED_AUTOSCALE_VARS)
 
 

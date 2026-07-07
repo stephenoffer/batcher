@@ -69,14 +69,32 @@ def topology_scope():
         _TOPOLOGY.reset(token)
 
 
+# The Ray head node's marker. Distributed WORKER actors are never placed on the head
+# (it runs the GCS / dashboard / job supervisor — scheduling data operators there causes
+# contention and instability), so every node-count that sizes the worker fan-out MUST
+# exclude it too. When the head is the whole cluster it is kept (it has to run the work).
+_HEAD_MARKER = "node:__internal_head__"
+
+
+def _worker_eligible(nodes: list[dict]) -> list[dict]:
+    """`nodes` minus the Ray head, matching worker placement — unless the head is the whole
+    cluster (a single-node run must keep it). Sizing the fan-out from these keeps the worker
+    count at what can actually be PLACED: counting the head made a data-heavy shuffle request
+    one worker more than the schedulable node count, and the un-placeable actor hung the spawn
+    (`ray.get` on its address never returned)."""
+    non_head = [n for n in nodes if _HEAD_MARKER not in n.get("Resources", {})]
+    return non_head or nodes
+
+
 def _alive_nodes() -> list[dict]:
-    """Alive node records — from the active snapshot if any, else a live `ray.nodes()`."""
+    """Worker-eligible alive node records (head excluded) — from the active snapshot if any,
+    else a live `ray.nodes()`. Head-excluded so every fan-out sizing agrees with placement."""
     snap = _TOPOLOGY.get()
     if snap is not None:
-        return snap.alive_nodes
+        return _worker_eligible(snap.alive_nodes)
     import ray
 
-    return [n for n in ray.nodes() if n.get("Alive", True)]
+    return _worker_eligible([n for n in ray.nodes() if n.get("Alive", True)])
 
 
 def alive_node_count() -> int:
@@ -136,16 +154,17 @@ def cluster_topology() -> dict:
     """
     snap = _TOPOLOGY.get()
     if snap is not None:
-        nodes, resources = snap.alive_nodes, snap.resources
+        nodes = _worker_eligible(snap.alive_nodes)
     else:
         import ray
 
-        nodes = [n for n in ray.nodes() if n.get("Alive", True)]
-        resources = ray.cluster_resources()
+        nodes = _worker_eligible([n for n in ray.nodes() if n.get("Alive", True)])
+    # CPU/GPU summed over the worker-eligible nodes (head excluded), so a CPU-driven fit
+    # never counts cores no worker will run on — consistent with the head-excluded `nodes`.
     return {
         "nodes": max(1, len(nodes)),
-        "cpus": float(resources.get("CPU", 0.0)),
-        "gpus": float(resources.get("GPU", 0.0)),
+        "cpus": sum(float(n.get("Resources", {}).get("CPU", 0.0)) for n in nodes),
+        "gpus": sum(float(n.get("Resources", {}).get("GPU", 0.0)) for n in nodes),
     }
 
 

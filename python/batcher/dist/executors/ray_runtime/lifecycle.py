@@ -86,22 +86,28 @@ _wrapped_resources: tuple | None = None
 _wrap_lock = threading.Lock()
 
 
-def _ray_init_kwargs(workers: int, *, force_attach: bool = False) -> dict:
+def _ray_init_kwargs(
+    workers: int, *, force_attach: bool = False, force_local: bool = False
+) -> dict:
     """`ray.init(**kwargs)` for the active config — attach to a cluster or spin local.
 
     Attach to a *running* cluster when an address is configured (`Config` or the
-    `RAY_ADDRESS` env var Ray itself honors), shipping `batcher` + its native
-    extension via `runtime_env` so workers can run the data plane. Only when no
-    address is given do we start a *local* cluster capped at `workers` CPUs (the
-    single-node / test path); against a real cluster we leave fan-out to the
-    scheduler/autoscaler and never pin `num_cpus`.
+    `RAY_ADDRESS` env var Ray itself honors) OR a managed control plane is detected
+    (`detect_managed_cluster` — e.g. an Anyscale workspace), shipping `batcher` + its
+    native extension via `runtime_env` so workers can run the data plane. On a managed
+    workspace that exports neither `RAY_ADDRESS` nor Ray's current-cluster pointer, a bare
+    `ray.init()` would silently start a *local* single-node Ray and strand a distributed job
+    on one node — so a managed signal routes to `address="auto"` here, and `_ensure_ray`
+    falls back to a local start only if no cluster turns out to be reachable. Only when no
+    address is configured *and* no cluster is detected/reachable do we start a *local*
+    cluster capped at `workers` CPUs (the single-node / test path); against a real cluster we
+    leave fan-out to the scheduler/autoscaler and never pin `num_cpus`.
 
-    `force_attach` overrides the local branch to attach to a discoverable cluster
-    (`address="auto"`, no local-only `num_cpus`/object-store hints): a managed
-    managed workspace can run a cluster *without* setting `RAY_ADDRESS`, so a
-    plain `ray.init` auto-connects and then rejects those hints — `_ensure_ray`
-    retries here when Ray reports exactly that conflict."""
+    `force_attach` forces the discoverable-cluster attach (`address="auto"`); `force_local`
+    forces the local start (the reachability fallback). Both take precedence over detection."""
     import os
+
+    from batcher.config.profiles import detect_managed_cluster
 
     dc = active_config().distributed
     kwargs: dict = {
@@ -110,9 +116,12 @@ def _ray_init_kwargs(workers: int, *, force_attach: bool = False) -> dict:
         "ignore_reinit_error": True,
         "namespace": dc.namespace,
     }
-    if dc.ray_address:
+    attach = not force_local and (
+        force_attach or os.environ.get("RAY_ADDRESS") or detect_managed_cluster()
+    )
+    if not force_local and dc.ray_address:
         kwargs["address"] = dc.ray_address
-    elif force_attach or os.environ.get("RAY_ADDRESS"):
+    elif attach:
         kwargs["address"] = "auto"
     else:
         kwargs["num_cpus"] = workers
@@ -217,6 +226,12 @@ def _ensure_ray(workers: int) -> None:
             if "existing cluster" not in str(e):
                 raise
             ray.init(**_ray_init_kwargs(workers, force_attach=True))
+        except ConnectionError:
+            # A managed-cluster signal routed us to `address="auto"` but no cluster is
+            # actually reachable (e.g. a local dev run inside a workspace whose cluster is
+            # down): start a local single-node Ray instead of failing the job outright.
+            if not ray.is_initialized():
+                ray.init(**_ray_init_kwargs(workers, force_local=True))
         # Batcher initialized Ray: a local cluster shares the driver's modules and a
         # remote one carries the self-shipped runtime_env, so the job makes batcher
         # importable — no per-remote shipping needed.

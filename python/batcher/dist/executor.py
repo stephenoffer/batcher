@@ -389,15 +389,33 @@ def _dispatch(
     agg_split = _split_at(plan, Aggregate)
     if agg_split is not None:
         above, agg = agg_split
-        # The map/shuffle aggregate path runs `agg.input` as the per-partition map prefix,
-        # which is only correct when that prefix is BREAKER-FREE (scan/filter/project). A
-        # breaker in the input (e.g. a `Distinct` from the `count_distinct → distinct+count`
-        # rewrite, or a user `distinct().count()`) has GLOBAL semantics: run map-local, each
-        # partition dedups independently and the reducer sums the per-partition counts, so a
-        # value spanning two source partitions is double-counted (COUNT(DISTINCT) overcounts).
-        # Fall through so the inner breaker is distributed first (the Distinct/Sort/… handlers
-        # below), then the aggregate runs over its globally-correct result.
-        if _single_source(agg.input) and not _has_breaker(agg.input):
+        # Aggregate over a DISTINCT (the `count_distinct → distinct + count` rewrite, or a
+        # user `distinct().agg(...)`) must be caught BEFORE the map/shuffle aggregate path:
+        # that path runs `agg.input` as a per-partition map prefix, but a DISTINCT has GLOBAL
+        # semantics — run map-local, each partition dedups independently and the reducer sums
+        # the per-partition counts, double-counting any value spanning two source partitions
+        # (the COUNT(DISTINCT) overcount). Distribute the DISTINCT first (globally deduped),
+        # then aggregate over its result. NOTE (perf): a high-cardinality DISTINCT collects the
+        # deduped rows to the driver for the outer aggregate — correct, but slow for a 15M-key
+        # COUNT(DISTINCT); the correct-and-fast form is a 2nd distributed stage (future work).
+        # Scoped to a direct `Distinct` input: OTHER breakers (nested aggregate / sort) keep
+        # the map-local path, which is correct for the composable aggregates that dominate.
+        if (
+            isinstance(agg.input, Distinct)
+            and _single_source(agg.input)
+            and not _has_breaker(agg.input.input)
+        ):
+            from batcher.dist.executors.distinct import _distributed_distinct
+
+            return _distributed_distinct(
+                [*above, agg], agg.input, sources, workers, transport, materialize=materialize
+            )
+        # The map/shuffle aggregate path: run `agg.input` as the per-partition map prefix, then
+        # partial-aggregate + shuffle + combine. Correct over a breaker-free prefix and over a
+        # NESTED aggregate/sort whose per-partition result composes under this aggregate (the
+        # dominant case); a `Distinct` prefix was already redirected above. A join input has two
+        # sources, so `_single_source` skips it to the join handlers below.
+        if _single_source(agg.input):
             if transport == "flight":
                 from batcher.dist.flight_aggregate import execute_aggregate_flight
 
@@ -411,22 +429,6 @@ def _dispatch(
 
             return _distributed_aggregate(
                 above, agg, sources, workers, hub, materialize=materialize, metrics_out=metrics_out
-            )
-        # Aggregate over a DISTINCT (the `count_distinct → distinct + count` rewrite, or a
-        # user `distinct().agg(...)`): the DISTINCT has GLOBAL semantics, so it must be
-        # distributed first (dedup across partitions via its own shuffle) and the aggregate
-        # then run over the globally-deduped result. Running it map-local — the path above —
-        # dedups each partition independently and the reducer sums the counts, double-counting
-        # any value that spans two source partitions (the COUNT(DISTINCT) overcount).
-        if (
-            isinstance(agg.input, Distinct)
-            and _single_source(agg.input)
-            and not _has_breaker(agg.input.input)
-        ):
-            from batcher.dist.executors.distinct import _distributed_distinct
-
-            return _distributed_distinct(
-                [*above, agg], agg.input, sources, workers, transport, materialize=materialize
             )
         # Aggregate over an inner join grouped by ⊇ the join key: fold each reducer's bucket
         # to groups (exchange elimination) — full join never collects on head.

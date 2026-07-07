@@ -138,13 +138,9 @@ def test_unsized_plan_safe_budget_is_a_capped_fair_share():
     ctx = ResourceContext(config=cfg)
     plan = _plan([_op(0, "Scan", mem=0, credits=0, par=0)])
     avail = 8 << 30
-    env = DefaultSchedulingPolicy().envelope(
-        plan, ctx, requested_workers=4, available_bytes=avail
-    )
+    env = DefaultSchedulingPolicy().envelope(plan, ctx, requested_workers=4, available_bytes=avail)
     assert 0 < env.memory_bytes <= int(avail * cfg.memory.soft_limit) // 4
-    env0 = DefaultSchedulingPolicy().envelope(
-        plan, ctx, requested_workers=4, available_bytes=0
-    )
+    env0 = DefaultSchedulingPolicy().envelope(plan, ctx, requested_workers=4, available_bytes=0)
     assert env0.memory_bytes == 0  # unknown budget → preserves the old no-hint behavior
 
 
@@ -161,9 +157,7 @@ def test_regular_user_query_auto_configures_every_ray_knob_with_no_input():
     from batcher.kyber import optimize
 
     ds = (
-        bt.from_pydict(
-            {"k": [i % 9 for i in range(900)], "v": [float(i) for i in range(900)]}
-        )
+        bt.from_pydict({"k": [i % 9 for i in range(900)], "v": [float(i) for i in range(900)]})
         .filter(bt.col("v") > 5)
         .group_by("k")
         .agg(s=bt.col("v").sum())
@@ -643,9 +637,7 @@ def test_clamp_workers_packs_fractional_cpu(monkeypatch):
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     # clamp_workers reads cluster_topology from its own module (scaling), so patch it there —
     # patching only the ray_runtime re-export would not reach the in-module lookup.
-    monkeypatch.setattr(
-        scaling, "cluster_topology", lambda: {"nodes": 1, "cpus": 8.0, "gpus": 0.0}
-    )
+    monkeypatch.setattr(scaling, "cluster_topology", lambda: {"nodes": 1, "cpus": 8.0, "gpus": 0.0})
     # 0.5 CPU/task → 16 tasks fit on 8 cores; 1.0 reproduces today's count; 2.0 → 4.
     assert ray_runtime.clamp_workers(16, 0.5) == 16
     assert ray_runtime.clamp_workers(20, 0.5) == 16  # over-subscribed → clamp to 16
@@ -660,7 +652,10 @@ def test_object_store_memory_only_on_local_start(monkeypatch):
     from batcher.config import Config, DistributedConfig, config_context
     from batcher.dist.executors.ray_runtime.lifecycle import _ray_init_kwargs
 
-    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    # Clear address + managed-cluster signals so this exercises the genuine local-start
+    # path (a managed signal would route to attach, which drops these local-only knobs).
+    for _var in ("RAY_ADDRESS", "ANYSCALE_SESSION_ID", "ANYSCALE_CLUSTER_ID"):
+        monkeypatch.delenv(_var, raising=False)
     with config_context(
         Config().replace(distributed=DistributedConfig(object_store_memory_bytes=2 << 30))
     ):
