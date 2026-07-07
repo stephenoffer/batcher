@@ -93,6 +93,37 @@ _SCAN_CACHE_BYTES = 0
 _SCAN_CACHE_LOCK = threading.Lock()
 
 
+# --- Broken-record tolerance (distributed.on_read_error="skip") --------------------
+# Count of splits (file / row-group group) a worker skipped because they failed to read.
+# Process-wide on the worker so a persistent-fleet worker's total is observable across a
+# query; `skipped_splits()` reads it. A skip is a silent data loss, so each one logs.
+_SKIPPED_SPLITS = 0
+_SKIPPED_LOCK = threading.Lock()
+
+
+def skipped_splits() -> int:
+    """The number of splits this worker skipped under ``on_read_error="skip"``.
+
+    Non-zero means the scan dropped unreadable data (a corrupt file / row-group) rather
+    than failing — the count makes that data loss observable instead of silent.
+    """
+    return _SKIPPED_SPLITS
+
+
+def _record_skipped(split, exc: Exception) -> None:
+    """Count and log a split skipped under ``on_read_error="skip"``."""
+    global _SKIPPED_SPLITS
+    with _SKIPPED_LOCK:
+        _SKIPPED_SPLITS += 1
+    try:
+        from batcher._internal.logging import get_logger
+
+        ident = getattr(split, "path", None) or getattr(split, "identity", lambda: split)()
+        get_logger("dist.scan").warning("skipping unreadable split %s: %s", ident, exc)
+    except Exception:  # pragma: no cover - logging must never break the scan
+        pass
+
+
 def _all_rowgroup(splits) -> bool:
     from batcher.io.splits import RowGroupSplit
 
@@ -131,7 +162,7 @@ def _scan_cache_put(key, batches, nbytes) -> None:
             _SCAN_CACHE_BYTES -= evb
 
 
-def _read_split_batches(splits, projection, predicate):
+def _read_split_batches(splits, projection, predicate, on_read_error="error"):
     """Stream `splits`' decoded batches, serving from the worker's scan cache when warm.
 
     On a persistent (session-fleet) worker, the SAME splits route here on every query
@@ -141,9 +172,13 @@ def _read_split_batches(splits, projection, predicate):
     Batcher beats the read-bound competition. Parquet files are immutable, so a cached
     decode is byte-identical to a fresh one. Falls through to a normal (uncached) read
     when caching is off, the splits aren't cacheable row-groups, or the partition exceeds
-    the cache budget (then it just streams)."""
-    if not (_SCAN_CACHE_CAP > 0 and splits and _all_rowgroup(splits)):
-        yield from _read_split_batches_uncached(splits, projection, predicate)
+    the cache budget (then it just streams).
+
+    Under ``on_read_error="skip"`` the read bypasses the cache and the coalesced bulk
+    scans for the per-split reader, so an unreadable split is skipped in isolation without
+    poisoning a cache entry (see `_read_split_batches_uncached`)."""
+    if on_read_error == "skip" or not (_SCAN_CACHE_CAP > 0 and splits and _all_rowgroup(splits)):
+        yield from _read_split_batches_uncached(splits, projection, predicate, on_read_error)
         return
     key = _scan_cache_key(splits, projection, predicate)
     cached = _scan_cache_get(key)
@@ -165,10 +200,20 @@ def _read_split_batches(splits, projection, predicate):
         _scan_cache_put(key, acc, acc_bytes)
 
 
-def _read_split_batches_uncached(splits, projection, predicate):
+def _read_split_batches_uncached(splits, projection, predicate, on_read_error="error"):
     """The reader itself (no cache): native Rust for predicate-free row-group splits, else
     the coalesced pyarrow dataset scan, else the prefetch pool. All stream and push
-    projection, so the result is identical and a worker never holds its whole partition."""
+    projection, so the result is identical and a worker never holds its whole partition.
+
+    ``on_read_error="skip"`` uses the per-split prefetch reader (not the coalesced bulk
+    scans) so a failing split is skipped in isolation — the bulk scan reads many
+    row-groups concurrently in C++ and a mid-stream decode error can't be attributed to
+    one split, so it can't skip just the bad one."""
+    if on_read_error == "skip":
+        yield from _prefetch_split_reads(
+            splits, projection, predicate, _SCAN_PREFETCH, skip_errors=True
+        )
+        return
     if _NATIVE_READER and predicate is None:
         native = _native_scan_batches(splits, projection)
         if native is not None:
@@ -321,7 +366,7 @@ def _split_read(split: Split, projection: list[str] | None, predicate: dict | No
     return split.read(projection)
 
 
-def _prefetch_split_reads(splits, projection, predicate, depth: int):
+def _prefetch_split_reads(splits, projection, predicate, depth: int, skip_errors: bool = False):
     """Yield each split's batches **in order**, reading up to `depth` splits ahead on a
     thread pool so object-store I/O overlaps the caller's per-split compute and several
     reads run at once. `depth <= 1` (or a single split) is the plain sequential read.
@@ -330,10 +375,22 @@ def _prefetch_split_reads(splits, projection, predicate, depth: int):
     each before the window advances, so a wide partition never materializes whole. Read
     order is preserved (a FIFO of futures), so a downstream that assumes file order is
     unaffected.
+
+    `skip_errors` (``on_read_error="skip"``): a split whose read raises is recorded and
+    skipped instead of failing the scan, so one corrupt file/row-group never loses its
+    healthy siblings. Off by default — a read failure propagates (fail-fast).
     """
     if depth <= 1 or len(splits) <= 1:
         for s in splits:
-            yield from _split_read(s, projection, predicate)
+            if skip_errors:
+                try:
+                    batches = _split_read(s, projection, predicate)
+                except Exception as e:  # a bad split is skipped, not fatal
+                    _record_skipped(s, e)
+                    continue
+                yield from batches
+            else:
+                yield from _split_read(s, projection, predicate)
         return
 
     import collections
@@ -343,12 +400,22 @@ def _prefetch_split_reads(splits, projection, predicate, depth: int):
         pending: collections.deque = collections.deque()
         it = iter(splits)
         for s in _take(it, depth):
-            pending.append(pool.submit(_split_read, s, projection, predicate))
+            pending.append((s, pool.submit(_split_read, s, projection, predicate)))
         while pending:
-            batches = pending.popleft().result()  # raises if the read failed
+            split, fut = pending.popleft()
+            # Submit the next read BEFORE draining this one so a failed split still
+            # advances the prefetch window (keeps the pipeline full under skip).
             nxt = next(it, None)
             if nxt is not None:
-                pending.append(pool.submit(_split_read, nxt, projection, predicate))
+                pending.append((nxt, pool.submit(_split_read, nxt, projection, predicate)))
+            if skip_errors:
+                try:
+                    batches = fut.result()
+                except Exception as e:  # a bad split is skipped, not fatal
+                    _record_skipped(split, e)
+                    continue
+            else:
+                batches = fut.result()  # raises if the read failed
             yield from batches
 
 

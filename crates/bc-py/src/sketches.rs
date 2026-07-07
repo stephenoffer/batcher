@@ -6,13 +6,83 @@
 //! optimizer consumes for cardinality, selectivity, and skew. Extracted from `lib`
 //! along the statistics seam to keep the FFI root within the size budget.
 
-use arrow::array::{Array, RecordBatch};
+use std::sync::Arc;
+
+use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::cast;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow_pyarrow::PyArrowType;
 use bc_sketches::Mergeable;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+
+/// Temporal types whose order the integer backing (days / ticks) preserves — the ones a
+/// range/quantile pass can treat numerically. Excludes `Interval` (not a totally-ordered
+/// scalar). Mirrors `bc_runtime::shuffle::is_temporal_key` so the sort *sample* here and the
+/// range *partition* there agree on which keys are numeric-backed.
+fn is_temporal_key(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+    )
+}
+
+/// Cast a temporal column to `Int64` via its order-preserving backing (`Date32`/`Time32`
+/// are `i32`-backed, so route through `Int32`). Same representation the range partition
+/// uses, so quantile boundaries sampled here route rows there identically.
+fn temporal_to_i64(col: &ArrayRef) -> Option<ArrayRef> {
+    match cast(col, &DataType::Int64) {
+        Ok(a) => Some(a),
+        Err(_) => cast(col, &DataType::Int32)
+            .and_then(|a| cast(&a, &DataType::Int64))
+            .ok(),
+    }
+}
+
+/// Replace each requested *temporal* column with its `Int64` backing, so the KLL quantile
+/// sketch (numeric-only) can summarize a `Date`/`Timestamp` sort key. Non-temporal columns
+/// and untouched batches pass through by clone. Scoped to `column_quantiles` (the sort
+/// sample) — the optimizer's `column_stats` still sees dates as dates.
+fn temporal_cols_as_i64(
+    columns: &[String],
+    batches: &[PyArrowType<RecordBatch>],
+) -> Vec<PyArrowType<RecordBatch>> {
+    let targets: std::collections::HashSet<&str> = columns.iter().map(|s| s.as_str()).collect();
+    batches
+        .iter()
+        .map(|pb| {
+            let b = &pb.0;
+            let mut changed = false;
+            let mut fields: Vec<Arc<Field>> = Vec::with_capacity(b.num_columns());
+            let mut cols: Vec<ArrayRef> = Vec::with_capacity(b.num_columns());
+            for (i, f) in b.schema().fields().iter().enumerate() {
+                let c = b.column(i);
+                if targets.contains(f.name().as_str()) && is_temporal_key(c.data_type()) {
+                    if let Some(i64c) = temporal_to_i64(c) {
+                        fields.push(Arc::new(Field::new(f.name(), DataType::Int64, f.is_nullable())));
+                        cols.push(i64c);
+                        changed = true;
+                        continue;
+                    }
+                }
+                fields.push(f.clone());
+                cols.push(c.clone());
+            }
+            if !changed {
+                return PyArrowType(b.clone());
+            }
+            match RecordBatch::try_new(Arc::new(Schema::new(fields)), cols) {
+                Ok(rb) => PyArrowType(rb),
+                Err(_) => PyArrowType(b.clone()),
+            }
+        })
+        .collect()
+}
 
 /// Estimate the number of distinct (non-null) values in a column across batches,
 /// using HyperLogLog++. Mergeable, so it can be computed per partition.
@@ -111,6 +181,11 @@ pub(crate) fn column_quantiles(
     batches: Vec<PyArrowType<RecordBatch>>,
     probs: Vec<f64>,
 ) -> PyResult<std::collections::HashMap<String, Vec<f64>>> {
+    // A temporal sort key (Date/Timestamp) has no numeric KLL, so summarize it on its
+    // order-preserving Int64 backing — the same representation the range partition compares
+    // on — so a distributed `ORDER BY <date>` gets balanced boundaries instead of an empty
+    // grid (one overloaded reducer). Numeric columns are untouched.
+    let batches = temporal_cols_as_i64(&columns, &batches);
     let merged = merge_column_stats(&columns, &batches);
     Ok(merged
         .into_iter()

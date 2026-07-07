@@ -218,6 +218,10 @@ def validate_config(cfg: Config) -> None:
         f"distributed.transport must be one of {{'auto', 'flight', 'disk'}}, got {d.transport!r}",
     )
     _check(
+        d.on_read_error in {"error", "skip"},
+        f"distributed.on_read_error must be one of {{'error', 'skip'}}, got {d.on_read_error!r}",
+    )
+    _check(
         d.speculation_straggler_factor >= 1.0,
         f"distributed.speculation_straggler_factor must be >= 1, "
         f"got {d.speculation_straggler_factor}",

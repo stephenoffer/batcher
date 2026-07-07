@@ -67,11 +67,6 @@ def _collect(
     result to materialize. This guards every materializing terminal (`collect`,
     `count`, `to_*`, `show`), so they fail fast instead of hanging.
     """
-    import os as _ce_os
-    import time as _ce_time
-
-    _cep = _ce_os.environ.get("BATCHER_SORT_PROFILE")
-    _ce0 = _ce_time.perf_counter()
     from batcher.io.source import is_bounded
 
     if any(not is_bounded(s) for s in sources):
@@ -194,23 +189,13 @@ def _collect(
         source_stats=source_stats,
         profile=event_log_collector(),
     )
-    import os as _ct_os
-
-    _ctp = _ct_os.environ.get("BATCHER_SORT_PROFILE")
-    if _ctp:
-        print(f"[collect] pre-execute routing {_ce_time.perf_counter() - _ce0:.1f}s", flush=True)
     t0 = time.perf_counter()
     table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
     total_ms = (time.perf_counter() - t0) * 1000.0
-    _ce_post = _ce_time.perf_counter()
-    if _ctp:
-        print(f"[collect] executor.execute {total_ms / 1000:.1f}s -> {table.num_rows} rows", flush=True)
     write_event_log(ctx.profile, total_ms=total_ms, rows=table.num_rows)
     from batcher.api.terminal.gpu_backend import record_cpu_crossover  # adaptive-crossover sample
 
     record_cpu_crossover(plan, sources, ctx.hub, total_ms)  # gated to a GPU cluster; else no-op
-    if _ctp:
-        print(f"[collect] post-execute tail {_ce_time.perf_counter() - _ce_post:.1f}s", flush=True)
     return table
 
 

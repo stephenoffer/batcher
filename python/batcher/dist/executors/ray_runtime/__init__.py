@@ -38,6 +38,7 @@ from .scaling import (
     request_autoscale,
     shuffle_partitions,
     topology_scope,
+    worker_node_memory_bytes,
 )
 from .scheduling import (
     create_worker_placement,
@@ -82,4 +83,5 @@ __all__ = [
     "speculation_policy",
     "task_options",
     "topology_scope",
+    "worker_node_memory_bytes",
 ]

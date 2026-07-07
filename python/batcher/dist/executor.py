@@ -44,6 +44,7 @@ from batcher.dist.executors.ray_runtime import _ensure_ray as _ensure_ray
 from batcher.dist.executors.ray_runtime import _rmtree as _rmtree
 from batcher.dist.executors.ray_runtime import (
     _single_node,
+    alive_node_count,
     await_autoscale,
     clamp_workers,
     engine_config_json,
@@ -53,6 +54,7 @@ from batcher.dist.executors.ray_runtime import (
     resolve_transport,
     set_scheduling_envelope,
     topology_scope,
+    worker_node_memory_bytes,
 )
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
@@ -114,11 +116,6 @@ def execute_distributed(
     # schedulable capacity, and pick the transport from the resulting topology.
     num_cpus, num_gpus = (envelope.num_cpus, envelope.num_gpus) if envelope else (1.0, 0.0)
     token = set_scheduling_envelope(envelope)
-    import os as _oz
-    import time as _tz
-
-    _pz = _oz.environ.get("BATCHER_SORT_PROFILE")
-    _z0 = _tz.perf_counter()
     request_autoscale(math.ceil(workers * num_cpus), workers * num_gpus)
     try:
         _ensure_ray(workers)
@@ -182,14 +179,24 @@ def execute_distributed(
             token = set_scheduling_envelope(envelope)
             _ensure_ray(clamped)
         workers = clamped
+        # Size the per-worker memory budget from the WORKER node's RAM (hardware metadata →
+        # decision): a large driver (e.g. a 197 GiB head) must not hand a 34 GiB worker a
+        # budget derived from the driver's memory. Under SPREAD a worker owns its node, so its
+        # spill threshold is the node's RAM × soft_limit split across the workers packed on it
+        # — enough to use the machine before spilling, bounded so it never OOMs the smallest
+        # node. A tighter Carbonite estimate still wins; the topology having no memory info
+        # leaves the grant untouched (today's behavior).
+        sized = _size_worker_memory(envelope, workers, num_cpus)
+        if sized is not envelope:
+            envelope = sized
+            reset_scheduling_envelope(token)
+            token = set_scheduling_envelope(envelope)
         # The worker count and cluster size are now settled (autoscale-wait + clamp done),
         # so snapshot the topology once for the whole placement/transport/shuffle phase
         # instead of paying a fresh `ray.nodes()` RPC at each of its ~5 read sites — the
         # O(nodes)-per-read amplification that bites at thousands of nodes.
         with topology_scope():
             transport = resolve_transport(transport, workers)
-            if _pz:
-                print(f"[sort] execute_distributed PRE-dispatch {_tz.perf_counter() - _z0:.1f}s", flush=True)
             return _dispatch(
                 plan,
                 sources,
@@ -224,20 +231,27 @@ def _worker_node_cpus() -> list[float]:
 
 
 def _cluster_fill_workers() -> tuple[int, float] | None:
-    """The cluster-filling fan-out: one worker per (non-head) node, each owning that node's
-    cores.
+    """The cluster-filling fan-out: enough `min`-core workers to fill EVERY node's cores.
 
-    Returns `(workers, num_cpus)` on a genuine multi-node cluster — `workers` = the live
-    worker-node count, `num_cpus` = the smallest node's cores (so the per-worker grant is
-    placeable on every node, SPREAD-safe). Returns `None` on a single node or when the
-    topology is unreadable, so the caller keeps the data-driven `_even_cpu_share` sizing.
-    Ray must already be initialized (`ray.nodes()` is empty before).
+    Returns `(workers, num_cpus)` on a genuine multi-node cluster. `num_cpus` = the smallest
+    worker node's cores, so a worker is placeable on any node (SPREAD-safe); `workers` =
+    ``Σ floor(node_cores / num_cpus)`` over the worker nodes — one worker per `num_cpus`-core
+    slice. A **homogeneous** cluster reduces to one worker per node exactly as before; a
+    **heterogeneous** one gives a node with k times the smallest node's cores k workers, so its
+    extra cores are used instead of stranded idle under a uniform one-worker-per-node grant
+    (a 64-core node next to 32-core nodes was running at half utilization). Any worker count
+    is result-correct under the mergeable algebra, so this only affects saturation; the
+    per-worker CPU grant stays `min`-sized so the SPREAD placement group still fits every
+    node. Returns `None` on a single node or unreadable topology, so the caller keeps the
+    data-driven `_even_cpu_share` sizing. Ray must already be initialized.
     """
     try:
         node_cpus = _worker_node_cpus()
         if len(node_cpus) <= 1:
             return None
-        return len(node_cpus), float(int(min(node_cpus)))
+        num_cpus = max(1.0, float(int(min(node_cpus))))
+        workers = sum(max(1, int(c // num_cpus)) for c in node_cpus)
+        return workers, num_cpus
     except Exception:
         return None
 
@@ -262,6 +276,37 @@ def _even_cpu_share(workers: int) -> float:
         return max(1.0, min(placeable, non_oversubscribing))
     except Exception:
         return 1.0
+
+
+def _size_worker_memory(
+    envelope: SchedulingEnvelope | None, workers: int, num_cpus: float
+) -> SchedulingEnvelope | None:
+    """Set the per-worker memory budget from the worker node's RAM (hardware-aware spill
+    threshold). Returns `envelope` unchanged (same object) when the topology advertises no
+    node memory, so a cluster that doesn't report it keeps today's behavior.
+
+    A worker owns its node under SPREAD; when several workers pack one node they split its
+    RAM. The budget is `min(node_mem * soft_limit / workers_per_node, Carbonite's estimate)`
+    — Carbonite's tighter data-driven estimate still wins, but an unset (unbounded) or
+    driver-oversized grant is clamped to what the worker machine can actually hold.
+    """
+    node_mem = worker_node_memory_bytes()
+    if node_mem <= 0:
+        return envelope
+    nodes = max(1, alive_node_count())
+    per_node_workers = max(1, math.ceil(workers / nodes))
+    from batcher.config import active_config
+
+    budget = int(node_mem * active_config().memory.soft_limit / per_node_workers)
+    if budget <= 0:
+        return envelope
+    if envelope is None:
+        return SchedulingEnvelope(num_cpus=num_cpus, n_tasks=workers, memory_bytes=budget)
+    current = envelope.memory_bytes
+    new_mem = budget if current <= 0 else min(current, budget)
+    if new_mem == current:
+        return envelope
+    return dataclasses.replace(envelope, memory_bytes=new_mem)
 
 
 def _rescale_envelope(

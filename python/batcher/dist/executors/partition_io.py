@@ -147,21 +147,23 @@ def _partition_source(
     if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):
         return _eager_range_split(source, workers, work_dir, tag, projection, predicate)
 
+    from batcher.config import active_config
     from batcher.dist.shuffle_io import write_ipc
 
+    # Broken-record policy resolved on the driver, embedded per manifest → reaches workers.
+    on_read_error = active_config().distributed.on_read_error
+    meta = {"projection": projection, "predicate": predicate, "on_read_error": on_read_error}
     schema = source.schema()
     paths = []
     for i, group in enumerate(_balance(splits, workers)):
         if group:
             path = os.path.join(work_dir, f"{tag}_part_{i}.splits")
             with open(path, "wb") as fh:
-                pickle.dump({"splits": group, "projection": projection, "predicate": predicate}, fh)
+                pickle.dump({"splits": group, **meta}, fh)
         else:
             # Empty group: a schema-only IPC partition keeps map tasks uniform.
-            cols = projection or schema.names
-            empty_schema = pa.schema([schema.field(c) for c in cols])
             path = os.path.join(work_dir, f"{tag}_part_{i}.arrow")
-            write_ipc([pa.RecordBatch.from_pylist([], schema=empty_schema)], path)
+            write_ipc([_projected_empty_batch(schema, projection)], path)
         paths.append(path)
     return paths
 
@@ -356,6 +358,14 @@ def streaming_partial_aggregate(
     return running
 
 
+def _projected_empty_batch(schema: pa.Schema, projection) -> pa.RecordBatch:
+    """One empty batch carrying `schema` (restricted to `projection`) — the schema a
+    fully-pruned/empty partition still hands downstream so the native ops get a schema."""
+    if projection is not None:
+        schema = pa.schema([schema.field(c) for c in projection])
+    return pa.RecordBatch.from_pylist([], schema=schema)
+
+
 def read_partition(path: str) -> list[pa.RecordBatch]:
     """Read a partition file written by `_partition_source` (manifest or IPC).
 
@@ -369,16 +379,10 @@ def read_partition(path: str) -> list[pa.RecordBatch]:
         projection = manifest["projection"]
         predicate = manifest["predicate"]
         splits = manifest["splits"]
-        out = list(_read_split_batches(splits, projection, predicate))
+        on_read_error = manifest.get("on_read_error", "error")
+        out = list(_read_split_batches(splits, projection, predicate, on_read_error))
         if not out and splits:
-            # A partition fully eliminated by predicate pushdown (or an empty
-            # source) still must carry a schema, so downstream operators — notably
-            # the native partial-aggregate, which can't run "over empty input with
-            # no schema" — have one. Emit a single schema-only batch.
-            schema = splits[0].schema()
-            if projection is not None:
-                schema = pa.schema([schema.field(c) for c in projection])
-            out = [pa.RecordBatch.from_pylist([], schema=schema)]
+            out = [_projected_empty_batch(splits[0].schema(), projection)]
         return out
     from batcher.dist.shuffle_io import read_ipc
 
@@ -400,15 +404,13 @@ def iter_partition(path: str):
             manifest["predicate"],
             manifest["splits"],
         )
+        on_read_error = manifest.get("on_read_error", "error")
         emitted = False
-        for b in _read_split_batches(splits, projection, predicate):
+        for b in _read_split_batches(splits, projection, predicate, on_read_error):
             emitted = True
             yield b
         if not emitted and splits:
-            schema = splits[0].schema()
-            if projection is not None:
-                schema = pa.schema([schema.field(c) for c in projection])
-            yield pa.RecordBatch.from_pylist([], schema=schema)
+            yield _projected_empty_batch(splits[0].schema(), projection)
         return
     with pa.OSFile(path, "rb") as src, pa.ipc.open_stream(src) as reader:
         yield from reader

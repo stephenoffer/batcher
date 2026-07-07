@@ -563,6 +563,21 @@ class DistributedConfig:
     # cluster with a higher background failure rate may want more attempts.
     recovery_max_attempts: int = 3
     recovery_backoff_base_s: float = 0.5
+    # Broken-record tolerance for the distributed scan. A single corrupt file /
+    # unreadable row-group otherwise raises out of a worker's read and — because the
+    # error is *deterministic* (a rerun fails identically) — the recompute loop retries
+    # it `recovery_max_attempts` times and then fails the whole cluster job. Real
+    # data-lake tables routinely carry a few bad files, so a fatal read is the wrong
+    # default for them but the right one for a small, trusted input. The policy travels
+    # with each partition manifest, so it reaches every worker without shipping config:
+    #   "error" (default) — any read failure fails the query (today's fail-fast behavior).
+    #   "skip" — a split (file / row-group group) that fails to read is skipped and the
+    #       scan continues; the count of skipped splits is recorded on the worker
+    #       (`skipped_splits()`), so a silent data loss is observable. Skipping isolates
+    #       failures per split (the bulk coalesced dataset scan, whose mid-stream decode
+    #       error can't be attributed to one split, is bypassed for the per-split reader),
+    #       so one bad file never discards its healthy siblings in the same partition.
+    on_read_error: str = "error"
     # Ray-level task/actor fault tolerance — the *first* line of defense, beneath the
     # shuffle recompute loop above. A transient task failure (a flaky node, a dropped
     # connection) is retried by Ray itself before the heavier app-level recompute

@@ -176,6 +176,36 @@ fn scatter_into_buckets(
 /// bucket the driver concatenates first (`n_buckets-1` for a descending sort, else
 /// `0`), and nulls land there when `nulls_first`, else at the opposite end.
 ///
+/// Whether `dt` is a temporal type with a total order that its integer backing
+/// (days / millis / micros / nanos) preserves — so range-partitioning on the backing
+/// gives the same order as the single-node temporal sort. Excludes `Interval`
+/// (month-day-nano is not a single totally-ordered scalar).
+pub fn is_temporal_key(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+    )
+}
+
+/// Cast a temporal column to `Int64` via its order-preserving backing (days / ticks).
+/// `Date32`/`Time32` are `i32`-backed, so a direct `Date32 → Int64` cast is unsupported;
+/// route those through `Int32` first. The result is the canonical integer the sort sample
+/// and the range partition both compare on, so they share one representation.
+pub fn temporal_to_i64(col: &ArrayRef) -> Result<ArrayRef, RuntimeError> {
+    match cast(col, &DataType::Int64) {
+        Ok(a) => Ok(a),
+        Err(_) => {
+            let i32 = cast(col, &DataType::Int32)?;
+            Ok(cast(&i32, &DataType::Int64)?)
+        }
+    }
+}
+
 /// This is the Rust counterpart of the hash [`partition_by_keys`] for the
 /// distributed-sort path. The key is compared as `f64` — bit-identical to the
 /// previous NumPy `searchsorted` over `to_numpy()` keys (the boundaries are
@@ -223,16 +253,24 @@ pub fn range_partition_by_key_array(
     } as u32;
 
     // Compare the key in f64 (the boundaries are f64 quantiles), matching the prior
-    // `kc.to_numpy()` + `np.searchsorted` path bit-for-bit. Guard non-numeric keys:
-    // Arrow would happily parse a string like "12" to 12.0, which would disagree with
-    // the single-node *lexical* string sort — exactly what the old `to_numpy()` on a
-    // string column refused to do.
-    if !key_col.data_type().is_numeric() {
+    // `kc.to_numpy()` + `np.searchsorted` path bit-for-bit. Numeric keys cast directly;
+    // TEMPORAL keys (Date/Time/Timestamp) route by their order-preserving integer backing
+    // (days / millis / micros as i64 → f64), so a distributed `ORDER BY <date>` balances and
+    // sorts exactly like single-node instead of failing — the common TPC-H shape. STRING and
+    // other non-orderable-numeric keys are still refused: Arrow would parse "12" → 12.0,
+    // disagreeing with the single-node *lexical* string sort (what `to_numpy()` refused).
+    let dt = key_col.data_type();
+    let key = if dt.is_numeric() {
+        cast(key_col, &DataType::Float64)?
+    } else if is_temporal_key(dt) {
+        // temporal → i64 (its backing) → f64. The sample side casts identically, so the
+        // boundaries and the routing share one representation.
+        cast(&temporal_to_i64(key_col)?, &DataType::Float64)?
+    } else {
         return Err(RuntimeError::NonNumericRangeKey {
-            dtype: key_col.data_type().to_string(),
+            dtype: dt.to_string(),
         });
-    }
-    let key = cast(key_col, &DataType::Float64)?;
+    };
     let key = key.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
         RuntimeError::NonNumericRangeKey {
             dtype: key_col.data_type().to_string(),

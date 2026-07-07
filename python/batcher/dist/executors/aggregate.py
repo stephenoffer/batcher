@@ -207,18 +207,30 @@ def _map_task(
 def _reduce_task(group_keys_json, aggregates_json, input_paths, work_dir, reducer_id):
     """Combine+finalize the partials routed to this reducer. Returns
     ``(ipc_path, row_count)`` for a non-empty bucket, else ``(None, 0)`` — the exact
-    count lets the driver size a materialized intermediate without reading it back."""
+    count lets the driver size a materialized intermediate without reading it back.
+
+    The mappers' partials are folded **incrementally** with `combine` — each input merged
+    into one running state (bounded by the group cardinality) and then dropped — rather than
+    materializing every mapper's partial for this reducer at once. So a high-fan-in or
+    skewed reducer's peak memory is one running state + one input, not the sum of all W
+    inputs (the disk path now matches the Flight path's bounded tree-reduce). `combine` is
+    associative+commutative, so the folded result is bit-identical to combining them all in
+    one call — the mergeable-algebra invariant."""
     import os as _os
 
     import batcher._native as nat
     from batcher.dist.shuffle_io import read_ipc, write_ipc
 
-    partials: list = []
+    running = None
     for path in input_paths:
-        partials.extend(read_ipc(path))
-    if not partials:
+        batch = read_ipc(path)
+        if not batch:
+            continue
+        merged = batch if running is None else [running, *batch]
+        running = nat.combine(group_keys_json, aggregates_json, merged)
+    if running is None:
         return (None, 0)
-    result = nat.combine_finalize(group_keys_json, aggregates_json, partials)
+    result = nat.combine_finalize(group_keys_json, aggregates_json, [running])
     if result.num_rows == 0:
         return (None, 0)
     path = _os.path.join(work_dir, f"reduce_{reducer_id}.arrow")

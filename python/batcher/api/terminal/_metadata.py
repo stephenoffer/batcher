@@ -40,8 +40,17 @@ def _stats_sample(src: Source) -> list[pa.RecordBatch]:
     for minutes *after* a ~60 s distributed agg). The actual cardinalities of that run are
     already learned from the worker metrics; these column sketches are an approximate
     prior the estimator refines across runs, so a bounded sample is the right trade.
-    `iter_source` is lazy, so this stops after the first batches past the row cap (an
-    in-memory source is already resident and small)."""
+
+    For a splittable Parquet source the sample is read through the coalesced, multi-thread
+    dataset scanner (`_fast_sample`) — the naive per-file driver read of even the bounded
+    262 k-row sample is ~0.8 MB/s on high-latency object storage (measured 45 s for a
+    single sf10 sample, which then blocks the query *return* after the distributed work is
+    already done). The fast reader cuts that to ~0.4 s. Any non-splittable source (or a
+    read failure) falls back to the lazy `iter_source` read; `iter_source` stops after the
+    first batches past the row cap (an in-memory source is already resident and small)."""
+    fast = _fast_sample(src)
+    if fast is not None:
+        return fast
     out: list[pa.RecordBatch] = []
     n = 0
     for b in iter_source(src, None, None):
@@ -50,6 +59,42 @@ def _stats_sample(src: Source) -> list[pa.RecordBatch]:
         if n >= _STATS_SAMPLE_ROWS:
             break
     return out
+
+
+def _fast_sample(src: Source) -> list[pa.RecordBatch] | None:
+    """The bounded sample read through the coalesced Parquet row-group scanner, or `None`.
+
+    Reuses the distributed scan reader (pre-buffered, 32-IO-thread pyarrow dataset scan)
+    over just the leading row-group splits needed to cover the row cap — the same fast
+    path a worker uses — instead of the naive single-stream driver read. Returns `None`
+    for a non-row-group source (in-memory, CSV, one whole-file split) or any failure, so
+    the caller falls back to `iter_source`."""
+    try:
+        from batcher.io.splits import RowGroupSplit
+
+        splits = src.splits()
+        if not splits or not all(isinstance(s, RowGroupSplit) for s in splits):
+            return None
+        # Take leading row-groups until their combined rows cover the cap (at least one).
+        chosen: list = []
+        rows = 0
+        for s in splits:
+            chosen.append(s)
+            rows += s.row_count() or 0
+            if rows >= _STATS_SAMPLE_ROWS:
+                break
+        from batcher.dist.executors.scan_read import _read_split_batches
+
+        out: list[pa.RecordBatch] = []
+        n = 0
+        for b in _read_split_batches(chosen, None, None):
+            out.append(b)
+            n += b.num_rows
+            if n >= _STATS_SAMPLE_ROWS:
+                break
+        return out or None
+    except Exception:  # any read/scan failure → caller falls back to iter_source
+        return None
 
 
 def collect_source_metadata(hub, sources: list[Source]) -> None:
@@ -69,9 +114,7 @@ def collect_source_metadata(hub, sources: list[Source]) -> None:
     try:
         known = set(kyber.load_learned_stats(hub).get(_NDV_KEY, {}))
         resolved = [
-            _stats_sample(src)
-            for src in sources
-            if any(c not in known for c in src.schema().names)
+            _stats_sample(src) for src in sources if any(c not in known for c in src.schema().names)
         ]
         if resolved:
             learn_column_stats(hub, resolved)
