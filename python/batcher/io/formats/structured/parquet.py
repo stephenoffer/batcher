@@ -8,6 +8,7 @@ path and supporting partition + row-group pruning.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import IO, Any
@@ -143,11 +144,31 @@ class ParquetSource(FileSource):
             return super().read(projection)
         import pyarrow.parquet as pq
 
-        out: list[pa.RecordBatch] = []
-        for f in self._files():
+        files = self._files()
+
+        def _read_one(f: str) -> list[pa.RecordBatch]:
             with self._fs.open(f) as fh:
-                out.extend(pq.read_table(fh, columns=projection, filters=pa_filter).to_batches())
-        return out
+                return pq.read_table(fh, columns=projection, filters=pa_filter).to_batches()
+
+        try:
+            if len(files) <= 1:
+                return _read_one(files[0]) if files else []
+            # Read files concurrently: Parquet decode + filtering run in the C++ layer
+            # with the GIL released, so a 100-file source no longer opens and filters one
+            # file at a time (the serial loop left 95 of 96 cores idle). Order preserved.
+            from concurrent.futures import ThreadPoolExecutor
+
+            workers = min(len(files), (os.cpu_count() or 1) * 2)
+            out: list[pa.RecordBatch] = []
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for batches in pool.map(_read_one, files):  # order preserved
+                    out.extend(batches)
+            return out
+        except Exception:
+            # A filter the reader can't bind (e.g. a type it lacks a kernel for) must
+            # never fail the query — the engine keeps the Filter operator, so an
+            # unfiltered read is always correct, just reads more rows.
+            return super().read(projection)
 
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
