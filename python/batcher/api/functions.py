@@ -13,9 +13,7 @@ from batcher.plan.expr_ir import (
     greatest,
     least,
     lit,
-    mean_horizontal,
     nullif,
-    sum_horizontal,
     when,
 )
 from batcher.plan.expr_ir.nodes import (
@@ -32,6 +30,8 @@ from batcher.plan.expr_ir.nodes import (
     row_number,
 )
 from batcher.plan.functions import (
+    all_horizontal,
+    any_horizontal,
     concat,
     concat_ws,
     corr,
@@ -50,10 +50,14 @@ from batcher.plan.functions import (
     iff,
     lcm,
     log,
+    max_horizontal,
+    mean_horizontal,
+    min_horizontal,
     named_struct,
     nanvl,
     sequence,
     struct,
+    sum_horizontal,
     width_bucket,
     window,
 )
@@ -61,6 +65,8 @@ from batcher.plan.functions import (
 __all__ = [
     "AggExpr",
     "Expr",
+    "all_horizontal",
+    "any_horizontal",
     "array",
     "atan2",
     "coalesce",
@@ -93,7 +99,9 @@ __all__ = [
     "least",
     "lit",
     "log",
+    "max_horizontal",
     "mean_horizontal",
+    "min_horizontal",
     "named_struct",
     "nanvl",
     "nth_value",

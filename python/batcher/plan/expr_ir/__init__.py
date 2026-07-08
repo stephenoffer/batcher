@@ -21,9 +21,7 @@ from batcher.plan.expr_ir.constructors import (
     greatest,
     least,
     lit,
-    mean_horizontal,
     nullif,
-    sum_horizontal,
     when,
 )
 from batcher.plan.expr_ir.core import (
@@ -110,10 +108,8 @@ __all__ = [
     "greatest",
     "least",
     "lit",
-    "mean_horizontal",
     "nullif",
     "referenced_columns",
     "remap_columns",
-    "sum_horizontal",
     "when",
 ]

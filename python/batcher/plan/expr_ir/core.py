@@ -448,17 +448,21 @@ class Expr:
             expr = expr | (self == v)
         return expr
 
-    def between(self, low: IntoExpr, high: IntoExpr) -> Expr:
-        """``self BETWEEN low AND high`` (inclusive on both bounds), matching SQL/DuckDB.
+    def between(self, low: IntoExpr, high: IntoExpr, closed: str = "both") -> Expr:
+        """``self BETWEEN low AND high``, matching SQL/DuckDB (both bounds inclusive by default).
 
-        Desugars to ``(self >= low) & (self <= high)``, so it follows SQL three-valued
-        logic — a null operand makes the result null. The idiomatic spelling for a
-        range filter (chained comparisons like ``low <= col("x") <= high`` are
-        rejected; see :meth:`__bool__`).
+        Desugars to a pair of comparisons, so it follows SQL three-valued logic — a
+        null operand makes the result null. The idiomatic spelling for a range filter
+        (chained comparisons like ``low <= col("x") <= high`` are rejected; see
+        :meth:`__bool__`). Pass `closed` to make either bound exclusive (Polars
+        ``is_between`` parity).
 
         Args:
-            low: Inclusive lower bound.
-            high: Inclusive upper bound.
+            low: Lower bound.
+            high: Upper bound.
+            closed: Which bounds are inclusive — ``"both"`` (default), ``"left"``
+                (``[low, high)``), ``"right"`` (``(low, high]``), or ``"none"``
+                (``(low, high)``).
 
         Examples:
             .. doctest::
@@ -467,8 +471,18 @@ class Expr:
                 >>> ds = bt.from_pydict({"x": [1, 5, 10]})
                 >>> ds.select(r=bt.col("x").between(2, 8)).to_pydict()
                 {'r': [False, True, False]}
+
+                >>> ds.select(r=bt.col("x").between(1, 10, closed="none")).to_pydict()
+                {'r': [False, True, False]}
         """
-        return (self >= low) & (self <= high)
+        if closed not in ("both", "left", "right", "none"):
+            raise PlanError(
+                f"between(closed=...) must be 'both', 'left', 'right', or 'none', got {closed!r}"
+            )
+        lo, hi = _wrap(low), _wrap(high)
+        lower = self >= lo if closed in ("both", "left") else self > lo
+        upper = self <= hi if closed in ("both", "right") else self < hi
+        return lower & upper
 
     def eq_missing(self, other: IntoExpr) -> Expr:
         """Null-safe equality (SQL ``IS NOT DISTINCT FROM``): two nulls compare

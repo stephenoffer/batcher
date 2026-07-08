@@ -36,6 +36,29 @@ print(out.to_pydict())
 # {'label': ['lo', 'hi', 'hi'], 'best': [2, 2, 3]}
 ```
 
+## Horizontal (row-wise) functions
+
+These fold *across* columns within each row (the counterpart to aggregates, which
+fold *down* a column). They mirror the Polars `*_horizontal` family.
+
+| Call | Meaning |
+| --- | --- |
+| `bt.sum_horizontal(*exprs)` | row-wise sum, nulls treated as 0 |
+| `bt.mean_horizontal(*exprs)` | row-wise mean, ignoring nulls |
+| `bt.min_horizontal(*exprs)` / `bt.max_horizontal(*exprs)` | row-wise min / max, ignoring nulls (the Polars-named `least` / `greatest`) |
+| `bt.all_horizontal(*exprs)` / `bt.any_horizontal(*exprs)` | row-wise boolean AND / OR across predicate columns |
+
+```python
+flags = bt.from_pydict({"a": [1, None, 3], "b": [10, 20, None]})
+out = flags.select(
+    total=bt.sum_horizontal(bt.col("a"), bt.col("b")),
+    lo=bt.min_horizontal(bt.col("a"), bt.col("b")),
+    both_pos=bt.all_horizontal(bt.col("a") > 0, bt.col("b") > 0),
+)
+print(out.to_pydict())
+# {'total': [11, 20, 3], 'lo': [1, 20, 3], 'both_pos': [True, None, None]}
+```
+
 ## Operators
 
 | Group | Operators |
@@ -74,7 +97,7 @@ print(out.to_pydict())
 | --- | --- |
 | `.cast(type)` | cast to an Arrow type named as a string (`"int64"`, `"float64"`, `"utf8"`, `"bool"`) |
 | `.is_in([...])` | membership test |
-| `.between(low, high)` | inclusive range test |
+| `.between(low, high, closed="both")` | range test; `closed` = `"both"`/`"left"`/`"right"`/`"none"` sets which bounds are inclusive |
 
 ```python
 out = ds.select(
@@ -179,7 +202,7 @@ Breadth lives on accessor namespaces rather than on the expression itself.
 | --- | --- |
 | `.str` | `upper`, `lower`, `trim(chars=None)`, `lstrip`/`rstrip(chars=None)`, `len`, `contains`, `starts_with`, `ends_with`, `like`, `ilike`, `substr`, `left`, `right`, `split`, `split_part(delim, n)`, `replace`, `regexp_replace`, `regexp_replace_all`, `regexp_extract`, `initcap`, `hex`, `base64`, `translate`, and more |
 | `.dt` | `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `dayofyear`, `dayname`, `monthname`, `epoch`, `iso_year`, `is_leap_year`, `days_in_month`, `truncate(unit)`, `strftime(fmt)`, `offset_by("1mo15d")`, `convert_timezone(from_tz, to_tz)` (DST-aware), and more |
-| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `normalize`, `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `slice`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `transform(element()-expr)`, `filter(element()-pred)`, `join(sep)`; vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)` |
+| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `normalize`, `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `first()`, `last()`, `slice`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `transform(element()-expr)`, `filter(element()-pred)`, `join(sep)`; vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)` |
 | `.struct` | `field(name)` |
 | `.json` | `extract_string(path)` |
 | `.image` | `decode()`, `to_tensor(width, height)` |

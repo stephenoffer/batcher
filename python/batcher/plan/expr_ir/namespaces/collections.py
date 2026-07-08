@@ -234,6 +234,36 @@ class _ListNamespace:
         """
         return ListGet(self._e, index)
 
+    def first(self) -> ListGet:
+        """Return the first element of each list; null if the list is null or empty.
+
+        The idiomatic spelling of ``.list.get(0)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[3, 1, 2], [], None]})
+                >>> ds.select(bt.col("a").list.first().alias("r")).to_pydict()
+                {'r': [3, None, None]}
+        """
+        return ListGet(self._e, 0)
+
+    def last(self) -> ListGet:
+        """Return the last element of each list; null if the list is null or empty.
+
+        The idiomatic spelling of ``.list.get(-1)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[3, 1, 2], [], None]})
+                >>> ds.select(bt.col("a").list.last().alias("r")).to_pydict()
+                {'r': [2, None, None]}
+        """
+        return ListGet(self._e, -1)
+
     def contains(self, value: int | float | bool | str) -> ListContains:
         """Test whether any element of each list equals ``value`` (→ Bool).
 

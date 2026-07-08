@@ -13,6 +13,14 @@ from __future__ import annotations
 from batcher.plan.functions.aggregate import corr, count_if, covar_pop, covar_samp
 from batcher.plan.functions.collection import element, named_struct, sequence, struct
 from batcher.plan.functions.conditional import iff, nanvl
+from batcher.plan.functions.horizontal import (
+    all_horizontal,
+    any_horizontal,
+    max_horizontal,
+    mean_horizontal,
+    min_horizontal,
+    sum_horizontal,
+)
 from batcher.plan.functions.math import gcd, hypot, lcm, log, width_bucket
 from batcher.plan.functions.string import concat, concat_ws, format_string
 from batcher.plan.functions.temporal import (
@@ -25,6 +33,8 @@ from batcher.plan.functions.temporal import (
 )
 
 __all__ = [
+    "all_horizontal",
+    "any_horizontal",
     "concat",
     "concat_ws",
     "corr",
@@ -43,10 +53,14 @@ __all__ = [
     "iff",
     "lcm",
     "log",
+    "max_horizontal",
+    "mean_horizontal",
+    "min_horizontal",
     "named_struct",
     "nanvl",
     "sequence",
     "struct",
+    "sum_horizontal",
     "width_bucket",
     "window",
 ]

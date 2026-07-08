@@ -7,9 +7,6 @@ free functions users call directly (e.g. `col("x")`, `when(c).then(v)`).
 
 from __future__ import annotations
 
-import functools
-import operator
-
 from batcher.plan.expr_ir.core import (
     AggExpr,
     Coalesce,
@@ -200,47 +197,6 @@ def least(*exprs: IntoExpr) -> Least:
     if not exprs:
         raise ValueError("least() requires at least one argument")
     return Least([_wrap(e) for e in exprs])
-
-
-def sum_horizontal(*exprs: IntoExpr) -> Expr:
-    """Row-wise sum across the given columns, treating nulls as 0 (Polars
-    ``sum_horizontal``). Complements `greatest`/`least` (row-wise max/min). An
-    all-null row sums to 0. ``sum_horizontal(col("a"), col("b"), col("c"))``.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"a": [1, None], "b": [10, 20]})
-            >>> ds.select(s=bt.sum_horizontal(bt.col("a"), bt.col("b"))).to_pydict()
-            {'s': [11, 20]}
-    """
-    if not exprs:
-        raise ValueError("sum_horizontal() requires at least one argument")
-    parts = [coalesce(_wrap(e), Lit(0)) for e in exprs]
-    return functools.reduce(operator.add, parts)
-
-
-def mean_horizontal(*exprs: IntoExpr) -> Expr:
-    """Row-wise mean across the given columns, ignoring nulls (Polars
-    ``mean_horizontal``): the sum of the non-null values divided by how many were
-    non-null. An all-null row yields null (no division by zero).
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"a": [1.0, None], "b": [3.0, 20.0]})
-            >>> ds.select(m=bt.mean_horizontal(bt.col("a"), bt.col("b"))).to_pydict()
-            {'m': [2.0, 20.0]}
-    """
-    if not exprs:
-        raise ValueError("mean_horizontal() requires at least one argument")
-    wrapped = [_wrap(e) for e in exprs]
-    total = functools.reduce(operator.add, [coalesce(e, Lit(0)) for e in wrapped])
-    count = functools.reduce(operator.add, [e.is_not_null().cast("int64") for e in wrapped])
-    # Divide by NULLIF(count, 0): an all-null row has count 0 → null (no div-by-zero).
-    return total / nullif(count, Lit(0))
 
 
 def col(name: str) -> Col:

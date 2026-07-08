@@ -88,6 +88,25 @@ print(out.to_pydict())
 # {'first_present': [1, 8, 3], 'filled': [1, 0, 3], 'bigger': [9, 8, 7]}
 ```
 
+## Row-wise (horizontal) reductions
+
+Aggregates fold a column *down* to one value; the `*_horizontal` functions fold
+*across* columns within each row. `sum_horizontal`/`mean_horizontal` combine numeric
+columns (nulls treated as 0 / skipped), `min_horizontal`/`max_horizontal` are the
+Polars-named row-wise `least`/`greatest`, and `all_horizontal`/`any_horizontal`
+reduce many boolean columns into one — handy for combining validation flags.
+
+```python
+checks = bt.from_pydict({"a": [1, 2, 3], "b": [4, 6, 6], "c": [7, 8, 9]})
+out = checks.select(
+    total=bt.sum_horizontal(bt.col("a"), bt.col("b"), bt.col("c")),
+    smallest=bt.min_horizontal(bt.col("a"), bt.col("b"), bt.col("c")),
+    all_even=bt.all_horizontal(bt.col("a") % 2 == 0, bt.col("b") % 2 == 0),
+)
+print(out.to_pydict())
+# {'total': [12, 16, 18], 'smallest': [1, 2, 3], 'all_even': [False, True, False]}
+```
+
 ## Membership, ranges, and casts
 
 ```python
@@ -178,15 +197,17 @@ lists = bt.from_pydict({"tags": [["x", "y"], ["z"], ["a", "b", "c"]]})
 out = lists.select(
     n=bt.col("tags").list.len(),
     joined=bt.col("tags").list.join("-"),
-    first=bt.col("tags").list.get(0),
+    first=bt.col("tags").list.first(),
+    last=bt.col("tags").list.last(),
 )
 print(out.to_pydict())
-# {'n': [2, 1, 3], 'joined': ['x-y', 'z', 'a-b-c'], 'first': ['x', 'z', 'a']}
+# {'n': [2, 1, 3], 'joined': ['x-y', 'z', 'a-b-c'], 'first': ['x', 'z', 'a'], 'last': ['y', 'z', 'c']}
 ```
 
 Numeric lists support reductions: `sum`, `min`, `max`, `mean`, `median`, `std`,
 `var`, `product`, `n_unique`, `arg_min`, `arg_max`. Structural methods include
-`sort`, `reverse`, `unique`, `slice`, and `contains`.
+`sort`, `reverse`, `unique`, `slice`, and `contains`. Element access is
+`get(i)` (negative indexes from the end), with `first()`/`last()` as shorthands.
 
 ## Struct accessor: .struct
 
