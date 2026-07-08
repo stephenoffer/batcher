@@ -157,7 +157,18 @@ pub(crate) fn hash_join_indices_impl(
     // *same* `build_probe` loop drives both paths, so the int path is bit-identical to
     // the row-encoded oracle by construction — only the key accessor differs.
     if let Some(keys) = I64Keys::try_new(left_keys, right_keys) {
-        return Ok(build_probe(
+        if radix_eligible(join_type) && right_rows > RADIX_MIN_BUILD_ROWS {
+            return Ok(radix_join_scalar(
+                |i| keys.right[i],
+                |l| keys.left[l],
+                right_rows,
+                left_rows,
+                &right_null,
+                &left_null,
+                join_type,
+            ));
+        }
+        return Ok(build_probe_flat(
             &keys,
             left_rows,
             right_rows,
@@ -174,7 +185,18 @@ pub(crate) fn hash_join_indices_impl(
     // raw `(i64, i64)` pair, skipping the `RowConverter` encoding the general path runs
     // over every row. Same `build_probe` loop → bit-identical to the row-encoded oracle.
     if let Some(keys) = I64x2Keys::try_new(left_keys, right_keys) {
-        return Ok(build_probe(
+        if radix_eligible(join_type) && right_rows > RADIX_MIN_BUILD_ROWS {
+            return Ok(radix_join_scalar(
+                |i| (keys.right.0[i], keys.right.1[i]),
+                |l| (keys.left.0[l], keys.left.1[l]),
+                right_rows,
+                left_rows,
+                &right_null,
+                &left_null,
+                join_type,
+            ));
+        }
+        return Ok(build_probe_flat(
             &keys,
             left_rows,
             right_rows,
@@ -196,7 +218,7 @@ pub(crate) fn hash_join_indices_impl(
         right: converter.convert_columns(right_keys)?,
         left: converter.convert_columns(left_keys)?,
     };
-    Ok(build_probe(
+    Ok(build_probe_flat(
         &keys,
         left_rows,
         right_rows,
@@ -482,13 +504,266 @@ impl JoinTable {
     }
 }
 
-/// Build a chained hash table over the right (build) side, probe with the left, and
-/// emit the index pairs. Shared by every key representation via [`JoinKeys`]; the
-/// build and probe loops live in [`JoinTable`] (so the broadcast executor's
-/// build-once/probe-many path runs exactly the same code) and are composed here once,
-/// so every join path agrees.
+/// Whether an integer-keyed join of this build size should take the cache-radix path.
+///
+/// A build side past this many rows spills its hash table out of cache, so the flat
+/// path's per-probe random lookup becomes a cache miss (measured ~4.5× throughput cliff
+/// past ~64K build rows). [`radix_join_scalar`] partitions both sides into cache-sized
+/// partitions and gathers each partition's keys contiguously, so the probe hits cache.
+/// Only the integer fast paths (which can gather a `Copy` key) use it; the row-encoded
+/// path stays flat. Left-driven join types only (Inner/Left/Semi/Anti) — Right/Full need
+/// cross-partition unmatched bookkeeping the flat oracle already does.
+const RADIX_MIN_BUILD_ROWS: usize = 1 << 16;
+
+/// Build-row floor for the **parallel broadcast** radix path. Higher than the
+/// single-threaded floor because a broadcast probe runs every core against one shared
+/// build table, which stays resident in the ~tens-of-MB shared L3 well past the ~64K that
+/// spills a single core's L2 — only once the build exceeds L3 does the per-probe miss
+/// dominate the parallel-sliced probe. Below this, the sequential partitioning gather
+/// would cost more than the cache it saves (measured: radix regressed small broadcasts).
+/// ~2M `i64` rows ≈ a ~34 MB build table + key array, past a typical L3.
+const RADIX_MIN_BUILD_ROWS_BROADCAST: usize = 1 << 21;
+
+/// Whether `join_type` is left-driven (every emitted row is keyed by a left/probe row),
+/// the shapes [`radix_join_scalar`] supports.
+fn radix_eligible(join_type: JoinType) -> bool {
+    matches!(
+        join_type,
+        JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti
+    )
+}
+
+/// Target build rows per radix partition — sized so a partition's hash table + chain
+/// stays cache-resident, which is the whole point (a probe into it then hits cache).
+const RADIX_PART_ROWS: usize = 1 << 15;
+
+/// Cap on radix fan-out: enough partitions to make any realistic build cache-resident
+/// without the partition vectors themselves thrashing cache on the scatter.
+const RADIX_MAX_PARTS: usize = 1 << 12;
+
+/// Cache-radix hash join over a `Copy` key witness (the integer fast paths), left-driven
+/// join types only.
+///
+/// Partitions BOTH sides by the high bits of the key hash into `parts` cache-sized
+/// partitions, **gathering each partition's keys contiguously** (`(key, abs_row)` pairs)
+/// so the per-partition build table, its chain, and the probe's key comparisons all touch
+/// only that small, cache-resident partition — never a random access back into the
+/// multi-megabyte source key array (the miss the flat path pays on every probe past
+/// cache). Equal keys land in the same partition (same deterministic hash), so the union
+/// over partitions is exactly the flat join — `radix_matches_flat` proves it. Null-key
+/// rows never match; the unmatched (`Left`) / no-match (`Anti`) ones are emitted last.
+///
+/// `build_key`/`probe_key` read the source key for a row; they are called once per row in
+/// ascending order (a sequential, streaming pass over the source array), then never again.
+fn radix_join_scalar<O: Copy + std::hash::Hash + Eq>(
+    build_key: impl Fn(usize) -> O,
+    probe_key: impl Fn(usize) -> O,
+    build_rows: usize,
+    probe_rows: usize,
+    build_null: &[bool],
+    probe_null: &[bool],
+    join_type: JoinType,
+) -> JoinIndices {
+    let (state, build_parts, probe_parts) =
+        radix_partition(build_key, probe_key, build_rows, probe_rows, build_null, probe_null);
+
+    // One table, reused per partition (each partition's build rows are disjoint).
+    let mut heads: HashTable<u32> = HashTable::with_capacity(RADIX_PART_ROWS);
+    let mut left_out: Vec<Option<u32>> = Vec::with_capacity(probe_rows);
+    let mut right_out: Vec<Option<u32>> = Vec::with_capacity(probe_rows);
+    for (b, probe) in build_parts.iter().zip(&probe_parts) {
+        join_partition_into(b, probe, &state, join_type, &mut heads, &mut left_out, &mut right_out);
+    }
+    emit_null_probe_unmatched(probe_null, join_type, &mut left_out, &mut right_out);
+
+    JoinIndices {
+        left: UInt32Array::from(left_out),
+        right: UInt32Array::from(right_out),
+    }
+}
+
+/// Parallel cache-radix join for the broadcast path: one [`JoinIndices`] per partition,
+/// joined concurrently across cores. Each partition is independent (equal keys
+/// co-partition), so the union over the returned pieces is exactly the flat relation —
+/// the broadcast caller gathers and concatenates them just as it does per-chunk pieces.
+/// Left-driven only (the broadcast contract); `radix_parallel_matches_flat` proves parity.
+fn radix_join_scalar_parallel<O: Copy + std::hash::Hash + Eq + Send + Sync>(
+    build_key: impl Fn(usize) -> O + Sync,
+    probe_key: impl Fn(usize) -> O + Sync,
+    build_rows: usize,
+    probe_rows: usize,
+    build_null: &[bool],
+    probe_null: &[bool],
+    join_type: JoinType,
+) -> Vec<JoinIndices> {
+    let (state, build_parts, probe_parts) =
+        radix_partition(build_key, probe_key, build_rows, probe_rows, build_null, probe_null);
+
+    let mut out: Vec<JoinIndices> = build_parts
+        .par_iter()
+        .zip(probe_parts.par_iter())
+        .map(|(b, probe)| {
+            let mut heads: HashTable<u32> = HashTable::with_capacity(b.len());
+            let mut left_out: Vec<Option<u32>> = Vec::with_capacity(probe.len());
+            let mut right_out: Vec<Option<u32>> = Vec::with_capacity(probe.len());
+            join_partition_into(
+                b,
+                probe,
+                &state,
+                join_type,
+                &mut heads,
+                &mut left_out,
+                &mut right_out,
+            );
+            JoinIndices {
+                left: UInt32Array::from(left_out),
+                right: UInt32Array::from(right_out),
+            }
+        })
+        .collect();
+    // Null-key probe rows (Left/Anti keep them as unmatched) — one extra piece.
+    let mut left_out = Vec::new();
+    let mut right_out = Vec::new();
+    emit_null_probe_unmatched(probe_null, join_type, &mut left_out, &mut right_out);
+    if !left_out.is_empty() {
+        out.push(JoinIndices {
+            left: UInt32Array::from(left_out),
+            right: UInt32Array::from(right_out),
+        });
+    }
+    out
+}
+
+/// Number of cache-sized partitions for a build of `build_rows`, and the high-bit shift
+/// that maps a 64-bit hash to a partition.
+fn radix_parts(build_rows: usize) -> (usize, u32) {
+    let parts = (build_rows / RADIX_PART_ROWS)
+        .next_power_of_two()
+        .clamp(2, RADIX_MAX_PARTS);
+    (parts, 64 - parts.trailing_zeros())
+}
+
+/// Gather both sides' non-null rows into cache-sized partitions, each carrying the key
+/// inline as `(key, abs_row)` so no later step touches the source key arrays. Shared by
+/// the sequential and parallel radix joins (one source of the partitioning, hence of the
+/// co-partitioning invariant). Returns the hash state (so the join reproduces the same
+/// hashes) and the per-partition build/probe vectors.
+#[allow(clippy::type_complexity)]
+fn radix_partition<O: Copy + std::hash::Hash + Eq>(
+    build_key: impl Fn(usize) -> O,
+    probe_key: impl Fn(usize) -> O,
+    build_rows: usize,
+    probe_rows: usize,
+    build_null: &[bool],
+    probe_null: &[bool],
+) -> (ahash::RandomState, Vec<Vec<(O, u32)>>, Vec<Vec<(O, u32)>>) {
+    let (parts, shift) = radix_parts(build_rows);
+    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
+    let part_of = |k: &O| (state.hash_one(k) >> shift) as usize;
+    let mut build_parts: Vec<Vec<(O, u32)>> = vec![Vec::new(); parts];
+    for (i, &is_null) in build_null.iter().enumerate() {
+        if !is_null {
+            let k = build_key(i);
+            build_parts[part_of(&k)].push((k, i as u32));
+        }
+    }
+    let mut probe_parts: Vec<Vec<(O, u32)>> = vec![Vec::new(); parts];
+    for (l, &is_null) in probe_null.iter().enumerate() {
+        if !is_null {
+            let k = probe_key(l);
+            probe_parts[part_of(&k)].push((k, l as u32));
+        }
+    }
+    let _ = probe_rows; // row counts arrive via the null masks; kept for a symmetric signature
+    (state, build_parts, probe_parts)
+}
+
+/// Join one radix partition: build a small (cache-resident) chained table over `b`'s keys
+/// with a partition-local `next` chain, probe with `probe`, and append absolute-index
+/// pairs. `heads` is cleared and reused. The one place the radix probe loop lives, so the
+/// sequential and parallel drivers cannot diverge.
+fn join_partition_into<O: Copy + std::hash::Hash + Eq>(
+    b: &[(O, u32)],
+    probe: &[(O, u32)],
+    state: &ahash::RandomState,
+    join_type: JoinType,
+    heads: &mut HashTable<u32>,
+    left_out: &mut Vec<Option<u32>>,
+    right_out: &mut Vec<Option<u32>>,
+) {
+    let hash = |k: &O| state.hash_one(k);
+    let emit_left_unmatched = matches!(join_type, JoinType::Left);
+    let is_semi = matches!(join_type, JoinType::Semi);
+    let is_anti = matches!(join_type, JoinType::Anti);
+    let mut next_local: Vec<u32> = vec![u32::MAX; b.len()];
+    heads.clear();
+    for (j, &(k, _)) in b.iter().enumerate() {
+        match heads.entry(
+            hash(&k),
+            |&s| b[s as usize].0 == k,
+            |&s| hash(&b[s as usize].0),
+        ) {
+            Entry::Occupied(mut e) => {
+                next_local[j] = *e.get();
+                *e.get_mut() = j as u32;
+            }
+            Entry::Vacant(e) => {
+                e.insert(j as u32);
+            }
+        }
+    }
+    for &(k, labs) in probe {
+        let head = heads.find(hash(&k), |&s| b[s as usize].0 == k).copied();
+        match head {
+            Some(_) if is_semi => {
+                left_out.push(Some(labs));
+                right_out.push(None);
+            }
+            Some(mut s) => {
+                if !is_anti {
+                    loop {
+                        left_out.push(Some(labs));
+                        right_out.push(Some(b[s as usize].1));
+                        let nxt = next_local[s as usize];
+                        if nxt == u32::MAX {
+                            break;
+                        }
+                        s = nxt;
+                    }
+                }
+            }
+            None => {
+                if emit_left_unmatched || is_anti {
+                    left_out.push(Some(labs));
+                    right_out.push(None);
+                }
+            }
+        }
+    }
+}
+
+/// Emit the null-key probe rows a `Left`/`Anti` join keeps as unmatched (they are excluded
+/// from the partitions since a null key matches nothing).
+fn emit_null_probe_unmatched(
+    probe_null: &[bool],
+    join_type: JoinType,
+    left_out: &mut Vec<Option<u32>>,
+    right_out: &mut Vec<Option<u32>>,
+) {
+    if matches!(join_type, JoinType::Left | JoinType::Anti) {
+        for (l, &is_null) in probe_null.iter().enumerate() {
+            if is_null {
+                left_out.push(Some(l as u32));
+                right_out.push(None);
+            }
+        }
+    }
+}
+
+/// The single-table hash join (no radix): build one chain table over the whole right
+/// side and probe the whole left. The correctness oracle and the small-build fast path.
 #[allow(clippy::too_many_arguments)]
-fn build_probe<K: JoinKeys>(
+fn build_probe_flat<K: JoinKeys>(
     keys: &K,
     left_rows: usize,
     right_rows: usize,
@@ -607,9 +882,34 @@ pub fn broadcast_hash_join_indices(
     }
 
     if let Some(keys) = I64Keys::try_new(left_keys, right_keys) {
+        // A build past cache takes the parallel cache-radix path (each partition's table is
+        // cache-resident); a small build stays on the single-table parallel-sliced probe
+        // (the table already fits cache, so radix's gather is pure overhead).
+        if right_rows > RADIX_MIN_BUILD_ROWS_BROADCAST {
+            return Ok(radix_join_scalar_parallel(
+                |i| keys.right[i],
+                |l| keys.left[l],
+                right_rows,
+                left_rows,
+                &right_null,
+                &left_null,
+                join_type,
+            ));
+        }
         return Ok(run!(keys));
     }
     if let Some(keys) = I64x2Keys::try_new(left_keys, right_keys) {
+        if right_rows > RADIX_MIN_BUILD_ROWS_BROADCAST {
+            return Ok(radix_join_scalar_parallel(
+                |i| (keys.right.0[i], keys.right.1[i]),
+                |l| (keys.left.0[l], keys.left.1[l]),
+                right_rows,
+                left_rows,
+                &right_null,
+                &left_null,
+                join_type,
+            ));
+        }
         return Ok(run!(keys));
     }
     let fields: Vec<SortField> = right_keys
@@ -740,6 +1040,97 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    // The cache-radix path MUST produce the identical relation as the flat oracle for
+    // every left-driven join type, including duplicate keys, misses, and null keys.
+    #[test]
+    fn radix_matches_flat() {
+        fn arr(v: &[i64]) -> Vec<ArrayRef> {
+            vec![Arc::new(Int64Array::from(v.to_vec())) as ArrayRef]
+        }
+        fn nulls(v: &[i64], is_null: &[usize]) -> Vec<ArrayRef> {
+            let opts: Vec<Option<i64>> = v
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| if is_null.contains(&i) { None } else { Some(x) })
+                .collect();
+            vec![Arc::new(Int64Array::from(opts)) as ArrayRef]
+        }
+        // Build with duplicate keys (3, 3), probe with matches/misses/dupes.
+        let cases: Vec<(Vec<ArrayRef>, Vec<ArrayRef>)> = vec![
+            (arr(&[1, 5, 2, 8, 3, 9]), arr(&[3, 1, 3, 7, 5, 5, 2, 4])),
+            (nulls(&[1, 5, 2, 3, 3], &[2]), nulls(&[3, 1, 3, 7, 5], &[3])),
+            (arr(&[]), arr(&[1, 2, 3])),
+            (arr(&[1, 2, 3]), arr(&[])),
+        ];
+        for (li, ri) in &cases {
+            let lrows = li[0].len();
+            let rrows = ri[0].len();
+            let lnull = null_mask(li, lrows);
+            let rnull = null_mask(ri, rrows);
+            let keys = I64Keys::try_new(li, ri).unwrap();
+            for jt in [JoinType::Inner, JoinType::Left, JoinType::Semi, JoinType::Anti] {
+                let flat =
+                    build_probe_flat(&keys, lrows, rrows, &lnull, &rnull, jt, false, BLOOM_FP_RATE);
+                // Force radix even on tiny inputs (parts >= 2 via clamp).
+                let radix = radix_join_scalar(
+                    |i| keys.right[i],
+                    |l| keys.left[l],
+                    rrows,
+                    lrows,
+                    &rnull,
+                    &lnull,
+                    jt,
+                );
+                let mut a = pairs(&flat);
+                let mut b = pairs(&radix);
+                a.sort();
+                b.sort();
+                assert_eq!(a, b, "radix != flat for {jt:?}");
+
+                // The parallel broadcast radix (union of per-partition pieces) must match too.
+                let pieces = radix_join_scalar_parallel(
+                    |i| keys.right[i],
+                    |l| keys.left[l],
+                    rrows,
+                    lrows,
+                    &rnull,
+                    &lnull,
+                    jt,
+                );
+                let mut c: Vec<_> = pieces.iter().flat_map(pairs).collect();
+                c.sort();
+                assert_eq!(a, c, "parallel radix != flat for {jt:?}");
+            }
+        }
+    }
+
+    // Run with: cargo test -p bc-runtime --release join_timing -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn join_timing() {
+        use std::time::Instant;
+        let probe_n: i64 = 1_200_000;
+        for build_n in [4_000i64, 40_000, 288_000, 2_000_000] {
+            let build: Vec<ArrayRef> =
+                vec![Arc::new(Int64Array::from((0..build_n).collect::<Vec<_>>()))];
+            let probe_vals: Vec<i64> = (0..probe_n).map(|i| i % build_n).collect();
+            let probe: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(probe_vals))];
+            let _ = hash_join_indices(&probe, &build, JoinType::Inner).unwrap();
+            let mut best = f64::MAX;
+            let mut out_rows = 0;
+            for _ in 0..5 {
+                let t = Instant::now();
+                let idx = hash_join_indices(&probe, &build, JoinType::Inner).unwrap();
+                best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+                out_rows = idx.left.len();
+            }
+            println!(
+                "build={build_n:>9} probe={probe_n} out={out_rows:>9}: {best:6.2} ms  ({:>4.0} M probe/s)",
+                probe_n as f64 / (best / 1000.0) / 1e6
+            );
+        }
+    }
+
     #[test]
     fn multi_key_join() {
         // Composite key (a, b): left rows (1,2)/(1,3)/(2,2) vs right (1,2)/(2,2)/(1,9).
@@ -803,8 +1194,8 @@ mod tests {
         ] {
             // Exercise both with and without the probe bloom (a pure short-circuit).
             for bloom in [false, true] {
-                let fast = build_probe(&i64keys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
-                let slow = build_probe(&rowkeys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                let fast = build_probe_flat(&i64keys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                let slow = build_probe_flat(&rowkeys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
                 assert_eq!(
                     sorted_pairs(&fast),
                     sorted_pairs(&slow),
@@ -872,8 +1263,8 @@ mod tests {
             JoinType::Anti,
         ] {
             for bloom in [false, true] {
-                let fast = build_probe(&fastkeys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
-                let slow = build_probe(&rowkeys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                let fast = build_probe_flat(&fastkeys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                let slow = build_probe_flat(&rowkeys, 5, 5, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
                 assert_eq!(
                     sorted_pairs(&fast),
                     sorted_pairs(&slow),
