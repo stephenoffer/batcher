@@ -122,19 +122,38 @@ def metadata_is_empty(
         return None
 
 
+def _has_structural_empty(plan: LogicalPlan) -> bool:
+    """Cheap O(nodes) test for a plan that could be *provably* empty from metadata.
+
+    A `Limit(_, 0)` (explicit or the canonical empty marker other rules fold to) is the
+    one shape whose emptiness the pre-check proves and the engine could not skip for
+    free. Everything else metadata could prove empty — a contradiction filter, an
+    always-false predicate, an empty-side join — the execution optimizer already folds
+    to an empty marker itself, so executing returns the same zero rows scan-free; only
+    the tiny engine-call setup is forgone, never a scan. Gating the (~60ms at small
+    scale) full re-optimization behind this keeps the scan-free win for `limit(0)` while
+    a normal join/aggregate/sort — which planning already dominates — pays nothing.
+    """
+    from batcher.plan.logical import Limit
+    from batcher.plan.visitor import walk
+
+    return any(isinstance(node, Limit) and node.n == 0 for node in walk(plan))
+
+
 def metadata_empty_table(
     plan: LogicalPlan, sources: list[Source], source_stats: list | None = None
 ) -> pa.Table | None:
     """An empty result table (correct schema, zero rows) when metadata proves the plan
-    empty, else None — a scan-free answer for a contradiction filter, `limit(0)`, an
-    always-false predicate, or an empty-side join.
+    empty, else None — a scan-free answer for a `limit(0)` / provably-empty subtree.
 
     Gated on a schema inferable without execution (`available_schema`), so it never
     triggers a zero-row run; an un-inferable schema returns None and the caller executes
-    (which also yields the empty result).
+    (which also yields the empty result). A cheap structural pre-gate (`_has_structural_
+    empty`) skips the full metadata re-optimization for the overwhelmingly common
+    non-empty plan — the execution path folds any residual emptiness itself.
     """
     inferred = plan.available_schema()
-    if inferred is None:
+    if inferred is None or not _has_structural_empty(plan):
         return None
     return inferred.arrow.empty_table() if metadata_is_empty(plan, sources, source_stats) else None
 

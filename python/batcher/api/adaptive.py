@@ -98,12 +98,49 @@ def _record_adaptive_flip(hub, plan: LogicalPlan, flipped: bool) -> None:
         return
 
 
+# Below this total input-row count, stage-by-stage re-optimization is not worth its
+# cost. Adaptive re-opt trades a per-stage materialize + re-plan (~20-40ms of control
+# plane) for a better downstream join/build-side choice — a win only when the data is
+# large enough that a mis-estimated plan would cost *more* than that overhead. At
+# interactive / dev scale (a few million rows, the whole query well under a second) the
+# one-shot plan is already fast and the re-plan is pure overhead. The gate reads EXACT
+# source row counts, so it separates scales cleanly (TPC-H sf1≈9M off, sf10≈90M on)
+# without ever depending on the guessed operand size it is trying to protect against.
+_ADAPTIVE_MIN_INPUT_ROWS = 20_000_000
+
+
+def _total_input_rows(plan: LogicalPlan, estimator) -> float:
+    """Sum of every `Scan`'s estimated rows — the query's total input size.
+
+    Scan estimates come straight from EXACT source statistics (footer/catalog row
+    counts), so this is a trustworthy size gauge even when downstream operand sizes are
+    only guessed.
+    """
+    from batcher.plan.logical import Scan
+
+    total = 0.0
+    for node in _walk(plan):
+        if isinstance(node, Scan):
+            total += estimator.estimate(node).rows
+    return total
+
+
+def _walk(node: LogicalPlan):
+    """Pre-order walk over the plan tree (local helper, no visitor import cycle)."""
+    yield node
+    for child in _children(node):
+        yield from _walk(child)
+
+
 def _adaptive_would_help(plan: LogicalPlan, sources: list[Source], hub) -> bool:
-    """Whether any join has a breaker-produced operand whose size is only guessed."""
+    """Whether any join has a breaker-produced operand whose size is only guessed —
+    *and* the total input is large enough for re-optimization to pay for itself."""
     joins = _joins(plan)
     if not joins:
         return False
     estimator = _build_estimator(sources, hub)
+    if _total_input_rows(plan, estimator) < _ADAPTIVE_MIN_INPUT_ROWS:
+        return False  # small inputs: the one-shot plan is already fast (see threshold note)
     return any(
         not is_streamable(operand) and estimator.estimate(operand).provenance >= Provenance.DEFAULT
         for join in joins
