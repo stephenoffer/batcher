@@ -61,3 +61,15 @@ class Engine:
         omit it (it shows as ``n/a``, never a failure). SQL engines override this.
         """
         return None
+
+    def sql_runner_scan(self, _uris: dict[str, str]) -> SqlRunner | None:
+        """A ``query -> pa.Table`` callable with each named table bound to a *lazy
+        native parquet scan* of ``uris[name]`` (a glob), or ``None``.
+
+        This is the large-scale counterpart to :meth:`sql_runner`: instead of
+        pre-materializing every table into shared Arrow (~100GB at sf100), each engine
+        reads parquet natively and lazily through its own scan — the representative way
+        these engines run at scale, and the only way that fits in memory. SQL engines
+        override it; the base returns ``None`` (the suite omits the engine).
+        """
+        return None

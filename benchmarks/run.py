@@ -92,6 +92,13 @@ def _parse_args() -> argparse.Namespace:
         "path instead of the auto-sensed host RAM — for exercising out-of-core at scale",
     )
     p.add_argument("--spill-dir", default=None, help="local scratch dir for spilled batches")
+    p.add_argument(
+        "--scan",
+        action="store_true",
+        help="scan mode: bind each table to a lazy native parquet scan instead of "
+        "preloading Arrow (required at sf100+; SQL suites only). Combine with --source "
+        "pointing at canonical-named parquet.",
+    )
     p.add_argument("--list", action="store_true", help="list registered benchmarks and exit")
     return p.parse_args()
 
@@ -124,10 +131,14 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
         return []
     names = [e.name for e in engines]
     t0 = time.perf_counter()
-    ctx = Context.build(benchmark, args.scale, engines, args.source)
+    if args.scan:
+        ctx = Context.build_scan(benchmark, args.scale, engines, args.source)
+    else:
+        ctx = Context.build(benchmark, args.scale, engines, args.source)
     runs = _runs_for(args.scale)
     elapsed = time.perf_counter() - t0
-    print(f"loaded {benchmark} (scale {args.scale}) in {elapsed:.2f}s, best-of-{runs}\n")
+    mode = "scan" if args.scan else "loaded"
+    print(f"{mode} {benchmark} (scale {args.scale}) in {elapsed:.2f}s, best-of-{runs}\n")
     results = []
     for case in cases:
         print(f"running {case.name} ...", flush=True)

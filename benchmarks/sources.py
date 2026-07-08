@@ -198,6 +198,34 @@ def _tpcds_tables(scale: float, base: str) -> dict[str, pa.Table]:
     return out
 
 
+def _sf(scale: float) -> str | int:
+    return int(scale) if float(scale).is_integer() else scale
+
+
+def table_uris(benchmark: str, scale: float, source: str | None = None) -> dict[str, str]:
+    """Per-table parquet globs for the *scan* path — each engine reads these natively.
+
+    The large-scale counterpart to :func:`load_tables`: rather than materialize every
+    table into shared Arrow, return ``{table -> glob}`` so each engine binds a lazy
+    native scan (``sources.py`` no longer touches the bulk data). ``source`` must point
+    at a base holding **canonical-named** parquet (``{base}/{table}/*.parquet``) — at
+    sf100 that is the normalized local mirror, since the raw Ray files are positional
+    and every engine's scan needs the ``l_``/``o_``... names.
+    """
+    if benchmark == "tpch":
+        base = source or TPCH_BASE
+        tables = TPCH_TABLES
+    elif benchmark == "tpcds":
+        base = source or TPCDS_BASE
+        tables = TPCDS_TABLES
+    else:
+        raise ValueError(f"scan mode unsupported for benchmark {benchmark!r}")
+    # A base already pointing at a specific scale dir (contains a table subdir) is used
+    # verbatim; otherwise the canonical ``{base}/sf{N}`` layout is assumed.
+    root = base if os.path.isdir(os.path.join(base, tables[0])) else f"{base}/sf{_sf(scale)}"
+    return {name: f"{root}/{name}/*.parquet" for name in tables}
+
+
 def load_tables(benchmark: str, scale: float, source: str | None = None) -> dict[str, pa.Table]:
     """Load the named tables for ``benchmark`` from its public parquet source.
 

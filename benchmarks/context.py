@@ -22,7 +22,7 @@ from typing import Any
 import pyarrow as pa
 
 from engines import Engine
-from sources import load_tables
+from sources import load_tables, table_uris
 
 # A benchmark dataset name -> the public source benchmark it reads from. The
 # operator-mix runs over the TPC-H tables (a real lineitem/orders join, real dates
@@ -42,6 +42,7 @@ class Context:
     benchmark: str
     tables: dict[str, pa.Table]
     engines: list[Engine]
+    uris: dict[str, str] = field(default_factory=dict)
     _runners: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _handles: dict[tuple[str, str], Any] = field(default_factory=dict, init=False, repr=False)
 
@@ -56,6 +57,23 @@ class Context:
         tables = load_tables(SOURCE_FOR[benchmark], scale, source)
         return cls(benchmark=benchmark, tables=tables, engines=engines)
 
+    @classmethod
+    def build_scan(
+        cls,
+        benchmark: str,
+        scale: float,
+        engines: list[Engine],
+        source: str | None = None,
+    ) -> Context:
+        """Scan-mode context: no Arrow preload — each table is a lazy parquet glob.
+
+        Used at large scale (sf100+), where materializing every table into shared
+        Arrow would not fit in memory. Only the SQL fanout suites are supported here
+        (operator-mix ``handle``/``table`` need in-memory Arrow and raise).
+        """
+        uris = table_uris(SOURCE_FOR[benchmark], scale, source)
+        return cls(benchmark=benchmark, tables={}, engines=engines, uris=uris)
+
     def table(self, name: str) -> pa.Table:
         """The normalized Arrow table registered under ``name``."""
         return self.tables[name]
@@ -65,12 +83,19 @@ class Context:
         return [e.name for e in self.engines]
 
     def sql_runners(self) -> dict[str, Any]:
-        """Engine name -> SQL executor, built once for every SQL-capable engine here."""
+        """Engine name -> SQL executor, built once for every SQL-capable engine here.
+
+        In scan mode (``uris`` set) each table binds to a lazy native parquet scan;
+        otherwise the pre-loaded Arrow tables are registered.
+        """
         if not self._runners:
+            scan = bool(self.uris)
             for engine in self.engines:
                 if not engine.supports_sql:
                     continue
-                runner = engine.sql_runner(self.tables)
+                runner = (
+                    engine.sql_runner_scan(self.uris) if scan else engine.sql_runner(self.tables)
+                )
                 if runner is not None:
                     self._runners[engine.name] = runner
         return self._runners

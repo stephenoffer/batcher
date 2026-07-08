@@ -41,3 +41,12 @@ class DuckDBEngine(Engine):
         for name, tbl in tables.items():
             con.register(name, tbl)
         return lambda query: con.sql(query).to_arrow_table()
+
+    def sql_runner_scan(self, uris: dict[str, str]) -> SqlRunner:
+        import duckdb
+
+        con = duckdb.connect()
+        con.sql("INSTALL httpfs; LOAD httpfs;")
+        for name, uri in uris.items():
+            con.sql(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet('{uri}')")
+        return lambda query: con.sql(query).to_arrow_table()

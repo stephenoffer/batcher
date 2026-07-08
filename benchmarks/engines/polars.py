@@ -58,3 +58,11 @@ class PolarsEngine(Engine):
         for name, tbl in tables.items():
             ctx.register(name, pl.from_arrow(tbl))
         return lambda query: ctx.execute(_polars_sql_dialect(query)).to_arrow()
+
+    def sql_runner_scan(self, uris: dict[str, str]) -> SqlRunner:
+        import polars as pl
+
+        ctx = pl.SQLContext(eager=True)
+        for name, uri in uris.items():
+            ctx.register(name, pl.scan_parquet(uri))
+        return lambda query: ctx.execute(_polars_sql_dialect(query)).to_arrow()

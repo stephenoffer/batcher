@@ -40,3 +40,9 @@ class DaftEngine(Engine):
         frames = {name: daft.from_arrow(tbl) for name, tbl in tables.items()}
         # Current Daft: named DataFrames are passed to daft.sql as bindings.
         return lambda query: daft.sql(query, **frames).to_arrow()
+
+    def sql_runner_scan(self, uris: dict[str, str]) -> SqlRunner | None:
+        import daft
+
+        frames = {name: daft.read_parquet(uri) for name, uri in uris.items()}
+        return lambda query: daft.sql(query, **frames).to_arrow()
