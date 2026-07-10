@@ -212,6 +212,34 @@ Passing the `Captioner` **class** (not an instance or a function) loads the mode
 once per GPU actor; a plain function would rebuild it on every batch. See
 [GPU scheduling](gpu.md) for sizing the actor pool.
 
+## Chunking documents (RAG ingest)
+
+A document is usually longer than an embedding model's context, so the ingest chain is
+**load → split → embed → index**. `.str.chunk(size, overlap)` is the split stage: it
+slices text into fixed-size overlapping windows as a `List<Utf8>`, which `explode` turns
+into one row per chunk. Sizes are in characters, and a chunk boundary never splits a
+Unicode codepoint.
+
+```python
+import batcher as bt
+
+docs = bt.from_pydict({"id": [1, 2], "body": ["abcdef", "xyz"]})
+chunks = docs.with_columns(chunk=bt.col("body").str.chunk(4, overlap=1)).explode("chunk")
+print(chunks.select("id", "chunk").to_pydict())
+# {'id': [1, 1, 2], 'chunk': ['abcd', 'def', 'xyz']}
+```
+
+`overlap` carries context across a boundary, so a sentence cut in half still appears
+whole in one chunk. Chunks stop once one reaches the end of the text, so the last chunk
+is never a redundant suffix of its predecessor. From here, `ds.ml.embed(...)` produces
+the vectors and the section below indexes them.
+
+The whole chain — scan, chunk, explode, embed — is a linear row-wise pipeline, so it
+distributes across workers and streams over an unbounded source with no breaker. The
+one thing no static rule can know is how many chunks a document yields; Kyber estimates
+1× on the first run, Core measures the real fan-out, and the next plan sizes the
+downstream GPU stage for it (see [adaptive re-optimization](../internals/kyber.md)).
+
 ## Vector search (RAG retrieval)
 
 After embedding text or images and writing them to a Lance dataset, retrieve the

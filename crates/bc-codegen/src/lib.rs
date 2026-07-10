@@ -86,10 +86,12 @@ use cranelift_jit::JITModule;
 
 use crate::analyze::analyze;
 use crate::compile::{compile, compile_simd};
+use crate::kleene::{is_null_propagating, needs_kleene};
 
 mod analyze;
 mod compile;
 mod emit;
+mod kleene;
 mod simd;
 
 /// Errors surfaced by the JIT backend. `Unsupported` is the signal for the
@@ -179,46 +181,12 @@ pub struct CompiledExpr {
     /// compound predicates run on the JIT with correct three-valued logic instead of
     /// falling back to the interpreter.
     kleene: bool,
-}
-
-/// True if `expr` should use the Kleene value+validity ABI: it contains a boolean
-/// `And`/`Or` (whose null semantics the simple combined-mask gets wrong) and every
-/// node is one `emit_validity` supports — i.e. no `Case`/`Coalesce`, whose result
-/// value itself depends on validity. Such an `And`/`Or` over a `Case` keeps falling
-/// back to the interpreter on nullable input (the value-only path).
-fn needs_kleene(expr: &bc_expr::Expr) -> bool {
-    contains_and_or(expr) && kleene_supported(expr)
-}
-
-fn contains_and_or(expr: &bc_expr::Expr) -> bool {
-    use bc_expr::{BinaryOp, Expr};
-    match expr {
-        Expr::Binary {
-            op: BinaryOp::And | BinaryOp::Or,
-            ..
-        } => true,
-        Expr::Binary { left, right, .. } | Expr::Math2 { left, right, .. } => {
-            contains_and_or(left) || contains_and_or(right)
-        }
-        Expr::Not { input } | Expr::Cast { input, .. } | Expr::Math { input, .. } => {
-            contains_and_or(input)
-        }
-        _ => false,
-    }
-}
-
-fn kleene_supported(expr: &bc_expr::Expr) -> bool {
-    use bc_expr::Expr;
-    match expr {
-        Expr::Col { .. } | Expr::Lit { .. } => true,
-        Expr::Binary { left, right, .. } | Expr::Math2 { left, right, .. } => {
-            kleene_supported(left) && kleene_supported(right)
-        }
-        Expr::Not { input } | Expr::Cast { input, .. } | Expr::Math { input, .. } => {
-            kleene_supported(input)
-        }
-        _ => false, // Case/Coalesce/etc. — value depends on validity; not supported.
-    }
+    /// A Kleene-ABI body kept as a per-batch fallback for a compound predicate whose
+    /// primary body is the fast value-only (SIMD) path: the value-only `band`/`bor` is
+    /// correct only on a null-free batch, so when a referenced column carries nulls the
+    /// Kleene body runs instead (correct three-valued logic, still on the JIT). `None`
+    /// unless the primary is a vectorized `And`/`Or` predicate.
+    kleene_fallback: Option<Compiled>,
 }
 
 /// The lane (scalar) type `expr` evaluates to in the vector (`compile_simd`) path,
@@ -239,9 +207,13 @@ fn simd_ty(expr: &bc_expr::Expr, cols: &ColumnSet) -> Option<ScalarTy> {
     use bc_expr::{BinaryOp, Expr, Literal};
     match expr {
         Expr::Col { name } => match cols.ty.get(name)? {
-            // Only numeric columns vectorize; temporal operands stay scalar.
+            // Numeric columns vectorize at full width; temporal (Date32 / Timestamp-µs)
+            // columns are comparison-only operands (the Binary arm rejects temporal
+            // arithmetic), and Date32 pins the width to 2 lanes (see `compile_expr_with`).
             ScalarTy::I64 => Some(ScalarTy::I64),
             ScalarTy::F64 => Some(ScalarTy::F64),
+            ScalarTy::Date32 => Some(ScalarTy::Date32),
+            ScalarTy::TsUs => Some(ScalarTy::TsUs),
             _ => None,
         },
         Expr::Lit {
@@ -250,6 +222,12 @@ fn simd_ty(expr: &bc_expr::Expr, cols: &ColumnSet) -> Option<ScalarTy> {
         Expr::Lit {
             value: Literal::Float(_),
         } => Some(ScalarTy::F64),
+        Expr::Lit {
+            value: Literal::Date(_),
+        } => Some(ScalarTy::Date32),
+        Expr::Lit {
+            value: Literal::Timestamp(_),
+        } => Some(ScalarTy::TsUs),
         Expr::Lit { .. } => None,
         Expr::Not { input } => (simd_ty(input, cols)? == ScalarTy::Bool).then_some(ScalarTy::Bool),
         Expr::Cast {
@@ -273,8 +251,30 @@ fn simd_ty(expr: &bc_expr::Expr, cols: &ColumnSet) -> Option<ScalarTy> {
         Expr::Binary { op, left, right } => {
             let l = simd_ty(left, cols)?;
             let r = simd_ty(right, cols)?;
-            // Boolean operands only flow into `Not` (handled above); arithmetic and
-            // comparison operands must be numeric.
+            // `And`/`Or` combine two boolean lane masks with a bitwise `band`/`bor` —
+            // bit-identical to the interpreter's non-Kleene `and`/`or` on a null-free
+            // batch (`eval` falls back to the Kleene oracle when a referenced column has
+            // nulls, since the expression is not null-propagating).
+            if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                return (l == ScalarTy::Bool && r == ScalarTy::Bool).then_some(ScalarTy::Bool);
+            }
+            // A temporal operand (date / timestamp) supports comparison only, against the
+            // *same* temporal type — Arrow compares them by integer value.
+            let is_temporal = |t: ScalarTy| matches!(t, ScalarTy::Date32 | ScalarTy::TsUs);
+            if is_temporal(l) || is_temporal(r) {
+                return (matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                ) && l == r)
+                    .then_some(ScalarTy::Bool);
+            }
+            // Boolean operands only flow into `Not`/`And`/`Or` (handled above);
+            // arithmetic and comparison operands must be numeric.
             if l == ScalarTy::Bool || r == ScalarTy::Bool {
                 return None;
             }
@@ -302,57 +302,6 @@ fn simd_ty(expr: &bc_expr::Expr, cols: &ColumnSet) -> Option<ScalarTy> {
             }
         }
         _ => None,
-    }
-}
-
-/// True if every node is in the null-propagating subset, so the JIT may run on
-/// nullable input and recover correctness by masking the output with the inputs'
-/// combined validity. This holds for ops whose SQL result is null **iff** an input
-/// is null and which never trap on a garbage value at a masked-out slot: column
-/// refs, literals, `Add`/`Sub`/`Mul`/comparisons, value-only unary/binary math,
-/// and exact numeric casts.
-///
-/// `Div`/`Mod` are included: this flag is only consulted *after* `analyze` already
-/// compiled the expression, and `analyze` admits an integer divisor only when it is
-/// a nonzero, non-`-1` constant (float div is IEEE and never traps). So a Div/Mod
-/// that reached here cannot trap on the garbage value at a masked-out null slot, and
-/// its SQL result is null iff a value input is null — exactly simple propagation.
-/// `Not` is included similarly: `NOT null = null` (and a garbage bool can't trap).
-///
-/// Excludes boolean `And`/`Or`, `Case`, `Coalesce` — their null semantics (Kleene /
-/// branch selection / first-non-null) are *not* simple propagation (e.g.
-/// `false AND null = false`, not null), so the combined-mask recovery would give a
-/// wrong validity; those need per-node validity tracking and stay on the interpreter
-/// for nullable input. (A node the JIT cannot compile makes the whole compile fall
-/// back before this flag is consulted, so listing a not-yet-compiled op is harmless.)
-fn is_null_propagating(expr: &bc_expr::Expr) -> bool {
-    use bc_expr::{BinaryOp, Expr};
-    match expr {
-        Expr::Col { .. } | Expr::Lit { .. } => true,
-        Expr::Binary { op, left, right } => {
-            matches!(
-                op,
-                BinaryOp::Add
-                    | BinaryOp::Sub
-                    | BinaryOp::Mul
-                    | BinaryOp::Div
-                    | BinaryOp::Mod
-                    | BinaryOp::Eq
-                    | BinaryOp::Ne
-                    | BinaryOp::Lt
-                    | BinaryOp::Le
-                    | BinaryOp::Gt
-                    | BinaryOp::Ge
-            ) && is_null_propagating(left)
-                && is_null_propagating(right)
-        }
-        // `NOT null = null`; the garbage bool at a null slot is masked out and can't
-        // trap, so logical NOT over a propagating operand still propagates.
-        Expr::Not { input } => is_null_propagating(input),
-        // Value-only math and exact numeric casts propagate nulls and never trap.
-        Expr::Math { input, .. } | Expr::Cast { input, .. } => is_null_propagating(input),
-        Expr::Math2 { left, right, .. } => is_null_propagating(left) && is_null_propagating(right),
-        _ => false,
     }
 }
 
@@ -395,31 +344,49 @@ pub fn compile_expr_with(
     if matches!(result_ty, ScalarTy::Date32 | ScalarTy::TsUs) {
         return Err(CodegenError::Unsupported("temporal result".into()));
     }
-    let kleene = needs_kleene(expr);
-    // Resolve the SIMD plan from the host profile + policy override. `force_scalar`
-    // (or a non-numeric host) collapses to 1 lane, disabling the vector path.
+    // The vector path covers the `simd_ty` subset — numeric arithmetic, comparisons,
+    // `Not`, exact casts, compound boolean predicates (`And`/`Or`), and temporal (date /
+    // timestamp) comparisons. For a **null-free** batch the value-only `band`/`bor` of
+    // comparison masks is bit-identical to the interpreter's `and`/`or` (two-valued ==
+    // Kleene when nothing is null); `eval` returns `Unsupported` on any batch with nulls
+    // in a referenced column, so the caller falls back to the interpreter (Kleene) oracle
+    // — vectorizing the common null-free compound filter instead of the scalar Kleene path.
     let profile = bc_arrow::HardwareProfile::resolved(over);
-    // The vector path is a drop-in for the scalar value path (same value-only ABI,
-    // same null-propagating masking in `eval`), so it needs no flag — only a
-    // different compiled body. It covers the `simd_ty` subset (numeric arithmetic,
-    // comparisons, `Not`, exact casts); `simd_ty` never admits `And`/`Or`, so it is
-    // mutually exclusive with the Kleene path. If a vector op fails to legalize on
-    // this host (e.g. a wide width the ISA lacks), fall back to the *scalar JIT* (not
-    // the interpreter) so the no-regression guarantee holds.
-    let simd = !kleene && profile.simd_lanes_f64 >= 2 && simd_ty(expr, &cols).is_some();
+    let simd_ty = simd_ty(expr, &cols);
+    // A Date32 column is an i32 buffer whose sign-extending vector load (`sload32x2`)
+    // yields an I64X2, so a predicate referencing one is pinned to 2 lanes for uniform
+    // 64-bit lanes. Timestamp-µs is already i64 and needs no pin.
+    let has_date32 = cols.ty.values().any(|t| matches!(t, ScalarTy::Date32));
+    let simd = profile.simd_lanes_f64 >= 2 && simd_ty.is_some();
+    // Value-only and Kleene are mutually exclusive per `CompiledExpr`; use Kleene only
+    // when a compound predicate can't vectorize (e.g. an `And` over a string comparison).
+    let kleene = needs_kleene(expr) && !simd;
+    // Date32 keeps the 2-lane sign-extending load but still **unrolls** — the width pin is
+    // about lane *type* uniformity (all 64-bit), which is orthogonal to how many
+    // independent 2-lane chains the loop body issues per iteration. At `unroll == 1` a
+    // date predicate ran a single narrow chain (~10 GB/s on TPC-H's date-range filters,
+    // vs ~40 GB/s for the f64 predicates); unrolling recovers the instruction-level
+    // parallelism the narrow lane count otherwise leaves on the table, per-lane identical.
+    let (lanes, unroll) = if has_date32 {
+        (2, profile.simd_unroll)
+    } else {
+        (profile.simd_lanes_f64, profile.simd_unroll)
+    };
     let compiled = if simd {
-        match compile_simd(
-            expr,
-            &cols,
-            result_ty,
-            profile.simd_lanes_f64,
-            profile.simd_unroll,
-        ) {
+        match compile_simd(expr, &cols, result_ty, lanes, unroll) {
             Ok(c) => c,
             Err(_) => compile(expr, &cols, result_ty, kleene)?,
         }
     } else {
         compile(expr, &cols, result_ty, kleene)?
+    };
+    // A vectorized compound (`And`/`Or`) predicate keeps a Kleene body for the batches
+    // its null-free value-only body can't handle. `needs_kleene` is exactly the
+    // kleene-eligible-compound-predicate test, so this is `Some` precisely for that case.
+    let kleene_fallback = if simd && needs_kleene(expr) {
+        compile(expr, &cols, result_ty, true).ok()
+    } else {
+        None
     };
     Ok(CompiledExpr {
         columns: cols.order,
@@ -427,6 +394,7 @@ pub fn compile_expr_with(
         compiled,
         null_safe: is_null_propagating(expr),
         kleene,
+        kleene_fallback,
     })
 }
 
@@ -437,7 +405,19 @@ impl CompiledExpr {
     /// for that particular batch.
     pub fn eval(&self, batch: &RecordBatch) -> Result<ArrayRef, CodegenError> {
         if self.kleene {
-            return self.eval_kleene(batch);
+            return self.eval_kleene_with(batch, &self.compiled);
+        }
+        // A vectorized compound predicate's value-only body is correct only null-free;
+        // if any referenced column carries nulls, run the Kleene fallback (O(1) null_count).
+        if let Some(kb) = &self.kleene_fallback {
+            let has_nulls = self.columns.iter().any(|name| {
+                batch
+                    .column_by_name(name)
+                    .is_some_and(|a| a.null_count() != 0)
+            });
+            if has_nulls {
+                return self.eval_kleene_with(batch, kb);
+            }
         }
         let n = batch.num_rows();
         let mut col_ptrs: Vec<*const u8> = Vec::with_capacity(self.columns.len());
@@ -541,7 +521,11 @@ impl CompiledExpr {
     /// boolean result from the value and validity outputs. A Kleene expression is
     /// always boolean, so the result is a `BooleanArray` whose nulls come from the
     /// computed validity (correct three-valued logic for `And`/`Or`).
-    fn eval_kleene(&self, batch: &RecordBatch) -> Result<ArrayRef, CodegenError> {
+    fn eval_kleene_with(
+        &self,
+        batch: &RecordBatch,
+        compiled: &Compiled,
+    ) -> Result<ArrayRef, CodegenError> {
         let n = batch.num_rows();
         let mut col_ptrs: Vec<*const u8> = Vec::with_capacity(self.columns.len());
         let mut valid_arrays: Vec<Vec<u8>> = Vec::with_capacity(self.columns.len());
@@ -598,8 +582,8 @@ impl CompiledExpr {
         let mut out = vec![0u8; n];
         let mut valid_out = vec![1u8; n];
         run_kleene(
-            self.compiled.ptr,
-            self.compiled.nargs,
+            compiled.ptr,
+            compiled.nargs,
             n,
             &col_ptrs,
             &null_ptrs,

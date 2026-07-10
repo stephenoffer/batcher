@@ -250,16 +250,65 @@ def _dedup_shrinks(ctx: OptimizerContext, branch: LogicalPlan) -> bool:
     return deduped.provenance == Provenance.LEARNED and deduped.rows <= rows * 0.9
 
 
+# Aggregates whose result is provably independent of the order their rows arrive in.
+# Grouping itself is order-independent, but the aggregate functions are not all so:
+#
+#   * `list_agg` collects its values *in arrival order* — dropping a sort below it
+#     silently returns a differently-ordered list (a wrong result, not a slower plan).
+#   * `arg_min`/`arg_max` (and the `first`/`last` that lower to them) and `mode` break
+#     ties by arrival order, so a sort decides which of several equal candidates wins.
+#   * `approx_quantile` feeds a KLL sketch whose sampling depends on insertion order, so
+#     the approximation itself changes.
+#
+# Anything not listed is treated as order-sensitive: a new aggregate must opt *in*, so
+# adding one can never silently turn this rewrite into a wrong-result bug.
+_ORDER_INSENSITIVE_AGGS = frozenset(
+    {
+        "sum",
+        "product",
+        "count",
+        "count_distinct",
+        "approx_count_distinct",
+        "min",
+        "max",
+        "mean",
+        "median",
+        "quantile",
+        "var",
+        "stddev",
+        "skewness",
+        "kurtosis",
+        "bit_and",
+        "bit_or",
+        "bit_xor",
+        "bool_and",
+        "bool_or",
+        "histogram",
+    }
+)
+
+
 @rule(name="eliminate_sort_before_aggregate", phase=Phase.NORMALIZE, matches=(Aggregate,))
 def eliminate_sort_before_aggregate(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """`Aggregate(Sort(x))` → `Aggregate(x)`. Grouping and the aggregate functions
-    (sum/min/max/mean/median/var/std/count/n_unique) are all order-independent, so a
-    sort feeding directly into a group-by is wasted work. Skipped when the sort
-    carries a `limit` (a top-N changes *which* rows are aggregated)."""
+    """`Aggregate(Sort(x))` → `Aggregate(x)` when every aggregate is order-independent.
+
+    A sort feeding directly into a group-by is wasted work — but only for aggregates whose
+    value cannot see the row order (`_ORDER_INSENSITIVE_AGGS`). `list_agg` collects in
+    arrival order, and `arg_min`/`arg_max`/`mode` break ties by it, so for those the sort
+    is load-bearing and must survive.
+
+    Skipped when the sort carries a `limit` (a top-N changes *which* rows are aggregated),
+    and when any aggregate carries a secondary `input2` order key.
+    """
     inner = node.input
-    if isinstance(inner, Sort) and inner.limit is None:
-        return Aggregate(inner.input, node.group_keys, node.aggregates)
-    return None
+    if not isinstance(inner, Sort) or inner.limit is not None:
+        return None
+    if any(
+        spec.agg.func not in _ORDER_INSENSITIVE_AGGS or spec.agg.input2 is not None
+        for spec in node.aggregates
+    ):
+        return None
+    return Aggregate(inner.input, node.group_keys, node.aggregates)
 
 
 @rule(name="constant_propagation", phase=Phase.NORMALIZE, matches=(Filter,))

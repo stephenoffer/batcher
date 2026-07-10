@@ -550,6 +550,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bloom::bloom_filter_batches, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::build_column_bloom, m)?)?;
     m.add_function(wrap_pyfunction!(sketches::estimate_distinct, m)?)?;
+    m.add_function(wrap_pyfunction!(sketches::column_ndv, m)?)?;
     m.add_function(wrap_pyfunction!(sketches::column_stats, m)?)?;
     m.add_function(wrap_pyfunction!(sketches::column_quantiles, m)?)?;
     m.add_function(wrap_pyfunction!(sketches::column_stats_full, m)?)?;

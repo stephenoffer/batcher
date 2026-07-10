@@ -117,6 +117,91 @@ def build_with_random(ds: Dataset, name: str, *, seed: int, normal: bool) -> Dat
     return ds.with_row_index(rid).with_columns(**{name: expr}).drop(rid)
 
 
+def split_key(ds: Dataset, key: list[str] | None, seed: int) -> Expr:
+    """A reproducible uniform ``[0, 1)`` per row, derived from the row's **content**.
+
+    Deliberately not `with_random`, which keys on `with_row_index`: a row index is a
+    `RowId` node, and `RowId` has no distributed implementation and is not streamable,
+    so a split built on it would silently pin an ML pipeline to one node. Hashing the
+    row's own values instead makes the split a pure row-wise `Filter` — the shape the
+    distributed executor treats as embarrassingly parallel and the streaming engine
+    accepts — and makes it *partition-independent*: the same row lands in the same part
+    however the data is laid out, which `Dataset.sample` already relies on.
+
+    With `key` given, only those columns are hashed. That is better on three counts and
+    is what to reach for on a real corpus: the split survives a schema change (adding or
+    recomputing a feature column does not reshuffle rows between train and test), and it
+    hashes one column rather than all of them. Without `key` the split is still correct
+    and reproducible — just tied to every value in the row.
+    """
+    from batcher.plan.expr_ir.constructors import hash_rows
+
+    columns = key if key is not None else list(ds.columns)
+    # A typed row hash: no per-value string rendering, and no dependence on how a float
+    # prints. `seed` keys the digest, so a new seed is a new split.
+    digest = hash_rows(*(Col(c) for c in columns), seed=seed)  # Int64, may be negative
+    positive = ((digest % _RANDOM_MODULUS) + _RANDOM_MODULUS) % _RANDOM_MODULUS
+    return positive.cast("float64") / float(_RANDOM_MODULUS)
+
+
+def build_random_split(
+    ds: Dataset, fractions: list[float], *, seed: int, key: list[str] | None = None
+) -> list[Dataset]:
+    """Partition rows into disjoint random subsets sized by `fractions`.
+
+    Each row's uniform ``[0, 1)`` (`split_key`) is compared against the cumulative
+    boundaries of `fractions`, so the parts are disjoint, cover every row, and are
+    stable across runs, partitions, and the parallel/distributed/streaming paths. Rows
+    land in a part in expectation, not exactly: the sizes are binomial around
+    ``fraction * n``, as with any hash-keyed split.
+
+    Each part is a `Filter` over the input — no extra column, no row index, no shuffle.
+    """
+    if not fractions:
+        raise PlanError("random_split(): fractions must be non-empty")
+    if any(f <= 0 for f in fractions):
+        raise PlanError(f"random_split(): every fraction must be > 0, got {fractions}")
+    total = sum(fractions)
+    if abs(total - 1.0) > 1e-9:
+        raise PlanError(f"random_split(): fractions must sum to 1.0, got {total}")
+    if key is not None:
+        unknown = [c for c in key if c not in ds.columns]
+        if unknown:
+            raise PlanError(f"random_split(): unknown key column(s) {unknown}")
+
+    if len(fractions) == 1:
+        return [ds]  # the whole dataset; no predicate to evaluate
+
+    parts: list[Dataset] = []
+    lo = 0.0
+    last = len(fractions) - 1
+    for i, fraction in enumerate(fractions):
+        hi = lo + fraction
+        u = split_key(ds, key, seed)
+        # Only the interior parts need both bounds: the first is bounded below by 0 and
+        # the last above by 1, and the last takes everything left so float drift on the
+        # cumulative boundaries can never drop a row.
+        if i == 0:
+            keep = u < hi
+        elif i == last:
+            keep = u >= lo
+        else:
+            keep = (u >= lo) & (u < hi)
+        parts.append(ds.filter(keep))
+        lo = hi
+    return parts
+
+
+def build_train_test_split(
+    ds: Dataset, test_size: float, *, seed: int, key: list[str] | None = None
+) -> tuple[Dataset, Dataset]:
+    """Split into a train and a test `Dataset` — `test_size` is the test fraction."""
+    if not 0.0 < test_size < 1.0:
+        raise PlanError(f"train_test_split(): test_size must be in (0, 1), got {test_size}")
+    train, test = build_random_split(ds, [1.0 - test_size, test_size], seed=seed, key=key)
+    return train, test
+
+
 def build_fill_null(ds: Dataset, value: Any | dict[str, Any]) -> Dataset:
     """Replace nulls — one fill `value` for every column, or per-column via a dict."""
     cols = ds.columns
@@ -324,29 +409,6 @@ def build_unnest(ds: Dataset, columns: str | list[str]) -> Dataset:
         for fname in fnames
     }
     return ds.with_columns(**derived).select(*final)
-
-
-def build_window_columns(ds: Dataset, items: dict[str, Any]) -> Dataset:
-    """Append window-function columns from ``agg.over(...)`` expressions.
-
-    Each `WindowExpr` becomes a `Window` node appending its aliased column (chained,
-    so all input columns and earlier window columns are preserved) — the relational
-    lowering of SQL ``<agg> OVER (PARTITION BY … ORDER BY …)``.
-    """
-    plan = ds._plan
-    for alias, we in items.items():
-        part_keys = tuple(_as_key_expr(k) for k in we.partition_by)
-        order_specs: list[SortKeySpec] = []
-        for key in we.order_by:
-            if isinstance(key, tuple):
-                name, descending = key
-                order_specs.append(SortKeySpec(_as_key_expr(name), descending=bool(descending)))
-            else:
-                order_specs.append(SortKeySpec(_as_key_expr(key)))
-        frame = WindowFrame(*we.frame) if we.frame is not None else None
-        spec = WindowFuncSpec(we.func, we.input, alias, we.offset, frame)
-        plan = Window(plan, part_keys, tuple(order_specs), (spec,))
-    return ds._derive(plan)
 
 
 _PIVOT_AGGS = ("sum", "mean", "min", "max", "count")

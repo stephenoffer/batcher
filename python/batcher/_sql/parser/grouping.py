@@ -109,11 +109,26 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
     group_cols: list[str] = []
     group_exprs: dict[str, Expr] = {}  # internal alias -> derived key expression
     group_expr_alias: dict[str, str] = {}  # GROUP BY expr SQL text -> alias
+    # SELECT output alias -> its defining expression, so a `GROUP BY <alias>` that names a
+    # derived SELECT item (`extract(minute FROM EventTime) AS m … GROUP BY m`) resolves to
+    # the expression rather than a non-existent column. SQL permits grouping by a select
+    # alias; DuckDB/Postgres do the same.
+    select_aliases: dict[str, object] = {}
+    for p in projections:
+        a = _alias_of(p)
+        if a:
+            select_aliases[a] = _unwrap_alias(p)
     if group is not None:
         for i, g in enumerate(group.expressions):
             # GROUP BY <n> refers to the n-th (1-based) SELECT item.
             if isinstance(g, exp.Literal) and not g.is_string:
                 g = _unwrap_alias(projections[int(g.this) - 1])
+            # GROUP BY <select-alias> of a derived expression resolves to that expression
+            # (skip when the alias just re-names a same-named column — that's a real key).
+            if isinstance(g, exp.Column) and g.name in select_aliases:
+                aliased = select_aliases[g.name]
+                if not (isinstance(aliased, exp.Column) and aliased.name == g.name):
+                    g = aliased
             if isinstance(g, exp.Column):
                 group_cols.append(g.name)
             else:

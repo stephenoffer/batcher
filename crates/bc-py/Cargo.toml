@@ -22,6 +22,7 @@ bc-resource.workspace = true
 arrow.workspace = true
 arrow-pyarrow.workspace = true
 pyo3.workspace = true
+rayon.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing.workspace = true

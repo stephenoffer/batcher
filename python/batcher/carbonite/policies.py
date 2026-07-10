@@ -10,12 +10,15 @@ constructed in their place.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from batcher.carbonite.memory.estimator import peak_operator_bytes
 from batcher.carbonite.memory.pressure import total_memory_bytes
 from batcher.config import Config, active_config
+from batcher.plan.physical import PhysicalOp
 from batcher.plan.resource import FeasibilityVerdict, ResourceBounds, SchedulingEnvelope
+from batcher.plan.stats import Provenance
 
 if TYPE_CHECKING:
     from batcher.carbonite.base import ResourceContext
@@ -100,13 +103,43 @@ class BudgetingAdmission:
             return FeasibilityVerdict(feasible=True)
         # Over budget: offer the envelope as the per-operator bound so the engine can
         # re-plan with a spill-friendly strategy instead of OOMing.
+        #
+        # `plan/physical.py` promises that "Carbonite reads provenance to decide how
+        # defensively to budget", and this is where it must: the byte figure above is only
+        # as trustworthy as the cardinality it was derived from. When the operator that
+        # binds the constraint was sized from a pure Selinger guess, the verdict is
+        # *advisory* — it still routes the plan out-of-core, but the conductor will not
+        # fail a query on it. Rejecting on a guess breaks the admission contract that a
+        # guess never fails a legitimate query.
         return FeasibilityVerdict(
             feasible=False,
             binding_constraint="memory",
             suggested_bounds=ResourceBounds(
                 m_max_bytes=envelope, c_max_credits=0, n_max_parallelism=0
             ),
+            advisory=_binding_op_is_a_guess(plan.ops),
         )
+
+
+def _binding_op_is_a_guess(ops: Sequence[PhysicalOp]) -> bool:
+    """Whether the operator whose memory binds admission was sized from a pure guess.
+
+    The binding operator is the one holding the plan's peak envelope. `Provenance.DEFAULT`
+    means its row count came from a Selinger constant with nothing measured behind it — a
+    number that can be wrong by orders of magnitude in either direction. Every stronger
+    provenance (a proof, a footer, a sketch, or a past measurement) is trusted.
+
+    Args:
+        ops: The plan's annotated operators.
+
+    Returns:
+        True when the peak-memory operator's cardinality is an unmeasured guess.
+    """
+    sized = [op for op in ops if op.bounds.m_max_bytes > 0]
+    if not sized:
+        return True  # nothing was sizable; any verdict over it is a guess
+    binding = max(sized, key=lambda op: op.bounds.m_max_bytes)
+    return binding.properties.provenance is Provenance.DEFAULT
 
 
 def credit_ceiling(config: Config) -> int:
@@ -145,6 +178,14 @@ class StaticCreditFlowControl:
         return min(max(requested, 1), ceiling)
 
 
+# AIMD's multiplicative-decrease factor must lie strictly inside (0, 1): at 1.0 the
+# congested branch stops decreasing (the window never backs off), and above 1.0 it grows
+# on congestion. The floor keeps a decrease from collapsing the window to the floor in one
+# round, which would serialize the shuffle.
+_MIN_AIMD_BETA = 0.1
+_MAX_AIMD_BETA = 0.95
+
+
 class AIMDFlowControl:
     """Adaptive credit window via AIMD (additive-increase / multiplicative-decrease).
 
@@ -164,7 +205,11 @@ class AIMDFlowControl:
         cfg = config or active_config()
         fc = cfg.flow_control
         self._alpha = max(1, fc.aimd_alpha)
-        self._beta = fc.aimd_beta
+        # A multiplicative *decrease* requires 0 < beta < 1. A misconfigured `beta >= 1`
+        # would make the congested branch *grow* the window — the opposite of AIMD, and
+        # an unstable control law (the window would only ever increase, congested or not).
+        # Clamped rather than raised: flow control must never fail a query on a tunable.
+        self._beta = min(max(fc.aimd_beta, _MIN_AIMD_BETA), _MAX_AIMD_BETA)
         self._floor = 1
         self._ceiling = credit_ceiling(cfg)  # count + byte bound (C53)
         # A recurring shuffle warm-starts at the window its past runs converged to
@@ -305,11 +350,25 @@ class DefaultSchedulingPolicy:
                 else 0
             )
         else:
+            # A task holds one partition of the dominant breaker, so `peak // n_tasks` is
+            # already its share — the *data* is divided by the task count exactly once.
             per_task = max(morsel_bytes, peak // n_tasks)
-            fair_share = (
-                max(morsel_bytes, available_bytes // n_tasks) if available_bytes > 0 else per_task
+            # Ray's `memory=` is a **reservation**: the scheduler only places a task on a
+            # node with that much free, and packs against it. Under-reporting it therefore
+            # over-packs the node and OOMs. The old clamp took `min(per_task,
+            # available_bytes // n_tasks)`, dividing one *machine's* budget by the
+            # *cluster-wide* fan-out — so a 100-task job asked for 1/100th of a node for
+            # every task, and Ray stacked all hundred onto one node.
+            #
+            # The only legitimate ceiling is a single node's usable memory: asking for more
+            # than a node has makes the task permanently unschedulable. Clamp there, and
+            # nowhere else, so the hint stays what the task actually needs.
+            node_capacity = (
+                max(morsel_bytes, int(available_bytes * cfg.memory.soft_limit))
+                if available_bytes > 0
+                else per_task
             )
-            memory_bytes = min(per_task, fair_share)
+            memory_bytes = min(per_task, node_capacity)
 
         # Per-task CPU: the dominant operator's share (a task runs a whole plan
         # partition, so its heaviest op sets the core need). A pure scan→filter→write

@@ -89,15 +89,18 @@ fn exec_seq(
                     available: sources.len(),
                 })?;
             let rows = count_rows(&batches);
+            let bytes = batch_bytes(&batches);
             m.record(OpMetric {
                 op_id,
                 kind: "scan",
                 rows_in: rows,
+                rows_build: 0,
                 rows_out: rows,
                 elapsed_ns: t0.elapsed_ns(),
                 cpu_ns: t0.cpu_ns(),
                 threads: 1,
-                peak_bytes: batch_bytes(&batches),
+                peak_bytes: bytes,
+                result_bytes: bytes,
                 spilled: false,
                 backend: "interp",
             });
@@ -215,7 +218,7 @@ fn exec_seq(
                 &partial.group_columns,
                 &agg_cols,
             )?];
-            record_op(m, op_id, "aggregate", rows_in, &out, t0, false);
+            record_breaker(m, op_id, "aggregate", rows_in, 0, batch_bytes(&batches), &out, t0, false);
             Ok(out)
         }
 
@@ -227,7 +230,7 @@ fn exec_seq(
                 Ok(combined) => vec![ops::sort_batch(&combined, keys, *limit)?],
                 Err(_) => Vec::new(),
             };
-            record_op(m, op_id, "sort", rows_in, &out, t0, false);
+            record_breaker(m, op_id, "sort", rows_in, 0, batch_bytes(&batches), &out, t0, false);
             Ok(out)
         }
 
@@ -251,7 +254,7 @@ fn exec_seq(
                 )?],
                 Err(_) => Vec::new(),
             };
-            record_op(m, op_id, "window", rows_in, &out, t0, false);
+            record_breaker(m, op_id, "window", rows_in, 0, batch_bytes(&batches), &out, t0, false);
             Ok(out)
         }
 
@@ -278,7 +281,11 @@ fn exec_seq(
         } => {
             let left_batches = exec_seq(left, sources, m, ids)?;
             let right_batches = exec_seq(right, sources, m, ids)?;
-            let rows_in = count_rows(&left_batches) + count_rows(&right_batches);
+            // The probe side (left) drives the per-row probe cost; the build side (right)
+            // drives the hash table's memory. Reporting their sum made both meaningless.
+            let rows_in = count_rows(&left_batches);
+            let rows_build = count_rows(&right_batches);
+            let in_bytes = batch_bytes(&left_batches) + batch_bytes(&right_batches);
             let t0 = Stopwatch::start();
             let left = ops::materialize(&left_batches)?;
             let right = ops::materialize(&right_batches)?;
@@ -293,7 +300,7 @@ fn exec_seq(
                 output,
                 bc_ir::JoinStrategy::Hash,
             )?];
-            record_op(m, op_id, "hash_join", rows_in, &out, t0, false);
+            record_breaker(m, op_id, "hash_join", rows_in, rows_build, in_bytes, &out, t0, false);
             Ok(out)
         }
 
@@ -309,14 +316,18 @@ fn exec_seq(
         } => {
             let left_batches = exec_seq(left, sources, m, ids)?;
             let right_batches = exec_seq(right, sources, m, ids)?;
-            let rows_in = count_rows(&left_batches) + count_rows(&right_batches);
+            // The probe side (left) drives the per-row probe cost; the build side (right)
+            // drives the hash table's memory. Reporting their sum made both meaningless.
+            let rows_in = count_rows(&left_batches);
+            let rows_build = count_rows(&right_batches);
+            let in_bytes = batch_bytes(&left_batches) + batch_bytes(&right_batches);
             let t0 = Stopwatch::start();
             let left = ops::materialize(&left_batches)?;
             let right = ops::materialize(&right_batches)?;
             let out = vec![ops::asof_join_batches(
                 &left, &right, left_on, right_on, left_by, right_by, *backward, output,
             )?];
-            record_op(m, op_id, "asof_join", rows_in, &out, t0, false);
+            record_breaker(m, op_id, "asof_join", rows_in, rows_build, in_bytes, &out, t0, false);
             Ok(out)
         }
 
@@ -325,7 +336,7 @@ fn exec_seq(
             let rows_in = count_rows(&batches);
             let t0 = Stopwatch::start();
             let out = vec![distinct(&batches)?];
-            record_op(m, op_id, "distinct", rows_in, &out, t0, false);
+            record_breaker(m, op_id, "distinct", rows_in, 0, batch_bytes(&batches), &out, t0, false);
             Ok(out)
         }
 
@@ -347,6 +358,7 @@ fn exec_seq(
 }
 
 /// Record one sequential-interpreter operator metric from its result batches.
+/// Record a **streaming** operator: it holds only its result, so peak == result bytes.
 fn record_op(
     m: &mut ExecMetrics,
     op_id: u32,
@@ -356,15 +368,50 @@ fn record_op(
     t0: Stopwatch,
     spilled: bool,
 ) {
+    let bytes = batch_bytes(out);
     m.record(OpMetric {
         op_id,
         kind,
         rows_in,
+        rows_build: 0,
         rows_out: count_rows(out),
         elapsed_ns: t0.elapsed_ns(),
         cpu_ns: t0.cpu_ns(),
         threads: 1,
-        peak_bytes: batch_bytes(out),
+        peak_bytes: bytes,
+        result_bytes: bytes,
+        spilled,
+        backend: "interp",
+    });
+}
+
+/// Record a **pipeline breaker**: it materializes `in_bytes` of input and builds its
+/// result at the same time, so both are live at its peak. `rows_build` is the join's
+/// build-side rows (0 elsewhere).
+#[allow(clippy::too_many_arguments)]
+fn record_breaker(
+    m: &mut ExecMetrics,
+    op_id: u32,
+    kind: &'static str,
+    rows_in: u64,
+    rows_build: u64,
+    in_bytes: u64,
+    out: &[RecordBatch],
+    t0: Stopwatch,
+    spilled: bool,
+) {
+    let result_bytes = batch_bytes(out);
+    m.record(OpMetric {
+        op_id,
+        kind,
+        rows_in,
+        rows_build,
+        rows_out: count_rows(out),
+        elapsed_ns: t0.elapsed_ns(),
+        cpu_ns: t0.cpu_ns(),
+        threads: 1,
+        peak_bytes: in_bytes.saturating_add(result_bytes),
+        result_bytes,
         spilled,
         backend: "interp",
     });

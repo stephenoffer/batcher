@@ -197,6 +197,29 @@
       }
     ]
   },
+  "hash": {
+    "e": "hash",
+    "inputs": [
+      {
+        "e": "col",
+        "name": "x"
+      },
+      {
+        "e": "col",
+        "name": "y"
+      }
+    ],
+    "seed": 7
+  },
+  "hash_default_seed": {
+    "e": "hash",
+    "inputs": [
+      {
+        "e": "col",
+        "name": "x"
+      }
+    ]
+  },
   "image_simple": {
     "e": "image",
     "fn": "decode",

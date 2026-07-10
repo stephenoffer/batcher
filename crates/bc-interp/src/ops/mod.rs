@@ -11,10 +11,8 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow::compute::SortOptions;
-use arrow::compute::{
-    concat_batches, filter_record_batch, lexsort_to_indices, sort_to_indices, take, SortColumn,
-};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::compute::{filter_record_batch, lexsort_to_indices, sort_to_indices, take, SortColumn};
+use arrow::datatypes::{Field, Schema};
 use bc_ir::{
     AggFunc, AggregateItem, FrameBound, FrameUnits, ProjectionItem, SortKey, WindowFn, WindowFrame,
     WindowFunc,
@@ -33,6 +31,8 @@ mod morsel;
 mod quantile_spill;
 mod radix_sort;
 mod reshape;
+mod sample_sort;
+mod str_sort;
 pub(crate) use external_sort::{external_merge_sort, external_sort_to_final_store};
 pub(crate) use joins::{
     asof_join_batches, columns_by_name, gather_join_output, join_batches, join_batches_with,
@@ -48,6 +48,7 @@ pub(crate) use quantile_spill::{
 pub(crate) use reshape::{
     add_row_ids, sample_batch, sample_n_batches, unnest_batch, unpivot_batch,
 };
+pub(crate) use sample_sort::parallel_sort_batch;
 
 // --- filter / project --------------------------------------------------------
 
@@ -97,6 +98,10 @@ pub(crate) fn filter_batch_jit(
         .ok_or_else(|| InterpError::NonBooleanPredicate {
             got: mask.data_type().to_string(),
         })?;
+    // NB: short-circuiting an all-true / all-false mask here (Arc-clone / empty slice
+    // instead of the gather) was measured and does NOT pay off: at the 16,384-row morsel
+    // granularity `filter_record_batch`'s copy is L2-resident, and mask evaluation plus
+    // rayon scheduling dominate. It only added a `true_count` pass to every morsel.
     Ok(filter_record_batch(batch, mask)?)
 }
 
@@ -380,6 +385,14 @@ fn sort_indices(
             nulls_first: k.nulls_first,
         };
         let vals = k.expr.eval(batch)?;
+        // A string key sorts through the stable permutation builder: arrow's
+        // `sort_to_indices` leaves ties in an arbitrary, input-size-dependent order, which
+        // would make the parallel sample-sort's per-range results disagree with this
+        // sequential oracle. Ties resolve to input order instead — deterministic, and the
+        // same guarantee the radix path already gives fixed-width keys.
+        if let Some(idx) = str_sort::stable_sort_indices_str(&vals, opts) {
+            return Ok(idx);
+        }
         // Radix fast path on a fixed-width integer/temporal key: O(n) vs the comparison
         // sort's O(n log n), producing the identical relation. Falls back for other types.
         match radix_sort::radix_sort_indices(&vals, opts) {
@@ -405,9 +418,11 @@ fn take_batch(
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-
 /// Evaluate each sort key against `batch` into an arrow `SortColumn` (values + options).
-fn eval_sort_columns(batch: &RecordBatch, keys: &[SortKey]) -> Result<Vec<SortColumn>, InterpError> {
+fn eval_sort_columns(
+    batch: &RecordBatch,
+    keys: &[SortKey],
+) -> Result<Vec<SortColumn>, InterpError> {
     keys.iter()
         .map(|k| {
             Ok(SortColumn {
@@ -419,127 +434,6 @@ fn eval_sort_columns(batch: &RecordBatch, keys: &[SortKey]) -> Result<Vec<SortCo
             })
         })
         .collect()
-}
-
-/// Rows below which the single-node sample-sort stays serial — the sampling + range
-/// partition + concat overhead only pays off on a large full sort.
-const PARALLEL_SORT_MIN_ROWS: usize = 1 << 17;
-
-/// Parallel single-node full sort by sample-sort: range-partition the rows by the leading key
-/// (sampled quantile boundaries), sort each range in parallel, and concatenate in key order —
-/// no final merge, because the ranges are globally ordered relative to each other. Each range
-/// sorts (and gathers) a contiguous, cache-resident subset in parallel, which is why this beats
-/// a single global permutation + one random-access gather (that gather is memory-bandwidth
-/// bound and cache-hostile across the whole table). This is the single-node form of the
-/// distributed range sort (`dist/flight_sort.py`), so one implementation serves both.
-///
-/// Returns `None` (caller uses the serial [`sort_batch`]) unless it applies: a full sort (no
-/// `LIMIT` — top-N is already cheap), a large input, and a **float or integer leading key**
-/// (the boundaries route it exactly — floats by `f64`, integers by `i64`; a string leading key
-/// falls back). Multi-key sorts are supported: rows bucket by the leading key (equal leading
-/// keys never span a boundary), then each range sorts by the full key list, so a plain
-/// concatenation in leading-key order is the globally sorted multi-key relation.
-pub(crate) fn parallel_sort_batch(
-    batch: &RecordBatch,
-    keys: &[SortKey],
-    limit: Option<usize>,
-) -> Result<Option<RecordBatch>, InterpError> {
-    use rayon::prelude::*;
-
-    let Some(k0) = keys.first() else {
-        return Ok(None);
-    };
-    if limit.is_some() || batch.num_rows() < PARALLEL_SORT_MIN_ROWS {
-        return Ok(None);
-    }
-    let key = k0.expr.eval(batch)?;
-    let parts = rayon::current_num_threads().clamp(2, 64);
-    let buckets = if matches!(key.data_type(), DataType::Float64 | DataType::Float32) {
-        let key_f64 = arrow::compute::cast(&key, &DataType::Float64)?;
-        let keyv = key_f64
-            .as_any()
-            .downcast_ref::<arrow::array::Float64Array>()
-            .expect("cast to Float64");
-        let Some(b) = sample_boundaries_f64(keyv, parts) else {
-            return Ok(None);
-        };
-        bc_runtime::shuffle::range_partition_by_key_array(
-            batch,
-            &key_f64,
-            &b,
-            parts,
-            k0.nulls_first,
-            k0.descending,
-        )?
-    } else if key.data_type().is_integer() {
-        let key_i64 = arrow::compute::cast(&key, &DataType::Int64)?;
-        let keyv = key_i64
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("cast to Int64");
-        let Some(b) = sample_boundaries_i64(keyv, parts) else {
-            return Ok(None);
-        };
-        bc_runtime::shuffle::range_partition_by_i64_key(
-            batch,
-            &key_i64,
-            &b,
-            parts,
-            k0.nulls_first,
-            k0.descending,
-        )?
-    } else {
-        return Ok(None);
-    };
-    let sorted: Vec<RecordBatch> = buckets
-        .par_iter()
-        .map(|b| sort_batch(b, keys, None))
-        .collect::<Result<_, InterpError>>()?;
-    let ordered: Vec<&RecordBatch> = if k0.descending {
-        sorted.iter().rev().collect()
-    } else {
-        sorted.iter().collect()
-    };
-    Ok(Some(concat_batches(&batch.schema(), ordered)?))
-}
-
-/// Sample `parts-1` ascending f64 quantile boundaries from a float key column. Returns
-/// `None` if fewer than `parts` finite values exist (nothing meaningful to split).
-fn sample_boundaries_f64(key: &arrow::array::Float64Array, parts: usize) -> Option<Vec<f64>> {
-    let n = key.len();
-    let target = 8192.min(n).max(parts);
-    let stride = (n / target).max(1);
-    let mut sample: Vec<f64> = (0..n)
-        .step_by(stride)
-        .filter(|&i| key.is_valid(i))
-        .map(|i| key.value(i))
-        .filter(|v| !v.is_nan())
-        .collect();
-    if sample.len() < parts {
-        return None;
-    }
-    sample.sort_unstable_by(|a, b| a.total_cmp(b));
-    let m = sample.len();
-    Some((1..parts).map(|j| sample[(j * m / parts).min(m - 1)]).collect())
-}
-
-/// Sample `parts-1` ascending i64 quantile boundaries from an integer key column (the
-/// exact-integer analog of [`sample_boundaries_f64`]). `None` if too few non-null values.
-fn sample_boundaries_i64(key: &arrow::array::Int64Array, parts: usize) -> Option<Vec<i64>> {
-    let n = key.len();
-    let target = 8192.min(n).max(parts);
-    let stride = (n / target).max(1);
-    let mut sample: Vec<i64> = (0..n)
-        .step_by(stride)
-        .filter(|&i| key.is_valid(i))
-        .map(|i| key.value(i))
-        .collect();
-    if sample.len() < parts {
-        return None;
-    }
-    sample.sort_unstable();
-    let m = sample.len();
-    Some((1..parts).map(|j| sample[(j * m / parts).min(m - 1)]).collect())
 }
 
 /// Window over a single (already-materialized) batch, at the default parallel-row
@@ -760,6 +654,108 @@ pub(crate) fn limit(batches: Vec<RecordBatch>, n: usize, offset: usize) -> Vec<R
 }
 
 #[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use bc_expr::{BinaryOp, Expr, Literal};
+    use std::sync::Arc;
+
+    fn batch() -> RecordBatch {
+        RecordBatch::try_from_iter(vec![
+            (
+                "a",
+                Arc::new(Int64Array::from(vec![1i64, 2, 3, 4])) as ArrayRef,
+            ),
+            (
+                "b",
+                Arc::new(Int64Array::from(vec![
+                    Some(10i64),
+                    None,
+                    Some(30),
+                    Some(40),
+                ])) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    }
+
+    fn cmp(op: BinaryOp, v: i64) -> bc_expr::Expr {
+        Expr::Binary {
+            op,
+            left: Box::new(Expr::Col { name: "a".into() }),
+            right: Box::new(Expr::Lit {
+                value: Literal::Int(v),
+            }),
+        }
+    }
+
+    /// An all-true mask returns the input rows unchanged (the short-circuit must not
+    /// reorder, drop, or alter validity).
+    #[test]
+    fn all_true_mask_returns_input_unchanged() {
+        let b = batch();
+        let out = filter_batch(&b, &cmp(BinaryOp::Gt, 0)).unwrap();
+        assert_eq!(out, b);
+    }
+
+    /// An all-false mask returns an empty batch with the same schema.
+    #[test]
+    fn all_false_mask_returns_empty() {
+        let b = batch();
+        let out = filter_batch(&b, &cmp(BinaryOp::Gt, 100)).unwrap();
+        assert_eq!(out.num_rows(), 0);
+        assert_eq!(out.schema(), b.schema());
+    }
+
+    /// The ordinary partial mask still gathers, and matches arrow's filter exactly.
+    #[test]
+    fn partial_mask_matches_arrow_filter() {
+        let b = batch();
+        let out = filter_batch(&b, &cmp(BinaryOp::Gt, 2)).unwrap();
+        assert_eq!(out.num_rows(), 2);
+        let a = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(a.values(), &[3, 4]);
+    }
+
+    /// A NULL in the predicate means "not selected". A mask that is true everywhere it is
+    /// non-null must NOT take the all-true short-circuit — the null row has to be dropped.
+    #[test]
+    fn null_in_mask_is_not_all_true() {
+        let b = batch();
+        // b > 0 is true for rows 0,2,3 and NULL for row 1.
+        let pred = Expr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::Col { name: "b".into() }),
+            right: Box::new(Expr::Lit {
+                value: Literal::Int(0),
+            }),
+        };
+        let out = filter_batch(&b, &pred).unwrap();
+        assert_eq!(out.num_rows(), 3, "the NULL row must be filtered out");
+        let a = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(a.values(), &[1, 3, 4]);
+    }
+
+    /// A mask that is entirely NULL selects nothing.
+    #[test]
+    fn all_null_mask_returns_empty() {
+        let b = RecordBatch::try_from_iter(vec![(
+            "b",
+            Arc::new(Int64Array::from(vec![None, None, None] as Vec<Option<i64>>)) as ArrayRef,
+        )])
+        .unwrap();
+        let pred = Expr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::Col { name: "b".into() }),
+            right: Box::new(Expr::Lit {
+                value: Literal::Int(0),
+            }),
+        };
+        assert_eq!(filter_batch(&b, &pred).unwrap().num_rows(), 0);
+    }
+}
+
+#[cfg(test)]
 mod sort_tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array};
@@ -931,10 +927,10 @@ mod sort_tests {
         );
     }
 
-    /// The parallel path declines for a small input and for a non-numeric (string)
-    /// leading key, so the caller uses the serial sort.
+    /// The parallel path declines for a small input (sampling + partition overhead would
+    /// dominate), so the caller uses the serial sort.
     #[test]
-    fn parallel_sort_declines_small_and_string() {
+    fn parallel_sort_declines_small() {
         let small = RecordBatch::try_from_iter(vec![(
             "k",
             Arc::new(Float64Array::from(vec![3.0, 1.0, 2.0])) as ArrayRef,
@@ -946,17 +942,42 @@ mod sort_tests {
             nulls_first: false,
         }];
         assert!(parallel_sort_batch(&small, &keys, None).unwrap().is_none());
+    }
 
+    /// A large **string** leading key now range-partitions and sorts in parallel, and the
+    /// result is identical to the serial oracle (ties resolve to input order on both paths
+    /// via the stable string permutation).
+    #[test]
+    fn parallel_sort_handles_string_key_identically_to_serial() {
         let n = 200_000usize;
         let strs: Vec<String> = (0..n).map(|i| format!("s{}", i % 1000)).collect();
-        let str_batch = RecordBatch::try_from_iter(vec![(
-            "k",
-            Arc::new(arrow::array::StringArray::from(strs)) as ArrayRef,
-        )])
+        let str_batch = RecordBatch::try_from_iter(vec![
+            (
+                "k",
+                Arc::new(arrow::array::StringArray::from(strs)) as ArrayRef,
+            ),
+            (
+                "p",
+                Arc::new(arrow::array::Int64Array::from(
+                    (0..n as i64).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+        ])
         .unwrap();
-        // String leading key → declines (can't range-partition here); serial sort handles it.
-        assert!(parallel_sort_batch(&str_batch, &keys, None)
-            .unwrap()
-            .is_none());
+        for (descending, nulls_first) in [(false, false), (true, false), (false, true)] {
+            let keys = vec![SortKey {
+                expr: Expr::Col { name: "k".into() },
+                descending,
+                nulls_first,
+            }];
+            let par = parallel_sort_batch(&str_batch, &keys, None)
+                .unwrap()
+                .expect("string sample-sort should engage on a large input");
+            let seq = sort_batch(&str_batch, &keys, None).unwrap();
+            assert_eq!(
+                seq, par,
+                "descending={descending} nulls_first={nulls_first}"
+            );
+        }
     }
 }

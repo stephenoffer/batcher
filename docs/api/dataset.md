@@ -65,6 +65,7 @@ Each method returns a new `Dataset`. They chain.
 | `.sort(*by, descending=False, nulls_first=False)` | Order rows. `by` is a name or expression. |
 | `.limit(n, offset=0)` | Take `n` rows after skipping `offset`. |
 | `.head(n=5)` | Take the first `n` rows. |
+| `.tail(n=5)` | Take the last `n` rows (executes a `count` first). |
 | `.sample(fraction=None, *, n=None, seed=None)` | Sample a `fraction` of rows or a fixed count `n`. Deterministic and partition-independent (a stable seeded content hash), so identical single-node or distributed. |
 | `.distinct()` | Drop duplicate rows. |
 | `.union(*others, distinct=False)` | Concatenate datasets; set `distinct=True` to dedupe. |
@@ -270,6 +271,8 @@ A terminal operation executes the plan.
 | `.to_pydict()` | A `dict[str, list]`. |
 | `.to_pylist()` | A `list[dict]`, one dict per row. |
 | `.count()` | Row count as an `int`. |
+| `.median(column)` / `.quantile(column, q)` | The exact median / `q`-quantile as a scalar. |
+| `.corr(x, y)` / `.cov(x, y, ddof=1)` | Pearson correlation / covariance of two columns. |
 | `.iter_batches(batch_size=None)` | An iterator of pyarrow `RecordBatch`es. |
 | `.explain()` | The plan as a `str`. |
 | `.show(limit=10)` | Prints a preview; returns `None`. |
@@ -365,7 +368,7 @@ print(ds.null_count().to_pydict())
 | Accessor | Purpose |
 | --- | --- |
 | `.dq` | Data-quality expectations. Constraint methods accumulate (returning a new `DatasetDQ`); a terminal method (`fail` / `drop` / `quarantine` / `validate`) applies them. |
-| `.scd` | Slowly-changing-dimension upserts. The dataset is the incoming dimension snapshot (natural keys + attributes). |
+| `.scd` | Dimension maintenance. `type1` / `type2` / `type3` take an incoming snapshot (natural keys + attributes); `apply_changes` takes a CDC change feed, with deletes, redeliveries, and out-of-order rows. |
 
 ## Next steps
 

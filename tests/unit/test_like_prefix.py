@@ -8,7 +8,8 @@ import batcher as bt
 from batcher import col
 from batcher.kyber.optimizer import Optimizer
 from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rules.normalize import _prefix_upper_bound, like_prefix_to_range
+from batcher.kyber.rules.normalize import like_prefix_to_range
+from batcher.kyber.rules.normalize.ranges import _prefix_upper_bound
 from batcher.plan.logical import Filter
 
 

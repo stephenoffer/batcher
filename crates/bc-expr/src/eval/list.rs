@@ -368,6 +368,7 @@ pub(crate) fn eval_list_binary(
         let (rs, re) = (ro[i] as usize, ro[i + 1] as usize);
         let n = (le - ls).min(re - rs);
         let (mut dot, mut lnorm, mut rnorm, mut dist2) = (0f64, 0f64, 0f64, 0f64);
+        let mut agree = 0usize;
         for k in 0..n {
             let (lk, rk) = (ls + k, rs + k);
             if !lf.is_valid(lk) || !rf.is_valid(rk) {
@@ -378,10 +379,19 @@ pub(crate) fn eval_list_binary(
             lnorm += x * x;
             rnorm += y * y;
             dist2 += (x - y) * (x - y);
+            // Exact for minhash signatures, whose values are bounded to 32 bits.
+            agree += usize::from(x == y);
         }
         match func {
             ListBinaryFunc::Dot => b.append_value(dot),
             ListBinaryFunc::L2Distance => b.append_value(dist2.sqrt()),
+            ListBinaryFunc::Jaccard => {
+                if n == 0 {
+                    b.append_null(); // no positions to agree on
+                } else {
+                    b.append_value(agree as f64 / n as f64)
+                }
+            }
             ListBinaryFunc::CosineSimilarity => {
                 let denom = lnorm.sqrt() * rnorm.sqrt();
                 if denom == 0.0 {

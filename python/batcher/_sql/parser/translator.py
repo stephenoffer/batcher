@@ -122,8 +122,8 @@ class _Translator:
     def _apply_subquery_predicates(self, ds: Dataset, pred):
         return subquery._apply_subquery_predicates(self, ds, pred)
 
-    def _decorrelate_scalar_subqueries(self, ds: Dataset, roots) -> Dataset:
-        return subquery._decorrelate_scalar_subqueries(self, ds, roots)
+    def _decorrelate_scalar_subqueries(self, ds: Dataset, roots, outer_node=None) -> Dataset:
+        return subquery._decorrelate_scalar_subqueries(self, ds, roots, outer_node)
 
     def _reject_correlated(self, select_node) -> None:
         subquery._reject_correlated(select_node)

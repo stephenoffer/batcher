@@ -15,6 +15,7 @@ from __future__ import annotations
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.expr_ir.fn_names import (
     DATE_FNS,
+    KEYED_STR_FNS,
     LIST_FNS,
     STR_FNS,
     ListBinaryFn,
@@ -37,6 +38,23 @@ class StrFunc(IRNode):
     replacement: str | None = scalar(omit_none=True, default=None)
     start: int | None = scalar(omit_none=True, default=None)
     length: int | None = scalar(omit_none=True, default=None)
+
+    def __repr__(self) -> str:
+        """Render the node, redacting `pattern` for the keyed (crypto) functions.
+
+        For `aes_encrypt`/`aes_decrypt`/`hmac_sha256` the ``pattern`` slot holds the
+        encryption key. A `repr` is the value that ends up in tracebacks, debugger
+        frames, notebook cells, and log lines, so it is the most likely place for a key
+        to escape; `to_ir()` is unaffected — the engine still receives the real key.
+        `dataclass` leaves an explicitly-declared ``__repr__`` in place, so this wins
+        over the generated one.
+        """
+        pattern = "'***'" if self.fn in KEYED_STR_FNS and self.pattern else repr(self.pattern)
+        return (
+            f"StrFunc(fn={self.fn!r}, input={self.input!r}, pattern={pattern}, "
+            f"replacement={self.replacement!r}, start={self.start!r}, "
+            f"length={self.length!r})"
+        )
 
 
 @expr_node

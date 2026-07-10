@@ -65,6 +65,7 @@ class ExprTag:
     GREATEST: Final = "greatest"
     LEAST: Final = "least"
     ARRAY: Final = "array"
+    HASH: Final = "hash"
     SEQUENCE: Final = "sequence"
     DATE: Final = "date"
     DATE_TRUNC: Final = "date_trunc"

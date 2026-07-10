@@ -13,6 +13,7 @@ from batcher.api import functions as _functions
 from batcher.api.dataset import Dataset, GroupBy
 from batcher.api.functions import *  # noqa: F403  (governed by functions.__all__)
 from batcher.api.io_namespace import read
+from batcher.api.security import security
 from batcher.api.session import (
     compact,
     date_range,
@@ -38,14 +39,18 @@ from batcher.api.session import (
     streams,
 )
 from batcher.api.sql_session import Session
+from batcher.governance import GovernanceEvent, Principal, SecurityCatalog
 from batcher.plan.streaming import OutputMode, Trigger
 
 # Session names listed as literals so ruff recognizes the explicit imports above as
 # re-exports; the expression functions come in via `*_functions.__all__`.
 __all__ = [
     "Dataset",
+    "GovernanceEvent",
     "GroupBy",
     "OutputMode",
+    "Principal",
+    "SecurityCatalog",
     "Session",
     "Trigger",
     "compact",
@@ -69,6 +74,7 @@ __all__ = [
     "read",
     "read_memory",
     "register_function",
+    "security",
     "sql",
     "streams",
     *_functions.__all__,

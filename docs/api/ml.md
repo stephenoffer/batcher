@@ -7,10 +7,15 @@ ML work attaches to a `Dataset` through the `.ml` accessor:
 | `ds.ml.map_batches(fn, ...)` | Apply an arbitrary function to each Arrow batch. |
 | `ds.ml.infer(model, ...)` | Run batch inference — a model id + `column`, or a model callable. |
 | `ds.ml.embed(model, ...)` | Generate embeddings — a model id + `column`, or a model callable. |
+| `ds.ml.generate(engine, ...)` | Offline LLM text generation, appending the response column. |
 | `ds.ml.download(url_col, ...)` | Fetch bytes at each URL/path into a column. |
 | `ds.ml.upload(data_col, dir, ...)` | Write a bytes column out to object storage. |
 | `ds.ml.iter_torch_batches(...)` | Stream the dataset to PyTorch as tensor batches. |
 | `ds.ml.stream_loader(...)` | A distributed-training `IterableDataset` for one rank. |
+| `ds.ml.train_test_split(test_size, seed=0)` | Disjoint, reproducible train/test `Dataset`s. |
+| `ds.ml.random_split(fractions, seed=0)` | The n-way generalization (train/val/test). |
+| `ds.ml.near_duplicates(column, threshold=0.8)` | MinHash + LSH near-duplicate pairs. |
+| `ds.ml.drop_near_duplicates(column, threshold=0.8)` | Fuzzy dedup, keeping one per cluster. |
 
 These operate on whole `pyarrow.RecordBatch` objects, never on individual rows.
 They are lazy like every other transformation and return a new `Dataset` (except the
@@ -137,8 +142,9 @@ See [Inference](../ml/inference.md) for the inference workflow and
 
 Operators that are not `Dataset` methods live in `batcher.ml` — the standalone
 `embed` / `llm_generate` functions, the [preprocessors](../ml/preprocessors.md),
-the [serving adapters](../ml/serving.md), [vector search](../ml/multimodal.md), and
-the [LLM engines](../ml/llm.md). A *callable* model passed to `map_batches`/`infer`
+the [serving adapters](../ml/serving.md), [vector search](../ml/multimodal.md), the
+`Chain` preprocessor pipeline, the `ResumableSampler` (checkpointable per-rank index
+stream), and the [LLM engines](../ml/llm.md). A *callable* model passed to `map_batches`/`infer`
 receives the whole batch and picks its own columns (no `input_columns=` keyword); the
 model-identifier form of `infer`/`embed` instead takes the `column` to run on.
 

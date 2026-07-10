@@ -23,12 +23,13 @@ from batcher.plan.logical import (
     Project,
     Scan,
     Sort,
+    Unnest,
     remap_sources,
 )
 from batcher.plan.schema import SchemaRef
 
 # Single-input nodes we can carry as "post-aggregation" work above the breaker.
-_PASS_THROUGH = (Filter, Project, Sort, Limit, Distinct)
+_PASS_THROUGH = (Filter, Project, Sort, Limit, Distinct, Unnest)
 
 # Schema for an intermediate stage's scan: only read when the upstream stage produced
 # zero rows (`_execute_node` falls back to it), where the downstream result is empty
@@ -41,7 +42,9 @@ def _has_breaker(node: LogicalPlan) -> bool:
     plain map input to a distributed sort)."""
     if isinstance(node, (Aggregate, Sort, Join, Distinct, Limit)):
         return True
-    if isinstance(node, (Filter, Project)):
+    if isinstance(node, (Filter, Project, Unnest)):
+        # `Unnest` multiplies rows but holds no state and materializes nothing, so it
+        # never breaks the pipeline — it just changes how many rows flow through it.
         return _has_breaker(node.input)
     return isinstance(node, Scan) is False  # unknown node → be conservative
 
@@ -77,13 +80,18 @@ def _relabel_single_source(plan: LogicalPlan) -> tuple[LogicalPlan, int]:
 
 
 def _is_linear_map_pipeline(plan: LogicalPlan) -> bool:
-    """True if the plan is a linear chain of scan / filter / project / map_batches
-    (no relational breakers) — embarrassingly parallel per partition."""
+    """True if the plan is a linear chain of scan / filter / project / map_batches /
+    unnest (no relational breakers) — embarrassingly parallel per partition.
+
+    `Unnest` (explode) belongs here: it is stateless and row-wise, so running it on each
+    partition and concatenating gives exactly the single-node result. Excluding it forced
+    the whole RAG ingest shape — scan, chunk, explode, embed — onto one node.
+    """
     node = plan
     while True:
         if isinstance(node, Scan):
             return True
-        if isinstance(node, (Filter, Project, MapBatches)):
+        if isinstance(node, (Filter, Project, MapBatches, Unnest)):
             node = node.input
         else:
             return False

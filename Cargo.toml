@@ -71,3 +71,20 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "unwind"
+# Drop DWARF from the release cdylib. `maturin develop --release` copies this artifact to
+# `python/batcher/_native.abi3.so`, and the distributed path ships that *package directory*
+# to Ray workers (`_self_ship_runtime_env` → `py_modules`). Unstripped it is ~573 MB, over
+# Ray's 512 MB runtime-env cap, so every distributed query on an editable release build
+# died with `Package size exceeds the maximum size`. Stripped it is ~153 MB. Symbol names
+# survive (`debuginfo`, not `symbols`), so profiles and backtraces still name functions.
+strip = "debuginfo"
+
+[profile.dev]
+# Same constraint as the release profile above, for the same reason: `just build`
+# (`maturin develop`) installs this artifact as `python/batcher/_native.abi3.so`, and the
+# distributed path ships that directory to Ray workers. Full DWARF makes it ~573 MB — past
+# Ray's 512 MB cap — so `just test` (which builds dev, then runs the distributed
+# differential tests) could never pass. Line tables keep panic backtraces pointing at real
+# file:line while dropping the bulk of the debug info; `debug_assertions` stay on, so the
+# dev build keeps its overflow/bounds checks.
+debug = "line-tables-only"

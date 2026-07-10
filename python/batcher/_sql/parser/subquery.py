@@ -89,11 +89,15 @@ def _apply_in_subquery(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
 
     inner_select = _in_subquery_select(node).copy()  # detach from outer AST
     target = node.this
-    if not _is_plain_column(target):
-        raise NotImplementedError(
-            "IN (subquery) supports a single plain column on the left-hand side"
-        )
-    left_key = target.name
+    # A plain column, or a row value `(a, b, …)` — a multi-column IN → multi-key semi-join.
+    if _is_plain_column(target):
+        left_keys = [target.name]
+    elif isinstance(target, exp.Tuple) and target.expressions and all(
+        _is_plain_column(e) for e in target.expressions
+    ):
+        left_keys = [e.name for e in target.expressions]
+    else:
+        raise NotImplementedError("IN (subquery) supports a plain column or a row value of columns")
     how = "anti" if negate else "semi"
 
     # Split the subquery WHERE into correlation equalities and local predicates.
@@ -109,14 +113,20 @@ def _apply_in_subquery(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     if not corr:
         _reject_correlated(inner_select)
         inner_ds = tr.statement(inner_select)
-        if len(inner_ds.columns) != 1:
-            raise NotImplementedError(
-                "IN (subquery) requires the subquery to project exactly one column"
-            )
-        return ds.join(inner_ds.distinct(), left_on=left_key, right_on=inner_ds.columns[0], how=how)
+        if len(inner_ds.columns) != len(left_keys):
+            raise NotImplementedError("IN subquery must project one column per left-hand column")
+        return ds.join(
+            inner_ds.distinct(),
+            left_on=left_keys,
+            right_on=list(inner_ds.columns[: len(left_keys)]),
+            how=how,
+        )
 
     # Correlated IN: semi/anti join on (target = projected) AND the correlation
     # equalities, with local predicates applied to the inner relation.
+    if len(left_keys) != 1:
+        raise NotImplementedError("multi-column IN (subquery) with a correlation is unsupported")
+    left_key = left_keys[0]
     if len(inner_select.expressions) != 1:
         raise NotImplementedError("correlated IN subquery must project one column")
     in_col = inner_select.expressions[0]
@@ -279,7 +289,55 @@ def _correlation_pair(leaf, local: set[str], local_cols: set[str] | None = None)
     return None
 
 
-def _decorrelate_scalar_subqueries(tr, ds: Dataset, roots) -> Dataset:
+def _outer_key_reducer(tr, outer_node, sub, corr):
+    """A cheap `SELECT k… FROM T WHERE <T's predicates>` to pre-filter a correlated aggregate
+    subquery by (`(ic…) IN (…)`), or None. A per-key aggregate otherwise scans the whole fact
+    table for every key, but the enclosing query only produces the keys of its own (often
+    filtered) dimension `T` (the base table owning every correlation column). `T` filtered by
+    the enclosing conjuncts whose *top-level* columns (not those in a nested subquery, so
+    `ps_partkey IN (SELECT …)` counts) all belong to `T` — minus the conjunct carrying the sub
+    (circular) — is a superset of the LEFT JOIN's keys, so it changes no surviving group."""
+    from sqlglot import expressions as exp
+
+    if outer_node is None or not corr:
+        return None
+    ocs = [oc for (oc, _ic) in corr]
+    from_ = outer_node.args.get("from") or outer_node.args.get("from_")
+    sources = ([from_.this] if from_ is not None else []) + [
+        j.this for j in outer_node.args.get("joins", []) or []
+    ]
+    owning = None
+    for t in sources:
+        if not (isinstance(t, exp.Table) and t.name in tr._registry):
+            continue
+        tcols = set(tr._registry[t.name].columns)
+        if all(oc in tcols for oc in ocs):
+            if owning is not None:
+                return None  # ambiguous
+            owning = t.name
+    if owning is None:
+        return None
+    tcols = set(tr._registry[owning].columns)
+    where = outer_node.args.get("where")
+    if where is None:
+        return None
+    tpreds = []
+    for leaf in _split_and(where.this):
+        nested = set(leaf.find_all(exp.Subquery))
+        if sub in nested:
+            continue
+        top_cols = {
+            c.name for c in leaf.find_all(exp.Column) if c.find_ancestor(exp.Subquery) not in nested
+        }
+        if top_cols and top_cols <= tcols:
+            tpreds.append(leaf.copy())
+    if not tpreds:
+        return None
+    cols = [exp.column(o) for o in ocs]
+    return exp.select(*cols).from_(exp.table_(owning)).where(_join_and(tpreds))
+
+
+def _decorrelate_scalar_subqueries(tr, ds: Dataset, roots, outer_node=None) -> Dataset:
     """Rewrite correlated scalar subqueries into LEFT JOINs.
 
     `(SELECT max(b.v) FROM b WHERE b.k = a.k)` becomes a LEFT JOIN with
@@ -322,11 +380,24 @@ def _decorrelate_scalar_subqueries(tr, ds: Dataset, roots) -> Dataset:
                 [exp.alias_(exp.column(ic), k) for (k, (_oc, ic)) in zip(jk, corr, strict=True)]
                 + [exp.alias_(value, alias)],
             )
-            if any(_has_aggregate(e) for e in m.expressions):
+            has_agg = any(_has_aggregate(e) for e in m.expressions)
+            if has_agg:
                 m.set("group", exp.Group(expressions=[exp.column(ic) for (_oc, ic) in corr]))
+                # Semi-join reduction (see `_outer_key_reducer`).
+                reducer = _outer_key_reducer(tr, outer_node, sub, corr)
+                if reducer is not None:
+                    ics = [exp.column(ic) for (_oc, ic) in corr]
+                    lhs = ics[0] if len(ics) == 1 else exp.Tuple(expressions=ics)
+                    in_pred = exp.In(this=lhs, query=reducer)
+                    cur = m.args.get("where")
+                    combined = exp.and_(cur.this, in_pred) if cur is not None else in_pred
+                    m.set("where", exp.Where(this=combined))
             _reject_correlated(m)
 
-            derived = tr.statement(m).distinct()
+            # A GROUP BY already yields one row per key, so a following DISTINCT is a
+            # redundant full pass; only a non-aggregate scalar subquery needs it to dedup.
+            stmt = tr.statement(m)
+            derived = stmt if has_agg else stmt.distinct()
             ds = ds.join(
                 derived,
                 left_on=[oc for (oc, _ic) in corr],

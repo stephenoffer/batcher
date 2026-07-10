@@ -39,8 +39,12 @@ from batcher.api.dataset._build import (
     build_unnest,
     build_unpivot,
     build_window,
-    build_window_columns,
     build_with_random,
+)
+from batcher.api.dataset._window import (
+    build_window_columns,
+    windowed_filter,
+    windowed_project,
 )
 from batcher.api.dataset.dq import DatasetDQ
 from batcher.api.dataset.ml import DatasetML
@@ -62,11 +66,10 @@ from batcher.api.terminal import (
 )
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Aliased, Col, Expr
-from batcher.plan.expr_ir.nodes import WindowExpr
+from batcher.plan.expr_rewrite import is_bare_window
 from batcher.plan.logical import (
     AsofJoin,
     Distinct,
-    Filter,
     Join,
     Limit,
     LogicalPlan,
@@ -231,6 +234,22 @@ class Dataset:
                 3
         """
         return self.count()
+
+    def __bool__(self) -> bool:
+        """Always raises — the truth value of a lazy `Dataset` is ambiguous.
+
+        Without this, ``if ds:`` would silently fall back to `__len__` and execute a
+        full ``count`` just to decide a branch. Ask for what you mean instead:
+        `has_rows` / `is_empty` for emptiness, ``ds is not None`` for existence.
+
+        Raises:
+            PlanError: Always.
+        """
+        raise PlanError(
+            "the truth value of a Dataset is ambiguous (a lazy plan, not a result); "
+            "use ds.has_rows / ds.is_empty() to test for rows, or `ds is not None` "
+            "to test that a Dataset was produced"
+        )
 
     def __iter__(self) -> Iterator[pa.RecordBatch]:
         """Iterate the result as Arrow ``RecordBatch``es — ``for batch in ds``.
@@ -403,6 +422,10 @@ class Dataset:
         tighter than comparisons. Rows where the predicate is null are dropped.
         Like every transformation this is lazy and returns a new `Dataset`.
 
+        The predicate may compose window expressions — ``filter(col("x") >
+        col("x").mean().over(partition_by=["g"]))`` keeps rows above their group
+        mean. The window sees every input row, as in the SQL subquery it desugars to.
+
         Args:
             predicate: A boolean expression evaluated per row.
 
@@ -417,7 +440,7 @@ class Dataset:
         """
         if not isinstance(predicate, Expr):
             raise PlanError("filter() requires an expression, e.g. col('x') > 0")
-        return self._derive(Filter(self._plan, predicate))
+        return windowed_filter(self, predicate)
 
     def select(self, *columns: str | Expr, **named: Expr | int | float | bool | str) -> Dataset:
         """Project to exactly the given columns.
@@ -452,15 +475,16 @@ class Dataset:
             items.append(Projection(alias, _as_expr(expr)))
         if not items:
             raise PlanError("select() requires at least one column")
-        return self._derive(Project(self._plan, tuple(items)))
+        return windowed_project(self, items)
 
     def with_columns(self, **named: Expr | int | float | bool | str) -> Dataset:
         """Add or replace columns, keeping all existing ones.
 
         Values may be expressions, scalars, or window expressions from
-        ``agg.over(...)`` (e.g. ``with_columns(total=col("x").sum().over(partition_by=["g"]))``),
-        which append windowed columns. Mixing window and non-window values in one call
-        is not supported — use separate calls.
+        ``agg.over(...)`` (e.g. ``with_columns(total=col("x").sum().over(partition_by=["g"]))``).
+        A window may be composed with ordinary arithmetic —
+        ``with_columns(share=col("x") / col("x").sum().over())`` — and window and
+        non-window columns may be mixed freely in one call.
 
         Examples:
             .. doctest::
@@ -472,14 +496,11 @@ class Dataset:
         """
         if not named:
             raise PlanError("with_columns() requires at least one named column")
-        windows = {a: e for a, e in named.items() if isinstance(e, WindowExpr)}
-        if windows:
-            if len(windows) != len(named):
-                raise PlanError(
-                    "with_columns(): mix of window (.over) and non-window columns; "
-                    "add them in separate with_columns() calls"
-                )
-            return build_window_columns(self, windows)
+        # Bare `agg.over(...)` columns need no surrounding projection: name each
+        # window by its own alias and append it. Anything composed goes through the
+        # hoisting path below.
+        if all(is_bare_window(e) for e in named.values()):
+            return build_window_columns(self, named)
         existing = self._plan.available_columns()
         items: list[Projection] = []
         for name in existing:
@@ -490,7 +511,7 @@ class Dataset:
         for alias, expr in named.items():
             if alias not in existing:
                 items.append(Projection(alias, _as_expr(expr)))
-        return self._derive(Project(self._plan, tuple(items)))
+        return windowed_project(self, items)
 
     def sort(
         self,
@@ -1470,6 +1491,38 @@ class Dataset:
         """
         return self.limit(n)
 
+    def tail(self, n: int = 5) -> Dataset:
+        """Keep the last `n` rows.
+
+        Unlike `head`, this needs to know how many rows there are, so it **executes a
+        `count` eagerly** (often answered from metadata with no scan) before building
+        the lazy plan that selects the trailing rows. Without a preceding `sort` the
+        rows are in an unspecified order.
+
+        Args:
+            n: Maximum number of rows to keep.
+
+        Returns:
+            A new `Dataset` with at most `n` rows.
+
+        Raises:
+            PlanError: If `n` is negative.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3, 4, 5]}).sort("x").tail(2).to_pydict()
+                {'x': [4, 5]}
+        """
+        if n < 0:
+            raise PlanError(f"tail(): n must be non-negative, got {n}")
+        total = self.count()
+        if n >= total:
+            return self
+        idx = "__bc_tail_idx"
+        return self.with_row_index(idx).filter(Col(idx) >= total - n).drop(idx)
+
     def join(
         self,
         other: Dataset,
@@ -1736,6 +1789,56 @@ class Dataset:
             backend=backend,
         )
 
+    def lineage(self) -> dict[str, list[str]]:
+        """Return, per output column, the source columns its values are derived from.
+
+        Column-level lineage, read straight off the plan — nothing executes. This is what
+        turns a governance tag into an answer: tag ``customers.ssn`` as PII, and lineage
+        names every downstream column that carries it.
+
+        Origins are rendered ``"<table>.<column>"``, where the table is the path a source
+        is read from. A column built only from literals, or generated (`with_row_index`),
+        has no origin and maps to an empty list.
+
+        Lineage tracks *data* flow, not control flow: filtering on a column does not put
+        it in the lineage of the surviving columns. An opaque `map_batches` stage is
+        over-approximated — every output column is assumed to derive from every input
+        column — because for a governance answer a false positive costs a review and a
+        false negative costs a breach.
+
+        Examples:
+            .. doctest::
+
+                >>> import os
+                >>> import tempfile
+
+                >>> import batcher as bt
+                >>> path = os.path.join(tempfile.mkdtemp(), "people.parquet")
+                >>> _ = bt.from_pydict({"first": ["a"], "last": ["b"], "age": [3]}).write(
+                ...     path, format="parquet"
+                ... )
+                >>> ds = bt.read.parquet(path).select(
+                ...     name=bt.concat(bt.col("first"), bt.col("last")),
+                ...     decade=bt.col("age") / 10,
+                ... )
+                >>> sorted(ds.lineage()["name"]) == sorted(
+                ...     [f"{path}.first", f"{path}.last"]
+                ... )
+                True
+
+        Returns:
+            A mapping from output column name to its sorted ``"table.column"`` origins.
+        """
+        from batcher.api.security import table_name
+        from batcher.governance import column_lineage
+
+        tables = [table_name(s) or f"<source {i}>" for i, s in enumerate(self._sources)]
+        lineage = column_lineage(self._plan, tables)
+        return {
+            alias: sorted(f"{table}.{column}" for table, column in origins)
+            for alias, origins in lineage.items()
+        }
+
     def explain(self, analyze: bool = False, *, format: str = "text") -> str:
         """Return the query plan as a tree, optionally with measured execution profile.
 
@@ -1941,6 +2044,115 @@ class Dataset:
 
         answer = metadata_n_unique(self._plan, self._sources, column)
         return answer if answer is not None else int(self._exec_scalar(Col(column).n_unique()))
+
+    def median(self, column: str) -> Any:
+        """The exact median of `column` (SQL ``MEDIAN``), ignoring nulls.
+
+        A scalar terminal, exact rather than sketched — use `approx_median` on a large
+        column when a bounded-error answer is enough and a sort is not affordable.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The median value, or ``None`` for an empty/all-null column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 5, 2, 4, 3]}).median("x")
+                3.0
+        """
+        self._require_column(column, "median")
+        return self._exec_scalar(Col(column).median())
+
+    def quantile(self, column: str, q: float) -> Any:
+        """The exact `q`-quantile of `column` (SQL ``QUANTILE_CONT``), ignoring nulls.
+
+        The exact counterpart of `approx_quantile`, which answers from a mergeable
+        TDigest instead.
+
+        Args:
+            column: The column to reduce.
+            q: The quantile to compute, in ``[0, 1]`` (``0.5`` is the median).
+
+        Returns:
+            The quantile value, or ``None`` for an empty/all-null column.
+
+        Raises:
+            PlanError: If `q` is outside ``[0, 1]``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3, 4]}).quantile("x", 0.25)
+                1.75
+        """
+        self._require_column(column, "quantile")
+        if not 0.0 <= q <= 1.0:
+            raise PlanError(f"quantile(): q must be in [0, 1], got {q}")
+        return self._exec_scalar(Col(column).quantile(q))
+
+    def corr(self, x: str, y: str) -> float | None:
+        """The Pearson correlation of columns `x` and `y` (SQL ``CORR``).
+
+        A scalar terminal. Rows where either column is null are ignored; the result is
+        ``None`` when fewer than two such rows remain, or when either column is constant.
+
+        Args:
+            x: The first column.
+            y: The second column.
+
+        Returns:
+            The correlation coefficient in ``[-1, 1]``, or ``None``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"a": [1, 2, 3], "b": [2, 4, 6]}).corr("a", "b")
+                1.0
+        """
+        from batcher.plan.functions.aggregate import corr
+
+        self._require_column(x, "corr")
+        self._require_column(y, "corr")
+        return self._exec_scalar(corr(Col(x), Col(y)))
+
+    def cov(self, x: str, y: str, *, ddof: int = 1) -> float | None:
+        """The covariance of columns `x` and `y` (SQL ``COVAR_SAMP``/``COVAR_POP``).
+
+        A scalar terminal. Rows where either column is null are ignored.
+
+        Args:
+            x: The first column.
+            y: The second column.
+            ddof: Delta degrees of freedom — ``1`` for the sample covariance (the
+                default, ``COVAR_SAMP``) or ``0`` for the population one (``COVAR_POP``).
+
+        Returns:
+            The covariance, or ``None`` when too few non-null row pairs remain.
+
+        Raises:
+            PlanError: If `ddof` is neither 0 nor 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"a": [1, 2, 3], "b": [2, 4, 6]}).cov("a", "b")
+                2.0
+        """
+        from batcher.plan.functions.aggregate import covar_pop, covar_samp
+
+        self._require_column(x, "cov")
+        self._require_column(y, "cov")
+        if ddof not in (0, 1):
+            raise PlanError(f"cov(): ddof must be 0 (population) or 1 (sample), got {ddof}")
+        fn = covar_samp if ddof == 1 else covar_pop
+        return self._exec_scalar(fn(Col(x), Col(y)))
 
     def n_null(self, column: str) -> int:
         """The exact number of null values in `column` (``count(*) - count(column)``).

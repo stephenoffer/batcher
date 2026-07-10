@@ -126,6 +126,61 @@ print(top1.to_pydict())
 # {'category': ['a', 'b'], 'product': ['x', 'p'], 'price': [30, 40]}
 ```
 
+## Composing a window with ordinary expressions
+
+A window expression is an ordinary expression: it can be combined with arithmetic,
+comparisons, and other windows inside `select`, `with_columns`, and `filter`. The
+engine lifts each window into its own `Window` operator and rewrites the surrounding
+expression to read the result, exactly as a SQL engine does for
+`x - lag(x) OVER (...)`.
+
+```python
+prices = bt.from_pydict({"category": ["a", "a", "b", "b"], "price": [10, 20, 40, 15]})
+
+shares = prices.with_columns(
+    share=bt.col("price") / bt.col("price").sum().over(partition_by=["category"])
+)
+print(shares.to_pydict())
+# {'category': ['a', 'a', 'b', 'b'], 'price': [10, 20, 40, 15],
+#  'share': [0.3333333333333333, 0.6666666666666666, 0.7272727272727273, 0.2727272727272727]}
+```
+
+Because the window sees every input row before the filter runs, a window in a
+predicate expresses "rows above their group's mean" directly — the subquery SQL
+would need:
+
+```python
+above = prices.filter(bt.col("price") > bt.col("price").mean().over(partition_by=["category"]))
+print(above.to_pydict())
+# {'category': ['a', 'b'], 'price': [20, 40]}
+```
+
+Windows may not appear where SQL also forbids them — inside `group_by().agg(...)`,
+a join key, or a sort key. Compute the window in a `with_columns` step first and
+reference the resulting column.
+
+## Expression shorthands
+
+Common window shapes have named methods on `Expr`, so you rarely spell the window
+out. They all accept `partition_by` / `order_by` and lower to the windows above.
+
+```python
+ts = bt.from_pydict({"price": [10, 15, 30]})
+print(
+    ts.with_columns(
+        change=bt.col("price").diff(),          # price - lag(price)
+        growth=bt.col("price").pct_change(),    # price / lag(price) - 1
+        rnk=bt.col("price").rank(),             # RANK() OVER (ORDER BY price)
+    ).to_pydict()
+)
+# {'price': [10, 15, 30], 'change': [None, 5, 15],
+#  'growth': [None, 0.5, 1.0], 'rnk': [1, 2, 3]}
+```
+
+`col("x").is_duplicated()` and `col("x").is_unique()` are the same idea — a
+`count(1) OVER (PARTITION BY x)` compared against 1 — and are most useful inside
+`filter`.
+
 ## Next steps
 
 - [Aggregations](aggregations.md): collapse groups into summary rows.

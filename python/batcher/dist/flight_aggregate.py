@@ -29,6 +29,7 @@ from batcher.dist.executor import (
 from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
+    map_barrier,
     release_placement,
     shuffle_partitions,
 )
@@ -80,14 +81,16 @@ def execute_aggregate_flight(
     _fault_inject: set[int] | None = None,
     *,
     materialize: bool = True,
+    _fault_inject_map: set[int] | None = None,
 ):
     """Distributed aggregation over a Flight shuffle, resilient to worker loss.
 
     A lost worker's shuffle output is recomputed from its source partition (still on
-    disk) on a surviving worker and the reducers retry — Spark-style lineage
-    recovery, coordinated by Carbonite's `ShuffleRecovery`. `_fault_inject` is a
-    test-only hook: the worker ids to kill after the map barrier to exercise the
-    recovery path.
+    disk) on a surviving worker and the reducers retry — Spark-style lineage recovery.
+    Worker loss is survived in *both* phases: `map_barrier` relocates a source whose
+    worker dies while mapping, `ShuffleRecovery` one whose worker dies before the reduce
+    fetches it. `_fault_inject` / `_fault_inject_map` are test-only hooks: the worker ids
+    to kill after / before the map barrier.
 
     `materialize=False` (with no post-aggregate operators, on the flat-reduce path)
     keeps the result on the worker actors and returns a `FlightMaterializedSource`:
@@ -119,7 +122,7 @@ def execute_aggregate_flight(
     # Borrow the query-lifetime fleet if the adaptive loop installed one (pins the
     # worker count to the fleet's, so every stage shuffles over the same actors);
     # otherwise spawn one we tear down. `owns` gates teardown.
-    actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
+    actors, pg, _addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_reducers = 1 if n_keys == 0 else aggregate_reducer_count(agg, shuffle_partitions(workers))
 
     keep_actors = False  # set when a FlightMaterializedSource takes ownership of them
@@ -136,12 +139,21 @@ def execute_aggregate_flight(
             sources[sid], workers, projection=projection, predicate=predicate
         )
 
-        # MAP barrier: every mapper publishes ALL its buckets on its own Flight server.
-        ray.get(
-            [
-                actors[i].map_publish.remote(map_ir, gk, aj, partitions[i], n_keys, n_reducers)
-                for i in range(workers)
-            ]
+        if _fault_inject_map:  # test hook: kill before the barrier, so nothing publishes
+            for i in _fault_inject_map:
+                ray.kill(actors[i])
+
+        # MAP barrier: every mapper publishes ALL its buckets on its own Flight server,
+        # under worker-loss recovery. A spot preemption *here* — the map phase reads the
+        # source from object storage and is usually the longest part of the query — would
+        # fail the whole query on a bare `ray.get`; instead the lost worker's source is
+        # republished on a survivor under the same `src`, so the reducers' tickets still
+        # resolve, and `dead` keeps the reduce off a worker that is gone.
+        addrs, dead = map_barrier(
+            workers,
+            lambda host, src: actors[host].map_publish.remote(
+                map_ir, gk, aj, partitions[src], n_keys, n_reducers, src, 0
+            ),
         )
 
         # Simulate worker loss after the map barrier (test hook): the killed workers'
@@ -157,50 +169,31 @@ def execute_aggregate_flight(
         # Locality-aware reducer placement (opt-in): host each reducer where its bucket
         # concentrates, so its fetches become same-node hits. None ⇒ default round-robin.
         reducer_hosts = _locality_reducer_hosts(actors, n_reducers, workers)
+        reduce_args = (actors, addrs, partitions, map_ir, gk, aj, n_keys, n_reducers, workers)
         if workers > fan_in:
             batches = _tree_reduce_with_recovery(
-                actors, list(addrs), partitions, map_ir, gk, aj, n_keys, n_reducers, fan_in, workers
+                actors, addrs, partitions, map_ir, gk, aj, n_keys, n_reducers, fan_in, workers, dead
             )
-        elif materialize is False and not above:
-            # Keep the result on the actors: each reducer publishes its bucket and the
-            # driver gets only handles. The actors stay alive (the source owns them).
-            from batcher.dist.fleet import FlightMaterializedSource
-
-            handles = _reduce_with_recovery(
-                actors,
-                list(addrs),
-                partitions,
-                map_ir,
-                gk,
-                aj,
-                n_keys,
-                n_reducers,
-                workers,
-                materialize=True,
-                reducer_hosts=reducer_hosts,
-            )
-            schema = handles[0][3] if handles else _empty_agg_table(agg).schema
-            src_handles = [(a, t, n) for a, t, n, _s in handles]
-            keep_actors = True
-            # A borrowed fleet outlives this stage and is freed once by the adaptive
-            # loop, so the source must NOT own the actors/pg (its `cleanup()` no-ops);
-            # only a self-spawned fleet is handed to the source to tear down.
-            src_actors = actors if owns else None
-            src_pg = pg if owns else None
-            return FlightMaterializedSource(src_handles, schema, src_actors, src_pg)
         else:
-            batches = _reduce_with_recovery(
-                actors,
-                list(addrs),
-                partitions,
-                map_ir,
-                gk,
-                aj,
-                n_keys,
-                n_reducers,
-                workers,
-                reducer_hosts=reducer_hosts,
+            # `on_actors`: keep the result on the workers — each reducer publishes its
+            # bucket and the driver gets only handles, so the next adaptive stage reads
+            # the intermediate in place. Otherwise the reducers return their batches.
+            on_actors = materialize is False and not above
+            out = _reduce_with_recovery(
+                *reduce_args, materialize=on_actors, reducer_hosts=reducer_hosts, dead=dead
             )
+            if on_actors:
+                from batcher.dist.fleet import FlightMaterializedSource
+
+                schema = out[0][3] if out else _empty_agg_table(agg).schema
+                keep_actors = True  # the source owns them now
+                # A borrowed fleet outlives this stage and is freed once by the adaptive
+                # loop, so the source must NOT own the actors/pg (its `cleanup()` no-ops);
+                # only a self-spawned fleet is handed to the source to tear down.
+                src_actors, src_pg = (actors, pg) if owns else (None, None)
+                handles = [(a, t, n) for a, t, n, _s in out]
+                return FlightMaterializedSource(handles, schema, src_actors, src_pg)
+            batches = out
     finally:
         # Only tear down a fleet we spawned; a borrowed one is the query's, freed once
         # by the adaptive loop. `keep_actors` further defers a self-spawned fleet to
@@ -264,6 +257,7 @@ def _reduce_with_recovery(
     *,
     materialize=False,
     reducer_hosts=None,
+    dead=None,
 ):
     """Run the reduce stage under Carbonite recompute-on-worker-loss recovery.
 
@@ -271,7 +265,8 @@ def _reduce_with_recovery(
     mapper (or whose host actor has died) drives a recompute of the lost source
     partition on a surviving worker, then a retry. Returns the finalized batches, or —
     when `materialize` — the `(addr, ticket, rows, schema)` handles of each reducer's
-    bucket left published on its host actor's Flight server.
+    bucket left published on its host actor's Flight server. `dead` seeds the workers the
+    map barrier already lost, so no reducer is scheduled onto an actor that is gone.
     """
     import ray
 
@@ -283,7 +278,7 @@ def _reduce_with_recovery(
         speculation_policy,
     )
 
-    dead: set[int] = set()
+    dead: set[int] = set(dead or ())
     # Per-source lineage: a recompute `reincarnate()`s the source to the next epoch,
     # so the regenerated partition is published *and* fetched under a fresh ticket and
     # a zombie worker's stale partial can never be read. Epoch 0 (no recompute) keeps
@@ -443,21 +438,22 @@ def _tree_reduce(actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead=N
 
 
 def _tree_reduce_with_recovery(
-    actors, leaf_addrs, partitions, map_ir, gk, aj, n_keys, n_reducers, fan_in, workers
+    actors, leaf_addrs, partitions, map_ir, gk, aj, n_keys, n_reducers, fan_in, workers, dead=None
 ):
     """Run the tree reduce under Carbonite recompute-on-worker-loss recovery.
 
     A lost worker takes its leaf partial (and any interior partials it held) with
     it. Recovery regenerates the lost leaf partition from its source (still on disk)
     onto a surviving worker and restarts the tree, which rebuilds every interior
-    partial fresh — so a single bounded-fan-in mechanism is also fault-tolerant.
+    partial fresh — so a single bounded-fan-in mechanism is also fault-tolerant. `dead`
+    seeds the workers the map barrier already lost, so the tree never assigns them work.
     """
     import ray
 
     from batcher.carbonite.resilience import ShuffleRecovery
     from batcher.dist.executors.ray_runtime import recovery_policy
 
-    dead: set[int] = set()
+    dead: set[int] = set(dead or ())
 
     def _detect_dead():
         # Ping every live actor *concurrently* (one ray.get over all refs), not one

@@ -6,8 +6,98 @@ it is distributed and spillable for free); `transform` is a lazy column rewrite.
 on the training set, then `transform` the training **and** validation sets with the
 same learned state.
 
-Compose several preprocessors by sequencing them: fit each on the previous step's
-output, then transform any split through the same fitted objects.
+Every preprocessor is importable from `batcher.ml` as well as
+`batcher.ml.preprocessors`.
+
+## Splitting first
+
+`fit` must see the training rows only — fitting on the whole frame leaks held-out
+statistics into the features. `ds.ml.train_test_split` gives disjoint parts that
+together cover every row, assigned by a reproducible hash of each row's own content.
+Each part is a plain row-wise filter, so the split streams, distributes, and is
+*partition-independent*: a row lands in the same part however the data is laid out.
+
+```python
+import batcher as bt
+
+ds = bt.range(0, 1000)
+train, test = ds.ml.train_test_split(0.2, seed=42)
+print(train.count() + test.count())
+# 1000
+```
+
+`ds.ml.random_split([0.7, 0.15, 0.15], seed=42)` generalizes it to a
+train/validation/test split.
+
+Pass `key=` to hash only the columns that identify a row:
+
+```python
+train, test = ds.ml.train_test_split(0.2, seed=42, key="id")
+```
+
+Then re-deriving a feature column does not move rows between train and test. Without
+`key=` every column is hashed, which is correct but re-splits whenever any value changes.
+
+## Fuzzy deduplication
+
+Exact deduplication is `distinct()`. On a web-scale training corpus it barely helps: the
+duplicates are the same article behind a different header, or the same page with a
+changed timestamp. Removing *those* is the highest-leverage preprocessing step for an LLM
+pretraining set.
+
+`ds.ml.near_duplicates` finds the pairs; `ds.ml.drop_near_duplicates` removes them,
+keeping one representative per cluster.
+
+```python
+import batcher as bt
+
+docs = bt.from_pydict({"text": [
+    "the quick brown fox jumps over the lazy dog",
+    "the quick brown fox jumps over the lazy dog!",   # near-duplicate
+    "a treatise on the migratory habits of geese",
+]})
+print(docs.ml.drop_near_duplicates("text", threshold=0.7).count())
+# 2
+print(docs.distinct().count())   # exact dedup keeps all three
+# 3
+```
+
+Under the hood: `str.minhash` reduces each document to a fixed-length signature whose
+positional agreement rate (`list.jaccard`) estimates the documents' Jaccard similarity,
+and LSH banding turns the similarity join into an equi-join on a band hash. Every
+returned pair is then **verified** against the threshold, so banding only costs recall,
+never precision. `bands` is the dial: more bands, more candidates, more recall, more work.
+
+Both are ordinary relational plans — a projection, an `explode`, and joins — so they run
+wherever a join runs.
+
+## Chaining steps
+
+`Chain` is the sklearn `Pipeline` equivalent: it fits each step on the **previous
+step's output** and replays the fitted steps, in order, over any split. Doing this by
+hand means fitting step *i* on data that steps *0..i-1* have already transformed — easy
+to get subtly wrong, and a mistake that leaks held-out statistics into training features
+without ever failing.
+
+```python
+import batcher as bt
+from batcher.ml import Chain, SimpleImputer, StandardScaler
+
+ds = bt.from_pydict({"age": [10.0, 20.0, None, 40.0, 30.0, 50.0]})
+train, test = ds.ml.train_test_split(0.3, seed=0)
+
+chain = Chain(SimpleImputer(["age"]), StandardScaler(["age"])).fit(train)
+train_x, test_x = chain.transform(train), chain.transform(test)
+print(chain)
+# Chain(SimpleImputer, StandardScaler)
+```
+
+`fit` on the training split only; `transform` both. A `Chain` is itself a
+`Preprocessor`, so it nests. Its steps stay introspectable (`chain[0]`, `len(chain)`)
+to read a fitted step's learned state.
+
+Or compose several preprocessors by sequencing them by hand: fit each on the previous
+step's output, then transform any split through the same fitted objects.
 
 ```python
 from batcher.ml.preprocessors import StandardScaler, SimpleImputer

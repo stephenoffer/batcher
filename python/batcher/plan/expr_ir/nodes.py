@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr, IntoExpr, _wrap
 from batcher.plan.expr_ir.node_base import IRNode, child, children, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
@@ -23,6 +24,21 @@ class Col(IRNode):
 
     tag = ExprTag.COL
     name: str = scalar()
+
+
+@expr_node
+class HashRows(IRNode):
+    """A deterministic 64-bit hash of the row's values across `inputs` → Int64.
+
+    Typed rather than textual (an integer hashes its bits, a float its canonicalized
+    IEEE bits, a string its UTF-8), order-sensitive, and stable across partitions,
+    runs, machines and versions — the properties a reproducible split, a surrogate key,
+    and hash bucketing all rest on.
+    """
+
+    tag = ExprTag.HASH
+    inputs: list[Expr] = children()
+    seed: int = scalar(omit_falsy=True, default=0)
 
 
 @expr_node
@@ -141,18 +157,24 @@ class ListJoin(IRNode):
     separator: str = scalar()
 
 
-class WindowExpr:
+class WindowExpr(Expr):
     """A window-function column built via ``agg.over(...)`` (e.g.
     ``col("x").sum().over(partition_by=["g"])``) or a value-function constructor
     (``lag(col("x"), 2).over(order_by=["t"])``).
 
-    This is *not* an `Expr` — it is a control-plane builder consumed by
-    `Dataset.with_columns`, which lowers it to the relational `Window` operator
-    (SQL ``<fn> OVER (PARTITION BY … ORDER BY …)``). `func` is the engine window-fn
-    tag (aggregates ``sum``/``avg``/``min``/``max``/``count``; value functions
-    ``lag``/``lead``/``first_value``/``last_value``); `input` is the argument
-    expression; `offset` is the lag/lead distance; `frame` is an optional
-    ``(start, end)`` ROWS frame (aggregates only).
+    It subclasses `Expr` so a window may be *composed* like any other scalar —
+    ``col("x") - col("x").shift(1)``, ``col("x") / col("x").sum().over()`` — but it
+    has no scalar IR of its own: `to_ir` always raises. Instead the relational
+    layer hoists each `WindowExpr` out of the surrounding expression into a
+    `Window` operator (SQL ``<fn> OVER (PARTITION BY … ORDER BY …)``) and leaves a
+    `Col` reference behind (`plan.expr_rewrite.hoist_windows`). A `WindowExpr` that
+    reaches `to_ir` therefore sat somewhere the hoist does not run — `group_by().agg()`,
+    a join key — which SQL also forbids, and the raised `PlanError` says so.
+
+    `func` is the engine window-fn tag (aggregates ``sum``/``avg``/``min``/``max``/
+    ``count``; value functions ``lag``/``lead``/``first_value``/``last_value``);
+    `input` is the argument expression; `offset` is the lag/lead distance; `frame` is
+    an optional ``(start, end)`` ROWS frame (aggregates only).
     """
 
     __slots__ = ("frame", "func", "input", "offset", "order_by", "partition_by")
@@ -172,6 +194,21 @@ class WindowExpr:
         self.order_by = order_by
         self.frame = frame
         self.offset = offset
+
+    def to_ir(self) -> dict[str, Any]:
+        """Always raises: a window has no scalar IR — it must be hoisted to a `Window` node."""
+        raise PlanError(
+            f"window function {self.func!r} is not allowed here; window expressions "
+            "(.over(...), shift(), diff(), cum_sum(), rank(), ...) are only valid in "
+            "select(), with_columns() and filter(). Compute the window in a "
+            "with_columns() step first, then reference the resulting column."
+        )
+
+    def with_input(self, input: Expr | None) -> WindowExpr:
+        """A copy of this window function over a different argument expression."""
+        return WindowExpr(
+            self.func, input, self.partition_by, self.order_by, self.frame, self.offset
+        )
 
     def over(
         self,

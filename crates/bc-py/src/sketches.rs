@@ -64,7 +64,11 @@ fn temporal_cols_as_i64(
                 let c = b.column(i);
                 if targets.contains(f.name().as_str()) && is_temporal_key(c.data_type()) {
                     if let Some(i64c) = temporal_to_i64(c) {
-                        fields.push(Arc::new(Field::new(f.name(), DataType::Int64, f.is_nullable())));
+                        fields.push(Arc::new(Field::new(
+                            f.name(),
+                            DataType::Int64,
+                            f.is_nullable(),
+                        )));
                         cols.push(i64c);
                         changed = true;
                         continue;
@@ -104,6 +108,57 @@ pub(crate) fn estimate_distinct(
         }
     }
     Ok(sketch.map_or(0.0, |s| s.distinct_estimate()))
+}
+
+/// Per-column distinct-count estimates (HLL only), computed in parallel across batches.
+///
+/// The distinct-count-only counterpart to `column_stats`. Kyber needs a column's `ndv`
+/// to order joins (`|L||R| / max(ndv_L, ndv_R)`) and to size a `GROUP BY` (the product
+/// of its key `ndv`s); without one the estimator falls back to `max(|L|, |R|)` and
+/// `0.1 · rows`, which is what steers a plan into multi-gigabyte intermediates. Cold —
+/// before any run has been measured — nothing else supplies `ndv`: a Parquet footer
+/// carries row counts, null counts, and min/max, but no distinct count.
+///
+/// `column_stats` cannot serve that need cheaply because it also builds a KLL quantile
+/// sketch per column (~50 ns/row, ~7x the HLL's cost). Dropping the KLL and merging the
+/// per-batch HLLs with rayon makes seeding a source's `ndv` cheap enough to do on the
+/// query path. The sketch is `Mergeable` — `merge` is associative and commutative — so
+/// the parallel fold returns exactly what a sequential build would.
+///
+/// The GIL is released for the duration: once the Arrow arrays are in hand no Python
+/// object is touched.
+#[pyfunction]
+pub(crate) fn column_ndv(
+    py: Python<'_>,
+    columns: Vec<String>,
+    batches: Vec<PyArrowType<RecordBatch>>,
+) -> PyResult<std::collections::HashMap<String, f64>> {
+    use rayon::prelude::*;
+
+    Ok(py.allow_threads(move || {
+        let sketches: Vec<Option<bc_sketches::HyperLogLog>> = columns
+            .par_iter()
+            .map(|name| {
+                batches
+                    .par_iter()
+                    .filter_map(|b| b.0.column_by_name(name))
+                    .map(|col| {
+                        let mut hll = bc_sketches::HyperLogLog::default_precision();
+                        hll.add_array(col);
+                        hll
+                    })
+                    .reduce_with(|mut a, b| {
+                        a.merge(&b);
+                        a
+                    })
+            })
+            .collect();
+        columns
+            .into_iter()
+            .zip(sketches)
+            .filter_map(|(name, hll)| hll.map(|h| (name, h.estimate())))
+            .collect()
+    }))
 }
 
 /// Per-column statistics for the optimizer (the W2 metadata FFI seam): for each

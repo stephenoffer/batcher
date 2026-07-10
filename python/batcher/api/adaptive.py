@@ -459,8 +459,16 @@ def _estimate_rows(node: LogicalPlan, sources: list[Source], hub) -> int:
 
 
 def _estimate_accurate(actual: int, estimate: int, reopt_error: float) -> bool:
-    """Whether `actual` is within `reopt_error` relative error of a positive `estimate`."""
-    return estimate > 0 and abs(actual - estimate) / estimate <= reopt_error
+    """Whether `actual` and `estimate` agree within a factor of `1 + reopt_error`.
+
+    The **symmetric q-error**, not a relative error normalized by the estimate: the latter is
+    bounded by 1 for any over-estimate, so it called every over-estimate accurate — and an
+    over-estimate is exactly what this loop exists to catch. Error is multiplicative, so the
+    band is too. A positive estimate that produced nothing is a total miss.
+    """
+    if estimate <= 0 or actual <= 0:
+        return False
+    return max(actual / estimate, estimate / actual) <= 1.0 + reopt_error
 
 
 def _children(node: LogicalPlan) -> list[LogicalPlan]:

@@ -12,6 +12,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from batcher.api.dataset._build import build_random_split, build_train_test_split
+from batcher.api.dataset._dedup import build_drop_near_duplicates, build_near_duplicates
 from batcher.plan.logical import MapBatches
 
 if TYPE_CHECKING:
@@ -35,6 +37,13 @@ def _validate_concurrency(concurrency: int | tuple[int, int] | None) -> None:
         raise PlanError(
             f"concurrency must be a positive int or (min, max) tuple, got {concurrency}"
         )
+
+
+def _as_key_columns(key: str | list[str] | None) -> list[str] | None:
+    """Normalize a split key: a single column name, several, or `None` (hash every column)."""
+    if key is None:
+        return None
+    return [key] if isinstance(key, str) else list(key)
 
 
 def _warn_if_model_reloads(fn: object, num_gpus: float) -> None:
@@ -328,6 +337,180 @@ class DatasetML:
             model_memory_gb=model_memory_gb,
         )
 
+    def train_test_split(
+        self, test_size: float = 0.25, *, seed: int = 0, key: str | list[str] | None = None
+    ) -> tuple[Dataset, Dataset]:
+        """Split the rows into a disjoint train and test `Dataset`.
+
+        Each row is assigned by a reproducible hash of its **own values** and `seed`, so
+        the parts are disjoint, together cover every row, and are identical however the
+        data is partitioned — single-node, multi-core, distributed, or streaming. Each
+        part is a plain row-wise filter, so nothing is materialized, nothing is shuffled,
+        and both parts stay lazy until a terminal op. Sizes are binomial around
+        ``test_size * n`` rather than exact, as with any hash-keyed split.
+
+        Args:
+            test_size: The fraction of rows to place in the test part, in ``(0, 1)``.
+            seed: Seed for the row assignment; the same seed reproduces the split.
+            key: The column(s) identifying a row. Prefer it on a real corpus: hashing
+                only these keeps the split stable when the *other* columns change
+                (recompute a feature and the same rows stay in train), costs one hash
+                per key column instead of one per column, and does not depend on how
+                floats render as text. The default hashes every column — correct and
+                reproducible, but re-splits whenever any value or the schema changes.
+
+        Returns:
+            The ``(train, test)`` pair.
+
+        Raises:
+            PlanError: If `test_size` is not strictly between 0 and 1, or `key` names a
+                column the dataset does not have.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.range(0, 1000)
+                >>> train, test = ds.ml.train_test_split(0.2, seed=42, key="value")
+                >>> train.count() + test.count()
+                1000
+        """
+        return build_train_test_split(self._ds, test_size, seed=seed, key=_as_key_columns(key))
+
+    def random_split(
+        self, fractions: list[float], *, seed: int = 0, key: str | list[str] | None = None
+    ) -> list[Dataset]:
+        """Split the rows into disjoint random parts sized by `fractions`.
+
+        The generalization of :meth:`train_test_split` to a train/validation/test
+        three-way (or n-way) split, with the same content-hash assignment.
+
+        Args:
+            fractions: The share of rows per part; must be positive and sum to 1.0.
+            seed: Seed for the row assignment; the same seed reproduces the split.
+            key: The column(s) identifying a row — see :meth:`train_test_split`.
+
+        Returns:
+            One `Dataset` per entry in `fractions`, in order.
+
+        Raises:
+            PlanError: If `fractions` is empty, holds a non-positive value, does not
+                sum to 1.0, or `key` names a column the dataset does not have.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.range(0, 1000)
+                >>> train, val, test = ds.ml.random_split([0.7, 0.15, 0.15], seed=42)
+                >>> train.count() + val.count() + test.count()
+                1000
+        """
+        return build_random_split(self._ds, fractions, seed=seed, key=_as_key_columns(key))
+
+    def near_duplicates(
+        self,
+        column: str,
+        *,
+        threshold: float = 0.8,
+        num_perm: int = 128,
+        ngram: int = 5,
+        bands: int = 16,
+        key: str | None = None,
+    ) -> Dataset:
+        """Find near-duplicate document pairs by MinHash + LSH — the fuzzy-dedup join.
+
+        Returns the pairs whose estimated Jaccard similarity over character
+        `ngram`-shingles is at least `threshold`, as ``(key_a, key_b, jaccard)`` with
+        ``key_a < key_b``. Exact duplication is `distinct()`; this finds the same
+        article behind a different header, which is what actually dominates a crawl.
+
+        Candidate pairs come from LSH banding and are then **verified** against
+        `threshold` by their signature agreement, so every returned pair clears it.
+        Recall is not total: a similar pair can miss every band. `bands` is the dial —
+        more bands mean more candidates (higher recall, more work), and the S-curve's
+        knee sits near ``(1 / bands) ** (bands / num_perm)``.
+
+        Args:
+            column: The text column to compare.
+            threshold: Minimum estimated Jaccard similarity, in ``(0, 1]``.
+            num_perm: MinHash permutations. Standard error is ``1 / sqrt(num_perm)``.
+            ngram: Shingle width in characters; larger is stricter.
+            bands: LSH bands; must divide `num_perm`.
+            key: The column identifying a row. Defaults to a hash of `column`, so
+                byte-identical documents collapse to one key before any comparison.
+
+        Returns:
+            A lazy `Dataset` of ``key_a``, ``key_b``, ``jaccard``.
+
+        Raises:
+            PlanError: On an unknown column, a `threshold` outside ``(0, 1]``, or
+                `bands` that does not divide `num_perm`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": ["a b c d e f g", "a b c d e f g!", "zzz"]})
+                >>> ds.ml.near_duplicates("t", threshold=0.5).count()
+                1
+        """
+        return build_near_duplicates(
+            self._ds,
+            column,
+            threshold=threshold,
+            num_perm=num_perm,
+            ngram=ngram,
+            bands=bands,
+            key=key,
+        )
+
+    def drop_near_duplicates(
+        self,
+        column: str,
+        *,
+        threshold: float = 0.8,
+        num_perm: int = 128,
+        ngram: int = 5,
+        bands: int = 16,
+        key: str | None = None,
+    ) -> Dataset:
+        """Remove near-duplicate rows, keeping one representative — the dedup pass.
+
+        Drops every row that has a near-duplicate (see :meth:`near_duplicates`) with a
+        smaller key. The survivors are the rows minimal among their near-duplicates: for
+        a duplicate cluster where every member matches every other — the usual shape —
+        that is exactly one row.
+
+        Args:
+            column: The text column to compare.
+            threshold: Minimum estimated Jaccard similarity to count as a duplicate.
+            num_perm: MinHash permutations.
+            ngram: Shingle width in characters.
+            bands: LSH bands; must divide `num_perm`.
+            key: The column identifying a row; defaults to a hash of `column`.
+
+        Returns:
+            A lazy `Dataset` with the near-duplicates removed and the input schema kept.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": ["a b c d e f g", "a b c d e f g!", "zzz"]})
+                >>> sorted(ds.ml.drop_near_duplicates("t", threshold=0.5).to_pydict()["t"])
+                ['a b c d e f g', 'zzz']
+        """
+        return build_drop_near_duplicates(
+            self._ds,
+            column,
+            threshold=threshold,
+            num_perm=num_perm,
+            ngram=ngram,
+            bands=bands,
+            key=key,
+        )
+
     def stream_loader(
         self,
         *,
@@ -426,6 +609,92 @@ class DatasetML:
             zero_copy=zero_copy,
             local_shuffle_buffer_size=local_shuffle_buffer_size,
             seed=seed,
+        )
+
+    def generate(
+        self,
+        engine: Callable,
+        *,
+        prompt_column: str,
+        output_column: str = "response",
+        template: str | None = None,
+        image_column: str | None = None,
+        adapter_column: str | None = None,
+        parse_json: bool = False,
+        usage: bool = False,
+        batch_size: int | None = None,
+        num_gpus: float = 0.0,
+        concurrency: int | tuple[int, int] | None = None,
+        accelerator_type: str | None = None,
+        model_memory_gb: float = 0.0,
+    ) -> Dataset:
+        """Run offline LLM text generation over the dataset, appending `output_column`.
+
+        `engine` is an `EngineFactory` — a zero-arg callable returning a
+        ``list[str] -> list[str]`` engine — so the model loads **once per worker** and
+        the row work stays columnar. Use `batcher.ml.vllm_engine` for local GPU
+        inference (structured JSON output, multi-LoRA, vision) or
+        `batcher.ml.http_engine` for an OpenAI-compatible endpoint. Any callable of the
+        same shape works, which is what makes this testable without a GPU.
+
+        No outer batch size is imposed by default: vLLM does its own continuous
+        batching, and a fixed outer batch would fight its scheduler. `num_gpus`,
+        `concurrency`, `accelerator_type` and `model_memory_gb` place and size the
+        engine on GPU actors exactly as `infer`/`embed` do.
+
+        Args:
+            engine: The `EngineFactory` to build once per worker.
+            prompt_column: The text column to send (ignored when `template` is set).
+            output_column: Name of the appended generated column.
+            template: A ``str.format`` template over the row's columns, e.g.
+                ``"Summarize: {body}"``. Overrides `prompt_column` for prompt building.
+            image_column: An image column (raw bytes or an ``(H, W, 3)`` tensor) for
+                vision-language models.
+            adapter_column: A column naming the per-row LoRA adapter; pair with
+                ``vllm_engine(lora_paths=...)``.
+            parse_json: Parse each output as JSON into a struct column (null on a parse
+                error). Pair with ``vllm_engine(guided_json=...)`` for reliable output.
+            usage: Also append ``prompt_tokens`` / ``completion_tokens`` columns.
+            batch_size: Rebatch before each engine call; leave unset for the engine's own.
+            num_gpus: GPUs to reserve per worker.
+            concurrency: Size of the distributed actor pool.
+            accelerator_type: Pin GPU actors to a model (e.g. ``"NVIDIA_A100"``).
+            model_memory_gb: The model's footprint, for memory budgeting.
+
+        Returns:
+            A new `Dataset` with the generated column(s) appended.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"q": ["2+2?", "capital of France?"]})
+                >>> shout = lambda: (lambda prompts: [p.upper() for p in prompts])
+                >>> ds.ml.generate(shout, prompt_column="q").to_pydict()
+                {'q': ['2+2?', 'capital of France?'], 'response': ['2+2?', 'CAPITAL OF FRANCE?']}
+        """
+        from batcher.ml.llm import llm_udf
+
+        udf = llm_udf(
+            engine,
+            prompt_column=prompt_column,
+            output_column=output_column,
+            template=template,
+            image_column=image_column,
+            adapter_column=adapter_column,
+            parse_json=parse_json,
+            usage=usage,
+        )
+        appended = [output_column, *(["prompt_tokens", "completion_tokens"] if usage else [])]
+        new = [c for c in appended if c not in self._ds.columns]
+        return self.map_batches(
+            udf,
+            output_columns=[*self._ds.columns, *new] if new else None,
+            batch_size=batch_size,
+            num_gpus=num_gpus,
+            concurrency=concurrency,
+            accelerator_type=accelerator_type,
+            model_memory_gb=model_memory_gb,
         )
 
     def embed(

@@ -84,6 +84,10 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    concat
    concat_ws
    format_string
+   mask
+   hmac_sha256
+   aes_encrypt
+   aes_decrypt
    current_date
    current_timestamp
    date_add
@@ -151,6 +155,25 @@ Use these in `group_by(...).agg(...)` or `.over(...)` window frames.
    :members:
    :member-order: groupwise
 ```
+
+## Governance
+
+See the [governance guide](../user-guide/governance.md) for how these fit together.
+
+```{eval-rst}
+.. autoclass:: batcher.SecurityCatalog
+   :members:
+
+.. autoclass:: batcher.Principal
+   :members:
+
+.. autoclass:: batcher.GovernanceEvent
+   :members:
+
+.. autofunction:: batcher.security
+```
+
+Column-level lineage is reached from the dataset itself: :meth:`batcher.Dataset.lineage`.
 
 ## Expressions
 

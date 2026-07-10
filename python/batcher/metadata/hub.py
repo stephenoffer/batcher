@@ -28,6 +28,12 @@ _log = get_logger("metadata")
 _OP_STATS = "op_stats"
 _LEARNED_PARAMS = "learned_params"
 
+# Cap on the in-memory view of signature-carrying feedback. The consumer averages the
+# last handful of observations per signature, so this is orders of magnitude more than it
+# reads; it exists only to bound a long-lived session's memory. Nothing is lost — the
+# backend still holds the full history.
+_SIGNED_HISTORY_MAX = 4096
+
 
 class MetadataHub:
     """Reads learned state and absorbs execution feedback."""
@@ -47,6 +53,13 @@ class MetadataHub:
         self._generation = 0
         self._keyed_cache: dict[str, tuple[int, dict[str, Any]]] = {}
         self._op_stats_cache: tuple[int, dict[str, list[dict[str, Any]]]] | None = None
+        # Chronological, bounded, in-memory view of the signature-carrying feedback rows.
+        # Kyber's cardinality correction reads it on *every* optimize, and a re-scan of
+        # the whole persisted history there would make planning cost grow with the
+        # session's cumulative query count (the O(queries²) trap the caches above exist to
+        # avoid). Loaded once from the backend on first read, then maintained
+        # incrementally by `record`, so a steady-state read is O(1).
+        self._signed: list[dict[str, Any]] | None = None
 
     def _bump(self) -> None:
         """Invalidate the parsed-read cache after a write."""
@@ -58,9 +71,13 @@ class MetadataHub:
         try:
             self._seq += 1
             key = (int(feedback.op_id), self._seq)
-            payload = json.dumps(dataclasses.asdict(feedback)).encode()
-            self._backend.put(_OP_STATS, key, payload)
+            row = dataclasses.asdict(feedback)
+            self._backend.put(_OP_STATS, key, json.dumps(row).encode())
             self._bump()
+            if self._signed is not None and row.get("signature"):
+                self._signed.append(row)  # keep the hot view current without a re-scan
+                if len(self._signed) > _SIGNED_HISTORY_MAX:
+                    del self._signed[:-_SIGNED_HISTORY_MAX]
         except Exception:  # pragma: no cover - feedback must not break execution
             _log.warning("dropped operator feedback", exc_info=True)
 
@@ -97,6 +114,48 @@ class MetadataHub:
             _log.warning("could not scan op_stats", exc_info=True)
         self._op_stats_cache = (self._generation, buckets)
         return buckets
+
+    def op_stats_with_signature(self) -> list[dict[str, Any]]:
+        """Signature-carrying operator feedback, **oldest first**.
+
+        The shape Kyber's cardinality-correction loop consumes: the q-error
+        (`n_actual / n_estimated`) is only meaningful when attributed to a *stable*
+        operator identity across executions, which `op_id` is not. Rows without a
+        signature are excluded — notably those a distributed worker reports for its
+        sub-plan, whose `op_id`s live in their own space.
+
+        Ordered by the hub's monotonic record sequence, **not** by the storage key
+        `(op_id, seq)`: the same operator shape can appear at different positions in
+        different plans, so an `op_id`-major order is not chronological. The consumer
+        weights recent observations more heavily, so this ordering is load-bearing.
+
+        Read on every optimize, so it must not cost the whole history: the backend is
+        scanned exactly once, and `record` keeps the view current thereafter. The view is
+        capped at the newest `_SIGNED_HISTORY_MAX` rows, far above the handful of recent
+        observations per signature the consumer averages — the persisted store keeps
+        everything regardless.
+
+        Best-effort; a malformed row is skipped, not raised.
+        """
+        if self._signed is None:
+            self._signed = self._load_signed()
+        return self._signed
+
+    def _load_signed(self) -> list[dict[str, Any]]:
+        """One-time chronological load of the signature-carrying rows from the backend."""
+        ordered: list[tuple[int, dict[str, Any]]] = []
+        try:
+            for key, value in self._backend.scan(_OP_STATS, ()):
+                row = json.loads(value)
+                if not row.get("signature"):
+                    continue
+                seq = int(key[1]) if len(key) > 1 else 0
+                ordered.append((seq, row))
+        except Exception:  # pragma: no cover - learning must not break planning
+            _log.warning("could not scan op_stats", exc_info=True)
+            return []
+        ordered.sort(key=lambda pair: pair[0])
+        return [row for _seq, row in ordered[-_SIGNED_HISTORY_MAX:]]
 
     # --- learned parameters ------------------------------------------------
     def load_params(self, namespace: str) -> dict[str, Any]:

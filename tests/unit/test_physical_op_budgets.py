@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import batcher as bt
 from batcher.kyber.cardinality import CardinalityEstimator
+from batcher.kyber.cost import CostModel
 from batcher.kyber.optimizer import _annotate_ops
 from batcher.plan.ids import OpId
 from batcher.plan.physical import PhysicalOp, PhysicalPlan
@@ -53,7 +54,7 @@ def test_op_budget_ids_are_preorder_and_align_with_annotation():
     cfg = active_config()
     ds = bt.from_pydict({"k": [1, 2, 1], "v": [3, 4, 5]}).group_by("k").agg(s=bt.col("v").sum())
     est = CardinalityEstimator([])
-    ops = _annotate_ops(ds._plan, est, cfg)
+    ops = _annotate_ops(ds._plan, est, cfg, CostModel(est))
     ids = [int(op.op_id) for op in ops]
     assert ids == list(range(len(ops)))  # contiguous pre-order
 

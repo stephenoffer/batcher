@@ -12,7 +12,10 @@
 
 use std::collections::HashSet;
 
-use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, StringArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, GenericStringArray, LargeStringArray, OffsetSizeTrait,
+    RecordBatch, StringArray, UInt32Array,
+};
 use arrow::compute::{cast, take};
 use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
@@ -344,6 +347,82 @@ pub fn range_partition_by_i64_key(
         })
         .collect();
 
+    scatter_into_buckets(batch, &part_of, n_buckets)
+}
+
+/// Like [`range_partition_by_i64_key`], but for a **string** leading key compared
+/// **lexicographically by bytes** — exactly the ordering arrow's `sort_to_indices`
+/// gives a `Utf8`/`LargeUtf8` column, so the per-range sorts concatenate into the
+/// same relation a single global string sort produces. Boundaries are ascending
+/// string quantiles sampled from the key.
+///
+/// Without this, a string `ORDER BY` had no range partitioner, so the single-node
+/// sample-sort refused it and a whole-column string sort ran single-threaded — the
+/// one sort shape that never used more than one core.
+pub fn range_partition_by_str_key(
+    batch: &RecordBatch,
+    key_col: &ArrayRef,
+    boundaries: &[String],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<RecordBatch>, RuntimeError> {
+    assert!(n_buckets >= 1);
+    if n_buckets == 1 {
+        return Ok(vec![batch.clone()]);
+    }
+    let front = if descending { n_buckets - 1 } else { 0 };
+    let null_bucket = if nulls_first {
+        front
+    } else {
+        n_buckets - 1 - front
+    } as u32;
+
+    // `partition_point(|b| b <= v)` routes a value equal to a boundary consistently to
+    // the higher bucket, so equal keys never straddle a boundary — the property the
+    // concatenation-without-merge relies on.
+    fn route<O: OffsetSizeTrait>(
+        arr: &GenericStringArray<O>,
+        boundaries: &[String],
+        null_bucket: u32,
+    ) -> Vec<u32> {
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    null_bucket
+                } else {
+                    let v = arr.value(i);
+                    boundaries.partition_point(|b| b.as_str() <= v) as u32
+                }
+            })
+            .collect()
+    }
+
+    let part_of = match key_col.data_type() {
+        DataType::Utf8 => {
+            let a = key_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| RuntimeError::NonNumericRangeKey {
+                    dtype: key_col.data_type().to_string(),
+                })?;
+            route(a, boundaries, null_bucket)
+        }
+        DataType::LargeUtf8 => {
+            let a = key_col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| RuntimeError::NonNumericRangeKey {
+                    dtype: key_col.data_type().to_string(),
+                })?;
+            route(a, boundaries, null_bucket)
+        }
+        other => {
+            return Err(RuntimeError::NonNumericRangeKey {
+                dtype: other.to_string(),
+            })
+        }
+    };
     scatter_into_buckets(batch, &part_of, n_buckets)
 }
 

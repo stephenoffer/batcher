@@ -51,11 +51,12 @@ class Expr:
     serialized via :meth:`to_ir` to the JSON the Rust ``bc-expr`` engine evaluates —
     no Python touches a row. Methods come in families: arithmetic/comparison/boolean
     operators, math functions (``sqrt``, ``ln``, ``sin``, …), null/NaN predicates
-    (``is_null``, ``is_nan``, ``fill_null``), aggregates for ``group_by().agg(...)``
-    / ``.over(...)`` (``sum``, ``mean``, ``count``, …), cumulative window helpers
-    (``cum_sum``, ``shift``), and the typed accessor namespaces (``.str``, ``.dt``,
-    ``.list``, ``.struct``, ``.json``, ``.image``, ``.audio``, ``.video``, ``.map``)
-    that hold the per-type breadth.
+    (``is_null``, ``is_nan``, ``fill_null``, ``fill_nan``), aggregates for
+    ``group_by().agg(...)`` / ``.over(...)`` (``sum``, ``mean``, ``count``, …), window
+    helpers (``cum_sum``, ``shift``, ``diff``, ``pct_change``, ``rank``,
+    ``rolling_mean``, ``is_unique``), and the typed accessor namespaces (``.str``,
+    ``.dt``, ``.list``, ``.struct``, ``.json``, ``.image``, ``.audio``, ``.video``,
+    ``.map``) that hold the per-type breadth.
 
     Subclasses are the concrete IR nodes (``Lit``, ``Binary``, ``MathExpr``, …); user
     code constructs expressions through ``col``/``lit`` and these methods, not the
@@ -114,8 +115,13 @@ class Expr:
         return Binary("mul", self, _wrap(other))
 
     def __truediv__(self, other: IntoExpr) -> Expr:
-        """Element-wise true division (``a / b``, → Float64); ``//`` is :meth:`__floordiv__`."""
-        return Binary("div", self, _wrap(other))
+        """Element-wise true division (``a / b``, → Float64); ``//`` is :meth:`__floordiv__`.
+
+        The numerator is cast to Float64 so integer operands divide *truly*
+        (``1 / 2`` is ``0.5``, as in Python, Polars and DuckDB) rather than
+        truncating. Desugars to existing ops — no new IR — and the cast is free when
+        the input is already Float64."""
+        return Binary("div", self.cast("float64"), _wrap(other))
 
     def __mod__(self, other: IntoExpr) -> Expr:
         """Element-wise modulo / remainder (``a % b``)."""
@@ -136,7 +142,7 @@ class Expr:
 
     def __rtruediv__(self, other: IntoExpr) -> Expr:
         """Reflected true division so ``scalar / expr`` works (→ Float64)."""
-        return Binary("div", _wrap(other), self)
+        return Binary("div", _wrap(other).cast("float64"), self)
 
     def __rmod__(self, other: IntoExpr) -> Expr:
         """Reflected modulo so ``scalar % expr`` works."""
@@ -233,6 +239,14 @@ class Expr:
     def __rxor__(self, other: IntoExpr) -> Expr:
         """Reflected bitwise XOR so ``scalar ^ expr`` works (operands cast to Int64)."""
         return Binary("bit_xor", _wrap(other), self)
+
+    def __rlshift__(self, other: IntoExpr) -> Expr:
+        """Reflected left shift so ``scalar << expr`` works."""
+        return Binary("shift_left", _wrap(other), self)
+
+    def __rrshift__(self, other: IntoExpr) -> Expr:
+        """Reflected right shift so ``scalar >> expr`` works."""
+        return Binary("shift_right", _wrap(other), self)
 
     def __getitem__(self, key: int | slice | str) -> Expr:
         """Index into a list or struct column with ``[]`` — the idiomatic spelling of
@@ -1075,6 +1089,31 @@ class Expr:
 
         return _VideoNamespace(self)
 
+    def hash(self, seed: int = 0) -> Expr:
+        """A deterministic 64-bit hash of this expression's value, per row → Int64.
+
+        The single-argument spelling of :func:`batcher.hash_rows`. Typed rather than
+        textual, so it neither depends on how a float renders nor pays to render it.
+
+        Args:
+            seed: Changes the digest; the same seed reproduces it.
+
+        Returns:
+            An Int64 expression — the value's digest.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 1, 2]})
+                >>> h = ds.select(h=bt.col("x").hash()).to_pydict()["h"]
+                >>> h[0] == h[1], h[0] == h[2]
+                (True, False)
+        """
+        from batcher.plan.expr_ir.constructors import hash_rows
+
+        return hash_rows(self, seed=seed)
+
     def fill_null(self, value: IntoExpr) -> Coalesce:
         """Replace nulls with `value`, leaving non-null values unchanged (SQL ``COALESCE``).
 
@@ -1726,6 +1765,331 @@ class Expr:
         from batcher.plan.expr_ir.nodes import lag, lead
 
         return lag(self, n) if n >= 0 else lead(self, -n)
+
+    # --- rolling (fixed-size trailing window) aggregates --------------------
+    def _rolling(
+        self,
+        agg: str,
+        window_size: int,
+        min_periods: int | None,
+        partition_by: Iterable[IntoExpr],
+        order_by: Iterable[IntoExpr],
+    ) -> Expr:
+        """`agg` over the `window_size` rows ending at the current one.
+
+        A ROWS frame of ``(-(window_size - 1), 0)``. Without `min_periods` the leading
+        rows of a partition aggregate a *partial* frame, as SQL does. With it, a row
+        whose frame holds fewer than `min_periods` non-null values becomes null — the
+        guard is a windowed `count` over the same frame, and the null is `nullif` of
+        the value against itself (a null of the aggregate's own type). Both compose out
+        of existing nodes, so rolling adds no IR."""
+        from batcher.plan.expr_ir.constructors import nullif, when
+
+        if window_size < 1:
+            raise PlanError(f"rolling_{agg}(): window_size must be >= 1, got {window_size}")
+        if min_periods is not None and not 1 <= min_periods <= window_size:
+            raise PlanError(
+                f"rolling_{agg}(): min_periods must be in [1, {window_size}], got {min_periods}"
+            )
+        frame = (-(window_size - 1), 0)
+        value = AggExpr(agg, self).over(partition_by=partition_by, order_by=order_by, frame=frame)
+        if min_periods is None:
+            return value
+        seen = AggExpr("count", self).over(
+            partition_by=partition_by, order_by=order_by, frame=frame
+        )
+        # `value` is reused in both branches; `hoist_windows` shares the one Window node.
+        return when(seen >= Lit(min_periods)).then(value).otherwise(nullif(value, value))
+
+    def rolling_sum(
+        self,
+        window_size: int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Sum over the `window_size` rows ending at the current one — Polars ``rolling_sum``.
+
+        A window expression; use it in ``with_columns``/``select``. The leading rows of
+        each partition aggregate a partial window (SQL semantics); pass `min_periods`
+        to make them null instead.
+
+        Args:
+            window_size: How many rows the trailing frame spans, including this one.
+            min_periods: Least non-null values the frame must hold, else the row is null.
+            partition_by: Restart the frame per group of these key expressions.
+            order_by: Order rows by these expressions before framing.
+
+        Returns:
+            The rolling sum.
+
+        Raises:
+            PlanError: If `window_size` < 1, or `min_periods` is outside
+                ``[1, window_size]``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
+                >>> ds.with_columns(r=bt.col("x").rolling_sum(2)).to_pydict()
+                {'x': [1, 2, 3, 4], 'r': [1, 3, 5, 7]}
+                >>> ds.with_columns(r=bt.col("x").rolling_sum(2, min_periods=2)).to_pydict()
+                {'x': [1, 2, 3, 4], 'r': [None, 3, 5, 7]}
+        """
+        return self._rolling("sum", window_size, min_periods, partition_by, order_by)
+
+    def rolling_mean(
+        self,
+        window_size: int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Mean over the `window_size` rows ending at the current one — the moving average.
+
+        See :meth:`rolling_sum` for the framing and `min_periods` semantics.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
+                >>> ds.with_columns(r=bt.col("x").rolling_mean(2)).to_pydict()
+                {'x': [1, 2, 3, 4], 'r': [1.0, 1.5, 2.5, 3.5]}
+        """
+        return self._rolling("avg", window_size, min_periods, partition_by, order_by)
+
+    def rolling_min(
+        self,
+        window_size: int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Minimum over the `window_size` rows ending at the current one.
+
+        See :meth:`rolling_sum` for the framing and `min_periods` semantics.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [3, 1, 4, 1]})
+                >>> ds.with_columns(r=bt.col("x").rolling_min(2)).to_pydict()
+                {'x': [3, 1, 4, 1], 'r': [3, 1, 1, 1]}
+        """
+        return self._rolling("min", window_size, min_periods, partition_by, order_by)
+
+    def rolling_max(
+        self,
+        window_size: int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Maximum over the `window_size` rows ending at the current one.
+
+        See :meth:`rolling_sum` for the framing and `min_periods` semantics.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [3, 1, 4, 1]})
+                >>> ds.with_columns(r=bt.col("x").rolling_max(2)).to_pydict()
+                {'x': [3, 1, 4, 1], 'r': [3, 3, 4, 4]}
+        """
+        return self._rolling("max", window_size, min_periods, partition_by, order_by)
+
+    def rolling_count(
+        self,
+        window_size: int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Count of non-null values over the `window_size` rows ending at the current one.
+
+        See :meth:`rolling_sum` for the framing and `min_periods` semantics.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, None, 3, 4]})
+                >>> ds.with_columns(r=bt.col("x").rolling_count(2)).to_pydict()
+                {'x': [1, None, 3, 4], 'r': [1, 1, 1, 2]}
+        """
+        return self._rolling("count", window_size, min_periods, partition_by, order_by)
+
+    def diff(
+        self,
+        n: int = 1,
+        *,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """The change from `n` rows back — Polars ``diff``, SQL ``x - lag(x, n) OVER (…)``.
+
+        A window expression composed with subtraction, so the first `n` rows of each
+        partition are null. Use it in ``with_columns``/``select``.
+
+        Args:
+            n: How many rows back to compare against; negative looks forward.
+            partition_by: Restart the comparison per group of these key expressions.
+            order_by: Order rows by these expressions before comparing.
+
+        Returns:
+            The difference between each value and the one `n` rows away.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 3, 8]})
+                >>> ds.with_columns(d=bt.col("x").diff()).to_pydict()
+                {'x': [1, 3, 8], 'd': [None, 2, 5]}
+        """
+        return self - self.shift(n).over(partition_by=partition_by, order_by=order_by)
+
+    def pct_change(
+        self,
+        n: int = 1,
+        *,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """The fractional change from `n` rows back — Polars ``pct_change``.
+
+        ``x / lag(x, n) - 1``, evaluated as true division, so integer columns yield a
+        float. The first `n` rows of each partition are null.
+
+        Args:
+            n: How many rows back to compare against; negative looks forward.
+            partition_by: Restart the comparison per group of these key expressions.
+            order_by: Order rows by these expressions before comparing.
+
+        Returns:
+            The relative change from the value `n` rows away (``0.5`` == +50%).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [10, 15, 30]})
+                >>> ds.with_columns(p=bt.col("x").pct_change()).to_pydict()
+                {'x': [10, 15, 30], 'p': [None, 0.5, 1.0]}
+        """
+        return self / self.shift(n).over(partition_by=partition_by, order_by=order_by) - 1
+
+    def fill_nan(self, value: IntoExpr) -> Expr:
+        """Replace IEEE NaN with `value`, leaving nulls and ordinary numbers alone.
+
+        The NaN counterpart of :meth:`fill_null`: NaN is a float value, not a null, so
+        ``fill_null`` never touches it. A null input stays null.
+
+        Args:
+            value: The replacement used wherever this expression is NaN.
+
+        Returns:
+            An expression with every NaN replaced by `value`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, float("nan"), 3.0]})
+                >>> ds.select(r=bt.col("x").fill_nan(0.0)).to_pydict()
+                {'r': [1.0, 0.0, 3.0]}
+        """
+        from batcher.plan.expr_ir.constructors import when
+
+        return when(self.is_nan()).then(_wrap(value)).otherwise(self)
+
+    def rank(
+        self,
+        method: str = "min",
+        *,
+        descending: bool = False,
+        partition_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Rank the rows by this expression's value — SQL ``RANK() OVER (ORDER BY self)``.
+
+        A window expression; use it in ``with_columns``/``select``. Ranks start at 1.
+
+        Args:
+            method: How ties are numbered. ``"min"`` gives tied rows the same rank and
+                leaves a gap (SQL ``RANK``); ``"dense"`` gives the same rank with no gap
+                (``DENSE_RANK``); ``"ordinal"`` breaks ties arbitrarily so every row gets
+                a distinct rank (``ROW_NUMBER``).
+            descending: Rank from the largest value down instead of the smallest up.
+            partition_by: Rank within each group of these key expressions.
+
+        Returns:
+            The 1-based rank of each row.
+
+        Raises:
+            PlanError: If `method` is not one of ``min``/``dense``/``ordinal``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [10, 30, 10]})
+                >>> ds.with_columns(r=bt.col("x").rank()).to_pydict()
+                {'x': [10, 30, 10], 'r': [1, 3, 1]}
+        """
+        from batcher.plan.expr_ir.nodes import dense_rank, rank, row_number
+
+        fns = {"min": rank, "dense": dense_rank, "ordinal": row_number}
+        if method not in fns:
+            raise PlanError(f"rank(): method must be one of {sorted(fns)}, got {method!r}")
+        return fns[method]().over(partition_by=partition_by, order_by=[(self, descending)])
+
+    def is_duplicated(self) -> Expr:
+        """True on every row whose value occurs more than once — Polars ``is_duplicated``.
+
+        A window expression (``count(*) OVER (PARTITION BY self) > 1``); use it in
+        ``with_columns``/``select``/``filter``. Nulls form their own group, so repeated
+        nulls are duplicates.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 1]})
+                >>> ds.with_columns(d=bt.col("x").is_duplicated()).to_pydict()
+                {'x': [1, 2, 1], 'd': [True, False, True]}
+        """
+        return self._value_count() > Lit(1)
+
+    def is_unique(self) -> Expr:
+        """True on every row whose value occurs exactly once — the negation of
+        :meth:`is_duplicated`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 1]})
+                >>> ds.with_columns(u=bt.col("x").is_unique()).to_pydict()
+                {'x': [1, 2, 1], 'u': [False, True, False]}
+        """
+        return self._value_count() == Lit(1)
+
+    def _value_count(self) -> WindowExpr:
+        """``count(1) OVER (PARTITION BY self)`` — how often each value occurs.
+
+        Counts *rows*, not non-null values: the argument is a literal so a partition of
+        nulls still counts its own rows (nulls group together, as in Polars). Counting
+        `self` instead would report 0 for every null row."""
+        return AggExpr("count", Lit(1)).over(partition_by=[self])
 
 
 # Imported here, after `Expr` is defined, to break the import cycle: `node_base`

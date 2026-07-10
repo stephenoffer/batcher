@@ -22,6 +22,7 @@ from batcher.plan.functions.horizontal import (
     sum_horizontal,
 )
 from batcher.plan.functions.math import gcd, hypot, lcm, log, width_bucket
+from batcher.plan.functions.security import aes_decrypt, aes_encrypt, hmac_sha256, mask
 from batcher.plan.functions.string import concat, concat_ws, format_string
 from batcher.plan.functions.temporal import (
     current_date,
@@ -33,6 +34,8 @@ from batcher.plan.functions.temporal import (
 )
 
 __all__ = [
+    "aes_decrypt",
+    "aes_encrypt",
     "all_horizontal",
     "any_horizontal",
     "concat",
@@ -49,10 +52,12 @@ __all__ = [
     "element",
     "format_string",
     "gcd",
+    "hmac_sha256",
     "hypot",
     "iff",
     "lcm",
     "log",
+    "mask",
     "max_horizontal",
     "mean_horizontal",
     "min_horizontal",

@@ -87,7 +87,7 @@ def _select(tr, node) -> Dataset:
     # Correlated scalar subqueries (SELECT list / HAVING / residual WHERE)
     # decorrelate into LEFT JOINs before the value expressions are built.
     ds = tr._decorrelate_scalar_subqueries(
-        ds, [*node.expressions, residual, node.args.get("having")]
+        ds, [*node.expressions, residual, node.args.get("having")], node
     )
     if residual is not None:
         # A registered scalar function in WHERE becomes a materialized column

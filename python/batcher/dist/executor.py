@@ -63,6 +63,7 @@ from batcher.plan.logical import (
     AsofJoin,
     Distinct,
     Join,
+    Limit,
     LogicalPlan,
     Sort,
     Union,
@@ -340,6 +341,27 @@ def _is_splittable_source(source: Source) -> bool:
 _TOPN_MAX_ROWS = 1_000_000
 
 
+def _collapse_limits(lim: Limit) -> tuple[int, int, LogicalPlan]:
+    """Fold a chain of nested `Limit`s into one `(n, offset, base)` over the chain's base.
+
+    Kyber's limit pushdown leaves a `Limit` above the one it pushed into the scan, so the
+    dispatcher routinely sees `Limit(Limit(scan))`; treating the inner `Limit` as an opaque
+    (non-map) input would strand the whole shape on `_unsupported`.
+
+    An outer `Limit(n, offset)` keeps rows `[offset, offset + n)` of its input, and the
+    inner one already restricted its child to `[i_offset, i_offset + i_n)`. Composing:
+    the child rows kept are `[i_offset + offset, ...)`, and at most `min(n, i_n - offset)`
+    of them survive (clamped at 0 when the outer offset skips past the inner window).
+    """
+    n, offset = lim.n, lim.offset
+    base = lim.input
+    while isinstance(base, Limit):
+        n = max(0, min(n, base.n - offset))
+        offset = base.offset + offset
+        base = base.input
+    return n, offset, base
+
+
 def _fusable_join_aggregate(agg: Aggregate) -> bool:
     """Whether `agg` is an aggregate over an inner join, grouped by (a superset of) the
     join key — so it can be distributed by reusing the join's co-partitioning.
@@ -430,6 +452,35 @@ def _dispatch(
             from batcher.dist.executors.map import _distributed_map
 
             return _distributed_map(plan, sources, workers, hub)
+
+    # A bare `LIMIT n OFFSET k` over a breaker-free single source (`df.limit(10)`,
+    # `df.head()`, `df.filter(...).limit(10)` — the most common interactive shape, and
+    # until now a hard failure on distributed data). Each worker keeps only the first
+    # `k + n` rows of its OWN partition and the driver re-slices their concatenation.
+    #
+    # This is exact, not a sample: the global first `k + n` rows are a prefix of the
+    # source, so every one of them lies in some partition's own first `k + n` rows; and
+    # `_distributed_map` assembles partition results **by index** (`gather_map_results`
+    # is index-addressed), so their concatenation is the source's row order and
+    # `slice(k, n)` selects precisely the rows the single-node engine returns. Only
+    # `workers x (k + n)` rows ever reach the driver, never the whole source.
+    #
+    # `hub=None`: the per-worker plan is truncated, so its row count must not be learned
+    # as the source's cardinality. A `map_batches` prefix returned above, so the pipeline
+    # here is pure scan/filter/project/unnest.
+    limit_split = _split_at(plan, Limit)
+    if limit_split is not None:
+        above, lim = limit_split
+        n, offset, base = _collapse_limits(lim)
+        if _single_source(base) and _is_linear_map_pipeline(base):
+            sid = next(iter(_source_ids(base)))
+            if sid < len(sources) and _is_splittable_source(sources[sid]):
+                from batcher.dist.executors.map import _distributed_map
+
+                per_worker = Limit(input=base, n=offset + n, offset=0)
+                table = _distributed_map(per_worker, sources, workers, None)
+                table = table.slice(offset, n)
+                return table if not above else _apply_above(above, table)
 
     agg_split = _split_at(plan, Aggregate)
     if agg_split is not None:

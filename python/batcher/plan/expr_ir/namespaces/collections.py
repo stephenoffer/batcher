@@ -446,6 +446,26 @@ class _ListNamespace:
         """
         return ListBinary("dot", self._e, _wrap(other))
 
+    def jaccard(self, other: Any) -> ListBinary:
+        """The fraction of positions where this list and `other` hold the same value.
+
+        Over two `str.minhash` signatures this is the unbiased estimator of the two
+        documents' Jaccard similarity — the near-duplicate score. Over arbitrary equal
+        length lists it is simply the agreement rate. Null if either list is null, and
+        null for two empty lists (no positions to agree on).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": ["hello world", "hello world!"]})
+                >>> sigs = ds.select(s=bt.col("t").str.minhash(128)).to_pydict()["s"]
+                >>> pair = bt.from_pydict({"a": [sigs[0]], "b": [sigs[1]]})
+                >>> pair.select(j=bt.col("a").list.jaccard(bt.col("b"))).to_pydict()["j"][0] > 0.5
+                True
+        """
+        return ListBinary("jaccard", self._e, _wrap(other))
+
     def cosine_similarity(self, other: Any) -> ListBinary:
         """Cosine similarity with another vector column, in ``[-1, 1]`` (→ Float64).
 

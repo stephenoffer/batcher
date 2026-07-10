@@ -109,10 +109,25 @@ def read_source(
     (or partially applies) the predicate still produces correct results — pushdown
     is a pure I/O optimization. Capable sources translate the predicate IR via
     `batcher.io.predicate` to their backend filter.
+
+    Always returns at least one batch. A `RecordBatch` is the only carrier of a schema
+    across the FFI boundary, and the engine's pipeline breakers (join, aggregate,
+    distinct, sort) cannot name their output columns without it. Sources disagree on the
+    empty case — an in-memory table yields one zero-row batch, a zero-row Parquet file
+    yields none — so the boundary normalizes it here rather than asking every connector
+    to remember. Reading nothing is routine: an incremental batch with no new rows, a
+    table whose rows were all deleted, a partition pruned away entirely.
     """
     if predicate is not None and getattr(source, "supports_predicate", False):
-        return source.read(projection, predicate=predicate)  # type: ignore[call-arg]
-    return source.read(projection)
+        batches = source.read(projection, predicate=predicate)  # type: ignore[call-arg]
+    else:
+        batches = source.read(projection)
+    if batches:
+        return batches
+    schema = source.schema()
+    if projection is not None:
+        schema = pa.schema([schema.field(schema.get_field_index(c)) for c in projection])
+    return [pa.RecordBatch.from_pylist([], schema=schema)]
 
 
 @runtime_checkable
@@ -186,29 +201,179 @@ def is_checkpointable(source: Source) -> bool:
     )
 
 
-class InMemorySource:
-    """A relation already materialized as Arrow record batches."""
+# Overflow-safe narrow → wide numeric widenings the engine normalizes to at the FFI
+# boundary anyway (Int8/16/32, UInt8/16/32 → Int64; Float16/32 → Float64). Doing it once
+# here — instead of the Rust boundary re-casting on *every* query — turns a per-query
+# O(rows) `cast` (arrow's int16→int64 cast is ~47 ms / 10 M rows) into a one-time cost.
+# UInt64 (can overflow Int64), dictionaries, and everything else are left to the Rust
+# `normalize_batch`, which stays the correctness backstop (a no-op on already-wide cols).
+_WIDEN_NARROW: dict[pa.DataType, pa.DataType] = {
+    pa.int8(): pa.int64(),
+    pa.int16(): pa.int64(),
+    pa.int32(): pa.int64(),
+    pa.uint8(): pa.int64(),
+    pa.uint16(): pa.int64(),
+    pa.uint32(): pa.int64(),
+    pa.float16(): pa.float64(),
+    pa.float32(): pa.float64(),
+}
 
-    __slots__ = ("_batches", "_schema")
+
+def _widen_schema(schema: pa.Schema, targets: dict[str, pa.DataType]) -> pa.Schema:
+    """`schema` with each `targets` column retyped to its widened type (metadata only)."""
+    return pa.schema([f.with_type(targets[f.name]) if f.name in targets else f for f in schema])
+
+
+class InMemorySource:
+    """A relation already materialized as Arrow record batches.
+
+    Narrow numeric columns (Int8/16/32, UInt8/16/32, Float16/32) are widened to
+    Int64/Float64 — the types the engine normalizes to at the FFI boundary anyway — but
+    **lazily and per column, with caching**: only the columns a query actually reads are
+    cast, and the cast happens once (arrow's int16→int64 cast is ~47 ms / 10 M rows, and
+    the Rust boundary would otherwise redo it on *every* query). This is skipped when
+    ``shrink_output_dtypes`` is on — that opt-in path re-narrows pass-through outputs from
+    the source widths, which pre-widening would erase — so that path keeps the Rust
+    boundary as the (correctness-equivalent) fallback.
+    """
+
+    __slots__ = (
+        "_batches",
+        "_cache",
+        "_mean_cache",
+        "_ndv_cache",
+        "_schema",
+        "_stats",
+        "_sum_cache",
+        "_targets",
+        "_valuecount_cache",
+    )
     bounded = True
+    # The batches are already in RAM, so a statistics pass over them costs no I/O. The
+    # conductor reads this before sketching cold-start distinct counts on the query path
+    # (`api.terminal._metadata.seed_column_ndv`); a file-backed source leaves it False and
+    # learns its ndv from the batches a run already scanned, rather than re-reading them.
+    resident = True
+    # `identity()` is shape-based for in-memory data (see `identity`), so two *different*
+    # in-memory relations that share a schema+size collide on it. That is fine for the
+    # optimizer's shape keys, but NOT for the cross-query source-stats cache, whose entries
+    # (row count, column min/max) depend on the actual data. So in-memory stats are never
+    # stored under the shared identity — they are memoized per instance in `statistics()`.
+    stable_stats_identity = False
 
     def __init__(self, batches: list[pa.RecordBatch]) -> None:
         if not batches:
             raise ValueError("InMemorySource requires at least one record batch")
+        from batcher.config import active_config
+
         self._batches = batches
-        self._schema = batches[0].schema
+        src_schema = batches[0].schema
+        if active_config().execution.shrink_output_dtypes:
+            self._targets: dict[str, pa.DataType] = {}
+            self._schema = src_schema
+        else:
+            self._targets = {f.name: t for f in src_schema if (t := _WIDEN_NARROW.get(f.type))}
+            self._schema = _widen_schema(src_schema, self._targets) if self._targets else src_schema
+        self._cache: dict[tuple[int, str], pa.Array] = {}
+        self._stats: object | None = None
+        self._ndv_cache: dict[str, int | None] = {}
+        self._mean_cache: dict[str, float | None] = {}
+        self._sum_cache: dict[str, float | int | None] = {}
+        self._valuecount_cache: dict[tuple[str, str, object], int | None] = {}
 
     def schema(self) -> pa.Schema:
         return self._schema
 
+    def _build_column(self, name: str) -> pa.ChunkedArray | pa.Array:
+        """Column `name` across all batches as one (narrow-int widened) Arrow column."""
+        chunks = [self._widened(bi, name, b.column(name)) for bi, b in enumerate(self._batches)]
+        return pa.chunked_array(chunks) if len(chunks) > 1 else chunks[0]
+
+    def column_ndv(self, name: str) -> int | None:
+        """EXACT distinct count of `name`'s non-null values, computed once and cached."""
+        if name not in self._ndv_cache:
+            from batcher.io.source import inmemory_stats
+
+            self._ndv_cache[name] = inmemory_stats.column_ndv(self._build_column, name)
+        return self._ndv_cache[name]
+
+    def column_mean(self, name: str) -> float | None:
+        """EXACT average of `name`'s non-null values, computed once and cached."""
+        if name not in self._mean_cache:
+            from batcher.io.source import inmemory_stats
+
+            self._mean_cache[name] = inmemory_stats.column_mean(self._build_column, name)
+        return self._mean_cache[name]
+
+    def column_sum(self, name: str) -> float | int | None:
+        """EXACT total of `name`'s non-null values (exactly representable), else None."""
+        if name not in self._sum_cache:
+            from batcher.io.source import inmemory_stats
+
+            self._sum_cache[name] = inmemory_stats.column_sum(self._build_column, name)
+        return self._sum_cache[name]
+
+    def column_predicate_count(self, op: str, name: str, value: object) -> int | None:
+        """EXACT surviving count of ``name <op> value`` (nulls excluded), cached per key.
+
+        `op` ∈ eq/ne/lt/le/gt/ge. Lets a repeat ``COUNT(*) WHERE col <op> v`` be answered
+        from metadata — the learned-metadata moat for any single-column comparison filter."""
+        key = (op, name, value)
+        if key not in self._valuecount_cache:
+            from batcher.io.source import inmemory_stats
+
+            self._valuecount_cache[key] = inmemory_stats.column_predicate_count(
+                self._build_column, op, name, value
+            )
+        return self._valuecount_cache[key]
+
+    def statistics(self):
+        """EXACT per-column min/max/null-count over the ordered columns, computed once.
+
+        An in-memory relation is immutable, so its column bounds are exact and constant; the
+        one vectorized pass (memoized per instance) lets Kyber answer an unfiltered
+        ``MIN``/``MAX`` from metadata on every subsequent run — the learned-metadata moat a
+        static optimizer can't match. See `io.inmemory_stats` for the computation.
+        """
+        if self._stats is None:
+            from batcher.io.source import inmemory_stats
+
+            rows = sum(b.num_rows for b in self._batches)
+            self._stats = inmemory_stats.statistics(self._build_column, self._schema, rows)
+        return self._stats
+
+    def _widened(self, bi: int, name: str, col: pa.Array) -> pa.Array:
+        """The widened (and cached) form of column `name` in batch `bi`, or `col` as-is."""
+        target = self._targets.get(name)
+        if target is None:
+            return col
+        key = (bi, name)
+        arr = self._cache.get(key)
+        if arr is None:
+            import pyarrow.compute as pc
+
+            arr = pc.cast(col, target)
+            self._cache[key] = arr
+        return arr
+
+    def _project(self, bi: int, b: pa.RecordBatch, projection: list[str] | None) -> pa.RecordBatch:
+        if projection is None and not self._targets:
+            return b
+        names = projection if projection is not None else b.schema.names
+        selected = b.select(names)
+        if not self._targets:
+            return selected
+        arrays = [self._widened(bi, n, selected.column(j)) for j, n in enumerate(names)]
+        return pa.RecordBatch.from_arrays(
+            arrays, schema=_widen_schema(selected.schema, self._targets)
+        )
+
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        if projection is None:
-            return self._batches
-        return [b.select(projection) for b in self._batches]
+        return [self._project(i, b, projection) for i, b in enumerate(self._batches)]
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        for b in self._batches:
-            yield b.select(projection) if projection is not None else b
+        for i, b in enumerate(self._batches):
+            yield self._project(i, b, projection)
 
     def row_count(self) -> int | None:
         return sum(b.num_rows for b in self._batches)

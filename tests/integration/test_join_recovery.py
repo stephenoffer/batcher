@@ -60,3 +60,18 @@ def test_join_flight_survives_worker_loss(killed):
     ds = bt.from_arrow(left).join(bt.from_arrow(right), on="k", how="inner")
     recovered = execute_join_flight([], ds._plan, ds._sources, workers=4, _fault_inject=killed)
     assert _rowset(expected) == _rowset(recovered)
+
+
+@pytest.mark.parametrize("killed", [{2}, {1, 3}])
+def test_join_flight_survives_worker_loss_during_map(killed):
+    """A worker preempted *during* the map barrier has BOTH its co-partitioned sides
+    republished on one survivor under the same source id, so the reducers' tickets still
+    resolve and the join equals single-node. The barrier used to be a bare `ray.get`, so
+    a preemption in the map phase failed the whole join."""
+    from batcher.dist.flight_join import execute_join_flight
+
+    left, right = _tables()
+    expected = bt.from_arrow(left).join(bt.from_arrow(right), on="k", how="inner").collect()
+    ds = bt.from_arrow(left).join(bt.from_arrow(right), on="k", how="inner")
+    recovered = execute_join_flight([], ds._plan, ds._sources, workers=4, _fault_inject_map=killed)
+    assert _rowset(expected) == _rowset(recovered)

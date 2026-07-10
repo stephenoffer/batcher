@@ -35,6 +35,8 @@ can catch a specific type when you want to react differently.
 | `ResourceError` | The resource manager cannot satisfy a memory or credit request. |
 | `BackpressureAbort` | Execution is aborted because backpressure could not be relieved. |
 | `IOError` | A source or sink fails to read, write, list, or open a path. |
+| `DataQualityError` | A `ds.dq...fail()` expectation has violating rows. Carries the per-constraint counts. |
+| `AccessDeniedError` | A principal may select no column of a governed table. A *column* it cannot select is instead absent, surfacing as `PlanError`. |
 | `FormatError`, `BackendError`, `CommitError`, `TransportError` | Lower-level IO, backend, write-commit, and shuffle failures. |
 
 `PlanError` is the one most user code encounters, because it is raised eagerly

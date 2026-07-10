@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from batcher.ml.preprocessors.base import Preprocessor
 from batcher.ml.preprocessors.binning import KBinsDiscretizer
+from batcher.ml.preprocessors.chain import Chain
 from batcher.ml.preprocessors.encoders import (
     LabelEncoder,
     MultiHotEncoder,
@@ -33,6 +34,7 @@ from batcher.ml.preprocessors.scalers import (
 from batcher.ml.preprocessors.text import Concatenator, Tokenizer
 
 __all__ = [
+    "Chain",
     "Concatenator",
     "KBinsDiscretizer",
     "LabelEncoder",

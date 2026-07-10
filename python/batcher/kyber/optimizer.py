@@ -79,6 +79,7 @@ def _annotate_ops(
     plan: LogicalPlan,
     estimator: CardinalityEstimator,
     config: Config,
+    cost_model: CostModel,
     cpu_util: dict[str, float] | None = None,
 ) -> tuple[PhysicalOp, ...]:
     """Tag each operator with its estimated rows + memory envelope for Carbonite.
@@ -90,6 +91,8 @@ def _annotate_ops(
     `cpu_util` is the learned per-kind CPU utilization (from prior runs); when a kind
     has a measurement it overrides the static CPU-share prior, so the per-task
     `num_cpus` request adapts to how CPU-bound each operator family actually is.
+
+    Each op also carries the feedback keys Core echoes back (see `PlanProperties`).
     """
     learned_cpu = cpu_util or {}
     row_bytes = config.optimizer.row_bytes
@@ -160,7 +163,13 @@ def _annotate_ops(
                         prefers_locality=prefers_local,
                     ),
                     inputs=(),
-                    properties=PlanProperties(est_rows=rows, provenance=est.provenance),
+                    properties=PlanProperties(
+                        est_rows=rows,
+                        provenance=est.provenance,
+                        signature=estimator.signature_of(node),
+                        est_rows_raw=estimator.reportable_estimate(node),
+                        expr_factor=cost_model.expr_factor(node),
+                    ),
                 )
             )
     except Exception:
@@ -382,6 +391,7 @@ class Optimizer:
                 plan,
                 ctx.estimator,
                 ctx.config,
+                ctx.costs(),
                 load_cpu_utilization(self._hub, self._config),
             ),
             source_projections=required_columns_per_source(plan),

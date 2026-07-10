@@ -1,192 +1,31 @@
-"""LLM batch inference — the Ray Data LLM competitor (offline text generation).
+"""LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends.
 
-Run a text-generation engine (vLLM, or any callable) over millions of rows. The
-engine is built **once per worker** (the load-once pattern) and does its *own*
-continuous batching, so Batcher feeds it each input batch as a whole request list
-and imposes **no** outer fixed batch size — an outer batch-size PID would fight
-vLLM's scheduler (the distinct LLM-stage contract, vs the embeddings stage which
-*does* adapt its batch size). On top of that the operator handles the surrounding
-columnar work: build each prompt from row columns via a `template`, and optionally
-parse each structured/JSON output into typed columns.
+An *engine* is the only thing `generate` needs from an LLM: hand it a batch of
+requests, get back a string per request in order. Keeping that contract this narrow is
+what lets vLLM, an OpenAI-compatible HTTP endpoint, and a deterministic test double be
+interchangeable — and what keeps the columnar machinery in `generate` free of any
+model library.
 
-The engine is injected as a factory, so this works with vLLM, an OpenAI client, or a
-deterministic test double — the engine never depends on a specific library. A vLLM
-adapter (`vllm_engine`) lives behind the optional ``batcher-engine[vllm]`` extra.
+An engine may also set ``last_usage`` (one ``(prompt_tokens, completion_tokens)`` pair
+per request, in order) for cost/throughput accounting.
 """
 
 from __future__ import annotations
 
-import json
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Sequence
 
-from batcher.ml.inference import InferencePool
-
-if TYPE_CHECKING:
-    import pyarrow as pa
-
-__all__ = ["Engine", "EngineFactory", "http_engine", "llm_generate", "vllm_engine"]
+__all__ = ["Engine", "EngineFactory", "http_engine", "vllm_engine"]
 
 # Maps a list of prompts to a list of generated strings (one per prompt, in order).
 Engine = Callable[[list[str]], Sequence[str]]
 EngineFactory = Callable[[], Engine]
 
 
-def _render(template: str | None, column: str, batch: pa.RecordBatch) -> list[str]:
-    """The prompt for each row: ``column`` verbatim, or `template` formatted with the
-    row's columns (``"{system} Q: {question}"``-style ``str.format`` placeholders)."""
-    if template is None:
-        return [str(v) for v in batch.column(column).to_pylist()]
-    rows = batch.to_pylist()
-    return [template.format(**row) for row in rows]
-
-
-def _build_requests(
-    template: str | None,
-    prompt_column: str,
-    image_column: str | None,
-    adapter_column: str | None,
-    batch: pa.RecordBatch,
-) -> list:
-    """Per-row engine requests: plain prompt strings, or ``{prompt, image?, adapter?}``
-    dicts when an `image_column` (vision-language) or `adapter_column` (per-row LoRA) is
-    given. A null image/adapter for a row drops that key (text-only / base model)."""
-    prompts = _render(template, prompt_column, batch)
-    if image_column is None and adapter_column is None:
-        return prompts
-    n = len(prompts)
-    images = _decode_image_inputs(batch.column(image_column)) if image_column else [None] * n
-    adapters = batch.column(adapter_column).to_pylist() if adapter_column else [None] * n
-    requests = []
-    for prompt, image, adapter in zip(prompts, images, adapters, strict=True):
-        request: dict = {"prompt": prompt}
-        if image is not None:
-            request["image"] = image
-        if adapter is not None:
-            request["adapter"] = adapter
-        requests.append(request)
-    return requests
-
-
-def _decode_image_inputs(column: pa.Array) -> list:
-    """A list of PIL images for a column of raw image bytes or decoded pixel tensors.
-
-    Bytes → ``PIL.Image.open``; a fixed-shape-tensor ``(H, W, 3)`` → ``Image.fromarray``.
-    Null rows yield ``None`` (the model sees a text-only request for that row)."""
-    import io as _io
-
-    from batcher.io.formats.ml.tensor import is_tensor_column
-
-    try:
-        from PIL import Image
-    except ImportError as exc:  # pragma: no cover - optional extra
-        from batcher._internal.errors import BackendError
-
-        msg = "vision LLM input needs Pillow: pip install 'batcher-engine[image]'"
-        raise BackendError(msg) from exc
-
-    if is_tensor_column(column):
-        if hasattr(column, "combine_chunks"):
-            column = column.combine_chunks()
-        return [Image.fromarray(row) for row in column.to_numpy_ndarray()]
-    return [None if b is None else Image.open(_io.BytesIO(b)) for b in column.to_pylist()]
-
-
-def llm_generate(
-    batches: Iterable[pa.RecordBatch],
-    engine_factory: EngineFactory,
-    *,
-    prompt_column: str,
-    output_column: str = "response",
-    template: str | None = None,
-    image_column: str | None = None,
-    adapter_column: str | None = None,
-    parse_json: bool = False,
-    usage: bool = False,
-    num_workers: int = 2,
-    target_batch_rows: int = 256,
-) -> Iterator[pa.RecordBatch]:
-    """Append an LLM-generated `output_column` to each batch.
-
-    Args:
-        batches: an iterable of `pyarrow.RecordBatch`.
-        engine_factory: zero-arg callable returning an engine (``list[str]`` →
-            sequence of strings); called once per worker so the model loads once.
-        prompt_column: the text column to send (ignored if `template` is set, which
-            builds prompts from any columns).
-        output_column: name of the appended generated column.
-        template: optional ``str.format`` template over the row's columns.
-        image_column: optional image column (raw bytes, or a decoded ``(H, W, 3)``
-            tensor) for **vision-language** models. Each request becomes
-            ``{"prompt": text, "image": PIL.Image}``; the engine must be vision-capable
-            (`vllm_engine` on a multimodal model handles it).
-        adapter_column: optional column naming the **LoRA adapter** to use per row
-            (multi-adapter serving). The engine routes each row to that adapter; a null
-            uses the base model. Pair with ``vllm_engine(lora_paths={name: path})``.
-        parse_json: parse each output as JSON into a struct column (guided/structured
-            decoding); on a parse error the row's value is null.
-        usage: also append integer ``prompt_tokens`` and ``completion_tokens`` columns
-            (the per-row token counts the engine reported — `vllm_engine` and
-            `http_engine` do). Aggregate them to track cost (tokens * price) or
-            throughput. Null for an engine that does not report usage.
-        num_workers / target_batch_rows: forwarded to `InferencePool` (no latency
-            controller — the engine owns its own batching).
-
-    Yields:
-        Each input batch with `output_column` appended, in order.
-    """
-    import pyarrow as pa
-
-    def make_worker() -> Callable[[pa.RecordBatch], pa.RecordBatch]:
-        engine = engine_factory()  # built once per worker
-
-        def worker(batch: pa.RecordBatch) -> pa.RecordBatch:
-            requests = _build_requests(template, prompt_column, image_column, adapter_column, batch)
-            outputs = list(engine(requests))
-            if parse_json:
-                col = pa.array([_safe_json(o) for o in outputs])
-            else:
-                col = pa.array([str(o) for o in outputs], type=pa.string())
-            arrays = [batch.column(i) for i in range(batch.num_columns)] + [col]
-            names = [*batch.schema.names, output_column]
-            if usage:
-                prompt_toks, completion_toks = _usage_columns(engine, len(outputs))
-                arrays += [prompt_toks, completion_toks]
-                names += ["prompt_tokens", "completion_tokens"]
-            return pa.RecordBatch.from_arrays(arrays, names=names)
-
-        return worker
-
-    pool = InferencePool(make_worker, num_workers=num_workers, target_batch_rows=target_batch_rows)
-    yield from pool.run(batches)
-
-
-def _safe_json(text: str) -> object | None:
-    try:
-        return json.loads(text)
-    except (ValueError, TypeError):
-        return None
-
-
-def _usage_columns(engine: object, n: int):
-    """Per-row `(prompt_tokens, completion_tokens)` Int64 arrays from the engine's
-    `last_usage` (set on its most recent call), or all-null when it reports none.
-
-    `last_usage` is `n` `(prompt_tokens, completion_tokens)` pairs in prompt order; a
-    `None` pair (a request whose usage the engine couldn't report) yields nulls for that
-    row."""
-    import pyarrow as pa
-
-    reported = getattr(engine, "last_usage", None)
-    pairs = list(reported) if reported is not None else [None] * n
-    prompt = [p[0] if p else None for p in pairs]
-    completion = [p[1] if p else None for p in pairs]
-    return pa.array(prompt, type=pa.int64()), pa.array(completion, type=pa.int64())
-
-
 def vllm_engine(
     model: str,
     *,
+    chat: bool = False,
+    system: str | None = None,
     sampling: dict[str, object] | None = None,
     guided_json: dict[str, object] | None = None,
     guided_regex: str | None = None,
@@ -201,6 +40,13 @@ def vllm_engine(
     ``list[str] -> list[str]`` callable, with full control over modern batch-inference
     knobs:
 
+    * `chat` — send each prompt as a **chat conversation** (``LLM.chat``), so vLLM
+      applies the model's own chat template. Set this for any instruction-tuned or
+      chat model: the completion path (`chat=False`, the default, matching a base
+      model) skips the template, and the model then answers a prompt in a format it
+      was never tuned on — degraded output with nothing to signal it. `system` adds a
+      system turn to every conversation. Not compatible with `image_column` (an image
+      has no place in a text conversation) — use the completion path for vision.
     * `sampling` — `SamplingParams` kwargs (``temperature``, ``top_p``, ``max_tokens``,
       ``stop``, ``n``, ``seed``, ...). Defaults to greedy (``temperature=0``).
     * `guided_json` / `guided_regex` — **structured output**: constrain generation to a
@@ -252,7 +98,9 @@ def vllm_engine(
         def engine(prompts: list) -> list[str]:
             # Route per-row by adapter (a request may carry an "adapter" tag), running
             # each adapter's group together; usage + order are preserved.
-            texts, usage = _generate_routed(llm, params, prompts, lora_table)
+            texts, usage = _generate_routed(
+                llm, params, prompts, lora_table, chat=chat, system=system
+            )
             engine.last_usage = usage
             return texts
 
@@ -272,21 +120,58 @@ def _group_indices_by_adapter(prompts: list) -> dict[str | None, list[int]]:
     return groups
 
 
-def _generate_routed(llm, params, prompts: list, lora_table: dict):
+def _generate_routed(
+    llm, params, prompts: list, lora_table: dict, *, chat: bool = False, system: str | None = None
+):
     """Generate with per-row LoRA routing: group requests by adapter, run each group with
     that adapter's `LoRARequest` (from `lora_table`, `None` key = base/single adapter),
     and reassemble outputs + per-prompt token usage in input order.
 
-    Pure but for `llm.generate`, so it tests with a stub `llm` (no vLLM/GPU)."""
+    With `chat`, each request is wrapped as a conversation and sent through
+    ``llm.chat``, which applies the model's own chat template; otherwise the raw prompt
+    goes to ``llm.generate``.
+
+    Pure but for `llm.generate`/`llm.chat`, so it tests with a stub `llm` (no vLLM/GPU)."""
     texts: list[str | None] = [None] * len(prompts)
     usage: list[tuple[int, int] | None] = [None] * len(prompts)
     for name, idxs in _group_indices_by_adapter(prompts).items():
-        requests = [_vllm_request(prompts[i]) for i in idxs]
-        outputs = llm.generate(requests, params, lora_request=lora_table.get(name))
+        lora = lora_table.get(name)
+        if chat:
+            convos = [_chat_messages(prompts[i], system) for i in idxs]
+            outputs = llm.chat(convos, params, lora_request=lora)
+        else:
+            requests = [_vllm_request(prompts[i]) for i in idxs]
+            outputs = llm.generate(requests, params, lora_request=lora)
         for j, o in zip(idxs, outputs, strict=True):
             texts[j] = o.outputs[0].text
             usage[j] = (len(o.prompt_token_ids), len(o.outputs[0].token_ids))
     return texts, usage
+
+
+def _chat_messages(prompt: object, system: str | None) -> list[dict[str, str]]:
+    """One request as an OpenAI-style conversation: an optional system turn, then the user turn.
+
+    vLLM's ``LLM.chat`` renders these through the model's own chat template, which is
+    what an instruction-tuned model was trained on. Sending the bare prompt to
+    ``LLM.generate`` instead skips the template — the model still answers, just far
+    worse, with no error to notice.
+
+    Raises:
+        ValueError: For a vision request, whose image has no place in a text
+            conversation; use the completion path (``chat=False``) for `image_column`.
+    """
+    if isinstance(prompt, dict):
+        if prompt.get("image") is not None:
+            raise ValueError(
+                "vllm_engine(chat=True) cannot carry an image_column; "
+                "use chat=False (the completion path) for vision-language models"
+            )
+        text = prompt["prompt"]
+    else:
+        text = prompt
+    messages = [{"role": "system", "content": system}] if system else []
+    messages.append({"role": "user", "content": str(text)})
+    return messages
 
 
 def _vllm_batch_defaults(engine_kwargs: dict[str, object]) -> dict[str, object]:
@@ -371,6 +256,8 @@ def http_engine(
     chat: bool = True,
     max_tokens: int = 512,
     temperature: float = 0.0,
+    top_p: float | None = None,
+    stop: list[str] | None = None,
     timeout: float = 60.0,
     concurrency: int = 8,
 ) -> EngineFactory:
@@ -381,7 +268,9 @@ def http_engine(
     ``/completions``; with chat, the **server applies the model's chat template**, so a
     plain prompt string is wrapped as a user message (with an optional `system`
     message). Works against vLLM's OpenAI server, llama.cpp, or a hosted API. `api_key`
-    sets the bearer token; `max_tokens`/`temperature` control decoding.
+    sets the bearer token; `max_tokens`/`temperature`/`top_p`/`stop` control decoding
+    (`top_p` and `stop` are omitted from the request body when unset, so a server that
+    rejects unknown or null fields still works).
 
     The prompts in each batch are sent **concurrently** over up to `concurrency`
     in-flight requests (input order preserved), so a batch's latency is the slowest
@@ -401,7 +290,9 @@ def http_engine(
             headers["Authorization"] = f"Bearer {api_key}"
 
         def call_one(prompt: str) -> tuple[str, tuple[int | None, int | None]]:
-            body = _openai_body(model, prompt, chat, system, max_tokens, temperature)
+            body = _openai_body(
+                model, prompt, chat, system, max_tokens, temperature, top_p=top_p, stop=stop
+            )
             # Retries with backoff handle the 429 rate limits hosted APIs return.
             resp = post_json(url, body, headers=headers, timeout=timeout)
             return _openai_text(resp, chat), _openai_usage(resp)
@@ -424,9 +315,27 @@ def http_engine(
 
 
 def _openai_body(
-    model: str, prompt: str, chat: bool, system: str | None, max_tokens: int, temperature: float
+    model: str,
+    prompt: str,
+    chat: bool,
+    system: str | None,
+    max_tokens: int,
+    temperature: float,
+    *,
+    top_p: float | None = None,
+    stop: list[str] | None = None,
 ) -> dict[str, object]:
-    common = {"model": model, "max_tokens": max_tokens, "temperature": temperature}
+    """The OpenAI request body. Unset sampling fields are omitted, not sent as null:
+    several OpenAI-compatible servers reject a null `stop` or an unknown key."""
+    common: dict[str, object] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if top_p is not None:
+        common["top_p"] = top_p
+    if stop:
+        common["stop"] = stop
     if not chat:
         return {**common, "prompt": prompt}
     messages = ([{"role": "system", "content": system}] if system else []) + [

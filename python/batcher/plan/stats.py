@@ -90,6 +90,7 @@ class ColumnStat:
     null_count: float | None = None
     ndv: float | None = None  # number of distinct values
     total_sum: float | None = None  # only when a catalog/format records it; enables exact sum()
+    mean: float | None = None  # recorded average of the non-null values; enables avg()/mean()
     provenance: Provenance = Provenance.DEFAULT
     # A serialized membership bloom over the column's values (a `BloomIndex`), for
     # data-skipping an equality/`IN` predicate the way min/max skip a range. It

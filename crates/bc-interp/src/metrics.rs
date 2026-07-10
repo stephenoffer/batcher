@@ -26,8 +26,17 @@ pub struct OpMetric {
     /// (`scan`, `filter`, `aggregate`, `hash_join`, ...). Kyber buckets cost
     /// calibration by this.
     pub kind: &'static str,
-    /// Rows fed into this operator (sum over child outputs; = `rows_out` for a scan).
+    /// Rows fed into this operator. For a single-input operator this is its child's
+    /// output; for a scan it equals `rows_out`. For a **join** it is the *probe* side
+    /// only (the left input) — not the sum of both sides. The probe rows are what the
+    /// per-row probe cost scales with, and `rows_out / rows_in` is then the join's
+    /// fan-out. Summing both sides made `selectivity` mean nothing and conflated the
+    /// asymmetric build and probe costs into one calibrated coefficient.
     pub rows_in: u64,
+    /// Rows fed into a join's *build* side (the right input, over which the hash table
+    /// is constructed). `0` for every non-join operator. The join's memory scales with
+    /// this, not with `rows_in`.
+    pub rows_build: u64,
     /// Rows this operator produced.
     pub rows_out: u64,
     /// Wall-clock nanoseconds spent in this operator's *own* work (excludes the
@@ -44,9 +53,23 @@ pub struct OpMetric {
     /// which is wrong under a cgroup CPU quota (a container sees host cores but rayon
     /// sizes to the quota), the common case in a Kubernetes deployment.
     pub threads: u32,
-    /// Bytes held by this operator's result (Arrow `get_array_memory_size`). A
-    /// coarse proxy for peak working-set used to calibrate the memory cost axis.
+    /// Bytes simultaneously live for this operator — its **peak working set**.
+    ///
+    /// For a pipeline breaker (aggregate / sort / distinct / window / join) that is the
+    /// materialized input it holds *plus* the result it is building, because both exist
+    /// at once. For a streaming operator it is the result alone.
+    ///
+    /// This used to be `batch_bytes(out)` — the operator's *output* size — for every
+    /// operator, which is a catastrophic under-count for exactly the cardinality-reducing
+    /// breakers that spill: a 60M-row aggregate over 4 groups reported ~0 peak. Carbonite
+    /// fits its per-family memory model on this field and drives admission, spill routing,
+    /// buffer reservation and per-worker sizing from it, so the under-count systematically
+    /// under-provisioned the operators most likely to exhaust memory.
     pub peak_bytes: u64,
+    /// Bytes held by this operator's *result* alone (Arrow `get_array_memory_size`).
+    /// What `peak_bytes` used to contain. The profiler reports this as `result_bytes`;
+    /// nothing sizes memory from it.
+    pub result_bytes: u64,
     /// Whether the operator engaged its out-of-core spill path.
     pub spilled: bool,
     /// Which execution backend ran the per-row work: `"interp"`, `"jit"`, or

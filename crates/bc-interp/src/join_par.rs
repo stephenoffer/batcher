@@ -168,9 +168,8 @@ pub(crate) fn broadcast_join(
     output: &[bc_ir::JoinOutputCol],
 ) -> Result<Vec<RecordBatch>, InterpError> {
     use bc_ir::{JoinSide, JoinStrategy, JoinType};
-    // Full: a single pass (chunks would duplicate both sides' unmatched rows).
-    if matches!(join_type, JoinType::Full) {
-        return Ok(vec![ops::join_batches(
+    let single_pass = || {
+        ops::join_batches(
             left,
             right,
             left_keys,
@@ -178,7 +177,26 @@ pub(crate) fn broadcast_join(
             join_type,
             output,
             JoinStrategy::Hash,
-        )?]);
+        )
+    };
+    // Full: a single pass (chunks would duplicate both sides' unmatched rows).
+    if matches!(join_type, JoinType::Full) {
+        return Ok(vec![single_pass()?]);
+    }
+    // An empty probe has no row-range chunks, so the chunked path below would produce
+    // *zero* batches — and a batch is the only thing that carries a schema. Every
+    // downstream pipeline breaker (join, aggregate, distinct) materializes its input and
+    // needs that schema even over zero rows, so an empty relation must still be one
+    // zero-row batch. The single-pass join produces exactly that. `Right` drives from
+    // the right side, so test the side that will become the probe.
+    let probe_is_right = matches!(join_type, JoinType::Right);
+    let probe_rows = if probe_is_right {
+        right.num_rows()
+    } else {
+        left.num_rows()
+    };
+    if probe_rows == 0 {
+        return Ok(vec![single_pass()?]);
     }
     // Right: chunk the driving (right) side, joined against the full left as a LEFT
     // join with flipped keys + output sides. Mirror of the left-driven path.

@@ -156,6 +156,74 @@ print(bt.read.parquet(t3).sort("id").to_pydict())
 # {'id': [1], 'city': ['LA'], 'city_prev': ['NYC']}
 ```
 
+## Change data capture
+
+`type1`/`type2`/`type3` take a clean snapshot of the dimension as it is *now*.
+A change-data-capture connector — Debezium, a Delta change feed, a Snowflake stream —
+does not give you that. It gives you the stream of what *happened*: inserts, updates,
+and deletes, delivered more than once and out of order.
+
+`ds.scd.apply_changes` consumes that feed directly (Delta Live Tables spells the same
+thing `APPLY CHANGES INTO ... STORED AS SCD TYPE 1`):
+
+```python
+cdc = os.path.join(work, "customers_cdc.parquet")
+
+feed = bt.from_pydict(
+    {
+        "id": [1, 2, 1],
+        "city": ["NYC", "LA", "SF"],
+        "op": ["INSERT", "INSERT", "UPDATE"],
+        "seq": [1, 2, 3],
+    }
+)
+feed.scd.apply_changes(
+    cdc,
+    keys="id",
+    sequence_by="seq",
+    deletes=bt.col("op") == "DELETE",
+    columns=["id", "city"],  # `op` drives the delete predicate; it is not stored
+)
+
+print(bt.read.parquet(cdc).sort("id").select("id", "city").to_pydict())
+# {'id': [1, 2], 'city': ['SF', 'LA']}
+```
+
+Three rules make this safe against a feed you do not control:
+
+* Within a batch, only the greatest-`sequence_by` change per key survives, so
+  redeliveries and out-of-order rows collapse to the latest.
+* `sequence_by` is **stored in the target**, so a *later* batch can recognize a change
+  older than what already landed and discard it, rather than resurrecting old data.
+* A row matching `deletes` removes the target row; a delete for an absent key is a
+  tombstone and changes nothing.
+
+```python
+later = bt.from_pydict(
+    {"id": [2, 1], "city": ["LA", "OLD"], "op": ["DELETE", "UPDATE"], "seq": [4, 0]}
+)
+later.scd.apply_changes(
+    cdc, keys="id", sequence_by="seq", deletes=bt.col("op") == "DELETE", columns=["id", "city"]
+)
+
+print(bt.read.parquet(cdc).select("id", "city").to_pydict())
+# {'id': [1], 'city': ['SF']}
+```
+
+`id=2` was deleted; the stale `seq=0` update for `id=1` was discarded because the target
+already holds `seq=3`.
+
+Re-applying a batch is therefore a no-op, and applying batches in non-decreasing sequence
+order — what a CDC reader produces — converges on the source's state.
+
+:::{warning}
+The apply is idempotent but not commutative. A delete is physical, not a tombstone, so a
+deleted key stores no sequence to compare against: replaying an *old insert* for a key
+that was since deleted will resurrect it. Feed batches in sequence order, and treat a full
+replay of a feed containing deletes as a rebuild, not a resume. Delta Live Tables' SCD
+type 1 has the same shape and the same caveat.
+:::
+
 ## Iceberg and Hudi
 
 Iceberg uses the same `read`/`write` surface, addressed by catalog identifier with

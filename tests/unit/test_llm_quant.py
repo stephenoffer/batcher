@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from batcher.ml.gpu import recommend_quantization
-from batcher.ml.llm import _with_auto_quant
+from batcher.ml.llm.engines import _with_auto_quant
 
 pytestmark = pytest.mark.unit
 

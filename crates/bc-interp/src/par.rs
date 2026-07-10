@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow::array::{Array, RecordBatch};
-use bc_ir::{EngineConfig, RelOp};
+use bc_ir::{AggFunc, AggregateItem, EngineConfig, ProjectionItem, RelOp};
 use bc_resource::{MemoryPool, MemoryReservation};
 use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore, SpillCodec};
 use bc_runtime::{agg, shuffle};
@@ -300,15 +300,47 @@ pub fn execute_parallel_with_metrics(
     // `parallelism == 0` ("all cores") therefore resolves to `available_parallelism`, which
     // reads the now-applied affinity; a positive value pins the requested width. On a
     // single node this is the same width as the global pool, so the result is unchanged.
-    let width = if opts.parallelism > 0 {
-        opts.parallelism
-    } else {
-        std::thread::available_parallelism()
-            .map(|v| v.get())
-            .unwrap_or(1)
-    };
+    let width = auto_width(opts, sources);
     let out = pool_for(width)?.install(|| exec(plan, sources, opts, &mut m, &mut ids))?;
     Ok((out, m))
+}
+
+/// The worker count this execution runs on.
+///
+/// An explicit `EngineConfig.parallelism` is honored verbatim — the control plane asked
+/// for that width and the hash-shuffle bucket count keys off it. Otherwise the width is
+/// "all cores", **capped by the number of morsels the inputs can actually produce**.
+///
+/// A worker with no morsel to take does no work, but it is not free: rayon still wakes
+/// it, it contends for the pool's job queue, and — because a scoped pool is cached per
+/// width — a one-row query would otherwise install and spin a 96-thread pool. Batcher's
+/// stated goal of low fixed overhead on sub-second queries is exactly this case. The cap
+/// is an upper bound on useful parallelism at the leaves, so it can never remove
+/// parallelism a plan could have used, and it never changes a result (scheduling only).
+fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>]) -> usize {
+    if opts.parallelism > 0 {
+        return opts.parallelism;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    cores.min(max_useful_workers(opts, sources)).max(1)
+}
+
+/// An upper bound on workers that could have a morsel to process: the largest number of
+/// morsels any single source yields. Operators fan out over one input's morsels at a
+/// time, so the widest leaf bounds the widest `par_iter`.
+fn max_useful_workers(opts: &ExecOptions, sources: &[Vec<RecordBatch>]) -> usize {
+    let target_rows = opts.morsel_target().rows.max(1);
+    sources
+        .iter()
+        .map(|batches| {
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            rows.div_ceil(target_rows)
+        })
+        .max()
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// Process-wide cache of fixed-width rayon thread pools, keyed by worker count.
@@ -551,6 +583,19 @@ fn exec(
             group_keys,
             aggregates,
         } => {
+            // Streaming Filter/Project → Aggregate fusion: fold each source morsel through
+            // the fusable linear chain and directly into its partial state, never
+            // materializing the full (often multi-GB) filtered/projected relation. Gated on
+            // the control plane opting into linear fusion, a fusable input, and every
+            // aggregate being constant-state — its out-of-core spill folds from *partials*
+            // via grace partitioning, whereas the value-list aggregates (median / quantile /
+            // distinct / mode / histogram) spill from the raw morsels and keep the
+            // materializing path. The partials are exactly those the unfused parallel path
+            // builds (same per-morsel partial-then-combine), so the result is identical
+            // within the float tolerance the parallel path already carries.
+            if opts.fuse_linear && is_fusable(input) && !needs_parts_for_spill(aggregates) {
+                return exec_agg_fused(input, op_id, group_keys, aggregates, sources, opts, m, ids);
+            }
             let parts = exec(input, sources, opts, m, ids)?;
             if parts.is_empty() {
                 return Err(InterpError::EmptyAggregateInput);
@@ -1250,6 +1295,167 @@ fn exec_fused(
     Ok(out)
 }
 
+/// Whether any aggregate needs the raw input morsels (not just partials) for its
+/// out-of-core spill — the value-list aggregates whose per-group state is unbounded.
+/// Those keep the materializing path; everything else spills from partials via grace.
+fn needs_parts_for_spill(aggregates: &[AggregateItem]) -> bool {
+    aggregates.iter().any(|a| {
+        matches!(
+            a.func,
+            AggFunc::Median
+                | AggFunc::Quantile
+                | AggFunc::CountDistinct
+                | AggFunc::Mode
+                | AggFunc::Histogram
+                | AggFunc::ListAgg
+                | AggFunc::ApproxCountDistinct
+                | AggFunc::ApproxQuantile
+        )
+    })
+}
+
+/// Fused Filter/Project → Aggregate: build each morsel's partial state directly from the
+/// linear chain's per-morsel output, without ever collecting the transformed relation.
+/// The chain is numbered and metered exactly as the recursive `exec` would (so adaptive
+/// metadata and the metric tree are unchanged), and the partials feed the same
+/// `combine`/grace-spill path as the unfused aggregate. Caller has checked the input is a
+/// fusable chain and no aggregate needs raw morsels for spill.
+#[allow(clippy::too_many_arguments)]
+fn exec_agg_fused(
+    input: &RelOp,
+    op_id: u32,
+    group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
+    sources: &[Vec<RecordBatch>],
+    opts: &ExecOptions,
+    m: &mut ExecMetrics,
+    ids: &mut IdGen,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    // Number the fusable chain (Filter/Project) below the aggregate, then execute the
+    // first non-fusable input — the exact pre-order numbering the recursive `exec` uses.
+    let mut chain: Vec<(u32, &RelOp)> = vec![(ids.next(), input)];
+    let mut base = fusable_input(input).expect("a fusable op has an input");
+    while is_fusable(base) {
+        chain.push((ids.next(), base));
+        base = fusable_input(base).expect("a fusable op has an input");
+    }
+    let base_morsels = exec(base, sources, opts, m, ids)?;
+    if base_morsels.is_empty() {
+        return Err(InterpError::EmptyAggregateInput);
+    }
+    let base_rows = count_rows(&base_morsels);
+
+    let stage_t0 = Stopwatch::start();
+    // Compile each linear stage innermost→outermost against the schema it sees, then the
+    // aggregate's expressions against the post-chain sample (mirrors the unfused compiles).
+    let mut sample = base_morsels.first().cloned();
+    let mut stages: Vec<FusedStage> = Vec::with_capacity(chain.len());
+    for (id, op) in chain.iter().rev() {
+        let stage = compile_stage(*id, op, sample.as_ref());
+        if let Some(s) = &sample {
+            sample = Some(stage.apply(s)?);
+        }
+        stages.push(stage);
+    }
+    let agg_sample = sample.as_ref().expect("non-empty base has a sample");
+    let agg_jit = ops::compile_agg(group_keys, aggregates, agg_sample);
+
+    // Per morsel: run the chain, then fold the result straight into a partial. Track the
+    // row count after each stage so the fused ops keep exact selectivity metrics.
+    let n = stages.len();
+    let results: Vec<(agg::Partial, Vec<u64>)> = base_morsels
+        .par_iter()
+        .map(|b| {
+            let mut cur = b.clone();
+            let mut stage_rows = Vec::with_capacity(n);
+            for stage in &stages {
+                cur = stage.apply(&cur)?;
+                stage_rows.push(cur.num_rows() as u64);
+            }
+            let partial = ops::eval_partial_jit(&cur, group_keys, aggregates, &agg_jit)?;
+            Ok((partial, stage_rows))
+        })
+        .collect::<Result<Vec<_>, InterpError>>()?;
+
+    let mut totals = vec![0u64; n];
+    let mut partials = Vec::with_capacity(results.len());
+    for (partial, rows) in results {
+        for (i, r) in rows.iter().enumerate() {
+            totals[i] += r;
+        }
+        partials.push(partial);
+    }
+    // Emit one metric per fused linear op (children before parents), as `exec_fused` does.
+    let stage_elapsed = stage_t0.elapsed_ns().max(1) / n as u64;
+    let stage_cpu = stage_t0.cpu_ns() / n as u64;
+    let threads = rayon::current_num_threads().max(1) as u32;
+    for (i, stage) in stages.iter().enumerate() {
+        let rows_in = if i == 0 { base_rows } else { totals[i - 1] };
+        m.record(OpMetric {
+            op_id: stage.op_id(),
+            kind: stage.kind(),
+            rows_in,
+            rows_out: totals[i],
+            elapsed_ns: stage_elapsed,
+            cpu_ns: stage_cpu,
+            threads,
+            peak_bytes: 0,
+            spilled: false,
+            backend: stage.backend(),
+        });
+    }
+
+    // Combine the partials — the same in-memory / grace-spill path as the unfused
+    // aggregate (no value-list aggregate reaches here, so no raw-morsel spill is needed).
+    let agg_t0 = Stopwatch::start();
+    let funcs = ops::agg_funcs(aggregates);
+    let rows_in = *totals.last().unwrap_or(&base_rows);
+    let state_bytes = partial_state_bytes(&partials);
+    let mut spilled = false;
+    let decision = if rows_in > 0 {
+        admit(opts, op_id, state_bytes)
+    } else {
+        Admit::InMemory(None)
+    };
+    let (group_columns, agg_cols) = match decision {
+        Admit::Spill => {
+            let global = opts.agg_spill.as_ref().expect("spill implies an envelope");
+            let sp =
+                &global.with_budget(opts.op_budget(op_id).unwrap_or(global.memory_budget_bytes));
+            spilled = true;
+            let p = grace_partitions(&partials, sp.memory_budget_bytes);
+            let mut store =
+                DiskSpillStore::with_codec(sp.dir.join(format!("agg-{p}p")), p, sp.codec)?;
+            let res =
+                combine_finalize_spilling(partials, &funcs, &mut store, sp.memory_budget_bytes)?;
+            (res.group_columns, res.agg_columns)
+        }
+        Admit::InMemory(_reservation) => {
+            let merged =
+                agg::combine_with(&partials, &funcs, opts.tuning.radix_parallel_threshold)?;
+            let agg_cols = agg::finalize(&funcs, &merged)?;
+            (merged.group_columns, agg_cols)
+        }
+    };
+    let out = vec![ops::build_agg_batch(
+        group_keys,
+        aggregates,
+        &group_columns,
+        &agg_cols,
+    )?];
+    push_metric(
+        m,
+        op_id,
+        "aggregate",
+        rows_in,
+        &out,
+        agg_t0,
+        spilled,
+        "interp",
+    );
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_metric(
     m: &mut ExecMetrics,
@@ -1396,6 +1602,63 @@ mod tests {
             ("v", Arc::new(Int64Array::from(vals.to_vec())) as ArrayRef),
         ])
         .unwrap()
+    }
+
+    /// An explicit `parallelism` is the control plane's decision and is never overridden —
+    /// the hash-shuffle bucket count keys off exactly this width.
+    #[test]
+    fn explicit_parallelism_is_honored_verbatim() {
+        let opts = ExecOptions {
+            parallelism: 7,
+            ..ExecOptions::default()
+        };
+        // One tiny source: the morsel cap would say 1, but the explicit width wins.
+        assert_eq!(auto_width(&opts, &[vec![batch(&[1], &[1])]]), 7);
+    }
+
+    /// A worker with no morsel to take still costs a wake-up and queue contention, so the
+    /// automatic width never exceeds the morsels the inputs can yield. A one-row query
+    /// must not install a 96-thread pool.
+    #[test]
+    fn auto_width_never_exceeds_available_morsels() {
+        let opts = ExecOptions {
+            parallelism: 0,
+            morsel_rows: 2,
+            ..ExecOptions::default()
+        };
+        // 1 row → 1 morsel → 1 worker.
+        assert_eq!(auto_width(&opts, &[vec![batch(&[1], &[1])]]), 1);
+        // 5 rows at 2 rows/morsel → 3 morsels; capped further by the machine's cores.
+        let cores = std::thread::available_parallelism().map_or(1, |v| v.get());
+        let five = vec![batch(&[1, 2, 3, 4, 5], &[1, 2, 3, 4, 5])];
+        assert_eq!(auto_width(&opts, &[five]), 3.min(cores));
+    }
+
+    /// The bound is the *widest* source, not their sum: an operator fans out over one
+    /// input's morsels at a time, so a large probe side must not be throttled by a tiny
+    /// build side.
+    #[test]
+    fn auto_width_uses_the_widest_source() {
+        let opts = ExecOptions {
+            parallelism: 0,
+            morsel_rows: 1,
+            ..ExecOptions::default()
+        };
+        let small = vec![batch(&[1], &[1])];
+        let large = vec![batch(&[1, 2, 3, 4], &[1, 2, 3, 4])];
+        let cores = std::thread::available_parallelism().map_or(1, |v| v.get());
+        assert_eq!(auto_width(&opts, &[small, large]), 4.min(cores));
+    }
+
+    /// No sources (a literal-only plan) still needs one worker, never zero.
+    #[test]
+    fn auto_width_is_at_least_one() {
+        let opts = ExecOptions {
+            parallelism: 0,
+            ..ExecOptions::default()
+        };
+        assert_eq!(auto_width(&opts, &[]), 1);
+        assert_eq!(auto_width(&opts, &[vec![]]), 1);
     }
 
     fn str_batch(vals: &[&str]) -> RecordBatch {
@@ -3285,6 +3548,67 @@ mod tests {
                 rows(&bcast),
                 "broadcast join type {jt:?} mismatch"
             );
+        }
+    }
+
+    /// A broadcast join whose probe side is empty must still emit **one zero-row batch**,
+    /// not zero batches.
+    ///
+    /// A batch is the only carrier of a schema. The chunked probe path produces one batch
+    /// per probe row-range, so an empty probe yields no chunks and therefore no batches —
+    /// and every downstream pipeline breaker (join / aggregate / distinct) materializes
+    /// its input and fails with `EmptyJoinInput` when handed none. Empty intermediates are
+    /// routine (an incremental batch with no changes, a filter that matches nothing), so
+    /// the invariant is: an operator whose input carried a schema returns a batch.
+    #[test]
+    fn broadcast_join_over_an_empty_probe_still_carries_a_schema() {
+        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+
+        let join_plan = |jt: JoinType| RelOp::HashJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["k".into()],
+            join_type: jt,
+            output: vec![JoinOutputCol {
+                side: JoinSide::Left,
+                name: "k".into(),
+                alias: "lk".into(),
+            }],
+            strategy: JoinStrategy::Broadcast,
+        };
+        let empty = vec![batch(&[], &[])];
+        let full = vec![batch(&[2, 3], &[1, 2])];
+
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            // `Right` drives from the right, so give each join type an empty probe side.
+            let (l, r) = if matches!(jt, JoinType::Right) {
+                (full.clone(), empty.clone())
+            } else {
+                (empty.clone(), full.clone())
+            };
+            let out = execute_parallel_with(
+                &join_plan(jt),
+                &[l.clone(), r.clone()],
+                &ExecOptions::default(),
+            )
+            .unwrap();
+            assert!(
+                !out.is_empty(),
+                "{jt:?}: empty probe produced no batch, losing the schema"
+            );
+            assert_eq!(out[0].schema().field(0).name(), "lk", "{jt:?}");
+            // The relation itself is still whatever the sequential oracle says — a `Full`
+            // join over an empty probe legitimately emits the other side's unmatched rows.
+            let oracle = execute(&join_plan(jt), &[l, r]).unwrap();
+            assert_eq!(rows(&oracle), rows(&out), "{jt:?}: relation changed");
         }
     }
 

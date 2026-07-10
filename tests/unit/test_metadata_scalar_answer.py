@@ -91,10 +91,12 @@ def test_exact_ndv_required_for_n_unique(pq_path):
     assert ds.n_unique("x") == 4  # but execution is correct
 
 
-def test_in_memory_scalars_fall_back_and_are_correct():
+def test_in_memory_scalars_answered_from_learned_bounds():
     ds = bt.from_arrow(pa.table({"x": pa.array([1, 1, None, 4], type=pa.int64())}))
-    # No footer stats → metadata returns None, public terminal executes correctly.
-    assert metadata_min(ds._plan, ds._sources, "x") is None
+    # An in-memory source now exposes EXACT column bounds (learned once, cached per instance),
+    # so an unfiltered `min` is answered from metadata and equals a full run. `n_unique` has
+    # no ndv to derive from, so it still executes — correct either way.
+    assert metadata_min(ds._plan, ds._sources, "x") == 1
     assert ds.min("x") == 1
     assert ds.n_null("x") == 1
     assert ds.n_unique("x") == 2
@@ -144,7 +146,10 @@ def test_value_at_quantile_edges():
 def test_sum_is_candidate_but_executes_without_recorded_total(pq_path):
     # `sum` joined `_METADATA_DERIVABLE_AGGS`, so it is *attempted*; a Parquet footer
     # records no exact total, so the answer is None and execution produces the value.
-    from batcher.api.terminal.metadata_answer import is_global_aggregate, metadata_aggregate_table
+    from batcher.api.terminal.metadata_answer import (
+        is_global_aggregate,
+        metadata_aggregate_table,
+    )
 
     ds = _ds(pq_path).agg(s=bt.col("x").sum())
     assert is_global_aggregate(ds._plan) is True  # now a candidate

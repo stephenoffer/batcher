@@ -7,6 +7,7 @@ free functions users call directly (e.g. `col("x")`, `when(c).then(v)`).
 
 from __future__ import annotations
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import (
     AggExpr,
     Coalesce,
@@ -16,7 +17,15 @@ from batcher.plan.expr_ir.core import (
     Math2Expr,
     _wrap,
 )
-from batcher.plan.expr_ir.nodes import Array, CaseBuilder, Col, Greatest, Least, NullIf
+from batcher.plan.expr_ir.nodes import (
+    Array,
+    CaseBuilder,
+    Col,
+    Greatest,
+    HashRows,
+    Least,
+    NullIf,
+)
 
 
 def when(cond: Expr) -> CaseBuilder:
@@ -145,6 +154,49 @@ def atan2(y: IntoExpr, x: IntoExpr) -> Math2Expr:
             {'r': [0.0]}
     """
     return Math2Expr("atan2", _wrap(y), _wrap(x))
+
+
+def hash_rows(*exprs: IntoExpr, seed: int = 0) -> HashRows:
+    """A deterministic 64-bit hash of the given values, per row → Int64.
+
+    Typed rather than textual: an integer hashes its bits, a float its canonicalized
+    IEEE bits (so ``-0.0`` and ``0.0`` agree, and every NaN agrees), a string its UTF-8
+    bytes. That makes it independent of how a float renders, and far cheaper than
+    hashing ``cast(col, "string")``. Order-sensitive across `exprs`, and null is a
+    distinct value — ``hash_rows(1, None)`` and ``hash_rows(None, 1)`` differ, and
+    neither collides with ``hash_rows(1, 1)``.
+
+    The digest is stable across partitions, runs, machines and Batcher versions, which
+    is what lets it key a reproducible train/test split, a surrogate key, or a hash
+    bucket. Two rows that compare equal always hash equally; two that differ may (very
+    rarely) collide, as with any 64-bit hash.
+
+    Args:
+        *exprs: The values to hash, in order. At least one is required.
+        seed: Changes the digest; the same seed reproduces it.
+
+    Returns:
+        An Int64 expression — the row's digest.
+
+    Raises:
+        PlanError: If no expressions are given.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [1, 1, 2], "b": ["x", "x", "x"]})
+            >>> h = ds.select(h=bt.hash_rows(bt.col("a"), bt.col("b"))).to_pydict()["h"]
+            >>> h[0] == h[1], h[0] == h[2]
+            (True, False)
+
+            >>> # Deterministic bucketing: 10 stable buckets, partition-independent.
+            >>> ds.select(bucket=bt.hash_rows(bt.col("a")).abs() % 10).to_pydict()["bucket"]
+            [9, 9, 5]
+    """
+    if not exprs:
+        raise PlanError("hash_rows() requires at least one expression")
+    return HashRows([_wrap(e) for e in exprs], int(seed))
 
 
 def greatest(*exprs: IntoExpr) -> Greatest:

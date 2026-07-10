@@ -164,8 +164,11 @@ For data-parallel training across ranks, use `ds.ml.stream_loader`, which gives 
 rank a `torch.utils.data.IterableDataset` over its slice of a single, seed-reproducible
 global order. It is the one shard authority — **disable any framework auto-sharding**
 (`DistributedSampler`, a DataLoader sampler) so the splits do not overlap. Every rank
-yields the *same* number of batches (`drop_last=True`), so no rank finishes early and
-stalls the others at the all-reduce barrier — the property DDP and FSDP both depend on.
+yields the *same* number of batches, so no rank finishes early and stalls the others at
+the all-reduce barrier — the property DDP and FSDP both depend on. `drop_last` only
+chooses how the epoch's tail is made divisible by `world_size`: `True` (the default)
+drops the remainder, `False` keeps it and pads by repeating a few samples, exactly as
+`torch.utils.data.DistributedSampler` does. Neither mode hands the ranks unequal counts.
 
 ```python
 # docs: skip

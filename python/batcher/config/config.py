@@ -339,6 +339,17 @@ class CardinalityConfig:
     eq_selectivity: float = 0.1  # col = literal
     range_selectivity: float = 1.0 / 3.0  # col <|<=|>|>= literal
     null_selectivity: float = 0.05  # col IS NULL
+    # String-pattern predicates (`LIKE`, `contains`, `starts_with`, a regex match).
+    # Without a string histogram their true selectivity is unknowable, but they are
+    # near-universally *selective* — a substring search that matched half the table
+    # would not be worth writing. Falling back to `default_filter_selectivity` (0.5)
+    # made Kyber believe TPC-H Q9's `p_name LIKE '%green%'` kept 100k of 200k parts
+    # (it keeps 10.7k), hiding the most selective join in the query and steering the
+    # order into gigabyte intermediates. These are the conventional optimizer defaults
+    # (Postgres/Spark use the same order of magnitude) and are cold-start values only:
+    # the learning loop replaces them with the measured selectivity on re-execution.
+    substring_selectivity: float = 0.05  # col LIKE '%x%' / contains / regex match
+    prefix_selectivity: float = 0.10  # col LIKE 'x%' / starts_with / ends_with
     # A value appearing in at least this fraction of a column's rows is recorded as a
     # most-common-value (MCV), so `col = <that value>` uses its measured frequency
     # instead of the uniform `1/ndv` — the skew case where `1/ndv` is most wrong.
@@ -371,6 +382,14 @@ class CostCoefficients:
     union_row: float = 0.2
     map_row: float = 5.0  # opaque UDF: assume expensive
     bytes_per_row: float = 64.0  # rough row width for io/net axes
+    # The divisor `expr_cost` applies to an expression the Cranelift tier compiles — the
+    # single parameter separating compiled from interpreted pricing. A prior until
+    # `calibration` fits it: the engine tags each operator with the tier that ran it
+    # (`op_stats.backend`), and the ratio of the two tiers' expression-normalized per-row
+    # times says how much the model misprices one against the other. It is a fitted model
+    # parameter, not a hardware benchmark — it also absorbs systematic error in the
+    # hand-written interpreted-expression cost table.
+    jit_speedup: float = 4.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +427,16 @@ class OptimizerConfig:
     target_bytes_per_task: int = 256 * 1024 * 1024  # 256 MiB
     fixpoint_iterations: int = 8  # max rewrite-phase iterations before bailing
     row_bytes: int = 64  # per-row footprint for the memory-budgeting estimate
+    # `split_expensive_filter`: the engine's `and` evaluates BOTH operands over every
+    # row (no short-circuit, no selection vector), so a conjunction pairing a cheap
+    # selective predicate with an expensive one pays the expensive one on rows the
+    # cheap one would have dropped. Splitting into stacked `Filter`s makes the second
+    # see only survivors, at the price of materializing one extra compacted batch.
+    # `filter_split_materialize_cost` is that price, in the same per-row work-units as
+    # `CostCoefficients` (~one `filter_row`); `filter_split_min_gain` is the cost ratio
+    # a split must beat before it is taken, so marginal rewrites are left alone.
+    filter_split_materialize_cost: float = 1.0
+    filter_split_min_gain: float = 1.25
     # Build-side byte threshold below which a join is broadcast (the right side is
     # replicated to every worker) rather than shuffled — Spark's
     # autoBroadcastJoinThreshold. Both the planner's *estimate*-based decision and the
@@ -416,6 +445,21 @@ class OptimizerConfig:
     # to a shuffle join instead of OOMing the driver by replicating an over-large side.
     broadcast_max_bytes: int = 10 * 1024 * 1024  # 10 MiB
     learning_smoothing_alpha: float = 0.5  # exp-smoothing toward new observations
+    # Learned cardinality correction: Core reports, per operator, the rows it actually
+    # produced against the rows Kyber estimated *before* correction. The geometric mean
+    # of that q-error, per operator signature, multiplies the next structural estimate —
+    # so a join Kyber has consistently under-estimated 8x is next planned for at 8x. A
+    # signature needs at least `min_samples` observations before its factor is trusted
+    # (one anomalous run must not steer a plan), and every factor is clamped to
+    # `[1/max_factor, max_factor]` so a pathological measurement cannot produce a
+    # degenerate estimate. Set `max_factor <= 1.0` to disable the loop entirely.
+    cardinality_correction_min_samples: int = 2
+    cardinality_correction_max_factor: float = 32.0
+    # Only the most recent `window` observations of a signature are averaged. The
+    # structural estimator sharpens as the column-stat loop learns NDVs/quantiles, and
+    # data drifts, so an all-history mean would keep applying a correction the estimator
+    # has already outgrown. Set to 0 to disable the loop entirely.
+    cardinality_correction_window: int = 8
     # Cost-model calibration from measured op_stats: a kind needs at least this many
     # samples before its coefficient is calibrated (else the default constant stands),
     # and each calibrated coefficient is clamped to within this factor of its default
@@ -424,6 +468,15 @@ class OptimizerConfig:
     cost_calibration_clamp: float = 10.0
     # Quantile grid Core collects for histogram-based selectivity.
     quantile_probs: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
+    # Ceiling on the `rows x columns` an in-memory source may be sketched for cold-start
+    # distinct counts before the optimizer runs (`api.terminal._metadata.seed_column_ndv`).
+    # Only the estimator's join/group/equality columns are sketched, so the cell count is
+    # rows x a handful of columns, not the whole relation. HLL runs at ~0.4 ns/cell across
+    # cores, so this default admits sf100 `lineitem`'s three join keys (~1.8G cells, ~0.7 s
+    # once per source) — a cost the plan it fixes repays immediately, since the blind plan
+    # peaks at 23 GB on TPC-H Q8 at sf10 alone. A source past the ceiling keeps learning
+    # its ndv from the post-run pass. Result-invariant either way: ndv only steers choice.
+    ndv_sketch_max_cells: int = 1 << 31
     cardinality: CardinalityConfig = CardinalityConfig()
     cost_coeffs: CostCoefficients = CostCoefficients()
     cost_weights: CostWeights = CostWeights()

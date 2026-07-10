@@ -19,6 +19,7 @@ from batcher.plan.expr_ir.constructors import (
     col,
     count,
     greatest,
+    hash_rows,
     least,
     lit,
     nullif,
@@ -66,6 +67,7 @@ from batcher.plan.expr_ir.nodes import (
     Least,
     ListJoin,
     NullIf,
+    WindowExpr,
 )
 from batcher.plan.expr_ir.walk import referenced_columns, remap_columns
 
@@ -100,12 +102,14 @@ __all__ = [
     "NullIf",
     "StrFunc",
     "StructField",
+    "WindowExpr",
     "array",
     "atan2",
     "coalesce",
     "col",
     "count",
     "greatest",
+    "hash_rows",
     "least",
     "lit",
     "nullif",

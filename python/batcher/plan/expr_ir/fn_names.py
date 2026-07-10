@@ -36,6 +36,7 @@ from batcher.plan.ir_tags import WINDOW_AGGREGATES, WINDOW_FUNCS, WINDOW_RANKING
 
 __all__ = [
     "DATE_FNS",
+    "KEYED_STR_FNS",
     "LIST_FNS",
     "MATH_FNS",
     "STR_FNS",
@@ -64,6 +65,7 @@ class ListBinaryFn(StrEnum):
     DOT = "dot"
     COSINE_SIMILARITY = "cosine_similarity"
     L2_DISTANCE = "l2_distance"
+    JACCARD = "jaccard"
 
 
 class ListSetFn(StrEnum):
@@ -89,17 +91,26 @@ class Math2Fn(StrEnum):
 
 STR_FNS: Final[frozenset[str]] = frozenset(
     {
-        "ascii", "base64", "bit_length", "contains", "crc32", "ends_with",
-        "from_base64", "hash64", "hex", "ilike", "initcap", "json_extract_bool",
-        "json_extract_float", "json_extract_int", "json_extract_string", "l_trim",
-        "len", "levenshtein", "like", "lower", "lpad", "md5", "octet_length",
-        "overlay", "position", "r_trim", "regexp_count", "regexp_extract",
-        "regexp_extract_all", "regexp_matches", "regexp_replace",
-        "regexp_replace_all", "repeat", "replace", "reverse", "right", "rpad",
-        "sha1", "sha256", "soundex", "split", "split_part", "starts_with", "substr",
-        "substring_index", "translate", "trim", "unhex", "upper", "xxhash64",
+        "aes_decrypt", "aes_encrypt", "ascii", "base64", "bit_length", "chunk", "contains",
+        "crc32", "ends_with", "from_base64", "hash64", "hex", "hmac_sha256", "ilike",
+        "initcap", "json_extract_bool", "json_extract_float", "json_extract_int",
+        "json_extract_string", "l_trim", "len", "levenshtein", "like", "lower",
+        "lpad", "mask", "md5", "minhash", "octet_length", "overlay", "position", "r_trim",
+        "regexp_count", "regexp_extract", "regexp_extract_all", "regexp_matches",
+        "regexp_replace", "regexp_replace_all", "repeat", "replace", "reverse",
+        "right", "rpad", "sha1", "sha256", "soundex", "split", "split_part",
+        "starts_with", "substr", "substring_index", "translate", "trim", "unhex",
+        "upper", "xxhash64",
     }
 )  # fmt: skip
+
+KEYED_STR_FNS: Final[frozenset[str]] = frozenset({"aes_decrypt", "aes_encrypt", "hmac_sha256"})
+"""The `STR_FNS` members whose ``pattern`` slot carries secret key material.
+
+Named here — rather than inline in the two places that care — because both the
+plan-build-time key validation (`plan.functions.security`) and the `StrFunc.__repr__`
+redaction must agree on the set exactly. A function added to one and not the other
+would leak a key into a traceback."""
 
 DATE_FNS: Final[frozenset[str]] = frozenset(
     {

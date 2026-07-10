@@ -7,6 +7,7 @@ string→string transforms are generated from `_STR_TRANSFORMS` (data, not code)
 
 from __future__ import annotations
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Cast, Expr
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
@@ -493,6 +494,94 @@ class _StrNamespace:
                 {'r': [['a', 'b', 'c']]}
         """
         return StrFunc("split", self._e, pattern=delimiter)
+
+    def chunk(self, size: int, overlap: int = 0) -> StrFunc:
+        """Slice text into fixed-size overlapping windows → List<Utf8>.
+
+        The *split* stage of a RAG ingest pipeline: chunk each document, `explode` the
+        list into one row per chunk, then embed. Chunks start every ``size - overlap``
+        characters and stop once one reaches the end of the text, so the last chunk may
+        be shorter but is never wholly contained in its predecessor. `overlap` carries
+        context across a boundary, so a sentence cut in half still appears whole in one
+        chunk.
+
+        Sizes are in **characters** (Unicode scalar values, as :meth:`len` counts them),
+        never bytes, so a chunk boundary never splits a codepoint. An empty string
+        yields an empty list; null yields null.
+
+        Args:
+            size: Characters per chunk. Must be at least 1.
+            overlap: Characters each chunk repeats from the previous one. Must be in
+                ``[0, size)`` — an overlap equal to `size` would never advance.
+
+        Returns:
+            A List<Utf8> expression, one element per chunk.
+
+        Raises:
+            PlanError: If `size` < 1 or `overlap` is outside ``[0, size)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"doc": ["abcdefg"]})
+                >>> ds.select(r=bt.col("doc").str.chunk(3)).to_pydict()
+                {'r': [['abc', 'def', 'g']]}
+
+                >>> ds.select(r=bt.col("doc").str.chunk(4, overlap=2)).to_pydict()
+                {'r': [['abcd', 'cdef', 'efg']]}
+        """
+        if size < 1:
+            raise PlanError(f"str.chunk(): size must be >= 1, got {size}")
+        if not 0 <= overlap < size:
+            raise PlanError(f"str.chunk(): overlap must be in [0, {size}), got {overlap}")
+        # `length` carries the chunk size and `start` the overlap — the same reuse of
+        # the two scalar slots that `repeat`/`right`/`split_part` already make.
+        return StrFunc("chunk", self._e, start=overlap, length=size)
+
+    def minhash(self, num_perm: int = 128, ngram: int = 5) -> StrFunc:
+        """A MinHash signature of the text → List<Int64> of `num_perm` values.
+
+        The primitive behind fuzzy deduplication. Two signatures agree on a fraction of
+        their positions that estimates the documents' **Jaccard similarity** over their
+        character `ngram`-shingles — see :meth:`~batcher.plan.expr_ir._ListNamespace.jaccard`.
+        So near-duplicates are found by comparing 128 integers rather than two documents,
+        which is what makes deduplicating a web-scale corpus tractable.
+
+        The estimator's standard error is ``1/sqrt(num_perm)``: 128 permutations resolve
+        Jaccard to about ±0.09, 256 to ±0.06. Signature values are bounded to 32 bits so
+        `jaccard` counts agreements exactly.
+
+        `ds.ml.near_duplicates` / `ds.ml.drop_near_duplicates` build the LSH banding on
+        top of this; reach for those first.
+
+        Args:
+            num_perm: Hash permutations — the signature length. More is more accurate
+                and proportionally slower.
+            ngram: Shingle width in **characters**. Larger is stricter (fewer accidental
+                matches on short common substrings).
+
+        Returns:
+            A List<Int64> expression: the row's signature. Null text → null signature.
+
+        Raises:
+            PlanError: If `num_perm` or `ngram` is less than 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": ["the quick brown fox"]})
+                >>> len(ds.select(s=bt.col("t").str.minhash(64)).to_pydict()["s"][0])
+                64
+        """
+        if num_perm < 1:
+            raise PlanError(f"str.minhash(): num_perm must be >= 1, got {num_perm}")
+        if ngram < 1:
+            raise PlanError(f"str.minhash(): ngram must be >= 1, got {ngram}")
+        # `length` carries num_perm and `start` the shingle width — the same reuse of the
+        # two scalar slots `chunk`/`repeat`/`split_part` make.
+        return StrFunc("minhash", self._e, start=ngram, length=num_perm)
 
     def regexp_matches(self, pattern: str) -> StrFunc:
         """Test whether the regex ``pattern`` matches anywhere in the string (→ Bool).

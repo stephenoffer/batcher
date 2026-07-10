@@ -21,7 +21,7 @@ from collections.abc import Callable
 import pyarrow as pa
 
 from batcher._internal.registry import Registry
-from batcher.api._join_helpers import _empty_schema
+from batcher.api._join_helpers import _empty_result_schema
 from batcher.api.orchestration import run_relational
 from batcher.api.terminal._metadata import collect_source_metadata
 from batcher.core import ExecutionContext, Executor
@@ -80,7 +80,7 @@ class UdfExecutor:
         from batcher import core
 
         batches = core.execute_with_udfs(plan, sources)
-        schema = batches[0].schema if batches else _empty_schema(ctx.columns)
+        schema = batches[0].schema if batches else _empty_result_schema(plan, ctx.columns)
         table = pa.Table.from_batches(batches, schema=schema)
         collect_source_metadata(ctx.hub, sources)
         return table

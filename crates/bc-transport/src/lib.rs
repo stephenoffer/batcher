@@ -829,12 +829,26 @@ mod tests {
         // Every value 0..N present exactly once (order not guaranteed across shards).
         let mut vals: Vec<i64> = got
             .iter()
-            .map(|b| b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0))
+            .map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
             .collect();
         vals.sort_unstable();
-        assert_eq!(vals, (0..N).collect::<Vec<_>>(), "union of shards == whole bucket");
+        assert_eq!(
+            vals,
+            (0..N).collect::<Vec<_>>(),
+            "union of shards == whole bucket"
+        );
         // The shards opened `STRIPE` parallel connections to the one peer.
-        assert_eq!(pool.channel_count().await, STRIPE as usize, "one flow per shard");
+        assert_eq!(
+            pool.channel_count().await,
+            STRIPE as usize,
+            "one flow per shard"
+        );
 
         // stripe <= 1 is exactly the un-sharded fetch (whole bucket, in order).
         let whole = pool

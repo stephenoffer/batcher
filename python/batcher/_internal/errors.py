@@ -9,6 +9,7 @@ and drop — so none of these should ever surface from a metrics or learning cal
 from __future__ import annotations
 
 __all__ = [
+    "AccessDeniedError",
     "BackendError",
     "BackpressureAbort",
     "BatcherError",
@@ -113,6 +114,20 @@ class DataQualityError(BatcherError):
     def __init__(self, message: str, violations: dict[str, int] | None = None) -> None:
         super().__init__(message)
         self.violations = violations or {}
+
+
+class AccessDeniedError(BatcherError):
+    """A principal referenced a table or column it holds no `SELECT` privilege on.
+
+    Raised by `batcher.governance` while rewriting the plan, before the optimizer runs
+    and before any data is read. It names the table and the columns denied, but never
+    the *values* behind them.
+    """
+
+    def __init__(self, message: str, *, table: str = "", columns: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.table = table
+        self.columns = columns
 
 
 # Classified shuffle-fetch exceptions. They originate at the PyO3 boundary

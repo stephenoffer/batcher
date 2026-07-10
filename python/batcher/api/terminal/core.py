@@ -136,11 +136,11 @@ def _collect(
             and is_streamable(plan.input)
             and not core.has_map_batches(plan.input)
         ):
-            from batcher.api._join_helpers import _empty_schema
+            from batcher.api._join_helpers import _empty_result_schema
             from batcher.core.streaming import stream_limit
 
             batches = list(stream_limit(plan, sources[0]))
-            schema = batches[0].schema if batches else _empty_schema(columns)
+            schema = batches[0].schema if batches else _empty_result_schema(plan, columns)
             return pa.Table.from_batches(batches, schema=schema)
 
     if adaptive:
@@ -223,7 +223,7 @@ def _shared_source_stats(plan: LogicalPlan, sources: list[Source]) -> list | Non
     also read them. Returns `None` otherwise, leaving each path to collect its own,
     so an opaque UDF/streaming terminal pays nothing extra.
     """
-    from batcher.api.terminal.metadata_answer import _metadata_answerable
+    from batcher.api.terminal.metadata_answer._core import _metadata_answerable
 
     if not _metadata_answerable(plan, sources):
         return None
@@ -348,6 +348,23 @@ def _streaming_write_eligible(
     return not all(isinstance(s, InMemorySource | MaterializedSource) for s in sources)
 
 
+def _commit(sink, manifest: WriteManifest, path: str, fmt: str) -> WriteManifest:
+    """Commit the write, then drop any statistics this session cached for `path`.
+
+    Those statistics are a zone map the optimizer prunes predicates and join sides with,
+    so serving the *previous* version's after a rewrite produces a wrong answer rather
+    than a slow plan. Every copy-on-write pattern — `write.merge`, `ds.scd.*`,
+    `ds.scd.apply_changes` — rewrites a path it also reads, so this is the common case,
+    not a corner one. Routed through one helper because `_write` commits from three
+    branches and a missed one is a silent wrong answer.
+    """
+    from batcher.api.orchestration import invalidate_source_stats
+
+    sink.commit(manifest, path)
+    invalidate_source_stats(path, fmt)
+    return manifest
+
+
 @with_auto_config
 def _write(
     plan: LogicalPlan,
@@ -396,8 +413,7 @@ def _write(
         manifest = _distributed_write_plan(
             plan, sources, path, fmt, sink_kwargs, partition_by, num_workers or 4
         )
-        sink.commit(manifest, path)
-        return manifest
+        return _commit(sink, manifest, path, fmt)
 
     # An unbounded source reaching the materialize path below would never finish.
     # The streaming distributed write above handles breaker-free shapes; otherwise
@@ -441,9 +457,7 @@ def _write(
             _iter_batches(plan, sources, columns), lambda: _schema(plan, sources, columns)
         )
         written = sink.write_stream(prefetch(stream), path, schema=schema, resume=resume)
-        manifest = WriteManifest((written,))
-        sink.commit(manifest, path)
-        return manifest
+        return _commit(sink, WriteManifest((written,)), path, fmt)
 
     table = _collect(plan, sources, columns, distributed=distributed, num_workers=num_workers)
     # Resolve a `repartition` layout to a per-file row cap now that the size is known
@@ -477,8 +491,7 @@ def _write(
         from batcher.api.orchestration import persist_written_source_stats
 
         persist_written_source_stats(table, path, fmt)
-    sink.commit(manifest, path)
-    return manifest
+    return _commit(sink, manifest, path, fmt)
 
 
 def _to_pydict(

@@ -1,14 +1,22 @@
-"""Projection pushdown computes the minimal per-source column set."""
+"""Projection pushdown computes the minimal per-source column set.
+
+Minimality is a property of the *optimized* plan, so these go through the optimizer and
+read `PhysicalPlan.source_projections` — exactly what the executor uses. The underlying
+analysis, `required_columns_per_source`, is deliberately not minimal on an unoptimized
+plan: it returns what that plan's operators actually read, which is what soundness
+requires (see `test_projection_source_agreement.py`). Asserting the minimal answer against
+an unpruned plan is what let two wrong-answer bugs through.
+"""
 
 from __future__ import annotations
 
 import batcher as bt
-from batcher import col, count
-from batcher.kyber.rules.projections import required_columns_per_source
+from batcher import col, count, kyber
 
 
 def _req(ds):
-    return required_columns_per_source(ds._plan)
+    opt, _, _ = kyber.optimize_full(ds._plan, sources=ds._sources, hub=None, source_stats=None)
+    return opt.source_projections
 
 
 def test_select_prunes_to_used_columns():

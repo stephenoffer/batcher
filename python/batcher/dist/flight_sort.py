@@ -30,6 +30,7 @@ from batcher.dist.executors.partition_io import (
 )
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
+    map_barrier,
     release_placement,
     shuffle_partitions,
 )
@@ -121,12 +122,16 @@ def execute_sort_flight(
     sources: list[Source],
     workers: int,
     _fault_inject: set[int] | None = None,
+    *,
+    _fault_inject_map: set[int] | None = None,
 ) -> pa.Table:
     """Range-partition by the leading key over Flight, sort each range, concat in order.
 
-    `_fault_inject` is a test-only hook: worker ids to kill after the map barrier to
-    exercise lineage recovery (a lost worker's range bucket is recomputed from its
-    source partition on a survivor)."""
+    Worker loss is survived in every phase: `map_barrier` reprocesses a split whose worker
+    dies while sampling or range-partitioning, and `ShuffleRecovery` recomputes a range
+    bucket whose worker dies before the reduce fetches it. `_fault_inject` /
+    `_fault_inject_map` are test-only hooks: worker ids to kill after / before the map
+    barrier."""
     import ray
 
     import os as _os0
@@ -164,7 +169,7 @@ def execute_sort_flight(
     _ps = _tt.perf_counter()
     # Borrow the query-lifetime fleet if installed (every Flight operator must, or a
     # second placement group deadlocks against the fleet's bundles); else spawn our own.
-    actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
+    actors, pg, _addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = shuffle_partitions(workers)
     if _prof0:
         print(f"[sort] acquire_fleet {_tt.perf_counter() - _ps:.1f}s", flush=True)
@@ -182,13 +187,27 @@ def execute_sort_flight(
         import time as _t
 
         _prof = os.environ.get("BATCHER_SORT_PROFILE")
+
+        # Simulate worker loss BEFORE the sample/map barriers (test hook).
+        if _fault_inject_map:
+            for i in _fault_inject_map:
+                ray.kill(actors[i])
+
+        # Both barriers run under worker-loss recovery, sharing one `dead` view of the
+        # fleet: a worker preempted while sampling or range-partitioning has its split
+        # reprocessed on a survivor rather than failing the whole sort. Sampling only
+        # reads (nothing to republish); range-publish carries `src` so the relocated
+        # buckets keep the ticket the reducers dial.
+        dead: set[int] = set()
+
         # SAMPLE: each worker samples its own split's leading-key distribution.
         _s = _t.perf_counter()
-        grids = ray.get(
-            [
-                actors[i].sample_quantiles.remote(map_ir, key_name, _SAMPLE_PROBS, parts[i])
-                for i in range(workers)
-            ]
+        grids, dead = map_barrier(
+            workers,
+            lambda host, src: actors[host].sample_quantiles.remote(
+                map_ir, key_name, _SAMPLE_PROBS, parts[src]
+            ),
+            dead=dead,
         )
         boundaries = merge_boundaries(grids, workers)
         if _prof:
@@ -196,13 +215,12 @@ def execute_sort_flight(
 
         # MAP: range-partition each split by the boundaries and publish raw rows.
         _s = _t.perf_counter()
-        ray.get(
-            [
-                actors[i].range_publish.remote(
-                    map_ir, key_name, boundaries, n_buckets, nulls_first, desc, parts[i]
-                )
-                for i in range(workers)
-            ]
+        mapper_addrs, dead = map_barrier(
+            workers,
+            lambda host, src: actors[host].range_publish.remote(
+                map_ir, key_name, boundaries, n_buckets, nulls_first, desc, parts[src], src
+            ),
+            dead=dead,
         )
         if _prof:
             print(f"[sort] MAP(range_publish) {_t.perf_counter() - _s:.1f}s", flush=True)
@@ -214,7 +232,7 @@ def execute_sort_flight(
         _s = _t.perf_counter()
         results = _sort_reduce_with_recovery(
             actors,
-            list(addrs),
+            mapper_addrs,
             parts,
             map_ir,
             key_name,
@@ -224,6 +242,7 @@ def execute_sort_flight(
             desc,
             n_buckets,
             workers,
+            dead=dead,
         )
         if _prof:
             print(f"[sort] REDUCE(gather+sort) {_t.perf_counter() - _s:.1f}s", flush=True)
@@ -265,6 +284,7 @@ def _sort_reduce_with_recovery(
     desc,
     n_buckets,
     workers,
+    dead=None,
 ):
     """Run the sort reduce under recompute-on-worker-loss recovery.
 
@@ -283,7 +303,7 @@ def _sort_reduce_with_recovery(
         speculation_policy,
     )
 
-    dead: set[int] = set()
+    dead: set[int] = set(dead or ())
 
     def _pick_live(avoid: set[int]) -> int:
         for i in range(workers):

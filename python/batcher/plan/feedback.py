@@ -55,6 +55,24 @@ class OperatorFeedback:
     # engine, or a source op with no input), in which case calibration reconstructs
     # it from `n_actual / selectivity`.
     n_input: int = 0
+    # The operator's structural plan signature — a stable identity across executions
+    # (`op_id` is only a position in one plan's walk). Empty when the reporter has no
+    # plan to correlate against: a distributed worker runs a sub-plan whose `op_id`s
+    # live in their own space, so it reports no signature and contributes only to the
+    # per-`kind` calibration.
+    signature: str = ""
+    # The rows Kyber estimated for this operator **before** applying any learned
+    # correction. Paired with `n_actual`, this is the raw q-error `n_actual /
+    # n_estimated` — the measure of the *structural* estimator's error. Reporting the
+    # already-corrected estimate instead would make a converged correction look
+    # error-free and decay it back to 1.0. 0.0 means unestimated.
+    n_estimated: float = 0.0
+    # Per-row cost of the expressions this operator evaluated, relative to a plain
+    # comparison (1.0 when it evaluates none). Cost calibration divides it out of
+    # `t_op_ms`, so the fitted per-row coefficients describe the *engine* rather than
+    # whichever expressions the workload happened to contain. Paired with `backend`
+    # (the tier that ran it), it is also what makes the JIT speedup measurable.
+    expr_factor: float = 1.0
 
 
 @runtime_checkable

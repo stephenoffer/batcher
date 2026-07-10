@@ -23,7 +23,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "global_count_plan",
-    "metadata_aggregate_table",
     "metadata_all_null",
     "metadata_approx_n_unique",
     "metadata_count",
@@ -156,82 +155,6 @@ def metadata_empty_table(
     if inferred is None or not _has_structural_empty(plan):
         return None
     return inferred.arrow.empty_table() if metadata_is_empty(plan, sources, source_stats) else None
-
-
-# Aggregate functions whose result can *ever* be derived from EXACT source
-# statistics (row count, footer min/max, exact distinct count). Any other function
-# — `sum`, `mean`, `stddev`, … — needs the actual values, so a metadata answer is
-# structurally impossible and the (non-trivial) `answer_aggregate` rewrite+estimate
-# would only burn ~0.5ms to return `None`. Skipping it when an aggregate is provably
-# non-derivable is the dominant fixed cost on a small global-aggregate query (e.g.
-# `SELECT sum(x) FROM t`). Conservative: a func in this set is only a *candidate* —
-# `answer_aggregate` stays the EXACT-gated authority on whether it truly answers.
-_METADATA_DERIVABLE_AGGS = frozenset(
-    {
-        "count",
-        "count_star",
-        "count_distinct",
-        "min",
-        "max",
-        # `sum` is derivable when a catalog records an EXACT total; `bool_and`/`bool_or`
-        # are derivable from an EXACT min/max on a boolean column. These are only
-        # *candidates* — `answer_aggregate` stays the EXACT-gated authority and returns
-        # None (→ execute) whenever the child stats can't actually derive them.
-        "sum",
-        "bool_and",
-        "bool_or",
-    }
-)
-
-
-def is_global_aggregate(plan: LogicalPlan) -> bool:
-    """Whether `plan` is a keyless aggregate, optionally behind output projection(s).
-
-    `SELECT count(*) AS n FROM t` and `ds.agg(n=col(...).count())` both lower to a
-    `Project(Aggregate(...))` — the projection just names/forwards the aggregate's
-    output — so the bare-`Aggregate` check would miss them and force a full scan of a
-    query the footer can answer. `answer_aggregate` propagates stats through the
-    projection and is EXACT-gated, so this widened structural guard is safe: it only
-    decides *whether to attempt* the metadata answer, never the answer itself.
-
-    Also requires that *every* output aggregate is metadata-derivable in principle
-    (`_METADATA_DERIVABLE_AGGS`): a `sum`/`mean`/… aggregate can never be answered
-    from stats, so attempting the (non-trivial) metadata rewrite for it is pure waste.
-    """
-    from batcher.plan.logical import Aggregate, Project
-
-    node = plan
-    while isinstance(node, Project):
-        node = node.input
-    if not isinstance(node, Aggregate) or node.group_keys:
-        return False
-    return all(spec.agg.func in _METADATA_DERIVABLE_AGGS for spec in node.aggregates)
-
-
-def metadata_aggregate_table(
-    plan: LogicalPlan, sources: list[Source], source_stats: list | None = None
-) -> pa.Table | None:
-    """One-row result of a global aggregate from metadata, or None to execute.
-
-    Returns a single-row Arrow table when the plan is a keyless aggregate (optionally
-    behind output projections) whose every output is exactly derivable from source
-    statistics (e.g. `count(*)`, `min`/`max` over footer bounds). The cheap structural
-    guard runs first so non-aggregate collects pay nothing.
-    """
-    if not is_global_aggregate(plan):
-        return None
-    if not _metadata_answerable(plan, sources):
-        return None
-    from batcher import core, kyber
-
-    try:
-        stats = _source_stats(sources, source_stats)
-        answer = kyber.answer_aggregate(plan, sources, stats, core.default_hub())
-    except Exception:  # the metadata shortcut must never break a runnable query
-        return None
-    if answer is None:
-        return None
-    return pa.table({alias: [value] for alias, value in answer.items()})
 
 
 def _scalar_answer(kyber_fn, column: str, plan: LogicalPlan, sources, source_stats):

@@ -3,8 +3,13 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
+use arrow::compute::cast;
+use arrow::datatypes::DataType;
 
 use crate::{ExprError, StrFunc};
+
+mod chunk;
+mod minhash;
 
 /// Evaluate a string function over a Utf8 array (preserving nulls).
 pub(crate) fn eval_str(
@@ -15,6 +20,19 @@ pub(crate) fn eval_str(
     start: Option<i64>,
     length: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
+    // A `Binary`-typed column (how ClickBench's `hits` string columns arrive — a
+    // `BYTE_ARRAY` with no UTF-8 logical annotation) is coerced to `Utf8` so string
+    // functions apply, matching DuckDB's VARCHAR treatment. `Binary -> Utf8` validates
+    // UTF-8 and errors on genuinely non-textual bytes (correct — a string function over
+    // real binary has no defined result).
+    let coerced;
+    let arr = match arr.data_type() {
+        DataType::Binary | DataType::LargeBinary => {
+            coerced = cast(arr, &DataType::Utf8)?;
+            &coerced
+        }
+        _ => arr,
+    };
     let s =
         arr.as_any()
             .downcast_ref::<StringArray>()
@@ -234,6 +252,11 @@ pub(crate) fn eval_str(
                 .map(|o| o.map(|v| (v.len() as i64) * 8))
                 .collect::<Int64Array>(),
         ),
+        // Data protection (keyed hash / encryption / redaction) — the arms that need a
+        // per-array key schedule and a key that never reaches an error message.
+        StrFunc::HmacSha256 | StrFunc::AesEncrypt | StrFunc::AesDecrypt | StrFunc::Mask => {
+            super::security::eval_security(func, s, pattern, start, length)?
+        }
         StrFunc::Hex => Arc::new(map_str(s, hex_encode)),
         StrFunc::Md5 => {
             use md5::{Digest, Md5};
@@ -334,6 +357,8 @@ pub(crate) fn eval_str(
             }
             Arc::new(builder.finish())
         }
+        StrFunc::Chunk => chunk::eval_chunk(s, start, length)?,
+        StrFunc::MinHash => minhash::eval_minhash(s, start, length)?,
         StrFunc::SubstringIndex => {
             let delim = require_pattern(pattern, func)?;
             let count = start.unwrap_or(0);
@@ -522,7 +547,8 @@ fn hex_encode(v: &str) -> String {
 
 /// Lowercase hex of arbitrary bytes — the digest encoding DuckDB's `md5`/`sha1`/
 /// `sha256` emit (distinct from `hex_encode`, which uppercases UTF-8 text bytes).
-fn hex_lower(bytes: &[u8]) -> String {
+/// Shared with `eval::security`, whose HMAC digest uses the same encoding.
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
@@ -730,7 +756,128 @@ fn require_pattern(pattern: Option<&str>, func: StrFunc) -> Result<&str, ExprErr
 
 #[cfg(test)]
 mod tests {
-    use super::{fnv1a64, hex_lower, xxhash64};
+    use super::{eval_str, fnv1a64, hex_lower, xxhash64};
+
+    /// `chunk` collects the per-row `List<Utf8>` back into `Vec<Vec<String>>`; a null
+    /// row becomes `None`.
+    #[cfg(test)]
+    fn chunks_of(input: Vec<Option<&str>>, size: i64, overlap: i64) -> Vec<Option<Vec<String>>> {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, ListArray, StringArray};
+        use std::sync::Arc;
+        let arr: ArrayRef = Arc::new(StringArray::from(input));
+        let out = eval_str(StrFunc::Chunk, &arr, None, None, Some(overlap), Some(size)).unwrap();
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        (0..list.len())
+            .map(|i| {
+                if list.is_null(i) {
+                    return None;
+                }
+                let vals = list.value(i);
+                let vals = vals.as_any().downcast_ref::<StringArray>().unwrap();
+                Some((0..vals.len()).map(|j| vals.value(j).to_string()).collect())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chunk_splits_without_overlap() {
+        let got = chunks_of(vec![Some("abcdefg")], 3, 0);
+        assert_eq!(got[0].as_deref().unwrap(), ["abc", "def", "g"]);
+    }
+
+    #[test]
+    fn chunk_overlaps_by_the_requested_characters() {
+        // size 4, overlap 2 → stride 2: starts at 0, 2; the chunk from 2 reaches the end.
+        let got = chunks_of(vec![Some("abcdef")], 4, 2);
+        assert_eq!(got[0].as_deref().unwrap(), ["abcd", "cdef"]);
+    }
+
+    /// A trailing start whose chunk would be wholly inside the previous one is not
+    /// emitted: "abcdefg"/4/2 stops at "efg" rather than adding a redundant "g".
+    #[test]
+    fn chunk_does_not_emit_a_redundant_tail() {
+        let got = chunks_of(vec![Some("abcdefg")], 4, 2);
+        assert_eq!(got[0].as_deref().unwrap(), ["abcd", "cdef", "efg"]);
+    }
+
+    /// Every character appears in some chunk, and consecutive chunks share exactly
+    /// `overlap` characters — the property a retrieval pipeline depends on.
+    #[test]
+    fn chunk_overlap_preserves_coverage() {
+        for size in 2..8usize {
+            for overlap in 0..size {
+                let text = "abcdefghijklmno";
+                let got = chunks_of(vec![Some(text)], size as i64, overlap as i64);
+                let got = got[0].as_deref().unwrap();
+                // Rebuild the text: the first chunk in full, then each later chunk
+                // minus the `overlap` characters it repeats from its predecessor.
+                let mut covered = got[0].clone();
+                for c in &got[1..] {
+                    covered.extend(c.chars().skip(overlap));
+                }
+                assert_eq!(covered, text, "size={size} overlap={overlap}");
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_covers_every_character_when_not_overlapping() {
+        let text = "the quick brown fox";
+        let got = chunks_of(vec![Some(text)], 5, 0);
+        assert_eq!(got[0].as_ref().unwrap().concat(), text);
+    }
+
+    #[test]
+    fn chunk_handles_empty_and_null_and_short_inputs() {
+        let got = chunks_of(vec![Some(""), None, Some("ab")], 5, 0);
+        assert_eq!(got[0].as_deref().unwrap(), [] as [String; 0]);
+        assert!(got[1].is_none());
+        assert_eq!(got[2].as_deref().unwrap(), ["ab"]);
+    }
+
+    /// Chunking is by Unicode character, so a multi-byte codepoint is never split
+    /// (a byte-wise slice would panic here).
+    #[test]
+    fn chunk_splits_on_character_boundaries() {
+        let got = chunks_of(vec![Some("héllo→wörld")], 3, 0);
+        let got = got[0].as_deref().unwrap();
+        assert_eq!(got, ["hél", "lo→", "wör", "ld"]);
+        assert_eq!(got.concat(), "héllo→wörld");
+    }
+
+    #[test]
+    fn chunk_rejects_a_degenerate_frame() {
+        use crate::StrFunc;
+        use arrow::array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("abc")]));
+        // overlap == size would never advance; size 0 has no defined chunk.
+        assert!(eval_str(StrFunc::Chunk, &arr, None, None, Some(3), Some(3)).is_err());
+        assert!(eval_str(StrFunc::Chunk, &arr, None, None, Some(0), Some(0)).is_err());
+        assert!(eval_str(StrFunc::Chunk, &arr, None, None, Some(-1), Some(3)).is_err());
+        // missing `length` (the chunk size)
+        assert!(eval_str(StrFunc::Chunk, &arr, None, None, Some(0), None).is_err());
+    }
+
+    /// A string function over a `Binary`-typed column (ClickBench's `hits` shape) coerces
+    /// the column to `Utf8` and applies, instead of erroring on the non-string type.
+    #[test]
+    fn string_function_over_binary_column() {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array};
+        use std::sync::Arc;
+        let bin: ArrayRef = Arc::new(BinaryArray::from_opt_vec(vec![
+            Some(b"hello".as_ref()),
+            Some(b""),
+            None,
+        ]));
+        let out = eval_str(StrFunc::Len, &bin, None, None, None, None).unwrap();
+        let got = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(got.value(0), 5);
+        assert_eq!(got.value(1), 0);
+        assert!(got.is_null(2));
+    }
 
     #[test]
     fn crypto_hash_known_vectors() {

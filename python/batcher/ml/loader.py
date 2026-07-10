@@ -5,8 +5,9 @@ Wraps the deterministic/elastic/resumable ordering from `streaming_sampler` in a
 rank, so it drops straight into a distributed training loop. The guarantees that
 matter (and that Ray Train's split iterator lacks):
 
-* **balanced** — every rank yields the same number of batches (``drop_last``), so no
-  rank finishes early and stalls the others at the all-reduce barrier;
+* **balanced** — every rank yields the same number of batches (the epoch's tail is
+  dropped or padded, per ``drop_last``), so no rank finishes early and stalls the
+  others at the all-reduce barrier;
 * **deterministic / elastic** — same ``(seed, epoch)`` → same global order regardless
   of world size, so a job can resume on a differently-sized cluster;
 * **resumable** — pass ``global_consumed`` (the sample count already processed this
@@ -18,19 +19,28 @@ Tensor collation is zero-copy where Arrow allows: a `FixedShapeTensor` column be
 a correctly-shaped tensor, numeric columns share their buffer; non-numeric columns
 are skipped (move text/ids through the engine, not the trainer hot path).
 
-This version materializes the dataset once and indexes it by the sampler order — the
-*ordering contract* is the hard, novel part and is what these layers verify;
-shard-streaming with a local cache is a drop-in follow-up behind the same API.
+Two loaders share that contract, one per memory regime. `stream_loader` materializes
+the dataset once (`collect()`) and indexes it — simplest, and right whenever the corpus
+fits in RAM. `shard_stream_loader` streams shards from disk with a bounded cache, and
+draws its indices from `rank_index_batches`, which *computes* the shuffled order from a
+keyed permutation instead of materializing it — so neither the samples nor their index
+list is ever held, and a corpus of any size loads in constant driver memory.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher._internal.prefetch import prefetch
-from batcher.ml.streaming_sampler import elastic_shard, epoch_order
+from batcher.ml.streaming_sampler import (
+    elastic_shard,
+    epoch_order,
+    num_rank_batches,
+    rank_index_batches,
+)
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -113,7 +123,9 @@ def stream_loader(
         batch_size: rows per yielded batch.
         world_size / rank: this process's slot in the data-parallel group.
         epoch / seed / shuffle: control the deterministic global order.
-        drop_last: keep every rank's batch count equal (recommended for DDP).
+        drop_last: drop the epoch's tail remainder (True, the default) or keep it
+            and pad back up to a whole number of ranks (False). Either way every
+            rank yields the same batch count, so no rank stalls the DDP barrier.
         columns: subset to tensorize (default: all tensorizable columns).
         global_consumed: samples already processed this epoch (resume point).
 
@@ -190,26 +202,37 @@ def shard_stream_loader(
     from batcher.io.formats.ml.shards import ShardReader
 
     reader = ShardReader(directory, cache_size=cache_size)
-    order = epoch_order(reader.total_rows, epoch=epoch, seed=seed, shuffle=shuffle)
-    indices = elastic_shard(
-        order,
-        world_size=world_size,
-        rank=rank,
-        global_consumed=global_consumed,
-        drop_last=drop_last,
-    )
     keep = list(columns) if columns is not None else list(reader.take([0]).column_names)
     bs = max(1, batch_size)
+    # The larger-than-RAM path, so the *index* sequence must not be materialized either:
+    # a shuffled list of every index costs ~28 bytes/sample (280 GB at 10^10 samples).
+    # `rank_index_batches` computes this rank's indices one batch at a time from a keyed
+    # permutation — identical order, O(batch_size) memory.
+    sampler_kwargs: dict[str, Any] = {
+        "batch_size": bs,
+        "world_size": world_size,
+        "rank": rank,
+        "epoch": epoch,
+        "seed": seed,
+        "shuffle": shuffle,
+        "drop_last": drop_last,
+        "global_consumed": global_consumed,
+    }
 
     class _ShardLoader(IterableDataset):  # type: ignore[misc]
         def __len__(self) -> int:
-            return len(indices) // bs if drop_last else (len(indices) + bs - 1) // bs
+            return num_rank_batches(
+                reader.total_rows,
+                batch_size=bs,
+                world_size=world_size,
+                rank=rank,
+                drop_last=drop_last,
+                global_consumed=global_consumed,
+            )
 
         def __iter__(self):
-            n = len(indices)
-            limit = (n // bs) * bs if drop_last else n
-            for start in range(0, limit, bs):
-                yield _tensorize(reader.take(indices[start : start + bs]), keep)
+            for indices in rank_index_batches(reader.total_rows, **sampler_kwargs):
+                yield _tensorize(reader.take(indices), keep)
 
     return _ShardLoader()
 
@@ -297,19 +320,41 @@ def streaming_split(
       consumed **concurrently** (the DDP norm); bounded `queue_depth` applies
       backpressure. Each rank yields the *same* number of batches (a trailing partial
       round is dropped) so no rank stalls the all-reduce barrier.
-    * **Single rank** (`rank` given) → one iterator that reads and keeps its
-      ``i % world_size == rank`` shard. For separate DDP processes over a *bounded*
-      corpus prefer `stream_loader`, whose indexed split is exactly balanced,
-      deterministic, and resumable without re-reading the others' shards.
+    * **Single rank** (`rank` given) → one iterator that reads the stream and keeps its
+      ``i % world_size == rank`` shard. Like the fleet mode it emits only **complete
+      rounds**, dropping a trailing partial one, so every rank yields the same batch
+      count. For separate DDP processes over a *bounded* corpus prefer `stream_loader`,
+      whose indexed split is exactly balanced, deterministic, and resumable without
+      re-reading the others' shards.
 
     Use either for unbounded/streaming sources that have no global length.
     """
     if world_size < 1:
         raise PlanError("streaming_split requires world_size >= 1")
     if rank is not None:
-        full = iter_torch_batches(dataset, **loader_kwargs)
-        return (batch for i, batch in enumerate(full) if i % world_size == rank)
+        if not 0 <= rank < world_size:
+            raise PlanError(f"streaming_split: rank {rank} out of range for {world_size}")
+        return _rank_shard_stream(iter_torch_batches(dataset, **loader_kwargs), world_size, rank)
     return _round_robin_split(dataset, world_size, queue_depth, loader_kwargs)
+
+
+def _rank_shard_stream(batches: Iterable[Any], world_size: int, rank: int) -> Iterator[Any]:
+    """This rank's batch from each **complete** round of `world_size` batches.
+
+    Keeping only ``i % world_size == rank`` would give rank 0 ``ceil(n / world_size)``
+    batches and the last rank ``floor(...)`` — the low ranks then reach the all-reduce
+    barrier once more than the high ones and the job hangs. Withholding a batch until
+    its round is known complete costs nothing (at most one batch is held) and makes the
+    counts equal, matching the fleet path; the trailing partial round is dropped.
+    """
+    pending = None
+    for i, batch in enumerate(batches):
+        position = i % world_size
+        if position == rank:
+            pending = batch
+        if position == world_size - 1:  # the round is complete — this rank's batch counts
+            yield pending
+            pending = None
 
 
 def _round_robin_split(

@@ -23,6 +23,16 @@ pub enum InterpError {
     #[error("join over an empty input side is not yet supported (no input schema)")]
     EmptyJoinInput,
 
+    #[error(
+        "pipeline breaker cannot materialize column {column:?}: its {bytes} bytes of \
+         variable-width data exceed the {limit}-byte limit of a 32-bit-offset Arrow array"
+    )]
+    MaterializeOffsetOverflow {
+        column: String,
+        bytes: usize,
+        limit: usize,
+    },
+
     #[error("join output references unknown column: {0}")]
     UnknownJoinColumn(String),
 

@@ -50,6 +50,7 @@ from batcher.plan.expr_ir.nodes import (
     Case,
     Col,
     Greatest,
+    HashRows,
     Least,
     ListJoin,
     MakeStruct,
@@ -116,7 +117,7 @@ def _referenced_columns_impl(expr: Expr) -> set[str]:
         ),
     ):
         return referenced_columns(expr.input)
-    if isinstance(expr, (Coalesce, Greatest, Least)):
+    if isinstance(expr, (Coalesce, Greatest, HashRows, Least)):
         cols: set[str] = set()
         for e in expr.inputs:
             cols |= referenced_columns(e)
@@ -255,6 +256,8 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         return Coalesce([remap_columns(e, mapping) for e in expr.inputs])
     if isinstance(expr, Greatest):
         return Greatest([remap_columns(e, mapping) for e in expr.inputs])
+    if isinstance(expr, HashRows):
+        return HashRows([remap_columns(e, mapping) for e in expr.inputs], expr.seed)
     if isinstance(expr, Least):
         return Least([remap_columns(e, mapping) for e in expr.inputs])
     if isinstance(expr, NullIf):

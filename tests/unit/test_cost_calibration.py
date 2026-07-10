@@ -152,15 +152,27 @@ def test_samples_reconstruct_input_rows_from_selectivity():
     """A row persisted before `n_input` existed still calibrates on input rows.
 
     Reconstructs `rows_in = n_actual / selectivity` so an older SQLite/object-store
-    metadata store migrates without recalibrating on output rows.
+    metadata store migrates without recalibrating on output rows. Such a row also
+    predates `expr_factor`, which must default to 1.0 (no expression pricing).
     """
     from batcher.kyber.calibration import _samples
 
     legacy_row = {"n_actual": 10, "selectivity": 0.01, "t_op_ms": 2.0}  # no n_input key
-    (rin, rout, t) = _samples([legacy_row])[0]
+    (rin, rout, t, factor) = _samples([legacy_row])[0]
     assert rin == pytest.approx(1000.0)  # 10 / 0.01
     assert rout == pytest.approx(10.0)
     assert t == pytest.approx(2.0)
+    assert factor == pytest.approx(1.0)
+
+
+def test_samples_carry_the_expression_cost_factor():
+    """The fit divides `expr_factor` out, so a regex-heavy workload cannot inflate the
+    per-row coefficient that the cost model then multiplies by the regex's factor again."""
+    from batcher.kyber.calibration import _samples
+
+    row = {"n_input": 100, "n_actual": 10, "t_op_ms": 5.0, "expr_factor": 40.0}
+    (_rin, _rout, _t, factor) = _samples([row])[0]
+    assert factor == pytest.approx(40.0)
 
 
 def test_clamp_bounds_runaway():
@@ -175,3 +187,67 @@ def test_clamp_bounds_runaway():
     _record(hub, "filter", n, rows=1, t_ms=10_000.0)
     coeffs = calibrate(hub, cfg)
     assert coeffs.filter_row <= defaults.filter_row * clamp + 1e-9
+
+
+def test_measured_jit_speedup_scales_the_prior_from_the_backend_tag():
+    """`jit_speedup` is fitted from `op_stats.backend` — metadata nothing consumed before.
+
+    Once the expression's own cost is divided out, the per-row residual of the two tiers
+    should agree if the model prices them correctly. A systematic gap means the prior is
+    wrong, and the fit scales it by the observed ratio. Here the interpreted bucket costs
+    2x per unit of expression work, so the prior (4.0) should roughly double.
+    """
+    from batcher.config import active_config
+    from batcher.kyber.calibration import _measured_jit_speedup
+
+    cfg = active_config()
+    n = cfg.optimizer.cost_calibration_min_samples
+    by_kind = {
+        "filter": (
+            [
+                {"n_input": 1000, "n_actual": 500, "t_op_ms": 1.0, "expr_factor": 1.0,
+                 "backend": "jit"}
+                for _ in range(n)
+            ]
+            + [
+                {"n_input": 1000, "n_actual": 500, "t_op_ms": 2.0, "expr_factor": 1.0,
+                 "backend": "interp"}
+                for _ in range(n)
+            ]
+        )
+    }  # fmt: skip
+    measured = _measured_jit_speedup(by_kind, cfg.optimizer.cost_coeffs, cfg)
+    assert measured == pytest.approx(cfg.optimizer.cost_coeffs.jit_speedup * 2.0)
+
+
+def test_measured_jit_speedup_needs_both_tiers():
+    """With only one tier observed there is no ratio to fit; the prior stands."""
+    from batcher.config import active_config
+    from batcher.kyber.calibration import _measured_jit_speedup
+
+    cfg = active_config()
+    n = cfg.optimizer.cost_calibration_min_samples
+    only_jit = {
+        "filter": [
+            {"n_input": 1000, "n_actual": 500, "t_op_ms": 1.0, "expr_factor": 1.0, "backend": "jit"}
+            for _ in range(n)
+        ]
+    }
+    assert _measured_jit_speedup(only_jit, cfg.optimizer.cost_coeffs, cfg) is None
+
+
+def test_measured_jit_speedup_ignores_mixed_tier_rows():
+    """`interp+jit` blends both tiers, so it cannot calibrate either bucket."""
+    from batcher.config import active_config
+    from batcher.kyber.calibration import _measured_jit_speedup
+
+    cfg = active_config()
+    n = cfg.optimizer.cost_calibration_min_samples
+    mixed = {
+        "filter": [
+            {"n_input": 1000, "n_actual": 500, "t_op_ms": 1.0, "expr_factor": 1.0,
+             "backend": "interp+jit"}
+            for _ in range(n * 2)
+        ]
+    }  # fmt: skip
+    assert _measured_jit_speedup(mixed, cfg.optimizer.cost_coeffs, cfg) is None

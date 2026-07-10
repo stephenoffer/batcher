@@ -1054,3 +1054,60 @@ def test_distributed_honors_engine_config_from_context():
             bt.from_arrow(t).sort("k", "v").collect(distributed=True, num_workers=4).to_pylist()
         )
         assert sort_single == sort_dist
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_limit_matches_single_node(tmp_path, transport):
+    """A bare `LIMIT`/`head` over a splittable source distributes, and returns *exactly*
+    the rows single-node returns — same values, same order, same schema.
+
+    Each worker keeps only its own first `offset + n` rows and the driver re-slices the
+    index-ordered concatenation, so only `workers x (offset + n)` rows reach the driver.
+    Before this path existed, `df.limit(10)` on Parquet raised `PlanError`.
+    """
+    import pyarrow.parquet as pq
+
+    n = 50_000
+    t = pa.table({"i": np.arange(n, dtype="int64"), "v": (np.arange(n) % 97).astype("int64")})
+    path = str(tmp_path / "t.parquet")
+    pq.write_table(t, path, row_group_size=5_000)  # 10 row-groups → 10 splits
+
+    cases = [
+        lambda ds: ds.limit(10),
+        lambda ds: ds.limit(1),
+        lambda ds: ds.limit(12_345),
+        lambda ds: ds.limit(0),
+        lambda ds: ds.limit(10, offset=25),
+        lambda ds: ds.filter(col("v") > 50).limit(10),
+        lambda ds: ds.select("i").limit(7),
+        lambda ds: ds.limit(999_999),  # more than the source holds
+    ]
+    for q in cases:
+        single = q(bt.read.parquet(path)).collect(distributed=False)
+        dist = q(bt.read.parquet(path)).collect(
+            distributed=True, num_workers=4, transport=transport
+        )
+        assert single.schema == dist.schema
+        assert single.to_pydict() == dist.to_pydict()  # ordered: the same first-k rows
+
+
+def test_distributed_empty_limit_result_keeps_its_schema(tmp_path):
+    """A filter that matches nothing, then a limit, yields zero batches — the result must
+    still carry the real column types (not null placeholders), identically on one node and
+    many. Otherwise a downstream concat / write_parquet breaks only on the empty case."""
+    import pyarrow.parquet as pq
+
+    n = 10_000
+    t = pa.table({"i": np.arange(n, dtype="int64"), "s": ["x"] * n})
+    path = str(tmp_path / "e.parquet")
+    pq.write_table(t, path, row_group_size=1_000)
+
+    def q(ds):
+        return ds.filter(col("i") > 10**9).limit(5)
+
+    single = q(bt.read.parquet(path)).collect(distributed=False)
+    dist = q(bt.read.parquet(path)).collect(distributed=True, num_workers=4, transport="disk")
+
+    assert single.num_rows == 0 and dist.num_rows == 0
+    assert single.schema == dist.schema
+    assert [str(f.type) for f in single.schema] == ["int64", "string"]

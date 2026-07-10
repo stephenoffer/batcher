@@ -413,7 +413,14 @@ def _distributed_map(
             batches.extend(r)
     _record_source_rows(hub, sources[sid], sum(b.num_rows for b in batches))
     if not batches:
-        return pa.table({})
+        # A pipeline whose filter matched nothing still has a schema, and the single-node
+        # path returns it. Returning a *column-less* table here made `distributed ==
+        # single-node` false for every empty result — and broke any caller that went on to
+        # select a column or concat with a non-empty batch. Fall back to the column-less
+        # table only when the plan cannot state its schema (a UDF whose output type is
+        # unknown until it runs).
+        schema = plan.available_schema()
+        return pa.table({}) if schema is None else pa.Table.from_batches([], schema=schema.arrow)
     # Reconcile a UDF whose output schema drifts across partitions (e.g. one partition's
     # rows carry extra fields) to one union schema, so the gather concatenates instead of
     # failing — the same schema-drift tolerance the single-node path gives.

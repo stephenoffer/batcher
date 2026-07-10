@@ -25,9 +25,12 @@ use rayon::prelude::*;
 use crate::error::RuntimeError;
 
 mod asof;
+mod radix;
 mod sort_merge;
+mod stream;
 
 pub use asof::asof_join_indices;
+pub use stream::BroadcastProbe;
 pub use sort_merge::sort_merge_join_indices;
 
 /// False-positive rate for the probe-side runtime bloom (see [`use_probe_bloom_with`]).
@@ -555,24 +558,33 @@ const RADIX_MAX_PARTS: usize = 1 << 12;
 ///
 /// `build_key`/`probe_key` read the source key for a row; they are called once per row in
 /// ascending order (a sequential, streaming pass over the source array), then never again.
-fn radix_join_scalar<O: Copy + std::hash::Hash + Eq>(
-    build_key: impl Fn(usize) -> O,
-    probe_key: impl Fn(usize) -> O,
+fn radix_join_scalar<O: Copy + std::hash::Hash + Eq + Send + Sync>(
+    build_key: impl Fn(usize) -> O + Sync,
+    probe_key: impl Fn(usize) -> O + Sync,
     build_rows: usize,
     probe_rows: usize,
     build_null: &[bool],
     probe_null: &[bool],
     join_type: JoinType,
 ) -> JoinIndices {
-    let (state, build_parts, probe_parts) =
-        radix_partition(build_key, probe_key, build_rows, probe_rows, build_null, probe_null);
+    let (state, build_parts, probe_parts) = radix_partition(
+        build_key, probe_key, build_rows, probe_rows, build_null, probe_null,
+    );
 
     // One table, reused per partition (each partition's build rows are disjoint).
     let mut heads: HashTable<u32> = HashTable::with_capacity(RADIX_PART_ROWS);
     let mut left_out: Vec<Option<u32>> = Vec::with_capacity(probe_rows);
     let mut right_out: Vec<Option<u32>> = Vec::with_capacity(probe_rows);
     for (b, probe) in build_parts.iter().zip(&probe_parts) {
-        join_partition_into(b, probe, &state, join_type, &mut heads, &mut left_out, &mut right_out);
+        join_partition_into(
+            b,
+            probe,
+            &state,
+            join_type,
+            &mut heads,
+            &mut left_out,
+            &mut right_out,
+        );
     }
     emit_null_probe_unmatched(probe_null, join_type, &mut left_out, &mut right_out);
 
@@ -596,8 +608,9 @@ fn radix_join_scalar_parallel<O: Copy + std::hash::Hash + Eq + Send + Sync>(
     probe_null: &[bool],
     join_type: JoinType,
 ) -> Vec<JoinIndices> {
-    let (state, build_parts, probe_parts) =
-        radix_partition(build_key, probe_key, build_rows, probe_rows, build_null, probe_null);
+    let (state, build_parts, probe_parts) = radix_partition(
+        build_key, probe_key, build_rows, probe_rows, build_null, probe_null,
+    );
 
     let mut out: Vec<JoinIndices> = build_parts
         .par_iter()
@@ -649,9 +662,9 @@ fn radix_parts(build_rows: usize) -> (usize, u32) {
 /// co-partitioning invariant). Returns the hash state (so the join reproduces the same
 /// hashes) and the per-partition build/probe vectors.
 #[allow(clippy::type_complexity)]
-fn radix_partition<O: Copy + std::hash::Hash + Eq>(
-    build_key: impl Fn(usize) -> O,
-    probe_key: impl Fn(usize) -> O,
+fn radix_partition<O: Copy + std::hash::Hash + Eq + Send + Sync>(
+    build_key: impl Fn(usize) -> O + Sync,
+    probe_key: impl Fn(usize) -> O + Sync,
     build_rows: usize,
     probe_rows: usize,
     build_null: &[bool],
@@ -660,20 +673,11 @@ fn radix_partition<O: Copy + std::hash::Hash + Eq>(
     let (parts, shift) = radix_parts(build_rows);
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
     let part_of = |k: &O| (state.hash_one(k) >> shift) as usize;
-    let mut build_parts: Vec<Vec<(O, u32)>> = vec![Vec::new(); parts];
-    for (i, &is_null) in build_null.iter().enumerate() {
-        if !is_null {
-            let k = build_key(i);
-            build_parts[part_of(&k)].push((k, i as u32));
-        }
-    }
-    let mut probe_parts: Vec<Vec<(O, u32)>> = vec![Vec::new(); parts];
-    for (l, &is_null) in probe_null.iter().enumerate() {
-        if !is_null {
-            let k = probe_key(l);
-            probe_parts[part_of(&k)].push((k, l as u32));
-        }
-    }
+    // Both scatters run histogram → prefix-sum → parallel write (`join::radix`), which
+    // reproduces the serial `push` loop's per-partition row order exactly while spreading
+    // the pass — the join's dominant sequential prefix — across every worker.
+    let build_parts = radix::partition_side(&build_key, build_null, parts, &part_of);
+    let probe_parts = radix::partition_side(&probe_key, probe_null, parts, &part_of);
     let _ = probe_rows; // row counts arrive via the null masks; kept for a symmetric signature
     (state, build_parts, probe_parts)
 }
@@ -1068,9 +1072,22 @@ mod tests {
             let lnull = null_mask(li, lrows);
             let rnull = null_mask(ri, rrows);
             let keys = I64Keys::try_new(li, ri).unwrap();
-            for jt in [JoinType::Inner, JoinType::Left, JoinType::Semi, JoinType::Anti] {
-                let flat =
-                    build_probe_flat(&keys, lrows, rrows, &lnull, &rnull, jt, false, BLOOM_FP_RATE);
+            for jt in [
+                JoinType::Inner,
+                JoinType::Left,
+                JoinType::Semi,
+                JoinType::Anti,
+            ] {
+                let flat = build_probe_flat(
+                    &keys,
+                    lrows,
+                    rrows,
+                    &lnull,
+                    &rnull,
+                    jt,
+                    false,
+                    BLOOM_FP_RATE,
+                );
                 // Force radix even on tiny inputs (parts >= 2 via clamp).
                 let radix = radix_join_scalar(
                     |i| keys.right[i],

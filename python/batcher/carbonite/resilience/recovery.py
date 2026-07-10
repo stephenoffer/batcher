@@ -71,6 +71,12 @@ class ShuffleRecovery:
             result, failed = attempt()
             if not failed:
                 return result
+            # Recompute only when another attempt will actually consume it. On the final
+            # round the loop exits straight into `ResourceError`, so regenerating the lost
+            # partitions on live workers — the most expensive step in recovery — is pure
+            # waste, and it perturbs the surviving workers on the way to failing anyway.
+            if round_idx + 1 >= self._policy.max_attempts:
+                break
             recompute(failed)
             self.recomputes += 1
             # Exponential backoff before the next round so a flaky network/cluster
@@ -78,7 +84,7 @@ class ShuffleRecovery:
             # (`half + U[0, half]`) keeps at least half the backoff while decorrelating
             # a correlated preemption wave's retries, so survivors aren't stampeded by
             # every lost reducer retrying at the same instant.
-            if self._policy.backoff_base_s > 0 and round_idx + 1 < self._policy.max_attempts:
+            if self._policy.backoff_base_s > 0:
                 import random
                 import time
 

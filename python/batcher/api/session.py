@@ -28,7 +28,7 @@ from batcher.io.source import (
     IteratorSource,
     Source,
 )
-from batcher.plan.logical import Scan
+from batcher.plan.logical import LogicalPlan, Scan
 from batcher.plan.schema import SchemaRef
 
 __all__ = [
@@ -147,8 +147,15 @@ def register_function(name: str, fn: Callable, **options: Any) -> None:
 
 
 def _scan(source: Source) -> Dataset:
-    plan = Scan(source_id=0, schema=SchemaRef.from_arrow(source.schema()))
-    return Dataset(plan, sources=[source])
+    """Build the `Dataset` for `source`, governed by the active security policy.
+
+    The single place a source becomes a plan, and therefore the single place governance
+    has to be applied for it to be unbypassable — see `api.security`.
+    """
+    from batcher.api.security import govern_scan
+
+    plan: LogicalPlan = Scan(source_id=0, schema=SchemaRef.from_arrow(source.schema()))
+    return Dataset(govern_scan(plan, source), sources=[source])
 
 
 def read(path: str, *, format: str | None = None, **opts: Any) -> Dataset:

@@ -52,6 +52,7 @@ Each returns a new lazy Dataset.
 | `.rename({old: new})` | rename columns |
 | `.sort(*by, descending=False, nulls_first=False)` | order rows |
 | `.limit(n, offset=0)` / `.head(n=5)` | take a prefix |
+| `.tail(n=5)` | take a suffix (executes a `count` first) |
 | `.distinct()` | drop duplicate rows |
 | `.union(*others, distinct=False)` | concatenate datasets |
 | `.intersect(other)` / `.except_(other)` | set operations |
@@ -153,6 +154,9 @@ print(out.to_pydict())
 | `bt.concat(*exprs)` | concatenate values into one string |
 | `bt.concat_ws(separator, *exprs)` | concatenate values with `separator` between them |
 | `bt.format_string(format, *exprs)` | interpolate values into a `{}` template (Polars `format`) |
+| `bt.mask(e, show_first=0, show_last=0, char="X")` | redact a string, optionally revealing its ends |
+| `bt.hmac_sha256(e, key)` | keyed, irreversible pseudonym that still joins |
+| `bt.aes_encrypt(e, key)` / `bt.aes_decrypt(e, key)` | deterministic AES-256-GCM-SIV column encryption |
 | `bt.log(base, value)` | logarithm of `value` in the given `base` (→ Float64) |
 | `bt.gcd(a, b)` / `bt.lcm(a, b)` | greatest common divisor / least common multiple |
 | `bt.hypot(a, b)` | Euclidean norm `sqrt(a² + b²)` |

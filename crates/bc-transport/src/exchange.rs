@@ -472,7 +472,12 @@ impl ClientPool {
         // concurrent first-fetch to the same peer resolves to one shared pool.
         self.peers
             .entry(addr.to_string())
-            .or_insert_with(|| Arc::new(PeerChannels::new(addr.to_string(), crate::connections_per_peer())))
+            .or_insert_with(|| {
+                Arc::new(PeerChannels::new(
+                    addr.to_string(),
+                    crate::connections_per_peer(),
+                ))
+            })
             .clone()
     }
 

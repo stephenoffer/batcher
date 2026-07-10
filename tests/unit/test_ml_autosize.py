@@ -126,7 +126,7 @@ def test_plain_function_not_autobatched_but_correct():
 def test_vllm_batch_defaults_enable_prefix_and_chunked():
     # Zero-config vLLM batch path turns on prefix caching + chunked prefill (the
     # throughput/TTFT wins Ray Data users must enable by hand); explicit values win.
-    from batcher.ml.llm import _vllm_batch_defaults
+    from batcher.ml.llm.engines import _vllm_batch_defaults
 
     assert _vllm_batch_defaults({}) == {
         "enable_prefix_caching": True,

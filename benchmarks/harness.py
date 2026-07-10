@@ -67,11 +67,13 @@ def _canon_scalar(v):
 def _rows_multiset(table: pa.Table) -> list[tuple]:
     """Return the table's rows as a sorted list of canonicalized tuples.
 
-    Column *order* is normalized away by sorting column names, so two engines
-    that emit the same columns in a different order still compare equal. Row
-    order is normalized by sorting the row tuples (a multiset comparison).
+    Column *order* is normalized away by sorting column names — case-insensitively, so the
+    two engines' differently-cased generated names (`avg(UserID)` vs `avg(userid)`) land in
+    the same position and their values are compared against each other rather than against
+    a neighbouring column. Row order is normalized by sorting the row tuples (a multiset
+    comparison).
     """
-    cols = sorted(table.column_names)
+    cols = sorted(table.column_names, key=str.lower)
     table = table.select(cols)
     pydict = table.to_pydict()
     n = table.num_rows
@@ -91,8 +93,17 @@ def _floats_close(a, b) -> bool:
 
 
 def results_match(reference: pa.Table, other: pa.Table) -> tuple[bool, str]:
-    """Compare two tables as sorted row multisets. Returns (ok, message)."""
-    if sorted(reference.column_names) != sorted(other.column_names):
+    """Compare two tables as sorted row multisets. Returns (ok, message).
+
+    Column names are matched case-insensitively: SQL identifiers are case-insensitive, and
+    the engines disagree on the case of a *derived* column's generated name — DuckDB folds
+    `avg(UserID)` to `avg(userid)`, Batcher preserves the source case. Both are defensible,
+    and neither is a difference in the data, so treating it as a correctness failure buried
+    the real mismatches (ClickBench reported 13 failures, of which 6 were only this).
+    """
+    ref_names = sorted(n.lower() for n in reference.column_names)
+    oth_names = sorted(n.lower() for n in other.column_names)
+    if ref_names != oth_names:
         return False, (
             f"column mismatch: {sorted(reference.column_names)} vs {sorted(other.column_names)}"
         )
@@ -140,6 +151,24 @@ class CompareResult:
     note: str = ""
 
 
+# The correctness oracle, in preference order. DuckDB is the project's designated oracle
+# (`.claude/rules/testing.md`); Batcher — the system under test — must never be the
+# reference, or a comparator's bug is reported as Batcher's. This is not hypothetical:
+# on TPC-H Q6 both Polars and Daft drop the `l_discount = 0.07` rows, and with Batcher as
+# the reference the row was blamed on Batcher even though it agreed with DuckDB and with
+# the published TPC-H answer. Any engine that produced a result may serve as a last
+# resort, so a run without DuckDB still cross-checks.
+_ORACLE_PREFERENCE = ("duckdb", "polars", "spark", "daft", "pyarrow")
+
+
+def _reference_engine(outputs: dict[str, pa.Table]) -> str:
+    """The engine whose result the others are checked against."""
+    for candidate in _ORACLE_PREFERENCE:
+        if candidate in outputs:
+            return candidate
+    return next(iter(outputs))
+
+
 def compare(
     name: str,
     fns: dict[str, Callable[[], pa.Table] | None],
@@ -180,7 +209,7 @@ def compare(
 
     # Correctness: compare every produced output to a reference.
     if outputs:
-        ref_engine = next(iter(outputs))
+        ref_engine = _reference_engine(outputs)
         ref = outputs[ref_engine]
         mismatches = []
         for engine, out in outputs.items():

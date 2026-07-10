@@ -184,10 +184,40 @@ def _tpch_tables(scale: float, base: str) -> dict[str, pa.Table]:
     return out
 
 
+# ClickBench's `hits_compatible` parquet stores its temporal columns as raw integers:
+# `EventDate` as days since the epoch (`uint16`), the three `*EventTime`s as seconds
+# (`int64`). The benchmark's queries treat them as a DATE and a TIMESTAMP — comparing
+# `EventDate >= '2013-07-01'` and calling `extract(minute FROM EventTime)` — so the
+# reference loaders reconstruct the types on ingest (the official DuckDB one does
+# `DATE '1970-01-01' + EventDate` and `epoch_ms(EventTime * 1000)`). Without it, every
+# engine fails those queries identically (`Could not convert string '2013-07-01' to
+# UINT16`), which is a broken benchmark rather than an engine result.
+_CLICKBENCH_DATE_COLUMNS = ("EventDate",)
+_CLICKBENCH_TIME_COLUMNS = ("EventTime", "ClientEventTime", "LocalEventTime")
+
+
+def _reconstruct_clickbench_temporals(table: pa.Table) -> pa.Table:
+    """Rebuild ClickBench's DATE / TIMESTAMP columns from their integer storage."""
+    for name in _CLICKBENCH_DATE_COLUMNS:
+        if name in table.column_names:
+            days = pc.cast(table.column(name), pa.int32())
+            table = table.set_column(
+                table.schema.get_field_index(name), name, pc.cast(days, pa.date32())
+            )
+    for name in _CLICKBENCH_TIME_COLUMNS:
+        if name in table.column_names:
+            secs = pc.cast(table.column(name), pa.int64())
+            stamps = pc.cast(secs, pa.timestamp("s"))
+            table = table.set_column(
+                table.schema.get_field_index(name), name, pc.cast(stamps, pa.timestamp("us"))
+            )
+    return table
+
+
 def _clickbench_tables(base: str, parts: int) -> dict[str, pa.Table]:
     uris = [f"{base}/hits_{i}.parquet" for i in range(parts)]
     hits = pa.concat_tables([_read(u) for u in uris]) if len(uris) > 1 else _read(uris[0])
-    return {"hits": _normalize_types(hits)}
+    return {"hits": _reconstruct_clickbench_temporals(_normalize_types(hits))}
 
 
 def _tpcds_tables(scale: float, base: str) -> dict[str, pa.Table]:

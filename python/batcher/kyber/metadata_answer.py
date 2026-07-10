@@ -21,7 +21,7 @@ from __future__ import annotations
 from typing import Any
 
 from batcher.config import Config
-from batcher.kyber.learning import _QUANTILES_KEY, load_learned_stats
+from batcher.kyber.learning import QUANTILES_KEY, load_learned_stats
 from batcher.kyber.optimizer import Optimizer
 from batcher.kyber.stats import StatsEstimator
 from batcher.metadata.hub import MetadataHub
@@ -277,7 +277,7 @@ def answer_learned_quantile(
     for `column` (the caller then streams an exact-ish sketch instead).
     """
     learned = load_learned_stats(hub) if hub is not None else {}
-    grid = learned.get(_QUANTILES_KEY, {}).get(column)
+    grid = learned.get(QUANTILES_KEY, {}).get(column)
     if not grid:
         return None
     return _value_at_quantile(float(q), grid.get("probs", []), grid.get("values", []))
