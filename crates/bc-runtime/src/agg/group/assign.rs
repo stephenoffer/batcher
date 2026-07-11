@@ -6,7 +6,8 @@
 //! direct-map** path drops the hash entirely when the key's value range is small.
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, GenericBinaryArray, GenericStringArray, Int64Array, UInt32Array,
+    Array, ArrayRef, AsArray, GenericBinaryArray, GenericByteArray, GenericStringArray, Int64Array,
+    UInt32Array,
 };
 use arrow::datatypes::{
     ArrowNativeType, ArrowPrimitiveType, BinaryType, Int16Type, Int32Type, Int64Type, Int8Type,
@@ -89,6 +90,24 @@ pub(crate) fn assign_groups(
     // element-wise equality check is exact, so the group ids and first-seen representative
     // columns are identical to that oracle — a pure performance short-circuit.
     if group_keys.len() >= 2 && group_keys.iter().all(is_raw_multikey_col) {
+        // All-single-byte fast path: when every key column is a null-free length-1 byte string
+        // (the two hottest composite TPC-H group keys — `GROUP BY l_returnflag, l_linestatus`),
+        // pack one byte per column into a `u64` with *no* length tags (all lengths are 1, so the
+        // bytes alone are injective) and group on the integer. Tight packing keeps the value
+        // range small, so `int_group_ids` takes the dense direct-map — no hashing, no probe. The
+        // group ids and reps are identical to the packed/hash oracle (distinct byte tuples map to
+        // distinct `u64`s). Up to 8 columns fit; anything wider or longer keeps the paths below.
+        if group_keys.len() <= 8 {
+            if let Some((ids, reps)) = bytes1_multi_group_ids(group_keys, num_rows) {
+                let num_groups = reps.len();
+                let reps_arr = UInt32Array::from(reps);
+                let group_columns = group_keys
+                    .iter()
+                    .map(|a| arrow::compute::take(a, &reps_arr, None))
+                    .collect::<Result<_, _>>()?;
+                return Ok((ids, num_groups, group_columns));
+            }
+        }
         // Packed fixed-width fast path: when the whole composite key fits in 16 bytes (short
         // strings + `Int64`s — e.g. `GROUP BY l_returnflag, l_linestatus`, two 1-char keys),
         // pack each row into one `u128` and hash/compare *that* single value. It replaces the
@@ -366,6 +385,36 @@ where
     for<'a> &'a T::Native: std::hash::Hash + Eq,
 {
     let a = arr.as_bytes::<T>();
+    // Short-string fast path: when every key is null-free and ≤ 7 bytes (the flag / status /
+    // short-code columns that dominate low-cardinality TPC-H group-bys — `l_returnflag`,
+    // `l_linestatus`, `o_orderpriority`'s prefix), pack `(len, bytes)` into one `u64` and group
+    // on that integer. This routes a low-cardinality key straight to `int_group_ids`' dense
+    // direct-map — no per-row `ahash` over a byte slice, no hash-table probe. Distinct
+    // `(len, bytes)` pairs map to distinct `u64`s (length in the high byte, bytes little-endian
+    // in the low 56 bits), so the group ids and first-seen reps are identical to the hash path
+    // below — a pure performance short-circuit. The representative group column is still
+    // `take`n from the original byte array, so its type and values carry through unchanged.
+    if a.null_count() == 0 {
+        // Single-byte keys (`l_returnflag`, `l_linestatus` — the two hottest TPC-H group keys)
+        // are the extreme case: the values buffer is exactly one contiguous byte per row, so we
+        // read it straight as a `&[u8]` and dense-map on the byte value (256 slots). No offset
+        // indirection, no `u64` scratch array, no hashing — one pass over `num_rows` bytes.
+        if let Some((ids, reps)) = byte1_group_ids::<T>(a, num_rows) {
+            let num_groups = reps.len();
+            let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
+            return Ok((ids, num_groups, group_columns));
+        }
+        // Short strings (≤ 7 bytes): pack `(len, bytes)` into a `u64` and group on the integer,
+        // routing a low-cardinality key to `int_group_ids`' dense direct-map instead of hashing
+        // byte slices. Distinct `(len, bytes)` → distinct `u64`, so the groups are identical.
+        if let Some(packed) = pack_short_bytes::<T>(a, num_rows) {
+            let keys = arrow::array::UInt64Array::from(packed);
+            let (group_ids, reps) = int_group_ids::<UInt64Type>(&keys, num_rows);
+            let num_groups = reps.len();
+            let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
+            return Ok((group_ids, num_groups, group_columns));
+        }
+    }
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
     let mut table: HashTable<u32> = HashTable::with_capacity(num_rows.max(1));
     let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
@@ -413,6 +462,126 @@ where
     let num_groups = reps.len();
     let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
     Ok((group_ids, num_groups, group_columns))
+}
+
+/// Group a null-free byte array whose every value is exactly one byte, or `None` if any value
+/// is not length-1 (the caller then tries the wider short-string / hash paths).
+///
+/// Length-1 means the values buffer is `num_rows` contiguous bytes starting at the array's first
+/// offset, so row `i`'s key is simply `bytes[i]`. A 256-slot direct map turns grouping into a
+/// single branch-light pass with no hashing, no probing, and no scratch allocation — the fastest
+/// possible path for the flag/status columns that dominate low-cardinality TPC-H group-bys.
+/// First-seen order and representatives match the hash oracle exactly (each new byte value takes
+/// the next group id at its first-seen row).
+fn byte1_group_ids<T>(a: &GenericByteArray<T>, num_rows: usize) -> Option<(Vec<u32>, Vec<u32>)>
+where
+    T: arrow::array::types::ByteArrayType,
+{
+    if num_rows == 0 {
+        return None;
+    }
+    let offsets = a.value_offsets();
+    let first = offsets[0];
+    // Every value length-1 ⇔ the span is exactly `num_rows` bytes. `value_offsets` is monotone,
+    // so this single subtraction rules out any longer (or empty) value without scanning them.
+    let last = offsets[num_rows];
+    if last.as_usize().wrapping_sub(first.as_usize()) != num_rows {
+        return None;
+    }
+    let base = first.as_usize();
+    let bytes = &a.value_data()[base..base + num_rows];
+    let mut slot = [u32::MAX; 256];
+    let mut reps: Vec<u32> = Vec::new();
+    let mut group_ids = Vec::with_capacity(num_rows);
+    for (i, &b) in bytes.iter().enumerate() {
+        let s = &mut slot[b as usize];
+        if *s == u32::MAX {
+            *s = reps.len() as u32;
+            reps.push(i as u32);
+        }
+        group_ids.push(*s);
+    }
+    Some((group_ids, reps))
+}
+
+/// Group a composite key whose every column is a null-free length-1 byte string, or `None` if
+/// any column is not that shape. Each row's key is `byte(col0) | byte(col1)<<8 | ...` — one byte
+/// per column, no length tags (all lengths are 1). Injective across distinct byte tuples, so the
+/// groups match the packed/hash oracle; and the tight packing keeps the value range small, so the
+/// downstream `int_group_ids` takes its dense direct-map. Caller gates on ≤ 8 columns.
+fn bytes1_multi_group_ids(cols: &[ArrayRef], num_rows: usize) -> Option<(Vec<u32>, Vec<u32>)> {
+    use arrow::datatypes::DataType::{Binary, LargeUtf8, Utf8};
+    // Each column's contiguous length-1 byte slice (base offset applied), or bail.
+    let mut byte_cols: Vec<&[u8]> = Vec::with_capacity(cols.len());
+    for a in cols {
+        if a.null_count() != 0 {
+            return None;
+        }
+        let (data, offsets_len1): (&[u8], bool) = match a.data_type() {
+            Utf8 => len1_bytes(a.as_string::<i32>(), num_rows)?,
+            LargeUtf8 => len1_bytes(a.as_string::<i64>(), num_rows)?,
+            Binary => len1_bytes(a.as_binary::<i32>(), num_rows)?,
+            _ => return None,
+        };
+        debug_assert!(offsets_len1);
+        byte_cols.push(data);
+    }
+    let mut keys: Vec<u64> = Vec::with_capacity(num_rows);
+    for i in 0..num_rows {
+        let mut k = 0u64;
+        for (j, bytes) in byte_cols.iter().enumerate() {
+            k |= (bytes[i] as u64) << (8 * j);
+        }
+        keys.push(k);
+    }
+    let arr = arrow::array::UInt64Array::from(keys);
+    Some(int_group_ids::<UInt64Type>(&arr, num_rows))
+}
+
+/// The contiguous length-1 values slice of a byte array (offset base applied), or `None` if not
+/// every value is exactly one byte. `(slice, true)` on success; the bool documents the invariant.
+fn len1_bytes<T>(a: &GenericByteArray<T>, num_rows: usize) -> Option<(&[u8], bool)>
+where
+    T: arrow::array::types::ByteArrayType,
+{
+    if num_rows == 0 {
+        return None;
+    }
+    let offsets = a.value_offsets();
+    let base = offsets[0].as_usize();
+    if offsets[num_rows].as_usize().wrapping_sub(base) != num_rows {
+        return None;
+    }
+    Some((&a.value_data()[base..base + num_rows], true))
+}
+
+/// Pack each null-free byte-string ≤ 7 bytes into a `u64` group key, or `None` if any value
+/// exceeds 7 bytes (in which case the caller keeps the byte-slice hash path).
+///
+/// The key is `(len << 56) | little_endian(bytes)`: the length occupies the high byte and the
+/// ≤ 7 payload bytes the low 56 bits, so two values collide iff they have the same length and
+/// the same bytes — i.e. iff the strings are equal. That injectivity is what lets the integer
+/// grouping produce the exact same groups as hashing the slices directly. One linear pass over
+/// the offsets bails out the moment a value is too long, so a long-string column pays only a
+/// cheap scan before falling back.
+fn pack_short_bytes<T>(a: &GenericByteArray<T>, num_rows: usize) -> Option<Vec<u64>>
+where
+    T: arrow::array::types::ByteArrayType,
+{
+    let mut out = Vec::with_capacity(num_rows);
+    for i in 0..num_rows {
+        let v: &[u8] = a.value(i).as_ref();
+        let len = v.len();
+        if len > 7 {
+            return None;
+        }
+        let mut key = (len as u64) << 56;
+        for (j, &b) in v.iter().enumerate() {
+            key |= (b as u64) << (8 * j);
+        }
+        out.push(key);
+    }
+    Some(out)
 }
 
 /// Multi-column all-`Int64` `assign_groups`: hash/compare the raw `i64` values of every
@@ -1046,5 +1215,113 @@ mod tests {
         let (want_ids, want_n, _) = reference(&as_i64);
         assert_eq!(ids, want_ids);
         assert_eq!(n, want_n);
+    }
+
+    /// Naive first-seen grouping over strings — the oracle the short-string u64 packing must
+    /// reproduce exactly (same ids, same distinct count, same first-seen representatives).
+    fn reference_str(vals: &[&str]) -> (Vec<u32>, usize, Vec<String>) {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut ids = Vec::with_capacity(vals.len());
+        for v in vals {
+            match seen.iter().position(|s| s == v) {
+                Some(g) => ids.push(g as u32),
+                None => {
+                    ids.push(seen.len() as u32);
+                    seen.push(v);
+                }
+            }
+        }
+        (
+            ids,
+            seen.len(),
+            seen.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    fn check_str(vals: Vec<&str>) {
+        let arr: ArrayRef = Arc::new(StringArray::from(vals.clone()));
+        let (ids, n, cols) = assign_groups(&[arr], vals.len()).unwrap();
+        let (want_ids, want_n, want_reps) = reference_str(&vals);
+        assert_eq!(ids, want_ids, "group_ids for {vals:?}");
+        assert_eq!(n, want_n, "group count for {vals:?}");
+        let got = cols[0].as_any().downcast_ref::<StringArray>().unwrap();
+        let got_reps: Vec<String> = (0..got.len()).map(|i| got.value(i).to_string()).collect();
+        assert_eq!(got_reps, want_reps, "reps for {vals:?}");
+    }
+
+    /// Low-cardinality single-char keys (the `l_returnflag` / `l_linestatus` shape) take the
+    /// short-string fast path and match the byte-slice oracle exactly.
+    #[test]
+    fn short_string_flags_match_reference() {
+        check_str(vec!["A", "N", "R", "A", "R", "N", "A", "A", "R"]);
+        check_str(vec!["O", "F", "O", "O", "F"]);
+    }
+
+    /// Mixed short lengths (≤ 7 bytes) still pack injectively: `"a"` and `"aa"` and `""` are
+    /// distinct groups even though their bytes overlap, because the length is in the key.
+    #[test]
+    fn short_strings_mixed_lengths_stay_distinct() {
+        check_str(vec!["", "a", "aa", "a", "aaa", "", "aa", "b", "ab", "ba"]);
+    }
+
+    /// A key longer than 7 bytes forces the fallback hash path — which must still be correct.
+    #[test]
+    fn long_strings_fall_back_and_match_reference() {
+        check_str(vec![
+            "1-URGENT", "2-HIGH", "1-URGENT", "5-LOW", "2-HIGH", "3-MEDIUM",
+        ]);
+    }
+
+    /// The packing preserves order-of-first-appearance across a boundary of short and long
+    /// values so the two paths never disagree on which representative row is first.
+    #[test]
+    fn boundary_length_seven_and_eight() {
+        check_str(vec!["abcdefg", "abcdefgh", "abcdefg", "abcdefgh"]);
+    }
+
+    /// Two single-byte string keys (the `GROUP BY l_returnflag, l_linestatus` shape) take the
+    /// tight all-single-byte pack and match a naive two-column first-seen oracle exactly.
+    #[test]
+    fn two_single_byte_keys_match_reference() {
+        let flags = vec!["A", "N", "R", "A", "R", "N", "A", "A", "R", "N"];
+        let stat = vec!["O", "F", "O", "F", "O", "O", "O", "F", "F", "F"];
+        let a: ArrayRef = Arc::new(StringArray::from(flags.clone()));
+        let b: ArrayRef = Arc::new(StringArray::from(stat.clone()));
+        let (ids, n, cols) = assign_groups(&[a, b], flags.len()).unwrap();
+        // Oracle: first-seen grouping over the (flag, status) pairs.
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        let mut want_ids = Vec::new();
+        for (f, s) in flags.iter().zip(&stat) {
+            match seen.iter().position(|p| p == &(*f, *s)) {
+                Some(g) => want_ids.push(g as u32),
+                None => {
+                    want_ids.push(seen.len() as u32);
+                    seen.push((f, s));
+                }
+            }
+        }
+        assert_eq!(ids, want_ids);
+        assert_eq!(n, seen.len());
+        let gf = cols[0].as_any().downcast_ref::<StringArray>().unwrap();
+        let gs = cols[1].as_any().downcast_ref::<StringArray>().unwrap();
+        let got: Vec<(String, String)> = (0..gf.len())
+            .map(|i| (gf.value(i).to_string(), gs.value(i).to_string()))
+            .collect();
+        let want: Vec<(String, String)> = seen
+            .iter()
+            .map(|(f, s)| (f.to_string(), s.to_string()))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// A single-byte key mixed with a longer key falls back to the packed/raw path (the tight
+    /// all-single-byte pack declines), and the result is still correct.
+    #[test]
+    fn single_byte_plus_long_key_falls_back() {
+        let a: ArrayRef = Arc::new(StringArray::from(vec!["A", "N", "A", "N"]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec!["xx", "yy", "xx", "zz"]));
+        let (ids, n, _) = assign_groups(&[a, b], 4).unwrap();
+        assert_eq!(ids, vec![0, 1, 0, 2]);
+        assert_eq!(n, 3);
     }
 }
