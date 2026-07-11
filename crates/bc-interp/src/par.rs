@@ -802,18 +802,13 @@ fn exec(
             // under-count that pushes a sort near the spill boundary the wrong way.
             let mut sort_scratch = 0u64;
             let out = match limit {
-                // Top-N: each morsel computes its local top-k in parallel (cheap),
-                // then we merge only the P×k survivors and take the global top-k —
-                // no full-input materialization. This is also mergeable, so it is
-                // the same shape the distributed top-N uses.
-                Some(k) => {
-                    let locals: Vec<RecordBatch> = parts
-                        .par_iter()
-                        .map(|b| ops::sort_batch(b, keys, Some(*k)))
-                        .collect::<Result<_, InterpError>>()?;
-                    let merged = ops::materialize(&locals)?;
-                    vec![ops::sort_batch(&merged, keys, Some(*k))?]
-                }
+                // Top-N: each morsel computes its local top-k in parallel (cheap), and only
+                // the sort-key values + a (morsel, row) locator of the P×k survivors are
+                // merged — the wide payload is gathered once, for just the final k rows
+                // (`parallel_top_n`, result-identical to gathering every candidate eagerly).
+                // No full-input materialization; the same mergeable shape the distributed
+                // top-N uses.
+                Some(k) => vec![ops::parallel_top_n(&parts, keys, *k)?],
                 // Full sort: out-of-core (spill sorted runs + k-way merge) when the
                 // input exceeds the budget or the pool can't admit it; else
                 // in-memory.

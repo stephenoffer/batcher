@@ -445,6 +445,110 @@ fn take_batch(
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
+/// Late-materialized parallel top-N over already-morselized `parts`.
+///
+/// The eager parallel top-N gathers **every column** of each morsel's local top-k before
+/// merging (`sort_batch(morsel, keys, Some(k))` per morsel, then a merge). On a wide row that
+/// copies `morsels × k` full rows only to discard all but the final `k` — measured the
+/// dominant cost of a `SELECT * … ORDER BY … LIMIT` once the scan is parallel.
+///
+/// Instead, each morsel emits only its top-k **sort-key values** plus a `(morsel, row)`
+/// locator; the merge sorts those narrow candidates and the wide columns are gathered **once**,
+/// for just the `k` survivors, via `interleave` across the source morsels.
+///
+/// Result-identical to the eager path: the candidates are concatenated in morsel order — the
+/// same order the eager merge produces — and the final sort uses the same keys and the same
+/// trailing row-position tie-break, so it selects the same rows in the same order; the locator
+/// gather then reproduces those exact rows. Callers pass a non-empty `parts`.
+pub(crate) fn parallel_top_n(
+    parts: &[RecordBatch],
+    keys: &[SortKey],
+    k: usize,
+) -> Result<RecordBatch, InterpError> {
+    use arrow::array::{UInt32Array, UInt32Builder};
+    use rayon::prelude::*;
+
+    let schema = parts[0].schema();
+    // Per morsel (parallel): its ≤k local top-k indices, and the key columns gathered to those
+    // rows — narrow (only the ORDER BY expressions), never the payload.
+    let per: Vec<(usize, UInt32Array, Vec<ArrayRef>)> = parts
+        .par_iter()
+        .enumerate()
+        .filter(|(_, b)| b.num_rows() > 0)
+        .map(|(p, b)| -> Result<_, InterpError> {
+            let idx = sort_indices(b, keys, Some(k))?;
+            let key_cols = keys
+                .iter()
+                .map(|key| {
+                    let col = key.expr.eval(b)?;
+                    Ok(bc_runtime::gather::take_column(col.as_ref(), &idx)?)
+                })
+                .collect::<Result<Vec<ArrayRef>, InterpError>>()?;
+            Ok((p, idx, key_cols))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Flatten the candidates in morsel order into: per-key concatenated columns + the two
+    // locator arrays (which source morsel, which row within it).
+    let total: usize = per.iter().map(|(_, idx, _)| idx.len()).sum();
+    let mut morsel_of = UInt32Builder::with_capacity(total);
+    let mut row_of = UInt32Builder::with_capacity(total);
+    for (p, idx, _) in &per {
+        for r in idx.values() {
+            morsel_of.append_value(*p as u32);
+            row_of.append_value(*r);
+        }
+    }
+    let morsel_of = morsel_of.finish();
+    let row_of = row_of.finish();
+
+    // Sort the narrow candidates by the same keys + a trailing row-position tie-break (matching
+    // `sort_indices`' limit path over the eager-merged batch), keeping the global top-k.
+    let mut sort_columns: Vec<SortColumn> = Vec::with_capacity(keys.len() + 1);
+    for (j, key) in keys.iter().enumerate() {
+        let col_j = per.iter().map(|(_, _, kc)| kc[j].as_ref()).collect::<Vec<_>>();
+        let values = if col_j.is_empty() {
+            key.expr.eval(&parts[0])? // empty: unreachable shape, keeps types
+        } else {
+            arrow::compute::concat(&col_j)?
+        };
+        sort_columns.push(SortColumn {
+            values,
+            options: Some(SortOptions {
+                descending: key.descending,
+                nulls_first: key.nulls_first,
+            }),
+        });
+    }
+    sort_columns.push(SortColumn {
+        values: Arc::new(UInt64Array::from_iter_values(0..total as u64)),
+        options: Some(SortOptions {
+            descending: false,
+            nulls_first: false,
+        }),
+    });
+    let winners = lexsort_to_indices(&sort_columns, Some(k))?;
+
+    // Gather the payload once, for the k survivors, straight from the source morsels.
+    let pairs: Vec<(usize, usize)> = winners
+        .values()
+        .iter()
+        .map(|&w| {
+            (
+                morsel_of.value(w as usize) as usize,
+                row_of.value(w as usize) as usize,
+            )
+        })
+        .collect();
+    let columns = (0..schema.fields().len())
+        .map(|c| {
+            let arrays: Vec<&dyn Array> = parts.iter().map(|b| b.column(c).as_ref()).collect();
+            Ok(arrow::compute::interleave(&arrays, &pairs)?)
+        })
+        .collect::<Result<Vec<ArrayRef>, InterpError>>()?;
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
 /// Evaluate each sort key against `batch` into an arrow `SortColumn` (values + options).
 fn eval_sort_columns(
     batch: &RecordBatch,
@@ -888,6 +992,63 @@ mod sort_tests {
                     descending,
                     nulls_first,
                 );
+            }
+        }
+    }
+
+    /// Late-materialized `parallel_top_n` must be byte-identical to the eager top-N (each
+    /// morsel's full-row local top-k, merged, re-topped) — same rows, same order, every
+    /// column — across ties, descending, nulls, and `k` smaller/larger than a morsel.
+    #[test]
+    fn parallel_top_n_matches_eager() {
+        let n = 40_000usize;
+        // Heavy ties on the key (so the row-position tie-break is exercised), a distinct
+        // payload so any tie-break disagreement surfaces as a column mismatch, and nulls.
+        let key: Vec<Option<i64>> = (0..n)
+            .map(|i| (i % 97 != 0).then_some(((i * 13) % 200) as i64))
+            .collect();
+        let payload: Vec<i64> = (0..n as i64).collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("k", Arc::new(Int64Array::from(key)) as ArrayRef),
+            ("p", Arc::new(Int64Array::from(payload)) as ArrayRef),
+        ])
+        .unwrap();
+        // Split into uneven morsels (the parallel executor's shape).
+        let parts: Vec<RecordBatch> = [0usize, 7000, 16384, 23000, 32768, n]
+            .windows(2)
+            .map(|w| batch.slice(w[0], w[1] - w[0]))
+            .collect();
+
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                let keys = vec![SortKey {
+                    expr: Expr::Col { name: "k".into() },
+                    descending,
+                    nulls_first,
+                }];
+                for k in [5usize, 100, 20_000, 50_000] {
+                    // Eager reference: per-morsel full-row top-k, merged, re-topped.
+                    let locals: Vec<RecordBatch> =
+                        parts.iter().map(|b| sort_batch(b, &keys, Some(k)).unwrap()).collect();
+                    let merged = materialize(&locals).unwrap();
+                    let eager = sort_batch(&merged, &keys, Some(k)).unwrap();
+
+                    let late = parallel_top_n(&parts, &keys, k).unwrap();
+
+                    assert_eq!(late.num_rows(), eager.num_rows(), "k={k} desc={descending}");
+                    for name in ["k", "p"] {
+                        let ci = eager.schema().index_of(name).unwrap();
+                        let (le, ea) = (late.column(ci), eager.column(ci));
+                        let le = le.as_any().downcast_ref::<Int64Array>().unwrap();
+                        let ea = ea.as_any().downcast_ref::<Int64Array>().unwrap();
+                        for r in 0..ea.len() {
+                            assert_eq!(le.is_null(r), ea.is_null(r), "null@{r} col={name} k={k}");
+                            if !ea.is_null(r) {
+                                assert_eq!(le.value(r), ea.value(r), "{name}@{r} k={k} desc={descending} nf={nulls_first}");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
