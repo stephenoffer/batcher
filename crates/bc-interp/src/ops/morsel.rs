@@ -157,6 +157,52 @@ fn flush_coalesced(
     *pending_bytes = 0;
 }
 
+/// Parallel [`morselize`] for the scan: split each input batch across rayon, preserving
+/// order. Byte-bounded splitting of a variable-width (string/list) column reads that
+/// column's offsets for every row ([`split_batch`]'s per-row-cost path) — an O(rows) walk
+/// the sequential `morselize` runs on **one** core. On a wide, string-heavy table that walk
+/// is the scan's dominant cost (measured ~450 ms and `cpu≈1 core` splitting 60 M rows of
+/// TPC-H `lineitem` for a `SELECT *` — the whole rest of the query is faster than it). The
+/// split of one batch is independent of every other, so fanning it across cores is a pure
+/// scheduling win: `batches.len()` was already the parallelism the downstream operators use.
+///
+/// Correctness: when no batch needs **coalescing** (every batch already stands alone as a
+/// morsel), `morselize` reduces to "split each batch, in order" with no cross-batch state —
+/// exactly what the parallel map computes, so the morsels are byte-for-byte identical. The
+/// coalescing path (a fine-grained source's undersized batches merged across boundaries) is
+/// inherently sequential, so if *any* batch is undersized this falls back to `morselize`.
+/// Row-only targets never walk offsets, so they gain nothing here and take the cheap
+/// sequential path too.
+pub(crate) fn morselize_par(
+    batches: &[RecordBatch],
+    target: bc_arrow::MorselTarget,
+) -> Vec<RecordBatch> {
+    use rayon::prelude::*;
+    // Parallelizing only pays for a byte-bounded target (the offset walk) with enough
+    // batches to fan out; and only the no-coalescing case is order-independent.
+    let worth_parallel = target.byte_bounded()
+        && batches.len() > 1
+        && batches
+            .iter()
+            .all(|b| b.num_rows() == 0 || batch_stands_alone(b, b.num_rows(), target));
+    if !worth_parallel {
+        return morselize(batches, target);
+    }
+    batches
+        .par_iter()
+        .map(|b| {
+            let mut out = Vec::new();
+            if b.num_rows() == 0 {
+                out.push(b.clone());
+            } else {
+                split_batch(&mut out, b, target);
+            }
+            out
+        })
+        .flatten()
+        .collect()
+}
+
 /// Re-bound already-produced morsels after a width-changing operator.
 ///
 /// The scheduler morselizes at the scan, but a projection that adds a wide column
@@ -655,6 +701,42 @@ mod tests {
         assert_eq!(total_rows(&out), 8 * 14_400, "rows preserved");
         for m in &out {
             assert_eq!(m.num_rows(), 14_400, "batches passed through unchanged (no re-split)");
+        }
+    }
+
+    /// `morselize_par` must produce byte-for-byte the same morsels as `morselize` on every
+    /// shape — it only changes *which core* splits each batch, never the boundaries. Covers
+    /// the parallel fast path (full wide string batches, byte-bounded) and the fall-throughs
+    /// (row-only target, undersized/coalescing batches, empties).
+    #[test]
+    fn morselize_par_matches_sequential() {
+        let long = "z".repeat(300); // wide enough to trip the per-row byte walk
+        let wide: Vec<RecordBatch> =
+            (0..40).map(|_| str_batch(&[long.as_str(); 8_000])).collect();
+        let cases: Vec<(Vec<RecordBatch>, bc_arrow::MorselTarget)> = vec![
+            // Parallel fast path: many full wide batches, byte-bounded.
+            (wide.clone(), bc_arrow::MorselTarget::new(16_384, 64 * 1024)),
+            // Row-only target: falls back to sequential (identity split).
+            (wide, bc_arrow::MorselTarget::rows(16_384)),
+            // Undersized batches: coalescing path, must fall back to sequential.
+            (
+                (0..50).map(|_| int_batch(64)).collect(),
+                bc_arrow::MorselTarget::new(16_384, 1 << 20),
+            ),
+            // Mixed with an empty batch interleaved.
+            (
+                vec![str_batch(&["a", "b"]), str_batch(&[]), int_batch(20_000)],
+                bc_arrow::MorselTarget::new(16_384, 1 << 20),
+            ),
+        ];
+        for (batches, target) in cases {
+            let seq = morselize(&batches, target);
+            let par = morselize_par(&batches, target);
+            assert_eq!(par.len(), seq.len(), "morsel count differs");
+            for (p, s) in par.iter().zip(&seq) {
+                assert_eq!(p.num_rows(), s.num_rows(), "morsel row count differs");
+            }
+            assert_eq!(total_rows(&par), total_rows(&seq), "total rows differ");
         }
     }
 

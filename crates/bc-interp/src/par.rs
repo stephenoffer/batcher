@@ -457,7 +457,7 @@ fn exec(
                 source_id: *source_id,
                 available: sources.len(),
             })?;
-            let out = ops::morselize(batches, opts.morsel_target());
+            let out = ops::morselize_par(batches, opts.morsel_target());
             let rows = count_rows(&out);
             push_metric(m, op_id, "scan", rows, &out, t0, false, "interp");
             Ok(out)

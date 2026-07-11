@@ -41,7 +41,7 @@ pub(crate) use joins::{
 };
 pub(crate) use materialize::materialize;
 pub(crate) use mixed_spill::try_bounded_mixed_spill;
-pub(crate) use morsel::{morselize, remorselize};
+pub(crate) use morsel::{morselize_par, remorselize};
 pub(crate) use quantile_spill::{
     try_bounded_distinct_spill, try_bounded_histogram_spill, try_bounded_mode_spill,
     try_bounded_quantile_spill,
