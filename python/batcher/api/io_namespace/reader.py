@@ -35,6 +35,15 @@ class Reader:
     ``bt.read.<format>(...)`` is the explicit, discoverable spelling. File/object
     formats take a path; catalog/SQL/NoSQL/streaming sources take their own
     connector arguments.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt, tempfile, os
+            >>> p = os.path.join(tempfile.mkdtemp(), "t.parquet")
+            >>> _ = bt.from_pydict({"x": [1, 2]}).write.parquet(p)
+            >>> bt.read.parquet(p).sort("x").to_pydict()
+            {'x': [1, 2]}
     """
 
     __slots__ = ()
@@ -63,12 +72,19 @@ class Reader:
         ``bt.read.table("delta", "s3://bucket/table", version=3)``. The typed
         methods below wrap this for the common backends.
 
+        Args:
+            format: Registered source name to dispatch to (e.g. ``"delta"``).
+            args: Positional arguments forwarded to that source.
+            opts: Connector options (connection, credentials, query) as keywords.
+
+        Returns:
+            A lazy `Dataset` over the named source.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.table("delta", "s3://bucket/table", version=3)
+                >>> import batcher as bt
+                >>> ds = bt.read.table("delta", "s3://bucket/table", version=3)  # doctest: +SKIP
         """
         return _read_table(format, *args, **opts)
 
@@ -78,6 +94,13 @@ class Reader:
 
         Kyber pushes column projection and row-group predicates into the read, so a
         filtered/projected query touches only the needed columns and row groups.
+
+        Args:
+            path: A Parquet file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the Parquet source.
 
         Examples:
             .. doctest::
@@ -96,6 +119,13 @@ class Reader:
 
         Partition columns are recovered from the directory layout, and projection plus
         predicate pushdown (including partition pruning) are applied per fragment.
+
+        Args:
+            path: Root directory of the partitioned Parquet dataset.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the partitioned Parquet dataset.
 
         Examples:
             .. doctest::
@@ -120,6 +150,13 @@ class Reader:
         into the read and a single large file is split into newline-aligned byte ranges
         for parallel parsing.
 
+        Args:
+            path: A CSV file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the CSV source.
+
         Examples:
             .. doctest::
 
@@ -136,6 +173,13 @@ class Reader:
 
         One JSON object per line; column types are inferred from the records.
 
+        Args:
+            path: A JSON file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the JSON source.
+
         Examples:
             .. doctest::
 
@@ -149,6 +193,13 @@ class Reader:
 
     def orc(self, path: str, **opts: Any) -> Dataset:
         """Read ORC file(s) — file, directory, or glob — with column projection pushed in.
+
+        Args:
+            path: An ORC file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the ORC source.
 
         Examples:
             .. doctest::
@@ -164,6 +215,13 @@ class Reader:
 
     def arrow(self, path: str, **opts: Any) -> Dataset:
         """Read Arrow/Feather IPC file(s) — file, directory, or glob — zero-copy into the engine.
+
+        Args:
+            path: An Arrow/Feather file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the Arrow/Feather source.
 
         Examples:
             .. doctest::
@@ -182,12 +240,18 @@ class Reader:
 
         Needs the optional extra: ``pip install 'batcher-engine[avro]'``.
 
+        Args:
+            path: An Avro file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the Avro source.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.avro("data/events.avro")
+                >>> import batcher as bt
+                >>> ds = bt.read.avro("data/events.avro")  # doctest: +SKIP
         """
         return _read(path, format="avro", **opts)
 
@@ -196,12 +260,18 @@ class Reader:
 
         Needs the optional extra: ``pip install 'batcher-engine[lance]'``.
 
+        Args:
+            path: Directory path of the Lance dataset.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the Lance dataset.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.lance("data/embeddings.lance")
+                >>> import batcher as bt
+                >>> ds = bt.read.lance("data/embeddings.lance")  # doctest: +SKIP
         """
         return _read(path, format="lance", **opts)
 
@@ -210,12 +280,18 @@ class Reader:
 
         Needs the optional extra: ``pip install 'batcher-engine[excel]'``.
 
+        Args:
+            path: An Excel workbook file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the Excel source.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.excel("report.xlsx")
+                >>> import batcher as bt
+                >>> ds = bt.read.excel("report.xlsx")  # doctest: +SKIP
         """
         return _read(path, format="excel", **opts)
 
@@ -224,12 +300,18 @@ class Reader:
 
         Needs the optional extra: ``pip install 'batcher-engine[xml]'``.
 
+        Args:
+            path: An XML file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the XML source.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.xml("data/records.xml")
+                >>> import batcher as bt
+                >>> ds = bt.read.xml("data/records.xml")  # doctest: +SKIP
         """
         return _read(path, format="xml", **opts)
 
@@ -241,16 +323,19 @@ class Reader:
         Args:
             path: A log file, directory, or glob.
             pattern: Optional grok pattern; named captures become columns.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the log source.
 
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.logs(
-                    "/var/log/app/*.log",
-                    pattern="%{IP:client} %{WORD:method} %{URIPATHPARAM:path}",
-                )
+                >>> import batcher as bt
+                >>> ds = bt.read.logs(  # doctest: +SKIP
+                ...     "/var/log/app/*.log",
+                ...     pattern="%{IP:client} %{WORD:method} %{URIPATHPARAM:path}",
+                ... )
         """
         return _read(path, format="logs", **opts)
 
@@ -260,6 +345,10 @@ class Reader:
         Args:
             path: A text file, directory, or glob.
             mode: ``"line"`` for one row per line, or ``"file"`` for whole-file rows.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the text source.
 
         Examples:
             .. doctest::
@@ -277,6 +366,13 @@ class Reader:
 
         The entry point for custom/multimodal decoding of arbitrary file(s).
 
+        Args:
+            path: A file, directory, or glob to read as whole-file rows.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` of whole-file rows.
+
         Examples:
             .. doctest::
 
@@ -293,17 +389,30 @@ class Reader:
 
         Needs the optional extra: ``pip install 'batcher-engine[pdf]'``.
 
+        Args:
+            path: A PDF file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` of extracted document text rows.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.documents("docs/*.pdf")
+                >>> import batcher as bt
+                >>> ds = bt.read.documents("docs/*.pdf")  # doctest: +SKIP
         """
         return _read(path, format="documents", **opts)
 
     def numpy(self, path: str, **opts: Any) -> Dataset:
         """Read NumPy ``.npy``/``.npz`` file(s) — file, directory, or glob — as tensor rows.
+
+        Args:
+            path: A NumPy ``.npy``/``.npz`` file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` of tensor rows.
 
         Examples:
             .. doctest::
@@ -319,12 +428,18 @@ class Reader:
     def webdataset(self, path: str, **opts: Any) -> Dataset:
         """Read WebDataset ``.tar`` shard(s), grouping each sample's member files into one row.
 
+        Args:
+            path: A ``.tar`` shard file, directory, or brace-expansion glob.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` with one row per WebDataset sample.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.webdataset("s3://bucket/shards/{000..099}.tar")
+                >>> import batcher as bt
+                >>> ds = bt.read.webdataset("s3://bucket/shards/{000..099}.tar")  # doctest: +SKIP
         """
         return _read(path, format="webdataset", **opts)
 
@@ -333,12 +448,18 @@ class Reader:
 
         Needs the optional extra: ``pip install 'batcher-engine[hdf5]'``.
 
+        Args:
+            path: An HDF5 file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the HDF5 source.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.hdf5("data/measurements.h5")
+                >>> import batcher as bt
+                >>> ds = bt.read.hdf5("data/measurements.h5")  # doctest: +SKIP
         """
         return _read(path, format="hdf5", **opts)
 
@@ -347,12 +468,18 @@ class Reader:
 
         Needs the optional extra: ``pip install 'batcher-engine[zarr]'``.
 
+        Args:
+            path: Path or URI of the Zarr store.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the Zarr store.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.zarr("s3://bucket/array.zarr")
+                >>> import batcher as bt
+                >>> ds = bt.read.zarr("s3://bucket/array.zarr")  # doctest: +SKIP
         """
         return _read(path, format="zarr", **opts)
 
@@ -370,13 +497,18 @@ class Reader:
             path: An image file, directory, or glob.
             decode: If true, append the decoded ``image`` tensor column.
             size: ``(height, width)`` to resize decoded images to; implies ``decode``.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` of image rows, optionally with a decoded tensor column.
 
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.images("s3://bucket/images/*.jpg", decode=True, size=(224, 224))
+                >>> import batcher as bt
+                >>> ds = bt.read.images(  # doctest: +SKIP
+                ...     "s3://bucket/images/*.jpg", decode=True, size=(224, 224)
+                ... )
         """
         ds = _read(path, format="images", **opts)
         return _decode(ds, "image_tensor_dataset", size=size) if (decode or size) else ds
@@ -394,13 +526,18 @@ class Reader:
             path: An audio file, directory, or glob.
             decode: If true, append the decoded ``waveform`` column.
             sample_rate: Target sample rate in Hz to resample to when decoding.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` of audio rows, optionally with a decoded waveform column.
 
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.audio("data/clips/*.wav", decode=True, sample_rate=16000)
+                >>> import batcher as bt
+                >>> ds = bt.read.audio(  # doctest: +SKIP
+                ...     "data/clips/*.wav", decode=True, sample_rate=16000
+                ... )
         """
         ds = _read(path, format="audio", **opts)
         return _decode(ds, "audio_dataset", sample_rate=sample_rate) if decode else ds
@@ -425,13 +562,18 @@ class Reader:
             decode: If true, append the decoded ``frames`` tensor column.
             size: ``(height, width)`` to resize decoded frames to; implies ``decode``.
             num_frames: Number of frames to sample per video (default 8).
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` of video rows, optionally with a decoded frames column.
 
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.video("s3://bucket/clips/*.mp4", decode=True, num_frames=16)
+                >>> import batcher as bt
+                >>> ds = bt.read.video(  # doctest: +SKIP
+                ...     "s3://bucket/clips/*.mp4", decode=True, num_frames=16
+                ... )
         """
         ds = _read(path, format="video", **opts)
         if not (decode or size):
@@ -461,13 +603,16 @@ class Reader:
                 ``readStream``) instead of a snapshot — see `delta_stream`. Requires
                 ``delta.enableChangeDataFeed = true`` on the table.
             starting_version: When streaming, the first version to read from (default 0).
+            opts: Connector options passed through to the Delta source.
+
+        Returns:
+            A lazy `Dataset` over the Delta table (a snapshot, or a stream if ``stream``).
 
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.delta("s3://bucket/delta/events", version=3)
+                >>> import batcher as bt
+                >>> ds = bt.read.delta("s3://bucket/delta/events", version=3)  # doctest: +SKIP
         """
         if stream:
             return _read_table("delta_stream", table_uri, starting_version=starting_version, **opts)
@@ -483,12 +628,21 @@ class Reader:
         commit after `starting_version`, as an unbounded source. Requires
         ``delta.enableChangeDataFeed = true`` on the table.
 
+        Args:
+            table_uri: Path/URI of the Delta table root.
+            starting_version: First commit version to stream changes from (default 0).
+            opts: Connector options passed through to the Delta source.
+
+        Returns:
+            A lazy `Dataset` streaming row-level change records.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.read_change_feed("s3://bucket/delta/events", starting_version=10)
+                >>> import batcher as bt
+                >>> ds = bt.read.read_change_feed(  # doctest: +SKIP
+                ...     "s3://bucket/delta/events", starting_version=10
+                ... )
         """
         return _read_table(
             "delta_stream", table_uri, starting_version=starting_version, change_feed=True, **opts
@@ -510,13 +664,16 @@ class Reader:
             identifier: Table identifier within the catalog.
             catalog: Named catalog to resolve against (defaults to the configured one).
             snapshot_id: Time-travel to this Iceberg snapshot id.
+            opts: Connector options passed through to the Iceberg source.
+
+        Returns:
+            A lazy `Dataset` over the Iceberg table.
 
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.iceberg("db.events", catalog="prod")
+                >>> import batcher as bt
+                >>> ds = bt.read.iceberg("db.events", catalog="prod")  # doctest: +SKIP
         """
         return _read_table("iceberg", identifier, catalog=catalog, snapshot_id=snapshot_id, **opts)
 
@@ -525,12 +682,18 @@ class Reader:
 
         Needs the optional extra: ``pip install 'batcher-engine[hudi]'``.
 
+        Args:
+            table_uri: Path/URI of the Hudi table root.
+            opts: Connector options passed through to the Hudi source.
+
+        Returns:
+            A lazy `Dataset` over the Hudi table snapshot.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.hudi("s3://bucket/hudi/events")
+                >>> import batcher as bt
+                >>> ds = bt.read.hudi("s3://bucket/hudi/events")  # doctest: +SKIP
         """
         return _read_table("hudi", table_uri, **opts)
 
@@ -539,12 +702,18 @@ class Reader:
 
         Needs the optional extra: ``pip install 'batcher-engine[delta-sharing]'``.
 
+        Args:
+            url: The ``<profile>#<share>.<schema>.<table>`` sharing URL.
+            opts: Connector options passed through to the Delta Sharing source.
+
+        Returns:
+            A lazy `Dataset` over the shared table.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.delta_sharing("config.share#share.schema.table")
+                >>> import batcher as bt
+                >>> ds = bt.read.delta_sharing("config.share#share.schema.table")  # doctest: +SKIP
         """
         return _read_table("delta_sharing", url, **opts)
 
@@ -557,16 +726,19 @@ class Reader:
 
         Args:
             query: SQL text to execute, or ``None`` when reading via ``table=``.
+            opts: Connection (``uri=``) and driver options passed as keywords.
+
+        Returns:
+            A lazy `Dataset` over the query or table result.
 
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.sql(
-                    "SELECT * FROM events WHERE country = 'US'",
-                    uri="postgresql://localhost:5432/app",
-                )
+                >>> import batcher as bt
+                >>> ds = bt.read.sql(  # doctest: +SKIP
+                ...     "SELECT * FROM events WHERE country = 'US'",
+                ...     uri="postgresql://localhost:5432/app",
+                ... )
         """
         return _read_table("adbc", query, **opts)
 
@@ -575,17 +747,23 @@ class Reader:
 
         Connection credentials are passed as keyword options.
 
+        Args:
+            query: SQL text to execute against Snowflake.
+            opts: Connection credentials (account, user, warehouse, …) as keywords.
+
+        Returns:
+            A lazy `Dataset` over the Snowflake query result.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.snowflake(
-                    "SELECT * FROM sales.orders",
-                    account="acme",
-                    user="bob",
-                    warehouse="wh",
-                )
+                >>> import batcher as bt
+                >>> ds = bt.read.snowflake(  # doctest: +SKIP
+                ...     "SELECT * FROM sales.orders",
+                ...     account="acme",
+                ...     user="bob",
+                ...     warehouse="wh",
+                ... )
         """
         return _read_table("snowflake", query, **opts)
 
@@ -594,12 +772,18 @@ class Reader:
 
         Uses credential vending to read the underlying Delta files directly.
 
+        Args:
+            table: Fully qualified Unity Catalog table name (``catalog.schema.table``).
+            opts: Connection and credential options passed as keywords.
+
+        Returns:
+            A lazy `Dataset` over the Databricks table.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.databricks("main.sales.orders")
+                >>> import batcher as bt
+                >>> ds = bt.read.databricks("main.sales.orders")  # doctest: +SKIP
         """
         return _read_table("databricks", table, **opts)
 
@@ -610,13 +794,18 @@ class Reader:
 
         Args:
             query: SQL text to execute, or ``None`` when reading via ``table=``.
+            opts: Project, credentials, and ``table=`` options passed as keywords.
+
+        Returns:
+            A lazy `Dataset` over the BigQuery query or table result.
 
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.bigquery("SELECT * FROM `project.dataset.events`")
+                >>> import batcher as bt
+                >>> ds = bt.read.bigquery(  # doctest: +SKIP
+                ...     "SELECT * FROM `project.dataset.events`"
+                ... )
         """
         return _read_table("bigquery", query, **opts)
 
@@ -625,12 +814,20 @@ class Reader:
 
         Connection details are passed as keyword options.
 
+        Args:
+            query: SQL text to execute against ClickHouse.
+            opts: Connection details (host, port, credentials) passed as keywords.
+
+        Returns:
+            A lazy `Dataset` over the ClickHouse query result.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.clickhouse("SELECT * FROM events", host="localhost")
+                >>> import batcher as bt
+                >>> ds = bt.read.clickhouse(  # doctest: +SKIP
+                ...     "SELECT * FROM events", host="localhost"
+                ... )
         """
         return _read_table("clickhouse", query, **opts)
 
@@ -640,16 +837,21 @@ class Reader:
 
         Pass connection, database, collection, and any query/projection as keyword options.
 
+        Args:
+            opts: Connection, ``database=``, ``collection=``, and query/projection keywords.
+
+        Returns:
+            A lazy `Dataset` over the MongoDB collection.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.mongo(
-                    uri="mongodb://localhost:27017",
-                    database="app",
-                    collection="events",
-                )
+                >>> import batcher as bt
+                >>> ds = bt.read.mongo(  # doctest: +SKIP
+                ...     uri="mongodb://localhost:27017",
+                ...     database="app",
+                ...     collection="events",
+                ... )
         """
         return _read_table("mongo", **opts)
 
@@ -658,16 +860,21 @@ class Reader:
 
         Pass connection, keyspace, and table as keyword options.
 
+        Args:
+            opts: Connection (``contact_points=``), ``keyspace=``, and ``table=`` keywords.
+
+        Returns:
+            A lazy `Dataset` over the Cassandra table.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.cassandra(
-                    contact_points=["127.0.0.1"],
-                    keyspace="app",
-                    table="events",
-                )
+                >>> import batcher as bt
+                >>> ds = bt.read.cassandra(  # doctest: +SKIP
+                ...     contact_points=["127.0.0.1"],
+                ...     keyspace="app",
+                ...     table="events",
+                ... )
         """
         return _read_table("cassandra", **opts)
 
@@ -676,12 +883,17 @@ class Reader:
 
         Pass the table name and AWS connection options as keywords.
 
+        Args:
+            opts: ``table=`` name and AWS connection options passed as keywords.
+
+        Returns:
+            A lazy `Dataset` over the DynamoDB table.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.dynamodb(table="events", region="us-east-1")
+                >>> import batcher as bt
+                >>> ds = bt.read.dynamodb(table="events", region="us-east-1")  # doctest: +SKIP
         """
         return _read_table("dynamodb", **opts)
 
@@ -690,45 +902,154 @@ class Reader:
 
         Pass the host, index, and query as keyword options.
 
+        Args:
+            opts: ``host=``, ``index=``, and query options passed as keywords.
+
+        Returns:
+            A lazy `Dataset` over the Elasticsearch index.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.elasticsearch(host="http://localhost:9200", index="events")
+                >>> import batcher as bt
+                >>> ds = bt.read.elasticsearch(  # doctest: +SKIP
+                ...     host="http://localhost:9200", index="events"
+                ... )
         """
         return _read_table("elasticsearch", **opts)
 
     # --- Streaming ---------------------------------------------------------
-    def kafka(self, **opts: Any) -> Dataset:
+    def kafka(
+        self,
+        topic: str,
+        *,
+        bootstrap_servers: str = "localhost:9092",
+        group: str = "batcher",
+        **opts: Any,
+    ) -> Dataset:
         """Read a Kafka topic as an unbounded streaming source.
 
-        Pass ``topic=`` and broker/connection options as keywords; needs the optional
-        extra: ``pip install 'batcher-engine[kafka]'``.
+        Needs the optional extra: ``pip install 'batcher-engine[kafka]'``.
+
+        Args:
+            topic: The Kafka topic to consume.
+            bootstrap_servers: Broker address(es), comma-separated.
+            group: Consumer group id (offsets are committed under it).
+            opts: Further consumer options (e.g. ``partitions=``) passed through.
+
+        Returns:
+            A lazy `Dataset` streaming from the Kafka topic.
 
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.kafka(topic="events", bootstrap_servers="localhost:9092")
+                >>> import batcher as bt
+                >>> ds = bt.read.kafka(  # doctest: +SKIP
+                ...     "events", bootstrap_servers="localhost:9092"
+                ... )
         """
-        return _read_table("kafka", **opts)
+        return _read_table("kafka", topic, bootstrap_servers=bootstrap_servers, group=group, **opts)
 
-    def kinesis(self, **opts: Any) -> Dataset:
+    def kinesis(self, stream_name: str, *, region: str = "us-east-1", **opts: Any) -> Dataset:
         """Read an AWS Kinesis stream as an unbounded source.
 
-        Pass the stream name and AWS options as keywords; needs the optional extra:
-        ``pip install 'batcher-engine[kinesis]'``.
+        Needs the optional extra: ``pip install 'batcher-engine[kinesis]'``.
+
+        Args:
+            stream_name: The Kinesis stream to consume.
+            region: AWS region the stream lives in.
+            opts: Further options (e.g. ``iterator_type=``) passed through.
+
+        Returns:
+            A lazy `Dataset` streaming from the Kinesis stream.
 
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.kinesis(stream_name="events", region="us-east-1")
+                >>> import batcher as bt
+                >>> ds = bt.read.kinesis("events", region="us-east-1")  # doctest: +SKIP
         """
-        return _read_table("kinesis", **opts)
+        return _read_table("kinesis", stream_name, region=region, **opts)
+
+    def pulsar(
+        self,
+        topic: str,
+        *,
+        service_url: str = "pulsar://localhost:6650",
+        subscription: str = "batcher",
+        **opts: Any,
+    ) -> Dataset:
+        """Read an Apache Pulsar topic as an unbounded streaming source.
+
+        Needs the optional extra: ``pip install 'batcher-engine[pulsar]'``.
+
+        Args:
+            topic: The Pulsar topic to consume.
+            service_url: The Pulsar broker service URL.
+            subscription: The subscription name to consume under.
+            opts: Further options passed through to the source.
+
+        Returns:
+            A lazy `Dataset` streaming from the Pulsar topic.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.pulsar("events")  # doctest: +SKIP
+        """
+        return _read_table(
+            "pulsar", topic, service_url=service_url, subscription=subscription, **opts
+        )
+
+    def pubsub(self, topic: str, **opts: Any) -> Dataset:
+        """Read a Google Cloud Pub/Sub subscription as an unbounded source.
+
+        Needs the optional extra: ``pip install 'batcher-engine[pubsub]'``.
+
+        Args:
+            topic: The Pub/Sub subscription to consume.
+            opts: Further options (e.g. ``project=``) passed through to the source.
+
+        Returns:
+            A lazy `Dataset` streaming from the Pub/Sub subscription.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.pubsub("projects/p/subscriptions/s")  # doctest: +SKIP
+        """
+        return _read_table("pubsub", topic, **opts)
+
+    def eventhubs(
+        self, topic: str, *, connection_str: str = "", consumer_group: str = "$Default", **opts: Any
+    ) -> Dataset:
+        """Read an Azure Event Hubs stream as an unbounded source.
+
+        Uses the AMQP client (the ``eventhubs`` extra); Event Hubs also exposes a
+        Kafka endpoint, so `read.kafka` works against it without the extra.
+
+        Args:
+            topic: The Event Hub name to consume.
+            connection_str: The Event Hubs namespace connection string.
+            consumer_group: The consumer group to read under.
+            opts: Further options passed through to the source.
+
+        Returns:
+            A lazy `Dataset` streaming from the Event Hub.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.eventhubs(  # doctest: +SKIP
+                ...     "events", connection_str="Endpoint=sb://..."
+                ... )
+        """
+        return _read_table(
+            "eventhubs", topic, connection_str=connection_str, consumer_group=consumer_group, **opts
+        )
 
     def files_incremental(self, path: str, file_format: str, **opts: Any) -> Dataset:
         """Incrementally discover and read newly arrived files under `path`.
@@ -738,13 +1059,18 @@ class Reader:
         Args:
             path: Directory or glob to watch for new files.
             file_format: Underlying format of those files (e.g. ``"parquet"``, ``"json"``).
+            opts: Options forwarded to the underlying file reader.
+
+        Returns:
+            A lazy `Dataset` streaming rows from newly arrived files.
 
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.files_incremental("s3://bucket/incoming/", "parquet")
+                >>> import batcher as bt
+                >>> ds = bt.read.files_incremental(  # doctest: +SKIP
+                ...     "s3://bucket/incoming/", "parquet"
+                ... )
         """
         return _read_table("files_incremental", path, file_format, **opts)
 
@@ -754,24 +1080,39 @@ class Reader:
         A dev/benchmark source. Pass ``num_rows=`` to bound it (and ``pace=False`` to
         emit without the one-second cadence).
 
+        Args:
+            rows_per_second: Number of rows to emit per second.
+            opts: ``num_rows=`` / ``pace=`` and other generator options as keywords.
+
+        Returns:
+            A lazy `Dataset` of generated ``(timestamp, value)`` rows.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.rate(rows_per_second=100, num_rows=1000, pace=False)
+                >>> import batcher as bt
+                >>> ds = bt.read.rate(  # doctest: +SKIP
+                ...     rows_per_second=100, num_rows=1000, pace=False
+                ... )
         """
         return _read_table("rate", rows_per_second, **opts)
 
     def socket(self, host: str = "localhost", port: int = 9999, **opts: Any) -> Dataset:
         """Read newline-delimited text from a TCP socket (Spark `socket`; dev only).
 
+        Args:
+            host: Hostname of the TCP source (default ``"localhost"``).
+            port: TCP port to connect to (default 9999).
+            opts: Additional socket-source options passed as keywords.
+
+        Returns:
+            A lazy `Dataset` streaming lines from the socket.
+
         Examples:
-            .. code-block:: python
+            .. doctest::
 
-                import batcher as bt
-
-                ds = bt.read.socket(host="localhost", port=9999)
+                >>> import batcher as bt
+                >>> ds = bt.read.socket(host="localhost", port=9999)  # doctest: +SKIP
         """
         return _read_table("socket", host, port, **opts)
 

@@ -57,6 +57,7 @@ _STR_INT = frozenset(
 _STR_FLOAT = frozenset({"json_extract_float"})
 _STR_STR = frozenset(
     {
+        "strip_html",
         "upper",
         "lower",
         "trim",
@@ -78,6 +79,10 @@ _STR_STR = frozenset(
         "md5",
         "sha1",
         "sha256",
+        "hmac_sha256",
+        "aes_encrypt",
+        "aes_decrypt",
+        "mask",
         "right",
         "substring_index",
         "overlay",
@@ -109,8 +114,8 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         MathExpr,
         Not,
     )
-    from batcher.plan.expr_ir.namespaces import StrFunc
-    from batcher.plan.expr_ir.nodes import Case, Col, Greatest, Least
+    from batcher.plan.expr_ir.namespaces import ListSimhash, StrFunc
+    from batcher.plan.expr_ir.nodes import Case, Col, Greatest, HashRows, Least
 
     if isinstance(expr, Col):
         return schema.field(expr.name).type if schema.has(expr.name) else None
@@ -130,11 +135,15 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return infer_type(expr.input, schema) if expr.fn == "abs" else pa.float64()
     if isinstance(expr, Math2Expr):
         return pa.float64()
+    if isinstance(expr, HashRows):
+        return pa.int64()  # a 64-bit digest, whatever the inputs' types
     if isinstance(expr, (Coalesce, Greatest, Least)):
         return _fold_promote(infer_type(e, schema) for e in expr.inputs)
     if isinstance(expr, Case):
         branch_thens = (infer_type(then, schema) for _cond, then in expr.branches)
         return _fold_promote([*branch_thens, infer_type(expr.otherwise, schema)])
+    if isinstance(expr, ListSimhash):
+        return pa.list_(pa.int64())  # one Int64 bit per hyperplane
     if isinstance(expr, StrFunc):
         return _strfunc_type(expr.fn)
     return None
@@ -176,6 +185,12 @@ def _binary_type(expr: object, schema: SchemaRef) -> pa.DataType | None:
 
 
 def _strfunc_type(fn: str) -> pa.DataType | None:
+    if fn == "minhash":
+        return pa.list_(pa.int64())  # the signature: one value per permutation
+    if fn == "chunk":
+        return pa.list_(pa.string())
+    if fn == "split":
+        return pa.list_(pa.string())
     if fn in _STR_BOOL:
         return pa.bool_()
     if fn in _STR_INT:

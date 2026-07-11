@@ -56,6 +56,41 @@ print(ranks.to_pydict())
 #  'product': ['y', 'z', 'x', 'q', 'p'], 'rk': [1, 2, 3, 1, 2], 'dr': [1, 2, 3, 1, 2]}
 ```
 
+`"percent_rank"` and `"cume_dist"` are the two *normalized* ranking specs (SQL
+`PERCENT_RANK` / `CUME_DIST`). `percent_rank` rescales each row's rank into
+`[0, 1]` — `0` for the first row, `1` for the last — and `cume_dist` gives the
+fraction of the partition at or below the current row. Reach for them to express
+"the cheapest 10% within each category" without hard-coding a row count.
+
+```python
+norm = ds.window(
+    partition_by=["category"],
+    order_by=[("price", False)],
+    functions={"pr": "percent_rank", "cd": "cume_dist"},
+).sort("category", "price")
+print(norm.to_pydict())
+# {'category': ['a', 'a', 'a', 'b', 'b'], 'product': ['y', 'z', 'x', 'q', 'p'],
+#  'price': [10, 20, 30, 15, 40], 'pr': [0.0, 0.5, 1.0, 0.0, 1.0],
+#  'cd': [0.3333333333333333, 0.6666666666666666, 1.0, 0.5, 1.0]}
+```
+
+`ntile(n)` splits each ordered partition into `n` roughly equal buckets numbered
+`1..n` (SQL `NTILE`) — the standard way to cut a partition into quartiles or
+deciles. Because it takes the bucket count as an argument, spell it with the
+top-level `ntile` constructor bound by `.over(...)` (the form covered below)
+rather than a bare string:
+
+```python
+from batcher import ntile
+
+quartiles = ds.with_columns(
+    bucket=ntile(2).over(partition_by=["category"], order_by=["price"])
+).sort("category", "price")
+print(quartiles.to_pydict())
+# {'category': ['a', 'a', 'a', 'b', 'b'], 'product': ['y', 'z', 'x', 'q', 'p'],
+#  'price': [10, 20, 30, 15, 40], 'bucket': [1, 1, 2, 1, 2]}
+```
+
 ## Aggregate functions
 
 An aggregate spec is a tuple `(func, column)` where `func` is one of `"sum"`,
@@ -93,19 +128,27 @@ print(running.to_pydict())
 
 ## Value functions
 
-Value specs are `(func, column)` for `"first_value"` and `"last_value"`, and
-`(func, column, offset)` for `"lag"` and `"lead"`.
+Value specs are `(func, column)` for `"first_value"` and `"last_value"`,
+`(func, column, offset)` for `"lag"` and `"lead"`, and `(func, column, n)` for
+`"nth_value"` — the value at the `n`-th row of the ordered partition (SQL
+`NTH_VALUE`; `first_value` is the special case `n = 1`). Reach for `nth_value`
+when the reference point is a fixed rank, such as "each product's price relative
+to its category's second-cheapest".
 
 ```python
 shifted = ds.window(
     partition_by=["category"],
     order_by=[("price", False)],
-    functions={"prev": ("lag", "price", 1), "top": ("first_value", "price")},
+    functions={
+        "prev": ("lag", "price", 1),
+        "top": ("first_value", "price"),
+        "second": ("nth_value", "price", 2),
+    },
 ).sort("category", "price")
 print(shifted.to_pydict())
-# {'category': ['a', 'a', 'a', 'b', 'b'], 'price': [10, 20, 30, 15, 40],
-#  'product': ['y', 'z', 'x', 'q', 'p'], 'prev': [None, 10, 20, None, 15],
-#  'top': [10, 10, 10, 15, 15]}
+# {'category': ['a', 'a', 'a', 'b', 'b'], 'product': ['y', 'z', 'x', 'q', 'p'],
+#  'price': [10, 20, 30, 15, 40], 'prev': [None, 10, 20, None, 15],
+#  'top': [10, 10, 10, 15, 15], 'second': [20, 20, 20, 40, 40]}
 ```
 
 ## Top-N per partition
@@ -126,7 +169,64 @@ print(top1.to_pydict())
 # {'category': ['a', 'b'], 'product': ['x', 'p'], 'price': [30, 40]}
 ```
 
+## Composing a window with ordinary expressions
+
+A window expression is an ordinary expression: it can be combined with arithmetic,
+comparisons, and other windows inside `select`, `with_columns`, and `filter`. The
+engine lifts each window into its own `Window` operator and rewrites the surrounding
+expression to read the result, exactly as a SQL engine does for
+`x - lag(x) OVER (...)`.
+
+```python
+prices = bt.from_pydict({"category": ["a", "a", "b", "b"], "price": [10, 20, 40, 15]})
+
+shares = prices.with_columns(
+    share=bt.col("price") / bt.col("price").sum().over(partition_by=["category"])
+)
+print(shares.to_pydict())
+# {'category': ['a', 'a', 'b', 'b'], 'price': [10, 20, 40, 15],
+#  'share': [0.3333333333333333, 0.6666666666666666, 0.7272727272727273, 0.2727272727272727]}
+```
+
+Because the window sees every input row before the filter runs, a window in a
+predicate expresses "rows above their group's mean" directly — the subquery SQL
+would need:
+
+```python
+above = prices.filter(bt.col("price") > bt.col("price").mean().over(partition_by=["category"]))
+print(above.to_pydict())
+# {'category': ['a', 'b'], 'price': [20, 40]}
+```
+
+Windows may not appear where SQL also forbids them — inside `group_by().agg(...)`,
+a join key, or a sort key. Compute the window in a `with_columns` step first and
+reference the resulting column.
+
+## Expression shorthands
+
+Common window shapes have named methods on `Expr`, so you rarely spell the window
+out. They all accept `partition_by` / `order_by` and lower to the windows above.
+
+```python
+ts = bt.from_pydict({"price": [10, 15, 30]})
+print(
+    ts.with_columns(
+        change=bt.col("price").diff(),          # price - lag(price)
+        growth=bt.col("price").pct_change(),    # price / lag(price) - 1
+        rnk=bt.col("price").rank(),             # RANK() OVER (ORDER BY price)
+    ).to_pydict()
+)
+# {'price': [10, 15, 30], 'change': [None, 5, 15],
+#  'growth': [None, 0.5, 1.0], 'rnk': [1, 2, 3]}
+```
+
+`col("x").is_duplicated()` and `col("x").is_unique()` are the same idea — a
+`count(1) OVER (PARTITION BY x)` compared against 1 — and are most useful inside
+`filter`.
+
 ## Next steps
 
 - [Aggregations](aggregations.md): collapse groups into summary rows.
 - [Joins](joins.md): combine windowed output with other datasets.
+- [Expressions API](../api/expressions.md): the window, ranking, and rolling method
+  reference.

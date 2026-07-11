@@ -24,7 +24,13 @@ from typing import TYPE_CHECKING, TypeVar
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
-from batcher.api._join_helpers import _empty_schema
+from batcher.api._join_helpers import _empty_result_schema
+from batcher.api.source_stats import (
+    collect_source_stats,
+    column_bounds_needed,
+    invalidate_source_stats,
+    persist_written_source_stats,
+)
 from batcher.config import Config, active_config, config_context
 from batcher.io.source import Source, read_source
 
@@ -33,7 +39,6 @@ if TYPE_CHECKING:
 
     from batcher.core import ExecutionContext
     from batcher.kyber.rules.selection import BuildSideDecision
-    from batcher.metadata.hub import MetadataHub
     from batcher.plan.logical import LogicalPlan
     from batcher.plan.physical import PhysicalPlan
 
@@ -42,6 +47,7 @@ __all__ = [
     "approx_quantile",
     "auto_num_partitions",
     "collect_source_stats",
+    "invalidate_source_stats",
     "partitions_from_physical",
     "persist_written_source_stats",
     "resolve_auto_config",
@@ -93,103 +99,6 @@ def with_auto_config(fn: Callable[..., _R]) -> Callable[..., _R]:
             return fn(*args, **kwargs)
 
     return wrapper
-
-
-def collect_source_stats(sources: list[Source], hub: MetadataHub | None) -> list:
-    """Per-source `SourceStatistics`, from the source itself or the metadata cache.
-
-    A source's own `statistics()` (footer/manifest/catalog) is authoritative for
-    the file as it exists now. When a source declares none (a footerless CSV/JSON),
-    fall back to statistics Batcher persisted when it *wrote* that path — but marked
-    advisory (`exact_rows=False`), since the file may have changed since: cached
-    stats sharpen cost and cardinality, they never answer an exact `count()`.
-    """
-    from dataclasses import replace
-
-    from batcher.io.source import source_statistics
-    from batcher.metadata.source_stats_store import load_source_stats
-
-    out = []
-    for s in sources:
-        # Footer/manifest statistics are stable for a source's (immutable) file set, but a
-        # source's `statistics()` re-reads + re-processes every row-group footer on each
-        # call — ~9s for a 100-file TPC-H sf100 read, paid PER QUERY and dwarfing the actual
-        # distributed run. Memoize by source identity for the session: stats only feed the
-        # optimizer's cost/cardinality (never a result), so a stale entry can at worst pick
-        # a slightly worse plan, never a wrong answer. Sources without an identity are not
-        # cached (computed each time, as before).
-        ident = _source_identity(s)
-        if ident and ident in _SOURCE_STATS_CACHE:
-            out.append(_SOURCE_STATS_CACHE[ident])
-            continue
-        stats = source_statistics(s)
-        if stats is None and hub is not None:
-            cached = load_source_stats(hub, ident)
-            stats = replace(cached, exact_rows=False) if cached is not None else None
-        if ident:
-            _SOURCE_STATS_CACHE[ident] = stats
-        out.append(stats)
-    return out
-
-
-# Session cache of per-source statistics, keyed by source identity (see collect_source_stats).
-_SOURCE_STATS_CACHE: dict[str, object] = {}
-
-
-def _source_identity(source: Source) -> str:
-    identity_fn = getattr(source, "identity", None)
-    return identity_fn() if callable(identity_fn) else ""
-
-
-def persist_written_source_stats(table: pa.Table, path: str, fmt: str) -> None:
-    """Persist a freshly-written result's statistics for a future read of `path`.
-
-    Keyed by the read-side identity (`<fmt>:<path>`), so a later `read.<fmt>(path)`
-    over a footerless format still finds an exact row count and per-column distinct
-    estimates. Best-effort; never breaks a write.
-    """
-    from batcher import core
-    from batcher.metadata.source_stats_store import save_source_stats
-    from batcher.plan.source_stats import SourceStatistics
-    from batcher.plan.stats import ColumnStat, Provenance
-
-    try:
-        from batcher.config import active_config
-
-        cols = table.schema.names
-        ndv, _quants, _bytes = core.column_statistics(table.to_batches(), cols)
-        index_on = active_config().optimizer.build_bloom_index
-        blooms = _build_bloom_index(table, cols) if index_on else {}
-        columns = {
-            name: ColumnStat(
-                ndv=float(ndv[name]) if ndv.get(name) else None,
-                provenance=Provenance.SKETCH,
-                bloom=blooms.get(name),
-            )
-            for name in cols
-            if ndv.get(name) or blooms.get(name)
-        }
-        stats = SourceStatistics(
-            row_count=table.num_rows, byte_size=table.nbytes, columns=columns, exact_rows=True
-        )
-        save_source_stats(core.default_hub(), f"{fmt}:{path}", stats)
-    except Exception:  # pragma: no cover - persistence must never break a write
-        pass
-
-
-def _build_bloom_index(table: pa.Table, cols: list[str]) -> dict[str, bytes]:
-    """A per-column membership bloom for each indexable (int/text) column — the
-    data-skipping index `zonemap_prune_filter` consults for equality/`IN`. Built in
-    Rust over the result already in memory; unindexable columns yield no entry."""
-    import batcher._native as nat
-
-    batches = table.to_batches()
-    out: dict[str, bytes] = {}
-    for i, name in enumerate(cols):
-        bloom = nat.build_column_bloom(batches, i, max(1, table.num_rows))
-        if bloom is not None:
-            out[name] = bloom
-    return out
 
 
 def approx_quantile(batches: Iterable[pa.RecordBatch], column: str, q: float) -> float | None:
@@ -273,8 +182,13 @@ def run_relational(
     if active_config().execution.adaptive_morsel_sizing:
         # Pass the hub so the morsel target reflects the *learned* per-family peak memory
         # (Carbonite's `LearnedMemoryModel` over recorded `m_peak_bytes`), not just live
-        # pressure — result-invariant (a morsel only batches data).
-        adapted = carbonite.ResourceManager(hub=ctx.hub).recommended_config()
+        # pressure — result-invariant (a morsel only batches data). Restrict the learned
+        # width to *this plan's* operator families so a narrow plan is not throttled by a
+        # wide aggregate measured in an unrelated earlier query.
+        from batcher.plan.visitor import walk
+
+        families = {type(node).__name__ for node in walk(plan)}
+        adapted = carbonite.ResourceManager(hub=ctx.hub).recommended_config(families)
         if adapted is not None:
             scope = config_context(adapted)
     with scope:
@@ -307,11 +221,18 @@ def _run_relational(
     _rpp = _rp_os.environ.get("BATCHER_SORT_PROFILE")
     _rpt = time.perf_counter()
     source_stats = (
-        ctx.source_stats if ctx.source_stats is not None else collect_source_stats(sources, ctx.hub)
+        ctx.source_stats
+        if ctx.source_stats is not None
+        else collect_source_stats(sources, ctx.hub, need_columns=column_bounds_needed(plan))
     )
     if _rpp:
         print(f"[rr] collect_source_stats {time.perf_counter() - _rpt:.1f}s", flush=True)
         _rpt = time.perf_counter()
+    # Seed the distinct counts the optimizer is about to read: no file footer carries
+    # `ndv`, so without this a query's *first* run orders its joins blind.
+    from batcher.api.terminal._metadata import seed_column_ndv
+
+    seed_column_ndv(ctx.hub, sources, plan)
     # One optimizer run yields both the physical plan (admission/costing) and the
     # optimized *logical* plan (the distributed / out-of-core executors read its derived
     # join keys + pushed predicates). Computing both here avoids re-running the entire
@@ -397,7 +318,11 @@ def _run_relational(
             print(f"[rr] collect_source_metadata {time.perf_counter() - _rpt:.1f}s", flush=True)
         # Close the loops: persist the shuffle window used and feed the join-strategy bandit.
         record_distributed(
-            ctx.hub, plan, logical_opt, decisions, envelope.credits,
+            ctx.hub,
+            plan,
+            logical_opt,
+            decisions,
+            envelope.credits,
             (time.perf_counter() - _t0) * 1000.0,
         )
         return result, decisions
@@ -438,22 +363,34 @@ def _run_relational(
         if spilled is not None:
             kyber.record_execution(ctx.hub, plan, spilled.num_rows)
             return spilled, decisions
-        if must_spill:
+        # An *advisory* infeasibility rests on a `Provenance.DEFAULT` guess: worth routing
+        # out-of-core, but a guess must never fail a legitimate query (the admission
+        # contract), so fall through to the in-memory path instead of raising.
+        if must_spill and not verdict.advisory:
             raise PlanError(
                 "plan does not fit the memory envelope and has no out-of-core path "
                 f"(binding constraint: {verdict.binding_constraint})"
             )
 
     # Resolve lazy sources to Arrow batches (reads happen here, not earlier).
-    # Projection + predicate pushdown tell each source what to read.
-    resolved = [
-        read_source(
-            src,
-            opt.source_projections.get(i),
-            opt.source_predicates.get(i),
+    # Projection + predicate pushdown tell each source what to read. Each read is timed and
+    # its observed throughput captured per source identity — Core measures the I/O the
+    # hardware actually delivered so a later read of the same source can predict its cost
+    # (the small-files scan pathology). Best-effort, negligible overhead.
+    import time as _time
+
+    from batcher.api.source_stats import _source_identity
+    from batcher.metadata.io_stats import record_source_io
+
+    resolved = []
+    for i, src in enumerate(sources):
+        _t0 = _time.perf_counter()
+        batches = read_source(src, opt.source_projections.get(i), opt.source_predicates.get(i))
+        _elapsed_ms = (_time.perf_counter() - _t0) * 1000.0
+        resolved.append(batches)
+        record_source_io(
+            ctx.hub, _source_identity(src), sum(b.nbytes for b in batches), _elapsed_ms
         )
-        for i, src in enumerate(sources)
-    ]
     # Reserve the estimated envelope against the process-wide buffer pool for the
     # duration of execution, so concurrent queries draw on one budget. If the
     # reservation does not fit (concurrent queries already over budget), prefer the
@@ -464,7 +401,9 @@ def _run_relational(
             from batcher.dist.spill import spill_collect
 
             parts = partitions_from_physical(opt) or DEFAULT_PARTITIONS
-            spilled = spill_collect(plan, sources, parts)
+            # The *optimized* plan, for the reason the primary spill site above states: the
+            # raw plan spills a comma join as a cartesian product.
+            spilled = spill_collect(logical_opt, sources, parts)
             if spilled is not None:
                 kyber.record_execution(ctx.hub, plan, spilled.num_rows)
                 return spilled, decisions
@@ -477,7 +416,7 @@ def _run_relational(
         else:
             batches = core.execute_local(opt, resolved, feedback=ctx.hub)
     table = pa.Table.from_batches(
-        batches, schema=batches[0].schema if batches else _empty_schema(ctx.columns)
+        batches, schema=batches[0].schema if batches else _empty_result_schema(plan, ctx.columns)
     )
     # Feed the measured output size back to the learner for next time, learn
     # per-column distinct counts / quantiles from the scanned input, and record the
@@ -494,7 +433,10 @@ def _run_relational(
     from batcher.api.tuning import record_run_feedback, total_source_rows
 
     record_run_feedback(
-        ctx.hub, plan, logical_opt, decisions,
+        ctx.hub,
+        plan,
+        logical_opt,
+        decisions,
         out_rows=table.num_rows,
         input_rows=total_source_rows(sources),
         wall_ms=(time.perf_counter() - _t0) * 1000.0,

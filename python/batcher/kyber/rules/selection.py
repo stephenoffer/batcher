@@ -68,6 +68,10 @@ class BuildSideDecision:
     provenance: str
     broadcast: bool = False
     cost_delta: float = 0.0  # cost(current) − cost(swapped); > 0 means the swap saves
+    # Bytes of the side that ends up hashed/replicated. The broadcast-vs-shuffle crossover
+    # is a *byte* threshold (`broadcast_max_bytes`), so its learned fit needs bytes, not
+    # rows — and only Kyber, which has the row widths, can supply them.
+    build_bytes: float = 0.0
 
 
 def adaptive_build_side(
@@ -220,8 +224,13 @@ def _rewrite(
             # Non-inner joins are not commutative — the build is always the right input.
             # Broadcast it when it is small enough to replicate (the engine probes left).
             broadcast = right_bytes <= max_bytes
-        # After any swap, the right input is the build side.
-        build_rows = min(l_est.rows, r_est.rows) if swap else r_est.rows
+        # After any swap, the right input is the build side — and a swap moves the
+        # *original left* there. `min(l, r)` only coincides with that when the swap was
+        # chosen on row counts; the cost-based swap above compares `op_cost`, which is
+        # byte-aware, so it can build a row-heavier but narrower side. Naming the side
+        # explicitly keeps the sort-merge gate below reading the rows it actually hashes.
+        build_rows = l_est.rows if swap else r_est.rows
+        build_bytes = left_bytes if swap else right_bytes
         if broadcast:
             node = dataclasses.replace(node, strategy="broadcast")
         elif build_rows >= smr:
@@ -240,7 +249,13 @@ def _rewrite(
             node = dataclasses.replace(node, strategy="sort_merge")
         decisions.append(
             BuildSideDecision(
-                l_est.rows, r_est.rows, swap, _prov(l_est, r_est), broadcast, cost_delta
+                l_est.rows,
+                r_est.rows,
+                swap,
+                _prov(l_est, r_est),
+                broadcast,
+                cost_delta,
+                build_bytes,
             )
         )
         return node

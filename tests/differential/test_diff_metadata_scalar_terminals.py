@@ -134,7 +134,6 @@ def test_scalar_terminals_on_empty_match_duckdb(pq_path, duck):
     assert empty.has_nulls("i") is False
     assert empty.all_null("i") is False
     assert empty.n_unique("i") == 0
-    assert empty.any() is False
     assert empty.has_rows is False
 
 
@@ -146,14 +145,14 @@ def test_scalar_terminals_on_single_row(pq_path):
     assert one.n_unique("i") == 1
     assert one.n_null("i") == 0
     assert one.has_nulls("i") is False
-    assert one.any() is True
+    assert one.has_rows is True
 
 
 @pytest.mark.differential
-def test_any_matches_count(pq_path):
+def test_has_rows_matches_count(pq_path):
     for ds in _sources(pq_path).values():
-        assert ds.any() is True
         assert ds.has_rows is True
+        assert ds.is_empty() is False
 
 
 @pytest.mark.differential

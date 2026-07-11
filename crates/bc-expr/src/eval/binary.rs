@@ -186,13 +186,16 @@ fn reject_zero_divisor(divisor: &ArrayRef) -> Result<(), ExprError> {
     Ok(())
 }
 
-/// Promote mixed Int64/Float64 operands to a common Float64 type (SQL semantics).
-/// Same-typed operands (and non-numeric mixes) pass through unchanged.
+/// Promote mixed operands to a common type before a binary op (SQL semantics):
+/// Int64/Float64 → Float64, numeric/decimal → the decimal type, and a string against a
+/// binary-typed column → the binary type. Same-typed operands pass through unchanged.
 pub(crate) fn coerce_numeric(
     l: &ArrayRef,
     r: &ArrayRef,
 ) -> Result<(ArrayRef, ArrayRef), ExprError> {
-    use DataType::{Decimal128, Float64, Int64};
+    use DataType::{
+        Binary, Date32, Date64, Decimal128, Float64, Int64, LargeBinary, LargeUtf8, Timestamp, Utf8,
+    };
     match (l.data_type(), r.data_type()) {
         (Int64, Float64) => Ok((cast(l, &Float64)?, r.clone())),
         (Float64, Int64) => Ok((l.clone(), cast(r, &Float64)?)),
@@ -200,6 +203,26 @@ pub(crate) fn coerce_numeric(
         // precision/scale, so the comparison/arithmetic stays exact.
         (Decimal128(..), Int64 | Float64) => Ok((l.clone(), cast(r, l.data_type())?)),
         (Int64 | Float64, Decimal128(..)) => Ok((cast(l, r.data_type())?, r.clone())),
+        // A Utf8 date/time literal (`'2013-07-01'`) against a temporal column: cast the
+        // string to the column's exact temporal type (`Date32`/`Date64`/`Timestamp(unit,
+        // tz)`), which arrow parses from ISO-8601 — matching DuckDB, which casts the
+        // string literal to the column's DATE/TIMESTAMP type for the comparison.
+        (Date32 | Date64 | Timestamp(..), Utf8 | LargeUtf8) => {
+            Ok((l.clone(), cast(r, l.data_type())?))
+        }
+        (Utf8 | LargeUtf8, Date32 | Date64 | Timestamp(..)) => {
+            Ok((cast(l, r.data_type())?, r.clone()))
+        }
+        // A Utf8 string literal compared to a Binary-typed column — the shape ClickBench's
+        // `hits` produces, since its string columns arrive as `Binary` (no UTF-8 logical
+        // annotation) while a SQL literal like `''` is `Utf8`. Cast the Utf8 side to the
+        // binary type: `Utf8 -> Binary` is a zero-copy, never-failing reinterpret (offsets
+        // + bytes are identical), and a lexicographic byte compare equals a string compare
+        // for valid UTF-8, so `=`/`<>`/`<`/`>` match DuckDB's VARCHAR semantics.
+        (Binary, Utf8 | LargeUtf8) => Ok((l.clone(), cast(r, &Binary)?)),
+        (Utf8 | LargeUtf8, Binary) => Ok((cast(l, &Binary)?, r.clone())),
+        (LargeBinary, Utf8 | LargeUtf8) => Ok((l.clone(), cast(r, &LargeBinary)?)),
+        (Utf8 | LargeUtf8, LargeBinary) => Ok((cast(l, &LargeBinary)?, r.clone())),
         _ => Ok((l.clone(), r.clone())),
     }
 }
@@ -279,5 +302,40 @@ mod scalar_path_tests {
                 }
             }
         }
+    }
+
+    /// A `Binary`-typed column compared to a `Utf8` string literal (ClickBench's `hits`
+    /// shape) coerces to a byte compare instead of erroring on the type mismatch, and the
+    /// result equals a plain string compare.
+    #[test]
+    fn binary_column_vs_utf8_literal_compares() {
+        use arrow::array::{BinaryArray, BooleanArray, StringArray};
+        let bin: ArrayRef = Arc::new(BinaryArray::from_opt_vec(vec![
+            Some(b"a".as_ref()),
+            Some(b""),
+            None,
+        ]));
+        let lit: ArrayRef = Arc::new(StringArray::from(vec![Some(""), Some(""), Some("")]));
+        let out = eval_binary(BinaryOp::Ne, &bin, &lit).unwrap();
+        let got = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        // "a" <> "" is true, "" <> "" is false, NULL <> "" is null.
+        assert_eq!(got.value(0), true);
+        assert_eq!(got.value(1), false);
+        assert!(got.is_null(2));
+    }
+
+    /// A `Timestamp`/`Date32` column compared to a `Utf8` date-string literal coerces by
+    /// parsing the literal to the column's temporal type (ClickBench's `EventDate >= '…'`).
+    #[test]
+    fn date_column_vs_utf8_literal_compares() {
+        use arrow::array::{BooleanArray, Date32Array, StringArray};
+        // 2013-07-01 is day 15887 from the epoch; use a value on each side of it.
+        let dates: ArrayRef = Arc::new(Date32Array::from(vec![15886, 15887, 15888]));
+        let lit: ArrayRef = Arc::new(StringArray::from(vec!["2013-07-01"; 3]));
+        let out = eval_binary(BinaryOp::Ge, &dates, &lit).unwrap();
+        let got = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(got.value(0), false); // 06-30 >= 07-01 → false
+        assert_eq!(got.value(1), true); // 07-01 >= 07-01 → true
+        assert_eq!(got.value(2), true); // 07-02 >= 07-01 → true
     }
 }

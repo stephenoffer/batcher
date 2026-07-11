@@ -142,13 +142,23 @@ def _apply(node: LogicalPlan, leaf) -> LogicalPlan | None:
     schema for the integer guard), returning the rebuilt node — or `None` when
     nothing changed, so the driver's fixpoint terminates."""
     input_node = node.input
-    int_cols = _int_cols(input_node.available_schema())
+    # The int-column set is a pure function of the input's schema, but `_apply` runs
+    # once per arith rule per node per fixpoint iteration — recomputing it (a scan of
+    # every schema field) each time is waste. Memoize it on the (immutable) input node,
+    # the same `__dict__` cache `to_ir`/`available_schema` use.
+    int_cols = input_node.__dict__.get("_c_int_cols")
+    if int_cols is None:
+        int_cols = _int_cols(input_node.available_schema())
+        input_node.__dict__["_c_int_cols"] = int_cols
 
     def rewrite(expr: Expr) -> Expr:
         return transform_expr_up(expr, lambda e: leaf(e, int_cols))
 
     rebuilt = map_node_expressions(node, rewrite)
-    return None if rebuilt.to_ir() == node.to_ir() else rebuilt
+    # `map_node_expressions` returns the *same object* when no expression changed, so the
+    # `is` check settles the common no-op case in O(1); the IR comparison is the fallback
+    # for a rule that rebuilt an equal-but-new expression (identical result either way).
+    return None if rebuilt is node or rebuilt.to_ir() == node.to_ir() else rebuilt
 
 
 # --- fold_add_sub_constants -------------------------------------------------

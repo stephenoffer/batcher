@@ -1,9 +1,93 @@
 # LLM inference
 
-`llm_generate` runs offline text generation over millions of rows. The engine loads
-once per worker and does its own continuous batching, so Batcher feeds it whole
-request lists and handles the surrounding columnar work: building prompts from row
-columns and parsing structured output.
+Offline text generation over millions of rows. The engine loads once per worker and
+does its own continuous batching, so Batcher feeds it whole request lists and handles
+the surrounding columnar work: building prompts from row columns and parsing structured
+output.
+
+## On a Dataset
+
+`ds.ml.generate(...)` is the Dataset-native form: it returns a new lazy `Dataset` with
+the generated column appended, and reuses the same GPU-actor scheduling as
+`ds.ml.infer` / `ds.ml.embed` (`num_gpus`, `concurrency`, `accelerator_type`).
+
+```python
+# docs: skip
+import batcher as bt
+from batcher.ml import vllm_engine
+
+engine = vllm_engine("meta-llama/Llama-3-8B-Instruct", chat=True, sampling={"max_tokens": 256})
+answers = (
+    bt.read.parquet("s3://bucket/questions.parquet")
+    .ml.generate(engine, prompt_column="question", num_gpus=1)
+    .write.parquet("s3://bucket/answers.parquet")
+)
+```
+
+Because an *engine* is just a zero-arg callable returning a `list[str] -> list[str]`
+function, a deterministic stub stands in for a model — so a generation pipeline is
+testable with no GPU:
+
+```python
+import batcher as bt
+
+shout = lambda: (lambda prompts: [p.upper() for p in prompts])
+print(bt.from_pydict({"q": ["hi"]}).ml.generate(shout, prompt_column="q").to_pydict())
+# {'q': ['hi'], 'response': ['HI']}
+```
+
+## Chat models need the chat template
+
+`vllm_engine(chat=True)` sends each row as a conversation through `LLM.chat`, so vLLM
+applies the model's own chat template. **Set this for any instruction-tuned or chat
+model.** The default (`chat=False`) is the completion path, right for a base model: it
+skips the template, and a tuned model then answers a prompt in a format it was never
+trained on — degraded output with nothing to signal it. `system=` adds a system turn to
+every conversation.
+
+```python
+# docs: skip
+engine = vllm_engine(
+    "meta-llama/Llama-3-8B-Instruct",
+    chat=True,
+    system="Answer in one sentence.",
+    sampling={"temperature": 0.2, "top_p": 0.9, "stop": ["\n\n"]},
+)
+```
+
+Vision models take their image through the completion path, so `image_column` requires
+`chat=False`.
+
+## Sequence packing (pretraining ingest)
+
+A pretraining batch is `seq_len` tokens wide; documents are not. Padding each document to
+the context length wastes the padding, and the GPU computes attention over it.
+`pack_sequences` lays the tokenized documents end to end, separated by an EOS token, and
+cuts the stream every `seq_len` tokens — so every position is a real token.
+
+```python
+import pyarrow as pa
+from batcher.ml import pack_sequences
+
+batch = pa.RecordBatch.from_pydict({"tokens": [[1, 2, 3], [4, 5], [6, 7, 8]]})
+print(list(pack_sequences([batch], seq_len=4))[0].column("tokens").to_pylist())
+# [[1, 2, 3, 4], [5, 6, 7, 8]]
+```
+
+On a corpus of 5,000 documents averaging ~325 tokens against a 4,096-token context,
+padding each document fills only **7.9%** of each sequence with real tokens; packing
+fills 100% and emits **92% fewer sequences** for the same data.
+
+Packing is sequential and stateful — a document that does not fit is carried into the
+next sequence rather than padded — so it transforms a *batch stream*, not a `map_batches`
+(a parallel per-batch map would cut the stream in a nondeterministic place). Shuffle
+before packing, not after. The output is a `FixedSizeList<Int64>[seq_len]` column, which
+`iter_torch_batches` turns into an `(n, seq_len)` tensor with no reshape at the edge.
+
+The trailing partial sequence is dropped by default (`drop_remainder=False` pads it with
+`pad_token`, so every emitted batch keeps one schema).
+
+## The streaming form
 
 ```python
 # docs: skip
@@ -132,12 +216,78 @@ answers = llm_generate(
 )
 ```
 
+## AI-powered ETL: typed columns, not strings
+
+Generation gives you a *string*. A string is not a column an analyst can filter, join, or
+aggregate — turning it into one is the actual ETL step, and it is where these pipelines
+break. Two Dataset methods do it.
+
+`ds.ml.extract(engine, schema=...)` appends one **typed** column per declared field. The
+declaration — not what the model happened to emit — decides the Arrow type:
+
+```python
+import batcher as bt
+
+notes = bt.from_pydict({"note": ["Paid 42 USD to Acme"]})
+stub = lambda: (lambda ps: ['{"vendor": "Acme", "total": "42"}'] * len(ps))
+print(notes.ml.extract(stub, schema={"vendor": "string", "total": "float64"}, prompt_column="note").to_pydict())
+# {'note': ['Paid 42 USD to Acme'], 'vendor': ['Acme'], 'total': [42.0]}
+```
+
+This is why `extract` exists rather than `generate(parse_json=True)`: `parse_json` infers
+the struct type from whatever came back **in that batch**. Ask for `{label, score}`, have
+the model omit `score` on one batch, and the two batches carry incompatible struct types —
+the scan dies at concat time with the GPU work already paid for. A declared schema pins
+every batch to the same types and makes the missing value a null. Note also that `"42"`
+came back as a *string* and landed in a `float64` column: values are coerced per row.
+
+Failures degrade one row, never the batch — an unparseable response, a missing key, or a
+value that will not coerce becomes null, and the damage is countable:
+
+```python
+# docs: skip
+bad = extracted.filter(bt.col("total").is_null()).count()
+```
+
+`ds.ml.classify(engine, labels=[...])` labels each row with exactly one of `labels`. A
+model asked for `"positive"` will answer `"Positive."` or `"The sentiment is positive."`;
+taken verbatim those give a category column with a long tail that never groups together.
+`classify` resolves the answer against the declared set and **nulls anything else**, so the
+column's domain is exactly `labels`:
+
+```python
+import batcher as bt
+
+reviews = bt.from_pydict({"review": ["loved it", "awful"]})
+stub = lambda: (lambda ps: ["Positive." if "loved" in p else "negative" for p in ps])
+print(reviews.ml.classify(stub, labels=["positive", "negative"], prompt_column="review").to_pydict())
+# {'review': ['loved it', 'awful'], 'label': ['positive', 'negative']}
+```
+
+Pair `extract` with guided decoding so that every row parses in the first place —
+`json_schema(schema)` builds the JSON Schema for you:
+
+```python
+# docs: skip
+from batcher.ml import json_schema, vllm_engine
+
+schema = {"vendor": "string", "total": "float64"}
+engine = vllm_engine("meta-llama/Llama-3-8B", guided_json=json_schema(schema))
+invoices = bt.read.parquet("s3://bucket/invoices.parquet").ml.extract(
+    engine, schema=schema, prompt_column="body", num_gpus=1
+)
+```
+
+Both lower to `map_batches`, so they are linear maps: they stream, they distribute across
+GPU actors, and they compose with the rest of the engine like any other projection.
+
 ## Structured output
 
 Constrain generation to a JSON schema so every row is parseable, then parse it into a
 struct column. `guided_json` on the engine forces the model's decoding to the schema,
 and `parse_json=True` on `llm_generate` parses each output into a struct; a row that
-fails to parse gets a null rather than failing the batch. Pair the two — guided
+fails to parse gets a null rather than failing the batch. Prefer `ds.ml.extract` above
+when the fields are known — it pins the Arrow types. Pair the two — guided
 decoding makes the output well-formed, and `parse_json` turns it into typed columns
 you can query downstream.
 
@@ -212,3 +362,9 @@ For a model Batcher does not wrap directly, `ds.ml.embed` also takes any load-on
 callable or class that maps a batch to vectors, and `ds.ml.infer` does the same for
 general model scoring — both accept `concurrency`, `num_gpus`, and `batch_size` the
 same way.
+
+## Next steps
+
+- [Inference](inference.md): the general batch-inference and embedding path.
+- [Serving](serving.md): expose a model behind an endpoint.
+- [GPU scheduling](gpu.md): how `num_gpus` and `concurrency` map to actors.

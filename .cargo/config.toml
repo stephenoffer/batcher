@@ -1,0 +1,23 @@
+# Static ISA floor for the ahead-of-time-compiled data-plane kernels.
+#
+# The engine ships ONE compiled `_native.abi3.so` from the driver to every Ray worker
+# (`runtime_env` py_modules), so on a MIXED-instance cluster that single binary must run on
+# the OLDEST worker. `target-cpu=native` would bake in the build host's ISA and SIGILL a
+# worker that lacks it — so the ahead-of-time floor is the universally-safe `x86-64-v2`
+# (SSE3/SSSE3/SSE4.1/SSE4.2, POPCNT, CMPXCHG16B), supported by *every* x86-64 cloud instance
+# since Nehalem/Sandy Bridge (AWS/GCP/Azure Intel and AMD EPYC alike). POPCNT alone
+# accelerates the null-bitmap / validity popcounts that pervade Arrow and aggregation, and
+# SSE4.2 helps string/compare kernels — a safe, universal win over the plain SSE2 default.
+#
+# AVX2 / AVX-512 are deliberately NOT a static floor: as a shipped baseline they would fault
+# on older or feature-restricted instances and defeat the mixed-cluster guarantee. They are
+# taken at RUNTIME instead — the Cranelift JIT selects vector width per worker via
+# `bc_arrow::HardwareProfile::detect` (`is_x86_feature_detected!`), so a heterogeneous cluster
+# is correct by construction. For a KNOWN-homogeneous modern cluster you can specialize the
+# whole binary with `RUSTFLAGS="-C target-cpu=x86-64-v3"` (AVX2/FMA/BMI) or `=native`; note
+# RUSTFLAGS replaces (does not merge with) the flags below.
+#
+# aarch64 (AWS Graviton, etc.) is intentionally left at its default: NEON is baseline there,
+# and a cross-arch cluster ships a per-arch binary regardless.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v2"]

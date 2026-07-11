@@ -17,8 +17,10 @@ import pyarrow as pa
 
 from batcher.dist.executor import _apply_above, _ensure_ray, _relabel_single_source
 from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
+from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
+    map_barrier,
     release_placement,
     shuffle_partitions,
 )
@@ -39,6 +41,7 @@ def execute_join_flight(
     *,
     fused_agg: Aggregate | None = None,
     combine_partials: bool = False,
+    _fault_inject_map: set[int] | None = None,
 ) -> pa.Table:
     """Co-partition both join sides over a Flight shuffle and join per bucket.
 
@@ -55,8 +58,10 @@ def execute_join_flight(
     servers (shuffle stages 0 and 1); reducer r fetches bucket r from every mapper
     on both sides and runs the local join. A lost worker's buckets are recomputed
     from its source partitions (still on disk) on a survivor — Spark-style lineage
-    recovery, matching the aggregate path. Object store bypassed. `_fault_inject`
-    is a test-only hook: worker ids to kill after the map barrier."""
+    recovery, matching the aggregate path — in the map phase via `map_barrier`, and
+    thereafter via `ShuffleRecovery`. Object store bypassed. `_fault_inject` /
+    `_fault_inject_map` are test-only hooks: worker ids to kill after / before the map
+    barrier."""
     import ray
 
     import batcher._native as nat
@@ -106,7 +111,7 @@ def execute_join_flight(
     # Borrow the query-lifetime fleet when the adaptive loop installed one; else spawn
     # one we tear down. Every Flight operator must borrow it — spawning a second
     # placement group would contend with the fleet's held bundles and deadlock.
-    actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
+    actors, pg, _addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = shuffle_partitions(workers)
     try:
         # Each side reads only the columns/rows its map prefix needs (join keys + carried
@@ -116,20 +121,26 @@ def execute_join_flight(
         lparts = partition_descriptors(sources[lsid], workers, projection=lproj, predicate=lpred)
         rparts = partition_descriptors(sources[rsid], workers, projection=rproj, predicate=rpred)
 
-        ray.get(
-            [
-                actors[i].map_publish_raw.remote(
-                    left_ir, list(join.left_keys), lparts[i], n_buckets, 0
-                )
-                for i in range(workers)
-            ]
-            + [
-                actors[i].map_publish_raw.remote(
-                    right_ir, list(join.right_keys), rparts[i], n_buckets, 1
-                )
-                for i in range(workers)
-            ]
-        )
+        # Simulate worker loss BEFORE the map barrier (test hook).
+        if _fault_inject_map:
+            for i in _fault_inject_map:
+                ray.kill(actors[i])
+
+        # MAP barrier under worker-loss recovery: a worker preempted while mapping has
+        # BOTH its sides republished on one survivor under the same `src`, so the single
+        # `mapper_addrs[src]` the reducers dial still resolves. Both sides are issued to
+        # the same actor and only the second is awaited — actor calls run in order, so
+        # the addr coming back means both landed (the same contract `recompute` below
+        # relies on). Without this a bare `ray.get` failed the whole join on one loss.
+        def _launch(host: int, src: int):
+            actors[host].map_publish_raw.remote(
+                left_ir, list(join.left_keys), lparts[src], n_buckets, 0, src
+            )
+            return actors[host].map_publish_raw.remote(
+                right_ir, list(join.right_keys), rparts[src], n_buckets, 1, src
+            )
+
+        mapper_addrs, mapper_dead = map_barrier(workers, _launch)
 
         # Simulate worker loss after the map barrier (test hook).
         if _fault_inject:
@@ -140,7 +151,7 @@ def execute_join_flight(
         rschema = probe(right_ir, sources[rsid])
         batches = _join_reduce_with_recovery(
             actors,
-            list(addrs),
+            mapper_addrs,
             (lparts, rparts),
             (left_ir, right_ir),
             (list(join.left_keys), list(join.right_keys)),
@@ -151,6 +162,7 @@ def execute_join_flight(
             gk,
             aj,
             finalize=not combine_partials,
+            dead=mapper_dead,
         )
     finally:
         if owns:
@@ -172,14 +184,14 @@ def execute_join_flight(
     elif fused_agg is not None:
         table = _empty_fused(fused_agg)
     else:
-        table = pa.table({o.alias: [] for o in join.output})
+        table = empty_result_table(join, [o.alias for o in join.output])
     return table if not above else _apply_above(above, table)
 
 
 def _empty_fused(fused_agg: Aggregate) -> pa.Table:
     """The empty result table for a fused post-join aggregate (group keys + aggregates)."""
     keys = [k.alias for k in fused_agg.group_keys]
-    return pa.table({c: [] for c in keys + [s.alias for s in fused_agg.aggregates]})
+    return empty_result_table(fused_agg, keys + [s.alias for s in fused_agg.aggregates])
 
 
 def _project_join_side(side: LogicalPlan, needed: set[str]) -> LogicalPlan:
@@ -211,6 +223,7 @@ def _join_reduce_with_recovery(
     gk=None,
     aj=None,
     finalize=True,
+    dead=None,
 ):
     """Run the join reduce under recompute-on-worker-loss recovery.
 
@@ -218,6 +231,9 @@ def _join_reduce_with_recovery(
     (or whose host died) drives a recompute of that worker's *both* sides (the join
     co-partitions left and right) from their on-disk source partitions onto a
     survivor, then a retry. Returns the joined batches.
+
+    `dead` seeds the workers the map barrier already lost, so no reducer is hosted on
+    an actor that is gone.
     """
     import ray
 
@@ -233,7 +249,7 @@ def _join_reduce_with_recovery(
     left_ir, right_ir = irs
     left_keys, right_keys = keys
     lschema, rschema = schemas
-    dead: set[int] = set()
+    dead: set[int] = set(dead or ())
 
     def _pick_live(avoid: set[int]) -> int:
         for i in range(workers):

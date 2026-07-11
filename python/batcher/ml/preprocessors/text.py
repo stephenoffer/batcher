@@ -30,6 +30,15 @@ class Concatenator(Preprocessor):
     native list column ready to become a tensor for training. The source columns are
     kept unless `drop` is set.
 
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import Concatenator
+            >>> ds = bt.from_pydict({"a": [1.0, 2.0], "b": [3.0, 4.0]})
+            >>> Concatenator(["a", "b"]).fit_transform(ds).to_pydict()
+            {'a': [1.0, 2.0], 'b': [3.0, 4.0], 'features': [[1.0, 3.0], [2.0, 4.0]]}
+
     Args:
         columns: the numeric columns to stack, in order.
         output_column: the name of the assembled list column.
@@ -48,6 +57,25 @@ class Concatenator(Preprocessor):
         self.drop = drop
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Add `output_column`, a list column stacking the source columns per row.
+
+        The source columns are dropped when `drop` is set.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import Concatenator
+                >>> ds = bt.from_pydict({"a": [1.0, 2.0], "b": [3.0, 4.0]})
+                >>> Concatenator(["a", "b"], drop=True).fit_transform(ds).to_pydict()
+                {'features': [[1.0, 3.0], [2.0, 4.0]]}
+
+        Args:
+            ds: The dataset whose columns to assemble.
+
+        Returns:
+            A new lazy `Dataset` with the assembled list column added.
+        """
         self._require_fitted()
         out = ds.with_columns(**{self.output_column: array(*(col(c) for c in self.columns))})
         if self.drop:
@@ -61,6 +89,15 @@ class Tokenizer(Preprocessor):
 
     `tokenizer` is a callable ``str -> list`` or any object exposing ``.encode(str)``
     (e.g. a HuggingFace tokenizer). A stateless transform (``fit`` is a no-op).
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import Tokenizer
+            >>> ds = bt.from_pydict({"t": ["a b", "c"]})
+            >>> Tokenizer("t", str.split).fit_transform(ds).to_pydict()
+            {'t': [['a', 'b'], ['c']]}
 
     Args:
         column: the text column to tokenize.
@@ -85,6 +122,25 @@ class Tokenizer(Preprocessor):
         self._encode = encode
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Apply the tokenizer to the text column, writing token lists to `output_column`.
+
+        Runs as a whole-batch `map_batches` UDF; null inputs stay null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import Tokenizer
+                >>> ds = bt.from_pydict({"t": ["a b", "c"]})
+                >>> Tokenizer("t", str.split, output_column="toks").fit_transform(ds).to_pydict()
+                {'t': ['a b', 'c'], 'toks': [['a', 'b'], ['c']]}
+
+        Args:
+            ds: The dataset whose text column to tokenize.
+
+        Returns:
+            A new lazy `Dataset` with the token-list column added or replaced.
+        """
         self._require_fitted()
         column, output, encode = self.column, self.output_column, self._encode
 

@@ -182,7 +182,8 @@ impl KllSketch {
 
     /// All retained items as `(value, weight)`, sorted by value.
     fn weighted_items(&self) -> Vec<(f64, u64)> {
-        let mut items: Vec<(f64, u64)> = Vec::new();
+        let n_retained: usize = self.compactors.iter().map(|c| c.len()).sum();
+        let mut items: Vec<(f64, u64)> = Vec::with_capacity(n_retained);
         for (h, comp) in self.compactors.iter().enumerate() {
             let w = 1u64 << h;
             items.extend(comp.iter().map(|&v| (v, w)));
@@ -259,7 +260,10 @@ impl KllSketch {
     /// `[len: u64][values: len × f64]`. The rng is *not* stored: it only seeds a
     /// reproducible coin and has no effect on the retained quantile estimates.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        // Exact wire size: 5×u64 header + per level (u64 len + len×f64) — pre-size so the
+        // shuffle/persist serialization fills one allocation instead of doubling as it grows.
+        let n_values: usize = self.compactors.iter().map(|c| c.len()).sum();
+        let mut out = Vec::with_capacity(40 + self.compactors.len() * 8 + n_values * 8);
         out.extend_from_slice(&(self.k as u64).to_le_bytes());
         out.extend_from_slice(&self.n.to_le_bytes());
         out.extend_from_slice(&self.min.to_le_bytes());

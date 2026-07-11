@@ -23,6 +23,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.fs as pafs
 
 # A pre-registered SQL executor: query string -> result table.
 SqlRunner = Callable[[str], pa.Table]
@@ -61,3 +62,41 @@ class Engine:
         omit it (it shows as ``n/a``, never a failure). SQL engines override this.
         """
         return None
+
+    def sql_runner_scan(self, _uris: dict[str, str]) -> SqlRunner | None:
+        """A ``query -> pa.Table`` callable with each named table bound to a *lazy
+        native parquet scan* of ``uris[name]`` (a glob), or ``None``.
+
+        This is the large-scale counterpart to :meth:`sql_runner`: instead of
+        pre-materializing every table into shared Arrow (~100GB at sf100), each engine
+        reads parquet natively and lazily through its own scan — the representative way
+        these engines run at scale, and the only way that fits in memory. SQL engines
+        override it; the base returns ``None`` (the suite omits the engine).
+        """
+        return None
+
+    # ----------------------------------------------------------------------- #
+    # Scan benchmark: bind the scan *inside* the timed call
+    # ----------------------------------------------------------------------- #
+    # `sql_runner_scan` binds its tables once, up front, so file listing and metadata
+    # opening land outside the timed region. That is right for TPC-H (where the scan is
+    # a fixed setup cost shared by 22 queries) and wrong for the file-layout benchmark,
+    # whose entire subject *is* that setup cost. These two hooks therefore rebuild the
+    # scan on every invocation, so the measurement covers list -> open -> read -> compute.
+
+    def scan_sql_runner(self, _glob: str) -> SqlRunner | None:
+        """A ``query -> pa.Table`` callable binding table ``t`` to a *fresh* scan of ``_glob``.
+
+        Re-planned on every call, unlike :meth:`sql_runner_scan`. Returns ``None`` when
+        the engine has no SQL surface (the case then shows ``n/a`` for it).
+        """
+        return None
+
+    def scan_handle(self, _filesystem: pafs.FileSystem, _paths: list[str]) -> Any:
+        """A native lazy handle over an explicit parquet file list.
+
+        The non-SQL engines (PyArrow, Ray Data) take a file list rather than a glob, so
+        the scan suite lists the corpus itself and hands the paths over. Called inside
+        the timed region.
+        """
+        raise NotImplementedError(f"{self.name} cannot scan a parquet file list")

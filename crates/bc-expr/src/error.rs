@@ -19,6 +19,26 @@ pub enum ExprError {
     #[error("string function {func} requires a {arg} argument")]
     MissingArgument { func: String, arg: &'static str },
 
+    /// A scalar argument that deserialized fine but cannot produce a defined result
+    /// (a zero-width chunk, an overlap wider than the chunk). The control plane
+    /// validates these at the API edge; this guards a hand-written IR document.
+    #[error("string function {func}: {reason}")]
+    InvalidArgument { func: String, reason: String },
+
+    /// The key material itself is deliberately absent from this message: an error
+    /// string is the one value in the engine that reliably reaches a log file.
+    #[error("{func}: key must be 32 bytes, given as 64 hex characters or as base64")]
+    InvalidKey { func: &'static str },
+
+    /// A key *reference* (`env:NAME` / `file:PATH`) could not be resolved on this node.
+    /// The reference is named (it is not secret and is what an operator needs to fix the
+    /// misconfiguration); the resolved key never appears here.
+    #[error("{func}: could not resolve key reference {reference}")]
+    KeyRefUnresolved {
+        func: &'static str,
+        reference: String,
+    },
+
     #[error("integer division or modulo by zero")]
     DivideByZero,
 

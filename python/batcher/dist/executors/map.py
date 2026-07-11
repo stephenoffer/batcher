@@ -26,6 +26,7 @@ from collections import deque
 
 import pyarrow as pa
 
+from batcher._internal.hardware import available_cpu_count
 from batcher.dist.executors.partition_io import descriptor_rows, partition_descriptors
 from batcher.dist.executors.plan_analysis import _relabel_single_source
 from batcher.dist.executors.ray_runtime import _ensure_ray
@@ -221,13 +222,14 @@ def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
 
 def _run_resident_pool(plan0, partitions, opts, size, registry):
     """Map `partitions` through the resident pool for `plan0` in `registry` (model loaded
-    once), preserving submission order. Returns ``(ordered_results, peak_gpu_util)``."""
+    once), preserving submission order. Returns ``(ordered_results, peak_gpu_util, peak_vram)``."""
     import ray
 
     actors = _resident_pool_for(plan0, opts, size, registry)
     results = _pipeline_actor_pool(actors, partitions, _actor_inflight_depth())
     samples = [s for s in ray.get([a.gpu_stats.remote() for a in actors]) if s is not None]
-    return results, (max(samples) if samples else None)
+    vram = [v for v in (_drain_gpu_vram(a) for a in actors) if v is not None]
+    return results, (max(samples) if samples else None), (max(vram) if vram else None)
 
 
 def _run_warm_pool(plan0, partitions, opts, lo, hi):
@@ -236,7 +238,7 @@ def _run_warm_pool(plan0, partitions, opts, lo, hi):
     On the rare case the warm pool loses actors mid-run (a node preempted after the liveness
     check), it evicts the pool and re-runs on a fresh recovering per-call pool, so a warm
     pool never turns a preemption into a failed query. The next inference call rebuilds the
-    warm pool. Returns ``(ordered_results, peak_gpu_util)``."""
+    warm pool. Returns ``(ordered_results, peak_gpu_util, peak_vram)``."""
     from ray.exceptions import RayError
 
     from batcher.dist.executors.ray_runtime import recovery_policy
@@ -376,14 +378,14 @@ def _distributed_map(
         scope = _INFERENCE_POOLS.get()
         warm = active_config().distributed.warm_inference_pools
         if scope is not None:
-            results, gpu_util = _run_resident_pool(plan0, partitions, opts, hi, scope)
+            results, gpu_util, gpu_vram = _run_resident_pool(plan0, partitions, opts, hi, scope)
         elif warm:
-            results, gpu_util = _run_warm_pool(plan0, partitions, opts, lo, hi)
+            results, gpu_util, gpu_vram = _run_warm_pool(plan0, partitions, opts, lo, hi)
         else:
-            results, gpu_util = _drive_actor_pool(
+            results, gpu_util, gpu_vram = _drive_actor_pool(
                 plan0, partitions, opts, lo, hi, recovery_policy()
             )
-        _record_gpu_feedback(hub, plan, gpu_util)
+        _record_gpu_feedback(hub, plan, gpu_util, gpu_vram)
     else:
         # Skew-aware adaptive CPU: each stateless task requests a CPU share sized to its
         # own partition's data (x the plan's compute weight) — fractional for a tiny
@@ -413,7 +415,14 @@ def _distributed_map(
             batches.extend(r)
     _record_source_rows(hub, sources[sid], sum(b.num_rows for b in batches))
     if not batches:
-        return pa.table({})
+        # A pipeline whose filter matched nothing still has a schema, and the single-node
+        # path returns it. Returning a *column-less* table here made `distributed ==
+        # single-node` false for every empty result — and broke any caller that went on to
+        # select a column or concat with a non-empty batch. Fall back to the column-less
+        # table only when the plan cannot state its schema (a UDF whose output type is
+        # unknown until it runs).
+        schema = plan.available_schema()
+        return pa.table({}) if schema is None else pa.Table.from_batches([], schema=schema.arrow)
     # Reconcile a UDF whose output schema drifts across partitions (e.g. one partition's
     # rows carry extra fields) to one union schema, so the gather concatenates instead of
     # failing — the same schema-drift tolerance the single-node path gives.
@@ -517,7 +526,7 @@ def _placeable_node_cores() -> float:
             return float(int(min(cores)))
     except Exception:
         pass
-    return float(os.cpu_count() or 4)
+    return float(available_cpu_count())
 
 
 def _cluster_cores() -> float:
@@ -525,9 +534,9 @@ def _cluster_cores() -> float:
     try:
         import ray
 
-        return float(int(ray.cluster_resources().get("CPU", 0.0))) or float(os.cpu_count() or 4)
+        return float(int(ray.cluster_resources().get("CPU", 0.0))) or float(available_cpu_count())
     except Exception:
-        return float(os.cpu_count() or 4)
+        return float(available_cpu_count())
 
 
 def _learning_hub(hub=None):
@@ -684,13 +693,21 @@ def stream_distributed_map(plan: LogicalPlan, sources: list[Source], workers: in
             yield from out
 
 
-def _record_gpu_feedback(hub, plan: LogicalPlan, gpu_util: float | None) -> None:
-    """Persist the pipeline's observed GPU utilization for next-run adaptation."""
-    if hub is None or gpu_util is None:
-        return
-    from batcher.ml.gpu import gpu_feedback_key, record_gpu_utilization
+def _record_gpu_feedback(
+    hub, plan: LogicalPlan, gpu_util: float | None, gpu_vram: float | None = None
+) -> None:
+    """Persist the pipeline's observed GPU utilization *and* peak VRAM for next-run adaptation.
 
-    record_gpu_utilization(hub, gpu_feedback_key(plan), gpu_util)
+    Utilization adapts `num_gpus`; the peak VRAM fraction adapts how many inference actors
+    pack onto one device (`actors_per_gpu_from_learned_vram`). Both keyed by the pipeline's
+    stable identity; best-effort (each recorder no-ops on `None`)."""
+    if hub is None:
+        return
+    from batcher.ml.gpu import gpu_feedback_key, record_gpu_peak_vram, record_gpu_utilization
+
+    key = gpu_feedback_key(plan)
+    record_gpu_utilization(hub, key, gpu_util)
+    record_gpu_peak_vram(hub, key, gpu_vram)
 
 
 def _gpu_options(num_gpus: float, accelerator_type: str | None) -> dict:
@@ -761,6 +778,7 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
     results: list = [None] * len(parts)
     attempts = [0] * len(parts)
     peak_util: float | None = None
+    peak_vram: float | None = None
 
     def _assign() -> None:
         while pending:
@@ -785,6 +803,7 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
             if action == "down" and fully_idle:
                 victim = fully_idle[-1]
                 peak_util = _max_opt(peak_util, _drain_gpu_stat(victim))
+                peak_vram = _max_opt(peak_vram, _drain_gpu_vram(victim))
                 actors.remove(victim)
                 slots.pop(victim, None)
                 ray.kill(victim)
@@ -820,7 +839,8 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy):
                     slots[new] = depth
         for a in actors:
             peak_util = _max_opt(peak_util, _drain_gpu_stat(a))
-        return results, peak_util
+            peak_vram = _max_opt(peak_vram, _drain_gpu_vram(a))
+        return results, peak_util, peak_vram
     finally:
         for a in actors:
             ray.kill(a)
@@ -832,6 +852,20 @@ def _drain_gpu_stat(actor) -> float | None:
 
     try:
         return ray.get(actor.gpu_stats.remote())
+    except Exception:  # pragma: no cover - feedback must never break execution
+        return None
+
+
+def _drain_gpu_vram(actor) -> float | None:
+    """The actor's peak VRAM fraction (best-effort; `None` if the actor predates the method
+    — e.g. a test double — or has no GPU)."""
+    import ray
+
+    stat = getattr(actor, "gpu_vram_stats", None)
+    if stat is None:
+        return None
+    try:
+        return ray.get(stat.remote())
     except Exception:  # pragma: no cover - feedback must never break execution
         return None
 
@@ -896,10 +930,11 @@ class _MapActor:
         # than spawning a full-width intra-actor pool that would oversubscribe the node.
         self._plan = _with_inference_workers(_prebuild_factories(plan0))
         self._gpu_util_max: float | None = None
+        self._gpu_vram_max: float | None = None
 
     def run(self, partition: dict):
         from batcher import core
-        from batcher.ml.gpu import sample_gpu_utilization
+        from batcher.ml.gpu import sample_gpu_utilization, sample_gpu_vram_fraction
 
         # A LAZY source over the descriptor: the scan reads its splits (storage) / iterates
         # its shipped batches incrementally, so `stream_linear_chain` overlaps reading chunk
@@ -909,11 +944,8 @@ class _MapActor:
         if source is None:
             return None
         out = core.execute_with_udfs(self._plan, [source])
-        # Sample GPU load right after the forward pass (None on a GPU-less host).
-        util = sample_gpu_utilization()
-        if util is not None:
-            prev = self._gpu_util_max
-            self._gpu_util_max = util if prev is None else max(prev, util)
+        # Sample GPU load + VRAM right after the forward pass (None on a GPU-less host).
+        self._observe_gpu(sample_gpu_utilization(), sample_gpu_vram_fraction())
         if not out or sum(b.num_rows for b in out) == 0:
             return None
         return out
@@ -926,23 +958,30 @@ class _MapActor:
         from batcher import core
         from batcher.carbonite.transfer.server import fetch
         from batcher.io.source import InMemorySource
-        from batcher.ml.gpu import sample_gpu_utilization
+        from batcher.ml.gpu import sample_gpu_utilization, sample_gpu_vram_fraction
 
         rows = fetch(addr, ticket)
         if not rows:
             return None
         out = core.execute_with_udfs(self._plan, [InMemorySource(rows)])
-        util = sample_gpu_utilization()
-        if util is not None:
-            prev = self._gpu_util_max
-            self._gpu_util_max = util if prev is None else max(prev, util)
+        self._observe_gpu(sample_gpu_utilization(), sample_gpu_vram_fraction())
         if not out or sum(b.num_rows for b in out) == 0:
             return None
         return out
 
+    def _observe_gpu(self, util: float | None, vram: float | None) -> None:
+        """Fold one post-forward GPU sample into this actor's running peaks (util + VRAM)."""
+        self._gpu_util_max = _max_opt(self._gpu_util_max, util)
+        self._gpu_vram_max = _max_opt(self._gpu_vram_max, vram)
+
     def gpu_stats(self) -> float | None:
         """The peak GPU utilization this actor observed, or `None` if no GPU."""
         return self._gpu_util_max
+
+    def gpu_vram_stats(self) -> float | None:
+        """The peak VRAM fraction this actor observed, or `None` if no GPU — the memory
+        twin of `gpu_stats`, sized so the next run packs actors by measured footprint."""
+        return self._gpu_vram_max
 
 
 # Threads a CPU (preprocess/decode) stage runs inside a GPU inference actor, so it keeps a
@@ -1040,7 +1079,8 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     import pyarrow as pa
 
     import batcher._native as nat
-    from batcher.dist.executors.partition_io import _apply_above, _empty_agg_table
+    from batcher.dist.executors.partition_io import _apply_above
+    from batcher.dist.executors.plan_analysis import _empty_agg_table
     from batcher.dist.executors.ray_runtime import current_envelope, gather_map_results
 
     _ensure_ray(workers)

@@ -252,10 +252,21 @@ def execute_spilling_aggregate(
 
         if out:
             return pa.Table.from_batches(out)
-        # Empty input: produce the correct empty/zero-row aggregate schema.
+        # Empty input. A *global* aggregate over zero rows still returns exactly one row
+        # (`count() -> 0`, `median() -> NULL`), which is what both the single-node engine
+        # and DuckDB do — so it cannot take the zero-row `_empty_table` path.
+        #
+        # `combine_finalize(..., [])` cannot serve it: with no partial state it has no
+        # schema to type the result from, and raises. Route a schema-carrying *empty*
+        # batch through the same map -> partial -> finalize pipeline the non-empty path
+        # uses; the aggregate's identity element then falls out of the mergeable algebra
+        # rather than being special-cased per function.
         if n_keys == 0:
+            empty_in = pa.RecordBatch.from_pylist([], schema=source.schema())
+            mapped = nat.execute_plan(map_ir, [[empty_in]], cfg_json)
+            partial = nat.partial_aggregate(group_keys_json, aggregates_json, mapped)
             return pa.Table.from_batches(
-                [nat.combine_finalize(group_keys_json, aggregates_json, [])]
+                [nat.combine_finalize(group_keys_json, aggregates_json, [partial])]
             )
         return _empty_table(agg)
     finally:

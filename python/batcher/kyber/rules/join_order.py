@@ -246,10 +246,14 @@ def _rebuild_greedy(
             if built is None:
                 continue  # not connected to the joined set yet
             cand_join, cand_schema = built
-            # Rank by estimated *cost*, not raw output rows: cost folds the
-            # build/probe asymmetry and accumulated work, so a calibrated model can
-            # prefer an order that pure row-minimization gets wrong.
-            score = cost.cost(cand_join).total()
+            # Rank by estimated *cost*, not raw output rows: cost folds the build/probe
+            # asymmetry, so a calibrated model can prefer an order that pure
+            # row-minimization gets wrong. Score the same **incremental** term the DP
+            # recurrence uses — the new leaf's subtree plus this join's own cost, at the
+            # orientation SELECTION will pick. The accumulated cost of `current` is common
+            # to every candidate, so including it would not change the argmin; it would
+            # only re-walk the whole subtree once per candidate per step.
+            score = cost.cost(leaves[j]).total() + cost.join_op_cost(cand_join).total()
             if best is None or score < best[0]:
                 best = (score, j, cand_join, cand_schema)
         if best is None:
@@ -316,7 +320,7 @@ def _rebuild_dp(
                 # deep subtrees super-linearly and can flip the optimum to a plan with a
                 # huge many-to-many intermediate). This is the standard additive DP
                 # recurrence: cost(S) = cost(S1) + cost(S2) + op_cost(join).
-                total = left[2] + right[2] + cost.op_cost(jplan).total()
+                total = left[2] + right[2] + cost.join_op_cost(jplan).total()
                 if chosen is None or total < chosen[2]:
                     chosen = (jplan, jschema, total)
             if chosen is not None:
@@ -418,7 +422,7 @@ def _rebuild_dphyp(
                         jplan, jschema = built
                         # Just this join's op cost; the halves already carry their own
                         # (see `_rebuild_dp` — `cost.cost` would double-count children).
-                        total = left[2] + right[2] + cost.op_cost(jplan).total()
+                        total = left[2] + right[2] + cost.join_op_cost(jplan).total()
                         if chosen is None or total < chosen[2]:
                             chosen = (jplan, jschema, total)
             if sub == 0:

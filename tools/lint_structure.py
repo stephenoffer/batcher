@@ -45,6 +45,18 @@ DIR_ALLOW: dict[str, str] = {
         "learning/learned_tuning/signature) sits at 13 modules by one; a subpackage split is a "
         "follow-up refactor, tracked to shrink back under the cap"
     ),
+    "python/batcher/api": (
+        "the conductor + public-API surface (session/orchestration/source_stats/executors/"
+        "adaptive/functions/...) sits at 13 modules by one; the breadth already lives in the "
+        "dataset/terminal/tuning subpackages, and source_stats can't move under terminal/ (an "
+        "import cycle back to orchestration), so a further subpackage split is a follow-up refactor"
+    ),
+    "python/batcher/io": (
+        "the neutral IO layer's distinct top-level concerns (base/filesystem/splits/sink/"
+        "manifest/credentials/detect/catalog/predicate/interop) plus two extracted helpers "
+        "(_file_cache keeps filesystem.py under the 500-line cap; _concurrent is the shared "
+        "per-file fan-out) sit at 13 by one; a subpackage split is a follow-up refactor"
+    ),
 }
 INIT_MAX = 120  # __init__.py is a re-export shim, not a code dump
 FUNC_SOFT = 60  # function length soft guideline (warn)
@@ -73,6 +85,11 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # splitting across modules forces a fragile base<->subclass import cycle — the
     # one-Expr invariant (rust-engine.md) wins over the line limit here.
     "python/batcher/plan/expr_ir/core.py": "one-Expr hierarchy; split forces a base/subclass import cycle",
+    # The one `Expr` enum and its `serde` wire tags. `.claude/rules/rust-engine.md` and
+    # crates/CLAUDE.md name this as the seam that is never cut across: the enum and its
+    # tags stay in the crate's lib.rs, so the wire contract lives in exactly one place.
+    # The evaluation bodies are already extracted to `eval/`.
+    "crates/bc-expr/src/lib.rs": "the one Expr enum + serde wire tags; a seam rust-engine.md forbids cutting",
     # Dataset is the canonical wide fluent builder (rust-engine/maintainability rules
     # name it as legitimately wide); its heavy method bodies are already extracted to
     # dataset/_build.py, leaving thin methods + docstrings that shouldn't be cut.

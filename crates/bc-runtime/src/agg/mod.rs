@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int64Array};
+use arrow::datatypes::DataType;
 use rayon::prelude::*;
 
 use crate::error::RuntimeError;
@@ -28,25 +29,25 @@ mod accum;
 mod argextreme;
 mod distinct;
 mod fused;
+mod group;
 mod hll;
 mod median;
 mod qsketch;
-mod radix;
 pub mod spill;
 mod stats;
 mod var;
 
 use accum::{bitfold_acc, bool_acc, concat_col, minmax_acc, product_acc, require, sum_acc};
 use argextreme::{arg_extreme_state, merge_arg_extreme};
-pub use distinct::distinct_batch;
 use distinct::{bucket_values_into_list, distinct_state, finalize_count_distinct, merge_distinct};
+pub use distinct::{distinct_batch, distinct_dense};
+pub(crate) use group::assign_groups;
 use hll::{approx_distinct_state, finalize_approx_distinct, merge_approx_distinct};
 use median::{
     finalize_histogram, finalize_median, finalize_mode, finalize_quantile, median_state,
     merge_median,
 };
 use qsketch::{approx_quantile_state, finalize_approx_quantile, merge_approx_quantile};
-pub(crate) use radix::assign_groups;
 use stats::{
     covar_state, finalize_corr, finalize_covar, finalize_kurtosis, finalize_skewness, moment_state,
 };
@@ -241,6 +242,22 @@ pub fn partial(
     calls: &[AggCall],
     num_rows: usize,
 ) -> Result<Partial, RuntimeError> {
+    // Widen a `Mean`'s Int64 input to Float64 once, up front, so both the global and
+    // grouped paths (and every fused/combine/distributed step downstream) carry an f64
+    // sum state uniformly. AVG is a float result, and the exact overflow-checked i64 SUM
+    // accumulator errors on a large-magnitude integer column (e.g. ClickBench `UserID`);
+    // an f64 accumulator can't overflow — matching DuckDB, which sums into a HUGEINT —
+    // at ~2^-52 relative rounding, far inside the differential tolerance. `SUM` itself is
+    // untouched (it keeps the exact i64 accumulator that errors rather than wrap).
+    // Decode any dictionary-encoded value/ordering inputs to their plain value type before
+    // the typed accumulator kernels (which downcast to a concrete array) run. Group *keys*
+    // need no such step — `assign_groups` routes a dictionary key through arrow's
+    // `RowConverter`, which encodes it natively. Identity (no realloc) when no input is a
+    // dictionary, so the common case pays only one `data_type()` check per call.
+    let decoded = decode_dict_call_inputs(calls)?;
+    let calls = decoded.as_deref().unwrap_or(calls);
+    let widened = widen_mean_int_inputs(calls)?;
+    let calls = widened.as_deref().unwrap_or(calls);
     // Global aggregate (no GROUP BY): every row is one group, so each aggregate's partial
     // state is the whole-column reduction — computable with arrow's SIMD kernels and, for
     // those, WITHOUT the `vec![0u32; num_rows]` group-id buffer the grouped path allocates
@@ -272,6 +289,70 @@ pub fn partial(
         group_columns,
         states,
     })
+}
+
+/// Decode any dictionary-encoded value/ordering-key input to its plain value type,
+/// returning a fresh call list only when some input was a dictionary (else `None`, so the
+/// common non-dictionary path allocates nothing). Keeps the typed accumulator kernels
+/// oblivious to dictionary encoding, mirroring the scalar `decode_dict` at the `Col` leaf.
+fn decode_dict_call_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, RuntimeError> {
+    let is_dict = |a: &Option<ArrayRef>| {
+        matches!(
+            a.as_ref().map(|x| x.data_type()),
+            Some(DataType::Dictionary(..))
+        )
+    };
+    if !calls.iter().any(|c| is_dict(&c.values) || is_dict(&c.key)) {
+        return Ok(None);
+    }
+    let decode = |a: &Option<ArrayRef>| -> Result<Option<ArrayRef>, RuntimeError> {
+        match a {
+            Some(arr) => match arr.data_type() {
+                DataType::Dictionary(_, v) => Ok(Some(arrow::compute::cast(arr, v)?)),
+                _ => Ok(Some(arr.clone())),
+            },
+            None => Ok(None),
+        }
+    };
+    let out = calls
+        .iter()
+        .map(|c| {
+            Ok(AggCall {
+                func: c.func,
+                values: decode(&c.values)?,
+                key: decode(&c.key)?,
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    Ok(Some(out))
+}
+
+/// Widen every `Mean` call's Int64 input to Float64, returning a fresh call list only
+/// when some widening happened (else `None`, so the common no-`AVG(int)` path allocates
+/// nothing). See the note in [`partial`] for why AVG sums in f64 while SUM stays i64.
+fn widen_mean_int_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, RuntimeError> {
+    let is_int_mean = |c: &AggCall| {
+        c.func == AggFunc::Mean
+            && c.values
+                .as_ref()
+                .is_some_and(|v| v.data_type() == &DataType::Int64)
+    };
+    if !calls.iter().any(is_int_mean) {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(calls.len());
+    for c in calls {
+        let values = if is_int_mean(c) {
+            Some(arrow::compute::cast(
+                c.values.as_ref().unwrap(),
+                &DataType::Float64,
+            )?)
+        } else {
+            c.values.clone()
+        };
+        out.push(AggCall::with_key(c.func, values, c.key.clone()));
+    }
+    Ok(Some(out))
 }
 
 /// The row count above which `combine` groups in parallel (hash-radix). Below it the
@@ -468,7 +549,7 @@ pub fn combine_with(
     if total_rows > radix_parallel_threshold && !group_concat.is_empty() {
         let partitions = rayon::current_num_threads().clamp(2, 64);
         let (group_columns, states) =
-            radix::combine_radix(&group_concat, &state_concats, funcs, total_rows, partitions)?;
+            group::combine_radix(&group_concat, &state_concats, funcs, total_rows, partitions)?;
         return Ok(Partial {
             group_columns,
             states,
@@ -478,7 +559,7 @@ pub fn combine_with(
     let (group_ids, num_groups, merged_group_columns) = assign_groups(&group_concat, total_rows)?;
     let mut states = Vec::with_capacity(funcs.len());
     for (a, &func) in funcs.iter().enumerate() {
-        states.push(radix::merge_state(
+        states.push(group::merge_state(
             func,
             &state_concats[a],
             &group_ids,
@@ -530,10 +611,80 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
 mod tests {
     use super::*;
     use arrow::array::{AsArray, Float64Array, Int64Array, StringArray};
-    use arrow::datatypes::Int64Type;
+    use arrow::datatypes::{Float64Type, Int64Type};
     use arrow::row::{RowConverter, SortField};
     use hashbrown::hash_table::Entry;
     use hashbrown::HashTable;
+
+    #[test]
+    fn aggregate_over_dictionary_inputs_equals_decoded() {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::Int32Type;
+        // A dictionary-encoded VALUE column and a dictionary-encoded group KEY column, plus
+        // their decoded forms — group_aggregate must give the same result over either.
+        let val_dict: DictionaryArray<Int32Type> = {
+            let v: DictionaryArray<Int32Type> = [Some("x"), Some("y"), Some("x"), Some("z")]
+                .into_iter()
+                .collect();
+            v
+        };
+        let key_dict: DictionaryArray<Int32Type> = [Some("g1"), Some("g1"), Some("g2"), Some("g2")]
+            .into_iter()
+            .collect();
+        let val_arr: ArrayRef = Arc::new(val_dict);
+        let key_arr: ArrayRef = Arc::new(key_dict);
+        let val_plain = arrow::compute::cast(&val_arr, &DataType::Utf8).unwrap();
+        let key_plain = arrow::compute::cast(&key_arr, &DataType::Utf8).unwrap();
+
+        // COUNT(val) grouped by key: count is non-null values per group; MIN(val) too.
+        let run = |k: &ArrayRef, v: &ArrayRef| {
+            let calls = [
+                AggCall::new(AggFunc::Count, Some(v.clone())),
+                AggCall::new(AggFunc::Min, Some(v.clone())),
+            ];
+            let r = group_aggregate(std::slice::from_ref(k), &calls, 4).unwrap();
+            // Sort by the (string) group key so the two runs line up regardless of order.
+            let gk = arrow::compute::cast(&r.group_columns[0], &DataType::Utf8).unwrap();
+            let idx = arrow::compute::sort_to_indices(&gk, None, None).unwrap();
+            let sorted: Vec<ArrayRef> = std::iter::once(&gk)
+                .chain(r.agg_columns.iter())
+                .map(|c| arrow::compute::take(c, &idx, None).unwrap())
+                .collect();
+            sorted
+        };
+        let from_dict = run(&key_arr, &val_arr);
+        let from_plain = run(&key_plain, &val_plain);
+        for (a, b) in from_dict.iter().zip(from_plain.iter()) {
+            assert_eq!(a.as_ref(), b.as_ref(), "dict vs decoded aggregate mismatch");
+        }
+    }
+
+    #[test]
+    fn mean_over_int64_does_not_overflow() {
+        // Two i64::MAX values sum to > i64::MAX (a SUM must error there); AVG sums in f64,
+        // so it returns their mean (≈ i64::MAX) instead of overflowing. This is exactly
+        // ClickBench's `AVG(UserID)`, which errored before the f64 mean accumulator.
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, i64::MAX]));
+        // Global (no group) and grouped both route through `partial`; test the grouped
+        // path (single group) so `assign_groups` + fused/per-call scans are exercised.
+        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![7i64, 7]))];
+        let calls = [AggCall::new(AggFunc::Mean, Some(values))];
+        let p = partial(&keys, &calls, 2).expect("AVG(int64) must not overflow");
+        let out = finalize(&[AggFunc::Mean], &p).expect("finalize");
+        let got = out[0].as_primitive::<Float64Type>().value(0);
+        assert!((got - i64::MAX as f64).abs() < 1.0, "got {got}");
+    }
+
+    #[test]
+    fn global_mean_over_int64_does_not_overflow() {
+        // The keyless fast path (`global_partial`) must widen too.
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, i64::MAX]));
+        let calls = [AggCall::new(AggFunc::Mean, Some(values))];
+        let p = partial(&[], &calls, 2).expect("global AVG(int64) must not overflow");
+        let out = finalize(&[AggFunc::Mean], &p).expect("finalize");
+        let got = out[0].as_primitive::<Float64Type>().value(0);
+        assert!((got - i64::MAX as f64).abs() < 1.0, "got {got}");
+    }
 
     fn i64s(v: &[i64]) -> ArrayRef {
         Arc::new(Int64Array::from(v.to_vec()))

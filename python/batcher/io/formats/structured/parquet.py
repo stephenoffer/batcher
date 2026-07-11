@@ -14,8 +14,10 @@ from typing import IO, Any
 
 import pyarrow as pa
 
+from batcher._internal.hardware import available_cpu_count
 from batcher.io.base import FileSink, FileSource, _parquet_row_group_splits
 from batcher.io.formats.base import SINKS, SOURCES
+from batcher.io.formats.structured import _parquet_native
 from batcher.io.splits import Split, WholeSourceSplit
 from batcher.plan.source_stats import SourceStatistics
 
@@ -121,11 +123,84 @@ class ParquetSource(FileSource):
 
         return pq.read_table(fh, columns=projection).to_batches()
 
+    def _native_read_many(self, projection: list[str] | None) -> list[pa.RecordBatch] | None:
+        """All files in one batched native pass (see `_parquet_native.read_many`), or ``None``.
+
+        The unfiltered multi-file read: one native call overlaps every file's I/O, beating a
+        per-file thread pool on a many-small-files scan. ``None`` (use base's per-file path)
+        for a single file, in non-strict mode (base owns normalization), or with a byte cache.
+        """
+        files = self._files()
+        if len(files) <= 1 or self._schema_mode != "strict":
+            return None
+        if self._fs.native_read_target(files[0]) is None:
+            return None
+        per_file = _parquet_native.read_many(files, projection)
+        if per_file is None:
+            return None
+        return [b for file_batches in per_file for b in file_batches]
+
+    def _read_by_path(self, path: str, projection: list[str] | None) -> list[pa.RecordBatch] | None:
+        """The unfiltered read: native Rust reader when possible, else PyArrow.
+
+        ``None`` (fall to the handle path) only when a read-through byte cache is active —
+        the native reader and PyArrow's `filesystem=` read both bypass that cache, so its
+        reads must go through `open`. Otherwise try the native Rust reader (3-4x faster on
+        object storage) and fall back to PyArrow's native-filesystem read on anything it
+        cannot handle.
+        """
+        if self._fs.native_read_target(path) is None:
+            return None
+        native = _parquet_native.read_one(path, projection)
+        if native is not None:
+            return native
+        return self._read_table(path, projection).to_batches()
+
+    def _read_table(
+        self, path: str, projection: list[str] | None, pa_filter: Any = None
+    ) -> pa.Table:
+        """Read `path`, letting pyarrow do its own I/O when the backend allows it.
+
+        Handed a Python file object, pyarrow's reader round-trips every read through the
+        interpreter, and that serializes the decode threads it fans across column chunks
+        — so the read gets *superlinearly* slower as the projection widens. Measured on
+        TPC-H sf100 `lineitem` (one 16 GB file, 600 M rows): one column reads in 648 ms
+        either way, four columns in 2,831 ms through a handle against 1,653 ms when
+        pyarrow owns the I/O. Backends that cannot hand over a native target (fsspec
+        behind a read-through cache) keep the handle; the result is identical.
+        """
+        import pyarrow.parquet as pq
+
+        from batcher.io.filesystem import ensure_io_threads
+
+        ensure_io_threads()  # lift the 8-thread IO cap so a wide S3 read isn't throttled
+        target = self._fs.native_read_target(path)
+        if target is not None:
+            fs, in_path = target
+            return pq.read_table(
+                in_path, filesystem=fs, columns=projection, filters=pa_filter, pre_buffer=True
+            )
+        with self._fs.open(path) as fh:
+            return pq.read_table(fh, columns=projection, filters=pa_filter)
+
     def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
         import pyarrow.parquet as pq
 
-        with self._fs.open(path) as fh:
-            yield from pq.ParquetFile(fh).iter_batches(columns=projection)
+        from batcher.io.filesystem import ensure_io_threads
+
+        ensure_io_threads()
+        # Prefer the native `(fs, path)` target with column-chunk pre-buffering: reading
+        # through a Python handle serializes pyarrow's per-column decode threads (the same
+        # anti-pattern `_read_table` avoids), and no `pre_buffer` leaves scattered column
+        # chunks as many small GETs. Backends with no native target keep the handle.
+        target = self._fs.native_read_target(path)
+        if target is not None:
+            fs, in_path = target
+            pf = pq.ParquetFile(in_path, filesystem=fs, pre_buffer=True)
+            yield from pf.iter_batches(columns=projection)
+        else:
+            with self._fs.open(path) as fh:
+                yield from pq.ParquetFile(fh).iter_batches(columns=projection)
 
     @staticmethod
     def _pa_filter(predicate: dict | None) -> Any:
@@ -140,14 +215,32 @@ class ParquetSource(FileSource):
     ) -> list[pa.RecordBatch]:
         pa_filter = self._pa_filter(predicate)
         if pa_filter is None:
-            return super().read(projection)
-        import pyarrow.parquet as pq
+            batched = self._native_read_many(projection)
+            return batched if batched is not None else super().read(projection)
+        files = self._files()
 
-        out: list[pa.RecordBatch] = []
-        for f in self._files():
-            with self._fs.open(f) as fh:
-                out.extend(pq.read_table(fh, columns=projection, filters=pa_filter).to_batches())
-        return out
+        def _read_one(f: str) -> list[pa.RecordBatch]:
+            return self._read_table(f, projection, pa_filter).to_batches()
+
+        try:
+            if len(files) <= 1:
+                return _read_one(files[0]) if files else []
+            # Read files concurrently: Parquet decode + filtering run in the C++ layer
+            # with the GIL released, so a 100-file source no longer opens and filters one
+            # file at a time (the serial loop left 95 of 96 cores idle). Order preserved.
+            from concurrent.futures import ThreadPoolExecutor
+
+            workers = min(len(files), available_cpu_count() * 2)
+            out: list[pa.RecordBatch] = []
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for batches in pool.map(_read_one, files):  # order preserved
+                    out.extend(batches)
+            return out
+        except Exception:
+            # A filter the reader can't bind (e.g. a type it lacks a kernel for) must
+            # never fail the query — the engine keeps the Filter operator, so an
+            # unfiltered read is always correct, just reads more rows.
+            return super().read(projection)
 
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None

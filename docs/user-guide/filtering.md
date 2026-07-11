@@ -121,3 +121,5 @@ print(result.to_pydict())
 - [Aggregations](aggregations.md): group and summarize the rows you kept.
 - [Joins](joins.md): combine datasets and use semi/anti joins to filter by
   existence.
+- [Dataset API](../api/dataset.md): the `filter`, `distinct`, `sample`, and `limit`
+  reference.

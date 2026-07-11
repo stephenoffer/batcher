@@ -130,6 +130,32 @@ def validate_config(cfg: Config) -> None:
         f"distributed.skew_join_fraction must be in [0, 1], got {d.skew_join_fraction}",
     )
 
+    # Shuffle TLS: when enabled, the server identity + trust root must all be present, so
+    # a half-configured deployment fails at config time rather than at the first fetch.
+    t = d.tls
+    if t.enabled:
+        _check(
+            bool(t.ca_cert_path),
+            "distributed.tls.enabled requires ca_cert_path (the peer trust root)",
+        )
+        _check(
+            bool(t.server_cert_path) and bool(t.server_key_path),
+            "distributed.tls.enabled requires server_cert_path and server_key_path",
+        )
+        _check(
+            not t.require_client_auth or bool(t.ca_cert_path),
+            "distributed.tls.require_client_auth (mTLS) requires ca_cert_path to verify "
+            "client certificates against",
+        )
+        _check(
+            bool(t.client_cert_path) == bool(t.client_key_path),
+            "distributed.tls client_cert_path and client_key_path must be set together",
+        )
+        _check(
+            bool(t.server_name),
+            "distributed.tls.enabled requires server_name (the peer certificate SAN)",
+        )
+
     # Flow control credits.
     _check(
         fc.default_credits >= 1,
@@ -216,6 +242,10 @@ def validate_config(cfg: Config) -> None:
     _check(
         d.transport in {"auto", "flight", "disk"},
         f"distributed.transport must be one of {{'auto', 'flight', 'disk'}}, got {d.transport!r}",
+    )
+    _check(
+        d.on_read_error in {"error", "skip"},
+        f"distributed.on_read_error must be one of {{'error', 'skip'}}, got {d.on_read_error!r}",
     )
     _check(
         d.speculation_straggler_factor >= 1.0,

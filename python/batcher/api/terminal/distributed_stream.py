@@ -20,6 +20,7 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
+from batcher._internal.hardware import available_cpu_count
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
@@ -106,10 +107,9 @@ def iter_distributed_scan(
     """Fan a breaker-free splittable scan out across workers and stream each worker's
     output back one partition at a time — parallel reads with the driver holding only one
     partition's result. The caller guarantees the shape (`distributable_scan_source`)."""
-    import os
 
     from batcher.dist.executors.map import stream_distributed_map
 
-    workers = num_workers or (os.cpu_count() or 4)
+    workers = num_workers or available_cpu_count()
     for b in stream_distributed_map(plan, sources, workers):
         yield from _rechunk(b, batch_size)

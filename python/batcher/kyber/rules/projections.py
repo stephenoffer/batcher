@@ -215,6 +215,31 @@ def rewrite_projection(plan: LogicalPlan) -> LogicalPlan:
     return _rewrite(plan, set(plan.available_columns()))
 
 
+def _surviving_items(node: Project, need: set[str]) -> tuple[Projection, ...]:
+    """The `Project` items that survive pruning when only `need` is consumed downstream.
+
+    A projection that produces nothing anyone wants still has to produce *something* —
+    it is the operator that emits the rows a `count(*)` above it counts — so an empty
+    result falls back to the first item.
+
+    Shared by `_rewrite` (which builds the pruned `Project`) and `_visit` (which decides
+    what the scan beneath it must read). The two MUST agree: if `_visit` assumed the
+    projection kept no items while `_rewrite` kept one, the source would be read without
+    the columns that item's expression references, and the scan would fail with an
+    unknown column at execution time.
+    """
+    kept = tuple(item for item in node.items if item.alias in need)
+    return kept or node.items[:1]
+
+
+def _columns_read_by(items: tuple[Projection, ...]) -> set[str]:
+    """The union of columns the expressions of `items` reference."""
+    child_need: set[str] = set()
+    for item in items:
+        child_need |= referenced_columns(item.expr)
+    return child_need
+
+
 def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
     # Each branch returns `node` unchanged when recursion pruned nothing and rewrote no
     # child (preserving identity → O(1) fixpoint). `kept`/`new_output` are subsequences
@@ -228,13 +253,8 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
     if isinstance(node, Project):
         # Drop output columns nothing downstream consumes (keep ≥1), then prune
         # the scan to only what the surviving expressions read.
-        kept = tuple(item for item in node.items if item.alias in need)
-        if not kept:
-            kept = node.items[:1]
-        child_need: set[str] = set()
-        for item in kept:
-            child_need |= referenced_columns(item.expr)
-        child = _rewrite(node.input, child_need)
+        kept = _surviving_items(node, need)
+        child = _rewrite(node.input, _columns_read_by(kept))
         if child is node.input and len(kept) == len(node.items):
             return node
         return Project(child, kept)
@@ -295,8 +315,12 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
             node.value_name,
         )
     if isinstance(node, Sample):
-        # Sample preserves the schema; its child needs exactly what's needed above.
-        child = _rewrite(node.input, set(need))
+        # Sample preserves the schema, but it does NOT preserve the ROWS under pruning: a row
+        # is kept iff a seeded hash of ALL its values falls under the fraction, so dropping a
+        # column changes which rows survive. Its child therefore needs its full schema, not
+        # just what is needed above — pruning here made `sample(0.1).select("k")` return a
+        # different row count than `sample(0.1)`.
+        child = _rewrite(node.input, set(node.input.available_columns()))
         return node if child is node.input else Sample(child, node.fraction, node.seed, node.n)
     if isinstance(node, Limit):
         child = _rewrite(node.input, set(need))
@@ -435,11 +459,13 @@ def _visit(node: LogicalPlan, need: set[str], acc: dict[int, list[str]]) -> None
         _visit(node.input, need | referenced_columns(node.predicate), acc)
 
     elif isinstance(node, Project):
-        child_need: set[str] = set()
-        for item in node.items:
-            if item.alias in need:
-                child_need |= referenced_columns(item.expr)
-        _visit(node.input, child_need, acc)
+        # Every item of *this* projection is evaluated when the plan runs, whether or not
+        # anything above consumes it, so the scan must supply what each one reads. Do not
+        # narrow by `need`: pruning unconsumed items is `_rewrite`'s job, and it has
+        # already run. A projection that still holds a dead item (because a later rule
+        # removed its only consumer) would otherwise read a column short and fail with
+        # `unknown column` at execution.
+        _visit(node.input, _columns_read_by(node.items), acc)
 
     elif isinstance(node, Aggregate):
         child_need = set()
@@ -472,14 +498,13 @@ def _visit(node: LogicalPlan, need: set[str], acc: dict[int, list[str]]) -> None
             _visit(inp, set(inp.available_columns()), acc)
 
     elif isinstance(node, Join):
+        # Like `Project`, a join emits every column of its declared `output`, so each
+        # side must supply the ones it owns. `_rewrite` is what narrows `output` to the
+        # consumed columns; narrowing again by `need` here would under-read.
         left_need = set(node.left_keys)
         right_need = set(node.right_keys)
         for col in node.output:
-            if col.alias in need:
-                if col.side == "left":
-                    left_need.add(col.name)
-                else:
-                    right_need.add(col.name)
+            (left_need if col.side == "left" else right_need).add(col.name)
         _visit(node.left, left_need, acc)
         _visit(node.right, right_need, acc)
 
@@ -487,8 +512,7 @@ def _visit(node: LogicalPlan, need: set[str], acc: dict[int, list[str]]) -> None
         left_need = {node.left_on, *node.left_by}
         right_need = {node.right_on, *node.right_by}
         for col in node.output:
-            if col.alias in need:
-                (left_need if col.side == "left" else right_need).add(col.name)
+            (left_need if col.side == "left" else right_need).add(col.name)
         _visit(node.left, left_need, acc)
         _visit(node.right, right_need, acc)
 
@@ -502,7 +526,9 @@ def _visit(node: LogicalPlan, need: set[str], acc: dict[int, list[str]]) -> None
         _visit(node.input, set(node.index) | set(node.on), acc)
 
     elif isinstance(node, Sample):
-        _visit(node.input, set(need), acc)
+        # The sample hash reads every column of its input (see `_rewrite`), so the scan below
+        # must supply them all; pruning to `need` would change which rows are sampled.
+        _visit(node.input, set(node.input.available_columns()), acc)
 
     else:  # pragma: no cover - defensive
         raise TypeError(f"projection pushdown: unhandled node {type(node).__name__}")

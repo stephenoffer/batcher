@@ -3,7 +3,7 @@
 The expression API describes column computations that lower to the Rust data plane
 and run vectorized over Arrow batches. This page is the reference for the
 constructors, operators, methods, and accessor namespaces. For a guided tour with
-runnable examples, see the expressions user guide.
+runnable examples, see the [expressions user guide](../user-guide/expressions.md).
 
 Blocks on this page share one namespace and run in order.
 
@@ -26,6 +26,7 @@ ds = bt.from_pydict({"a": [1, 2, 3], "b": [10.0, 20.0, 30.0]})
 | `bt.array(*exprs)` | build a list column from elements |
 | `bt.atan2(y, x)` | two-argument arctangent |
 | `bt.count()` | COUNT(*) aggregate |
+| `bt.hash_rows(*exprs, seed=0)` | deterministic 64-bit row digest (also `expr.hash(seed=0)`) |
 
 ```python
 out = ds.select(
@@ -34,6 +35,42 @@ out = ds.select(
 )
 print(out.to_pydict())
 # {'label': ['lo', 'hi', 'hi'], 'best': [2, 2, 3]}
+```
+
+`hash_rows` digests the row's **values**, typed: an integer from its bits, a float from
+its canonicalized IEEE bits (so `-0.0` and `0.0` agree, and every NaN agrees), a string
+from its UTF-8. It is order-sensitive, treats null as a positional value, and is stable
+across partitions, runs, machines and versions — which is what lets it key a
+reproducible split, a surrogate key, or a hash bucket. It is 3–10x faster than hashing
+`cast(col, "string")`, and unlike that idiom it does not depend on how a float prints.
+
+```python
+keys = bt.from_pydict({"a": [1, 1, 2]})
+print(keys.select(bucket=bt.col("a").hash().abs() % 10).to_pydict())
+# {'bucket': [9, 9, 5]}
+```
+
+## Horizontal (row-wise) functions
+
+These fold *across* columns within each row (the counterpart to aggregates, which
+fold *down* a column). They mirror the Polars `*_horizontal` family.
+
+| Call | Meaning |
+| --- | --- |
+| `bt.sum_horizontal(*exprs)` | row-wise sum, nulls treated as 0 |
+| `bt.mean_horizontal(*exprs)` | row-wise mean, ignoring nulls |
+| `bt.min_horizontal(*exprs)` / `bt.max_horizontal(*exprs)` | row-wise min / max, ignoring nulls (the Polars-named `least` / `greatest`) |
+| `bt.all_horizontal(*exprs)` / `bt.any_horizontal(*exprs)` | row-wise boolean AND / OR across predicate columns |
+
+```python
+flags = bt.from_pydict({"a": [1, None, 3], "b": [10, 20, None]})
+out = flags.select(
+    total=bt.sum_horizontal(bt.col("a"), bt.col("b")),
+    lo=bt.min_horizontal(bt.col("a"), bt.col("b")),
+    both_pos=bt.all_horizontal(bt.col("a") > 0, bt.col("b") > 0),
+)
+print(out.to_pydict())
+# {'total': [11, 20, 3], 'lo': [1, 20, 3], 'both_pos': [True, None, None]}
 ```
 
 ## Operators
@@ -59,7 +96,11 @@ print(out.to_pydict())
 | --- | --- |
 | `.is_null()` | true where null |
 | `.is_not_null()` | true where not null |
+| `.is_nan()` / `.is_not_nan()` | true where the float value is (not) NaN — distinct from null |
+| `.is_finite()` / `.is_infinite()` | true where the float value is finite / ±infinity |
 | `.fill_null(value)` | replace nulls with a value |
+| `.forward_fill()` / `.backward_fill()` | carry the nearest non-null value along an ordered window (`.over(order_by=…)` required) |
+| `.cut(breaks, labels=None, left_closed=False)` | bin a numeric column into labelled intervals |
 
 ```python
 nulls = bt.from_pydict({"x": [1, None, 3]})
@@ -74,7 +115,7 @@ print(out.to_pydict())
 | --- | --- |
 | `.cast(type)` | cast to an Arrow type named as a string (`"int64"`, `"float64"`, `"utf8"`, `"bool"`) |
 | `.is_in([...])` | membership test |
-| `.between(low, high)` | inclusive range test |
+| `.between(low, high, closed="both")` | range test; `closed` = `"both"`/`"left"`/`"right"`/`"none"` sets which bounds are inclusive |
 
 ```python
 out = ds.select(
@@ -91,9 +132,10 @@ print(out.to_pydict())
 `.abs()`, `.round(digits)`, `.pow(e)`, `.sqrt()`, `.floor()`, `.ceil()`, `.ln()`,
 `.log10()`, `.log2()`, `.exp()`, `.sin()`, `.cos()`, `.tan()`, `.asin()`, `.acos()`,
 `.atan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`, `.sign()`, `.trunc()`,
-`.cbrt()`, `.degrees()`, `.radians()`. Integer bitwise ops (distinct from the
-boolean `&`/`|`): `.bitwise_and(o)`, `.bitwise_or(o)`, `.bitwise_xor(o)`,
-`.bitwise_left_shift(o)`, `.bitwise_right_shift(o)`.
+`.cbrt()`, `.degrees()`, `.radians()`, `.factorial()` (→ Float64). Integer bitwise
+ops (distinct from the boolean `&`/`|`): `.bitwise_and(o)`, `.bitwise_or(o)`,
+`.bitwise_xor(o)`, `.bitwise_left_shift(o)`, `.bitwise_right_shift(o)`, and
+`.bit_count()` (the number of set bits, i.e. population count → Int64).
 
 ```python
 out = ds.select(root=bt.col("b").sqrt(), third=(bt.col("b") / 3).round(2))
@@ -105,6 +147,8 @@ print(out.to_pydict())
 
 | Method | Description |
 | --- | --- |
+| `.alias(name)` | bind an output name to a derived expression, for positional `select` |
+| `.clip(lower=None, upper=None)` | clamp each value into `[lower, upper]` (either bound optional) |
 | `.eq_missing(other)` | null-safe equality (SQL `IS NOT DISTINCT FROM`): two nulls compare equal, null vs non-null is false (never null) |
 | `.try_cast(type)` | like `.cast` but unconvertible values become NULL instead of erroring (DuckDB `TRY_CAST`) — the safe-ingest spelling |
 | `.approx_count_distinct()` | approximate `COUNT(DISTINCT)` via a HyperLogLog sketch (~2% error) |
@@ -112,7 +156,9 @@ print(out.to_pydict())
 ## Aggregation methods
 
 Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
-`.var()`, `.std()`, `.median()`, `.quantile(q)`, `.histogram()` (a
+`.var()`, `.std()`, `.median()`, `.quantile(q)`, `.skewness()` / `.kurtosis()`
+(third / fourth standardized moment of each group; DuckDB `skewness` / `kurtosis`),
+`.histogram()` (a
 `Map<value, count>` of each group's values, DuckDB `histogram`), `.count()`, `.n_unique()`
 (aliased `.count_distinct()`), `.mode()`, `.bool_and()`, `.bool_or()`,
 `.bit_and()` / `.bit_or()` / `.bit_xor()` (bitwise reduction of the non-null
@@ -171,18 +217,53 @@ print(c.with_columns(cs=bt.col("x").cum_sum(), prev=bt.col("x").shift(1)).to_pyd
 # {'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10], 'prev': [None, 1, 2, 3]}
 ```
 
+A window expression composes with ordinary arithmetic and other windows — the engine
+lifts it into a `Window` operator and rewrites the surrounding expression to read the
+result (see [window functions](../user-guide/window-functions.md)). The shapes that
+come up most have their own names:
+
+| Method | Equivalent |
+| --- | --- |
+| `.diff(n=1)` | `x - lag(x, n)` |
+| `.pct_change(n=1)` | `x / lag(x, n) - 1` |
+| `.rank(method="min", descending=False)` | `RANK()` / `DENSE_RANK()` / `ROW_NUMBER()` over `x` |
+| `.is_duplicated()` / `.is_unique()` | `count(1) OVER (PARTITION BY x)` vs 1 |
+| `.rolling_sum(k)` / `.rolling_mean(k)` / `.rolling_min(k)` / `.rolling_max(k)` / `.rolling_count(k)` | `agg(x) OVER (ROWS BETWEEN k-1 PRECEDING AND CURRENT ROW)` |
+
+All of them take `partition_by=` / `order_by=`, and `.fill_nan(v)` replaces IEEE NaN
+(which `.fill_null(v)` never touches, NaN being a value rather than a null).
+
+The `rolling_*` family aggregates a fixed trailing frame. The leading rows of each
+partition aggregate a *partial* frame, as SQL does; pass `min_periods=k` to make
+those rows null instead (the Polars default).
+
+```python
+r = bt.from_pydict({"x": [1, 2, 3, 4]})
+print(r.with_columns(m=bt.col("x").rolling_mean(2), s=bt.col("x").rolling_sum(2, min_periods=2)).to_pydict())
+# {'x': [1, 2, 3, 4], 'm': [1.0, 1.5, 2.5, 3.5], 's': [None, 3, 5, 7]}
+```
+
+```python
+d = bt.from_pydict({"x": [10, 15, 30]})
+print(d.with_columns(chg=bt.col("x").diff(), pct=bt.col("x").pct_change()).to_pydict())
+# {'x': [10, 15, 30], 'chg': [None, 5, 15], 'pct': [None, 0.5, 1.0]}
+```
+
 ## Accessor namespaces
 
 Breadth lives on accessor namespaces rather than on the expression itself.
 
 | Namespace | Covers |
 | --- | --- |
-| `.str` | `upper`, `lower`, `trim(chars=None)`, `lstrip`/`rstrip(chars=None)`, `len`, `contains`, `starts_with`, `ends_with`, `like`, `ilike`, `substr`, `left`, `right`, `split`, `split_part(delim, n)`, `replace`, `regexp_replace`, `regexp_replace_all`, `regexp_extract`, `initcap`, `hex`, `base64`, `translate`, and more |
+| `.str` | `upper`, `lower`, `trim(chars=None)`, `lstrip`/`rstrip(chars=None)`, `len`, `contains`, `starts_with`, `ends_with`, `like`, `ilike`, `substr`, `left`, `right`, `split`, `split_part(delim, n)`, `strip_html()` (markup → prose; drops `<script>`/`<style>` bodies and decodes entities), `chunk(size, overlap=0)` (RAG document splitter), `minhash(num_perm=128, ngram=5)` (fuzzy-dedup signature), `replace`, `regexp_replace`, `regexp_replace_all`, `regexp_extract`, `initcap`, `hex`, `base64`, `translate`, and more |
 | `.dt` | `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `dayofyear`, `dayname`, `monthname`, `epoch`, `iso_year`, `is_leap_year`, `days_in_month`, `truncate(unit)`, `strftime(fmt)`, `offset_by("1mo15d")`, `convert_timezone(from_tz, to_tz)` (DST-aware), and more |
-| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `normalize`, `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `slice`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `transform(element()-expr)`, `filter(element()-pred)`, `join(sep)`; vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)` |
+| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `normalize`, `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `first()`, `last()`, `slice`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `transform(element()-expr)`, `filter(element()-pred)`, `join(sep)`; vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)`, `jaccard(o)` (agreement rate; the MinHash/SimHash similarity estimate), `simhash(num_bits=64, seed=0)` (random-hyperplane LSH signature — the blocking key for a vector similarity join) |
 | `.struct` | `field(name)` |
 | `.json` | `extract_string(path)` |
-| `.image` | `decode()`, `to_tensor(width, height)` |
+| `.map` | `get(key)`, `keys()`, `values()` — read a `Map`-typed column |
+| `.image` | `decode()`, `to_tensor(width, height)`, `resize(width, height)` (re-encode to PNG bytes) |
+| `.audio` | `decode()`, `to_waveform()` (decode to a mono PCM `List<Float>` signal) |
+| `.video` | `decode()` |
 
 ### More `.str` methods
 

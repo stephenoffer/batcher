@@ -122,10 +122,15 @@ class DeltaSharingSource:
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
-        out: list[pa.RecordBatch] = []
-        for f in self._files():
-            out.extend(_read_presigned(f.url, projection, predicate).to_batches())
-        return out
+        from batcher.io._concurrent import read_each_file
+
+        files = self._files()
+        # Each shared file is a separate presigned-URL parquet fetch that releases the GIL;
+        # read them concurrently so a many-file shared table isn't fetched one at a time.
+        tables = read_each_file(
+            None, files, lambda _fs, f: _read_presigned(f.url, projection, predicate)
+        )
+        return [b for table in tables for b in table.to_batches()]
 
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None

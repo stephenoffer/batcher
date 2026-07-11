@@ -105,22 +105,75 @@ class Trigger:
 
     @classmethod
     def processing_time(cls, interval: float | int | str) -> Trigger:
-        """Fire a micro-batch every `interval` (seconds, or a string like '5 seconds')."""
+        """Fire a micro-batch every `interval` (seconds, or a string like '5 seconds').
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.Trigger.processing_time("5 seconds")
+                Trigger(kind='processing_time', interval_seconds=5.0)
+
+        Args:
+            interval: The wall-clock cadence, as seconds or a Spark-style string
+                such as ``"5 seconds"`` or ``"100ms"``.
+
+        Returns:
+            A trigger that fires on the given fixed interval.
+        """
         return cls("processing_time", parse_interval_seconds(interval))
 
     @classmethod
     def once(cls) -> Trigger:
-        """Process one micro-batch of available data, then stop."""
+        """Process one micro-batch of available data, then stop.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.Trigger.once()
+                Trigger(kind='once', interval_seconds=None)
+
+        Returns:
+            A trigger that processes a single micro-batch and then stops.
+        """
         return cls("once", None)
 
     @classmethod
     def available_now(cls) -> Trigger:
-        """Drain all available data (multiple micro-batches), then stop."""
+        """Drain all available data (multiple micro-batches), then stop.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.Trigger.available_now()
+                Trigger(kind='available_now', interval_seconds=None)
+
+        Returns:
+            A trigger that drains all available data, then stops.
+        """
         return cls("available_now", None)
 
     @classmethod
     def continuous(cls, interval: float | int | str) -> Trigger:
-        """Continuous processing, committing a checkpoint epoch every `interval`."""
+        """Continuous processing, committing a checkpoint epoch every `interval`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.Trigger.continuous("1 second")
+                Trigger(kind='continuous', interval_seconds=1.0)
+
+        Args:
+            interval: The checkpoint-epoch cadence, as seconds or a Spark-style
+                string such as ``"1 second"``.
+
+        Returns:
+            A trigger that runs micro-batches back-to-back, committing an epoch on
+            the interval.
+        """
         return cls("continuous", parse_interval_seconds(interval))
 
 
@@ -154,7 +207,25 @@ class OutputMode:
 
     @classmethod
     def validate(cls, mode: str) -> str:
-        """Return `mode` if recognized, else raise `ValueError`."""
+        """Return `mode` if recognized, else raise `ValueError`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.OutputMode.validate("complete")
+                'complete'
+
+        Args:
+            mode: The output mode to check, one of ``APPEND``, ``COMPLETE``,
+                ``UPDATE``.
+
+        Returns:
+            The `mode` string unchanged, once validated.
+
+        Raises:
+            ValueError: If `mode` is not a recognized output mode.
+        """
         if mode not in cls._ALL:
             raise ValueError(f"unknown output_mode {mode!r}; use one of {sorted(cls._ALL)}")
         return mode

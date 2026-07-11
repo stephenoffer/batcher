@@ -303,23 +303,27 @@ class RowGroupSplit:
     def _file(self) -> Any:
         import pyarrow.parquet as pq
 
-        from batcher.io.filesystem import resolve_filesystem
+        from batcher.io.filesystem import ensure_io_threads, resolve_filesystem
 
+        ensure_io_threads()
         fs = resolve_filesystem(self.path)
+        footer = _parquet_footer(self.path)
         # Pass the cached footer so opening this row-group reader does NOT re-read the
         # Parquet metadata from object storage. A worker reads several row-group splits
         # of one file; re-reading the footer per split is ~100ms each on S3 (the
         # dominant distributed-scan overhead). The footer is immutable, so sharing it
         # is safe; only a fresh data stream is opened per read.
         #
-        # `pre_buffer` coalesces this read's column-chunk byte ranges into a few large
-        # asynchronous object-store reads instead of one small GET per (column, row-group).
-        # With projection pushdown a split fetches only a handful of columns scattered
-        # across its row-groups, so un-buffered it issues many tiny latency-bound GETs —
-        # the throughput wall on a high-latency worker→S3 path. Result-invariant.
-        return pq.ParquetFile(
-            fs.open(self.path), metadata=_parquet_footer(self.path), pre_buffer=True
-        )
+        # Prefer the native `(fs, path)` target: reading through a Python handle serializes
+        # pyarrow's per-column decode threads (the `_read_table` finding — 2,831 vs 1,653 ms
+        # for a 4-column read), and this per-split reader is the primary distributed fallback.
+        # `pre_buffer` coalesces the column-chunk byte ranges into a few large asynchronous
+        # object-store reads instead of one small GET per (column, row-group). Result-invariant.
+        target = fs.native_read_target(self.path)
+        if target is not None:
+            pafs, in_path = target
+            return pq.ParquetFile(in_path, filesystem=pafs, metadata=footer, pre_buffer=True)
+        return pq.ParquetFile(fs.open(self.path), metadata=footer, pre_buffer=True)
 
     def schema(self) -> pa.Schema:
         return self._file().schema_arrow

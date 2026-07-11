@@ -15,6 +15,7 @@ from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr
 from batcher.plan.ir_tags import (
     WINDOW_AGGREGATES,
+    WINDOW_FILL,
     WINDOW_FUNCS,
     WINDOW_RANKING,
     WINDOW_VALUE,
@@ -179,6 +180,13 @@ class Window(LogicalPlan):
         for fn in self.functions:
             if fn.func in WINDOW_RANKING and not self.order_keys:
                 raise PlanError(f"window ranking function {fn.func!r} requires order_by keys")
+            if fn.func in WINDOW_FILL and not self.order_keys:
+                # Without an order there is no "previous" row: the result would depend on
+                # arrival order, which a morselized/distributed scan does not fix.
+                raise PlanError(
+                    f"window function {fn.func!r} requires order_by keys — a fill carries "
+                    "values along a defined row order, and an unordered relation has none"
+                )
             if fn.input is not None:
                 _validate_refs(fn.input, available, what=f"window function {fn.alias!r}")
         # Aliases must not collide with input columns or each other.

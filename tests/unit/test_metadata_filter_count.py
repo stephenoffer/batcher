@@ -195,7 +195,9 @@ def test_footer_falls_back_on_partial_overlap(pq_path):
     assert ds.count() == 2  # but execution is correct
 
 
-def test_in_memory_range_falls_back(pq_path):
+def test_in_memory_range_pruned_from_learned_bounds(pq_path):
     ds = bt.from_arrow(pa.table({"x": pa.array([1, 2, None, 4], type=pa.int64())}))
-    assert _count(ds.filter(bt.col("x") > 100)) is None  # no footer bounds → execute
+    # `max(x) == 4 < 100`, so the range predicate is pruned to 0 from the source's EXACT
+    # column bounds (learned per instance) rather than executed — and equals a full run.
+    assert _count(ds.filter(bt.col("x") > 100)) == 0
     assert ds.filter(bt.col("x") > 100).count() == 0

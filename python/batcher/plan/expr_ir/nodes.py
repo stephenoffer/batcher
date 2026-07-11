@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr, IntoExpr, _wrap
 from batcher.plan.expr_ir.node_base import IRNode, child, children, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
@@ -23,6 +24,21 @@ class Col(IRNode):
 
     tag = ExprTag.COL
     name: str = scalar()
+
+
+@expr_node
+class HashRows(IRNode):
+    """A deterministic 64-bit hash of the row's values across `inputs` → Int64.
+
+    Typed rather than textual (an integer hashes its bits, a float its canonicalized
+    IEEE bits, a string its UTF-8), order-sensitive, and stable across partitions,
+    runs, machines and versions — the properties a reproducible split, a surrogate key,
+    and hash bucketing all rest on.
+    """
+
+    tag = ExprTag.HASH
+    inputs: list[Expr] = children()
+    seed: int = scalar(omit_falsy=True, default=0)
 
 
 @expr_node
@@ -141,18 +157,24 @@ class ListJoin(IRNode):
     separator: str = scalar()
 
 
-class WindowExpr:
+class WindowExpr(Expr):
     """A window-function column built via ``agg.over(...)`` (e.g.
     ``col("x").sum().over(partition_by=["g"])``) or a value-function constructor
     (``lag(col("x"), 2).over(order_by=["t"])``).
 
-    This is *not* an `Expr` — it is a control-plane builder consumed by
-    `Dataset.with_columns`, which lowers it to the relational `Window` operator
-    (SQL ``<fn> OVER (PARTITION BY … ORDER BY …)``). `func` is the engine window-fn
-    tag (aggregates ``sum``/``avg``/``min``/``max``/``count``; value functions
-    ``lag``/``lead``/``first_value``/``last_value``); `input` is the argument
-    expression; `offset` is the lag/lead distance; `frame` is an optional
-    ``(start, end)`` ROWS frame (aggregates only).
+    It subclasses `Expr` so a window may be *composed* like any other scalar —
+    ``col("x") - col("x").shift(1)``, ``col("x") / col("x").sum().over()`` — but it
+    has no scalar IR of its own: `to_ir` always raises. Instead the relational
+    layer hoists each `WindowExpr` out of the surrounding expression into a
+    `Window` operator (SQL ``<fn> OVER (PARTITION BY … ORDER BY …)``) and leaves a
+    `Col` reference behind (`plan.expr_rewrite.hoist_windows`). A `WindowExpr` that
+    reaches `to_ir` therefore sat somewhere the hoist does not run — `group_by().agg()`,
+    a join key — which SQL also forbids, and the raised `PlanError` says so.
+
+    `func` is the engine window-fn tag (aggregates ``sum``/``avg``/``min``/``max``/
+    ``count``; value functions ``lag``/``lead``/``first_value``/``last_value``);
+    `input` is the argument expression; `offset` is the lag/lead distance; `frame` is
+    an optional ``(start, end)`` ROWS frame (aggregates only).
     """
 
     __slots__ = ("frame", "func", "input", "offset", "order_by", "partition_by")
@@ -172,6 +194,21 @@ class WindowExpr:
         self.order_by = order_by
         self.frame = frame
         self.offset = offset
+
+    def to_ir(self) -> dict[str, Any]:
+        """Always raises: a window has no scalar IR — it must be hoisted to a `Window` node."""
+        raise PlanError(
+            f"window function {self.func!r} is not allowed here; window expressions "
+            "(.over(...), shift(), diff(), cum_sum(), rank(), ...) are only valid in "
+            "select(), with_columns() and filter(). Compute the window in a "
+            "with_columns() step first, then reference the resulting column."
+        )
+
+    def with_input(self, input: Expr | None) -> WindowExpr:
+        """A copy of this window function over a different argument expression."""
+        return WindowExpr(
+            self.func, input, self.partition_by, self.order_by, self.frame, self.offset
+        )
 
     def over(
         self,
@@ -195,8 +232,16 @@ class WindowExpr:
 
 
 def lag(expr: IntoExpr, n: int = 1) -> WindowExpr:
-    """The value `n` rows before the current row in the ordered partition (SQL
-    ``LAG``). Bind the window with ``.over(partition_by=…, order_by=…)``.
+    """The value ``n`` rows before the current row in the ordered partition.
+
+    Backs SQL ``LAG``. Bind the window with ``.over(partition_by=…, order_by=…)``.
+
+    Args:
+        expr: The column (or expression) to read.
+        n: How many rows back to look.
+
+    Returns:
+        A window expression yielding the lagged value (null before the partition start).
 
     Examples:
         .. doctest::
@@ -210,8 +255,16 @@ def lag(expr: IntoExpr, n: int = 1) -> WindowExpr:
 
 
 def lead(expr: IntoExpr, n: int = 1) -> WindowExpr:
-    """The value `n` rows after the current row in the ordered partition (SQL
-    ``LEAD``). Bind the window with ``.over(partition_by=…, order_by=…)``.
+    """The value ``n`` rows after the current row in the ordered partition.
+
+    Backs SQL ``LEAD``. Bind the window with ``.over(partition_by=…, order_by=…)``.
+
+    Args:
+        expr: The column (or expression) to read.
+        n: How many rows ahead to look.
+
+    Returns:
+        A window expression yielding the lead value (null past the partition end).
 
     Examples:
         .. doctest::
@@ -231,6 +284,12 @@ def first_value(expr: IntoExpr) -> WindowExpr:
     FOLLOWING``), not the running frame, so every row of a partition gets the same
     value. Bind with ``.over(partition_by=…, order_by=…)``.
 
+    Args:
+        expr: The column (or expression) to read the first value of.
+
+    Returns:
+        A window expression yielding the partition's first value for every row.
+
     Examples:
         .. doctest::
 
@@ -239,9 +298,6 @@ def first_value(expr: IntoExpr) -> WindowExpr:
             >>> w = bt.first_value(bt.col("x")).over(order_by=["x"])
             >>> ds.with_columns(r=w).select("r").to_pydict()
             {'r': [10, 10, 10]}
-
-    Args:
-        expr: The column (or expression) to read the first value of.
     """
     return WindowExpr("first_value", _wrap(expr), [], [], None)
 
@@ -254,6 +310,12 @@ def last_value(expr: IntoExpr) -> WindowExpr:
     same for every row, not a running "last seen so far". Bind with
     ``.over(partition_by=…, order_by=…)``.
 
+    Args:
+        expr: The column (or expression) to read the last value of.
+
+    Returns:
+        A window expression yielding the partition's last value for every row.
+
     Examples:
         .. doctest::
 
@@ -262,21 +324,28 @@ def last_value(expr: IntoExpr) -> WindowExpr:
             >>> w = bt.last_value(bt.col("x")).over(order_by=["x"])
             >>> ds.with_columns(r=w).select("r").to_pydict()
             {'r': [30, 30, 30]}
-
-    Args:
-        expr: The column (or expression) to read the last value of.
     """
     return WindowExpr("last_value", _wrap(expr), [], [], None)
 
 
 def nth_value(expr: IntoExpr, n: int) -> WindowExpr:
-    """The value of the ``n``-th row (1-based) of the ordered partition (SQL
-    ``NTH_VALUE``); null if the partition has fewer than ``n`` rows. Bind with
-    ``.over(partition_by=…, order_by=…)``.
+    """The value of the ``n``-th row (1-based) of the ordered partition.
 
-    Like :func:`first_value`/:func:`last_value`, this reads the **whole partition**
+    Backs SQL ``NTH_VALUE``; null if the partition has fewer than ``n`` rows. Like
+    :func:`first_value`/:func:`last_value`, this reads the **whole partition**
     (equivalent to ``ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING``), not
     the running frame — so the ``n``-th value is the same for every row of a partition.
+    Bind with ``.over(partition_by=…, order_by=…)``.
+
+    Args:
+        expr: The column (or expression) to read.
+        n: The 1-based position within the partition to return.
+
+    Returns:
+        A window expression yielding the partition's ``n``-th value for every row.
+
+    Raises:
+        PlanError: If ``n`` is less than 1.
 
     Examples:
         .. doctest::
@@ -295,9 +364,13 @@ def nth_value(expr: IntoExpr, n: int) -> WindowExpr:
 
 
 def row_number() -> WindowExpr:
-    """Sequential 1-based row number within the ordered partition (SQL
-    ``ROW_NUMBER``). Takes no input; bind with ``.over(partition_by=…, order_by=…)``
-    — ``order_by`` is required.
+    """Sequential 1-based row number within the ordered partition.
+
+    Backs SQL ``ROW_NUMBER``. Takes no input; bind with
+    ``.over(partition_by=…, order_by=…)`` — ``order_by`` is required.
+
+    Returns:
+        A window expression yielding each row's 1-based ordinal in the partition.
 
     Examples:
         .. doctest::
@@ -311,10 +384,13 @@ def row_number() -> WindowExpr:
 
 
 def rank() -> WindowExpr:
-    """Rank within the ordered partition, with gaps after ties (SQL ``RANK``):
-    peers share the minimum rank and the next distinct value skips ahead. Takes no
-    input; bind with ``.over(partition_by=…, order_by=…)`` — ``order_by`` is
-    required.
+    """Rank within the ordered partition, with gaps after ties (SQL ``RANK``).
+
+    Peers share the minimum rank and the next distinct value skips ahead. Takes no
+    input; bind with ``.over(partition_by=…, order_by=…)`` — ``order_by`` is required.
+
+    Returns:
+        A window expression yielding each row's rank (ties share the minimum, gaps follow).
 
     Examples:
         .. doctest::
@@ -328,10 +404,13 @@ def rank() -> WindowExpr:
 
 
 def dense_rank() -> WindowExpr:
-    """Rank within the ordered partition with no gaps after ties (SQL
-    ``DENSE_RANK``): peers share a rank and the next distinct value increments by
-    one. Takes no input; bind with ``.over(partition_by=…, order_by=…)`` —
-    ``order_by`` is required.
+    """Rank within the ordered partition with no gaps after ties (SQL ``DENSE_RANK``).
+
+    Peers share a rank and the next distinct value increments by one. Takes no input;
+    bind with ``.over(partition_by=…, order_by=…)`` — ``order_by`` is required.
+
+    Returns:
+        A window expression yielding each row's dense rank (ties share, no gaps).
 
     Examples:
         .. doctest::
@@ -345,10 +424,14 @@ def dense_rank() -> WindowExpr:
 
 
 def percent_rank() -> WindowExpr:
-    """Relative rank within the ordered partition (SQL ``PERCENT_RANK``):
-    ``(rank - 1) / (rows - 1)``, in ``[0, 1]``; ``0`` for a single-row partition.
-    Takes no input; bind with ``.over(partition_by=…, order_by=…)`` — ``order_by``
-    is required.
+    """Relative rank within the ordered partition (SQL ``PERCENT_RANK``).
+
+    Computes ``(rank - 1) / (rows - 1)``, in ``[0, 1]``; ``0`` for a single-row
+    partition. Takes no input; bind with ``.over(partition_by=…, order_by=…)`` —
+    ``order_by`` is required.
+
+    Returns:
+        A window expression yielding each row's relative rank in ``[0, 1]``.
 
     Examples:
         .. doctest::
@@ -362,10 +445,14 @@ def percent_rank() -> WindowExpr:
 
 
 def cume_dist() -> WindowExpr:
-    """Cumulative distribution within the ordered partition (SQL ``CUME_DIST``): the
-    fraction of rows at or before the current row's peer group, in ``(0, 1]``. Takes
-    no input; bind with ``.over(partition_by=…, order_by=…)`` — ``order_by`` is
+    """Cumulative distribution within the ordered partition (SQL ``CUME_DIST``).
+
+    The fraction of rows at or before the current row's peer group, in ``(0, 1]``.
+    Takes no input; bind with ``.over(partition_by=…, order_by=…)`` — ``order_by`` is
     required.
+
+    Returns:
+        A window expression yielding each row's cumulative distribution in ``(0, 1]``.
 
     Examples:
         .. doctest::
@@ -379,10 +466,20 @@ def cume_dist() -> WindowExpr:
 
 
 def ntile(n: int) -> WindowExpr:
-    """Distribute the ordered partition into `n` buckets numbered ``1..n`` as evenly
-    as possible (SQL ``NTILE(n)``): earlier buckets take the remainder, and with
-    fewer rows than buckets each row is its own bucket. Takes no input; bind with
+    """Distribute the ordered partition into ``n`` buckets numbered ``1..n`` evenly.
+
+    Backs SQL ``NTILE(n)``: earlier buckets take the remainder, and with fewer rows
+    than buckets each row is its own bucket. Takes no input; bind with
     ``.over(partition_by=…, order_by=…)`` — ``order_by`` is required.
+
+    Args:
+        n: The number of buckets to distribute rows into.
+
+    Returns:
+        A window expression yielding each row's 1-based bucket number.
+
+    Raises:
+        PlanError: If ``n`` is less than 1.
 
     Examples:
         .. doctest::

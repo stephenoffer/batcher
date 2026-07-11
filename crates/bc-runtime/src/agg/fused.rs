@@ -360,6 +360,13 @@ pub(super) fn run_fused(
     if calls.iter().filter(|c| is_fusable_func(c.func)).count() < FUSE_THRESHOLD {
         return Ok(());
     }
+    // NB: an interleaved (array-of-structs) state array — group `g`'s state for every
+    // aggregate in one contiguous cache line, instead of one `Vec` per accumulator — was
+    // implemented and A/B'd inside one binary. It does NOT pay off: `partial` runs per
+    // *morsel*, so `num_groups` never exceeds the 16,384-row morsel and all the
+    // accumulator arrays stay L2-resident whatever the layout. Measured at 2 M rows, five
+    // aggregates: +2% at 10k groups, **-5%** at 1.5M groups. The per-aggregate cost is the
+    // scatter's dependent load-modify-store, not a cache miss per accumulator.
     // Classify; an unsupported dtype drops a call back to per-call (None slot).
     let mut accs: Vec<FusedAcc> = Vec::new();
     let mut layout: Vec<(usize, usize)> = Vec::new(); // (call idx, n state cols)
@@ -459,6 +466,63 @@ mod tests {
         let want = per_call(&calls, &group_ids, 3);
         let got = fused(&calls, &group_ids, 3);
         for (w, g) in want.iter().zip(&got) {
+            assert_cols_eq(w, g);
+        }
+    }
+
+    /// The whole null-free numeric set must equal the per-call kernel — the common
+    /// `sum, mean, min, max, count` shape.
+    #[test]
+    fn fused_equals_per_call_on_null_free_numeric() {
+        let f: ArrayRef = Arc::new(Float64Array::from(vec![1.5, -2.0, 3.25, 0.0, 9.75, -1.0]));
+        let i: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, -5, 7, 0, 3]));
+        let group_ids = [0u32, 1, 0, 2, 1, 2];
+        let calls = vec![
+            AggCall::new(AggFunc::Sum, Some(f.clone())),
+            AggCall::new(AggFunc::Mean, Some(f.clone())),
+            AggCall::new(AggFunc::Min, Some(i.clone())),
+            AggCall::new(AggFunc::Max, Some(f.clone())),
+            AggCall::new(AggFunc::CountStar, None),
+        ];
+        for (w, g) in per_call(&calls, &group_ids, 3)
+            .iter()
+            .zip(&fused(&calls, &group_ids, 3))
+        {
+            assert_cols_eq(w, g);
+        }
+    }
+
+    /// A leading `NaN` must survive `min`/`max` exactly as the per-call kernel leaves it:
+    /// the first row of a group is taken verbatim, never compared against a sentinel.
+    #[test]
+    fn fused_minmax_nan_matches_per_call() {
+        let f: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN, 1.0, 2.0, f64::NAN]));
+        let group_ids = [0u32, 0, 1, 1];
+        let calls = vec![
+            AggCall::new(AggFunc::Min, Some(f.clone())),
+            AggCall::new(AggFunc::Max, Some(f.clone())),
+        ];
+        for (w, g) in per_call(&calls, &group_ids, 2)
+            .iter()
+            .zip(&fused(&calls, &group_ids, 2))
+        {
+            assert_cols_eq(w, g);
+        }
+    }
+
+    /// `-0.0` and `+0.0` compare equal, so the first row of the group wins — same as per-call.
+    #[test]
+    fn fused_signed_zero_matches_per_call() {
+        let f: ArrayRef = Arc::new(Float64Array::from(vec![-0.0f64, 0.0, 0.0, -0.0]));
+        let group_ids = [0u32, 0, 1, 1];
+        let calls = vec![
+            AggCall::new(AggFunc::Min, Some(f.clone())),
+            AggCall::new(AggFunc::Max, Some(f.clone())),
+        ];
+        for (w, g) in per_call(&calls, &group_ids, 2)
+            .iter()
+            .zip(&fused(&calls, &group_ids, 2))
+        {
             assert_cols_eq(w, g);
         }
     }

@@ -12,12 +12,14 @@ batch.
    plugs into.
 3. [Batch inference](../tutorials/batch-inference.md): the `.ml.map_batches`
    pattern.
-4. [ML overview](../ml/index.md): the accessor and its operations.
-5. [Inference](../ml/inference.md): `ds.ml.infer` and `ds.ml.embed`.
-6. [GPU execution](../ml/gpu.md): reserving and sharing GPUs.
-7. [PyTorch integration](../ml/pytorch.md).
-8. [Streaming](../ml/streaming.md): processing batches as a stream.
-9. [ML API reference](../api/ml.md).
+4. [Feature engineering](../tutorials/feature-engineering.md): build a model-ready
+   feature matrix with fit/transform preprocessors.
+5. [ML overview](../ml/index.md): the accessor and its operations.
+6. [Inference](../ml/inference.md): `ds.ml.infer` and `ds.ml.embed`.
+7. [GPU execution](../ml/gpu.md): reserving and sharing GPUs.
+8. [PyTorch integration](../ml/pytorch.md).
+9. [Streaming](../ml/streaming.md): processing batches as a stream.
+10. [ML API reference](../api/ml.md).
 
 ## Example: map a function over batches
 
@@ -69,6 +71,7 @@ class Embedder:
 
 - `ml_inference.py` — a batch-inference pipeline with `ds.ml.map_batches` (runs as written).
 - `feature_engineering.py` — prepare model-ready features.
+- `preprocessors.py` — the same features with fit/transform preprocessor objects and `Chain`.
 - `streaming_pipeline.py` — a streaming inference pipeline shape (needs a broker to run).
 
 See also the [performance guide](../user-guide/performance.md) for caching feature

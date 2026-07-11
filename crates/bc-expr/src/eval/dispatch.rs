@@ -32,14 +32,38 @@ use crate::eval::str::eval_str;
 use crate::eval::timezone::eval_convert_timezone;
 use crate::{BinaryOp, Expr, ExprError};
 
+/// Decode a dictionary-encoded array to its value type; identity for any other array.
+///
+/// The scalar `eval` path decodes at the `Col` leaf so every downstream kernel sees a
+/// plain array and stays oblivious to dictionary encoding; only the dict-native ops read a
+/// column directly. `DictionaryArray` is a standard Arrow type, so this keeps the
+/// Arrow-only columnar contract while letting dictionary-encoded inputs (common in Parquet)
+/// flow through the engine without a blanket decode at the FFI boundary.
+pub(crate) fn decode_dict(arr: ArrayRef) -> Result<ArrayRef, ExprError> {
+    if let arrow::datatypes::DataType::Dictionary(_, value) = arr.data_type() {
+        Ok(arrow::compute::cast(&arr, value)?)
+    } else {
+        Ok(arr)
+    }
+}
+
 impl Expr {
     /// Evaluate the expression against `batch`, returning a full-length column.
     pub fn eval(&self, batch: &RecordBatch) -> Result<ArrayRef, ExprError> {
         match self {
-            Expr::Col { name } => batch
-                .column_by_name(name)
-                .cloned()
-                .ok_or_else(|| ExprError::UnknownColumn(name.clone())),
+            Expr::Col { name } => {
+                let arr = batch
+                    .column_by_name(name)
+                    .cloned()
+                    .ok_or_else(|| ExprError::UnknownColumn(name.clone()))?;
+                // Decode a dictionary column to its value type at the leaf, so every
+                // downstream scalar kernel sees a plain array and never has to special-case
+                // dictionary encoding. Identity (a cheap `Arc` clone) for any non-dictionary
+                // column — the overwhelming common case — so existing data is bit-unchanged.
+                // The dict-native ops (currently `InList`) bypass this and read the column
+                // directly to keep the dictionary.
+                decode_dict(arr)
+            }
             Expr::Lit { value } => Ok(value.to_array(batch.num_rows())),
             Expr::Not { input } => {
                 let arr = input.eval(batch)?;
@@ -137,8 +161,27 @@ impl Expr {
                 eval_video(*func, &arr)
             }
             Expr::Coalesce { inputs } => eval_coalesce(inputs, batch),
-            Expr::InList { input, set } => eval_in_list(&input.eval(batch)?, set),
+            Expr::InList { input, set } => {
+                // Read a `Col` input directly (keeping any dictionary encoding) so the
+                // dict-accelerated membership path fires; any other input is evaluated
+                // normally (already decoded at its `Col` leaves).
+                let arr = match input.as_ref() {
+                    Expr::Col { name } => batch
+                        .column_by_name(name)
+                        .cloned()
+                        .ok_or_else(|| ExprError::UnknownColumn(name.clone()))?,
+                    _ => input.eval(batch)?,
+                };
+                eval_in_list(&arr, set)
+            }
             Expr::Array { elements } => eval_array(elements, batch),
+            Expr::Hash { inputs, seed } => {
+                let args: Vec<_> = inputs
+                    .iter()
+                    .map(|e| e.eval(batch))
+                    .collect::<Result<_, _>>()?;
+                crate::eval::hash::eval_hash(&args, *seed, batch.num_rows())
+            }
             Expr::Sequence { start, stop, step } => {
                 let (s, e, d) = (start.eval(batch)?, stop.eval(batch)?, step.eval(batch)?);
                 eval_sequence(&s, &e, &d)
@@ -176,6 +219,14 @@ impl Expr {
             Expr::ListGet { input, index } => {
                 let arr = input.eval(batch)?;
                 eval_list_get(&arr, *index)
+            }
+            Expr::ListSimhash {
+                input,
+                num_bits,
+                seed,
+            } => {
+                let arr = input.eval(batch)?;
+                crate::eval::list_ops::eval_list_simhash(&arr, *num_bits, *seed)
             }
             Expr::StructField { input, field } => {
                 let arr = input.eval(batch)?;
@@ -259,6 +310,70 @@ impl Expr {
                     (begin..end).map(|k| k as u32).collect()
                 })
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dict_tests {
+    use super::*;
+    use crate::{Literal, StrFunc};
+    use arrow::array::{DictionaryArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+
+    /// A batch with one `Dictionary<Int32, Utf8>` column `s`, plus the same column decoded
+    /// to plain `Utf8` under name `s` — for asserting every expression agrees on both.
+    fn dict_and_plain() -> (RecordBatch, RecordBatch) {
+        let dict: DictionaryArray<Int32Type> =
+            [Some("MAIL"), Some("AIR"), None, Some("SHIP"), Some("MAIL")]
+                .into_iter()
+                .collect();
+        let dict_arr: ArrayRef = Arc::new(dict);
+        let plain: ArrayRef = arrow::compute::cast(&dict_arr, &DataType::Utf8).unwrap();
+        let mk = |a: ArrayRef| {
+            let schema = Schema::new(vec![Field::new("s", a.data_type().clone(), true)]);
+            RecordBatch::try_new(Arc::new(schema), vec![a]).unwrap()
+        };
+        (mk(dict_arr), mk(plain))
+    }
+
+    fn col() -> Expr {
+        Expr::Col { name: "s".into() }
+    }
+
+    /// Every scalar expression must produce the same result over a dictionary column as
+    /// over its decoded form — the decode-at-`Col` safety net plus the dict-native `InList`.
+    #[test]
+    fn scalar_exprs_agree_dict_vs_decoded() {
+        let (d, p) = dict_and_plain();
+        let exprs = [
+            // comparison against a string literal (decoded at the Col leaf)
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(col()),
+                right: Box::new(Expr::Lit {
+                    value: Literal::Str("MAIL".into()),
+                }),
+            },
+            // a string function (decoded at the Col leaf)
+            Expr::Str {
+                func: StrFunc::Upper,
+                input: Box::new(col()),
+                pattern: None,
+                replacement: None,
+                start: None,
+                length: None,
+            },
+            // IN membership (dict-native fast path over the dictionary column)
+            Expr::InList {
+                input: Box::new(col()),
+                set: vec![Literal::Str("MAIL".into()), Literal::Str("SHIP".into())],
+            },
+        ];
+        for e in &exprs {
+            let od = e.eval(&d).expect("eval over dict");
+            let op = e.eval(&p).expect("eval over plain");
+            assert_eq!(od.as_ref(), op.as_ref(), "mismatch for {e:?}");
         }
     }
 }

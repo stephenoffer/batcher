@@ -65,6 +65,28 @@ def test_no_fault_is_unaffected():
     assert _norm(got) == _norm(expected)
 
 
+@pytest.mark.parametrize("killed", [{1}, {0, 2}])
+def test_aggregate_survives_worker_loss_during_map(killed):
+    """A worker preempted *during* the map barrier — before it publishes anything — has
+    its source relocated onto a survivor, and the aggregate still equals single-node.
+
+    This is the likeliest spot failure (the map phase reads the source from object
+    storage and dominates the query), and the barrier used to be a bare `ray.get`, so a
+    single preemption here failed the whole query rather than recovering.
+    """
+    from batcher.dist.flight_aggregate import execute_aggregate_flight
+
+    t = _data()
+    expected = bt.from_arrow(t).group_by("k").agg(s=col("v").sum(), n=count()).collect()
+
+    ds = bt.from_arrow(t).group_by("k").agg(s=col("v").sum(), n=count())
+    recovered = execute_aggregate_flight(
+        [], ds._plan, ds._sources, workers=4, _fault_inject_map=killed
+    )
+
+    assert _norm(recovered) == _norm(expected)
+
+
 def test_aggregate_proactively_migrates_draining_worker(monkeypatch):
     """A worker under a spot-preemption notice has its output migrated to a survivor
     *before* it dies; the aggregate still equals single-node. Proactive, not reactive —
@@ -98,6 +120,38 @@ def test_window_survives_worker_loss(killed):
     recovered = execute_window_flight([], ds._plan, ds._sources, workers=4, _fault_inject=killed)
 
     assert _norm(recovered) == _norm(expected)
+
+
+@pytest.mark.parametrize("killed", [{1}, {0, 2}])
+def test_window_survives_worker_loss_during_map(killed):
+    """A worker preempted during the window's map barrier has its row bucket republished on
+    a survivor; the Flight window shuffle still equals single-node."""
+    from batcher.dist.flight_window import execute_window_flight
+
+    t = _data()
+    expected = bt.from_arrow(t).window(partition_by=["k"], functions={"s": ("sum", "v")}).collect()
+
+    ds = bt.from_arrow(t).window(partition_by=["k"], functions={"s": ("sum", "v")})
+    recovered = execute_window_flight(
+        [], ds._plan, ds._sources, workers=4, _fault_inject_map=killed
+    )
+
+    assert _norm(recovered) == _norm(expected)
+
+
+@pytest.mark.parametrize("killed", [{1}, {0, 2}])
+def test_sort_survives_worker_loss_during_map(killed):
+    """A worker preempted during the sample/range-publish barriers has its split
+    reprocessed on a survivor; the range-sort still produces the global order."""
+    from batcher.dist.flight_sort import execute_sort_flight
+
+    t = _data()
+    expected = bt.from_arrow(t).sort("k").collect()
+
+    ds = bt.from_arrow(t).sort("k")
+    recovered = execute_sort_flight([], ds._plan, ds._sources, workers=4, _fault_inject_map=killed)
+
+    assert recovered.column("k").to_pylist() == expected.column("k").to_pylist()
 
 
 @pytest.mark.parametrize("killed", [{1}, {0, 2}])

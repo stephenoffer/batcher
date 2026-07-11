@@ -68,9 +68,7 @@ _ADDITIVE_AGGS = frozenset({"sum", "count", "count_star"})
 
 
 @rule(name="count_distinct_to_distinct_count", phase=Phase.REWRITE, matches=(Aggregate,))
-def count_distinct_to_distinct_count(
-    node: Aggregate, _ctx: OptimizerContext
-) -> LogicalPlan | None:
+def count_distinct_to_distinct_count(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Rewrite a lone ``COUNT(DISTINCT x)`` group-by into a distinct then a plain count.
 
     ``Aggregate(group=G, [count_distinct(x) AS a])`` →

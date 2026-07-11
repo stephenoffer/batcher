@@ -52,6 +52,25 @@ def test_envelope_vram_packs_small_model(monkeypatch):
     assert env.memory_bytes == int(2.0 * 1.5 * (1 << 30))  # host budget for the model
 
 
+def test_envelope_tightens_packing_from_learned_peak_vram(monkeypatch):
+    # A prior run's MEASURED peak VRAM refines packing beyond the declared model size: an
+    # actor that really peaked at 60% of VRAM only fits ~1 per GPU, so it gets a whole GPU
+    # even though the declared 2 GB would pack onto a fraction. Measurement only tightens.
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends import InProcessBackend
+    from batcher.ml.gpu import gpu_feedback_key, record_gpu_peak_vram
+
+    monkeypatch.setattr("batcher.ml.gpu.gpu_vram_gb", lambda: 24.0)
+    ds = bt.from_pydict({"x": [1, 2, 3]}).ml.infer(_Model, num_gpus=1.0, model_memory_gb=2.0)
+    hub = MetadataHub(InProcessBackend())
+    cold = _map_scheduling_envelope(ds._plan, 4, hub).num_gpus  # declared-only packing
+    assert 0 < cold < 1.0
+    record_gpu_peak_vram(hub, gpu_feedback_key(ds._plan), 0.6)  # measured 60% VRAM peak
+    warm = _map_scheduling_envelope(ds._plan, 4, hub).num_gpus
+    assert warm == 1.0  # 60% peak → 1 actor/GPU → whole GPU; never packs looser than cold
+    assert warm >= cold
+
+
 def test_envelope_honors_declared_gpus_without_detectable_vram(monkeypatch):
     # GPU-less driver can't detect VRAM → can't VRAM-pack, so the declared request stands.
     monkeypatch.setattr("batcher.ml.gpu.gpu_vram_gb", lambda: None)

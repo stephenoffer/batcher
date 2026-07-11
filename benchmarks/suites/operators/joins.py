@@ -50,4 +50,39 @@ def join_agg(ctx: Context):
 
         fns["pyarrow"] = pyarrow
 
+    if "ray" in ctx.names():
+        line_h = ctx.handle("lineitem", "ray")
+        orders_h = ctx.handle("orders", "ray")
+
+        def ray() -> pa.Table:
+            from ray.data.aggregate import Sum
+
+            orders_pri = orders_h.map_batches(
+                lambda b: pa.table(
+                    {"o_orderkey": b["o_orderkey"], "o_orderpriority": b["o_orderpriority"]}
+                ),
+                batch_format="pyarrow",
+            )
+            joined = line_h.join(
+                orders_pri,
+                join_type="inner",
+                num_partitions=64,
+                on=("l_orderkey",),
+                right_on=("o_orderkey",),
+            )
+
+            def revenue(b: pa.Table) -> pa.Table:
+                rev = pc.multiply(b["l_extendedprice"], pc.subtract(1.0, b["l_discount"]))
+                return pa.table({"o_orderpriority": b["o_orderpriority"], "revenue": rev})
+
+            g = (
+                joined.map_batches(revenue, batch_format="pyarrow")
+                .groupby("o_orderpriority")
+                .aggregate(Sum("revenue"))
+            )
+            df = g.to_pandas().rename(columns={"sum(revenue)": "revenue"})
+            return pa.Table.from_pandas(df, preserve_index=False)
+
+        fns["ray"] = ray
+
     return fns

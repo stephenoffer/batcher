@@ -26,6 +26,7 @@ performance and scheduling, never correctness.
 from __future__ import annotations
 
 import weakref
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from batcher.config import Config, active_config
@@ -84,17 +85,50 @@ class LearnedMemoryModel:
     _alpha: float
     _clamp: float
     _row_bytes: int
+    # Measured out-of-core spill volume per input row per family (from `spill_bytes`), for
+    # the families that actually spilled. Sizes spill partitions from the volume that really
+    # goes to disk, which is smaller than the total working-set `peak` the plan otherwise
+    # shards on. Empty until a family has spilled enough times to fit.
+    _spill_per_row: dict[str, float]
 
     def bytes_per_row(self, kind: str) -> float | None:
         """Measured peak bytes per input row for `kind`'s family, or `None` if unlearned."""
         return self._bytes_per_row.get(_canonical_kind(kind))
 
-    def max_bytes_per_row(self) -> float | None:
-        """The widest measured per-row footprint across all learned families, or `None`.
+    def spill_bytes_per_row(self, kind: str) -> float | None:
+        """Measured spill volume per input row for `kind`'s family, or `None` if it never
+        spilled enough to fit. The size-general basis for predicting a plan's spill volume."""
+        return self._spill_per_row.get(_canonical_kind(kind))
 
-        The morsel byte-budget cap uses this: a workload whose rows proved wide anywhere
-        should keep a tighter row-count so its true byte working set stays bounded."""
-        widths = [w for w in self._bytes_per_row.values() if w > 0]
+    def predicted_spill_bytes(self, plan_ops: object) -> int:
+        """Predicted total out-of-core spill volume for `plan_ops`, or `0` if unlearned.
+
+        For each op with a learned spill-per-row, multiply by that op's estimated input rows
+        (recovered from its plan peak estimate ÷ the assumed row width) and sum. `0` when no
+        op's family has a spill history — the caller then keeps its peak-based sizing.
+        """
+        total = 0.0
+        for op in plan_ops:  # type: ignore[attr-defined]
+            spr = self.spill_bytes_per_row(getattr(op, "kind", ""))
+            if spr is None or self._row_bytes <= 0:
+                continue
+            est_rows = op.bounds.m_max_bytes / self._row_bytes
+            total += spr * est_rows
+        return int(total)
+
+    def max_bytes_per_row(self, kinds: Iterable[str] | None = None) -> float | None:
+        """The widest measured per-row footprint, or `None` if nothing is learned.
+
+        The morsel byte-budget cap uses this: a workload whose rows proved wide should keep
+        a tighter row-count so its true byte working set stays bounded. `kinds` restricts the
+        max to *this plan's* operator families (canonical or plan-class names), so a narrow
+        scan-only plan is not throttled by an unrelated wide aggregate measured in an earlier
+        query; `None` (the default) keeps the global widest, unchanged."""
+        if kinds is None:
+            widths = [w for w in self._bytes_per_row.values() if w > 0]
+        else:
+            wanted = {_canonical_kind(k) for k in kinds}
+            widths = [w for k, w in self._bytes_per_row.items() if k in wanted and w > 0]
         return max(widths) if widths else None
 
     def blend_peak(self, kind: str, plan_estimate: int) -> int:
@@ -133,33 +167,62 @@ class LearnedMemoryModel:
         return best
 
 
+def _memory_basis_rows(row: dict) -> float:
+    """The row count an operator's peak memory actually scales with.
+
+    For a **join** that is `probe + build`: this is a batch engine, so a join materializes
+    *both* inputs, and `m_peak_bytes` accounts for both. `n_input` now reports the probe
+    side alone (so the join's `selectivity` is a meaningful fan-out), so dividing the
+    two-sided peak by it would produce a bytes-per-row that grows with the build side.
+
+    For every other family the input rows are the basis. A row persisted before `n_input`
+    existed reconstructs them from `n_actual / selectivity`, the inverse of how selectivity
+    was recorded.
+    """
+    n_in = row.get("n_input") or row.get("rows_in") or 0
+    if not n_in:
+        out = float(row.get("n_actual", 0) or 0.0)
+        sel = float(row.get("selectivity", 0.0) or 0.0)
+        n_in = out / sel if sel > 0.0 else out
+    return float(n_in) + float(row.get("n_build") or 0)
+
+
 def _fit(hub: MetadataHub, cfg: Config) -> LearnedMemoryModel:
     """Fit the per-family bytes-per-row model from the hub's measured `op_stats`."""
     opt = cfg.optimizer
     min_samples = max(1, opt.cost_calibration_min_samples)
     by_kind = hub.op_stats_by_kind()
     bpr: dict[str, float] = {}
+    spr: dict[str, float] = {}
     for kind, rows in by_kind.items():
         samples: list[float] = []
+        spill_samples: list[float] = []
         for r in rows:
-            peak = float(r.get("m_peak_bytes", 0) or 0.0)
-            n_in = r.get("n_input") or r.get("rows_in") or 0
-            if not n_in:
-                # An op recorded before `n_input` existed: reconstruct input rows from
-                # output / selectivity (the inverse of how selectivity was recorded).
-                out = float(r.get("n_actual", 0) or 0.0)
-                sel = float(r.get("selectivity", 0.0) or 0.0)
-                n_in = out / sel if sel > 0.0 else out
-            n_in = float(n_in)
-            if peak > 0.0 and n_in > 0.0:
-                samples.append(peak / n_in)
+            # The true peak is the greater of the Arrow working-set estimate and the measured
+            # process RSS high-water (`peak_rss_bytes`): the latter captures transient scratch,
+            # allocator fragmentation, and off-pool buffers the estimate cannot see, so fitting
+            # against the max sizes admission/spill against reality and never under-provisions.
+            peak = max(
+                float(r.get("m_peak_bytes", 0) or 0.0),
+                float(r.get("peak_rss_bytes", 0) or 0.0),
+            )
+            basis = _memory_basis_rows(r)
+            if peak > 0.0 and basis > 0.0:
+                samples.append(peak / basis)
+            spill = float(r.get("spill_bytes", 0) or 0.0)
+            if spill > 0.0 and basis > 0.0:
+                spill_samples.append(spill / basis)
+        canon = _canonical_kind(kind)
         if len(samples) >= min_samples:
-            bpr[_canonical_kind(kind)] = _median(samples)
+            bpr[canon] = _median(samples)
+        if len(spill_samples) >= min_samples:
+            spr[canon] = _median(spill_samples)
     return LearnedMemoryModel(
         _bytes_per_row=bpr,
         _alpha=opt.learning_smoothing_alpha,
         _clamp=max(1.0, opt.cost_calibration_clamp),
         _row_bytes=max(1, opt.row_bytes),
+        _spill_per_row=spr,
     )
 
 
@@ -203,4 +266,5 @@ def _empty_model(cfg: Config) -> LearnedMemoryModel:
         _alpha=opt.learning_smoothing_alpha,
         _clamp=max(1.0, opt.cost_calibration_clamp),
         _row_bytes=max(1, opt.row_bytes),
+        _spill_per_row={},
     )

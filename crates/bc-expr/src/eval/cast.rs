@@ -27,6 +27,13 @@ pub(crate) fn cast_expr(
     use arrow::datatypes::DataType::{
         Float16, Float32, Float64, Int16, Int32, Int64, Int8, UInt16, UInt32, UInt64, UInt8,
     };
+    // Identity cast: hand the array straight back. `a / b` lowers to
+    // `div(cast(a, float64), b)` so integer operands divide truly, and that cast is
+    // a no-op whenever `a` is already Float64 — the common case in a float pipeline.
+    // Arrow's kernel would still walk and rebuild the array; this makes it free.
+    if arr.data_type() == target {
+        return Ok(Arc::clone(arr));
+    }
     let opts = CastOptions {
         safe: try_cast,
         ..Default::default()

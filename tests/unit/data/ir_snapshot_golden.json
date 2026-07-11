@@ -197,6 +197,29 @@
       }
     ]
   },
+  "hash": {
+    "e": "hash",
+    "inputs": [
+      {
+        "e": "col",
+        "name": "x"
+      },
+      {
+        "e": "col",
+        "name": "y"
+      }
+    ],
+    "seed": 7
+  },
+  "hash_default_seed": {
+    "e": "hash",
+    "inputs": [
+      {
+        "e": "col",
+        "name": "x"
+      }
+    ]
+  },
   "image_simple": {
     "e": "image",
     "fn": "decode",
@@ -344,6 +367,23 @@
       "e": "col",
       "name": "b"
     }
+  },
+  "list_simhash": {
+    "e": "list_simhash",
+    "input": {
+      "e": "col",
+      "name": "v"
+    },
+    "num_bits": 64
+  },
+  "list_simhash_seeded": {
+    "e": "list_simhash",
+    "input": {
+      "e": "col",
+      "name": "v"
+    },
+    "num_bits": 64,
+    "seed": 3
   },
   "list_slice_full": {
     "e": "list_slice",

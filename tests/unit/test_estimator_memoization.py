@@ -1,7 +1,7 @@
 """The `StatsEstimator` memoizes by node identity within one optimize run.
 
 `estimate(node)` is invoked O(nodes) times per optimize (once per node in
-`_annotate_ops`, plus every cost-based rule), and each call previously re-descended
+`annotate_ops`, plus every cost-based rule), and each call previously re-descended
 to the leaves — making planning super-linear in plan depth and re-hashing whole
 subtrees for the structural signature. These tests pin the memoization that keeps
 per-query planning cost proportional to the plan, protecting the sub-second

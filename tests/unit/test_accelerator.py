@@ -78,6 +78,140 @@ def test_xpu_utilization_degrades_to_none_without_intel_gpu():
     assert util is None or 0.0 <= util <= 1.0
 
 
+def test_visible_device_indices_honors_cuda_visible_devices(monkeypatch):
+    from batcher.ml.gpu import _visible_device_indices
+
+    # Unset/empty → all physical devices (an unpinned driver or monitor).
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert _visible_device_indices(4) == (0, 1, 2, 3)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    assert _visible_device_indices(4) == (0, 1, 2, 3)
+    # A single-device pin (how Ray pins one GPU per actor) → just that device.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    assert _visible_device_indices(4) == (2,)
+    # A multi-device pin → each visible device, in order.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,3")
+    assert _visible_device_indices(4) == (1, 3)
+    # Out-of-range / UUID entries are dropped; if nothing valid remains, fall back to all.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "9")
+    assert _visible_device_indices(4) == (0, 1, 2, 3)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-abc123")
+    assert _visible_device_indices(4) == (0, 1, 2, 3)
+    # AMD ROCm pins through HIP_/ROCR_VISIBLE_DEVICES — honored when CUDA's is unset.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "3")
+    assert _visible_device_indices(4) == (3,)
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0,1")
+    assert _visible_device_indices(4) == (0, 1)
+
+
+def test_rocm_utilization_attributes_to_the_pinned_device(monkeypatch):
+    import sys
+    import types
+
+    from batcher.ml import gpu
+
+    utils = {0: 0, 1: 0, 2: 80, 3: 0}
+    fake = types.ModuleType("amdsmi")
+    fake.amdsmi_init = lambda: None
+    fake.amdsmi_shut_down = lambda: None
+    fake.amdsmi_get_processor_handles = lambda: [0, 1, 2, 3]
+    fake.amdsmi_get_gpu_activity = lambda h: {"gfx_activity": utils[h]}
+    monkeypatch.setitem(sys.modules, "amdsmi", fake)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2")
+    # Device 2's 80% — not the 4-device mean (20%).
+    assert gpu._rocm_utilization() == pytest.approx(0.80)
+
+
+def test_gpu_samples_attribute_to_the_pinned_device(monkeypatch):
+    # On a multi-GPU node a pinned actor must sample ITS device, not physical 0 or a
+    # node-wide mean that a co-located idle/busy GPU would distort.
+    import sys
+    import types
+
+    from batcher.ml import gpu
+
+    # 4 devices; device 2 is the busy one this actor is pinned to. used/total differ per device.
+    utils = {0: 0, 1: 0, 2: 90, 3: 0}
+    mems = {i: types.SimpleNamespace(used=i + 1, total=10) for i in range(4)}
+    fake = types.ModuleType("pynvml")
+    fake.nvmlInit = lambda: None
+    fake.nvmlShutdown = lambda: None
+    fake.nvmlDeviceGetCount = lambda: 4
+    fake.nvmlDeviceGetHandleByIndex = lambda i: i  # handle IS the index, for the mock
+    fake.nvmlDeviceGetUtilizationRates = lambda h: types.SimpleNamespace(gpu=utils[h])
+    fake.nvmlDeviceGetMemoryInfo = lambda h: mems[h]
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    gpu._nvml.cache_clear()
+    gpu._nvml_handles.cache_clear()
+    try:
+        # Utilization is device 2's 90% — NOT the 4-device mean (22.5%).
+        assert sample_gpu_utilization("cuda") == pytest.approx(0.90)
+        # VRAM fraction is device 2's used/total = 3/10 — not physical 0's 1/10.
+        assert gpu.sample_gpu_vram_fraction() == pytest.approx(0.30)
+    finally:
+        gpu._nvml.cache_clear()
+        gpu._nvml_handles.cache_clear()
+
+
+def test_nvml_session_initialized_once_across_many_samples(monkeypatch):
+    # Per-batch GPU sampling (throughput autobatcher VRAM cap, adaptive num_gpus loop)
+    # must share one NVML session, not init/shutdown the driver on every call.
+    import sys
+    import types
+
+    from batcher.ml import gpu
+
+    calls = {"init": 0, "shutdown": 0}
+    fake = types.ModuleType("pynvml")
+    fake.nvmlInit = lambda: calls.__setitem__("init", calls["init"] + 1)
+    fake.nvmlShutdown = lambda: calls.__setitem__("shutdown", calls["shutdown"] + 1)
+    fake.nvmlDeviceGetCount = lambda: 1
+    fake.nvmlDeviceGetHandleByIndex = lambda i: f"handle-{i}"
+    fake.nvmlDeviceGetUtilizationRates = lambda h: types.SimpleNamespace(gpu=42)
+    fake.nvmlDeviceGetMemoryInfo = lambda h: types.SimpleNamespace(used=2, total=8)
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
+    gpu._nvml.cache_clear()
+    gpu._nvml_handles.cache_clear()
+    try:
+        for _ in range(5):
+            assert sample_gpu_utilization("cuda") == pytest.approx(0.42)
+            assert gpu.sample_gpu_vram_fraction() == pytest.approx(0.25)
+        assert calls["init"] == 1  # one handshake for the whole process
+        assert calls["shutdown"] == 0  # session held open, not torn down per sample
+    finally:
+        gpu._nvml.cache_clear()
+        gpu._nvml_handles.cache_clear()
+
+
+def test_gpu_peak_vram_record_load_and_pack():
+    # The memory twin of the utilization loop: a measured peak-VRAM fraction is persisted,
+    # smoothed, and turned into an actors-per-GPU packing count.
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends import InProcessBackend
+    from batcher.ml.gpu import (
+        actors_per_gpu_from_learned_vram,
+        load_gpu_peak_vram,
+        record_gpu_peak_vram,
+    )
+
+    hub = MetadataHub(InProcessBackend())
+    record_gpu_peak_vram(hub, "pipe", 0.3)  # an actor peaked at 30% VRAM
+    assert load_gpu_peak_vram(hub, "pipe") == pytest.approx(0.3)
+    record_gpu_peak_vram(hub, "pipe", 0.5)  # exp-smoothed toward the new sample
+    assert 0.3 < load_gpu_peak_vram(hub, "pipe") < 0.5
+    # 30% peak → ~2 actors fit within an 0.8 usable budget; None measurement → None.
+    assert actors_per_gpu_from_learned_vram(0.3) == 2
+    assert actors_per_gpu_from_learned_vram(0.9) == 1
+    assert actors_per_gpu_from_learned_vram(None) is None
+    # Cold store / None inputs never raise.
+    record_gpu_peak_vram(hub, "pipe", None)
+    assert load_gpu_peak_vram(None, "pipe") is None
+
+
 def test_gpu_feedback_key_is_accelerator_type_aware():
     import batcher as bt
 

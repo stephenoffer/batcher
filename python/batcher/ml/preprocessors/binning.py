@@ -22,12 +22,21 @@ __all__ = ["KBinsDiscretizer"]
 
 
 class KBinsDiscretizer(Preprocessor):
-    """Bin continuous columns into ``n_bins`` integer bins (sklearn
-    ``KBinsDiscretizer`` with ``encode="ordinal"``).
+    """Bin continuous columns into ``n_bins`` integer bins (sklearn ``KBinsDiscretizer``).
 
-    ``strategy="quantile"`` (default) makes each bin hold roughly equal counts (edges
-    are the quantiles); ``"uniform"`` makes equal-width bins (edges from min/max). The
-    output column replaces the input with its bin index ``0..n_bins-1``.
+    Matches ``encode="ordinal"``. ``strategy="quantile"`` (default) makes each bin hold
+    roughly equal counts (edges are the quantiles); ``"uniform"`` makes equal-width
+    bins (edges from min/max). The output column replaces the input with its bin index
+    ``0..n_bins-1``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import KBinsDiscretizer
+            >>> ds = bt.from_pydict({"v": [0.0, 2.0, 6.0, 8.0, 10.0]})
+            >>> KBinsDiscretizer(["v"], n_bins=2, strategy="uniform").fit_transform(ds).to_pydict()
+            {'v': [0, 0, 1, 1, 1]}
 
     Args:
         columns: the numeric columns to discretize (replaced in place).
@@ -53,6 +62,26 @@ class KBinsDiscretizer(Preprocessor):
         self.edges_: dict[str, list[float]] = {}
 
     def fit(self, ds: Dataset) -> KBinsDiscretizer:
+        """Learn each column's ``n_bins - 1`` inner bin edges into `edges_`.
+
+        For ``"uniform"`` the edges are equally spaced between min and max; for
+        ``"quantile"`` they are the approximate quantiles — both one mergeable pass.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import KBinsDiscretizer
+                >>> ds = bt.from_pydict({"v": [0.0, 2.0, 6.0, 8.0, 10.0]})
+                >>> KBinsDiscretizer(["v"], n_bins=2, strategy="uniform").fit(ds).edges_
+                {'v': [5.0]}
+
+        Args:
+            ds: The dataset to compute each column's bin edges from.
+
+        Returns:
+            ``self``, fitted.
+        """
         inner = self.n_bins - 1
         if self.strategy == "uniform":
             aggs = {}
@@ -77,6 +106,27 @@ class KBinsDiscretizer(Preprocessor):
         return self
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Replace each fitted column with its integer bin index ``0..n_bins-1``.
+
+        The index is how many learned edges the value meets or exceeds, computed by a
+        `CASE` chain.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import KBinsDiscretizer
+                >>> ds = bt.from_pydict({"v": [0.0, 2.0, 6.0, 8.0, 10.0]})
+                >>> kb = KBinsDiscretizer(["v"], n_bins=2, strategy="uniform").fit(ds)
+                >>> kb.transform(ds).to_pydict()
+                {'v': [0, 0, 1, 1, 1]}
+
+        Args:
+            ds: The dataset to discretize.
+
+        Returns:
+            A new lazy `Dataset` with each fitted column replaced by its bin index.
+        """
         self._require_fitted()
         new = {}
         for c in self.columns:

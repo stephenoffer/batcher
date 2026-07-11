@@ -24,13 +24,17 @@ def test_object_store_prefix_survives_trailing_slash(monkeypatch, trailing):
         type_name = "s3"
 
     # `pyarrow.fs.FileSystem` is an immutable C type, so patch the module's reference to
-    # it. Mirror pyarrow: `from_uri` returns the fs and a trailing-slash-stripped in_path.
+    # it. Mirror pyarrow: `from_uri` returns the fs and the in_path (everything after
+    # `scheme://`), trailing slash stripped — resolve_filesystem now reduces the URI to
+    # `scheme://authority` first, so the object path's trailing slash never reaches the
+    # prefix math (the more robust fix this test guards).
     class _FakeFS:
         @staticmethod
-        def from_uri(_p):
-            return _FakeS3(), bucket_path
+        def from_uri(p):
+            return _FakeS3(), p.split("://", 1)[1].rstrip("/")
 
     monkeypatch.setattr(fsmod.pafs, "FileSystem", _FakeFS)
+    fsmod._resolve_uri_fs.cache_clear()  # isolate from other resolutions / parametrize runs
     fs = fsmod.resolve_filesystem(uri)
     # The prefix must be exactly the scheme+authority, so mapping the original URI back
     # to an in-filesystem path recovers the bucket key (modulo the trailing slash).

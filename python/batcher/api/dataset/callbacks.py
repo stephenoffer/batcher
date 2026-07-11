@@ -76,15 +76,8 @@ def udf(fn: Callable | None = None, *, per_row: bool = False, **config: Any) -> 
     """Decorate a function as a reusable, configured column transform (``@udf``).
 
     Bundles a function with its `map_batches` options (``batch_format``/``num_gpus``/
-    ``concurrency``/…); apply the result to a dataset by calling it::
-
-        @udf(batch_format="numpy", num_gpus=1.0)
-        def classify(batch):
-            ...
-
-        scored = classify(ds)
-
-    Pass ``per_row=True`` to write a ``fn(row) -> row`` per-row callback instead of a
+    ``concurrency``/…); apply the result to a dataset by calling it. Pass
+    ``per_row=True`` to write a ``fn(row) -> row`` per-row callback instead of a
     batch function. Usable bare (``@udf``) or with options (``@udf(...)``).
 
     Examples:
@@ -97,6 +90,24 @@ def udf(fn: Callable | None = None, *, per_row: bool = False, **config: Any) -> 
             ...     return batch.set_column(0, "x", pc.add(batch.column("x"), 1))
             >>> add_one(bt.from_pydict({"x": [1, 2, 3]})).to_pydict()
             {'x': [2, 3, 4]}
+
+            >>> @bt.udf(concurrency=2)
+            ... def double(batch):
+            ...     return batch.set_column(0, "x", pc.multiply(batch.column("x"), 2))
+            >>> double(bt.from_pydict({"x": [1, 2, 3]})).to_pydict()
+            {'x': [2, 4, 6]}
+
+    Args:
+        fn: The function to wrap when used bare as ``@udf``; ``None`` when used with
+            options as ``@udf(...)``, which returns a decorator.
+        per_row: Treat `fn` as a per-row ``fn(row) -> row`` callback rather than a
+            whole-batch function.
+        **config: `map_batches` options forwarded to the transform (e.g.
+            ``batch_format``, ``num_gpus``, ``concurrency``).
+
+    Returns:
+        The configured `Udf` when applied to a function, otherwise a decorator that
+        produces one.
     """
 
     def wrap(f: Callable) -> Udf:

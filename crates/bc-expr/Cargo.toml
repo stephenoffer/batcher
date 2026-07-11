@@ -24,6 +24,14 @@ sha1 = "0.10"
 sha2 = "0.10"
 crc32fast = "1"
 twox-hash = "1"
+# Data-protection functions (`hmac_sha256`, `aes_encrypt`, `aes_decrypt`). Pure-Rust
+# RustCrypto. AES-GCM-**SIV** is chosen over plain GCM because the engine needs a
+# deterministic ciphertext (the interpreter is the oracle; a random nonce would make the
+# parallel path disagree, and would make an encrypted column unjoinable). SIV is the
+# AEAD whose security does not collapse under the fixed nonce that determinism forces.
+# `getrandom` is off: nothing here samples randomness.
+hmac = "0.12"
+aes-gcm-siv = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 # Image decode for the `.image` expression namespace (interpreter oracle path);
 # limited to common codecs to keep the dependency footprint small.
 image = { version = "0.25", default-features = false, features = [

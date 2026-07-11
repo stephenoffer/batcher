@@ -81,6 +81,43 @@ def active_streams() -> list[StreamingQuery]:
         return [q for q in _ACTIVE.values() if q.is_active]
 
 
+def await_any_termination(timeout: float | None = None) -> bool:
+    """Block until any active streaming query stops (Spark ``awaitAnyTermination``).
+
+    Waits for the first of the currently-running queries to terminate, re-raising its
+    exception if it failed. With no active queries, returns immediately.
+
+    Args:
+        timeout: Maximum seconds to wait; ``None`` waits indefinitely.
+
+    Returns:
+        ``True`` if a query stopped (or none were active), ``False`` on timeout.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.await_any_termination(timeout=0.0)  # no active queries
+            True
+    """
+    import time
+
+    watching = active_streams()
+    if not watching:
+        return True
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        for q in watching:
+            if not q.is_active:
+                q.await_termination(0.0)  # re-raise if it failed; deregister
+                return True
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        # Poll: the queries run on their own daemon threads, so a short sleep between
+        # liveness checks keeps this cheap without a shared condition variable.
+        time.sleep(0.05)
+
+
 class StreamingQuery:
     """A handle to a running streaming query (Spark `StreamingQuery` parity).
 
@@ -94,6 +131,19 @@ class StreamingQuery:
     def __init__(self, name: str, engine: StreamingQueryEngine) -> None:
         self._name = name
         self._engine = engine
+
+    def __repr__(self) -> str:
+        """Show the query name and whether it is still running."""
+        state = "active" if self._engine.is_active else "stopped"
+        return f"StreamingQuery(name={self._name!r}, {state})"
+
+    def __enter__(self) -> StreamingQuery:
+        """Enter a ``with`` block; the query keeps running until the block exits."""
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Stop the query on leaving the ``with`` block (even if the body raised)."""
+        self.stop()
 
     @property
     def name(self) -> str:
@@ -137,6 +187,31 @@ class StreamingQuery:
         """The most recent micro-batch's metrics, or None if none completed yet."""
         progress = self._engine.recent_progress()
         return progress[-1] if progress else None
+
+    def exception(self) -> BaseException | None:
+        """The exception that terminated the query, or None if it is healthy.
+
+        Spark `StreamingQuery.exception()` parity: read the failure without letting
+        it propagate (unlike `await_termination`, which re-raises). Returns None while
+        the query is running normally or after a clean stop.
+
+        Returns:
+            The terminating exception, or None.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> stream = bt.read.rate(rows_per_second=5, num_rows=5, pace=False)
+                >>> q = stream.write.memory(  # doctest: +SKIP
+                ...     "m", trigger=bt.Trigger.available_now()
+                ... )
+                >>> q.await_termination()  # doctest: +SKIP
+                True
+                >>> q.exception() is None  # doctest: +SKIP
+                True
+        """
+        return self._engine.exception
 
 
 def _build_run_batch(plan: LogicalPlan, sources: list[Source]):

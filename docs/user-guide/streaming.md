@@ -56,8 +56,11 @@ files and tables:
 
 | Source | Reader |
 | --- | --- |
-| Apache Kafka | `bt.read.kafka(topic="events", ...)` |
-| Amazon Kinesis | `bt.read.kinesis(stream_name="...")` |
+| Apache Kafka | `bt.read.kafka("events", bootstrap_servers=...)` |
+| Amazon Kinesis | `bt.read.kinesis("my-stream", region=...)` |
+| Apache Pulsar | `bt.read.pulsar("events", service_url=...)` |
+| Google Pub/Sub | `bt.read.pubsub("projects/p/subscriptions/s")` |
+| Azure Event Hubs | `bt.read.eventhubs("hub", connection_str=...)` |
 | Incremental files (Auto Loader) | `bt.read.files_incremental(path, "parquet", state_dir=...)` |
 | Delta Lake (new commits) | `bt.read.delta(uri, stream=True)` |
 | Delta Change Data Feed | `bt.read.read_change_feed(uri)` |
@@ -142,6 +145,15 @@ A `Trigger` sets the cadence (Spark parity):
 - `"complete"` — the full result table after every micro-batch (aggregations only).
 - `"update"` — only the result rows whose value changed this micro-batch.
 
+Those literals are the values of the {py:class}`OutputMode <batcher.OutputMode>`
+constants — `bt.OutputMode.APPEND`, `bt.OutputMode.COMPLETE`, `bt.OutputMode.UPDATE`
+— which you can pass in place of the raw strings for an explicit, typo-proof spelling:
+
+```python
+print(bt.OutputMode.COMPLETE)
+# complete
+```
+
 ```python
 agg_stream = bt.from_batches(feed, schema, bounded=False).group_by("user").agg(
     total=col("amount").sum()
@@ -165,9 +177,14 @@ q = clicks.write("s3://bucket/out", format="parquet",
 q.is_active            # True while running
 q.status               # a point-in-time StreamingQueryStatus
 q.recent_progress()    # per-micro-batch metrics
+q.exception()          # the failure that stopped it, or None (does not re-raise)
 q.stop()               # halt at the next micro-batch boundary
 bt.streams()           # all active streaming queries
 ```
+
+With several queries running, `bt.await_any_termination(timeout=None)` blocks until
+the first of them stops (re-raising its exception if it failed) — the Spark
+`awaitAnyTermination` pattern for a driver that supervises multiple streams.
 
 ## Event-time windows and watermarks
 

@@ -28,6 +28,7 @@ import contextvars
 import threading
 
 from batcher._internal.errors import ResourceError
+from batcher._internal.hardware import available_cpu_count
 
 __all__ = [
     "ShuffleFleet",
@@ -288,7 +289,6 @@ def maybe_spawn_query_fleet(num_workers: int | None, transport: str) -> ShuffleF
         return None
 
     import math
-    import os
 
     from batcher.dist.executors.ray_runtime import (
         _ensure_ray,
@@ -299,7 +299,7 @@ def maybe_spawn_query_fleet(num_workers: int | None, transport: str) -> ShuffleF
         resolve_transport,
     )
 
-    workers = num_workers or (os.cpu_count() or 4)
+    workers = num_workers or available_cpu_count()
     _ensure_ray(workers)
     # Ask the autoscaler for the fleet's cores and wait (bounded) for them while sizing
     # it; release the request once sized — the spawned actors keep the nodes busy, so the

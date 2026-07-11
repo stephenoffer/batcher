@@ -30,7 +30,7 @@ Kyber's passes, cost-based choices, and adaptive re-optimization.
 ::::
 
 ```{toctree}
-:maxdepth: 1
+:hidden:
 
 overview
 execution

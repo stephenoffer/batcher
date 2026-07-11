@@ -33,6 +33,21 @@ class PlanProperties:
     carries the per-column statistics the estimator propagated, so Carbonite and
     the adaptive controller see not just *how many* rows but *what* the columns
     look like and how much to trust it.
+
+    `signature` and `est_rows_raw` close the cardinality feedback loop. `signature` is
+    the operator's structural plan signature — a *stable* identity across executions,
+    unlike `op_id`, which is only a position in this plan's walk. `est_rows_raw` is the
+    raw **structural** estimate (before any learned correction), which Core reports back
+    so Kyber can measure how wrong its own row formulas are (`actual / est_rows_raw`).
+    It is `0.0` for operators whose estimate came from a past measurement or a proof
+    rather than from the structural estimator — their q-error is ~1.0 by construction and
+    averaging it in would decay a learned correction back to 1.0.
+
+    `expr_factor` is the per-row cost of the expressions this operator evaluates, relative
+    to a plain comparison (1.0 for operators that evaluate none). Core echoes it back so
+    `calibration` can divide it out of the measured wall time: without that, a workload of
+    regex filters would fit a huge `filter_row` coefficient that then gets multiplied by
+    the regex's factor *again* at planning time.
     """
 
     est_rows: float = float("nan")
@@ -40,6 +55,9 @@ class PlanProperties:
     confidence: float = 0.0
     provenance: Provenance = Provenance.DEFAULT
     column_stats: Mapping[str, ColumnStat] = field(default_factory=dict)
+    signature: str = ""
+    est_rows_raw: float = float("nan")
+    expr_factor: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)

@@ -118,9 +118,19 @@ exclude_patterns = [
     # Standalone formal paper, rendered to PDF by internals/generate_pdf.py rather
     # than as a site page. It carries its own internal cross-reference scheme.
     "internals/mathematical_foundations.md",
+    # An engineering audit ledger (findings fixed / still open), kept in-tree so the
+    # analysis is recoverable. A working record for contributors, not a site page.
+    "internals/audit_ledger.md",
     # Design proposal (RFC), not a published page — kept in-tree for contributors,
     # excluded from the site build until/unless its proposals are accepted.
     "internals/rfc-gpu-transport.md",
+    # RFC: the streaming/pipelined executor tier that closes the single-node scale gap to
+    # DuckDB (fixes the sf100 OOM, kills the high-selectivity gather tax) while preserving
+    # every invariant. In-tree for contributors; not a site page until accepted.
+    "internals/rfc-streaming-executor.md",
+    # Design/migration note for porting the optimizer's cold hot-path passes to Rust.
+    # A contributor working record (scope + dependency-ordered migration), not a site page.
+    "internals/rust_optimizer_port.md",
 ]
 
 # -- Options for HTML output -------------------------------------------------

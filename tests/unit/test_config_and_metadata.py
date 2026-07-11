@@ -79,6 +79,57 @@ def test_keyed_params_isolate_writes_and_reassemble():
         assert hub.get_keyed_param("kyber.stats", "missing") is None
 
 
+def _signed_fb(op: int, n: int, sig: str) -> OperatorFeedback:
+    return OperatorFeedback(
+        op_id=OpId(op),
+        kind="filter",
+        n_actual=n,
+        t_op_ms=1.0,
+        m_peak_bytes=0,
+        selectivity=1.0,
+        batch_size=0,
+        signature=sig,
+        n_estimated=float(n),
+    )
+
+
+def test_derived_views_absorb_records_made_after_first_read():
+    # The bucketed and signature views are materialized lazily on first read, then folded
+    # forward by `record` — a read after later records must see them without a re-scan.
+    hub = MetadataHub(InProcessBackend())
+    hub.record(_signed_fb(0, 5, "sigA"))
+    assert hub.op_stats_by_kind()["filter"][0]["n_actual"] == 5  # materializes the view
+    signed_before = len(hub.op_stats_with_signature())
+    hub.record(_signed_fb(1, 9, "sigB"))  # recorded AFTER the views were first read
+    by_kind = hub.op_stats_by_kind()
+    assert [r["n_actual"] for r in by_kind["filter"]] == [5, 9]
+    assert len(hub.op_stats_with_signature()) == signed_before + 1
+    assert hub.signed_appends == signed_before + 1
+
+
+def test_op_stats_by_kind_matches_a_cold_reload():
+    # The incrementally maintained view must equal what a fresh hub reads from the same
+    # backend cold — the fold and the one-time scan cannot drift.
+    backend = InProcessBackend()
+    hub = MetadataHub(backend)
+    for i in range(6):
+        hub.record(_fb(i, i * 2))
+    warm = {k: [r["n_actual"] for r in v] for k, v in hub.op_stats_by_kind().items()}
+    cold = {k: [r["n_actual"] for r in v] for k, v in MetadataHub(backend).op_stats_by_kind().items()}
+    assert warm == cold
+
+
+def test_get_keyed_param_reflects_a_write_after_a_prior_load():
+    # `get_keyed_param` is served from the same parsed view `load_keyed_params` builds;
+    # a write after that view was cached must be visible without a re-scan or a miss.
+    hub = MetadataHub(InProcessBackend())
+    hub.put_keyed_param("kyber.stats", "sigA", {"rows": 1.0})
+    assert hub.load_keyed_params("kyber.stats") == {"sigA": {"rows": 1.0}}  # caches the ns
+    hub.put_keyed_param("kyber.stats", "sigB", {"rows": 2.0})  # write after the cache exists
+    assert hub.get_keyed_param("kyber.stats", "sigB") == {"rows": 2.0}
+    assert hub.load_keyed_params("kyber.stats") == {"sigA": {"rows": 1.0}, "sigB": {"rows": 2.0}}
+
+
 def test_keyed_params_merge_legacy_blob():
     # A store written by the old whole-blob path still reads back: load_keyed_params
     # merges the legacy `(namespace,)` blob underneath the per-key entries, which win.

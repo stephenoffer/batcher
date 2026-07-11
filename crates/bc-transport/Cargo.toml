@@ -11,8 +11,12 @@ arrow.workspace = true
 # the RecordBatch/Schema types are identical across the dependency graph.
 arrow-flight = "56"
 # tonic 0.13 is the gRPC stack arrow-flight 56 is built against; keeping it in
-# lockstep avoids a duplicate tonic/prost in the graph.
-tonic = "0.13"
+# lockstep avoids a duplicate tonic/prost in the graph. `tls-ring` adds
+# rustls-over-ring TLS (server identity + mTLS client-cert verification) so the
+# inter-node shuffle can be encrypted and mutually authenticated — required to run
+# the data plane across an untrusted network. `ring`/`rustls`/`tokio-rustls` are
+# already in the graph (the cloud IO stack pulls them), so this adds no new C build.
+tonic = { version = "0.13", features = ["tls-ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 # TcpListenerStream: lets us bind an ephemeral port, read it back, then hand the
 # listener to tonic via serve_with_incoming.

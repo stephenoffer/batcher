@@ -22,6 +22,7 @@ from typing import IO, Any, ClassVar
 
 import pyarrow as pa
 
+from batcher._internal.hardware import available_cpu_count
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.splits import FileSplit, RowGroupSplit, Split
@@ -32,6 +33,11 @@ __all__ = ["FileSink", "FileSource", "pack_row_groups"]
 # Caps the parallel-read memory to ~this many files while overlapping I/O + decode so a
 # streaming consumer isn't throttled by a one-file-at-a-time read.
 _ITER_READAHEAD_FILES = 16
+# Concurrency for the driver's footer-read phase (`splits`/`row_count`). Footer reads are
+# pure object-store *latency* (a small metadata GET each), not CPU or bandwidth, so a wide
+# fan-out is safe and cuts the many-thousand-file driver stall the old cap of 16 left on the
+# table. Env-overridable; capped at the file count so a small dataset spawns no idle threads.
+_FOOTER_READ_CONCURRENCY = max(8, int(os.environ.get("BATCHER_FOOTER_CONCURRENCY", "64")))
 
 
 def pack_row_groups(
@@ -101,19 +107,40 @@ class FileSource(ABC):
             else:
                 from batcher.io.schema import unify_schemas
 
-                self._schema_cache = unify_schemas(
-                    [self._file_schema(f) for f in files], self._schema_mode
-                )
+                # Schema evolution reads every file's schema; read them concurrently (each a
+                # GIL-releasing metadata round trip) so a many-file unify isn't serialized.
+                if len(files) <= 1:
+                    schemas = [self._file_schema(f) for f in files]
+                else:
+                    cap = min(_FOOTER_READ_CONCURRENCY, len(files))
+                    with ThreadPoolExecutor(max_workers=cap) as pool:
+                        schemas = list(pool.map(self._file_schema, files))
+                self._schema_cache = unify_schemas(schemas, self._schema_mode)
         return self._schema_cache
+
+    def _read_by_path(
+        self,
+        path: str,  # noqa: ARG002 (the default reader has no path-based fast read)
+        projection: list[str] | None,  # noqa: ARG002
+    ) -> list[pa.RecordBatch] | None:
+        """Read `path` without a Python file handle, or `None` to fall back to `open`.
+
+        A format whose reader can do its own C++-side I/O (Parquet) overrides this: the
+        handle otherwise serializes the reader's internal decode threads. Formats with no
+        such path — and backends that cannot expose one — return `None` and are unchanged.
+        """
+        return None
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         files = self._files()
 
         def _read_one(f: str) -> list[pa.RecordBatch]:
+            proj = self._file_proj(f, projection)
+            batches = self._read_by_path(f, proj)
+            if batches is not None:
+                return list(self._normalize(batches, projection))
             with self._fs.open(f) as fh:
-                return list(
-                    self._normalize(self._read_file(fh, self._file_proj(f, projection)), projection)
-                )
+                return list(self._normalize(self._read_file(fh, proj), projection))
 
         # Read the files concurrently: the decode runs in the C++ layer with the GIL
         # released, so a many-small-files read (thousands of Parquet parts — the shape
@@ -125,7 +152,7 @@ class FileSource(ABC):
             return _read_one(files[0]) if files else []
         from concurrent.futures import ThreadPoolExecutor
 
-        workers = min(len(files), (os.cpu_count() or 1) * 2)
+        workers = min(len(files), available_cpu_count() * 2)
         out: list[pa.RecordBatch] = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for batches in pool.map(_read_one, files):  # order preserved
@@ -150,7 +177,7 @@ class FileSource(ABC):
         import itertools
         from collections import deque
 
-        depth = min(len(files), max(2, min(os.cpu_count() or 4, _ITER_READAHEAD_FILES)))
+        depth = min(len(files), max(2, min(available_cpu_count(), _ITER_READAHEAD_FILES)))
 
         def _read(f: str) -> list[pa.RecordBatch]:
             return list(self._iter_file(f, self._file_proj(f, projection)))
@@ -202,7 +229,7 @@ class FileSource(ABC):
         if len(files) <= 1:
             counts = [self._file_row_count(f) for f in files]
         else:
-            with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:
+            with ThreadPoolExecutor(max_workers=min(_FOOTER_READ_CONCURRENCY, len(files))) as pool:
                 counts = list(pool.map(self._file_row_count, files))
         return None if any(c is None for c in counts) else sum(counts)  # type: ignore[misc]
 
@@ -228,7 +255,7 @@ class FileSource(ABC):
         # single file (the common small case) skips the pool entirely.
         if len(files) <= 1:
             return [s for f in files for s in self._file_splits(f, target_size)]
-        with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:
+        with ThreadPoolExecutor(max_workers=min(_FOOTER_READ_CONCURRENCY, len(files))) as pool:
             per_file = pool.map(lambda f: self._file_splits(f, target_size), files)
         return [s for file_splits in per_file for s in file_splits]
 
@@ -414,7 +441,7 @@ class FileSink(ABC):
 
         if len(chunks) == 1:
             return [_write_chunk(chunks[0])]
-        workers = min(len(chunks), os.cpu_count() or 1)
+        workers = min(len(chunks), available_cpu_count())
         with ThreadPoolExecutor(max_workers=workers) as pool:
             return list(pool.map(_write_chunk, chunks))  # order preserved
 

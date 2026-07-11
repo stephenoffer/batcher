@@ -26,20 +26,57 @@ __all__ = [
     "with_children",
 ]
 
-# Per-type field-name cache. A node's dataclass fields are fixed by its *type*, but
-# `dataclasses.fields(node)` rebuilds the field tuple on every call — and the optimizer
-# walks the tree thousands of times per query. Caching the names once per type turns the
-# hot `children`/`with_children` traversal into plain `getattr`s. Keyed by the node class,
-# which is process-stable, so the cache never invalidates.
-_FIELD_NAMES: dict[type, tuple[str, ...]] = {}
+# Per-type child-field cache. A node's dataclass fields are fixed by its *type*, and only a
+# couple ever hold child plans (a `Filter` has one `input`; the rest are predicates, keys,
+# schemas). `dataclasses.fields(node)` rebuilds the whole field tuple on every call, and the
+# generic walk then does a `getattr` + `isinstance` on *every* field — yet the optimizer
+# walks the tree thousands of times per query. So classify each type once, on its first node,
+# keeping only the child-bearing fields *and how each carries children*; the hot traversal
+# then touches nothing but those and dispatches with no per-call `isinstance` ladder. Keyed
+# by the node class, which is process-stable, so the cache never invalidates.
+#
+# Each kept field carries a `_Kind`. The classification is by the field's shape, which is
+# fixed by its dataclass type (a `tuple[...]` field is always a tuple; a `LogicalPlan` field
+# is never one), so it is stable across instances — *except* a field first seen as `None`,
+# whose type could be `LogicalPlan | None` or `tuple[...] | None`; that stays `AMBIGUOUS` and
+# is re-examined by value on every call, exactly the old conservative behavior. The plan
+# nodes today have no optional/None child field, so `AMBIGUOUS` never occurs and every kept
+# field dispatches straight to its branch — the guard costs nothing now and stays correct if
+# an optional child is ever added.
+_KIND_PLAN = 0  # a single `LogicalPlan` slot
+_KIND_TUPLE = 1  # a tuple that holds (some) plans, positionally
+_KIND_AMBIGUOUS = 2  # first seen `None` — could hold a plan later; dispatch by value
+
+_ChildSpec = tuple[tuple[str, int], ...]
+_CHILD_SPEC: dict[type, _ChildSpec] = {}
 
 
-def _field_names(node: LogicalPlan) -> tuple[str, ...]:
-    names = _FIELD_NAMES.get(type(node))
-    if names is None:
-        names = tuple(f.name for f in dataclasses.fields(node))
-        _FIELD_NAMES[type(node)] = names
-    return names
+def _classify(value: object) -> int | None:
+    """The `_Kind` of a field holding `value`, or `None` if it can never hold a child."""
+    if isinstance(value, LogicalPlan):
+        return _KIND_PLAN
+    if isinstance(value, tuple):
+        # Empty → ambiguous shape but definitely a *tuple* field, so still dispatch as a
+        # tuple (it may fill with plans later). Non-empty and plan-free → a scalar tuple
+        # (keys, schema) that never holds a child.
+        if not value:
+            return _KIND_TUPLE
+        return _KIND_TUPLE if any(isinstance(v, LogicalPlan) for v in value) else None
+    return None if value is not None else _KIND_AMBIGUOUS
+
+
+def _child_spec(node: LogicalPlan) -> _ChildSpec:
+    """`((field_name, kind), ...)` for `node`'s child-bearing fields, cached per type."""
+    spec = _CHILD_SPEC.get(type(node))
+    if spec is None:
+        pairs = []
+        for f in dataclasses.fields(node):
+            kind = _classify(getattr(node, f.name))
+            if kind is not None:
+                pairs.append((f.name, kind))
+        spec = tuple(pairs)
+        _CHILD_SPEC[type(node)] = spec
+    return spec
 
 
 def children(node: LogicalPlan) -> list[LogicalPlan]:
@@ -50,9 +87,13 @@ def children(node: LogicalPlan) -> list[LogicalPlan]:
     new node types need no edit here.
     """
     out: list[LogicalPlan] = []
-    for name in _field_names(node):
+    for name, kind in _child_spec(node):
         value = getattr(node, name)
-        if isinstance(value, LogicalPlan):
+        if kind == _KIND_PLAN:
+            out.append(value)
+        elif kind == _KIND_TUPLE:
+            out.extend(v for v in value if isinstance(v, LogicalPlan))
+        elif isinstance(value, LogicalPlan):  # AMBIGUOUS: dispatch by value
             out.append(value)
         elif isinstance(value, tuple):
             out.extend(v for v in value if isinstance(v, LogicalPlan))
@@ -74,25 +115,57 @@ def with_children(node: LogicalPlan, new_children: list[LogicalPlan]) -> Logical
     """
     it = iter(new_children)
     changes: dict[str, object] = {}
-    for name in _field_names(node):
+    for name, kind in _child_spec(node):
         value = getattr(node, name)
-        if isinstance(value, LogicalPlan):
+        if kind == _KIND_PLAN or (kind == _KIND_AMBIGUOUS and isinstance(value, LogicalPlan)):
             replacement = next(it)
             if replacement is not value:
                 changes[name] = replacement
-        elif isinstance(value, tuple) and any(isinstance(v, LogicalPlan) for v in value):
+        elif kind == _KIND_TUPLE or (kind == _KIND_AMBIGUOUS and isinstance(value, tuple)):
             rebuilt = tuple(next(it) if isinstance(v, LogicalPlan) else v for v in value)
             if any(a is not b for a, b in zip(rebuilt, value, strict=True)):
                 changes[name] = rebuilt
+        # else: an ambiguous slot that is currently `None` consumed no child, so the
+        # `new_children` cursor is not advanced and the field is left untouched.
     return node if not changes else dataclasses.replace(node, **changes)
 
 
 def transform_up(node: LogicalPlan, fn: Callable[[LogicalPlan], LogicalPlan]) -> LogicalPlan:
     """Bottom-up rewrite: transform children first, then apply `fn` to the rebuilt
     node. The post-order shape most rewrites want (children are already final when
-    a node is visited)."""
-    rebuilt = with_children(node, [transform_up(c, fn) for c in children(node)])
-    return fn(rebuilt)
+    a node is visited).
+
+    Fused into a *single* pass over the child fields — recurse into each child and
+    record only the replacements that actually differ — instead of building a child
+    list (`children`) and mapping it back (`with_children`), which scanned the fields
+    twice and allocated an intermediate list per node. Semantics and structural sharing
+    are identical (an unchanged subtree returns the same object).
+    """
+    changes: dict[str, object] | None = None
+    for name, kind in _child_spec(node):
+        value = getattr(node, name)
+        if kind == _KIND_PLAN or (kind == _KIND_AMBIGUOUS and isinstance(value, LogicalPlan)):
+            new = transform_up(value, fn)
+            if new is not value:
+                if changes is None:
+                    changes = {}
+                changes[name] = new
+        elif kind == _KIND_TUPLE or (kind == _KIND_AMBIGUOUS and isinstance(value, tuple)):
+            rebuilt: list[object] | None = None
+            for idx, v in enumerate(value):
+                if isinstance(v, LogicalPlan):
+                    nv = transform_up(v, fn)
+                    if nv is not v:
+                        if rebuilt is None:
+                            rebuilt = list(value)
+                        rebuilt[idx] = nv
+            if rebuilt is not None:
+                if changes is None:
+                    changes = {}
+                changes[name] = tuple(rebuilt)
+        # else: an ambiguous slot currently `None` — no child to recurse into.
+    rebuilt_node = node if changes is None else dataclasses.replace(node, **changes)
+    return fn(rebuilt_node)
 
 
 def transform_down(node: LogicalPlan, fn: Callable[[LogicalPlan], LogicalPlan]) -> LogicalPlan:

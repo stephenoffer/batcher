@@ -174,8 +174,9 @@ class IRNode(Expr):
 def expr_node(cls: type[_T]) -> type[_T]:
     """Class decorator turning an `IRNode` subclass into its constructor.
 
-    A thin alias for ``dataclass(eq=False)`` — ``eq=False`` preserves `Expr`'s
-    expression-building ``__eq__``/``__ne__`` and its ``__hash__ = None``. Named for
-    intent so node definitions read as declarations, not "dataclasses".
+    A thin alias for ``dataclass(eq=False, repr=False)`` — ``eq=False`` preserves
+    `Expr`'s expression-building ``__eq__``/``__ne__`` and its ``__hash__ = None``, and
+    ``repr=False`` keeps `Expr`'s source-like ``__repr__`` instead of the dataclass's
+    field dump. Named for intent so node definitions read as declarations.
     """
-    return dataclass(eq=False)(cls)
+    return dataclass(eq=False, repr=False)(cls)

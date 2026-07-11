@@ -87,6 +87,67 @@ class Session:
         self._plan_cache: dict[str, tuple[int, Dataset]] = {}
         self._generation = 0
 
+    def __repr__(self) -> str:
+        """Show the registered table names, e.g. ``Session(tables=['emp', 'dept'])``."""
+        return f"Session(tables={list(self._tables)!r})"
+
+    def __len__(self) -> int:
+        """The number of registered tables.
+
+        Returns:
+            The count of tables in the session catalog.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = s.register("t", bt.from_pydict({"x": [1]}))
+                >>> len(s)
+                1
+        """
+        return len(self._tables)
+
+    def __contains__(self, name: str) -> bool:
+        """Whether a table is registered under `name`.
+
+        Args:
+            name: The table name to look up.
+
+        Returns:
+            True if a table is registered under `name`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = s.register("t", bt.from_pydict({"x": [1]}))
+                >>> "t" in s
+                True
+        """
+        return name in self._tables
+
+    def __getitem__(self, name: str) -> Dataset:
+        """Get a registered table by name — sugar for `table`.
+
+        Args:
+            name: The registered table name.
+
+        Returns:
+            The `Dataset` registered under `name`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> _ = s.register("t", bt.from_pydict({"x": [1]}))
+                >>> s["t"].columns
+                ['x']
+        """
+        return self.table(name)
+
     def _bump(self) -> None:
         """Invalidate the prepared-statement cache after a catalog mutation."""
         self._generation += 1
@@ -130,6 +191,15 @@ class Session:
                 >>> _ = s.register("t", bt.from_pydict({"x": [1, 2, 3]}))
                 >>> s.table("t").to_pydict()
                 {'x': [1, 2, 3]}
+
+        Args:
+            name: The registered table name to look up.
+
+        Returns:
+            The `Dataset` bound to `name`.
+
+        Raises:
+            PlanError: If no table is registered under `name`.
         """
         if name not in self._tables:
             raise PlanError(f"no table {name!r} in catalog; registered: {self.list()}")
@@ -147,6 +217,9 @@ class Session:
                 >>> _ = s.register("a", bt.from_pydict({"x": [1]}))
                 >>> s.list()
                 ['a', 'b']
+
+        Returns:
+            The sorted list of registered table names.
         """
         return sorted(self._tables)
 
@@ -163,6 +236,9 @@ class Session:
                 >>> s.drop("a")
                 >>> s.list()
                 ['b']
+
+        Args:
+            name: The table name to remove from the catalog.
         """
         self._tables.pop(name, None)
         self._bump()
@@ -197,9 +273,9 @@ class Session:
         batch_format: str = "pyarrow",
         **config: Any,
     ) -> None:
-        """Register a Python function callable from SQL (DuckDB ``create_function`` /
-        Spark ``udf.register``).
+        """Register a Python function callable from SQL (a DuckDB/Spark UDF).
 
+        The DuckDB ``create_function`` / Spark ``udf.register`` analogue.
         Python cannot run inside the engine's expression evaluator, so the function
         lowers to a `map_batches` stage. Two call forms are supported:
 
@@ -264,6 +340,9 @@ class Session:
                 >>> s.register_function("dbl", lambda a: pc.multiply(a, 2), result_type="int64")
                 >>> s.list_functions()
                 ['dbl']
+
+        Returns:
+            The sorted list of registered function names.
         """
         return sorted(self._functions)
 

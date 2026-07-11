@@ -58,3 +58,23 @@ class PolarsEngine(Engine):
         for name, tbl in tables.items():
             ctx.register(name, pl.from_arrow(tbl))
         return lambda query: ctx.execute(_polars_sql_dialect(query)).to_arrow()
+
+    def sql_runner_scan(self, uris: dict[str, str]) -> SqlRunner:
+        import polars as pl
+
+        ctx = pl.SQLContext(eager=True)
+        for name, uri in uris.items():
+            ctx.register(name, pl.scan_parquet(uri))
+        return lambda query: ctx.execute(_polars_sql_dialect(query)).to_arrow()
+
+    def scan_sql_runner(self, glob: str) -> SqlRunner:
+        import polars as pl
+
+        def run(query: str) -> pa.Table:
+            # `scan_parquet` expands the glob when it is built, so it must be rebuilt per
+            # call for the listing cost to be measured rather than amortized away.
+            ctx = pl.SQLContext(eager=True)
+            ctx.register("t", pl.scan_parquet(glob))
+            return ctx.execute(_polars_sql_dialect(query)).to_arrow()
+
+        return run

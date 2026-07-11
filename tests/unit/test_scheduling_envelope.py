@@ -1,7 +1,7 @@
 """Metadata-driven distributed scheduling (Pillar B), tested without a cluster.
 
 Covers the derivation chain end to end as pure/local logic: Kyber fills the
-parallelism/credit axes from estimated rows (`_annotate_ops`); Carbonite clamps
+parallelism/credit axes from estimated rows (`annotate_ops`); Carbonite clamps
 those into a per-task `SchedulingEnvelope`; the executor turns the envelope into Ray
 `.options(...)` kwargs; the GPU tag flows and adapts from measured utilization; and
 the AIMD credit window evolves from a congestion signal.
@@ -43,7 +43,8 @@ def _op(op_id: int, kind: str, mem: int, credits: int, par: int) -> PhysicalOp:
 def test_annotate_ops_scales_parallelism_with_rows():
     import batcher as bt
     from batcher.kyber.cardinality import CardinalityEstimator
-    from batcher.kyber.optimizer import _annotate_ops
+    from batcher.kyber.cost import CostModel
+    from batcher.kyber.annotate import annotate_ops
 
     class _Source:
         """Source stub that reports a huge row count to the estimator."""
@@ -58,7 +59,7 @@ def test_annotate_ops_scales_parallelism_with_rows():
     big = cfg.optimizer.target_rows_per_task * 5  # a breaker over this wants ~5 tasks
     ds = bt.from_pydict({"k": [1, 2], "v": [3, 4]}).group_by("k").agg(s=bt.col("v").sum())
     est = CardinalityEstimator([_Source(big)])
-    ops = _annotate_ops(ds._plan, est, cfg)
+    ops = annotate_ops(ds._plan, est, cfg, CostModel(est))
     agg_op = next(op for op in ops if op.kind == "Aggregate")
     # A breaker over ~5×target rows wants multiple tasks and a positive credit window.
     assert agg_op.bounds.n_max_parallelism >= 2
@@ -113,7 +114,11 @@ def test_scheduling_policy_unsized_falls_back_to_local_budget():
     env = DefaultSchedulingPolicy().envelope(
         plan, ctx, requested_workers=None, available_bytes=1 << 40
     )
-    budget = cfg.execution.parallelism or __import__("os").cpu_count() or 4
+    # The local budget is the *usable* CPU count (cgroup/affinity aware), not the host
+    # core count — a throttled container fans out to what it may actually run on.
+    from batcher._internal.hardware import available_cpu_count
+
+    budget = cfg.execution.parallelism or available_cpu_count()
     assert env.n_tasks == max(1, budget)
 
 
@@ -255,7 +260,8 @@ def test_resolve_placement_strategy_against_live_nodes(monkeypatch):
 def test_annotate_ops_sets_locality_for_small_shuffle_only():
     import batcher as bt
     from batcher.kyber.cardinality import CardinalityEstimator
-    from batcher.kyber.optimizer import _annotate_ops
+    from batcher.kyber.cost import CostModel
+    from batcher.kyber.annotate import annotate_ops
 
     class _Source:
         def __init__(self, rows: int) -> None:
@@ -267,12 +273,12 @@ def test_annotate_ops_sets_locality_for_small_shuffle_only():
     cfg = active_config()
     ds = bt.from_pydict({"k": [1, 2], "v": [3, 4]}).group_by("k").agg(s=bt.col("v").sum())
     # A tiny shuffle (few rows × width) is below the broadcast threshold → prefers locality.
-    small = _annotate_ops(ds._plan, CardinalityEstimator([_Source(10)]), cfg)
+    small_est = CardinalityEstimator([_Source(10)])
+    small = annotate_ops(ds._plan, small_est, cfg, CostModel(small_est))
     assert next(op for op in small if op.kind == "Aggregate").bounds.prefers_locality is True
     # A shuffle of ~broadcast_max_bytes *rows* (× width ≫ threshold) → no locality preference.
-    big = _annotate_ops(
-        ds._plan, CardinalityEstimator([_Source(cfg.optimizer.broadcast_max_bytes)]), cfg
-    )
+    big_est = CardinalityEstimator([_Source(cfg.optimizer.broadcast_max_bytes)])
+    big = annotate_ops(ds._plan, big_est, cfg, CostModel(big_est))
     assert next(op for op in big if op.kind == "Aggregate").bounds.prefers_locality is False
 
 
@@ -458,11 +464,13 @@ def test_envelope_cpu_is_dominant_operator_share():
 def test_kyber_annotates_cpu_light_with_fraction():
     import batcher as bt
     from batcher.kyber.cardinality import CardinalityEstimator
-    from batcher.kyber.optimizer import _annotate_ops
+    from batcher.kyber.cost import CostModel
+    from batcher.kyber.annotate import annotate_ops
 
     cfg = active_config()
     ds = bt.from_pydict({"k": [1, 2], "v": [3, 4]}).filter(bt.col("v") > 0)
-    ops = _annotate_ops(ds._plan, CardinalityEstimator([]), cfg)
+    est = CardinalityEstimator([])
+    ops = annotate_ops(ds._plan, est, cfg, CostModel(est))
     filt = next(op for op in ops if op.kind == "Filter")
     scan = next(op for op in ops if op.kind == "Scan")
     assert filt.bounds.c_cpu_shares == cfg.execution.cpu_share_io
@@ -528,16 +536,18 @@ def test_load_cpu_utilization_medians_by_kind():
 def test_annotate_ops_overrides_static_cpu_with_learned():
     import batcher as bt
     from batcher.kyber.cardinality import CardinalityEstimator
-    from batcher.kyber.optimizer import _annotate_ops
+    from batcher.kyber.cost import CostModel
+    from batcher.kyber.annotate import annotate_ops
 
     cfg = active_config()
     ds = bt.from_pydict({"k": [1, 2], "v": [3, 4]}).filter(bt.col("v") > 0)
     # Cold start: Filter keeps the CPU-light prior.
-    cold = _annotate_ops(ds._plan, CardinalityEstimator([]), cfg)
+    est = CardinalityEstimator([])
+    cold = annotate_ops(ds._plan, est, cfg, CostModel(est))
     filt_cold = next(op for op in cold if op.kind == "Filter")
     assert filt_cold.bounds.c_cpu_shares == cfg.execution.cpu_share_io
     # Learned: a CPU-bound filter (regex-heavy) measured at 0.95 → near a whole core.
-    warm = _annotate_ops(ds._plan, CardinalityEstimator([]), cfg, {"filter": 0.95})
+    warm = annotate_ops(ds._plan, est, cfg, CostModel(est), {"filter": 0.95})
     filt_warm = next(op for op in warm if op.kind == "Filter")
     assert filt_warm.bounds.c_cpu_shares == 0.95
 
@@ -545,7 +555,7 @@ def test_annotate_ops_overrides_static_cpu_with_learned():
 def test_learned_cpu_flows_through_optimizer_into_envelope():
     # The whole adaptive CPU loop, end to end through the *real* Optimizer and
     # ResourceManager: recorded utilization → load_cpu_utilization (inside optimize)
-    # → _annotate_ops c_cpu_shares → envelope.num_cpus. Proves the class→IR-tag bridge
+    # → annotate_ops c_cpu_shares → envelope.num_cpus. Proves the class→IR-tag bridge
     # and the wiring actually fire (not just the pieces in isolation).
     import batcher as bt
     from batcher.carbonite import ResourceManager

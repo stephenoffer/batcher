@@ -1,0 +1,236 @@
+"""Unit tests for the expression cost model and its JIT-subset mirror.
+
+Two contracts are pinned here:
+
+* `jit_compilable` must agree with `crates/bc-codegen/src/analyze.rs` on which
+  expressions the Cranelift tier accepts, and must **never** claim an expression is
+  compilable when `analyze` rejects it on structure alone (a false positive under-prices
+  it; a false negative only over-prices it).
+* `expr_cost_factor` must be exactly 1.0 for the archetypal `col OP literal` predicate,
+  because every calibrated `CostCoefficients` value was fitted against that baseline.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+
+import pytest
+
+import batcher as bt
+from batcher.kyber.expr_cost import (
+    JIT_SPEEDUP,
+    expr_cost,
+    expr_cost_factor,
+    jit_compilable,
+    raw_expr_cost,
+)
+from batcher.plan.expr_ir import Binary, Case, Cast, Col, InList, Lit
+
+# --- jit_compilable: the supported subset -----------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "expr",
+    [
+        bt.col("x") > 5,
+        bt.col("x") + 1,
+        (bt.col("x") > 5) & (bt.col("y") < 2.0),
+        (bt.col("x") > 5) | (bt.col("y") < 2.0),
+        ~(bt.col("x") > 5),
+        bt.col("x"),  # a bare numeric column is a compilable column clone
+        bt.col("x") / 3,  # constant divisor cannot trap
+        bt.col("x") / 2.5,  # float division is IEEE, never traps
+        Cast(bt.col("x"), "float64", False),
+        Cast(bt.col("x"), "double", False),  # dtype alias
+        # `analyze.rs` lowers sqrt directly and the transcendentals to a libm call.
+        bt.col("x").sqrt(),
+        bt.col("x").ln(),
+        bt.col("x").abs(),
+        # `Expr.__truediv__` casts to float64, and IEEE division never traps.
+        bt.col("x") / bt.col("y"),
+        bt.col("x") / 0,
+        # Temporal comparison against the same temporal type — the ubiquitous TPC-H
+        # date filter, which `analyze` compiles.
+        bt.col("d") < dt.date(1998, 1, 1),
+        bt.col("t") >= dt.datetime(2020, 1, 1),
+    ],
+)
+def test_jit_compilable_accepts_supported_subset(expr):
+    assert jit_compilable(expr)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "expr",
+    [
+        bt.col("s") == "abc",  # string literal
+        bt.col("b") == True,  # noqa: E712 - bool literal is explicitly unsupported
+        bt.col("s").str.contains("a"),  # string function
+        bt.col("s").str.regexp_matches("^a"),
+        bt.col("x").is_null(),
+        bt.col("x").is_not_null(),
+        bt.col("x") % bt.col("y"),  # integer modulo by a non-constant divisor traps
+        Binary("div", bt.col("x"), bt.col("y")),  # raw integer division
+        bt.col("y").round(),  # rounding mode differs from the interpreter
+        bt.col("y").sign(),
+        bt.col("y").cbrt(),  # Rust's software cbrt differs from libm by 1 ULP
+        Cast(bt.col("x"), "int64", True),  # try_cast
+        Cast(bt.col("x"), "string", False),  # unsupported target dtype
+        InList(bt.col("x"), (1, 2, 3)),  # hash-set probe, interpreter only
+        Lit(dt.date(2020, 1, 1)),  # a bare temporal is not a storable JIT output
+        # `case` whose result is a string, not a numeric
+        Case([(bt.col("x") > 1, Lit("a"))], Lit("b")),
+    ],
+)
+def test_jit_compilable_rejects_unsupported(expr):
+    assert not jit_compilable(expr)
+
+
+@pytest.mark.unit
+def test_known_over_claims_from_missing_dtypes():
+    """A bare `Col` carries no dtype here, so two cases are reported compilable that
+    `analyze` would reject once it sees the batch. Both are harmless — the JIT itself
+    makes the real call and falls back — and the cost error is bounded by `JIT_SPEEDUP`.
+    Pinned so the limitation stays visible rather than being rediscovered as a bug.
+    """
+    assert jit_compilable(bt.col("d"))  # a bare Date32 column: `analyze` rejects it
+    assert jit_compilable(bt.col("s") == bt.col("t"))  # two string columns compared
+
+
+@pytest.mark.unit
+def test_jit_compilable_numeric_case():
+    expr = Case([(bt.col("x") > 1, Lit(1))], Lit(2))
+    assert jit_compilable(expr)
+
+
+@pytest.mark.unit
+def test_int_division_by_trapping_constant_is_rejected():
+    # cranelift's integer `sdiv` traps on 0 and on i64::MIN / -1; `analyze` refuses both.
+    # Built from the raw IR node: `Expr.__truediv__` casts to float64 first, and IEEE
+    # float division never traps (see `test_float_division_always_compiles`).
+    assert not jit_compilable(Binary("div", bt.col("x"), Lit(0)))
+    assert not jit_compilable(Binary("div", bt.col("x"), Lit(-1)))
+    assert not jit_compilable(Binary("div", bt.col("x"), bt.col("y")))
+    assert jit_compilable(Binary("div", bt.col("x"), Lit(7)))
+
+
+@pytest.mark.unit
+def test_float_division_always_compiles():
+    # IEEE division yields inf/nan rather than trapping, so even a zero or non-constant
+    # divisor compiles once either operand is a float.
+    assert jit_compilable(bt.col("x") / 0)
+    assert jit_compilable(bt.col("x") / bt.col("y"))
+    assert jit_compilable(bt.col("x") / 2.5)
+
+
+# --- expr_cost: ranking and the JIT speedup ---------------------------------------
+
+
+@pytest.mark.unit
+def test_compiled_expression_is_cheaper_than_its_raw_cost():
+    expr = bt.col("x") > 5
+    assert expr_cost(expr) == pytest.approx(raw_expr_cost(expr) / JIT_SPEEDUP)
+
+
+@pytest.mark.unit
+def test_interpreted_expression_pays_no_speedup():
+    expr = bt.col("s").str.contains("a")
+    assert expr_cost(expr) == pytest.approx(raw_expr_cost(expr))
+
+
+@pytest.mark.unit
+def test_cost_ranks_regex_far_above_a_comparison():
+    cheap = expr_cost(bt.col("x") > 5)
+    regex = expr_cost(bt.col("s").str.regexp_matches("^a.*z$"))
+    assert regex > 100 * cheap
+
+
+@pytest.mark.unit
+def test_cost_ranks_string_ops_between_comparison_and_regex():
+    cheap = expr_cost(bt.col("x") > 5)
+    contains = expr_cost(bt.col("s").str.contains("a"))
+    regex = expr_cost(bt.col("s").str.regexp_matches("^a"))
+    assert cheap < contains < regex
+
+
+@pytest.mark.unit
+def test_cost_is_additive_over_the_tree():
+    # A conjunction costs at least as much as either of its conjuncts.
+    a, b = bt.col("x") > 5, bt.col("s").str.contains("a")
+    assert expr_cost(a & b) > expr_cost(b) > expr_cost(a)
+
+
+@pytest.mark.unit
+def test_slotted_nodes_expose_their_children():
+    # `InList` and `Aliased` use __slots__; a naive vars() walk would treat them as
+    # leaves and under-price them. The child column read must be counted.
+    assert raw_expr_cost(InList(bt.col("x"), (1, 2))) > raw_expr_cost(Lit(1))
+    aliased = (bt.col("s").str.contains("a")).alias("hit")
+    assert raw_expr_cost(aliased) == pytest.approx(raw_expr_cost(bt.col("s").str.contains("a")))
+
+
+@pytest.mark.unit
+def test_raw_cost_is_memoized_per_node():
+    # `raw_expr_cost` depends only on structure, so it is cached on the node. `expr_cost`
+    # is not, because it also depends on the JIT speedup calibration learns.
+    expr = bt.col("s").str.regexp_matches("^a")
+    assert raw_expr_cost(expr) == raw_expr_cost(expr)
+    assert expr.__dict__["_c_rawcost"] == pytest.approx(raw_expr_cost(expr))
+
+
+@pytest.mark.unit
+def test_speedup_scales_interpreted_expressions_against_compiled_ones():
+    # The archetypal compiled predicate is 1.0 at any speedup (its baseline moves with
+    # it); a higher measured speedup makes an interpreted regex relatively pricier.
+    regex = bt.col("s").str.regexp_matches("^a")
+    assert expr_cost_factor(bt.col("x") > 5, 1.0) == pytest.approx(1.0)
+    assert expr_cost_factor(bt.col("x") > 5, 8.0) == pytest.approx(1.0)
+    assert expr_cost_factor(regex, 8.0) > expr_cost_factor(regex, 1.0)
+
+
+# --- expr_cost_factor: the multiplier the cost model applies ----------------------
+
+
+@pytest.mark.unit
+def test_baseline_predicate_has_factor_one():
+    # The whole point: a plain compiled comparison must not perturb the calibrated
+    # per-row coefficients it multiplies.
+    assert expr_cost_factor(bt.col("x") > 5) == pytest.approx(1.0)
+    assert expr_cost_factor(bt.col("x") < 5) == pytest.approx(1.0)
+    assert expr_cost_factor(Col("x") == Lit(5)) == pytest.approx(1.0)
+
+
+@pytest.mark.unit
+def test_factor_is_clamped_at_both_ends():
+    # A bare column floors at 0.2. The ceiling sits above the priciest *measured* scalar
+    # function, so real costs pass through untruncated; only the unmeasured media-decode
+    # estimate is bounded.
+    from batcher.plan.expr_ir.image import ImageFunc
+
+    assert expr_cost_factor(bt.col("x")) == pytest.approx(0.2)
+    assert expr_cost_factor(bt.col("s").str.sha256()) > 200.0  # not truncated
+    assert expr_cost_factor(ImageFunc("decode", bt.col("s"), None, None)) == pytest.approx(1000.0)
+
+
+@pytest.mark.unit
+def test_measured_function_costs_are_ranked_correctly():
+    """The table is calibrated against measurement (see `weights`); these orderings are
+    the ones a guessed table gets wrong, so they are pinned.
+    """
+    f = expr_cost_factor
+    s = bt.col("s")
+    # A regex is only a few times a substring search — RE2 prefilters on literals.
+    assert f(s.str.contains("abc")) < f(s.str.regexp_matches("a.*b")) < 4 * f(s.str.contains("abc"))
+    # ...but a digest and an edit distance dwarf a regex.
+    assert f(s.str.sha256()) > 4 * f(s.str.regexp_matches("a.*b"))
+    assert f(s.str.levenshtein("abc")) > 3 * f(s.str.regexp_matches("a.*b"))
+    # Even `length` is expensive: decoding string offsets dominates the operation.
+    assert f(s.str.len()) > 20 * f(bt.col("x") > 5)
+    # Numeric math stays cheap next to any string work.
+    assert f(bt.col("y").sqrt()) < f(s.str.len())
+
+
+@pytest.mark.unit
+def test_factor_scales_with_expense():
+    assert expr_cost_factor(bt.col("s").str.regexp_matches("^a")) > 50

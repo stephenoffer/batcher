@@ -24,6 +24,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from batcher._internal.hardware import available_cpu_count
 from batcher.config import active_config
 
 if TYPE_CHECKING:
@@ -31,11 +32,13 @@ if TYPE_CHECKING:
     from batcher.plan.logical import LogicalPlan
 
 __all__ = [
+    "actors_per_gpu_from_learned_vram",
     "autocast_call",
     "detect_backend",
     "gpu_aware_pool_default",
     "gpu_feedback_key",
     "gpu_vram_gb",
+    "load_gpu_peak_vram",
     "load_gpu_utilization",
     "max_actors_per_gpu",
     "recommend_gpu_fraction",
@@ -43,6 +46,7 @@ __all__ = [
     "recommend_inflight_depth",
     "recommend_num_gpus",
     "recommend_quantization",
+    "record_gpu_peak_vram",
     "record_gpu_utilization",
     "resolve_num_workers",
     "sample_gpu_utilization",
@@ -62,13 +66,11 @@ def resolve_num_workers(num_workers: int | str, num_gpus: float) -> int:
     GIL-releasing `fn` (Arrow / NumPy / torch); a GIL-bound pure-Python `fn` should pass
     ``multiprocessing=True`` to use those cores across processes. An explicit int wins.
     """
-    import os
-
     if num_workers != "auto":
         return max(1, int(num_workers))  # type: ignore[arg-type]
     if num_gpus > 0:
         return 1
-    return max(1, os.cpu_count() or 1)
+    return available_cpu_count()  # usable local cores (cgroup/affinity aware), not host count
 
 
 def gpu_aware_pool_default(
@@ -120,6 +122,9 @@ _MIN_FRACTION = 0.25
 # actor keeps in flight). A starved GPU (low measured utilization) submits deeper to
 # overlap the dispatch/gather round-trip; a saturated one keeps the shallow default.
 _INFLIGHT_DEPTH_MAX = 16
+# Above this measured peak-VRAM fraction the device has too little headroom to hold several
+# partitions in flight, so the submit-ahead depth stays shallow regardless of utilization.
+_VRAM_TIGHT = 0.8
 # Per-vendor VRAM a process reserves for its runtime context before any model loads —
 # the overhead that makes packing many tiny models less dense than naive math. MPS
 # shares unified memory (no separate context reserve); TPU/CPU have none.
@@ -200,25 +205,97 @@ def vram_context_overhead(backend: str | None = None) -> float:
     return _CONTEXT_OVERHEAD_GB.get(backend or detect_backend(), 0.4)
 
 
+@functools.cache
+def _nvml() -> Any | None:
+    """The initialized NVML module (`pynvml`) for this process, or `None`.
+
+    NVML is initialized **once** and held open for the process lifetime rather than
+    `nvmlInit`/`nvmlShutdown` around every sample: VRAM and utilization are sampled
+    per batch (the throughput autobatcher's live cap, the adaptive `num_gpus` loop),
+    so a driver init/shutdown handshake per call is pure per-batch overhead. The
+    session is refcounted and released at process exit. `None` when `pynvml` is
+    absent, NVML won't initialize, or the host exposes no devices — a stable fact for
+    a worker process, so caching the negative is correct."""
+    try:
+        import pynvml  # type: ignore[import-not-found]
+
+        pynvml.nvmlInit()
+        if pynvml.nvmlDeviceGetCount() == 0:
+            return None
+        return pynvml
+    except Exception:
+        return None
+
+
+@functools.cache
+def _nvml_handles() -> tuple[Any, ...]:
+    """Per-device NVML handles for this process (empty when NVML is unavailable).
+
+    Cached alongside the session: a handle lookup is cheap, but resolving it once keeps
+    the per-sample path a bare counter read with no repeated device enumeration."""
+    nvml = _nvml()
+    if nvml is None:
+        return ()
+    try:
+        return tuple(nvml.nvmlDeviceGetHandleByIndex(i) for i in range(nvml.nvmlDeviceGetCount()))
+    except Exception:
+        return ()
+
+
+# The env vars a scheduler pins a GPU actor's *visible* devices through, in priority order:
+# NVIDIA/HIP honor CUDA_VISIBLE_DEVICES; AMD ROCm adds HIP_ / ROCR_VISIBLE_DEVICES. The first
+# one set names this process's devices — a host is one vendor, so checking all is safe.
+_VISIBLE_DEVICE_ENVS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
+
+
+def _visible_device_indices(n_handles: int) -> tuple[int, ...]:
+    """Physical device indices this process can actually see, honoring the vendor visibility env.
+
+    Ray pins each GPU actor by setting a ``*_VISIBLE_DEVICES`` var to its assigned device(s), so
+    a sample must attribute VRAM/utilization to *those* physical devices — not to physical 0 or
+    to a node-wide mean that a co-located actor's idle or busy device would distort. Returns every
+    in-range physical index named by the first env var set (a multi-GPU actor sees several), or
+    **all** devices when none is set/parseable (an unpinned driver or monitor — the safe historical
+    behavior). A UUID-form entry that can't be indexed by ordinal is skipped.
+    """
+    import os
+
+    for env in _VISIBLE_DEVICE_ENVS:
+        raw = os.environ.get(env, "").strip()
+        if not raw:
+            continue
+        toks = (t.strip() for t in raw.split(","))
+        idxs = tuple(int(t) for t in toks if t.isdigit() and int(t) < n_handles)
+        if idxs:
+            return idxs
+    return tuple(range(n_handles))
+
+
+def _vram_handle() -> Any | None:
+    """The NVML handle for this process's *visible* GPU 0, honoring ``CUDA_VISIBLE_DEVICES``.
+
+    Falls back to physical device 0 when the pin resolves to nothing in range, so a bad env
+    never breaks the sample — it only reverts to the old behavior. `None` when NVML exposes
+    no devices.
+    """
+    handles = _nvml_handles()
+    if not handles:
+        return None
+    return handles[_visible_device_indices(len(handles))[0]]
+
+
 def gpu_vram_gb() -> float | None:
     """Total VRAM (GB) of accelerator 0, or `None` when it can't be determined.
 
     Used to VRAM-pack inference actors. Tries the vendor SMI (NVML) first, then torch's
     device properties (covers CUDA/ROCm/XPU); returns `None` on a host with no
     accelerator (e.g. a GPU-less driver), where packing is simply skipped."""
-    try:  # NVML reports total memory without allocating a CUDA context
-        import pynvml  # type: ignore[import-not-found]
-
-        pynvml.nvmlInit()
+    handle = _vram_handle()  # this process's visible device, not physical 0
+    if handle is not None:  # NVML reports total memory without allocating a CUDA context
         try:
-            if pynvml.nvmlDeviceGetCount() == 0:
-                return None
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            return pynvml.nvmlDeviceGetMemoryInfo(handle).total / (1 << 30)
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception:
-        pass
+            return _nvml().nvmlDeviceGetMemoryInfo(handle).total / (1 << 30)
+        except Exception:
+            pass
     try:
         import torch
 
@@ -241,19 +318,13 @@ def sample_gpu_vram_fraction() -> float | None:
     batch *before* an out-of-memory rather than catching one after the fact. Tries the
     vendor SMI (NVML — counts every process on the device) then torch's reserved
     memory; returns `None` on a GPU-less host, where the guard is simply inert."""
-    try:
-        import pynvml  # type: ignore[import-not-found]
-
-        pynvml.nvmlInit()
+    handle = _vram_handle()
+    if handle is not None:
         try:
-            if pynvml.nvmlDeviceGetCount() == 0:
-                return None
-            info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0))
+            info = _nvml().nvmlDeviceGetMemoryInfo(handle)
             return info.used / info.total if info.total else None
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception:
-        pass
+        except Exception:
+            pass
     try:
         import torch
 
@@ -325,22 +396,20 @@ def sample_gpu_utilization(backend: str | None = None) -> float | None:
 
 
 def _nvml_utilization() -> float | None:
-    """Mean NVIDIA GPU utilization via NVML (`pynvml`); `None` on any failure."""
-    try:
-        import pynvml  # type: ignore[import-not-found]
+    """Mean NVIDIA GPU utilization via NVML (`pynvml`); `None` on any failure.
 
-        pynvml.nvmlInit()
-        try:
-            count = pynvml.nvmlDeviceGetCount()
-            if count == 0:
-                return None
-            total = sum(
-                pynvml.nvmlDeviceGetUtilizationRates(pynvml.nvmlDeviceGetHandleByIndex(i)).gpu
-                for i in range(count)
-            )
-            return max(0.0, min(1.0, total / count / 100.0))
-        finally:
-            pynvml.nvmlShutdown()
+    Reads through the process-wide cached NVML session (`_nvml`) instead of an
+    init/shutdown per sample — the adaptive `num_gpus` loop polls this repeatedly."""
+    handles = _nvml_handles()
+    if not handles:
+        return None
+    try:
+        nvml = _nvml()
+        # Average only over the devices this process can see (a pinned actor's own GPU[s]),
+        # not every physical device — a co-located idle GPU must not dilute a busy one.
+        visible = [handles[i] for i in _visible_device_indices(len(handles))]
+        total = sum(nvml.nvmlDeviceGetUtilizationRates(h).gpu for h in visible)
+        return max(0.0, min(1.0, total / len(visible) / 100.0))
     except Exception:
         return None
 
@@ -355,8 +424,11 @@ def _rocm_utilization() -> float | None:
             handles = amdsmi.amdsmi_get_processor_handles()
             if not handles:
                 return None
-            total = sum(amdsmi.amdsmi_get_gpu_activity(h)["gfx_activity"] for h in handles)
-            return max(0.0, min(1.0, total / len(handles) / 100.0))
+            # Average only the devices this actor can see (HIP_/ROCR_/CUDA_VISIBLE_DEVICES),
+            # not every physical GPU — a co-located idle device must not dilute a busy one.
+            visible = [handles[i] for i in _visible_device_indices(len(handles))]
+            total = sum(amdsmi.amdsmi_get_gpu_activity(h)["gfx_activity"] for h in visible)
+            return max(0.0, min(1.0, total / len(visible) / 100.0))
         finally:
             amdsmi.amdsmi_shut_down()
     except Exception:
@@ -474,7 +546,9 @@ def recommend_num_gpus(util_fraction: float | None, requested: float) -> float:
     return requested
 
 
-def recommend_inflight_depth(util_fraction: float | None, default: int) -> int:
+def recommend_inflight_depth(
+    util_fraction: float | None, default: int, peak_vram_fraction: float | None = None
+) -> int:
     """Adapt an inference actor's per-actor submit-ahead depth from measured utilization.
 
     A shallow pipeline leaves a GPU idle across the dispatch/gather round-trip; submitting
@@ -486,9 +560,17 @@ def recommend_inflight_depth(util_fraction: float | None, default: int) -> int:
     * util ``< _PACK_BELOW`` (starved) → ``default * 4``, capped at `_INFLIGHT_DEPTH_MAX`.
     * otherwise (partly fed) → ``default * 2``, capped.
 
+    `peak_vram_fraction` is the learned peak VRAM the pipeline used. A VRAM-tight pipeline
+    (``>= _VRAM_TIGHT``) keeps the shallow `default` regardless of utilization: each in-flight
+    partition holds its own activations/output, so submitting several ahead into a near-full
+    device would OOM. Safety-only — this can lower the depth but never raises it above what
+    utilization alone would grant.
+
     Always at least `default` (never shrinks below the configured floor).
     """
     base = max(1, default)
+    if peak_vram_fraction is not None and peak_vram_fraction >= _VRAM_TIGHT:
+        return base  # too little VRAM headroom to hold several partitions in flight
     if util_fraction is None or util_fraction >= _SATURATED_ABOVE:
         return base
     factor = 4 if util_fraction < _PACK_BELOW else 2
@@ -545,6 +627,55 @@ def record_gpu_utilization(hub: MetadataHub | None, key: str, util_fraction: flo
         hub.save_params(_NAMESPACE, stats)
     except Exception:  # pragma: no cover - feedback must never break execution
         pass
+
+
+_VRAM_NAMESPACE = "ml.gpu.peak_vram"
+
+
+def load_gpu_peak_vram(hub: MetadataHub | None, key: str) -> float | None:
+    """The smoothed peak-VRAM *fraction* (0..1) an actor of pipeline `key` used, or `None`.
+
+    The memory twin of `load_gpu_utilization`: where utilization sizes `num_gpus`, the peak
+    VRAM sizes how many inference actors safely pack onto one device (`actors_per_gpu_from_
+    learned_vram`) from what a prior run actually consumed, rather than the declared model size."""
+    if hub is None:
+        return None
+    try:
+        return hub.load_params(_VRAM_NAMESPACE).get(key)
+    except Exception:  # pragma: no cover - a learned read must never break execution
+        return None
+
+
+def record_gpu_peak_vram(hub: MetadataHub | None, key: str, vram_fraction: float | None) -> None:
+    """Record a measured peak-VRAM fraction for `key`, exp-smoothed across runs. Best-effort."""
+    if hub is None or vram_fraction is None:
+        return
+    try:
+        stats = hub.load_params(_VRAM_NAMESPACE)
+        alpha = active_config().optimizer.learning_smoothing_alpha
+        prior = stats.get(key)
+        stats[key] = (
+            float(vram_fraction)
+            if prior is None
+            else alpha * float(vram_fraction) + (1.0 - alpha) * float(prior)
+        )
+        hub.save_params(_VRAM_NAMESPACE, stats)
+    except Exception:  # pragma: no cover - feedback must never break execution
+        pass
+
+
+def actors_per_gpu_from_learned_vram(
+    peak_vram_fraction: float | None, *, headroom: float = 0.2
+) -> int | None:
+    """Inference actors that fit on one GPU from the *measured* peak-VRAM fraction one used.
+
+    The learned counterpart to the declared-size `max_actors_per_gpu`: if a prior run's actor
+    peaked at 30% of VRAM, ~2 fit within a `headroom`-reduced budget. At least 1; `None` (no
+    measurement) leaves the caller on its declared-size estimate. Pure — it only sizes packing."""
+    if peak_vram_fraction is None or peak_vram_fraction <= 0.0:
+        return None
+    usable = max(0.0, 1.0 - headroom)
+    return max(1, int(usable / peak_vram_fraction))
 
 
 # --- Auto mixed-precision (the tensor-core ~2x hardware lever) ---------------------------

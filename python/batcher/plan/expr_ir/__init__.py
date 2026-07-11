@@ -6,8 +6,7 @@ via `to_ir()` to the exact JSON document the Rust `bc-expr` crate deserializes â
 the same IR consumed by both the interpreter and (later) the JIT. The wire tags
 here (`e`, `op`, literal kind) are a contract with the engine; keep them in sync.
 
-This package re-exports the full expression surface from its submodules: ``core``,
-``namespaces`` (the `.str`/`.dt`/`.list`/â€¦ accessors), ``walk``, ``constructors``.
+Re-exports the full surface: ``core``, ``namespaces``, ``walk``, ``constructors``.
 """
 
 from __future__ import annotations
@@ -19,11 +18,10 @@ from batcher.plan.expr_ir.constructors import (
     col,
     count,
     greatest,
+    hash_rows,
     least,
     lit,
-    mean_horizontal,
     nullif,
-    sum_horizontal,
     when,
 )
 from batcher.plan.expr_ir.core import (
@@ -50,6 +48,7 @@ from batcher.plan.expr_ir.namespaces import (
     ListContains,
     ListFunc,
     ListGet,
+    ListSimhash,
     ListSlice,
     StrFunc,
     StructField,
@@ -68,6 +67,7 @@ from batcher.plan.expr_ir.nodes import (
     Least,
     ListJoin,
     NullIf,
+    WindowExpr,
 )
 from batcher.plan.expr_ir.walk import referenced_columns, remap_columns
 
@@ -94,6 +94,7 @@ __all__ = [
     "ListFunc",
     "ListGet",
     "ListJoin",
+    "ListSimhash",
     "ListSlice",
     "Lit",
     "Math2Expr",
@@ -102,18 +103,18 @@ __all__ = [
     "NullIf",
     "StrFunc",
     "StructField",
+    "WindowExpr",
     "array",
     "atan2",
     "coalesce",
     "col",
     "count",
     "greatest",
+    "hash_rows",
     "least",
     "lit",
-    "mean_horizontal",
     "nullif",
     "referenced_columns",
     "remap_columns",
-    "sum_horizontal",
     "when",
 ]

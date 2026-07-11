@@ -98,6 +98,43 @@ decode=True, size=(h, w))` re-types that flat result into a fixed-shape `(h, w, 
 tensor column so the shape travels with the data (see below); the bare expression
 leaves it flat for when you reshape it yourself in a downstream `map_batches`.
 
+`.image.resize(width, height)` is the other half of the pair. It decodes, resizes, and
+**re-encodes to PNG bytes**, so the column stays a compact `binary` blob instead of
+becoming a tensor. Reach for `resize` when you want to shrink payloads before a
+shuffle, a spill, or a write; reach for `to_tensor` when the next stage is a model.
+
+```python
+resized = ds.with_columns(small=col("bytes").image.resize(4, 4)).collect()
+thumbnail = resized.column("small")[0].as_py()
+print(resized.schema.field("small").type, thumbnail[:4] == b"\x89PNG")
+# binary True
+```
+
+The audio counterpart is `.audio.to_waveform()`, which decodes an encoded clip and
+averages its channels down to a single mono PCM signal — a `list<float>` per row, the
+shape most audio models take as input. (`.video.decode()` is the video equivalent.)
+
+```python
+import math
+import struct
+import wave
+
+buf = io.BytesIO()
+with wave.open(buf, "wb") as clip_writer:
+    clip_writer.setnchannels(2)
+    clip_writer.setsampwidth(2)
+    clip_writer.setframerate(8000)
+    samples = [int(3000 * math.sin(i / 10)) for i in range(16)]
+    clip_writer.writeframes(b"".join(struct.pack("<hh", s, s) for s in samples))
+
+signal = bt.from_pydict({"clip": [buf.getvalue()]}).with_columns(
+    mono=col("clip").audio.to_waveform()
+)
+decoded_audio = signal.collect()
+print(decoded_audio.schema.field("mono").type, len(decoded_audio.column("mono")[0].as_py()))
+# list<item: float> 16
+```
+
 ## Blob-by-reference: keep large payloads out of shuffles and spills
 
 A multi-GB payload (a video, audio file, or PDF) carried inline in a column is
@@ -172,6 +209,23 @@ or `"torch"`, the per-row tensors arrive **stacked** into one leading-batch arra
 `(batch, H, W, 3)` block — which is exactly the shape a vision model's forward pass
 wants. No manual stacking or reshaping in the UDF.
 
+Nested list columns — a row that holds several small vectors, such as per-frame
+features or a ragged batch of patches — collapse into one flat list per row with
+`.list.flatten()`, which removes a single level of nesting and keeps element order.
+Reach for it before feeding a downstream stage that wants one contiguous vector, not a
+list of lists:
+
+```python
+import batcher as bt
+from batcher import col
+
+# Each row is a list of per-frame feature vectors; flatten to one vector per row.
+frames = bt.from_pydict({"clip": [[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0]]]})
+flat = frames.select(vec=col("clip").list.flatten())
+print(flat.to_pydict())
+# {'vec': [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0]]}
+```
+
 ## End to end: references to predictions
 
 The steps compose into one lazy pipeline — fetch, decode, then a GPU model stage —
@@ -212,6 +266,55 @@ Passing the `Captioner` **class** (not an instance or a function) loads the mode
 once per GPU actor; a plain function would rebuild it on every batch. See
 [GPU scheduling](gpu.md) for sizing the actor pool.
 
+## Cleaning scraped text
+
+Scraped pages, product descriptions, and email bodies arrive as markup. `.str.strip_html()`
+recovers the prose: it drops tags *and* the contents of `<script>`/`<style>`, drops
+comments, decodes entities, and collapses whitespace, separating block elements with a
+space.
+
+```python
+import batcher as bt
+
+pages = bt.from_pydict({"page": ["<p>Tom &amp; Jerry</p><p>x</p><script>f()</script>"]})
+print(pages.select(text=bt.col("page").str.strip_html()).to_pydict())
+# {'text': ['Tom & Jerry x']}
+```
+
+Reach for this over the `regexp_replace('<[^>]*>', '')` idiom, which is wrong in three
+ways that quietly poison a corpus: it leaves the JavaScript in `<script>` as prose, it
+leaves `&amp;` and `&nbsp;` undecoded, and it welds `<p>a</p><p>b</p>` into `ab`. It is a
+text extractor, not an HTML parser — malformed markup never raises, so one bad row in a
+web scrape cannot abort the scan.
+
+## Chunking documents (RAG ingest)
+
+A document is usually longer than an embedding model's context, so the ingest chain is
+**load → split → embed → index**. `.str.chunk(size, overlap)` is the split stage: it
+slices text into fixed-size overlapping windows as a `List<Utf8>`, which `explode` turns
+into one row per chunk. Sizes are in characters, and a chunk boundary never splits a
+Unicode codepoint.
+
+```python
+import batcher as bt
+
+docs = bt.from_pydict({"id": [1, 2], "body": ["abcdef", "xyz"]})
+chunks = docs.with_columns(chunk=bt.col("body").str.chunk(4, overlap=1)).explode("chunk")
+print(chunks.select("id", "chunk").to_pydict())
+# {'id': [1, 1, 2], 'chunk': ['abcd', 'def', 'xyz']}
+```
+
+`overlap` carries context across a boundary, so a sentence cut in half still appears
+whole in one chunk. Chunks stop once one reaches the end of the text, so the last chunk
+is never a redundant suffix of its predecessor. From here, `ds.ml.embed(...)` produces
+the vectors and the section below indexes them.
+
+The whole chain — scan, chunk, explode, embed — is a linear row-wise pipeline, so it
+distributes across workers and streams over an unbounded source with no breaker. The
+one thing no static rule can know is how many chunks a document yields; Kyber estimates
+1× on the first run, Core measures the real fan-out, and the next plan sizes the
+downstream GPU stage for it (see [adaptive re-optimization](../internals/kyber.md)).
+
 ## Vector search (RAG retrieval)
 
 After embedding text or images and writing them to a Lance dataset, retrieve the
@@ -229,3 +332,56 @@ top = hits.collect()  # k rows nearest to the query, with a _distance column
 
 Vector search needs `batcher-engine[lance]`. See [embeddings](inference.md) for the
 compute side and [LLM inference](llm.md) for generation over retrieved context.
+
+When the embeddings already ride in a column — a reranking pass, or a small candidate
+set that does not warrant an index — score them against a query vector in-engine with
+the `.list` distance expressions, no Lance required. `.list.cosine_distance(q)` is
+`1 - cosine_similarity` (0 for identical direction, 1 for orthogonal, 2 for opposite) —
+the standard embedding metric; `.list.l2_distance(q)` is the Euclidean distance. Each
+takes the query as another column or an `array(...)` literal, returns a Float64, and
+sorts ascending so the nearest rows come first:
+
+```python
+import batcher as bt
+from batcher import array, col
+
+# Embeddings already in a column, and a query vector.
+docs = bt.from_pydict({"id": [1, 2, 3], "vec": [[1.0, 0.0], [0.8, 0.6], [0.0, 1.0]]})
+query = array(1.0, 0.0)
+
+ranked = docs.with_columns(dist=col("vec").list.cosine_distance(query)).sort("dist")
+out = ranked.to_pydict()
+print(out["id"], [round(d, 4) for d in out["dist"]])
+# [1, 2, 3] [0.0, 0.2, 1.0]
+```
+
+A dot product is a cheaper kernel than a full cosine, and on **unit-length** vectors
+the two rank identically: cosine similarity is the dot product divided by both
+magnitudes, and those are 1 once the vectors are normalized. So normalize once, up front
+at embedding time, with `.list.normalize()` (L2-normalize each vector to unit length),
+and retrieve with the plain `.list.dot(q)` against a likewise-normalized query.
+`.list.l2_norm()` reports a vector's Euclidean magnitude — handy to confirm a vector is
+already unit-length (norm 1) before you skip the normalization:
+
+```python
+import batcher as bt
+from batcher import array, col
+
+vecs = bt.from_pydict({"id": [1, 2, 3], "vec": [[3.0, 4.0], [0.0, 2.0], [1.0, 0.0]]})
+
+# Magnitudes before normalization ...
+print(vecs.select(n=col("vec").list.l2_norm()).to_pydict())
+# {'n': [5.0, 2.0, 1.0]}
+
+# ... normalize to unit length, then a plain dot ranks like cosine similarity.
+unit = vecs.with_columns(u=col("vec").list.normalize())
+print(unit.select("id", score=col("u").list.dot(array(1.0, 0.0))).to_pydict())
+# {'id': [1, 2, 3], 'score': [0.6, 0.0, 1.0]}
+```
+
+## Next steps
+
+- [Inference](inference.md): run a model over the decoded tensors.
+- [Preprocessors](preprocessors.md): assemble the decoded features into a training matrix.
+- [Expressions API](../api/expressions.md): the `.image`/`.audio`/`.video` and vector
+  `.list` method reference.

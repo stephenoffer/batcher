@@ -72,8 +72,11 @@ pub fn sort_merge_join_indices(
     let emit_left_unmatched = matches!(join_type, JoinType::Left | JoinType::Full | JoinType::Anti);
     let emit_right_unmatched = matches!(join_type, JoinType::Right | JoinType::Full);
 
-    let mut left_out: Vec<Option<u32>> = Vec::new();
-    let mut right_out: Vec<Option<u32>> = Vec::new();
+    // The output is at least as large as the bigger side (each matched/unmatched row emits
+    // once); pre-size to that lower bound so the common near-1:1 join skips early reallocs.
+    let out_hint = l.len().max(r.len());
+    let mut left_out: Vec<Option<u32>> = Vec::with_capacity(out_hint);
+    let mut right_out: Vec<Option<u32>> = Vec::with_capacity(out_hint);
     let mut push = |lo: Option<u32>, ro: Option<u32>| {
         left_out.push(lo);
         right_out.push(ro);

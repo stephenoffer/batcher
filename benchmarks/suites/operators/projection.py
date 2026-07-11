@@ -26,4 +26,17 @@ def filter_project(ctx: Context):
         f = t.filter(pc.greater(t["l_extendedprice"], 50000))
         return pa.table({"l_orderkey": f["l_orderkey"], "p2": pc.multiply(f["l_extendedprice"], 2)})
 
-    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow)
+    def ray(rd) -> pa.Table:
+        from ray.data.expressions import col
+
+        def project(b: pa.Table) -> pa.Table:
+            return pa.table(
+                {"l_orderkey": b["l_orderkey"], "p2": pc.multiply(b["l_extendedprice"], 2)}
+            )
+
+        out = rd.filter(expr=col("l_extendedprice") > 50000).map_batches(
+            project, batch_format="pyarrow"
+        )
+        return pa.Table.from_pandas(out.to_pandas(), preserve_index=False)
+
+    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)

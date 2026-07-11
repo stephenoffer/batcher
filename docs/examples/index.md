@@ -73,7 +73,7 @@ builds its own in-memory data and asserts on its output — run any of them with
 
 - **ETL** — `data_quality.py`, `lakehouse_scd.py`, `feature_engineering.py`,
   `timeseries.py`, `window_functions.py`
-- **ML** — `ml_inference.py`, `streaming_pipeline.py`
+- **ML** — `ml_inference.py`, `preprocessors.py`, `streaming_pipeline.py`
 - **Operations** — `performance_caching.py`, `spill.py`, `adaptive_optimization.py`,
   `distributed.py`
 

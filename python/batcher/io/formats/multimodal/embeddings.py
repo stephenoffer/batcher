@@ -111,11 +111,15 @@ class EmbeddingSource:
     def _build_batch(self, chunk: list[str], dim: int) -> pa.RecordBatch:
         import numpy as np
 
+        from batcher.io._concurrent import read_each_file
+
+        # Load the chunk's embedding files concurrently (each is one object-store read);
+        # the concatenation below is cheap CPU work kept serial. Order preserved.
+        loaded = read_each_file(self._fs, chunk, lambda _fs, p: self._file_vectors(p))
         uris: list[str] = []
         rows: list[int] = []
         mats: list[Any] = []
-        for path in chunk:
-            mat = self._file_vectors(path)
+        for path, mat in zip(chunk, loaded, strict=True):
             if mat.shape[1] != dim:
                 raise FormatError(
                     f"embedding dim mismatch in {path!r}: got {mat.shape[1]}, expected {dim}"

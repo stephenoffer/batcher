@@ -87,24 +87,52 @@ impl SimdCodegen<'_, '_> {
                 // asserts wider vector alignment for these accesses.
                 let ty = self.cols.ty[name];
                 let base = self.col_ptrs[self.cols.index(name)];
-                let off = self.b.ins().imul_imm(self.i, 8);
-                let addr = self.b.ins().iadd(base, off);
                 let flags = MemFlags::new().with_notrap();
                 match ty {
-                    ScalarTy::I64 => (
-                        self.b
-                            .ins()
-                            .load(vec_ty(ScalarTy::I64, self.lanes), flags, addr, 0),
-                        ScalarTy::I64,
-                    ),
-                    ScalarTy::F64 => (
-                        self.b
-                            .ins()
-                            .load(vec_ty(ScalarTy::F64, self.lanes), flags, addr, 0),
-                        ScalarTy::F64,
-                    ),
-                    // `simd_ty` admits only I64/F64 columns (temporal is excluded).
-                    _ => unreachable!("simd_ty excludes non-numeric columns"),
+                    ScalarTy::I64 => {
+                        let off = self.b.ins().imul_imm(self.i, 8);
+                        let addr = self.b.ins().iadd(base, off);
+                        (
+                            self.b
+                                .ins()
+                                .load(vec_ty(ScalarTy::I64, self.lanes), flags, addr, 0),
+                            ScalarTy::I64,
+                        )
+                    }
+                    ScalarTy::F64 => {
+                        let off = self.b.ins().imul_imm(self.i, 8);
+                        let addr = self.b.ins().iadd(base, off);
+                        (
+                            self.b
+                                .ins()
+                                .load(vec_ty(ScalarTy::F64, self.lanes), flags, addr, 0),
+                            ScalarTy::F64,
+                        )
+                    }
+                    // tz-naive Timestamp-µs is an i64 instant buffer — a plain I64xL
+                    // load, carried as an integer lane for the comparison.
+                    ScalarTy::TsUs => {
+                        let off = self.b.ins().imul_imm(self.i, 8);
+                        let addr = self.b.ins().iadd(base, off);
+                        (
+                            self.b
+                                .ins()
+                                .load(vec_ty(ScalarTy::I64, self.lanes), flags, addr, 0),
+                            ScalarTy::TsUs,
+                        )
+                    }
+                    // Date32 is an i32 day-count buffer (4-byte stride). `sload32x2`
+                    // loads 2 lanes and sign-extends each to i64 — bit-identical to the
+                    // scalar path's `load i32 + sextend`. The dispatch pins a Date32
+                    // predicate to `lanes == 2`, so this I64X2 matches the other lanes.
+                    ScalarTy::Date32 => {
+                        debug_assert_eq!(self.lanes, 2, "Date32 SIMD is pinned to 2 lanes");
+                        let off = self.b.ins().imul_imm(self.i, 4);
+                        let addr = self.b.ins().iadd(base, off);
+                        (self.b.ins().sload32x2(flags, addr, 0), ScalarTy::Date32)
+                    }
+                    // `simd_ty` admits only I64/F64/Date32/TsUs columns.
+                    ScalarTy::Bool => unreachable!("a bare boolean column is not a simd_ty leaf"),
                 }
             }
             Expr::Lit { value } => match value {
@@ -122,7 +150,24 @@ impl SimdCodegen<'_, '_> {
                         ScalarTy::F64,
                     )
                 }
-                _ => unreachable!("simd_ty admits only Int/Float literals"),
+                // A date literal is its i32 day count, a timestamp literal its i64 µs
+                // instant — each splat to an i64 lane to compare against the matching
+                // temporal column (loaded as sign-extended / native i64).
+                Literal::Date(d) => {
+                    let s = self.b.ins().iconst(types::I64, *d as i64);
+                    (
+                        self.b.ins().splat(vec_ty(ScalarTy::I64, self.lanes), s),
+                        ScalarTy::Date32,
+                    )
+                }
+                Literal::Timestamp(t) => {
+                    let s = self.b.ins().iconst(types::I64, *t);
+                    (
+                        self.b.ins().splat(vec_ty(ScalarTy::I64, self.lanes), s),
+                        ScalarTy::TsUs,
+                    )
+                }
+                _ => unreachable!("simd_ty admits only Int/Float/Date/Timestamp literals"),
             },
             Expr::Not { input } => {
                 // Boolean NOT on a canonical mask: bitwise-not flips all-ones <->
@@ -151,6 +196,23 @@ impl SimdCodegen<'_, '_> {
                     _ => unreachable!("validated in simd_ty"),
                 }
             }
+            // `And`/`Or` of two boolean canonical masks: a bitwise `band`/`bor` keeps
+            // the mask canonical (all-ones / all-zeros). Correct for a null-free batch;
+            // the dispatch guarantees a batch with nulls falls back to the interpreter.
+            Expr::Binary {
+                op: op @ (BinaryOp::And | BinaryOp::Or),
+                left,
+                right,
+            } => {
+                let (lv, _) = self.emit_typed(left);
+                let (rv, _) = self.emit_typed(right);
+                let v = match op {
+                    BinaryOp::And => self.b.ins().band(lv, rv),
+                    BinaryOp::Or => self.b.ins().bor(lv, rv),
+                    _ => unreachable!("matched And/Or"),
+                };
+                (v, ScalarTy::Bool)
+            }
             Expr::Binary { op, left, right } => {
                 let (mut lv, lt) = self.emit_typed(left);
                 let (mut rv, rt) = self.emit_typed(right);
@@ -163,6 +225,12 @@ impl SimdCodegen<'_, '_> {
                         | BinaryOp::Gt
                         | BinaryOp::Ge
                 );
+                // A temporal comparison (date / timestamp) runs on the i64 lanes the
+                // operands were loaded into — an integer compare, never a float promote.
+                let is_temporal = |t: ScalarTy| matches!(t, ScalarTy::Date32 | ScalarTy::TsUs);
+                if is_cmp && (is_temporal(lt) || is_temporal(rt)) {
+                    return (self.emit_cmp(*op, lv, rv, false), ScalarTy::Bool);
+                }
                 // Promote to f64 lanes if either side is f64 (matches Arrow).
                 let promote_f64 = lt == ScalarTy::F64 || rt == ScalarTy::F64;
                 if promote_f64 {

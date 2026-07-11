@@ -24,6 +24,7 @@ from batcher.dist.executors.ray_runtime import (
     _ensure_ray,
     _rmtree,
     engine_config_json,
+    record_worker_metrics,
     shuffle_partitions,
 )
 from batcher.dist.shuffle_io import distributed_work_dir, read_ipc
@@ -36,7 +37,11 @@ _SAMPLE_PROBS = [i / 32 for i in range(33)]
 
 
 def _distributed_sort(
-    above: list[LogicalPlan], sort: Sort, sources: list[Source], workers: int
+    above: list[LogicalPlan],
+    sort: Sort,
+    sources: list[Source],
+    workers: int,
+    hub=None,
 ) -> pa.Table:
     """Sample boundaries, range-partition each split, sort each range in parallel,
     then concatenate the ranges in leading-key order — globally sorted, no merge."""
@@ -99,9 +104,11 @@ def _distributed_sort(
                 cfg_json,
             )
 
-        map_paths = gather_with_backups(
+        map_results = gather_with_backups(
             [_range_for(w) for w in range(len(partitions))], _range_for, pol
         )
+        map_paths = [paths for paths, _metrics in map_results]
+        record_worker_metrics(hub, (m for _paths, m in map_results))
 
         # REDUCE: each bucket gathers its shard from every mapper, sorts the range.
         def _reduce_for(r: int):
@@ -109,9 +116,14 @@ def _distributed_sort(
                 sort_ir, [paths[r] for paths in map_paths], work_dir, r, cfg_json
             )
 
-        sorted_paths = gather_with_backups(
+        reduce_results = gather_with_backups(
             [_reduce_for(r) for r in range(n_buckets)], _reduce_for, pol
         )
+        sorted_paths = [path for path, _metrics in reduce_results]
+        # The reduce task *is* the sort breaker: its `peak_bytes` is the only measurement
+        # of what a distributed sort actually costs in memory, and the memory model that
+        # decides spilling is fit from exactly these rows.
+        record_worker_metrics(hub, (m for _path, m in reduce_results))
 
         # Concatenate the ranges in leading-key order (reversed for a descending
         # sort) — each bucket is globally ordered relative to the others, no merge.
@@ -159,11 +171,11 @@ def _range_task(
 ):
     import os as _os
 
-    import batcher._native as nat
     from batcher.dist.executors.partition_io import bucketize, read_partition
+    from batcher.dist.executors.ray_runtime import execute_metered
     from batcher.dist.shuffle_io import write_ipc
 
-    rows = nat.execute_plan(map_ir, [read_partition(part_path)], engine_config)
+    rows, metrics_json = execute_metered(map_ir, [read_partition(part_path)], engine_config)
     schema = rows[0].schema if rows else pa.schema([])
     buckets = bucketize(rows, key_name, boundaries, n_buckets, nulls_first, desc)
     paths = []
@@ -175,13 +187,13 @@ def _range_task(
         batches = buckets[r] or [pa.RecordBatch.from_pylist([], schema=schema)]
         write_ipc(batches, path)
         paths.append(path)
-    return paths
+    return paths, metrics_json
 
 
 def _sort_reduce_task(sort_ir, input_paths, work_dir, reducer_id, engine_config):
     import os as _os
 
-    import batcher._native as nat
+    from batcher.dist.executors.ray_runtime import execute_metered
     from batcher.dist.shuffle_io import write_ipc
 
     rows: list = []
@@ -189,10 +201,10 @@ def _sort_reduce_task(sort_ir, input_paths, work_dir, reducer_id, engine_config)
         rows.extend(read_ipc(p))
     rows = [b for b in rows if b.num_rows > 0]
     if not rows:
-        return None
-    out = nat.execute_plan(sort_ir, [rows], engine_config)
+        return (None, "")
+    out, metrics_json = execute_metered(sort_ir, [rows], engine_config)
     if not out:
-        return None
+        return (None, metrics_json)
     path = _os.path.join(work_dir, f"sorted_{reducer_id}.arrow")
     write_ipc(out, path)
-    return path
+    return (path, metrics_json)

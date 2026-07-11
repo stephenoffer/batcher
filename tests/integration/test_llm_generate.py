@@ -105,7 +105,7 @@ def test_http_engine_sends_prompts_concurrently_in_order(monkeypatch):
 
 
 def test_group_indices_by_adapter():
-    from batcher.ml.llm import _group_indices_by_adapter
+    from batcher.ml.llm.engines import _group_indices_by_adapter
 
     prompts = [
         {"prompt": "a", "adapter": "x"},
@@ -117,7 +117,7 @@ def test_group_indices_by_adapter():
 
 
 def test_build_requests_carries_adapter_tag():
-    from batcher.ml.llm import _build_requests
+    from batcher.ml.llm.generate import _build_requests
 
     batch = pa.RecordBatch.from_pydict({"q": ["a", "b"], "ad": ["lora1", None]})
     reqs = _build_requests(None, "q", None, "ad", batch)
@@ -125,7 +125,7 @@ def test_build_requests_carries_adapter_tag():
 
 
 def test_generate_routed_groups_by_adapter_preserves_order():
-    from batcher.ml.llm import _generate_routed
+    from batcher.ml.llm.engines import _generate_routed
 
     class _Out:
         def __init__(self, text, pt, ct):

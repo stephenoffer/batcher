@@ -1,0 +1,290 @@
+"""Typed columns out of an LLM — the AI-powered-ETL primitives.
+
+`llm_generate` gives you a *string*. That string is not a column an analyst can filter,
+join, or aggregate; turning it into one is the whole job of an AI-powered ETL step, and
+it is where these pipelines break.
+
+Two failure modes this module exists to remove:
+
+* **Schema drift.** `parse_json=True` infers the struct type from whatever the model
+  happened to emit *in that batch*. Ask for ``{label, score}`` and the model omits
+  ``score`` on one batch, and the two batches carry incompatible struct types — the scan
+  fails at concat time, after the GPU work is paid for. `extract` takes a **declared**
+  schema, so every batch produces the same Arrow types no matter what the model says.
+* **Unconstrained labels.** A classifier that answers ``"Positive."`` where you expected
+  ``"positive"`` yields a category column with a long tail of near-duplicates. `classify`
+  matches the output against the declared label set and nulls anything else, so the
+  column has exactly the domain you asked for and bad rows are countable.
+
+Both degrade per row, never per batch: an unparseable output or an off-menu label becomes
+a null, so one bad generation cannot abort a scan over millions of rows.
+
+Pair `extract` with ``vllm_engine(guided_json=json_schema(schema))`` — guided decoding
+makes the output well-formed, and the declared schema makes it *typed*.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING
+
+from batcher._internal.errors import PlanError
+from batcher.plan.types import CAST_DTYPES, DTYPE_REGISTRY
+
+if TYPE_CHECKING:
+    import pyarrow as pa
+
+    from batcher.ml.llm.engines import Engine, EngineFactory
+
+__all__ = ["json_schema", "llm_classify_udf", "llm_extract_udf"]
+
+# The JSON Schema type each Batcher dtype maps to, for guided decoding.
+_JSON_TYPES: dict[str, str] = {
+    "int64": "integer",
+    "int32": "integer",
+    "float64": "number",
+    "float32": "number",
+    "bool": "boolean",
+    "string": "string",
+}
+
+_EXTRACT_INSTRUCTION = (
+    "Respond with a single JSON object and nothing else. "
+    "It must have exactly these keys: {keys}. "
+    "Use null for any value you cannot determine."
+)
+
+
+def _resolve_schema(schema: dict[str, str]) -> dict[str, pa.DataType]:
+    """Validate the declared dtypes and resolve them to Arrow types."""
+    if not schema:
+        raise PlanError("extract(): schema must declare at least one field")
+    unknown = {d for d in schema.values() if d not in CAST_DTYPES}
+    if unknown:
+        raise PlanError(
+            f"extract(): unknown dtype(s) {sorted(unknown)}; use one of {sorted(CAST_DTYPES)}"
+        )
+    return {name: DTYPE_REGISTRY[dtype] for name, dtype in schema.items()}
+
+
+def json_schema(schema: dict[str, str]) -> dict:
+    """A JSON Schema for `schema`, to hand to ``vllm_engine(guided_json=...)``.
+
+    Guided decoding constrains the model to emit exactly this shape, so every row parses.
+    `extract` still types the result independently — this only removes the parse failures.
+
+    Args:
+        schema: Column name → Batcher dtype (``"string"``, ``"int64"``, ``"float64"``,
+            ``"bool"``, …), the same mapping `extract` takes.
+
+    Returns:
+        A JSON Schema ``object`` with one property per field.
+
+    Raises:
+        PlanError: If a dtype is unknown or has no JSON Schema analogue.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml import json_schema
+            >>> json_schema({"sentiment": "string", "score": "float64"})["properties"]
+            {'sentiment': {'type': 'string'}, 'score': {'type': 'number'}}
+    """
+    _resolve_schema(schema)
+    properties = {}
+    for name, dtype in schema.items():
+        canonical = DTYPE_REGISTRY[dtype]
+        json_type = next(
+            (j for d, j in _JSON_TYPES.items() if DTYPE_REGISTRY[d] == canonical), None
+        )
+        if json_type is None:
+            raise PlanError(f"json_schema(): dtype {dtype!r} has no JSON Schema equivalent")
+        properties[name] = {"type": json_type}
+    return {"type": "object", "properties": properties, "required": list(schema)}
+
+
+def _coerce(value: object, arrow_type: pa.DataType) -> object | None:
+    """Coerce one parsed JSON value to `arrow_type`, or null if it cannot be.
+
+    A model that returns ``"42"`` for an integer field, or ``"yes"`` for a boolean, is
+    doing what models do; a per-value coercion recovers the row instead of losing it.
+    """
+    import pyarrow as pa
+
+    if value is None:
+        return None
+    try:
+        if pa.types.is_boolean(arrow_type):
+            if isinstance(value, bool):
+                return value
+            return {"true": True, "yes": True, "false": False, "no": False}.get(
+                str(value).strip().lower()
+            )
+        if pa.types.is_integer(arrow_type):
+            return int(float(value)) if not isinstance(value, bool) else None
+        if pa.types.is_floating(arrow_type):
+            return float(value) if not isinstance(value, bool) else None
+        if pa.types.is_string(arrow_type):
+            return value if isinstance(value, str) else json.dumps(value)
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _extract_batch(
+    engine: Engine,
+    batch: pa.RecordBatch,
+    *,
+    fields: dict[str, pa.DataType],
+    prompt_column: str | None,
+    template: str | None,
+    instruct: bool,
+) -> pa.RecordBatch:
+    """One batch through the engine, appending one typed column per declared field."""
+    import pyarrow as pa
+
+    from batcher.ml.llm.generate import _build_requests
+
+    requests = _build_requests(template, prompt_column, None, None, batch)
+    if instruct:
+        suffix = "\n\n" + _EXTRACT_INSTRUCTION.format(keys=", ".join(fields))
+        requests = [r + suffix if isinstance(r, str) else r for r in requests]
+
+    parsed: list[dict] = []
+    for out in engine(requests):
+        try:
+            obj = json.loads(out)
+        except (TypeError, ValueError):
+            obj = None
+        parsed.append(obj if isinstance(obj, dict) else {})
+
+    arrays = [batch.column(i) for i in range(batch.num_columns)]
+    names = list(batch.schema.names)
+    for name, arrow_type in fields.items():
+        # The declared type, always — never inferred from what this batch happened to
+        # contain. That is what keeps every batch's schema identical.
+        values = [_coerce(row.get(name), arrow_type) for row in parsed]
+        arrays.append(pa.array(values, type=arrow_type))
+        names.append(name)
+    return pa.RecordBatch.from_arrays(arrays, names=names)
+
+
+def llm_extract_udf(
+    engine_factory: EngineFactory,
+    *,
+    schema: dict[str, str],
+    prompt_column: str | None = None,
+    template: str | None = None,
+    instruct: bool = True,
+) -> type:
+    """A load-once class UDF appending one **typed** column per `schema` field.
+
+    Args:
+        engine_factory: Zero-arg callable returning an `Engine`; called once per worker.
+        schema: Output column name → Batcher dtype.
+        prompt_column: The text column to send (ignored when `template` is set).
+        template: A ``str.format`` template over the row's columns.
+        instruct: Append a "reply with JSON having exactly these keys" instruction to
+            each prompt. Turn it off when the engine already constrains decoding
+            (``guided_json``) or the template says it itself.
+
+    Returns:
+        A class whose instances map a `pyarrow.RecordBatch` to the batch plus one
+        column per declared field.
+    """
+    fields = _resolve_schema(schema)
+
+    class _LlmExtract:
+        """Holds one engine for the worker's lifetime; called once per batch."""
+
+        def __init__(self) -> None:
+            self._engine = engine_factory()
+
+        def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+            return _extract_batch(
+                self._engine,
+                batch,
+                fields=fields,
+                prompt_column=prompt_column,
+                template=template,
+                instruct=instruct,
+            )
+
+    return _LlmExtract
+
+
+_CLASSIFY_INSTRUCTION = "Answer with exactly one of these labels and nothing else: {labels}"
+
+
+def _match_label(output: str, lookup: dict[str, str]) -> str | None:
+    """Resolve a model's answer to a declared label, or null.
+
+    Tolerates the two things a model reliably does to a label — changes its case, and
+    wraps it in punctuation or a sentence — while refusing to guess at anything else.
+    """
+    if not isinstance(output, str):
+        return None
+    text = output.strip().strip(".\"'` \n").lower()
+    if text in lookup:
+        return lookup[text]
+    # The label may sit inside a short sentence ("The sentiment is positive.").
+    hits = {canonical for key, canonical in lookup.items() if key in text}
+    return hits.pop() if len(hits) == 1 else None
+
+
+def llm_classify_udf(
+    engine_factory: EngineFactory,
+    *,
+    labels: list[str],
+    prompt_column: str | None = None,
+    output_column: str = "label",
+    template: str | None = None,
+    instruct: bool = True,
+) -> type:
+    """A load-once class UDF appending a label column constrained to `labels`.
+
+    Any output that does not resolve to exactly one declared label becomes null, so the
+    column's domain is exactly `labels` and the failures are countable
+    (``ds.filter(col("label").is_null()).count()``).
+
+    Args:
+        engine_factory: Zero-arg callable returning an `Engine`; called once per worker.
+        labels: The permitted labels. Must be non-empty and case-insensitively distinct.
+        prompt_column: The text column to classify (ignored when `template` is set).
+        output_column: Name of the appended label column.
+        template: A ``str.format`` template over the row's columns.
+        instruct: Append the "answer with one of these labels" instruction to each prompt.
+
+    Returns:
+        A class whose instances map a `pyarrow.RecordBatch` to the batch plus the label.
+
+    Raises:
+        PlanError: If `labels` is empty or contains case-insensitive duplicates.
+    """
+    if not labels:
+        raise PlanError("classify(): labels must be non-empty")
+    lookup = {label.strip().lower(): label for label in labels}
+    if len(lookup) != len(labels):
+        raise PlanError(f"classify(): labels must be distinct ignoring case, got {labels}")
+
+    class _LlmClassify:
+        """Holds one engine for the worker's lifetime; called once per batch."""
+
+        def __init__(self) -> None:
+            self._engine = engine_factory()
+
+        def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+            import pyarrow as pa
+
+            from batcher.ml.llm.generate import _build_requests
+
+            requests = _build_requests(template, prompt_column, None, None, batch)
+            if instruct:
+                suffix = "\n\n" + _CLASSIFY_INSTRUCTION.format(labels=", ".join(labels))
+                requests = [r + suffix if isinstance(r, str) else r for r in requests]
+            resolved = [_match_label(o, lookup) for o in self._engine(requests)]
+            arrays = [batch.column(i) for i in range(batch.num_columns)]
+            arrays.append(pa.array(resolved, type=pa.string()))
+            return pa.RecordBatch.from_arrays(arrays, names=[*batch.schema.names, output_column])
+
+    return _LlmClassify

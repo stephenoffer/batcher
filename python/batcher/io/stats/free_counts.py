@@ -42,14 +42,18 @@ def numpy_statistics(fs: Any, files: list[str]) -> SourceStatistics | None:
     Returns None if any file's header is unreadable (so the count is not falsely
     reported as exact). ``.npz`` files yield None and are skipped by the caller.
     """
-    total = 0
-    for path in files:
-        try:
-            with fs.open(path) as fh:
-                rows = npy_header_rows(fh)
-        except Exception:
-            return None
-        if rows is None:
-            return None
-        total += rows
-    return SourceStatistics(row_count=total, exact_rows=True)
+    if not files:
+        return None
+    from batcher.io._concurrent import read_each_file
+
+    def _rows(filesystem: Any, path: str) -> int | None:
+        with filesystem.open(path) as fh:
+            return npy_header_rows(fh)
+
+    try:
+        counts = read_each_file(fs, files, _rows)  # concurrent header reads, in order
+    except Exception:
+        return None
+    if any(c is None for c in counts):  # an unparseable header → not an exact count
+        return None
+    return SourceStatistics(row_count=sum(counts), exact_rows=True)

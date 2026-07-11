@@ -119,8 +119,10 @@ For data-parallel training across ranks, `ds.ml.stream_loader` gives each rank a
 order. It is the streaming-ingest path for PyTorch DDP/FSDP/DeepSpeed, and it holds the
 guarantees a distributed loop needs:
 
-- **balanced** — with `drop_last=True` every rank yields the same number of batches, so
-  no rank finishes early and stalls the others at the all-reduce barrier;
+- **balanced** — every rank yields the same number of batches, so no rank finishes early
+  and stalls the others at the all-reduce barrier. `drop_last=True` (the default) trims
+  the epoch's tail to a multiple of `world_size`; `drop_last=False` keeps every sample
+  and pads instead, repeating a few — never handing the ranks unequal counts;
 - **deterministic / elastic** — the same `(seed, epoch)` produces the same global order
   *regardless of `world_size`*, so a job can resume on a differently-sized cluster;
 - **resumable** — pass `global_consumed` (the sample count already processed this epoch,
@@ -157,6 +159,80 @@ sample-order contract. For an unbounded or streaming source with no global lengt
 
 At the top of each epoch, bump `epoch` so the shuffle reseeds; on restart, pass the
 checkpointed `global_consumed` so the rank picks up exactly where it stopped.
+
+### Shuffling at PB / exabyte scale
+
+The global order is **computed, never materialized**. A shuffled list of every sample
+index costs ~28 bytes per sample in CPython, so the index order alone would need 280 GB
+of driver RAM for a 10-billion-sample corpus — before a single row is read. Instead
+`epoch_permutation` is a keyed pseudorandom bijection on `[0, n)`: index in, shuffled
+index out, no state.
+
+| Corpus samples | Shuffled index list | Batcher (computed) |
+| --- | --- | --- |
+| 10 M | 280 MB | 0.5 MB |
+| 1 B | 28 GB | 0.8 MB |
+| 10 B | 280 GB | 0.8 MB |
+| 1 T | 28 TB | 0.8 MB |
+
+Because the order is a function rather than a table, resuming is also O(1): seeking to
+sample 900,000,000,000 of a trillion-sample epoch is a modular-arithmetic step, not a
+walk. Indices are generated in vectorized batches at ~11 M/s, so ordering never gates a
+training step.
+
+`shard_stream_loader` — the larger-than-RAM path — draws its indices from
+`rank_index_batches`, which holds one batch of indices at a time. `stream_loader`
+materializes the dataset anyway (`collect()`), so it keeps the simpler list path.
+
+```python
+from batcher.ml import rank_index_batches
+
+# Rank 3 of 1024, over a trillion-sample corpus, in constant memory.
+for indices in rank_index_batches(10**12, batch_size=8192, world_size=1024, rank=3, seed=1):
+    ...  # fetch these rows; each rank sees a disjoint, balanced, reproducible slice
+    break
+```
+
+### How this compares
+
+| System | Global shuffle | Mid-epoch resume | Balanced ranks | Elastic world size |
+| --- | --- | --- | --- | --- |
+| `DistributedSampler` | in-RAM index list (O(n) per rank) | no | yes (pads) | no |
+| WebDataset | shard order + local buffer (approximate) | no | `ddp_equalize` heuristic | no |
+| MosaicML Streaming | shard/block shuffle, bounded | yes (`state_dict`) | yes | yes |
+| Ray Data `streaming_split` | local buffer only | no | not guaranteed | n/a |
+| **Batcher** | **exact, O(1) memory** | **yes (`state_dict`)** | **yes (drop or pad)** | **yes** |
+
+The distinction worth being precise about: WebDataset and MosaicML shuffle *approximately*
+— a shard permutation plus a local buffer, so two samples in the same shard stay
+correlated. Batcher's is an exact permutation of the whole corpus, and it costs less
+memory than either, because it is never stored.
+
+### Checkpointing the position
+
+`ResumableSampler` owns the `(epoch, global_consumed)` pair for you, with the
+`state_dict` / `load_state_dict` protocol a checkpoint already speaks — so the training
+loop never computes a sample offset by hand.
+
+```python
+from itertools import islice
+from batcher.ml import ResumableSampler
+
+sampler = ResumableSampler(1000, world_size=2, rank=0, seed=42)
+seen = list(islice(sampler, 3))          # train three steps
+state = sampler.state_dict()             # checkpoint between steps
+
+resumed = ResumableSampler(1000, world_size=2, rank=0, seed=42)
+resumed.load_state_dict(state)
+print(len(resumed), set(seen) & set(resumed))
+# 497 set()
+```
+
+Take the `state_dict` **between steps**, where every rank has consumed the same count.
+`set_epoch(n)` reshuffles and rewinds, the `DistributedSampler` protocol. Restoring a
+state from a different corpus or seed raises rather than silently reshuffling samples
+the model has already trained on, and — because the global order does not depend on
+`world_size` — a state may be restored onto a differently sized cluster.
 
 ## Next steps
 

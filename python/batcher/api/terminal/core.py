@@ -67,11 +67,6 @@ def _collect(
     result to materialize. This guards every materializing terminal (`collect`,
     `count`, `to_*`, `show`), so they fail fast instead of hanging.
     """
-    import os as _ce_os
-    import time as _ce_time
-
-    _cep = _ce_os.environ.get("BATCHER_SORT_PROFILE")
-    _ce0 = _ce_time.perf_counter()
     from batcher.io.source import is_bounded
 
     if any(not is_bounded(s) for s in sources):
@@ -91,7 +86,14 @@ def _collect(
             from batcher import core
             from batcher.api.orchestration import collect_source_stats
 
-            source_stats = collect_source_stats(sources, core.default_hub())
+            # Only MIN/MAX read a source's column bounds (and only for the aggregated
+            # column); COUNT answers from the row count, and SUM/MEAN/COUNT DISTINCT from
+            # the source's lazy per-column methods — none of which need the O(rows)
+            # zone-map scan. So a keyless SUM/COUNT over a fresh in-memory source no longer
+            # pays to build bounds it never reads, and a MIN(x) scans only column x.
+            source_stats = collect_source_stats(
+                sources, core.default_hub(), need_columns=_global_agg_bound_columns(plan)
+            )
     metadata = metadata_aggregate_table(plan, sources, source_stats)
     if metadata is not None:
         return metadata
@@ -122,11 +124,15 @@ def _collect(
     distributed = _resolve_distributed(distributed, plan, sources)
     # Resolve `adaptive="auto"` to a concrete decision before the fast-path checks
     # below ("auto" is a truthy string). Join-less plans short-circuit to False without
-    # touching source stats, so the common path pays nothing.
+    # touching source stats, so the common path pays nothing. `distributed` is passed so
+    # a shape the one-shot dispatcher can't route (a 3+-table join) takes the staged path
+    # rather than raising.
     from batcher import core
     from batcher.api.adaptive import resolve_adaptive
 
-    adaptive = resolve_adaptive(adaptive, plan, sources, core.default_hub())
+    adaptive = resolve_adaptive(
+        adaptive, plan, sources, core.default_hub(), distributed=distributed
+    )
 
     # `head(n)` / `limit(n)` over a breaker-free pipeline reads the source only until
     # `n` rows are produced, then stops — no whole-source scan (Ray's `limit` does not
@@ -141,11 +147,11 @@ def _collect(
             and is_streamable(plan.input)
             and not core.has_map_batches(plan.input)
         ):
-            from batcher.api._join_helpers import _empty_schema
+            from batcher.api._join_helpers import _empty_result_schema
             from batcher.core.streaming import stream_limit
 
             batches = list(stream_limit(plan, sources[0]))
-            schema = batches[0].schema if batches else _empty_schema(columns)
+            schema = batches[0].schema if batches else _empty_result_schema(plan, columns)
             return pa.Table.from_batches(batches, schema=schema)
 
     if adaptive:
@@ -194,23 +200,13 @@ def _collect(
         source_stats=source_stats,
         profile=event_log_collector(),
     )
-    import os as _ct_os
-
-    _ctp = _ct_os.environ.get("BATCHER_SORT_PROFILE")
-    if _ctp:
-        print(f"[collect] pre-execute routing {_ce_time.perf_counter() - _ce0:.1f}s", flush=True)
     t0 = time.perf_counter()
     table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
     total_ms = (time.perf_counter() - t0) * 1000.0
-    _ce_post = _ce_time.perf_counter()
-    if _ctp:
-        print(f"[collect] executor.execute {total_ms / 1000:.1f}s -> {table.num_rows} rows", flush=True)
     write_event_log(ctx.profile, total_ms=total_ms, rows=table.num_rows)
     from batcher.api.terminal.gpu_backend import record_cpu_crossover  # adaptive-crossover sample
 
     record_cpu_crossover(plan, sources, ctx.hub, total_ms)  # gated to a GPU cluster; else no-op
-    if _ctp:
-        print(f"[collect] post-execute tail {_ce_time.perf_counter() - _ce_post:.1f}s", flush=True)
     return table
 
 
@@ -230,6 +226,34 @@ def _explain(
     return explain(plan, sources, columns, analyze=analyze, fmt=fmt)
 
 
+def _global_agg_bound_columns(plan: LogicalPlan) -> set[str] | None:
+    """The columns whose min/max bounds a keyless aggregate's metadata answer reads.
+
+    Only ``MIN``/``MAX`` read bounds (from `SourceStatistics.columns`), and only of their
+    own input column; ``COUNT`` answers from the row count and ``SUM``/``MEAN``/``COUNT
+    DISTINCT`` from the source's lazy per-column methods. So the needed set is the plain
+    input columns of the min/max aggregates — empty when there are none (skip the scan),
+    and `None` (collect everything, be safe) when the shape isn't the expected keyless
+    aggregate or a min/max input is a computed expression rather than a bare column.
+    """
+    from batcher.plan.expr_ir import Col
+    from batcher.plan.logical import Aggregate, Project
+
+    node = plan
+    while isinstance(node, Project):
+        node = node.input
+    if not isinstance(node, Aggregate):
+        return None  # not the expected shape — be safe and collect full bounds
+    needed: set[str] = set()
+    for spec in node.aggregates:
+        if spec.agg.func in ("min", "max"):
+            if isinstance(spec.agg.input, Col):
+                needed.add(spec.agg.input.name)
+            else:
+                return None  # min/max over a computed expr — fall back to full bounds
+    return needed
+
+
 def _shared_source_stats(plan: LogicalPlan, sources: list[Source]) -> list | None:
     """Source statistics to share across a metadata attempt and its execution fallback.
 
@@ -238,14 +262,20 @@ def _shared_source_stats(plan: LogicalPlan, sources: list[Source]) -> list | Non
     also read them. Returns `None` otherwise, leaving each path to collect its own,
     so an opaque UDF/streaming terminal pays nothing extra.
     """
-    from batcher.api.terminal.metadata_answer import _metadata_answerable
+    from batcher.api.terminal.metadata_answer._core import _metadata_answerable
 
     if not _metadata_answerable(plan, sources):
         return None
     from batcher import core
     from batcher.api.orchestration import collect_source_stats
+    from batcher.api.source_stats import column_bounds_needed
 
-    return collect_source_stats(sources, core.default_hub())
+    # `count()`/`is_empty()` answer from the row count and, when filtered, from the
+    # predicate columns' bounds (comparison-empty detection). So only those columns need
+    # a bounds scan — a `count()` over a wide unfiltered relation stays a cheap row count.
+    return collect_source_stats(
+        sources, core.default_hub(), need_columns=column_bounds_needed(plan)
+    )
 
 
 def _count(plan: LogicalPlan, sources: list[Source], _columns: list[str]) -> int:
@@ -363,6 +393,23 @@ def _streaming_write_eligible(
     return not all(isinstance(s, InMemorySource | MaterializedSource) for s in sources)
 
 
+def _commit(sink, manifest: WriteManifest, path: str, fmt: str) -> WriteManifest:
+    """Commit the write, then drop any statistics this session cached for `path`.
+
+    Those statistics are a zone map the optimizer prunes predicates and join sides with,
+    so serving the *previous* version's after a rewrite produces a wrong answer rather
+    than a slow plan. Every copy-on-write pattern — `write.merge`, `ds.scd.*`,
+    `ds.scd.apply_changes` — rewrites a path it also reads, so this is the common case,
+    not a corner one. Routed through one helper because `_write` commits from three
+    branches and a missed one is a silent wrong answer.
+    """
+    from batcher.api.orchestration import invalidate_source_stats
+
+    sink.commit(manifest, path)
+    invalidate_source_stats(path, fmt)
+    return manifest
+
+
 @with_auto_config
 def _write(
     plan: LogicalPlan,
@@ -411,8 +458,7 @@ def _write(
         manifest = _distributed_write_plan(
             plan, sources, path, fmt, sink_kwargs, partition_by, num_workers or 4
         )
-        sink.commit(manifest, path)
-        return manifest
+        return _commit(sink, manifest, path, fmt)
 
     # An unbounded source reaching the materialize path below would never finish.
     # The streaming distributed write above handles breaker-free shapes; otherwise
@@ -456,9 +502,7 @@ def _write(
             _iter_batches(plan, sources, columns), lambda: _schema(plan, sources, columns)
         )
         written = sink.write_stream(prefetch(stream), path, schema=schema, resume=resume)
-        manifest = WriteManifest((written,))
-        sink.commit(manifest, path)
-        return manifest
+        return _commit(sink, WriteManifest((written,)), path, fmt)
 
     table = _collect(plan, sources, columns, distributed=distributed, num_workers=num_workers)
     # Resolve a `repartition` layout to a per-file row cap now that the size is known
@@ -492,8 +536,7 @@ def _write(
         from batcher.api.orchestration import persist_written_source_stats
 
         persist_written_source_stats(table, path, fmt)
-    sink.commit(manifest, path)
-    return manifest
+    return _commit(sink, manifest, path, fmt)
 
 
 def _to_pydict(

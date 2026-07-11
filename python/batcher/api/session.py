@@ -28,7 +28,7 @@ from batcher.io.source import (
     IteratorSource,
     Source,
 )
-from batcher.plan.logical import Scan
+from batcher.plan.logical import LogicalPlan, Scan
 from batcher.plan.schema import SchemaRef
 
 __all__ = [
@@ -147,8 +147,15 @@ def register_function(name: str, fn: Callable, **options: Any) -> None:
 
 
 def _scan(source: Source) -> Dataset:
-    plan = Scan(source_id=0, schema=SchemaRef.from_arrow(source.schema()))
-    return Dataset(plan, sources=[source])
+    """Build the `Dataset` for `source`, governed by the active security policy.
+
+    The single place a source becomes a plan, and therefore the single place governance
+    has to be applied for it to be unbypassable — see `api.security`.
+    """
+    from batcher.api.security import govern_scan
+
+    plan: LogicalPlan = Scan(source_id=0, schema=SchemaRef.from_arrow(source.schema()))
+    return Dataset(govern_scan(plan, source), sources=[source])
 
 
 def read(path: str, *, format: str | None = None, **opts: Any) -> Dataset:
@@ -205,6 +212,15 @@ def read_memory(name: str) -> Dataset:
             >>> _ = query.await_termination()
             >>> bt.read_memory("demo").count()
             3
+
+    Args:
+        name: The in-memory sink name a streaming write accumulated into.
+
+    Returns:
+        A `Dataset` snapshotting the current contents of the named sink.
+
+    Raises:
+        PlanError: If no query has written to `name`.
     """
     from batcher._internal.errors import PlanError
     from batcher.io.formats.streaming.sinks import memory_table
@@ -237,6 +253,30 @@ def streams() -> list[Any]:
     return active_streams()
 
 
+def await_any_termination(timeout: float | None = None) -> bool:
+    """Block until any active streaming query stops (Spark ``awaitAnyTermination``).
+
+    Waits for the first currently-running query to terminate, re-raising its exception
+    if it failed. Returns immediately when no query is active.
+
+    Args:
+        timeout: Maximum seconds to wait; ``None`` waits indefinitely.
+
+    Returns:
+        ``True`` if a query stopped (or none were active), ``False`` on timeout.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.await_any_termination(timeout=0.0)
+            True
+    """
+    from batcher.api.streaming import await_any_termination as _await_any
+
+    return _await_any(timeout)
+
+
 def from_arrow(data: pa.Table | pa.RecordBatch | Sequence[pa.RecordBatch]) -> Dataset:
     """Create a `Dataset` from an Arrow table, record batch, or list of batches.
 
@@ -251,6 +291,15 @@ def from_arrow(data: pa.Table | pa.RecordBatch | Sequence[pa.RecordBatch]) -> Da
             >>> import batcher as bt
             >>> bt.from_arrow(pa.table({"x": [1, 2]})).to_pydict()
             {'x': [1, 2]}
+
+    Args:
+        data: An Arrow table, record batch, or sequence of record batches.
+
+    Returns:
+        A lazy `Dataset` over the Arrow data.
+
+    Raises:
+        ValueError: If `data` is an empty sequence carrying no schema.
     """
     if isinstance(data, pa.Table):
         # A zero-row Table yields no batches; keep its schema with one empty morsel.
@@ -308,6 +357,12 @@ def from_pylist(rows: list[dict[str, Any]]) -> Dataset:
             >>> import batcher as bt
             >>> bt.from_pylist([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]).to_pydict()
             {'a': [1, 2], 'b': ['x', 'y']}
+
+    Args:
+        rows: A list of ``{column: value}`` dicts; the union of keys is the schema.
+
+    Returns:
+        A lazy `Dataset` over the rows.
     """
     return from_arrow(pa.Table.from_pylist(rows))
 
@@ -324,6 +379,13 @@ def from_items(items: list[Any], *, column: str = "item") -> Dataset:
             >>> import batcher as bt
             >>> bt.from_items([1, 2, 3]).to_pydict()
             {'item': [1, 2, 3]}
+
+    Args:
+        items: The items, one row each; dict items expand to columns.
+        column: The single-column name used for scalar (non-dict) items.
+
+    Returns:
+        A lazy `Dataset` with one row per item.
     """
     return _scan(interop.from_items(items, column=column))
 
@@ -358,6 +420,18 @@ def compact(
             >>> _ = bt.compact(d, num_files=1, format="parquet")
             >>> len(glob.glob(os.path.join(d, "*.parquet")))
             1
+
+    Args:
+        path: The dataset location to compact in place.
+        target_size_mb: Approximate target size per output file (ignored if
+            `num_files` is given).
+        num_files: Exact number of output files to rewrite to.
+        by: Column(s) to Hive-partition the rewritten output by.
+        format: The dataset format; inferred from `path` when omitted.
+        **opts: Extra options forwarded to the writer.
+
+    Returns:
+        The `WriteManifest` describing the compacted output.
     """
     import os
 
@@ -401,6 +475,15 @@ def range(start: int, stop: int, step: int = 1, *, name: str = "value") -> Datas
             >>> import batcher as bt
             >>> bt.range(0, 5).to_pydict()
             {'value': [0, 1, 2, 3, 4]}
+
+    Args:
+        start: The first integer (inclusive).
+        stop: The end integer (exclusive).
+        step: The stride between successive integers.
+        name: The output column name.
+
+    Returns:
+        A one-column lazy `Dataset` of the integer range.
     """
     import builtins
 
@@ -409,10 +492,11 @@ def range(start: int, stop: int, step: int = 1, *, name: str = "value") -> Datas
 
 
 def date_range(start: str, end: str, *, interval_days: int = 1, name: str = "date") -> Dataset:
-    """A one-column `Dataset` of dates from `start` to `end` (both ISO ``YYYY-MM-DD``,
-    inclusive) stepped by `interval_days` — the calendar/date-dimension generator.
+    """A one-column `Dataset` of dates from `start` to `end`, stepped by `interval_days`.
 
-    ``bt.date_range("2024-01-01", "2024-12-31")`` builds a daily date dimension.
+    Both bounds are inclusive ISO ``YYYY-MM-DD`` strings — the calendar /
+    date-dimension generator. ``bt.date_range("2024-01-01", "2024-12-31")`` builds a
+    daily date dimension.
 
     Examples:
         .. doctest::
@@ -420,6 +504,18 @@ def date_range(start: str, end: str, *, interval_days: int = 1, name: str = "dat
             >>> import batcher as bt
             >>> bt.date_range("2024-01-01", "2024-01-03").count()
             3
+
+    Args:
+        start: The first date (inclusive), ISO ``YYYY-MM-DD``.
+        end: The last date (inclusive), ISO ``YYYY-MM-DD``.
+        interval_days: The stride in days between successive dates.
+        name: The output column name.
+
+    Returns:
+        A one-column lazy `Dataset` of the date range.
+
+    Raises:
+        ValueError: If `interval_days` is less than 1.
     """
     import builtins
     from datetime import date, timedelta
@@ -456,6 +552,15 @@ def from_batches(
             >>> ds = bt.from_batches(lambda: iter([pa.record_batch({"x": [1, 2, 3]})]), schema)
             >>> ds.count()
             3
+
+    Args:
+        factory: A callable returning a fresh iterator of record batches each call.
+        schema: The Arrow schema of the produced batches.
+        bounded: Whether the stream is finite; ``False`` makes materializing terminal
+            operations fail fast rather than hang.
+
+    Returns:
+        A streaming lazy `Dataset` over the factory's batches.
     """
     return _scan(IteratorSource(factory, schema, bounded=bounded))
 
@@ -499,6 +604,15 @@ def from_pandas(df: Any) -> Dataset:
             >>> import batcher as bt
             >>> bt.from_pandas(pd.DataFrame({"a": [1, 2], "b": [3, 4]})).to_pydict()
             {'a': [1, 2], 'b': [3, 4]}
+
+    Args:
+        df: The pandas `DataFrame` to ingest.
+
+    Returns:
+        A lazy `Dataset` over the frame.
+
+    Raises:
+        BackendError: If pandas is not installed.
     """
     return _scan(interop.from_pandas(df))
 
@@ -517,6 +631,15 @@ def from_polars(df: Any) -> Dataset:
             >>> import batcher as bt
             >>> bt.from_polars(pl.DataFrame({"a": [1, 2, 3]})).to_pydict()
             {'a': [1, 2, 3]}
+
+    Args:
+        df: The Polars `DataFrame` to ingest (referenced zero-copy).
+
+    Returns:
+        A lazy `Dataset` over the frame.
+
+    Raises:
+        BackendError: If polars is not installed.
     """
     return _scan(interop.from_polars(df))
 
@@ -529,13 +652,21 @@ def from_huggingface(hf_dataset: Any) -> Dataset:
     raises `BackendError` if it is absent.
 
     Examples:
-        ::
+        .. doctest::
 
-            import batcher as bt
-            from datasets import load_dataset
+            >>> import batcher as bt
+            >>> from datasets import load_dataset  # doctest: +SKIP
+            >>> hf = load_dataset("imdb", split="train")  # doctest: +SKIP
+            >>> ds = bt.from_huggingface(hf)  # doctest: +SKIP
 
-            hf = load_dataset("imdb", split="train")
-            ds = bt.from_huggingface(hf)
+    Args:
+        hf_dataset: The HuggingFace ``datasets.Dataset`` to ingest.
+
+    Returns:
+        A lazy `Dataset` over the underlying Arrow table.
+
+    Raises:
+        BackendError: If ``datasets`` is not installed.
     """
     return _scan(interop.from_huggingface(hf_dataset))
 
@@ -551,10 +682,19 @@ def from_torch(dataset_or_tensors: Any) -> Dataset:
     Examples:
         .. doctest::
 
-            >>> import torch
+            >>> import torch  # doctest: +SKIP
             >>> import batcher as bt
-            >>> bt.from_torch(torch.tensor([1, 2, 3])).to_pydict()
+            >>> bt.from_torch(torch.tensor([1, 2, 3])).to_pydict()  # doctest: +SKIP
             {'data': [1, 2, 3]}
+
+    Args:
+        dataset_or_tensors: A PyTorch tensor, tuple of tensors, or ``Dataset``.
+
+    Returns:
+        A lazy `Dataset`, one column per tensor.
+
+    Raises:
+        BackendError: If ``torch`` is not installed.
     """
     return _scan(interop.from_torch(dataset_or_tensors))
 
@@ -567,13 +707,21 @@ def from_tf(tf_dataset: Any) -> Dataset:
     `BackendError` if it is absent.
 
     Examples:
-        ::
+        .. doctest::
 
-            import tensorflow as tf
-            import batcher as bt
+            >>> import tensorflow as tf  # doctest: +SKIP
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> tf_ds = tf.data.Dataset.from_tensor_slices({"x": [1, 2, 3]})  # doctest: +SKIP
+            >>> ds = bt.from_tf(tf_ds)  # doctest: +SKIP
 
-            tf_ds = tf.data.Dataset.from_tensor_slices({"x": [1, 2, 3]})
-            ds = bt.from_tf(tf_ds)
+    Args:
+        tf_dataset: The ``tf.data.Dataset`` to materialize.
+
+    Returns:
+        A lazy `Dataset` over the converted data.
+
+    Raises:
+        BackendError: If ``tensorflow`` is not installed.
     """
     return _scan(interop.from_tf(tf_dataset))
 
@@ -587,14 +735,22 @@ def from_spark(spark_df: Any) -> Dataset:
     `BackendError` if it is absent.
 
     Examples:
-        ::
+        .. doctest::
 
-            import batcher as bt
-            from pyspark.sql import SparkSession
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> from pyspark.sql import SparkSession  # doctest: +SKIP
+            >>> spark = SparkSession.builder.getOrCreate()  # doctest: +SKIP
+            >>> sdf = spark.createDataFrame([(1,), (2,), (3,)], ["x"])  # doctest: +SKIP
+            >>> ds = bt.from_spark(sdf)  # doctest: +SKIP
 
-            spark = SparkSession.builder.getOrCreate()
-            sdf = spark.createDataFrame([(1,), (2,), (3,)], ["x"])
-            ds = bt.from_spark(sdf)
+    Args:
+        spark_df: The Spark `DataFrame` to collect through Arrow.
+
+    Returns:
+        A lazy `Dataset` over the collected data.
+
+    Raises:
+        BackendError: If ``pyspark`` is not installed.
     """
     return _scan(interop.from_spark(spark_df))
 
@@ -607,14 +763,23 @@ def from_dask(ddf: Any) -> Dataset:
     raises `BackendError` if it is absent.
 
     Examples:
-        ::
+        .. doctest::
 
-            import dask.dataframe as dd
-            import pandas as pd
-            import batcher as bt
+            >>> import dask.dataframe as dd  # doctest: +SKIP
+            >>> import pandas as pd  # doctest: +SKIP
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> pdf = pd.DataFrame({"x": [1, 2, 3]})  # doctest: +SKIP
+            >>> ddf = dd.from_pandas(pdf, npartitions=2)  # doctest: +SKIP
+            >>> ds = bt.from_dask(ddf)  # doctest: +SKIP
 
-            ddf = dd.from_pandas(pd.DataFrame({"x": [1, 2, 3]}), npartitions=2)
-            ds = bt.from_dask(ddf)
+    Args:
+        ddf: The Dask `DataFrame` to stream in, one partition per batch.
+
+    Returns:
+        A streaming lazy `Dataset` over the partitions.
+
+    Raises:
+        BackendError: If ``dask`` is not installed.
     """
     return _scan(interop.from_dask(ddf))
 
@@ -626,12 +791,20 @@ def from_ray_dataset(ray_dataset: Any) -> Dataset:
     bounded memory. Requires `ray`.
 
     Examples:
-        .. code-block:: python
+        .. doctest::
 
-            import ray
-            import batcher as bt
+            >>> import ray  # doctest: +SKIP
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> rds = ray.data.range(100)  # doctest: +SKIP
+            >>> ds = bt.from_ray_dataset(rds)  # doctest: +SKIP
 
-            rds = ray.data.range(100)
-            ds = bt.from_ray_dataset(rds)
+    Args:
+        ray_dataset: The Ray Dataset to stream in, one Arrow block per batch.
+
+    Returns:
+        A streaming lazy `Dataset` over the blocks.
+
+    Raises:
+        BackendError: If ``ray`` is not installed.
     """
     return _scan(interop.from_ray_dataset(ray_dataset))

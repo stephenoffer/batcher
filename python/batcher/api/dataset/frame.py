@@ -12,7 +12,7 @@ for choosing/deriving the full output, `with_columns` for adding/replacing.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 import pyarrow as pa
 
@@ -30,17 +30,25 @@ from batcher.api.dataset._build import (
     RepartitionSpec,
     build_cast,
     build_distinct,
-    build_drop_nulls,
     build_explode,
-    build_fill_null,
-    build_fill_null_strategy,
     build_pivot,
     build_sample,
     build_unnest,
     build_unpivot,
     build_window,
-    build_window_columns,
     build_with_random,
+    expand_selector_expr,
+    selector_columns,
+)
+from batcher.api.dataset._nulls import (
+    build_drop_nulls,
+    build_fill_null,
+    build_fill_null_strategy,
+)
+from batcher.api.dataset._window import (
+    build_window_columns,
+    windowed_filter,
+    windowed_project,
 )
 from batcher.api.dataset.dq import DatasetDQ
 from batcher.api.dataset.ml import DatasetML
@@ -62,11 +70,11 @@ from batcher.api.terminal import (
 )
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Aliased, Col, Expr
-from batcher.plan.expr_ir.nodes import WindowExpr
+from batcher.plan.expr_ir.selectors import Selector, has_selector
+from batcher.plan.expr_rewrite import is_bare_window
 from batcher.plan.logical import (
     AsofJoin,
     Distinct,
-    Filter,
     Join,
     Limit,
     LogicalPlan,
@@ -87,11 +95,22 @@ if TYPE_CHECKING:
 
 __all__ = ["Dataset", "GroupBy"]
 
+# The return of a user function passed to `Dataset.pipe` — `pipe` is transparent.
+_T = TypeVar("_T")
+
 
 def _unknown_cols(missing: set[str], available: list[str]) -> str:
     """Render an unknown-column list with a 'did you mean' hint for the first miss."""
     ordered = sorted(missing)
     return f"{ordered}{suggest_columns(ordered[0], available)}" if ordered else "[]"
+
+
+def _empty_projection_message(method: str, positional: tuple[object, ...]) -> str:
+    """Explain an empty projection — a selector that matched nothing reads as 'no columns'."""
+    selectors = [repr(p) for p in positional if has_selector(p)]
+    if selectors:
+        return f"{method}(): the column selector(s) {', '.join(selectors)} matched no columns"
+    return f"{method}() requires at least one column"
 
 
 class Dataset:
@@ -145,6 +164,9 @@ class Dataset:
     def columns(self) -> list[str]:
         """The output column names of the current plan.
 
+        Returns:
+            The output column names, in order.
+
         Examples:
             .. doctest::
 
@@ -160,6 +182,9 @@ class Dataset:
 
         A streaming dataset cannot be `collect()`-ed (it would never finish); consume
         it incrementally with `iter_batches()` or write it to a sink instead.
+
+        Returns:
+            ``True`` if any bound source is unbounded.
 
         Examples:
             .. doctest::
@@ -189,9 +214,23 @@ class Dataset:
             f"<table><thead><tr>{cols}</tr></thead></table></div>"
         )
 
+    @overload
+    def __getitem__(self, key: str) -> Expr: ...
+
+    @overload
+    def __getitem__(self, key: list[str] | slice) -> Dataset: ...
+
     def __getitem__(self, key: str | list[str] | slice) -> Expr | Dataset:
-        """Index sugar: ``ds["x"]`` → an `Expr`; ``ds[["a", "b"]]`` → a projected
-        `Dataset`; ``ds[:n]`` / ``ds[i:j]`` → a row slice (like `limit`/`offset`).
+        """Index sugar: a column `Expr`, a projected `Dataset`, or a row slice.
+
+        ``ds["x"]`` returns an `Expr`; ``ds[["a", "b"]]`` returns a projected
+        `Dataset`; ``ds[:n]`` / ``ds[i:j]`` returns a row slice (like `limit`/`offset`).
+
+        Args:
+            key: A column name, a list of names, or a slice.
+
+        Returns:
+            An `Expr` for a single column name, else a projected or sliced `Dataset`.
 
         Examples:
             .. doctest::
@@ -223,6 +262,9 @@ class Dataset:
     def __len__(self) -> int:
         """Row count — ``len(ds)`` is sugar for `count()` (a terminal operation).
 
+        Returns:
+            The number of result rows.
+
         Examples:
             .. doctest::
 
@@ -232,6 +274,22 @@ class Dataset:
         """
         return self.count()
 
+    def __bool__(self) -> bool:
+        """Always raises — the truth value of a lazy `Dataset` is ambiguous.
+
+        Without this, ``if ds:`` would silently fall back to `__len__` and execute a
+        full ``count`` just to decide a branch. Ask for what you mean instead:
+        `has_rows` / `is_empty` for emptiness, ``ds is not None`` for existence.
+
+        Raises:
+            PlanError: Always.
+        """
+        raise PlanError(
+            "the truth value of a Dataset is ambiguous (a lazy plan, not a result); "
+            "use ds.has_rows / ds.is_empty() to test for rows, or `ds is not None` "
+            "to test that a Dataset was produced"
+        )
+
     def __iter__(self) -> Iterator[pa.RecordBatch]:
         """Iterate the result as Arrow ``RecordBatch``es — ``for batch in ds``.
 
@@ -239,6 +297,9 @@ class Dataset:
         Python iteration would touch tuples in the control plane (forbidden), so to
         process individual rows, work on each batch's columns (Arrow/NumPy) instead.
         A terminal, streaming operation.
+
+        Returns:
+            An iterator over the result's Arrow record batches.
 
         Examples:
             .. doctest::
@@ -251,9 +312,43 @@ class Dataset:
         """
         return iter(self.iter_batches())
 
+    def __arrow_c_stream__(self, requested_schema: object = None) -> object:
+        """Export the result over the Arrow **PyCapsule stream interface** (zero-copy).
+
+        This is the bridge out of Batcher: any library that speaks the C Data Interface
+        — Polars, DuckDB, pyarrow, pandas, nanoarrow — consumes a `Dataset` directly,
+        with no ``to_arrow()`` call and no copy::
+
+            pl.DataFrame(ds)            # Polars
+            duckdb.sql("SELECT * FROM ds")
+            pa.table(ds)
+
+        The stream is **lazy**: batches are pulled from `iter_batches()` as the consumer
+        reads them, so a larger-than-memory result streams into DuckDB rather than
+        materializing first. Executing the plan is therefore a side effect of the
+        consumer iterating, which makes this a terminal operation.
+
+        Args:
+            requested_schema: A schema capsule the consumer would prefer, per the
+                protocol. Honoured only when it matches; otherwise the stream's own
+                schema is exported (the consumer must then cast).
+
+        Returns:
+            An ``ArrowArrayStream`` PyCapsule.
+        """
+        reader = pa.RecordBatchReader.from_batches(self.schema, self.iter_batches())
+        return reader.__arrow_c_stream__(requested_schema)
+
     def __contains__(self, name: object) -> bool:
-        """Column-membership test — ``"x" in ds`` is true if ``x`` is an output
-        column. Resolved from the schema with no execution (never a value scan).
+        """Column-membership test — ``"x" in ds`` is true if ``x`` is an output column.
+
+        Resolved from the schema with no execution (never a value scan).
+
+        Args:
+            name: The candidate column name.
+
+        Returns:
+            ``True`` if `name` is an output column.
 
         Examples:
             .. doctest::
@@ -339,6 +434,24 @@ class Dataset:
         # before a `filter`/`select` still reaches the downstream `group_by().agg()`.
         return Dataset(plan, self._sources, watermark=self._watermark)
 
+    def _named_positionals(self, exprs: tuple[Expr, ...]) -> dict[str, Expr]:
+        """Resolve self-naming positional expressions to an ordered name -> expr map."""
+        out: dict[str, Expr] = {}
+        for e in exprs:
+            if has_selector(e):
+                out.update(expand_selector_expr(self, e))
+            elif isinstance(e, Aliased):
+                out[e.name] = e.inner
+            elif isinstance(e, Col):
+                out[e.name] = e
+            else:
+                raise PlanError(
+                    "a positional with_columns() argument must name its output: pass a "
+                    "column selector, an aliased expression (expr.alias('total')), or a "
+                    "bare col(...); otherwise use a keyword (with_columns(total=expr))"
+                )
+        return out
+
     def cache(self) -> Dataset:
         """Mark this dataset's result to be cached in memory after it is computed.
 
@@ -350,6 +463,9 @@ class Dataset:
         running queries under pressure, so caching never grows the process without
         bound. Like Spark/Polars ``cache``, it marks *this* result; a further
         transform is a new, uncached result. Single-node relational results only.
+
+        Returns:
+            A new `Dataset` whose first computed result is cached.
 
         Examples:
             .. doctest::
@@ -378,6 +494,13 @@ class Dataset:
         and evicted, and rows older than the watermark are dropped as late. Carried
         through to the next ``group_by(window(...)).agg(...)``.
 
+        Args:
+            time_col: The event-time column the watermark advances on.
+            lateness: How late a row may arrive and still count (e.g. ``"10m"``).
+
+        Returns:
+            A new `Dataset` carrying the watermark.
+
         Examples:
             .. doctest::
 
@@ -394,6 +517,35 @@ class Dataset:
         return Dataset(self._plan, self._sources, repartition=self._repartition, watermark=wm)
 
     # --- transformations ---------------------------------------------------
+    def pipe(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+        """Apply `fn(self, *args, **kwargs)` and return its result, to keep a chain fluent.
+
+        The escape hatch for composing your own transformations without breaking the
+        method chain: ``ds.pipe(add_features).filter(...)`` reads in the order it runs,
+        where ``add_features(ds.filter(...))`` would not. `pipe` is transparent — it
+        adds no plan node and returns whatever `fn` returns, so it stays lazy when `fn`
+        does.
+
+        Args:
+            fn: A callable taking this `Dataset` as its first argument.
+            *args: Extra positional arguments forwarded to `fn`.
+            **kwargs: Extra keyword arguments forwarded to `fn`.
+
+        Returns:
+            Whatever `fn` returns — typically a new `Dataset`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> def scale(ds, factor):
+                ...     return ds.with_columns(x=bt.col("x") * factor)
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.pipe(scale, 10).filter(bt.col("x") > 10).to_pydict()
+                {'x': [20, 30]}
+        """
+        return fn(self, *args, **kwargs)
+
     def filter(self, predicate: Expr) -> Dataset:
         """Keep only the rows where `predicate` is true.
 
@@ -403,28 +555,44 @@ class Dataset:
         tighter than comparisons. Rows where the predicate is null are dropped.
         Like every transformation this is lazy and returns a new `Dataset`.
 
+        The predicate may compose window expressions — ``filter(col("x") >
+        col("x").mean().over(partition_by=["g"]))`` keeps rows above their group
+        mean. The window sees every input row, as in the SQL subquery it desugars to.
+
         Args:
             predicate: A boolean expression evaluated per row.
 
         Returns:
             A new `Dataset` with the matching rows.
 
-        Example:
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"x": [1, 5, 9], "ok": [True, False, True]})
-            >>> ds.filter((bt.col("x") > 2) & bt.col("ok")).to_pydict()
-            {'x': [9], 'ok': [True]}
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 5, 9], "ok": [True, False, True]})
+                >>> ds.filter((bt.col("x") > 2) & bt.col("ok")).to_pydict()
+                {'x': [9], 'ok': [True]}
         """
         if not isinstance(predicate, Expr):
             raise PlanError("filter() requires an expression, e.g. col('x') > 0")
-        return self._derive(Filter(self._plan, predicate))
+        return windowed_filter(self, predicate)
 
     def select(self, *columns: str | Expr, **named: Expr | int | float | bool | str) -> Dataset:
         """Project to exactly the given columns.
 
-        Positional args are column names (strings), bare ``col(...)`` references, or
-        aliased expressions (``expr.alias("name")``); keyword args bind a new name to
-        an expression: ``ds.select("id", total=col("price") * col("qty"))``.
+        Positional args are column names (strings), bare ``col(...)`` references,
+        aliased expressions (``expr.alias("name")``), or column selectors
+        (``bt.exclude("id")``, ``bt.numeric() * 2``) which expand to one output per
+        matched column; keyword args bind a new name to an expression:
+        ``ds.select("id", total=col("price") * col("qty"))``.
+
+        Args:
+            *columns: Column names, ``col(...)`` references, aliased expressions, or
+                column selectors.
+            **named: New column names bound to expressions.
+
+        Returns:
+            A new `Dataset` with exactly the selected columns.
 
         Examples:
             .. doctest::
@@ -433,11 +601,16 @@ class Dataset:
                 >>> ds = bt.from_pydict({"x": [1, 2, 3], "g": ["a", "b", "a"]})
                 >>> ds.select("x", y=bt.col("x") * 2).to_pydict()
                 {'x': [1, 2, 3], 'y': [2, 4, 6]}
+
+                >>> ds.select(bt.exclude("g")).to_pydict()
+                {'x': [1, 2, 3]}
         """
         items: list[Projection] = []
         for c in columns:
             if isinstance(c, str):
                 items.append(Projection(c, Col(c)))
+            elif has_selector(c):
+                items.extend(Projection(n, e) for n, e in expand_selector_expr(self, c))
             elif isinstance(c, Aliased):
                 items.append(Projection(c.name, c.inner))
             elif isinstance(c, Col):
@@ -445,22 +618,35 @@ class Dataset:
             else:
                 raise PlanError(
                     "positional select() arguments must be column names, col(...) "
-                    "references, or aliased expressions; name other derived columns "
-                    "via a keyword (select(total=expr)) or .alias('total')"
+                    "references, aliased expressions, or column selectors; name other "
+                    "derived columns via a keyword (select(total=expr)) or .alias('total')"
                 )
         for alias, expr in named.items():
             items.append(Projection(alias, _as_expr(expr)))
         if not items:
-            raise PlanError("select() requires at least one column")
-        return self._derive(Project(self._plan, tuple(items)))
+            raise PlanError(_empty_projection_message("select", columns))
+        return windowed_project(self, items)
 
-    def with_columns(self, **named: Expr | int | float | bool | str) -> Dataset:
+    def with_columns(self, *exprs: Expr, **named: Expr | int | float | bool | str) -> Dataset:
         """Add or replace columns, keeping all existing ones.
 
         Values may be expressions, scalars, or window expressions from
-        ``agg.over(...)`` (e.g. ``with_columns(total=col("x").sum().over(partition_by=["g"]))``),
-        which append windowed columns. Mixing window and non-window values in one call
-        is not supported — use separate calls.
+        ``agg.over(...)`` (e.g. ``with_columns(total=col("x").sum().over(partition_by=["g"]))``).
+        A window may be composed with ordinary arithmetic —
+        ``with_columns(share=col("x") / col("x").sum().over())`` — and window and
+        non-window columns may be mixed freely in one call.
+
+        Positional args must already carry their output name: a column selector
+        (``bt.numeric().round(2)`` replaces each numeric column in place), an aliased
+        expression, or a bare ``col(...)``. Anything else needs a keyword.
+
+        Args:
+            *exprs: Self-naming expressions — column selectors, aliased expressions,
+                or bare ``col(...)`` references.
+            **named: Column names bound to expressions (or scalars) to add or replace.
+
+        Returns:
+            A new `Dataset` with the columns added or replaced.
 
         Examples:
             .. doctest::
@@ -469,17 +655,26 @@ class Dataset:
                 >>> ds = bt.from_pydict({"x": [1, 2, 3]})
                 >>> ds.with_columns(y=bt.col("x") + 1).to_pydict()
                 {'x': [1, 2, 3], 'y': [2, 3, 4]}
+
+                >>> ds = bt.from_pydict({"a": [1.234], "b": [5.678], "s": ["x"]})
+                >>> ds.with_columns(bt.numeric().round(1)).to_pydict()
+                {'a': [1.2], 'b': [5.7], 's': ['x']}
         """
+        positional = self._named_positionals(exprs)
+        clashing = sorted(positional.keys() & named.keys())
+        if clashing:
+            raise PlanError(
+                f"with_columns() got column(s) {clashing} both positionally and as a "
+                "keyword; give each output column exactly one definition"
+            )
+        named = {**positional, **named}
         if not named:
-            raise PlanError("with_columns() requires at least one named column")
-        windows = {a: e for a, e in named.items() if isinstance(e, WindowExpr)}
-        if windows:
-            if len(windows) != len(named):
-                raise PlanError(
-                    "with_columns(): mix of window (.over) and non-window columns; "
-                    "add them in separate with_columns() calls"
-                )
-            return build_window_columns(self, windows)
+            raise PlanError(_empty_projection_message("with_columns", exprs))
+        # Bare `agg.over(...)` columns need no surrounding projection: name each
+        # window by its own alias and append it. Anything composed goes through the
+        # hoisting path below.
+        if all(is_bare_window(e) for e in named.values()):
+            return build_window_columns(self, named)
         existing = self._plan.available_columns()
         items: list[Projection] = []
         for name in existing:
@@ -490,7 +685,7 @@ class Dataset:
         for alias, expr in named.items():
             if alias not in existing:
                 items.append(Projection(alias, _as_expr(expr)))
-        return self._derive(Project(self._plan, tuple(items)))
+        return windowed_project(self, items)
 
     def sort(
         self,
@@ -502,6 +697,14 @@ class Dataset:
 
         `descending`/`nulls_first` are either a single bool applied to all keys or
         a list matching the number of keys.
+
+        Args:
+            *by: The sort keys, as column names or expressions.
+            descending: Sort descending — one bool for all keys or a per-key list.
+            nulls_first: Order nulls first — one bool for all keys or a per-key list.
+
+        Returns:
+            A new `Dataset` with rows ordered by the keys.
 
         Examples:
             .. doctest::
@@ -544,6 +747,15 @@ class Dataset:
         positive = following, ``None`` = unbounded), so ``frame=(-2, 0)`` is a
         trailing 3-row window.
 
+        Args:
+            partition_by: Columns or expressions to partition rows by.
+            order_by: Ordering keys — names, ``(name, descending)`` tuples, or expressions.
+            functions: Output name to a ranking function or an ``(agg, column)`` pair.
+            frame: An explicit ``ROWS`` frame as a ``(start, end)`` offset pair.
+
+        Returns:
+            A new `Dataset` with the window columns appended.
+
         Examples:
             .. doctest::
 
@@ -562,8 +774,13 @@ class Dataset:
 
     @property
     def ml(self) -> DatasetML:
-        """ML/multimodal accessor: batch `infer`/`embed`/`map_batches` with GPU and
-        actor-pool scheduling (`ds.ml.infer(model, num_gpus=1, concurrency=4)`).
+        """ML/multimodal accessor: batch inference, embedding, and mapping.
+
+        Runs `infer`/`embed`/`map_batches` with GPU and actor-pool scheduling
+        (``ds.ml.infer(model, num_gpus=1, concurrency=4)``).
+
+        Returns:
+            The ML accessor bound to this dataset.
 
         Examples:
             .. doctest::
@@ -577,11 +794,16 @@ class Dataset:
 
     @property
     def dq(self) -> DatasetDQ:
-        """Data-quality accessor: accumulate expectations
+        """Data-quality accessor: accumulate expectations then act on the failures.
+
+        Chain expectations
         (`not_null`/`unique`/`in_range`/`matches`/`accepted_values`/`check`) then
         `fail()` (raise), `drop()` (keep valid), `quarantine()` (split valid/rejected),
         or `validate()` (counts). E.g.
         ``ds.dq.not_null("id").unique(["id"]).in_range("age", 0, 120).quarantine()``.
+
+        Returns:
+            The data-quality accessor bound to this dataset.
 
         Examples:
             .. doctest::
@@ -595,9 +817,13 @@ class Dataset:
 
     @property
     def scd(self) -> DatasetSCD:
-        """Slowly-changing-dimension accessor: upsert this incoming snapshot into a
-        target as `scd.type1` (overwrite), `scd.type2` (effective-dated history), or
+        """Slowly-changing-dimension accessor: upsert this snapshot into a target.
+
+        Apply as `scd.type1` (overwrite), `scd.type2` (effective-dated history), or
         `scd.type3` (previous-value column).
+
+        Returns:
+            The SCD accessor bound to this dataset.
 
         Examples:
             .. doctest::
@@ -622,14 +848,29 @@ class Dataset:
         multiprocessing: bool = False,
         max_errored_rows: int = 0,
     ) -> Dataset:
-        """Apply a Python function to each batch — `ds.ml.map_batches`, kept
-        top-level for the familiar spelling (see `ds.ml` for the full ML surface).
+        """Apply a Python function to each Arrow batch (sugar for `ds.ml.map_batches`).
+
+        Kept top-level for the familiar spelling; see `ds.ml` for the full ML surface.
 
         `num_workers` defaults to ``"auto"`` — the per-batch calls fan across all
         local cores, so a batch transform is parallel by default rather than
         single-threaded (the Ray Data foot-gun). Threads only speed up a
         GIL-releasing `fn` (Arrow/NumPy/torch); pass ``multiprocessing=True`` for a
         CPU-bound pure-Python `fn`. An explicit int wins.
+
+        Args:
+            fn: A callable (or stateful class) applied to each batch.
+            batch_size: Rows per batch handed to `fn`; ``None`` uses the engine default.
+            output_columns: The output column names, when `fn` reshapes the schema.
+            num_workers: Worker fan-out; ``"auto"`` spreads across local cores.
+            num_gpus: GPUs reserved per worker.
+            concurrency: Maximum concurrent workers; ``None`` lets the engine choose.
+            batch_format: The batch type passed to `fn` (``"pyarrow"`` by default).
+            multiprocessing: Use processes instead of threads for a CPU-bound `fn`.
+            max_errored_rows: How many per-row errors to tolerate before failing.
+
+        Returns:
+            A new `Dataset` of the transformed batches.
 
         Examples:
             .. doctest::
@@ -670,6 +911,15 @@ class Dataset:
         of every shuffle and spill buffer until `materialize_blobs` reads them back
         right before they are needed. `root` defaults to the configured spill store.
 
+        Args:
+            column: The payload column to offload.
+            uri_column: The handle column that replaces the payload.
+            root: The content-addressed store root; defaults to the spill store.
+            batch_size: Rows per batch while writing blobs.
+
+        Returns:
+            A new `Dataset` with the payload column replaced by handles.
+
         Examples:
             .. doctest::
 
@@ -708,6 +958,24 @@ class Dataset:
         use): each ``uri_column`` handle is fetched into ``into`` as ``large_binary``.
         Run it right before the operator that needs raw bytes — with a small
         ``batch_size`` the GB payloads never all co-reside.
+
+        Args:
+            uri_column: The handle column to read payloads from.
+            into: The output column that receives the payload bytes.
+            batch_size: Rows per batch while reading blobs.
+
+        Returns:
+            A new `Dataset` with the payloads materialized into `into`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, tempfile, pyarrow as pa
+                >>> root = tempfile.mkdtemp()
+                >>> ds = bt.from_arrow(pa.table({"id": [1], "bytes": [b"payload"]}))
+                >>> handles = ds.offload_blobs(root=root)
+                >>> handles.materialize_blobs().collect().column("bytes").to_pylist()
+                [b'payload']
         """
         from functools import partial
 
@@ -723,8 +991,16 @@ class Dataset:
         )
 
     def map(self, fn: Callable, *, output_columns: list[str] | None = None) -> Dataset:
-        """Apply a per-row function ``fn(row) -> row`` (Ray Data ``map``) — sugar for
-        `ds.ml.map`. Prefer `map_batches` (vectorized) when you can; see `ds.ml`.
+        """Apply a per-row function ``fn(row) -> row`` (Ray Data ``map``).
+
+        Sugar for `ds.ml.map`. Prefer `map_batches` (vectorized) when you can; see `ds.ml`.
+
+        Args:
+            fn: A callable mapping one row dict to a new row dict.
+            output_columns: The output column names when `fn` changes the schema.
+
+        Returns:
+            A new `Dataset` of the mapped rows.
 
         Examples:
             .. doctest::
@@ -737,8 +1013,16 @@ class Dataset:
         return self.ml.map(fn, output_columns=output_columns)
 
     def flat_map(self, fn: Callable, *, output_columns: list[str] | None = None) -> Dataset:
-        """Apply a per-row function ``fn(row) -> iterable[row]`` and flatten (Ray Data
-        ``flat_map``) — sugar for `ds.ml.flat_map`; see `ds.ml`.
+        """Apply a per-row function ``fn(row) -> iterable[row]`` and flatten.
+
+        The Ray Data ``flat_map`` — sugar for `ds.ml.flat_map`; see `ds.ml`.
+
+        Args:
+            fn: A callable mapping one row dict to an iterable of row dicts.
+            output_columns: The output column names when `fn` changes the schema.
+
+        Returns:
+            A new `Dataset` of the flattened rows.
 
         Examples:
             .. doctest::
@@ -803,15 +1087,16 @@ class Dataset:
         """
         return self.with_columns(**{name: expr})
 
-    def drop(self, *columns: str) -> Dataset:
+    def drop(self, *columns: str | Selector) -> Dataset:
         """Return a dataset without the named columns, preserving the rest in order.
 
         The complement of `select`: name the columns to remove rather than the ones
-        to keep. Lazy. Raises `PlanError` on an unknown column (with a suggestion)
-        or if every column would be dropped.
+        to keep, either by name or with a column selector (``ds.drop(bt.temporal())``).
+        Lazy. Raises `PlanError` on an unknown column name (with a suggestion) or if
+        every column would be dropped.
 
         Args:
-            *columns: Names of the columns to remove.
+            *columns: Names of the columns to remove, or column selectors matching them.
 
         Returns:
             A new `Dataset` with the remaining columns.
@@ -823,9 +1108,21 @@ class Dataset:
                 >>> ds = bt.from_pydict({"a": [1, 2], "b": [3, 4], "c": [5, 6]})
                 >>> ds.drop("b").to_pydict()
                 {'a': [1, 2], 'c': [5, 6]}
+
+                >>> ds.drop(bt.matches("^[bc]$")).to_pydict()
+                {'a': [1, 2]}
         """
-        to_drop = set(columns)
         available = self._plan.available_columns()
+        to_drop: set[str] = set()
+        for c in columns:
+            if isinstance(c, Selector):
+                to_drop.update(selector_columns(self, c))
+            elif isinstance(c, str):
+                to_drop.add(c)
+            else:
+                raise PlanError(
+                    f"drop() takes column names or column selectors, got {type(c).__name__}"
+                )
         missing = to_drop - set(available)
         if missing:
             raise PlanError(f"drop(): unknown column(s) {_unknown_cols(missing, available)}")
@@ -835,8 +1132,17 @@ class Dataset:
         return self.select(*keep)
 
     def rename(self, mapping: dict[str, str] | None = None, **renames: str) -> Dataset:
-        """Rename columns, preserving order. Pass a ``{old: new}`` dict or kwargs
-        (``rename(old="new")``); a dict and kwargs may be combined.
+        """Rename columns, preserving order.
+
+        Pass a ``{old: new}`` dict or kwargs (``rename(old="new")``); a dict and
+        kwargs may be combined.
+
+        Args:
+            mapping: An ``{old: new}`` rename mapping.
+            **renames: Renames given as ``old="new"`` keyword arguments.
+
+        Returns:
+            A new `Dataset` with the columns renamed.
 
         Examples:
             .. doctest::
@@ -869,6 +1175,14 @@ class Dataset:
         deterministic row. Lowers to ``row_number() OVER (PARTITION BY subset
         ORDER BY ...)`` + filter — no new IR.
 
+        Args:
+            subset: Columns defining the key; ``None`` deduplicates over all columns.
+            keep: Which row to keep per key — ``"any"``, ``"first"``, or ``"last"``.
+            order_by: The order defining first/last (required for those `keep` modes).
+
+        Returns:
+            A new `Dataset` with duplicate rows removed.
+
         Examples:
             .. doctest::
 
@@ -896,6 +1210,14 @@ class Dataset:
         a sizing option. ``ds.repartition(target_size_mb=128).write("out/")``;
         ``ds.repartition(by="dt").write("out/")``. See `bt.compact` for in-place use.
 
+        Args:
+            num_files: Split the output into this many files.
+            by: Column(s) to Hive-partition the output by.
+            target_size_mb: Coalesce into files of about this size.
+
+        Returns:
+            A new `Dataset` carrying the write layout hint.
+
         Examples:
             .. doctest::
 
@@ -917,9 +1239,18 @@ class Dataset:
         return Dataset(self._plan, self._sources, spec)
 
     def value_counts(self, column: str, *, name: str = "count", sort: bool = True) -> Dataset:
-        """Count occurrences of each distinct value of `column` (pandas/Polars
-        ``value_counts``). Returns ``[column, name]``, sorted by count descending
-        unless `sort=False`. Sugar over ``group_by(column).agg(count())``.
+        """Count occurrences of each distinct value of `column` (pandas/Polars ``value_counts``).
+
+        Returns ``[column, name]``, sorted by count descending unless `sort=False`.
+        Sugar over ``group_by(column).agg(count())``.
+
+        Args:
+            column: The column whose values to count.
+            name: The name of the output count column.
+            sort: Sort by count descending (the default).
+
+        Returns:
+            A new `Dataset` of value and count columns.
 
         Examples:
             .. doctest::
@@ -943,6 +1274,12 @@ class Dataset:
         quartiles) / max; non-numeric columns report count and null_count only.
         Composes the already-tested aggregates — no per-row work in Python.
 
+        Args:
+            percentiles: The quantiles to report for numeric columns.
+
+        Returns:
+            A `Dataset` of summary statistics with a ``statistic`` label column.
+
         Examples:
             .. doctest::
 
@@ -961,6 +1298,9 @@ class Dataset:
         Lazy: lowers to a single global aggregate and a `select`, so it stays
         mergeable and identical single-node and distributed.
 
+        Returns:
+            A one-row `Dataset` of each column's null count.
+
         Examples:
             .. doctest::
 
@@ -974,9 +1314,14 @@ class Dataset:
         return null_count(self)
 
     def profile(self) -> Dataset:
-        """A per-column data-quality profile (**executes**): one row per column with
+        """A per-column data-quality profile that **executes** the query.
+
+        Returns one row per column with
         ``count``/``null_count``/``null_fraction``/``approx_distinct`` (HyperLogLog
         cardinality). The quick "what does this column look like" check before a load.
+
+        Returns:
+            A `Dataset` with one profile row per input column.
 
         Examples:
             .. doctest::
@@ -991,8 +1336,18 @@ class Dataset:
         return profile(self)
 
     def top_k(self, k: int, by: str | list[str], *, descending: bool = True) -> Dataset:
-        """The `k` rows ranked highest (or lowest, `descending=False`) by `by` — sugar
-        for ``sort(by, descending).limit(k)`` (the engine fuses sort+limit to a top-N).
+        """The `k` rows ranked highest (or lowest) by `by`.
+
+        Sugar for ``sort(by, descending).limit(k)`` — the engine fuses sort+limit to
+        a top-N.
+
+        Args:
+            k: The number of rows to keep.
+            by: The ranking key column(s).
+            descending: Rank highest-first (the default); ``False`` ranks lowest-first.
+
+        Returns:
+            A new `Dataset` with the top `k` rows.
 
         Examples:
             .. doctest::
@@ -1010,6 +1365,13 @@ class Dataset:
 
         Lowered to an equi-join on a constant key, so it reuses the join engine; the
         temporary key is dropped from the output (colliding names get `suffix`).
+
+        Args:
+            other: The right-hand dataset to pair every left row with.
+            suffix: Suffix appended to right columns whose names collide.
+
+        Returns:
+            A new `Dataset` of the Cartesian product.
 
         Examples:
             .. doctest::
@@ -1033,6 +1395,13 @@ class Dataset:
         Other columns repeat per element; null/empty lists produce no rows. The
         exploded column replaces `column` in place (renamed to `alias` if given) and
         streams (no breaker). Raises `PlanError` if `column` is not a column.
+
+        Args:
+            column: The list/array column to explode.
+            alias: Rename the exploded column to this name.
+
+        Returns:
+            A new `Dataset` with one row per list element.
 
         Examples:
             .. doctest::
@@ -1107,6 +1476,14 @@ class Dataset:
         deduplication (plain `distinct`); over a stream it runs the watermark-bounded
         driver. Consume with `iter_batches()` (or `for_each_batch`).
 
+        Args:
+            subset: The columns whose combination defines a duplicate.
+            event_time: The event-time column the watermark advances on.
+            lateness: How late a row may arrive and still be deduplicated (e.g. ``"10m"``).
+
+        Returns:
+            A new `Dataset` with duplicates removed within the watermark.
+
         Examples:
             .. doctest::
 
@@ -1152,6 +1529,15 @@ class Dataset:
         Composed from the window + group-by engine (no new operator), so it is
         differential-tested against DuckDB and runs single-node or distributed.
 
+        Args:
+            time_col: The event-time column that orders events into sessions.
+            gap: The maximum inter-arrival gap within a session (e.g. ``"10m"``).
+            partition_by: Columns whose groups sessionize independently.
+            **aggs: Named aggregate expressions computed per session.
+
+        Returns:
+            A new `Dataset` with one row per session.
+
         Examples:
             .. doctest::
 
@@ -1171,12 +1557,18 @@ class Dataset:
         return build_session_window(self, time_col, gap, partition_by or [], aggs)
 
     def unnest(self, *columns: str) -> Dataset:
-        """Expand each struct `column` into its fields as top-level columns
-        (Polars ``unnest``; Spark ``select("s.*")``).
+        """Expand each struct `column` into its fields as top-level columns.
 
-        Each struct field becomes a column where the struct was; non-struct columns
-        are unchanged. Raises `PlanError` if a column is not a struct or if an
-        expanded field name would collide with an existing column.
+        Matches Polars ``unnest`` / Spark ``select("s.*")``. Each struct field becomes
+        a column where the struct was; non-struct columns are unchanged. Raises
+        `PlanError` if a column is not a struct or if an expanded field name would
+        collide with an existing column.
+
+        Args:
+            *columns: The struct columns to expand.
+
+        Returns:
+            A new `Dataset` with each struct's fields promoted to columns.
 
         Examples:
             .. doctest::
@@ -1203,6 +1595,14 @@ class Dataset:
         breaker, each row kept iff its hash is under `fraction`); `n` keeps exactly
         the `n` smallest-hash rows (a breaker). Pass exactly one of `fraction`/`n`.
         With `seed=None` a fresh seed is baked at plan-build.
+
+        Args:
+            fraction: The fraction of rows to keep, in ``[0.0, 1.0]``.
+            n: An exact number of rows to keep (mutually exclusive with `fraction`).
+            seed: Seeds the sampling; ``None`` bakes a fresh seed at plan-build.
+
+        Returns:
+            A new `Dataset` of the sampled rows.
 
         Examples:
             .. doctest::
@@ -1231,6 +1631,16 @@ class Dataset:
         values are discovered by an eager pre-pass over `on`; pass `columns=[...]` to
         fix them (and avoid the pre-pass). Lowers to a grouped conditional aggregate.
 
+        Args:
+            index: The columns to group by (the output row key).
+            on: The column whose distinct values become output columns.
+            values: The column aggregated into each pivoted cell.
+            aggregate: The aggregate to apply — sum/mean/min/max/count.
+            columns: Fix the pivot values explicitly, skipping the discovery pre-pass.
+
+        Returns:
+            A new `Dataset` reshaped from long to wide.
+
         Examples:
             .. doctest::
 
@@ -1258,6 +1668,15 @@ class Dataset:
         (its value). Omit `on` to melt every non-`index` column, or omit `index` to
         keep every non-`on` column as an identifier. The `on` columns must share a type.
 
+        Args:
+            index: The identifier columns that repeat per melted column.
+            on: The columns to melt; ``None`` melts every non-`index` column.
+            variable_name: The name of the column holding each melted column's name.
+            value_name: The name of the column holding each melted value.
+
+        Returns:
+            A new `Dataset` reshaped from wide to long.
+
         Examples:
             .. doctest::
 
@@ -1274,12 +1693,34 @@ class Dataset:
         *,
         strategy: str | None = None,
         subset: list[str] | None = None,
+        order_by: list[str] | None = None,
+        partition_by: list[str] | None = None,
     ) -> Dataset:
         """Replace nulls with `value` (one for all columns, or a ``{col: value}`` dict).
 
-        Pass `strategy` instead of `value` to fill from a statistic: ``"mean"``,
-        ``"min"``, ``"max"`` (the column's whole-relation aggregate) or ``"zero"``.
-        `subset` limits a strategy fill to specific columns.
+        Pass `strategy` instead of `value` to fill from a statistic — ``"mean"``,
+        ``"min"``, ``"max"`` (the column's whole-relation aggregate) or ``"zero"`` — or
+        to carry a neighbouring value: ``"forward"`` / ``"backward"``. The carrying
+        strategies **require `order_by`**, because a fill moves values along a row order
+        and a relation has none by itself; `partition_by` keeps each series independent.
+        `subset` limits a strategy fill to specific columns; the `order_by` /
+        `partition_by` keys are never filled, being the frame of reference.
+
+        Args:
+            value: A fill value for every column, or a ``{column: value}`` mapping.
+            strategy: ``"zero"``, ``"mean"``, ``"min"``, ``"max"``, ``"forward"``, or
+                ``"backward"``. Mutually exclusive with `value`.
+            subset: Columns a strategy fill applies to; ``None`` means all of them.
+            order_by: Columns defining the row order the fill carries along. Required
+                for ``"forward"`` / ``"backward"``, ignored by the other strategies.
+            partition_by: Columns whose groups the fill must not cross.
+
+        Returns:
+            A new lazy `Dataset` with nulls replaced.
+
+        Raises:
+            PlanError: If both `value` and `strategy` are given, if neither is, if the
+                strategy is unknown, or if a carrying strategy has no `order_by`.
 
         Examples:
             .. doctest::
@@ -1288,11 +1729,17 @@ class Dataset:
                 >>> ds = bt.from_pydict({"x": [1, None, 3]})
                 >>> ds.fill_null(0).to_pydict()
                 {'x': [1, 0, 3]}
+
+                >>> readings = bt.from_pydict(
+                ...     {"t": [1, 2, 3, 4], "temp": [20.0, None, None, 23.0]}
+                ... )
+                >>> readings.fill_null(strategy="forward", order_by=["t"]).to_pydict()
+                {'t': [1, 2, 3, 4], 'temp': [20.0, 20.0, 20.0, 23.0]}
         """
         if strategy is not None:
             if value is not None:
                 raise PlanError("fill_null(): pass either `value` or `strategy`, not both")
-            return build_fill_null_strategy(self, strategy, subset)
+            return build_fill_null_strategy(self, strategy, subset, order_by, partition_by)
         if value is None:
             raise PlanError("fill_null(): provide a `value` or a `strategy`")
         return build_fill_null(self, value)
@@ -1326,6 +1773,13 @@ class Dataset:
         With `strict=False`, values that cannot be converted become NULL (DuckDB
         ``TRY_CAST``) instead of erroring the query — the safe-ingest spelling.
 
+        Args:
+            dtypes: One dtype for all columns, or a ``{column: dtype}`` mapping.
+            strict: Error on an invalid value (the default); ``False`` casts it to NULL.
+
+        Returns:
+            A new `Dataset` with the columns cast.
+
         Examples:
             .. doctest::
 
@@ -1341,6 +1795,13 @@ class Dataset:
 
         All datasets must have identical columns. Sources are merged so each
         side's scans resolve correctly.
+
+        Args:
+            *others: The datasets to concatenate; each must share this one's columns.
+            distinct: Deduplicate the result (UNION) instead of keeping all rows.
+
+        Returns:
+            A new `Dataset` concatenating the inputs.
 
         Examples:
             .. doctest::
@@ -1365,6 +1826,12 @@ class Dataset:
         nulls included — in both inputs is in the result. Returns distinct rows
         (INTERSECT ALL multiplicity is not supported).
 
+        Args:
+            other: The dataset to intersect with; must share this one's columns.
+
+        Returns:
+            A new `Dataset` of the distinct rows in both inputs.
+
         Examples:
             .. doctest::
 
@@ -1382,6 +1849,12 @@ class Dataset:
 
         NULLs compare equal (a wholly-null row in both inputs is excluded), matching
         SQL set semantics. Returns distinct rows (EXCEPT ALL is not supported).
+
+        Args:
+            other: The dataset whose rows to subtract; must share this one's columns.
+
+        Returns:
+            A new `Dataset` of the distinct rows in this but not `other`.
 
         Examples:
             .. doctest::
@@ -1438,11 +1911,13 @@ class Dataset:
         Returns:
             A new `Dataset` with at most `n` rows.
 
-        Example:
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"x": [1, 2, 3, 4, 5]})
-            >>> ds.sort("x").limit(2, offset=1).to_pydict()
-            {'x': [2, 3]}
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4, 5]})
+                >>> ds.sort("x").limit(2, offset=1).to_pydict()
+                {'x': [2, 3]}
         """
         if n < 0 or offset < 0:
             raise PlanError("limit() requires non-negative n and offset")
@@ -1470,6 +1945,38 @@ class Dataset:
         """
         return self.limit(n)
 
+    def tail(self, n: int = 5) -> Dataset:
+        """Keep the last `n` rows.
+
+        Unlike `head`, this needs to know how many rows there are, so it **executes a
+        `count` eagerly** (often answered from metadata with no scan) before building
+        the lazy plan that selects the trailing rows. Without a preceding `sort` the
+        rows are in an unspecified order.
+
+        Args:
+            n: Maximum number of rows to keep.
+
+        Returns:
+            A new `Dataset` with at most `n` rows.
+
+        Raises:
+            PlanError: If `n` is negative.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3, 4, 5]}).sort("x").tail(2).to_pydict()
+                {'x': [4, 5]}
+        """
+        if n < 0:
+            raise PlanError(f"tail(): n must be non-negative, got {n}")
+        total = self.count()
+        if n >= total:
+            return self
+        idx = "__bc_tail_idx"
+        return self.with_row_index(idx).filter(Col(idx) >= total - n).drop(idx)
+
     def join(
         self,
         other: Dataset,
@@ -1486,6 +1993,17 @@ class Dataset:
         `how` is one of inner/left/right/semi/anti. Output keeps the key columns
         (named after the left keys), then the remaining left columns, then the
         remaining right columns (colliding names get `suffix`).
+
+        Args:
+            other: The right-hand dataset.
+            on: Shared key column name(s) present on both sides.
+            left_on: The left key column(s), when the key names differ.
+            right_on: The right key column(s), when the key names differ.
+            how: The join type — inner/left/right/full/outer/semi/anti.
+            suffix: Suffix appended to right columns whose names collide.
+
+        Returns:
+            A new `Dataset` of the joined rows.
 
         Examples:
             .. doctest::
@@ -1550,6 +2068,19 @@ class Dataset:
         unbounded streams. Over bounded sources it is a plain inner join plus the
         interval filter. Consume the streaming result with `iter_batches()`.
 
+        Args:
+            other: The right-hand stream.
+            on: Shared equality key column name(s).
+            left_on: The left equality key(s), when the names differ.
+            right_on: The right equality key(s), when the names differ.
+            left_time: The left event-time column.
+            right_time: The right event-time column.
+            within: The maximum time difference for a pair to match (e.g. ``"1h"``).
+            lateness: Extra grace before evicting buffered state; ``None`` for none.
+
+        Returns:
+            A new `Dataset` of the interval-joined rows.
+
         Examples:
             .. doctest::
 
@@ -1606,11 +2137,27 @@ class Dataset:
         direction: str = "backward",
         suffix: str = "_right",
     ) -> Dataset:
-        """ASOF (nearest-match) join — match each left row to the right row whose `on`
-        key is nearest (``direction``: ``"backward"`` ≤, ``"forward"`` ≥), within the
-        same `by` group (exact). Left-style: every left row is kept (null right columns
-        when unmatched). Both sides should be sorted on `on` within `by` for the
-        intended semantics. Specify keys via `on`/`by` (shared) or `*_on`/`*_by`.
+        """ASOF (nearest-match) join — match each left row to the nearest right row.
+
+        The match is on the right row whose `on` key is nearest (`direction`:
+        ``"backward"`` ≤, ``"forward"`` ≥), within the same `by` group (exact).
+        Left-style: every left row is kept (null right columns when unmatched). Both
+        sides should be sorted on `on` within `by` for the intended semantics. Specify
+        keys via `on`/`by` (shared) or `*_on`/`*_by`.
+
+        Args:
+            other: The right-hand dataset to match against.
+            on: The shared nearest-match key column.
+            left_on: The left match key, when the names differ.
+            right_on: The right match key, when the names differ.
+            by: Shared exact-match grouping column(s).
+            left_by: The left grouping column(s), when the names differ.
+            right_by: The right grouping column(s), when the names differ.
+            direction: ``"backward"`` (≤) or ``"forward"`` (≥) nearest match.
+            suffix: Suffix appended to right columns whose names collide.
+
+        Returns:
+            A new `Dataset` with each left row matched to its nearest right row.
 
         Examples:
             .. doctest::
@@ -1642,6 +2189,13 @@ class Dataset:
         ``ds.group_by("dept").agg(total=col("salary").sum(), n=count())``.
         Global aggregation (no keys) is ``ds.group_by().agg(...)``.
 
+        Args:
+            *keys: Key columns by name.
+            **named: Derived key columns bound to expressions.
+
+        Returns:
+            A `GroupBy` to finish with ``.agg(...)``.
+
         Examples:
             .. doctest::
 
@@ -1668,11 +2222,19 @@ class Dataset:
                 raise PlanError(f"group_by() value for {alias!r} must be an expression")
         return GroupBy(self, keys, named)
 
-    def agg(self, **aggregates: Expr) -> Dataset:
+    def agg(self, *aggs: Expr, **aggregates: Expr) -> Dataset:
         """Aggregate over the whole dataset (no grouping).
 
         Shorthand for ``group_by().agg(...)``: ``ds.agg(total=col("x").sum())`` returns
-        a single-row dataset.
+        a single-row dataset. Positional args are self-naming aggregates —
+        ``ds.agg(bt.sum("x"), bt.mean("y"))`` keeps each source column's name.
+
+        Args:
+            *aggs: Self-naming aggregate expressions (e.g. ``bt.sum("x")``).
+            **aggregates: Named aggregate expressions over the whole dataset.
+
+        Returns:
+            A single-row `Dataset` of the aggregates.
 
         Examples:
             .. doctest::
@@ -1681,8 +2243,11 @@ class Dataset:
                 >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
                 >>> ds.agg(total=bt.col("x").sum()).to_pydict()
                 {'total': [10]}
+
+                >>> ds.agg(bt.sum("x")).to_pydict()
+                {'x': [10]}
         """
-        return self.group_by().agg(**aggregates)
+        return self.group_by().agg(*aggs, **aggregates)
 
     # --- terminal operations ----------------------------------------------
     def collect(
@@ -1714,6 +2279,18 @@ class Dataset:
         Raises `PlanError` if the dataset is unbounded (a streaming source) — use
         `iter_batches()` / `write()`.
 
+        Args:
+            distributed: ``"auto"`` uses Ray on a cluster; ``True``/``False`` force it.
+            num_workers: Worker fan-out; ``None`` sizes it from the data volume.
+            spill: Force out-of-core spilling on (it is automatic under pressure).
+            num_partitions: Override the shuffle bucket count.
+            adaptive: Enable intra-query re-optimization (``"auto"``/``True``/``False``).
+            transport: The shuffle transport; ``"auto"`` selects one.
+            backend: ``"cpu"``, ``"gpu"``, or ``"auto"`` to let Kyber's cost policy decide.
+
+        Returns:
+            The materialized result table.
+
         Examples:
             .. doctest::
 
@@ -1735,6 +2312,56 @@ class Dataset:
             cache=self._cache,
             backend=backend,
         )
+
+    def lineage(self) -> dict[str, list[str]]:
+        """Return, per output column, the source columns its values are derived from.
+
+        Column-level lineage, read straight off the plan — nothing executes. This is what
+        turns a governance tag into an answer: tag ``customers.ssn`` as PII, and lineage
+        names every downstream column that carries it.
+
+        Origins are rendered ``"<table>.<column>"``, where the table is the path a source
+        is read from. A column built only from literals, or generated (`with_row_index`),
+        has no origin and maps to an empty list.
+
+        Lineage tracks *data* flow, not control flow: filtering on a column does not put
+        it in the lineage of the surviving columns. An opaque `map_batches` stage is
+        over-approximated — every output column is assumed to derive from every input
+        column — because for a governance answer a false positive costs a review and a
+        false negative costs a breach.
+
+        Examples:
+            .. doctest::
+
+                >>> import os
+                >>> import tempfile
+
+                >>> import batcher as bt
+                >>> path = os.path.join(tempfile.mkdtemp(), "people.parquet")
+                >>> _ = bt.from_pydict({"first": ["a"], "last": ["b"], "age": [3]}).write(
+                ...     path, format="parquet"
+                ... )
+                >>> ds = bt.read.parquet(path).select(
+                ...     name=bt.concat(bt.col("first"), bt.col("last")),
+                ...     decade=bt.col("age") / 10,
+                ... )
+                >>> sorted(ds.lineage()["name"]) == sorted(
+                ...     [f"{path}.first", f"{path}.last"]
+                ... )
+                True
+
+        Returns:
+            A mapping from output column name to its sorted ``"table.column"`` origins.
+        """
+        from batcher.api.security import table_name
+        from batcher.governance import column_lineage
+
+        tables = [table_name(s) or f"<source {i}>" for i, s in enumerate(self._sources)]
+        lineage = column_lineage(self._plan, tables)
+        return {
+            alias: sorted(f"{table}.{column}" for table, column in origins)
+            for alias, origins in lineage.items()
+        }
 
     def explain(self, analyze: bool = False, *, format: str = "text") -> str:
         """Return the query plan as a tree, optionally with measured execution profile.
@@ -1775,8 +2402,15 @@ class Dataset:
         answer to "where is my time going"). Not available for `map_batches`/ML
         pipelines (raises `BackendError`).
 
-        Example:
-            >>> print(ds.group_by("k").agg(s=col("v").sum()).stats())  # doctest: +SKIP
+        Returns:
+            The measured per-operator run statistics.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"k": ["a", "a", "b"], "v": [1, 2, 3]})
+                >>> print(ds.group_by("k").agg(s=bt.col("v").sum()).stats())  # doctest: +SKIP
         """
         return _stats(self._plan, self._sources, self.columns)
 
@@ -1787,6 +2421,9 @@ class Dataset:
         exact — ``ds.limit(n).count()`` is ``min(n, ds.count())``, a global
         aggregate is ``1``, an empty source is ``0`` — and falls back to a full
         run otherwise. The result is always identical to executing.
+
+        Returns:
+            The number of result rows.
 
         Examples:
             .. doctest::
@@ -1803,6 +2440,9 @@ class Dataset:
         Answered from metadata when the row count is provably known; otherwise a
         single-row probe (which the streaming path reads without scanning the
         whole source).
+
+        Returns:
+            ``True`` if the result has no rows.
 
         Examples:
             .. doctest::
@@ -1821,6 +2461,9 @@ class Dataset:
         column types via a zero-row execution. Use `columns` for just the names
         (always free).
 
+        Returns:
+            The output Arrow schema.
+
         Examples:
             .. doctest::
 
@@ -1833,6 +2476,9 @@ class Dataset:
     @property
     def dtypes(self) -> list[pa.DataType]:
         """The output column Arrow types, in order (see `schema`).
+
+        Returns:
+            The output column Arrow types, in order.
 
         Examples:
             .. doctest::
@@ -1942,6 +2588,203 @@ class Dataset:
         answer = metadata_n_unique(self._plan, self._sources, column)
         return answer if answer is not None else int(self._exec_scalar(Col(column).n_unique()))
 
+    def median(self, column: str) -> Any:
+        """The exact median of `column` (SQL ``MEDIAN``), ignoring nulls.
+
+        A scalar terminal, exact rather than sketched — use `approx_median` on a large
+        column when a bounded-error answer is enough and a sort is not affordable.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The median value, or ``None`` for an empty/all-null column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 5, 2, 4, 3]}).median("x")
+                3.0
+        """
+        self._require_column(column, "median")
+        return self._exec_scalar(Col(column).median())
+
+    def mean(self, column: str) -> Any:
+        """The arithmetic mean of `column` (SQL ``AVG``), ignoring nulls.
+
+        A scalar terminal, the whole-dataset counterpart of
+        ``group_by(...).mean()``; runs one aggregate pass.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The mean value, or ``None`` for an empty/all-null column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3, 4]}).mean("x")
+                2.5
+        """
+        self._require_column(column, "mean")
+        return self._exec_scalar(Col(column).mean())
+
+    def sum(self, column: str) -> Any:
+        """The sum of `column` (SQL ``SUM``), ignoring nulls.
+
+        A scalar terminal; runs one aggregate pass. An empty or all-null column sums
+        to ``None`` (matching SQL), not ``0``.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The sum, or ``None`` for an empty/all-null column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3, 4]}).sum("x")
+                10
+        """
+        self._require_column(column, "sum")
+        return self._exec_scalar(Col(column).sum())
+
+    def std(self, column: str) -> Any:
+        """The sample standard deviation of `column` (SQL ``STDDEV_SAMP``), ignoring nulls.
+
+        A scalar terminal; runs one aggregate pass. Fewer than two non-null values
+        yields ``None``.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The sample standard deviation, or ``None`` when undefined.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [2, 4, 4, 4, 5, 5, 7, 9]}).std("x")
+                2.138089935299395
+        """
+        self._require_column(column, "std")
+        return self._exec_scalar(Col(column).std())
+
+    def var(self, column: str) -> Any:
+        """The sample variance of `column` (SQL ``VAR_SAMP``), ignoring nulls.
+
+        A scalar terminal; runs one aggregate pass. Fewer than two non-null values
+        yields ``None``.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The sample variance, or ``None`` when undefined.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3, 4, 5]}).var("x")
+                2.5
+        """
+        self._require_column(column, "var")
+        return self._exec_scalar(Col(column).var())
+
+    def quantile(self, column: str, q: float) -> Any:
+        """The exact `q`-quantile of `column` (SQL ``QUANTILE_CONT``), ignoring nulls.
+
+        The exact counterpart of `approx_quantile`, which answers from a mergeable
+        TDigest instead.
+
+        Args:
+            column: The column to reduce.
+            q: The quantile to compute, in ``[0, 1]`` (``0.5`` is the median).
+
+        Returns:
+            The quantile value, or ``None`` for an empty/all-null column.
+
+        Raises:
+            PlanError: If `q` is outside ``[0, 1]``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3, 4]}).quantile("x", 0.25)
+                1.75
+        """
+        self._require_column(column, "quantile")
+        if not 0.0 <= q <= 1.0:
+            raise PlanError(f"quantile(): q must be in [0, 1], got {q}")
+        return self._exec_scalar(Col(column).quantile(q))
+
+    def corr(self, x: str, y: str) -> float | None:
+        """The Pearson correlation of columns `x` and `y` (SQL ``CORR``).
+
+        A scalar terminal. Rows where either column is null are ignored; the result is
+        ``None`` when fewer than two such rows remain, or when either column is constant.
+
+        Args:
+            x: The first column.
+            y: The second column.
+
+        Returns:
+            The correlation coefficient in ``[-1, 1]``, or ``None``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"a": [1, 2, 3], "b": [2, 4, 6]}).corr("a", "b")
+                1.0
+        """
+        from batcher.plan.functions.aggregate import corr
+
+        self._require_column(x, "corr")
+        self._require_column(y, "corr")
+        return self._exec_scalar(corr(Col(x), Col(y)))
+
+    def cov(self, x: str, y: str, *, ddof: int = 1) -> float | None:
+        """The covariance of columns `x` and `y` (SQL ``COVAR_SAMP``/``COVAR_POP``).
+
+        A scalar terminal. Rows where either column is null are ignored.
+
+        Args:
+            x: The first column.
+            y: The second column.
+            ddof: Delta degrees of freedom — ``1`` for the sample covariance (the
+                default, ``COVAR_SAMP``) or ``0`` for the population one (``COVAR_POP``).
+
+        Returns:
+            The covariance, or ``None`` when too few non-null row pairs remain.
+
+        Raises:
+            PlanError: If `ddof` is neither 0 nor 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"a": [1, 2, 3], "b": [2, 4, 6]}).cov("a", "b")
+                2.0
+        """
+        from batcher.plan.functions.aggregate import covar_pop, covar_samp
+
+        self._require_column(x, "cov")
+        self._require_column(y, "cov")
+        if ddof not in (0, 1):
+            raise PlanError(f"cov(): ddof must be 0 (population) or 1 (sample), got {ddof}")
+        fn = covar_samp if ddof == 1 else covar_pop
+        return self._exec_scalar(fn(Col(x), Col(y)))
+
     def n_null(self, column: str) -> int:
         """The exact number of null values in `column` (``count(*) - count(column)``).
 
@@ -2026,26 +2869,15 @@ class Dataset:
         nulls, total = self._exec_null_total(column)
         return total > 0 and nulls == total
 
-    def any(self) -> bool:
+    @property
+    def has_rows(self) -> bool:
         """Whether the result has at least one row (the complement of `is_empty`).
 
         Answered from metadata when the row count is provably known, else a single-row
         probe (which the streaming path reads without scanning the whole source).
 
-        Examples:
-            .. doctest::
-
-                >>> import batcher as bt
-                >>> bt.from_pydict({"x": [1, 2, 3]}).any()
-                True
-                >>> bt.from_pydict({"x": [1]}).filter(bt.col("x") > 10).any()
-                False
-        """
-        return not self.is_empty()
-
-    @property
-    def has_rows(self) -> bool:
-        """Whether the result has at least one row — property form of `any`.
+        Returns:
+            ``True`` if the result has at least one row.
 
         Examples:
             .. doctest::
@@ -2053,6 +2885,8 @@ class Dataset:
                 >>> import batcher as bt
                 >>> bt.from_pydict({"x": [1, 2, 3]}).has_rows
                 True
+                >>> bt.from_pydict({"x": [1]}).filter(bt.col("x") > 10).has_rows
+                False
         """
         return not self.is_empty()
 
@@ -2095,6 +2929,16 @@ class Dataset:
         than the exact sort `quantile` would need. Returns ``None`` for a non-numeric
         or empty column. Use the exact aggregate when precision matters.
 
+        Args:
+            column: The numeric column to summarize.
+            q: The quantile to estimate, in ``[0, 1]``.
+
+        Returns:
+            The approximate quantile value, or ``None`` for a non-numeric/empty column.
+
+        Raises:
+            PlanError: If `q` is outside ``[0, 1]``.
+
         Examples:
             .. doctest::
 
@@ -2120,6 +2964,12 @@ class Dataset:
 
     def approx_median(self, column: str) -> float | None:
         """Approximate median of a numeric `column` — `approx_quantile(column, 0.5)`.
+
+        Args:
+            column: The numeric column to summarize.
+
+        Returns:
+            The approximate median, or ``None`` if unavailable.
 
         Examples:
             .. doctest::
@@ -2178,6 +3028,15 @@ class Dataset:
         reducer bucket at a time, so the driver never holds the whole distributed
         result — the bounded-memory way to pull a large distributed output.
 
+        Args:
+            batch_size: Rebatch the output to this many rows; ``None`` keeps engine batches.
+            distributed: Fan a top-level breaker across Ray workers (``True``/``"auto"``).
+            num_workers: Worker fan-out for the distributed path.
+            transport: The shuffle transport; ``"auto"`` selects one.
+
+        Yields:
+            The result as Arrow record batches.
+
         Examples:
             .. doctest::
 
@@ -2200,9 +3059,14 @@ class Dataset:
 
     @property
     def write(self) -> Writer:
-        """The write namespace: ``ds.write(path)`` autodetects the sink format from the
-        path; ``ds.write.<format>(...)`` (``parquet``/``delta``/…) is explicit. All
-        accept `partition_by=`/`distributed=`/`num_workers=` and return a `WriteManifest`.
+        """The write namespace — ``ds.write(path)`` writes, ``ds.write.<format>(...)`` is explicit.
+
+        ``ds.write(path)`` autodetects the sink format from the path;
+        ``ds.write.parquet(...)`` / ``ds.write.delta(...)`` name it. All accept
+        `partition_by=`/`distributed=`/`num_workers=` and return a `WriteManifest`.
+
+        Returns:
+            The `Writer` namespace bound to this dataset.
 
         Examples:
             .. doctest::
@@ -2316,6 +3180,13 @@ class Dataset:
         columns are skipped). Re-iterating runs the query again, so it is safe for
         multi-epoch training and streams in bounded memory. Needs `torch`.
 
+        Args:
+            columns: The columns to include; ``None`` uses all numeric columns.
+            batch_size: Rows per emitted tensor batch; ``None`` uses engine batches.
+
+        Returns:
+            A re-iterable ``torch.utils.data.IterableDataset`` of tensor dicts.
+
         Examples:
             .. doctest::
 
@@ -2337,6 +3208,14 @@ class Dataset:
         ``batch_size=None``; pass `batch_size` to size engine batches and forward
         any other `DataLoader` kwargs (`num_workers`, `pin_memory`, …). Needs `torch`.
 
+        Args:
+            columns: The columns to include; ``None`` uses all numeric columns.
+            batch_size: Rows per engine batch; ``None`` keeps the engine's batching.
+            **dl_kwargs: Extra ``DataLoader`` kwargs (``num_workers``, ``pin_memory``, …).
+
+        Returns:
+            A ``torch.utils.data.DataLoader`` over the tensor dicts.
+
         Examples:
             .. doctest::
 
@@ -2354,6 +3233,13 @@ class Dataset:
 
         Each element is one engine batch's numeric columns as TensorFlow tensors;
         non-numeric columns are skipped.
+
+        Args:
+            columns: The columns to include; ``None`` uses all numeric columns.
+            batch_size: Rows per emitted tensor batch; ``None`` uses engine batches.
+
+        Returns:
+            A re-iterable ``tf.data.Dataset`` of tensor dicts.
 
         Examples:
             .. doctest::

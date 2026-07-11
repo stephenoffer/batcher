@@ -14,6 +14,7 @@ distribute fall back to the multi-core single-node engine.
 from __future__ import annotations
 
 from batcher.dist.executor import execute_distributed
+from batcher.dist.executors.plan_analysis import requires_staging
 from batcher.dist.executors.ray_runtime import cluster_topology, resolve_transport
 
-__all__ = ["cluster_topology", "execute_distributed", "resolve_transport"]
+__all__ = ["cluster_topology", "execute_distributed", "requires_staging", "resolve_transport"]

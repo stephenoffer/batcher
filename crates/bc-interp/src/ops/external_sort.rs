@@ -31,10 +31,11 @@ pub(crate) fn external_merge_sort(
     dir: &std::path::Path,
     sort_merge_fanin: usize,
     codec: bc_runtime::agg::spill::SpillCodec,
-) -> Result<Vec<RecordBatch>, InterpError> {
-    let Some(mut store) = external_sort_to_final_store(parts, keys, dir, sort_merge_fanin, codec)?
+) -> Result<(Vec<RecordBatch>, u64), InterpError> {
+    let Some((mut store, spill_bytes)) =
+        external_sort_to_final_store(parts, keys, dir, sort_merge_fanin, codec)?
     else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     };
     // The final run holds the globally sorted result; stream its morsels out.
     let mut out = Vec::new();
@@ -46,7 +47,7 @@ pub(crate) fn external_merge_sort(
             }
         }
     }
-    Ok(out)
+    Ok((out, spill_bytes))
 }
 
 /// Spill + bounded multi-pass merge, returning the final [`DiskSpillStore`] whose
@@ -60,7 +61,7 @@ pub(crate) fn external_sort_to_final_store(
     dir: &std::path::Path,
     sort_merge_fanin: usize,
     codec: bc_runtime::agg::spill::SpillCodec,
-) -> Result<Option<bc_runtime::agg::spill::DiskSpillStore>, InterpError> {
+) -> Result<Option<(bc_runtime::agg::spill::DiskSpillStore, u64)>, InterpError> {
     use bc_runtime::agg::spill::{DiskSpillStore, SpillStore};
 
     // Pass 0: sort each input morsel into a run and spill it, dropping each input
@@ -80,6 +81,9 @@ pub(crate) fn external_sort_to_final_store(
     if n_runs == 0 {
         return Ok(None);
     }
+    // Pass-0 wrote the whole input to sorted runs; that is the representative spill volume
+    // (merge passes re-spill subsets of it). Captured before the merge loop reassigns `store`.
+    let spill_bytes = store.spilled_bytes();
 
     // Merge passes: each merges groups of <= `fanin` runs into one larger (spilled)
     // run, streaming so only one batch per run is resident. Repeats until a single run
@@ -104,7 +108,7 @@ pub(crate) fn external_sort_to_final_store(
         store = next;
         n_runs = n_groups;
     }
-    Ok(Some(store))
+    Ok(Some((store, spill_bytes)))
 }
 
 /// A streaming reader over one spilled run's batches.

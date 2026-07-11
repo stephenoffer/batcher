@@ -159,13 +159,33 @@ def cluster_topology() -> dict:
         import ray
 
         nodes = _worker_eligible([n for n in ray.nodes() if n.get("Alive", True)])
-    # CPU/GPU summed over the worker-eligible nodes (head excluded), so a CPU-driven fit
-    # never counts cores no worker will run on — consistent with the head-excluded `nodes`.
+    # CPU/GPU/memory summed over the worker-eligible nodes (head excluded), so a CPU- or
+    # memory-driven fit never counts a resource no worker will run on — consistent with the
+    # head-excluded `nodes`. `min_node_memory` is the smallest worker node's RAM: the
+    # SPREAD-safe per-worker memory ceiling (a grant sized above it would OOM the smallest
+    # node it lands on), the hardware fact Carbonite sizes the distributed spill budget from.
+    mem = [float(n.get("Resources", {}).get("memory", 0.0)) for n in nodes]
     return {
         "nodes": max(1, len(nodes)),
         "cpus": sum(float(n.get("Resources", {}).get("CPU", 0.0)) for n in nodes),
         "gpus": sum(float(n.get("Resources", {}).get("GPU", 0.0)) for n in nodes),
+        "memory": sum(mem),
+        "min_node_memory": min((m for m in mem if m > 0), default=0.0),
     }
+
+
+def worker_node_memory_bytes() -> int:
+    """The smallest worker node's RAM in bytes — the per-worker memory ceiling for a SPREAD
+    fleet — or ``0`` when unknown (Ray down / no memory resource advertised).
+
+    This is the hardware fact the distributed memory budget must respect: the driver may be a
+    large box (e.g. a 197 GiB head) while workers are small (e.g. 34 GiB), so a budget sized
+    from the driver's RAM would over-commit every worker. Sizing from the *worker* node keeps
+    a distributed operator's spill threshold within the machine it actually runs on."""
+    try:
+        return int(cluster_topology().get("min_node_memory", 0.0))
+    except Exception:
+        return 0
 
 
 def node_classes() -> list[dict]:

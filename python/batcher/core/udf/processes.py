@@ -19,6 +19,8 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import pyarrow as pa
 
+from batcher._internal.hardware import available_cpu_count
+
 __all__ = ["run_map_processes", "shutdown_pool"]
 
 
@@ -131,7 +133,7 @@ def _input_shards(batches: list[pa.RecordBatch], nshards: int) -> tuple[list[str
     shard_size = -(-len(batches) // nshards)  # ceil-divide
     groups = [batches[g : g + shard_size] for g in range(0, len(batches), shard_size)]
     paths = [f"{stem}_{g}.arrow" for g in range(len(groups))]
-    with ThreadPoolExecutor(max_workers=min(len(groups), os.cpu_count() or 1)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(groups), available_cpu_count())) as pool:
         list(pool.map(_write_shard, paths, groups))
     return paths, shard_size
 
@@ -148,7 +150,7 @@ def run_map_processes(
     `fn` and a shard path cross to the child; the results cross back over the pool. The pool
     is process-wide and reused, so there is no per-call startup cost.
     """
-    n_procs = max(1, min(num_workers, len(batches), os.cpu_count() or 1))
+    n_procs = max(1, min(num_workers, len(batches), available_cpu_count()))
     pool = _persistent_pool(n_procs)
     paths, _size = _input_shards(batches, n_procs)
     try:

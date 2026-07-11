@@ -16,6 +16,27 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::store::PartitionStore;
 
+/// The gRPC metadata key a `DoGet` caller presents its shuffle token under.
+pub(crate) const AUTH_HEADER: &str = "authorization";
+/// The scheme prefix of that header's value (`Bearer <token>`).
+pub(crate) const AUTH_SCHEME: &str = "Bearer ";
+
+/// Whether `provided` equals `expected`, compared in time independent of how many
+/// leading bytes agree.
+///
+/// A short-circuiting `==` leaks, one failed request at a time, how long a common prefix
+/// the guess shares with the real token — enough to recover it byte by byte over a
+/// network an attacker can time. Length is not secret (it is fixed by the deployment), so
+/// comparing lengths first is fine.
+fn token_matches(provided: &str, expected: &str) -> bool {
+    provided.len() == expected.len()
+        && provided
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
 /// The [`FlightService`] implementation backing a [`FlightServer`].
 ///
 /// [`FlightServer`]: crate::FlightServer
@@ -51,6 +72,22 @@ impl FlightService for FlightHandler {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        // Auth (N5): `do_get` shares the service and ticket space with `do_exchange`, so it
+        // must enforce the same token — otherwise enabling `shuffle_token` protects the
+        // credited path while leaving this one an open read of every partition. A `Ticket`
+        // has no path field to carry the token (unlike `do_exchange`'s descriptor), so it
+        // rides in the request's `authorization` metadata as `Bearer <token>`.
+        if let Some(expected) = &self.token {
+            let provided = request
+                .metadata()
+                .get(AUTH_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix(AUTH_SCHEME))
+                .unwrap_or("");
+            if !token_matches(provided, expected) {
+                return Err(Status::unauthenticated("shuffle token mismatch"));
+            }
+        }
         let ticket = String::from_utf8(request.into_inner().ticket.to_vec())
             .map_err(|e| Status::invalid_argument(format!("ticket not valid utf-8: {e}")))?;
 
@@ -168,8 +205,7 @@ impl FlightService for FlightHandler {
             })?;
 
         // Auth (N5): when a token is configured, the consumer must present a matching
-        // one in path[1]. A constant-time-ish compare avoids leaking length via early
-        // exit on the (tiny) token; mismatch is rejected before any data is served.
+        // one in path[1]. Rejected before any data is served.
         if let Some(expected) = &self.token {
             let provided = first
                 .flight_descriptor
@@ -177,13 +213,7 @@ impl FlightService for FlightHandler {
                 .and_then(|d| d.path.get(1))
                 .map(String::as_str)
                 .unwrap_or("");
-            if provided.len() != expected.len()
-                || provided
-                    .bytes()
-                    .zip(expected.bytes())
-                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                    != 0
-            {
+            if !token_matches(provided, expected) {
                 return Err(Status::unauthenticated("shuffle token mismatch"));
             }
         }
@@ -236,6 +266,7 @@ impl FlightService for FlightHandler {
                     Ok(data) => {
                         let granted = decode_credits(&data.app_metadata);
                         if granted > 0 {
+                            gauge_for_pump.on_grant_message();
                             for _ in 0..granted {
                                 gauge_for_pump.on_ack();
                             }

@@ -17,6 +17,7 @@ avoid an import-time cycle.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Union
 
@@ -25,15 +26,18 @@ from batcher.plan.ir_tags import ExprTag
 from batcher.plan.types import CAST_DTYPES
 
 if TYPE_CHECKING:
+    from batcher.plan.expr_ir.audio import _AudioNamespace
     from batcher.plan.expr_ir.image import _ImageNamespace
     from batcher.plan.expr_ir.namespaces import (
         _DtNamespace,
         _JsonNamespace,
         _ListNamespace,
+        _MapNamespace,
         _StrNamespace,
         _StructNamespace,
     )
     from batcher.plan.expr_ir.nodes import WindowExpr
+    from batcher.plan.expr_ir.video import _VideoNamespace
 
 # A value that can be promoted to an expression: another Expr or a Python scalar.
 IntoExpr = Union["Expr", int, float, bool, str]
@@ -41,6 +45,24 @@ IntoExpr = Union["Expr", int, float, bool, str]
 
 def _wrap(value: IntoExpr) -> Expr:
     return value if isinstance(value, Expr) else Lit(value)
+
+
+def _cut_labels(edges: list[float], left_closed: bool) -> list[str]:
+    """Interval notation for `Expr.cut`'s bins, e.g. ``["(-inf, 1]", "(1, inf]"]``."""
+    bounds = [float("-inf"), *edges, float("inf")]
+    open_, close = ("[", ")") if left_closed else ("(", "]")
+    return [
+        f"{open_}{_cut_edge(lo)}, {_cut_edge(hi)}{close}" for lo, hi in itertools.pairwise(bounds)
+    ]
+
+
+def _cut_edge(value: float) -> str:
+    """Render a bin edge: infinities by name, and whole floats without a `.0` tail."""
+    if value == float("-inf"):
+        return "-inf"
+    if value == float("inf"):
+        return "inf"
+    return str(int(value)) if value.is_integer() else str(value)
 
 
 class Expr:
@@ -51,15 +73,24 @@ class Expr:
     serialized via :meth:`to_ir` to the JSON the Rust ``bc-expr`` engine evaluates —
     no Python touches a row. Methods come in families: arithmetic/comparison/boolean
     operators, math functions (``sqrt``, ``ln``, ``sin``, …), null/NaN predicates
-    (``is_null``, ``is_nan``, ``fill_null``), aggregates for ``group_by().agg(...)``
-    / ``.over(...)`` (``sum``, ``mean``, ``count``, …), cumulative window helpers
-    (``cum_sum``, ``shift``), and the typed accessor namespaces (``.str``, ``.dt``,
-    ``.list``, ``.struct``, ``.json``, ``.image``, ``.audio``, ``.video``, ``.map``)
-    that hold the per-type breadth.
+    (``is_null``, ``is_nan``, ``fill_null``, ``fill_nan``), aggregates for
+    ``group_by().agg(...)`` / ``.over(...)`` (``sum``, ``mean``, ``count``, …), window
+    helpers (``cum_sum``, ``shift``, ``diff``, ``pct_change``, ``rank``,
+    ``rolling_mean``, ``is_unique``), and the typed accessor namespaces (``.str``,
+    ``.dt``, ``.list``, ``.struct``, ``.json``, ``.image``, ``.audio``, ``.video``,
+    ``.map``) that hold the per-type breadth.
 
     Subclasses are the concrete IR nodes (``Lit``, ``Binary``, ``MathExpr``, …); user
     code constructs expressions through ``col``/``lit`` and these methods, not the
     node classes directly.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, 2], "y": [10, 20]})
+            >>> ds.select(z=bt.col("x") * bt.col("y") + 1).to_pydict()
+            {'z': [11, 41]}
     """
 
     # --- serialization -----------------------------------------------------
@@ -69,6 +100,16 @@ class Expr:
         Each node emits ``{"e": <tag>, ...}`` matching the ``bc_expr::Expr`` serde
         tags the Rust interpreter and JIT deserialize. Overridden by every subclass;
         the base raises ``NotImplementedError``. Internal — not part of the user API.
+
+        Returns:
+            The node's JSON IR dict, tagged with its ``"e"`` wire kind.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.col("x").to_ir()
+                {'e': 'col', 'name': 'x'}
         """
         raise NotImplementedError
 
@@ -100,6 +141,12 @@ class Expr:
     # Expr is used for plan building, not as a dict key; make that explicit.
     __hash__ = None  # type: ignore[assignment]
 
+    def __repr__(self) -> str:
+        """A source-like rendering of the expression, e.g. ``(col('x') + lit(1))``."""
+        from batcher.plan.expr_ir.render import render_expr
+
+        return render_expr(self)
+
     # --- arithmetic operators ---------------------------------------------
     def __add__(self, other: IntoExpr) -> Expr:
         """Element-wise addition (``a + b``); also the string-concat operator on Utf8."""
@@ -114,8 +161,13 @@ class Expr:
         return Binary("mul", self, _wrap(other))
 
     def __truediv__(self, other: IntoExpr) -> Expr:
-        """Element-wise true division (``a / b``, → Float64); ``//`` is :meth:`__floordiv__`."""
-        return Binary("div", self, _wrap(other))
+        """Element-wise true division (``a / b``, → Float64); ``//`` is :meth:`__floordiv__`.
+
+        The numerator is cast to Float64 so integer operands divide *truly*
+        (``1 / 2`` is ``0.5``, as in Python, Polars and DuckDB) rather than
+        truncating. Desugars to existing ops — no new IR — and the cast is free when
+        the input is already Float64."""
+        return Binary("div", self.cast("float64"), _wrap(other))
 
     def __mod__(self, other: IntoExpr) -> Expr:
         """Element-wise modulo / remainder (``a % b``)."""
@@ -136,7 +188,7 @@ class Expr:
 
     def __rtruediv__(self, other: IntoExpr) -> Expr:
         """Reflected true division so ``scalar / expr`` works (→ Float64)."""
-        return Binary("div", _wrap(other), self)
+        return Binary("div", _wrap(other).cast("float64"), self)
 
     def __rmod__(self, other: IntoExpr) -> Expr:
         """Reflected modulo so ``scalar % expr`` works."""
@@ -234,9 +286,18 @@ class Expr:
         """Reflected bitwise XOR so ``scalar ^ expr`` works (operands cast to Int64)."""
         return Binary("bit_xor", _wrap(other), self)
 
+    def __rlshift__(self, other: IntoExpr) -> Expr:
+        """Reflected left shift so ``scalar << expr`` works."""
+        return Binary("shift_left", _wrap(other), self)
+
+    def __rrshift__(self, other: IntoExpr) -> Expr:
+        """Reflected right shift so ``scalar >> expr`` works."""
+        return Binary("shift_right", _wrap(other), self)
+
     def __getitem__(self, key: int | slice | str) -> Expr:
-        """Index into a list or struct column with ``[]`` — the idiomatic spelling of
-        the ``.list``/``.struct`` accessors it delegates to.
+        """Index into a list or struct column with ``[]`` (delegates to ``.list``/``.struct``).
+
+        The idiomatic spelling of the accessors:
 
         - ``col("a")[2]`` → list element at index 2 (negative counts from the end),
           equivalent to ``col("a").list.get(2)``.
@@ -244,6 +305,25 @@ class Expr:
           ``col("a").list.slice(1, 2)`` (a ``step`` other than 1 raises).
         - ``col("s")["field"]`` → struct field, equivalent to
           ``col("s").struct.field("field")``.
+
+        Args:
+            key: An int list index, a slice for a list sub-range, or a str struct
+                field name.
+
+        Returns:
+            A new expression selecting the indexed element, sub-range, or field.
+
+        Raises:
+            PlanError: If `key` is a bool, has an unsupported type, or is a slice with
+                a step other than 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[10, 20, 30]]})
+                >>> ds.select(r=bt.col("a")[1]).to_pydict()
+                {'r': [20]}
         """
         from batcher.plan.expr_ir.func_nodes import ListGet, ListSlice, StructField
 
@@ -269,6 +349,12 @@ class Expr:
         the ``&`` operator which is boolean AND on predicates. The method spelling is
         unambiguous; nulls propagate.
 
+        Args:
+            other: The right-hand integer expression.
+
+        Returns:
+            A new integer expression of the bitwise AND.
+
         Examples:
             .. doctest::
 
@@ -281,6 +367,12 @@ class Expr:
 
     def bitwise_or(self, other: IntoExpr) -> Expr:
         """Bitwise OR ``self | other`` of two integers (per-row; Int64; nulls propagate).
+
+        Args:
+            other: The right-hand integer expression.
+
+        Returns:
+            A new integer expression of the bitwise OR.
 
         Examples:
             .. doctest::
@@ -295,6 +387,12 @@ class Expr:
     def bitwise_xor(self, other: IntoExpr) -> Expr:
         """Bitwise XOR ``self ^ other`` of two integers (per-row; Int64; nulls propagate).
 
+        Args:
+            other: The right-hand integer expression.
+
+        Returns:
+            A new integer expression of the bitwise XOR.
+
         Examples:
             .. doctest::
 
@@ -308,6 +406,12 @@ class Expr:
     def bitwise_left_shift(self, other: IntoExpr) -> Expr:
         """Left-shift this integer expression by `other` bits (per-row; Int64; nulls propagate).
 
+        Args:
+            other: The integer shift amount, in bits.
+
+        Returns:
+            A new integer expression of the left-shifted values.
+
         Examples:
             .. doctest::
 
@@ -320,6 +424,12 @@ class Expr:
 
     def bitwise_right_shift(self, other: IntoExpr) -> Expr:
         """Right-shift this integer expression by `other` bits (per-row; Int64; nulls propagate).
+
+        Args:
+            other: The integer shift amount, in bits.
+
+        Returns:
+            A new integer expression of the right-shifted values.
 
         Examples:
             .. doctest::
@@ -342,6 +452,12 @@ class Expr:
         reads it. `select`/`with_columns` keyword binding remains the canonical
         spelling — this is not a second way to project, only a positional name.
 
+        Args:
+            name: The output name to bind to this expression.
+
+        Returns:
+            The expression tagged with `name` for a positional `select`.
+
         Examples:
             .. doctest::
 
@@ -360,6 +476,12 @@ class Expr:
         failing opaquely in the engine mid-query. A value that cannot be converted
         errors the query (DuckDB ``CAST``); use `try_cast` to get NULL instead.
 
+        Args:
+            dtype: Target Arrow type name (e.g. ``"int64"``, ``"float64"``, ``"string"``).
+
+        Returns:
+            A new expression of the converted values.
+
         Examples:
             .. doctest::
 
@@ -371,12 +493,17 @@ class Expr:
         return self._cast(dtype, try_cast=False)
 
     def try_cast(self, dtype: str) -> Cast:
-        """Cast to an Arrow type by name, yielding NULL for values that cannot be
-        converted (DuckDB ``TRY_CAST``) instead of erroring the query.
+        """Cast to an Arrow type by name; unconvertible values become NULL (DuckDB ``TRY_CAST``).
 
         The common safe-ingest spelling: ``col("x").try_cast("int64")`` turns a
         dirty string column into integers, with unparseable values becoming NULL
         (ready to `drop_nulls` or route to a quarantine sink).
+
+        Args:
+            dtype: Target Arrow type name (e.g. ``"int64"``, ``"float64"``, ``"string"``).
+
+        Returns:
+            A new expression of the converted values, NULL where conversion fails.
 
         Examples:
             .. doctest::
@@ -403,6 +530,9 @@ class Expr:
         A boolean expression that never itself yields null — a null input maps to
         true. Distinct from :meth:`is_nan`, which is the float-only NaN notion.
 
+        Returns:
+            A boolean expression, true where the value is null.
+
         Examples:
             .. doctest::
 
@@ -415,6 +545,9 @@ class Expr:
 
     def is_not_null(self) -> IsNotNull:
         """True where the value is non-NULL (SQL ``IS NOT NULL``); negation of :meth:`is_null`.
+
+        Returns:
+            A boolean expression, true where the value is non-null.
 
         Examples:
             .. doctest::
@@ -432,6 +565,12 @@ class Expr:
         Desugars to an OR of equality checks, so it follows SQL three-valued
         logic (``NULL IN (...)`` is NULL) and an empty collection is always false.
 
+        Args:
+            values: The scalars or expressions to test membership against.
+
+        Returns:
+            A boolean expression, true where the value is in `values`.
+
         Examples:
             .. doctest::
 
@@ -448,17 +587,24 @@ class Expr:
             expr = expr | (self == v)
         return expr
 
-    def between(self, low: IntoExpr, high: IntoExpr) -> Expr:
-        """``self BETWEEN low AND high`` (inclusive on both bounds), matching SQL/DuckDB.
+    def between(self, low: IntoExpr, high: IntoExpr, closed: str = "both") -> Expr:
+        """``self BETWEEN low AND high``, matching SQL/DuckDB (both bounds inclusive by default).
 
-        Desugars to ``(self >= low) & (self <= high)``, so it follows SQL three-valued
-        logic — a null operand makes the result null. The idiomatic spelling for a
-        range filter (chained comparisons like ``low <= col("x") <= high`` are
-        rejected; see :meth:`__bool__`).
+        Desugars to a pair of comparisons, so it follows SQL three-valued logic — a
+        null operand makes the result null. The idiomatic spelling for a range filter
+        (chained comparisons like ``low <= col("x") <= high`` are rejected; see
+        :meth:`__bool__`). Pass `closed` to make either bound exclusive (Polars
+        ``is_between`` parity).
 
         Args:
-            low: Inclusive lower bound.
-            high: Inclusive upper bound.
+            low: Lower bound.
+            high: Upper bound.
+            closed: Which bounds are inclusive — ``"both"`` (default), ``"left"``
+                (``[low, high)``), ``"right"`` (``(low, high]``), or ``"none"``
+                (``(low, high)``).
+
+        Returns:
+            A boolean expression, true where the value lies in the range.
 
         Examples:
             .. doctest::
@@ -467,15 +613,31 @@ class Expr:
                 >>> ds = bt.from_pydict({"x": [1, 5, 10]})
                 >>> ds.select(r=bt.col("x").between(2, 8)).to_pydict()
                 {'r': [False, True, False]}
+
+                >>> ds.select(r=bt.col("x").between(1, 10, closed="none")).to_pydict()
+                {'r': [False, True, False]}
         """
-        return (self >= low) & (self <= high)
+        if closed not in ("both", "left", "right", "none"):
+            raise PlanError(
+                f"between(closed=...) must be 'both', 'left', 'right', or 'none', got {closed!r}"
+            )
+        lo, hi = _wrap(low), _wrap(high)
+        lower = self >= lo if closed in ("both", "left") else self > lo
+        upper = self <= hi if closed in ("both", "right") else self < hi
+        return lower & upper
 
     def eq_missing(self, other: IntoExpr) -> Expr:
-        """Null-safe equality (SQL ``IS NOT DISTINCT FROM``): two nulls compare
-        equal, and a null vs a non-null compares **false** (never null).
+        """Null-safe equality (SQL ``IS NOT DISTINCT FROM``) where two nulls compare equal.
 
-        The reliable way to compare possibly-null keys — used for change detection
+        A null compared with a non-null is **false** (never null). The reliable way
+        to compare possibly-null keys — used for change detection
         in slowly-changing dimensions. Desugars to existing ops (no new IR).
+
+        Args:
+            other: The expression or scalar to compare against.
+
+        Returns:
+            A boolean expression of the null-safe comparison.
 
         Examples:
             .. doctest::
@@ -490,11 +652,19 @@ class Expr:
         return Coalesce([self == o, Lit(False)]) | both_null
 
     def replace(self, mapping: dict[Any, Any], *, default: IntoExpr | None = None) -> Expr:
-        """Remap values via a ``{old: new}`` dictionary (value standardization /
-        lookup recode). Values absent from `mapping` keep their original value, or
-        take `default` when one is given. Desugars to a ``CASE`` chain (no new IR).
+        """Remap values through a ``{old: new}`` dictionary (a value standardization / recode).
+
+        Values absent from `mapping` keep their original value, or take `default`
+        when one is given. Desugars to a ``CASE`` chain (no new IR).
 
         ``col("c").replace({"US": "USA", "UK": "GBR"})`` standardizes country codes.
+
+        Args:
+            mapping: A ``{old: new}`` dict of replacements.
+            default: Value for entries absent from `mapping`; ``None`` keeps the original.
+
+        Returns:
+            A new expression with mapped values substituted.
 
         Examples:
             .. doctest::
@@ -522,6 +692,9 @@ class Expr:
         ``.str.upper()``, ``.str.contains("x")``, ``.str.replace(...)``,
         ``.str.slice(...)``, and ``.str.len()``.
 
+        Returns:
+            The `.str` string-function accessor namespace.
+
         Examples:
             .. doctest::
 
@@ -541,6 +714,9 @@ class Expr:
         Returns a namespace with components such as ``.dt.year()``, ``.dt.month()``,
         ``.dt.day()``, ``.dt.hour()``, and ``.dt.weekday()``.
 
+        Returns:
+            The `.dt` date/time accessor namespace.
+
         Examples:
             .. doctest::
 
@@ -557,6 +733,9 @@ class Expr:
     # --- math functions ----------------------------------------------------
     def abs(self) -> MathExpr:
         """Absolute value, preserving the input numeric dtype (nulls propagate).
+
+        Returns:
+            A new expression of the absolute values.
 
         Examples:
             .. doctest::
@@ -575,6 +754,9 @@ class Expr:
             digits: Number of decimal places to keep. ``None`` (the default) rounds to
                 a whole number.
 
+        Returns:
+            A new expression of the rounded values.
+
         Examples:
             .. doctest::
 
@@ -592,6 +774,9 @@ class Expr:
 
         Args:
             exponent: A scalar or expression power; applied per row, nulls propagate.
+
+        Returns:
+            A new Float64 expression of the powers.
 
         Examples:
             .. doctest::
@@ -614,6 +799,9 @@ class Expr:
     def floor(self) -> MathExpr:
         """Round down toward negative infinity to the nearest integer value (nulls propagate).
 
+        Returns:
+            A new expression rounded toward negative infinity.
+
         Examples:
             .. doctest::
 
@@ -626,6 +814,9 @@ class Expr:
 
     def ceil(self) -> MathExpr:
         """Round up toward positive infinity to the nearest integer value (nulls propagate).
+
+        Returns:
+            A new expression rounded toward positive infinity.
 
         Examples:
             .. doctest::
@@ -640,6 +831,9 @@ class Expr:
     def sqrt(self) -> MathExpr:
         """Square root (→ Float64). Negative inputs yield NaN; nulls propagate.
 
+        Returns:
+            A new Float64 expression of the square roots.
+
         Examples:
             .. doctest::
 
@@ -652,6 +846,9 @@ class Expr:
 
     def ln(self) -> MathExpr:
         """Natural logarithm, base e (→ Float64). Non-positive inputs yield NaN/-inf; nulls keep.
+
+        Returns:
+            A new Float64 expression of the natural logarithms.
 
         Examples:
             .. doctest::
@@ -667,6 +864,9 @@ class Expr:
     def log10(self) -> MathExpr:
         """Base-10 logarithm (→ Float64). Non-positive inputs yield NaN/-inf; nulls propagate.
 
+        Returns:
+            A new Float64 expression of the base-10 logarithms.
+
         Examples:
             .. doctest::
 
@@ -679,6 +879,9 @@ class Expr:
 
     def log2(self) -> MathExpr:
         """Base-2 logarithm (→ Float64). Non-positive inputs yield NaN/-inf; nulls propagate.
+
+        Returns:
+            A new Float64 expression of the base-2 logarithms.
 
         Examples:
             .. doctest::
@@ -693,6 +896,9 @@ class Expr:
     def exp(self) -> MathExpr:
         """``e`` raised to this value, the inverse of :meth:`ln` (→ Float64; nulls propagate).
 
+        Returns:
+            A new Float64 expression of ``e`` raised to each value.
+
         Examples:
             .. doctest::
 
@@ -705,6 +911,9 @@ class Expr:
 
     def sin(self) -> MathExpr:
         """Sine of an angle given in radians (→ Float64; nulls propagate). See :meth:`radians`.
+
+        Returns:
+            A new Float64 expression of the sines.
 
         Examples:
             .. doctest::
@@ -719,6 +928,9 @@ class Expr:
     def cos(self) -> MathExpr:
         """Cosine of an angle given in radians (→ Float64; nulls propagate). See :meth:`radians`.
 
+        Returns:
+            A new Float64 expression of the cosines.
+
         Examples:
             .. doctest::
 
@@ -731,6 +943,9 @@ class Expr:
 
     def tan(self) -> MathExpr:
         """Tangent of an angle in radians (→ Float64; nulls propagate). See :meth:`radians`.
+
+        Returns:
+            A new Float64 expression of the tangents.
 
         Examples:
             .. doctest::
@@ -745,6 +960,9 @@ class Expr:
     def sign(self) -> MathExpr:
         """Sign of the value as ``-1.0``, ``0.0``, or ``1.0`` (→ Float64; nulls propagate).
 
+        Returns:
+            A new Float64 expression of the signs.
+
         Examples:
             .. doctest::
 
@@ -757,6 +975,9 @@ class Expr:
 
     def trunc(self) -> MathExpr:
         """Truncate toward zero, dropping the fractional part (→ Float64; nulls propagate).
+
+        Returns:
+            A new Float64 expression of the truncated values.
 
         Examples:
             .. doctest::
@@ -771,6 +992,9 @@ class Expr:
     def cbrt(self) -> MathExpr:
         """Cube root (→ Float64; defined for negatives, unlike :meth:`sqrt`; nulls propagate).
 
+        Returns:
+            A new Float64 expression of the cube roots.
+
         Examples:
             .. doctest::
 
@@ -783,6 +1007,9 @@ class Expr:
 
     def asin(self) -> MathExpr:
         """Arcsine in radians, inverse of :meth:`sin` (→ Float64; outside [-1, 1] → NaN).
+
+        Returns:
+            A new Float64 expression of the arcsines, in radians.
 
         Examples:
             .. doctest::
@@ -797,6 +1024,9 @@ class Expr:
     def acos(self) -> MathExpr:
         """Arccosine in radians, inverse of :meth:`cos` (→ Float64; outside [-1, 1] → NaN).
 
+        Returns:
+            A new Float64 expression of the arccosines, in radians.
+
         Examples:
             .. doctest::
 
@@ -809,6 +1039,9 @@ class Expr:
 
     def atan(self) -> MathExpr:
         """Arctangent in radians, the inverse of :meth:`tan` (→ Float64; nulls propagate).
+
+        Returns:
+            A new Float64 expression of the arctangents, in radians.
 
         Examples:
             .. doctest::
@@ -823,6 +1056,9 @@ class Expr:
     def sinh(self) -> MathExpr:
         """Hyperbolic sine (→ Float64; nulls propagate).
 
+        Returns:
+            A new Float64 expression of the hyperbolic sines.
+
         Examples:
             .. doctest::
 
@@ -835,6 +1071,9 @@ class Expr:
 
     def cosh(self) -> MathExpr:
         """Hyperbolic cosine (→ Float64; nulls propagate).
+
+        Returns:
+            A new Float64 expression of the hyperbolic cosines.
 
         Examples:
             .. doctest::
@@ -849,6 +1088,9 @@ class Expr:
     def tanh(self) -> MathExpr:
         """Hyperbolic tangent (→ Float64; nulls propagate).
 
+        Returns:
+            A new Float64 expression of the hyperbolic tangents.
+
         Examples:
             .. doctest::
 
@@ -861,6 +1103,9 @@ class Expr:
 
     def degrees(self) -> MathExpr:
         """Convert an angle from radians to degrees (→ Float64; nulls propagate).
+
+        Returns:
+            A new Float64 expression of the angles in degrees.
 
         Examples:
             .. doctest::
@@ -879,6 +1124,9 @@ class Expr:
         The trig functions (:meth:`sin`/:meth:`cos`/:meth:`tan`) expect radians, so
         pair this with them when starting from degrees.
 
+        Returns:
+            A new Float64 expression of the angles in radians.
+
         Examples:
             .. doctest::
 
@@ -892,18 +1140,24 @@ class Expr:
     def cot(self) -> MathExpr:
         """Cotangent (``1 / tan``) of an angle in radians (→ Float64; nulls propagate).
 
+        Returns:
+            A new Float64 expression of the cotangents.
+
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [1.0]})
                 >>> ds.select(r=bt.col("x").cot()).to_pydict()
-                {'r': [0.6420926159343308]}
+                {'r': [0.6420926159343306]}
         """
         return MathExpr("cot", self)
 
     def factorial(self) -> MathExpr:
         """``n!`` — factorial of a non-negative integer (DuckDB ``factorial``; → Float64).
+
+        Returns:
+            A new Float64 expression of the factorials.
 
         Examples:
             .. doctest::
@@ -916,8 +1170,10 @@ class Expr:
         return MathExpr("factorial", self)
 
     def bit_count(self) -> MathExpr:
-        """Population count — the number of set bits in the integer value
-        (DuckDB ``bit_count``).
+        """Population count — the number of set bits in the integer value (DuckDB ``bit_count``).
+
+        Returns:
+            A new expression of the set-bit counts.
 
         Examples:
             .. doctest::
@@ -935,6 +1191,9 @@ class Expr:
 
         Returns a namespace with ops such as ``.list.len()``, ``.list.sum()``,
         ``.list.get(i)``, ``.list.slice(offset, length)``, and ``.list.join(sep)``.
+
+        Returns:
+            The `.list` accessor namespace.
 
         Examples:
             .. doctest::
@@ -954,6 +1213,9 @@ class Expr:
 
         Returns a namespace whose ``.field(name)`` projects a named field as a column.
 
+        Returns:
+            The `.struct` accessor namespace.
+
         Examples:
             .. doctest::
 
@@ -967,19 +1229,21 @@ class Expr:
         return _StructNamespace(self)
 
     @property
-    def map(self):
+    def map(self) -> _MapNamespace:
         """Map accessor — grouped key/value access on a map column.
 
         Returns a namespace with ``.map.keys()``, ``.map.values()``, and
         ``.map.get(key)``.
 
+        Returns:
+            The `.map` accessor namespace.
+
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> Expr = type(bt.col("x")).__mro__[1]
-                >>> isinstance(bt.col("m").map.get("k"), Expr)
-                True
+                >>> bt.col("m").map.get("k").to_ir()["e"]
+                'map'
         """
         from batcher.plan.expr_ir.namespaces import _MapNamespace
 
@@ -991,6 +1255,9 @@ class Expr:
 
         Returns a namespace with typed extractors such as
         ``.json.extract_string("$.a")``, evaluated in the engine (no Python parsing).
+
+        Returns:
+            The `.json` accessor namespace.
 
         Examples:
             .. doctest::
@@ -1011,6 +1278,9 @@ class Expr:
         Returns a namespace with ops such as ``.image.decode()`` and
         ``.image.to_tensor(224, 224)``; decoding stays in the Rust data plane.
 
+        Returns:
+            The `.image` accessor namespace.
+
         Examples:
             .. doctest::
 
@@ -1024,42 +1294,71 @@ class Expr:
         return _ImageNamespace(self)
 
     @property
-    def audio(self):
+    def audio(self) -> _AudioNamespace:
         """Audio accessor — grouped lazy audio-decode ops on a binary column.
 
         Returns a namespace with ops such as ``.audio.decode()`` and
         ``.audio.to_waveform()``.
 
+        Returns:
+            The `.audio` accessor namespace.
+
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> Expr = type(bt.col("x")).__mro__[1]
-                >>> isinstance(bt.col("a").audio.decode(), Expr)
-                True
+                >>> bt.col("a").audio.decode().to_ir()["e"]
+                'audio'
         """
         from batcher.plan.expr_ir.audio import _AudioNamespace
 
         return _AudioNamespace(self)
 
     @property
-    def video(self):
+    def video(self) -> _VideoNamespace:
         """Video accessor — grouped lazy video-decode ops on a binary column.
 
         Returns a namespace with ops such as ``.video.decode()`` (requires the engine
         built with the ``video`` feature).
 
+        Returns:
+            The `.video` accessor namespace.
+
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> Expr = type(bt.col("x")).__mro__[1]
-                >>> isinstance(bt.col("v").video.decode(), Expr)
-                True
+                >>> bt.col("v").video.decode().to_ir()["e"]
+                'video'
         """
         from batcher.plan.expr_ir.video import _VideoNamespace
 
         return _VideoNamespace(self)
+
+    def hash(self, seed: int = 0) -> Expr:
+        """A deterministic 64-bit hash of this expression's value, per row → Int64.
+
+        The single-argument spelling of :func:`batcher.hash_rows`. Typed rather than
+        textual, so it neither depends on how a float renders nor pays to render it.
+
+        Args:
+            seed: Changes the digest; the same seed reproduces it.
+
+        Returns:
+            An Int64 expression — the value's digest.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 1, 2]})
+                >>> h = ds.select(h=bt.col("x").hash()).to_pydict()["h"]
+                >>> h[0] == h[1], h[0] == h[2]
+                (True, False)
+        """
+        from batcher.plan.expr_ir.constructors import hash_rows
+
+        return hash_rows(self, seed=seed)
 
     def fill_null(self, value: IntoExpr) -> Coalesce:
         """Replace nulls with `value`, leaving non-null values unchanged (SQL ``COALESCE``).
@@ -1070,6 +1369,9 @@ class Expr:
 
         Args:
             value: The replacement used wherever this expression is null.
+
+        Returns:
+            A new expression with every null replaced by `value`.
 
         Examples:
             .. doctest::
@@ -1089,6 +1391,9 @@ class Expr:
         not the ``self != self`` trick: the engine's ``!=`` uses total ordering
         (where ``NaN == NaN``), so ``self != self`` would never flag a NaN.
 
+        Returns:
+            A boolean expression, true where the value is NaN.
+
         Examples:
             .. doctest::
 
@@ -1104,6 +1409,9 @@ class Expr:
 
         Nulls propagate (a null input yields null, not true). NaN is distinct from
         NULL; use :meth:`is_not_null` for the null check.
+
+        Returns:
+            A boolean expression, true where the value is not NaN.
 
         Examples:
             .. doctest::
@@ -1121,6 +1429,9 @@ class Expr:
         A dedicated op because ``±inf`` literals do not survive the JSON IR, so a
         comparison against them cannot express this. Nulls propagate (null → null).
 
+        Returns:
+            A boolean expression, true where the value is infinite.
+
         Examples:
             .. doctest::
 
@@ -1132,8 +1443,12 @@ class Expr:
         return IsInf(self)
 
     def is_finite(self) -> Expr:
-        """True where the value is finite — not NaN and not ``±inf`` (Polars/pandas
-        ``is_finite``). Nulls propagate (null → null).
+        """True where the value is finite — not NaN and not ``±inf`` (``is_finite``).
+
+        Nulls propagate (null → null).
+
+        Returns:
+            A boolean expression, true where the value is finite.
 
         Examples:
             .. doctest::
@@ -1151,6 +1466,13 @@ class Expr:
         Nulls are preserved (a null stays null, not pulled to a bound): the lowering
         is a conditional, so a comparison against a null input is null and falls
         through to the original value.
+
+        Args:
+            lower: Lower bound; ``None`` leaves the low side unclamped.
+            upper: Upper bound; ``None`` leaves the high side unclamped.
+
+        Returns:
+            A new expression with the values clamped into the bounds.
 
         Examples:
             .. doctest::
@@ -1177,6 +1499,9 @@ class Expr:
         broadcasts the group result to each row). Mergeable, so identical single-node
         and distributed.
 
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+
         Examples:
             .. doctest::
 
@@ -1190,6 +1515,9 @@ class Expr:
     def min(self) -> AggExpr:
         """Minimum non-null value per group. Use in ``group_by().agg(...)`` or ``.over(...)``.
 
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+
         Examples:
             .. doctest::
 
@@ -1202,6 +1530,9 @@ class Expr:
 
     def max(self) -> AggExpr:
         """Maximum non-null value per group. Use in ``group_by().agg(...)`` or ``.over(...)``.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1218,6 +1549,9 @@ class Expr:
 
         An aggregate for ``group_by().agg(...)`` / ``.over(...)``.
 
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+
         Examples:
             .. doctest::
 
@@ -1232,6 +1566,9 @@ class Expr:
         """Sample variance per group, Bessel-corrected (divides by ``n - 1``).
 
         An aggregate for ``group_by().agg(...)``.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1248,6 +1585,9 @@ class Expr:
 
         An aggregate for ``group_by().agg(...)``.
 
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+
         Examples:
             .. doctest::
 
@@ -1259,9 +1599,12 @@ class Expr:
         return AggExpr("stddev", self)
 
     def skewness(self) -> AggExpr:
-        """Sample skewness of this expression's non-null values per group
-        (adjusted Fisher-Pearson, matching DuckDB; -> Float64). Null when the group
-        has fewer than 3 values. Mergeable (sum-of-powers moment state).
+        """Sample skewness per group (adjusted Fisher-Pearson, matching DuckDB; → Float64).
+
+        Null when the group has fewer than 3 values. Mergeable (sum-of-powers moment state).
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1274,8 +1617,12 @@ class Expr:
         return AggExpr("skewness", self)
 
     def kurtosis(self) -> AggExpr:
-        """Sample excess kurtosis per group (0 for a normal distribution, matching
-        DuckDB; → Float64). Null when the group has fewer than 4 values. Mergeable.
+        """Sample excess kurtosis per group (0 for a normal distribution; → Float64).
+
+        Matches DuckDB. Null when the group has fewer than 4 values. Mergeable.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1288,9 +1635,14 @@ class Expr:
         return AggExpr("kurtosis", self)
 
     def median(self) -> AggExpr:
-        """Exact median per group — the 0.5 quantile, averaging the two middle values
-        for an even count (→ Float64). Equals ``quantile(0.5)``. An aggregate for
-        ``group_by().agg(...)``; see :meth:`approx_median` for a bounded-memory sketch.
+        """Exact median per group — the 0.5 quantile (→ Float64).
+
+        Averages the two middle values for an even count. Equals ``quantile(0.5)``. An
+        aggregate for ``group_by().agg(...)``; see :meth:`approx_median` for a
+        bounded-memory sketch.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1307,6 +1659,15 @@ class Expr:
 
         ``quantile(0.5)`` equals :meth:`median`. Raises ``PlanError`` if ``q`` is
         outside [0, 1].
+
+        Args:
+            q: The quantile in ``[0, 1]``.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+
+        Raises:
+            PlanError: If `q` is outside ``[0, 1]``.
 
         Examples:
             .. doctest::
@@ -1328,6 +1689,9 @@ class Expr:
         An aggregate for ``group_by().agg(...)``. For a row count that includes nulls,
         count a non-null key or use the top-level ``count()``.
 
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+
         Examples:
             .. doctest::
 
@@ -1343,6 +1707,9 @@ class Expr:
 
         Exact, so it holds every distinct value — see :meth:`approx_n_unique` for the
         bounded-memory, skew-safe sketch. An aggregate for ``group_by().agg(...)``.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1364,6 +1731,9 @@ class Expr:
         `n_unique` on a hot key would hold every distinct value. Mergeable, so it
         is identical single-node and distributed.
 
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+
         Examples:
             .. doctest::
 
@@ -1383,6 +1753,15 @@ class Expr:
         The skew-safe choice when an exact `quantile`/`median` on a hot key would
         hold every value. Mergeable, so identical single-node and distributed.
 
+        Args:
+            q: The quantile in ``[0, 1]``.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+
+        Raises:
+            PlanError: If `q` is outside ``[0, 1]``.
+
         Examples:
             .. doctest::
 
@@ -1397,8 +1776,10 @@ class Expr:
         return AggExpr("approx_quantile", self, param=float(q))
 
     def approx_median(self) -> AggExpr:
-        """Approximate median (the 0.5 quantile) via a KLL sketch — see
-        `approx_quantile`.
+        """Approximate median (the 0.5 quantile) via a KLL sketch — see :meth:`approx_quantile`.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1412,8 +1793,12 @@ class Expr:
         return AggExpr("approx_quantile", self, param=0.5)
 
     def mode(self) -> AggExpr:
-        """Most frequent value per group. Ties are broken by the smallest value
-        (deterministic and partition-independent). Works on any column type.
+        """Most frequent value per group, ties broken by the smallest value.
+
+        Deterministic and partition-independent. Works on any column type.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1426,13 +1811,20 @@ class Expr:
         return AggExpr("mode", self)
 
     def first(self, order_by: IntoExpr) -> AggExpr:
-        """This expression's value at the first row in `order_by` order (SQL
-        ``first(x ORDER BY order_by)``). Equivalent to ``arg_min(order_by)``.
+        """This expression's value at the first row in `order_by` order (SQL ``first``).
+
+        Equivalent to ``arg_min(order_by)``.
 
         An explicit `order_by` is **required**: an arrival-order first/last is not
         partition-independent, so it could not stay identical single-node and
         distributed. With an order key the result is deterministic and mergeable
         (ties on the key break to the smallest value).
+
+        Args:
+            order_by: The ordering expression; the value at its first row is returned.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1445,10 +1837,17 @@ class Expr:
         return AggExpr("arg_min", self, input2=_wrap(order_by))
 
     def last(self, order_by: IntoExpr) -> AggExpr:
-        """This expression's value at the last row in `order_by` order (SQL
-        ``last(x ORDER BY order_by)``). Equivalent to ``arg_max(order_by)``. As with
-        :meth:`first`, an explicit `order_by` is required so the result stays
-        deterministic and mergeable across partitions.
+        """This expression's value at the last row in `order_by` order (SQL ``last``).
+
+        Equivalent to ``arg_max(order_by)``. As with :meth:`first`, an explicit
+        `order_by` is required so the result stays deterministic and mergeable across
+        partitions.
+
+        Args:
+            order_by: The ordering expression; the value at its last row is returned.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1461,9 +1860,16 @@ class Expr:
         return AggExpr("arg_max", self, input2=_wrap(order_by))
 
     def arg_min(self, by: IntoExpr) -> AggExpr:
-        """This expression's value at the row where `by` is minimal in the group
-        (SQL ``arg_min``/``min_by``). Key ties break to the smallest value, so the
-        result is deterministic and partition-independent.
+        """This expression's value at the row where `by` is minimal (SQL ``arg_min``/``min_by``).
+
+        Key ties break to the smallest value, so the result is deterministic and
+        partition-independent.
+
+        Args:
+            by: The expression whose minimum selects the row.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1476,8 +1882,13 @@ class Expr:
         return AggExpr("arg_min", self, input2=_wrap(by))
 
     def arg_max(self, by: IntoExpr) -> AggExpr:
-        """This expression's value at the row where `by` is maximal in the group
-        (SQL ``arg_max``/``max_by``).
+        """This expression's value at the row where `by` is maximal (SQL ``arg_max``/``max_by``).
+
+        Args:
+            by: The expression whose maximum selects the row.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1490,8 +1901,12 @@ class Expr:
         return AggExpr("arg_max", self, input2=_wrap(by))
 
     def bool_and(self) -> AggExpr:
-        """Logical AND of this boolean expression's non-null values per group
-        (null when the group has no non-null value).
+        """Logical AND of this boolean expression's non-null values per group.
+
+        Null when the group has no non-null value.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1504,8 +1919,12 @@ class Expr:
         return AggExpr("bool_and", self)
 
     def bool_or(self) -> AggExpr:
-        """Logical OR of this boolean expression's non-null values per group
-        (null when the group has no non-null value).
+        """Logical OR of this boolean expression's non-null values per group.
+
+        Null when the group has no non-null value.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1518,8 +1937,12 @@ class Expr:
         return AggExpr("bool_or", self)
 
     def product(self) -> AggExpr:
-        """Product of this expression's non-null values per group (DuckDB
-        ``product``; → Float64). Mergeable, so identical single-node and distributed.
+        """Product of non-null values per group (DuckDB ``product``; → Float64).
+
+        Mergeable, so identical single-node and distributed.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1532,8 +1955,12 @@ class Expr:
         return AggExpr("product", self)
 
     def bit_and(self) -> AggExpr:
-        """Bitwise AND of this expression's non-null Int64 values per group
-        (Spark/DuckDB ``bit_and``). Mergeable.
+        """Bitwise AND of non-null Int64 values per group (Spark/DuckDB ``bit_and``).
+
+        Mergeable.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1546,8 +1973,12 @@ class Expr:
         return AggExpr("bit_and", self)
 
     def bit_or(self) -> AggExpr:
-        """Bitwise OR of this expression's non-null Int64 values per group
-        (Spark/DuckDB ``bit_or``). Mergeable.
+        """Bitwise OR of non-null Int64 values per group (Spark/DuckDB ``bit_or``).
+
+        Mergeable.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1560,8 +1991,12 @@ class Expr:
         return AggExpr("bit_or", self)
 
     def bit_xor(self) -> AggExpr:
-        """Bitwise XOR of this expression's non-null Int64 values per group
-        (Spark/DuckDB ``bit_xor``). Mergeable.
+        """Bitwise XOR of non-null Int64 values per group (Spark/DuckDB ``bit_xor``).
+
+        Mergeable.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1574,10 +2009,13 @@ class Expr:
         return AggExpr("bit_xor", self)
 
     def histogram(self) -> AggExpr:
-        """Collect this expression's non-null values per group into a
-        ``Map<value, count>`` (DuckDB ``histogram``). Keys are the distinct values
-        sorted ascending; values are their counts. Mergeable, so identical
-        single-node and distributed.
+        """Collect non-null values per group into a ``Map<value, count>`` (DuckDB ``histogram``).
+
+        Keys are the distinct values sorted ascending; values are their counts.
+        Mergeable, so identical single-node and distributed.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1590,14 +2028,18 @@ class Expr:
         return AggExpr("histogram", self)
 
     def array_agg(self) -> AggExpr:
-        """Collect this expression's non-null values in each group into a ``List``
-        (SQL ``array_agg``; Spark ``collect_list``). Without an explicit order the
-        element order is arrival-dependent. Mergeable — the per-group value list is
-        the partial state, so the result is the same single-node and distributed.
+        """Collect non-null values in each group into a ``List`` (SQL ``array_agg``).
+
+        Spark ``collect_list``. Without an explicit order the element order is
+        arrival-dependent. Mergeable — the per-group value list is the partial state,
+        so the result is the same single-node and distributed.
 
         Chain a list reduction on the result column to summarize it, e.g.
         ``ds.group_by("g").agg(tags=col("t").array_agg())`` then
         ``col("tags").list.join(",")``.
+
+        Returns:
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Examples:
             .. doctest::
@@ -1634,6 +2076,9 @@ class Expr:
             partition_by: Restart the running sum per group of these key expressions.
             order_by: Order rows by these expressions before accumulating.
 
+        Returns:
+            A window expression carrying the running sum.
+
         Examples:
             .. doctest::
 
@@ -1651,6 +2096,13 @@ class Expr:
 
         A window expression; use it in ``with_columns``/``select``. Pass
         `partition_by` to restart per group and `order_by` to set the running order.
+
+        Args:
+            partition_by: Restart the running value per group of these key expressions.
+            order_by: Order rows by these expressions before accumulating.
+
+        Returns:
+            A window expression carrying the running minimum.
 
         Examples:
             .. doctest::
@@ -1670,6 +2122,13 @@ class Expr:
         A window expression; use it in ``with_columns``/``select``. Pass
         `partition_by` to restart per group and `order_by` to set the running order.
 
+        Args:
+            partition_by: Restart the running value per group of these key expressions.
+            order_by: Order rows by these expressions before accumulating.
+
+        Returns:
+            A window expression carrying the running maximum.
+
         Examples:
             .. doctest::
 
@@ -1683,8 +2142,14 @@ class Expr:
     def cum_count(
         self, *, partition_by: Iterable[IntoExpr] = (), order_by: Iterable[IntoExpr] = ()
     ) -> WindowExpr:
-        """Cumulative count of non-null values up to the current row — Polars
-        ``cum_count``.
+        """Cumulative count of non-null values up to the current row — Polars ``cum_count``.
+
+        Args:
+            partition_by: Restart the running value per group of these key expressions.
+            order_by: Order rows by these expressions before accumulating.
+
+        Returns:
+            A window expression carrying the running count.
 
         Examples:
             .. doctest::
@@ -1697,9 +2162,16 @@ class Expr:
         return self._running("count", partition_by, order_by)
 
     def shift(self, n: int = 1) -> WindowExpr:
-        """Shift values by `n` rows in row order (Polars ``shift``): positive `n` lags
-        (moves down, vacated leading rows null), negative `n` leads (moves up). A
-        window expression — use in ``with_columns``/``select``.
+        """Shift values by `n` rows in row order — Polars ``shift`` (lag/lead).
+
+        Positive `n` lags (moves down, vacated leading rows null); negative `n` leads
+        (moves up). A window expression — use in ``with_columns``/``select``.
+
+        Args:
+            n: Number of rows to shift; positive lags, negative leads.
+
+        Returns:
+            A window expression with the values shifted by `n` rows.
 
         Examples:
             .. doctest::
@@ -1712,6 +2184,492 @@ class Expr:
         from batcher.plan.expr_ir.nodes import lag, lead
 
         return lag(self, n) if n >= 0 else lead(self, -n)
+
+    def forward_fill(self) -> WindowExpr:
+        """Carry the last non-null value forward — Polars ``forward_fill``.
+
+        The time-series gap filler: a sensor that reports only on change, a price series
+        sampled at irregular times, a slowly-changing dimension. Each row takes the
+        nearest non-null value at or before it; rows before the first non-null stay null.
+
+        A window expression, so it must be bound with ``.over(...)`` and **``order_by``
+        is required** — a fill carries values along a defined row order, and an
+        unordered relation has none. ``partition_by`` keeps each series independent, so
+        one device's reading never leaks into another's gap.
+
+        In SQL this is ``last_value(x IGNORE NULLS) OVER (… ROWS UNBOUNDED PRECEDING)``;
+        the frame is implied here, so there is none to pass.
+
+        Returns:
+            A window expression carrying the forward-filled column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [1, 2, 3, 4], "x": [10, None, None, 40]})
+                >>> ds.with_columns(f=bt.col("x").forward_fill().over(order_by=["t"])).to_pydict()
+                {'t': [1, 2, 3, 4], 'x': [10, None, None, 40], 'f': [10, 10, 10, 40]}
+        """
+        from batcher.plan.expr_ir.nodes import WindowExpr
+
+        return WindowExpr("forward_fill", self, [], [], None)
+
+    def backward_fill(self) -> WindowExpr:
+        """Carry the next non-null value backward — Polars ``backward_fill``.
+
+        The mirror of :meth:`forward_fill`: each row takes the nearest non-null value at
+        or after it, and rows after the last non-null stay null. ``order_by`` is likewise
+        required. Use it to seed a series whose first readings are missing.
+
+        Returns:
+            A window expression carrying the backward-filled column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [1, 2, 3], "x": [None, None, 30]})
+                >>> ds.with_columns(b=bt.col("x").backward_fill().over(order_by=["t"])).to_pydict()
+                {'t': [1, 2, 3], 'x': [None, None, 30], 'b': [30, 30, 30]}
+        """
+        from batcher.plan.expr_ir.nodes import WindowExpr
+
+        return WindowExpr("backward_fill", self, [], [], None)
+
+    # --- rolling (fixed-size trailing window) aggregates --------------------
+    def _rolling(
+        self,
+        agg: str,
+        window_size: int,
+        min_periods: int | None,
+        partition_by: Iterable[IntoExpr],
+        order_by: Iterable[IntoExpr],
+    ) -> Expr:
+        """`agg` over the `window_size` rows ending at the current one.
+
+        A ROWS frame of ``(-(window_size - 1), 0)``. Without `min_periods` the leading
+        rows of a partition aggregate a *partial* frame, as SQL does. With it, a row
+        whose frame holds fewer than `min_periods` non-null values becomes null — the
+        guard is a windowed `count` over the same frame, and the null is `nullif` of
+        the value against itself (a null of the aggregate's own type). Both compose out
+        of existing nodes, so rolling adds no IR."""
+        from batcher.plan.expr_ir.constructors import nullif, when
+
+        if window_size < 1:
+            raise PlanError(f"rolling_{agg}(): window_size must be >= 1, got {window_size}")
+        if min_periods is not None and not 1 <= min_periods <= window_size:
+            raise PlanError(
+                f"rolling_{agg}(): min_periods must be in [1, {window_size}], got {min_periods}"
+            )
+        frame = (-(window_size - 1), 0)
+        value = AggExpr(agg, self).over(partition_by=partition_by, order_by=order_by, frame=frame)
+        if min_periods is None:
+            return value
+        seen = AggExpr("count", self).over(
+            partition_by=partition_by, order_by=order_by, frame=frame
+        )
+        # `value` is reused in both branches; `hoist_windows` shares the one Window node.
+        return when(seen >= Lit(min_periods)).then(value).otherwise(nullif(value, value))
+
+    def rolling_sum(
+        self,
+        window_size: int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Sum over the `window_size` rows ending at the current one — Polars ``rolling_sum``.
+
+        A window expression; use it in ``with_columns``/``select``. The leading rows of
+        each partition aggregate a partial window (SQL semantics); pass `min_periods`
+        to make them null instead.
+
+        Args:
+            window_size: How many rows the trailing frame spans, including this one.
+            min_periods: Least non-null values the frame must hold, else the row is null.
+            partition_by: Restart the frame per group of these key expressions.
+            order_by: Order rows by these expressions before framing.
+
+        Returns:
+            The rolling sum.
+
+        Raises:
+            PlanError: If `window_size` < 1, or `min_periods` is outside
+                ``[1, window_size]``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
+                >>> ds.with_columns(r=bt.col("x").rolling_sum(2)).to_pydict()
+                {'x': [1, 2, 3, 4], 'r': [1, 3, 5, 7]}
+                >>> ds.with_columns(r=bt.col("x").rolling_sum(2, min_periods=2)).to_pydict()
+                {'x': [1, 2, 3, 4], 'r': [None, 3, 5, 7]}
+        """
+        return self._rolling("sum", window_size, min_periods, partition_by, order_by)
+
+    def rolling_mean(
+        self,
+        window_size: int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Mean over the `window_size` rows ending at the current one — the moving average.
+
+        See :meth:`rolling_sum` for the framing and `min_periods` semantics.
+
+        Args:
+            window_size: How many rows the trailing frame spans, including this one.
+            min_periods: Least non-null values the frame must hold, else the row is null.
+            partition_by: Restart the frame per group of these key expressions.
+            order_by: Order rows by these expressions before framing.
+
+        Returns:
+            A window expression carrying the rolling mean.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
+                >>> ds.with_columns(r=bt.col("x").rolling_mean(2)).to_pydict()
+                {'x': [1, 2, 3, 4], 'r': [1.0, 1.5, 2.5, 3.5]}
+        """
+        return self._rolling("avg", window_size, min_periods, partition_by, order_by)
+
+    def rolling_min(
+        self,
+        window_size: int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Minimum over the `window_size` rows ending at the current one.
+
+        See :meth:`rolling_sum` for the framing and `min_periods` semantics.
+
+        Args:
+            window_size: How many rows the trailing frame spans, including this one.
+            min_periods: Least non-null values the frame must hold, else the row is null.
+            partition_by: Restart the frame per group of these key expressions.
+            order_by: Order rows by these expressions before framing.
+
+        Returns:
+            A window expression carrying the rolling minimum.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [3, 1, 4, 1]})
+                >>> ds.with_columns(r=bt.col("x").rolling_min(2)).to_pydict()
+                {'x': [3, 1, 4, 1], 'r': [3, 1, 1, 1]}
+        """
+        return self._rolling("min", window_size, min_periods, partition_by, order_by)
+
+    def rolling_max(
+        self,
+        window_size: int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Maximum over the `window_size` rows ending at the current one.
+
+        See :meth:`rolling_sum` for the framing and `min_periods` semantics.
+
+        Args:
+            window_size: How many rows the trailing frame spans, including this one.
+            min_periods: Least non-null values the frame must hold, else the row is null.
+            partition_by: Restart the frame per group of these key expressions.
+            order_by: Order rows by these expressions before framing.
+
+        Returns:
+            A window expression carrying the rolling maximum.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [3, 1, 4, 1]})
+                >>> ds.with_columns(r=bt.col("x").rolling_max(2)).to_pydict()
+                {'x': [3, 1, 4, 1], 'r': [3, 3, 4, 4]}
+        """
+        return self._rolling("max", window_size, min_periods, partition_by, order_by)
+
+    def rolling_count(
+        self,
+        window_size: int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Count of non-null values over the `window_size` rows ending at the current one.
+
+        See :meth:`rolling_sum` for the framing and `min_periods` semantics.
+
+        Args:
+            window_size: How many rows the trailing frame spans, including this one.
+            min_periods: Least non-null values the frame must hold, else the row is null.
+            partition_by: Restart the frame per group of these key expressions.
+            order_by: Order rows by these expressions before framing.
+
+        Returns:
+            A window expression carrying the rolling count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, None, 3, 4]})
+                >>> ds.with_columns(r=bt.col("x").rolling_count(2)).to_pydict()
+                {'x': [1, None, 3, 4], 'r': [1, 1, 1, 2]}
+        """
+        return self._rolling("count", window_size, min_periods, partition_by, order_by)
+
+    def diff(
+        self,
+        n: int = 1,
+        *,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """The change from `n` rows back — Polars ``diff``, SQL ``x - lag(x, n) OVER (…)``.
+
+        A window expression composed with subtraction, so the first `n` rows of each
+        partition are null. Use it in ``with_columns``/``select``.
+
+        Args:
+            n: How many rows back to compare against; negative looks forward.
+            partition_by: Restart the comparison per group of these key expressions.
+            order_by: Order rows by these expressions before comparing.
+
+        Returns:
+            The difference between each value and the one `n` rows away.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 3, 8]})
+                >>> ds.with_columns(d=bt.col("x").diff()).to_pydict()
+                {'x': [1, 3, 8], 'd': [None, 2, 5]}
+        """
+        return self - self.shift(n).over(partition_by=partition_by, order_by=order_by)
+
+    def pct_change(
+        self,
+        n: int = 1,
+        *,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """The fractional change from `n` rows back — Polars ``pct_change``.
+
+        ``x / lag(x, n) - 1``, evaluated as true division, so integer columns yield a
+        float. The first `n` rows of each partition are null.
+
+        Args:
+            n: How many rows back to compare against; negative looks forward.
+            partition_by: Restart the comparison per group of these key expressions.
+            order_by: Order rows by these expressions before comparing.
+
+        Returns:
+            The relative change from the value `n` rows away (``0.5`` == +50%).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [10, 15, 30]})
+                >>> ds.with_columns(p=bt.col("x").pct_change()).to_pydict()
+                {'x': [10, 15, 30], 'p': [None, 0.5, 1.0]}
+        """
+        return self / self.shift(n).over(partition_by=partition_by, order_by=order_by) - 1
+
+    def fill_nan(self, value: IntoExpr) -> Expr:
+        """Replace IEEE NaN with `value`, leaving nulls and ordinary numbers alone.
+
+        The NaN counterpart of :meth:`fill_null`: NaN is a float value, not a null, so
+        ``fill_null`` never touches it. A null input stays null.
+
+        Args:
+            value: The replacement used wherever this expression is NaN.
+
+        Returns:
+            An expression with every NaN replaced by `value`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1.0, float("nan"), 3.0]})
+                >>> ds.select(r=bt.col("x").fill_nan(0.0)).to_pydict()
+                {'r': [1.0, 0.0, 3.0]}
+        """
+        from batcher.plan.expr_ir.constructors import when
+
+        return when(self.is_nan()).then(_wrap(value)).otherwise(self)
+
+    def cut(
+        self,
+        breaks: Iterable[float],
+        labels: Iterable[str] | None = None,
+        *,
+        left_closed: bool = False,
+    ) -> Expr:
+        """Bin a numeric column into labelled intervals — Polars ``cut``, pandas ``cut``.
+
+        The move from a measurement to a category: ages to cohorts, latencies to SLA
+        buckets, scores to grades. `breaks` are the interior boundaries, so `n` breaks
+        make `n + 1` bins, and the outermost two are unbounded.
+
+        Bins are right-closed by default — ``(-inf, b0]``, ``(b0, b1]``, …,
+        ``(bn, inf]`` — matching Polars and pandas. Pass ``left_closed=True`` for
+        ``[-inf, b0)``, ``[b0, b1)``, …, ``[bn, inf)``. A null input yields a null bin
+        rather than falling into the last one.
+
+        This lowers to a `CASE` chain over existing IR, so it adds no plan node and runs
+        in the Rust expression evaluator like any other projection.
+
+        Args:
+            breaks: Interior bin boundaries, strictly increasing.
+            labels: One name per bin (``len(breaks) + 1`` of them). Defaults to the
+                interval notation, e.g. ``"(1, 5]"``.
+            left_closed: Close each interval on the left instead of the right.
+
+        Returns:
+            A Utf8 expression carrying each row's bin label.
+
+        Raises:
+            PlanError: If `breaks` is empty or not strictly increasing, or if `labels`
+                does not have exactly ``len(breaks) + 1`` entries.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"age": [7, 21, 64, None]})
+                >>> bins = bt.col("age").cut([12, 19, 65], ["child", "teen", "adult", "senior"])
+                >>> ds.select(cohort=bins).to_pydict()
+                {'cohort': ['child', 'adult', 'adult', None]}
+
+                >>> ds.select(b=bt.col("age").cut([12, 19])).to_pydict()
+                {'b': ['(-inf, 12]', '(19, inf]', '(19, inf]', None]}
+        """
+        from batcher.plan.expr_ir.constructors import lit, nullif, when
+
+        edges = [float(b) for b in breaks]
+        if not edges:
+            raise PlanError("cut(): breaks must not be empty")
+        if any(lo >= hi for lo, hi in itertools.pairwise(edges)):
+            raise PlanError(f"cut(): breaks must be strictly increasing, got {edges}")
+        names = list(labels) if labels is not None else _cut_labels(edges, left_closed)
+        if len(names) != len(edges) + 1:
+            raise PlanError(
+                f"cut(): {len(edges)} breaks make {len(edges) + 1} bins, "
+                f"but {len(names)} label(s) were given"
+            )
+        # A null value makes every comparison null, so without this guard it would fall
+        # through the CASE chain into the final `otherwise` and be labelled as the top
+        # bin. `nullif(x, x)` is a null of the label column's own type.
+        builder = when(self.is_null()).then(nullif(lit(names[0]), lit(names[0])))
+        for edge, name in zip(edges, names, strict=False):
+            below = self < lit(edge) if left_closed else self <= lit(edge)
+            builder = builder.when(below).then(lit(name))
+        return builder.otherwise(lit(names[-1]))
+
+    def rank(
+        self,
+        method: str = "min",
+        *,
+        descending: bool = False,
+        partition_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Rank the rows by this expression's value — SQL ``RANK() OVER (ORDER BY self)``.
+
+        A window expression; use it in ``with_columns``/``select``. Ranks start at 1.
+
+        Args:
+            method: How ties are numbered. ``"min"`` gives tied rows the same rank and
+                leaves a gap (SQL ``RANK``); ``"dense"`` gives the same rank with no gap
+                (``DENSE_RANK``); ``"ordinal"`` breaks ties arbitrarily so every row gets
+                a distinct rank (``ROW_NUMBER``).
+            descending: Rank from the largest value down instead of the smallest up.
+            partition_by: Rank within each group of these key expressions.
+
+        Returns:
+            The 1-based rank of each row.
+
+        Raises:
+            PlanError: If `method` is not one of ``min``/``dense``/``ordinal``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [10, 30, 10]})
+                >>> ds.with_columns(r=bt.col("x").rank()).to_pydict()
+                {'x': [10, 30, 10], 'r': [1, 3, 1]}
+        """
+        from batcher.plan.expr_ir.nodes import dense_rank, rank, row_number
+
+        fns = {"min": rank, "dense": dense_rank, "ordinal": row_number}
+        if method not in fns:
+            raise PlanError(f"rank(): method must be one of {sorted(fns)}, got {method!r}")
+        return fns[method]().over(partition_by=partition_by, order_by=[(self, descending)])
+
+    def is_duplicated(self) -> Expr:
+        """True on every row whose value occurs more than once — Polars ``is_duplicated``.
+
+        A window expression (``count(*) OVER (PARTITION BY self) > 1``); use it in
+        ``with_columns``/``select``/``filter``. Nulls form their own group, so repeated
+        nulls are duplicates.
+
+        Returns:
+            A boolean window expression, true on duplicated rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 1]})
+                >>> ds.with_columns(d=bt.col("x").is_duplicated()).to_pydict()
+                {'x': [1, 2, 1], 'd': [True, False, True]}
+        """
+        return self._value_count() > Lit(1)
+
+    def is_unique(self) -> Expr:
+        """True on every row whose value occurs exactly once — negation of :meth:`is_duplicated`.
+
+        Returns:
+            A boolean window expression, true where the value is unique.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 1]})
+                >>> ds.with_columns(u=bt.col("x").is_unique()).to_pydict()
+                {'x': [1, 2, 1], 'u': [False, True, False]}
+        """
+        return self._value_count() == Lit(1)
+
+    def _value_count(self) -> WindowExpr:
+        """``count(1) OVER (PARTITION BY self)`` — how often each value occurs.
+
+        Counts *rows*, not non-null values: the argument is a literal so a partition of
+        nulls still counts its own rows (nulls group together, as in Polars). Counting
+        `self` instead would report 0 for every null row."""
+        return AggExpr("count", Lit(1)).over(partition_by=[self])
 
 
 # Imported here, after `Expr` is defined, to break the import cycle: `node_base`
@@ -1884,6 +2842,14 @@ class AggExpr:
     (`quantile`, `approx_quantile`) take a scalar via `param`. The two are
     keyword-only so a call site can never silently swap the second input for the
     parameter.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 3]})
+            >>> ds.group_by("g").agg(total=bt.col("x").sum()).sort("g").to_pydict()
+            {'g': ['a', 'b'], 'total': [3, 3]}
     """
 
     __slots__ = ("func", "input", "input2", "param")
@@ -1905,8 +2871,32 @@ class AggExpr:
         # The scalar parameter for parametric aggregates (the q of quantile); None otherwise.
         self.param = param
 
+    def __repr__(self) -> str:
+        """A source-like rendering, e.g. ``col('x').sum()`` or ``count()``."""
+        args = []
+        if self.input2 is not None:
+            args.append(repr(self.input2))
+        if self.param is not None:
+            args.append(repr(self.param))
+        call = f"{self.func}({', '.join(args)})"
+        return call if self.input is None else f"{self.input!r}.{call}"
+
     def to_ir(self, alias: str) -> dict[str, Any]:
-        """Lower this aggregate to its JSON ``AggregateItem`` dict, bound to `alias`."""
+        """Lower this aggregate to its JSON ``AggregateItem`` dict, bound to `alias`.
+
+        Args:
+            alias: The output column name to bind this aggregate to.
+
+        Returns:
+            The aggregate's JSON ``AggregateItem`` dict.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.col("x").sum().to_ir("total")
+                {'func': 'sum', 'alias': 'total', 'input': {'e': 'col', 'name': 'x'}}
+        """
         item: dict[str, Any] = {"func": self.func, "alias": alias}
         if self.input is not None:
             item["input"] = self.input.to_ir()
@@ -1929,6 +2919,12 @@ class AggExpr:
         a running aggregate; `frame` sets an explicit ``ROWS`` window. Used inside
         `with_columns`, which lowers it to the relational `Window` operator. Only the
         aggregate functions (`sum`/`mean`/`min`/`max`/`count`) support `over`.
+
+        Args:
+            partition_by: Key expressions whose groups the aggregate is computed within.
+            order_by: Expressions to order rows by, making it a running aggregate.
+            frame: An explicit ``ROWS`` frame as ``(preceding, following)`` offsets; ``None`` for
+                the default.
 
         Examples:
             .. doctest::

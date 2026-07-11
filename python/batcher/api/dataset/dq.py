@@ -59,13 +59,26 @@ Constraint = RowConstraint | UniqueConstraint
 
 @dataclass(frozen=True, slots=True)
 class ValidationReport:
-    """Per-constraint violation counts from `DatasetDQ.validate`."""
+    """Per-constraint violation counts from `DatasetDQ.validate`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"x": [1, 2, -3]})
+            >>> report = ds.dq.in_range("x", 0, 10).validate()
+            >>> report.ok, report.total_violations
+            (False, 1)
+    """
 
     violations: dict[str, int]
 
     @property
     def ok(self) -> bool:
         """True when no constraint has any violating row.
+
+        Returns:
+            True if every constraint has zero violations.
 
         Examples:
             .. doctest::
@@ -82,8 +95,39 @@ class ValidationReport:
 
     @property
     def total_violations(self) -> int:
-        """Total number of violating rows summed across every constraint."""
+        """Total number of violating rows summed across every constraint.
+
+        Returns:
+            The sum of the per-constraint violation counts.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, -3]})
+                >>> ds.dq.in_range("x", 0, 10).validate().total_violations
+                1
+        """
         return sum(self.violations.values())
+
+    def __bool__(self) -> bool:
+        """Truthy when the data passed every constraint — ``if report: ...`` reads as "ok".
+
+        The boolean view of `ok`, so a report can gate a branch directly instead of
+        checking ``report.ok``.
+
+        Returns:
+            True if every constraint has zero violations.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> report = bt.from_pydict({"x": [1, 2, 3]}).dq.in_range("x", 0, 10).validate()
+                >>> "clean" if report else "dirty"
+                'clean'
+        """
+        return self.ok
 
     def __str__(self) -> str:
         """Render ``ValidationReport(ok)`` or the per-constraint violation counts."""
@@ -98,6 +142,14 @@ class DatasetDQ:
 
     Constraint methods accumulate (returning a new `DatasetDQ`); a terminal method
     (`fail`/`drop`/`quarantine`/`validate`) applies them.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"id": [1, 2, 3], "age": [40, -1, 25]})
+            >>> ds.dq.not_null("id").in_range("age", 0, 120).drop().to_pydict()
+            {'id': [1, 3], 'age': [40, 25]}
     """
 
     __slots__ = ("_constraints", "_ds")
@@ -113,6 +165,12 @@ class DatasetDQ:
     # --- constraints -------------------------------------------------------
     def not_null(self, *cols: str) -> DatasetDQ:
         """Require every column in `cols` to be non-null.
+
+        Args:
+            cols: The columns that must not contain a null.
+
+        Returns:
+            A new `DatasetDQ` with the constraint added.
 
         Examples:
             .. doctest::
@@ -130,6 +188,12 @@ class DatasetDQ:
     def unique(self, keys: str | list[str]) -> DatasetDQ:
         """Require the combination of `keys` to be unique across all rows.
 
+        Args:
+            keys: The key column or list of columns whose combination must be unique.
+
+        Returns:
+            A new `DatasetDQ` with the constraint added.
+
         Examples:
             .. doctest::
 
@@ -146,6 +210,14 @@ class DatasetDQ:
     def in_range(self, column: str, low: Any, high: Any) -> DatasetDQ:
         """Require `column` ∈ ``[low, high]`` (NULL passes; add `not_null` to forbid).
 
+        Args:
+            column: The column to bound.
+            low: Inclusive lower bound.
+            high: Inclusive upper bound.
+
+        Returns:
+            A new `DatasetDQ` with the constraint added.
+
         Examples:
             .. doctest::
 
@@ -161,6 +233,13 @@ class DatasetDQ:
 
     def matches(self, column: str, pattern: str) -> DatasetDQ:
         """Require `column` to match the regex `pattern` (NULL passes).
+
+        Args:
+            column: The column to test.
+            pattern: The regular expression each value must match.
+
+        Returns:
+            A new `DatasetDQ` with the constraint added.
 
         Examples:
             .. doctest::
@@ -180,6 +259,13 @@ class DatasetDQ:
     def accepted_values(self, column: str, values: Iterable[Any]) -> DatasetDQ:
         """Require `column` to be one of `values` (NULL passes).
 
+        Args:
+            column: The column to test.
+            values: The permitted set of values.
+
+        Returns:
+            A new `DatasetDQ` with the constraint added.
+
         Examples:
             .. doctest::
 
@@ -195,6 +281,13 @@ class DatasetDQ:
 
     def check(self, predicate: Expr, *, name: str) -> DatasetDQ:
         """A custom constraint — any boolean `predicate` that is TRUE for a valid row.
+
+        Args:
+            predicate: A boolean expression that is TRUE for a valid row.
+            name: Label for this constraint in the violation report.
+
+        Returns:
+            A new `DatasetDQ` with the constraint added.
 
         Examples:
             .. doctest::
@@ -213,13 +306,20 @@ class DatasetDQ:
         references: Dataset,
         ref_columns: str | list[str] | None = None,
     ) -> Dataset:
-        """Return the **orphan** rows whose `columns` have no matching key in
-        `references` (referential-integrity check). An empty result means every key
-        resolves; otherwise the orphans are ready to quarantine. Lowers to an
-        anti-join — no new IR.
+        """Return the **orphan** rows whose `columns` have no matching key in `references`.
 
-        ``ds.dq.foreign_key("customer_id", references=customers)`` → rows referencing
-        a customer that does not exist.
+        A referential-integrity check: an empty result means every key resolves;
+        otherwise the orphans are ready to quarantine. Lowers to an anti-join — no new
+        IR. ``ds.dq.foreign_key("customer_id", references=customers)`` returns rows
+        referencing a customer that does not exist.
+
+        Args:
+            columns: The foreign-key column(s) on this dataset.
+            references: The dataset holding the referenced keys.
+            ref_columns: The key column(s) in `references`; defaults to `columns`.
+
+        Returns:
+            A lazy `Dataset` of the orphan rows.
 
         Examples:
             .. doctest::
@@ -242,6 +342,9 @@ class DatasetDQ:
     # --- terminals ---------------------------------------------------------
     def validate(self) -> ValidationReport:
         """Execute the checks and return per-constraint violation counts (no raise).
+
+        Returns:
+            A `ValidationReport` of per-constraint violation counts.
 
         Examples:
             .. doctest::
@@ -270,8 +373,15 @@ class DatasetDQ:
         return ValidationReport(violations)
 
     def fail(self) -> Dataset:
-        """Raise `DataQualityError` if any constraint is violated; else return the
-        dataset unchanged — the data-contract gate at a pipeline boundary.
+        """Raise `DataQualityError` on any violation; else return the dataset unchanged.
+
+        The data-contract gate at a pipeline boundary.
+
+        Returns:
+            The input `Dataset`, unchanged, when every constraint holds.
+
+        Raises:
+            DataQualityError: If any constraint is violated, with per-constraint counts.
 
         Examples:
             .. doctest::
@@ -291,6 +401,9 @@ class DatasetDQ:
     def drop(self) -> Dataset:
         """Return only the rows that satisfy every constraint.
 
+        Returns:
+            A lazy `Dataset` of the rows passing every constraint.
+
         Examples:
             .. doctest::
 
@@ -304,8 +417,12 @@ class DatasetDQ:
         return kept.drop(*helpers) if helpers else kept
 
     def quarantine(self) -> tuple[Dataset, Dataset]:
-        """Return ``(clean, rejected)`` — valid rows and violating rows — so the bad
-        rows can be written to a dead-letter sink instead of failing the run.
+        """Return ``(clean, rejected)`` so bad rows route to a dead-letter sink.
+
+        Splits the input into valid rows and violating rows instead of failing the run.
+
+        Returns:
+            The ``(clean, rejected)`` pair of datasets.
 
         Examples:
             .. doctest::

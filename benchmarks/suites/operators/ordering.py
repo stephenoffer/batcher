@@ -39,4 +39,12 @@ def sort_limit(ctx: Context):
         )
         return ordered.slice(0, 100)
 
-    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow)
+    def ray(rd) -> pa.Table:
+        cols = rd.select_columns(["l_orderkey", "l_linenumber", "l_extendedprice"])
+        ordered = cols.sort(
+            ["l_extendedprice", "l_orderkey", "l_linenumber"],
+            descending=[True, False, False],
+        )
+        return pa.Table.from_pandas(ordered.limit(100).to_pandas(), preserve_index=False)
+
+    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)

@@ -53,7 +53,7 @@ pub struct EngineConfig {
     /// `MemoryConfig.spill_compression`; the default (`"lz4"`) matches it.
     pub spill_compression: Option<String>,
     /// Per-operator spill budget (bytes), keyed by the pre-order `op_id` Kyber
-    /// assigns in `_annotate_ops` (the same numbering the metrics side-channel uses).
+    /// assigns in `annotate_ops` (the same numbering the metrics side-channel uses).
     /// This is the *byte-true, per-operator* envelope (Kyber's `m_max_bytes`) that
     /// the global `memory_budget_bytes` collapses to one number for every operator;
     /// when an operator has an entry here the executor budgets *it* against this

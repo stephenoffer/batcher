@@ -16,12 +16,43 @@ import pyarrow as pa
 from batcher.config import active_config
 
 __all__ = [
+    "column_ndv",
     "column_statistics",
     "heavy_hitters",
     "tail_quantiles",
     "tdigest_partial",
     "tdigest_quantile",
 ]
+
+
+def column_ndv(batches: list[pa.RecordBatch], columns: list[str]) -> dict[str, float]:
+    """Measure each column's distinct-count estimate (HLL), in parallel across batches.
+
+    The distinct-count-only counterpart to `column_statistics`, for the one statistic
+    the optimizer cannot get from a file footer: a Parquet footer carries row counts,
+    null counts, and min/max, but no `ndv`. Skipping the quantile sketch makes this
+    roughly seven times cheaper per row, so a source's join-key distinct counts can be
+    seeded on the query path rather than only after a run has been measured.
+
+    Best-effort: returns an empty dict if the native engine is unavailable or the inputs
+    are empty. Estimates are approximate (HyperLogLog, ~1% relative error) and must never
+    be labelled `EXACT`.
+
+    Args:
+        batches: Arrow batches to sketch. Never iterated row-wise in Python.
+        columns: Column names to measure. A name absent from `batches` is omitted.
+
+    Returns:
+        Column name to its estimated distinct count.
+    """
+    if not batches or not columns:
+        return {}
+    try:
+        import batcher._native as _native
+
+        return _native.column_ndv(list(columns), batches)
+    except Exception:  # pragma: no cover - measurement must never break a query
+        return {}
 
 
 def column_statistics(

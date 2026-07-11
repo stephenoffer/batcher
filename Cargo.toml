@@ -41,6 +41,21 @@ bc-interp = { path = "crates/bc-interp" }
 bc-transport = { path = "crates/bc-transport" }
 bc-io = { path = "crates/bc-io" }
 
+# The engine's global allocator (installed once, in `bc-py`). Every operator allocates
+# per-morsel output buffers, and glibc's malloc serves those through `mmap`/`munmap`:
+# each free unmaps pages, which broadcasts a TLB shootdown IPI to every core. On a
+# 96-core box that turns a parallel filter into a serialization point — measured 5.3 ms
+# vs 1.9 ms for the same 6M-row filter. mimalloc's per-thread heaps keep the pages.
+#
+# `local_dynamic_tls` is REQUIRED: this allocator is statically linked into `_native.abi3.so`,
+# a cdylib Python `dlopen`s at import. mimalloc's default `initial-exec` TLS model wants a slot
+# in the *static* TLS block, which the dynamic loader reserves at thread start and is usually
+# already full by the time a late-`dlopen`'d module needs it — so import fails hard with
+# `cannot allocate memory in static TLS block`. The `local-dynamic` model allocates the slot
+# on first use instead, which is the correct model for a dlopen'd library. Tiny per-access cost,
+# and it makes the allocator load reliably regardless of what Python imported first.
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
+
 # Shared utility deps.
 thiserror = "2"
 ahash = "0.8"
@@ -71,3 +86,20 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "unwind"
+# Drop DWARF from the release cdylib. `maturin develop --release` copies this artifact to
+# `python/batcher/_native.abi3.so`, and the distributed path ships that *package directory*
+# to Ray workers (`_self_ship_runtime_env` → `py_modules`). Unstripped it is ~573 MB, over
+# Ray's 512 MB runtime-env cap, so every distributed query on an editable release build
+# died with `Package size exceeds the maximum size`. Stripped it is ~153 MB. Symbol names
+# survive (`debuginfo`, not `symbols`), so profiles and backtraces still name functions.
+strip = "debuginfo"
+
+[profile.dev]
+# Same constraint as the release profile above, for the same reason: `just build`
+# (`maturin develop`) installs this artifact as `python/batcher/_native.abi3.so`, and the
+# distributed path ships that directory to Ray workers. Full DWARF makes it ~573 MB — past
+# Ray's 512 MB cap — so `just test` (which builds dev, then runs the distributed
+# differential tests) could never pass. Line tables keep panic backtraces pointing at real
+# file:line while dropping the bulk of the debug info; `debug_assertions` stay on, so the
+# dev build keeps its overflow/bounds checks.
+debug = "line-tables-only"

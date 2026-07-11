@@ -28,20 +28,63 @@ class AudioFunc(IRNode):
 
 
 class _AudioNamespace:
-    """Lazy audio decode: ``col("bytes").audio.decode()`` / ``.audio.to_waveform()``."""
+    """Lazy audio decode: ``col("bytes").audio.decode()`` / ``.audio.to_waveform()``.
+
+    Decoding runs in the Rust data plane over a binary column (symphonia-backed), so an
+    audio pipeline never materializes samples in Python. Null or undecodable input —
+    including bytes that are not audio at all — yields null rather than raising.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"clip": [b"not audio"]})
+            >>> ds.select(meta=bt.col("clip").audio.decode()).to_pydict()
+            {'meta': [None]}
+    """
 
     __slots__ = ("_e",)
 
     def __init__(self, e: Expr) -> None:
+        """Wrap the parent :class:`Expr` so its `.audio` methods can build on it."""
         self._e = e
 
+    def __repr__(self) -> str:
+        """Show the accessor and its parent, e.g. ``<.audio accessor of col('c')>``."""
+        return f"<.audio accessor of {self._e!r}>"
+
     def decode(self) -> AudioFunc:
-        """Decode audio bytes → struct ``{sample_rate, channels, num_frames,
-        duration_secs}`` (WAV/FLAC; null/undecodable → null)."""
+        """Read each clip's metadata without materializing its samples.
+
+        Returns:
+            An expression evaluating to a struct ``{sample_rate, channels, num_frames,
+            duration_secs}`` (WAV/FLAC); null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.audio("s3://bucket/clips/")  # doctest: +SKIP
+                >>> ds.select(m=bt.col("bytes").audio.decode()).to_pydict()  # doctest: +SKIP
+                {'m': [{'sample_rate': 44100, 'channels': 2, ...}]}
+        """
         return AudioFunc("decode", self._e)
 
     def to_waveform(self) -> AudioFunc:
-        """Decode to a mono PCM signal → ``List<Float32>`` (channel-averaged samples;
-        null/undecodable → null). The training-ingest path, native (no per-row
-        Python)."""
+        """Decode to a mono PCM signal by averaging channels.
+
+        The training-ingest path: it produces a numeric column that feeds a model
+        directly, with no per-row Python.
+
+        Returns:
+            An expression evaluating to a ``List<Float32>`` of channel-averaged
+            samples; null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.audio("s3://bucket/clips/")  # doctest: +SKIP
+                >>> ds.select(w=bt.col("bytes").audio.to_waveform())  # doctest: +SKIP
+        """
         return AudioFunc("to_waveform", self._e)

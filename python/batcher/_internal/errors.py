@@ -9,6 +9,7 @@ and drop — so none of these should ever surface from a metrics or learning cal
 from __future__ import annotations
 
 __all__ = [
+    "AccessDeniedError",
     "BackendError",
     "BackpressureAbort",
     "BatcherError",
@@ -26,6 +27,7 @@ __all__ = [
     "ResourceError",
     "RetryableShuffleError",
     "SchemaError",
+    "SecurityWarning",
     "TransportError",
 ]
 
@@ -37,6 +39,14 @@ class PerformanceWarning(UserWarning):
     e.g. a plain-function UDF on a GPU stage that reloads the model every batch. The
     query still runs and returns the right answer; the warning points at the faster
     spelling."""
+
+
+class SecurityWarning(UserWarning):
+    """A usage pattern that works but weakens security.
+
+    Raised (via `warnings.warn`) when a crypto key is passed inline instead of as a
+    reference (`env:NAME` / `file:PATH`), so the secret is embedded in the query and its
+    serialized plan. The query is correct; the warning points at the safer spelling."""
 
 
 class BatcherError(Exception):
@@ -113,6 +123,20 @@ class DataQualityError(BatcherError):
     def __init__(self, message: str, violations: dict[str, int] | None = None) -> None:
         super().__init__(message)
         self.violations = violations or {}
+
+
+class AccessDeniedError(BatcherError):
+    """A principal referenced a table or column it holds no `SELECT` privilege on.
+
+    Raised by `batcher.governance` while rewriting the plan, before the optimizer runs
+    and before any data is read. It names the table and the columns denied, but never
+    the *values* behind them.
+    """
+
+    def __init__(self, message: str, *, table: str = "", columns: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.table = table
+        self.columns = columns
 
 
 # Classified shuffle-fetch exceptions. They originate at the PyO3 boundary

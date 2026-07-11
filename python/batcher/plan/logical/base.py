@@ -10,6 +10,8 @@ via `to_ir()`; types of derived columns are resolved by the engine.
 from __future__ import annotations
 
 import functools
+import hashlib
+import json
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
@@ -81,6 +83,28 @@ class LogicalPlan:
 
     def to_ir(self) -> dict[str, Any]:  # pragma: no cover - overridden
         raise NotImplementedError
+
+    def content_key(self) -> str:
+        """A stable content fingerprint of this plan's lowered IR (memoized per node).
+
+        Two plans with byte-identical `to_ir()` share a key; any node change changes it.
+        `kyber.plan_cache` keys its optimizer memo on this so a re-issued identical query
+        reuses its plan. Building the hash (serialize the IR + `blake2b`) is essentially
+        the whole cost of a plan-cache lookup, so it is cached in the instance `__dict__`
+        the way `to_ir` is: a plan keyed repeatedly — a `collect` loop, an adaptive
+        re-optimization of the same subtree — then pays it once, not once per lookup.
+
+        `sort_keys` is unnecessary — `to_ir()` builds its dicts in a fixed, deterministic
+        order, so the serialization already canonicalizes an identical plan — which is why
+        the compact, unsorted dump is a safe key (never a wrong hit; at worst a missed one).
+        """
+        cache = self.__dict__
+        val = cache.get("_c_content_key", _UNSET)
+        if val is _UNSET:
+            payload = json.dumps(self.to_ir(), separators=(",", ":"), default=str)
+            val = hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
+            cache["_c_content_key"] = val
+        return val
 
     def available_columns(self) -> list[str]:  # pragma: no cover - overridden
         raise NotImplementedError

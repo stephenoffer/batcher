@@ -289,6 +289,10 @@ def _derive_scalar_aggregate(func: str, input_expr, child: RelStats):
         if child.rows_exact and child.rows == 0:
             return None
         return stat.total_sum
+    if func == "mean":
+        # SQL `avg`/`mean` of the non-null values (a recorded exact mean). NULL over an
+        # all-null / empty group — not derivable, fall back rather than divide by zero.
+        return stat.mean
     if func == "count_distinct":
         # SQL `count(distinct col)` excludes NULL; the `ndv` contract is likewise the
         # number of distinct *non-null* values (what a footer/HLL counts), so an EXACT
@@ -344,15 +348,28 @@ def grouped_aggregate_columns(node: Aggregate, child: RelStats) -> dict[str, Col
     return out
 
 
-def join_columns(node: Join, left: RelStats, right: RelStats) -> dict[str, ColumnStat]:
+def join_columns(
+    node: Join, left: RelStats, right: RelStats, out_rows: float | None = None
+) -> dict[str, ColumnStat]:
     """Column stats for a join's output: each side's values as downgraded *bounds*.
 
     A join only removes rows from a side or repeats them (an FK match), never invents
     a new value, so a preserved column's `min`/`max` stay valid *bounds* — but the
     extremes may be dropped and provenance must fall from `EXACT` (a join is a
-    row-shrinking/duplicating operator). `null_count`/`ndv` are dropped (a match may
-    duplicate rows or an outer join add nulls, changing both). The membership bloom
-    survives — a value absent from a side stays absent in any join output of it.
+    row-shrinking/duplicating operator). `null_count` is dropped (a match may duplicate
+    rows or an outer join add nulls). The membership bloom survives — a value absent
+    from a side stays absent in any join output of it.
+
+    `ndv` is carried forward as `min(ndv_in, out_rows)`. Because a join invents no
+    values, the output's distinct count for a preserved column can only *fall* (rows
+    are dropped) — never rise — and it is trivially bounded by the output row count;
+    the minimum of the two is therefore a sound upper bound and the standard Selinger
+    estimate. Dropping it instead (the previous behaviour) left every join *above* a
+    join with no key NDV, so `_estimate_join` fell back to `max(|L|, |R|)` and could
+    not see that an upstream selective join shrinks the pipeline — which is what
+    steered TPC-H Q9 into multi-gigabyte `lineitem ⋈ partsupp ⋈ orders` intermediates
+    before joining the 5%-selective `part`. `out_rows` is the join's estimated output
+    cardinality; when unknown, `ndv` is dropped as before.
     """
     out: dict[str, ColumnStat] = {}
     for o in node.output:
@@ -363,11 +380,18 @@ def join_columns(node: Join, left: RelStats, right: RelStats) -> dict[str, Colum
                 min=src.min,
                 max=src.max,
                 null_count=None,
-                ndv=None,
+                ndv=_join_ndv(src.ndv, out_rows),
                 provenance=weakest(src.provenance, Provenance.DEFAULT),
                 bloom=src.bloom,
             )
     return out
+
+
+def _join_ndv(ndv: float | None, out_rows: float | None) -> float | None:
+    """A preserved column's distinct count after a join: `min(ndv, out_rows)`."""
+    if ndv is None or out_rows is None:
+        return None
+    return max(1.0, min(ndv, out_rows))
 
 
 def _safe_min(values: list):

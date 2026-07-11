@@ -19,6 +19,7 @@ always works.
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from enum import Enum
 
@@ -28,6 +29,44 @@ from batcher._internal.errors import IOError as BatcherIOError
 from batcher._internal.errors import ResourceError
 
 __all__ = ["SpillHandle", "SpillTier", "TieredSpillStore"]
+
+# Never let the local spill tier fill the scratch filesystem past this fraction of its
+# measured free space: the last sliver keeps room for other tenants, log/tmp writes, and
+# the filesystem metadata that a 100%-full disk starves — a full scratch disk is a hard
+# query failure, not a slow one.
+_SPILL_DISK_FRACTION = 0.9
+
+
+def _clamp_to_free_disk(local_dir: str, budget: int | None) -> int | None:
+    """Clamp a configured local spill budget to a safe fraction of *measured* free disk.
+
+    The static config budget is a guess about a disk it has never seen: on a
+    smaller-than-configured scratch volume it lets the local tier fill the filesystem
+    before overflow to the remote tier ever triggers (a hard OOM-on-disk); on a larger one
+    it overflows to slow object storage prematurely. Measuring the scratch filesystem's
+    free space makes overflow track the disk that actually exists — and derives a budget at
+    all when none was configured. Best-effort: if the volume can't be stat'd, the configured
+    value stands unchanged, so behavior only ever gets safer, never more fragile.
+    """
+    # The spill dir is created lazily (on first spill), so stat the nearest *existing*
+    # ancestor — the same filesystem the dir will live on — instead of losing the disk-aware
+    # clamp entirely on the common first-use path (which would silently keep the too-large
+    # configured budget, the OOM-on-disk this guards against).
+    free = None
+    path = os.path.abspath(local_dir)
+    while True:
+        try:
+            free = shutil.disk_usage(path).free
+            break
+        except OSError:
+            parent = os.path.dirname(path)
+            if parent == path:  # reached the root and still couldn't stat
+                break
+            path = parent
+    if free is None:  # pragma: no cover - even the root failed to stat
+        return budget
+    safe = int(free * _SPILL_DISK_FRACTION)
+    return safe if budget is None else min(budget, safe)
 
 
 def _open_local_map(path: str) -> pa.MemoryMappedFile:
@@ -96,6 +135,18 @@ def _ipc_options(compression: str | None) -> pa.ipc.IpcWriteOptions | None:
         return None
 
 
+def _remote_ipc_options(compression: str | None) -> pa.ipc.IpcWriteOptions | None:
+    """IPC write options for the REMOTE tier — **always compressed**.
+
+    Object storage is slow and priced by bytes transferred, so the CPU of a cheap codec
+    always pays there even when the fast local NVMe tier stays uncompressed. An unset or
+    ``"auto"`` codec is upgraded to LZ4; an explicit ``"lz4"``/``"zstd"`` is honored.
+    Degrades to uncompressed only if the codec isn't built into this pyarrow.
+    """
+    codec = compression if compression in ("lz4", "zstd") else "lz4"
+    return _ipc_options(codec)
+
+
 class _BucketWriter:
     """Streams batches for one spill bucket to its tier, chosen at first write.
 
@@ -127,16 +178,19 @@ class _BucketWriter:
             and store._local_budget is not None
             and store._local_used >= store._local_budget
         )
-        opts = _ipc_options(store._compression)
         if overflow:
             self._tier = SpillTier.REMOTE
             self._path = f"{store._remote_uri}/{self._name}.arrow"
             self._fh = _fsspec_open(self._path, "wb").open()
+            # The remote tier is slow object storage that charges for bytes transferred, so
+            # LZ4 always pays there even when the local NVMe tier stays uncompressed.
+            opts = _remote_ipc_options(store._compression)
             self._writer = pa.ipc.new_stream(self._fh, schema, options=opts)
         else:
             self._tier = SpillTier.LOCAL
             self._path = os.path.join(store._local_dir, f"{self._name}.arrow")
             self._fh = pa.OSFile(self._path, "wb")
+            opts = _ipc_options(store._compression)
             self._writer = pa.ipc.new_stream(self._fh, schema, options=opts)
 
     def close(self) -> SpillHandle | None:
@@ -171,7 +225,10 @@ class TieredSpillStore:
         self._local_dir = local_dir
         os.makedirs(local_dir, exist_ok=True)
         self._remote_uri = remote_uri.rstrip("/") if remote_uri else None
-        self._local_budget = local_budget_bytes
+        # Overflow to the remote tier tracks the disk that actually exists, not a static
+        # guess — so a smaller-than-configured scratch volume overflows before it fills
+        # rather than failing the query on a full filesystem.
+        self._local_budget = _clamp_to_free_disk(local_dir, local_budget_bytes)
         self._compression = compression
         self._local_used = 0
         self._local_paths: list[str] = []

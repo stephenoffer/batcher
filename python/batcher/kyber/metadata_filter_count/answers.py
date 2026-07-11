@@ -69,7 +69,10 @@ def answer_filter_count(
     if filt is None:
         return None
     child = _child_stats(filt, sources, source_stats, hub)
-    return _exact_surviving_count(filt.predicate, child)
+    exact = _exact_surviving_count(filt.predicate, child)
+    if exact is not None:
+        return exact
+    return _exact_predicate_count(filt, child, sources)
 
 
 def answer_filter_is_empty(
@@ -159,6 +162,36 @@ def _exact_surviving_count(predicate, child: RelStats) -> int | None:
         if _comparison_empty(op, child.columns.get(name), value):
             return 0  # only the provably-empty side is exact; a partial overlap is None
     return None
+
+
+def _exact_predicate_count(filt: Filter, child: RelStats, sources: list) -> int | None:
+    """Exact surviving count of a bare single-column comparison (``col <op> v`` for any of
+    ``= <> < <= > >=``) from a learned per-predicate count over a single in-memory source.
+
+    The provably-empty shapes (`_exact_surviving_count`) cover the extremes from EXACT
+    min/max bounds; this covers the interior — a comparison that partially overlaps the
+    range. A source that can count its own predicate matches exactly
+    (`InMemorySource.column_predicate_count`, one Arrow kernel pass, cached) turns a common
+    filtered ``COUNT(*)`` into a metadata answer — the learned-metadata moat DuckDB's static
+    engine can't match. The Arrow kernel already yields SQL semantics (a null operand is
+    never true, so nulls drop from every comparison), so the match count *is* the surviving
+    count directly. Sound only when the predicate sits *directly* on a bare `Scan` of the one
+    source with no row-reducing or value-transforming pushdown (an intervening projection
+    could redefine the column, a residual scan predicate could pre-drop rows), so a
+    whole-column count matches exactly what the filter sees.
+    """
+    scan = filt.input
+    if type(scan).__name__ != "Scan" or getattr(scan, "predicate", None) is not None:
+        return None  # not a bare scan — a whole-source count may not match the input
+    parsed = _parse_comparison(filt.predicate)
+    if parsed is None or len(sources) != 1 or not child.rows_exact:
+        return None
+    op, name, value = parsed
+    counter = getattr(sources[0], "column_predicate_count", None)
+    if counter is None:
+        return None
+    matches = counter(op, name, value)
+    return None if matches is None else int(matches)
 
 
 def _strip_not(expr):

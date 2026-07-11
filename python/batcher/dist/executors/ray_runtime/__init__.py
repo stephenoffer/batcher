@@ -18,11 +18,16 @@ from .lifecycle import (
     engine_config_json,
     resolve_transport,
 )
+from .metering import (
+    execute_metered,
+    record_worker_metrics,
+)
 from .policies import (
     actor_fault_options,
     draining_workers,
     fault_options,
     gather_map_results,
+    map_barrier,
     recovery_policy,
     runtime_bloom_join,
     skew_join_salt,
@@ -38,6 +43,7 @@ from .scaling import (
     request_autoscale,
     shuffle_partitions,
     topology_scope,
+    worker_node_memory_bytes,
 )
 from .scheduling import (
     create_worker_placement,
@@ -64,11 +70,14 @@ __all__ = [
     "current_envelope",
     "draining_workers",
     "engine_config_json",
+    "execute_metered",
     "fault_options",
     "fleet_actor_options",
     "gather_map_results",
+    "map_barrier",
     "node_class_selector",
     "placement_actor_options",
+    "record_worker_metrics",
     "recovery_policy",
     "release_autoscale",
     "release_placement",
@@ -82,4 +91,5 @@ __all__ = [
     "speculation_policy",
     "task_options",
     "topology_scope",
+    "worker_node_memory_bytes",
 ]

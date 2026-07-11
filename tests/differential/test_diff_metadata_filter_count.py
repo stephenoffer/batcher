@@ -140,8 +140,8 @@ def test_is_empty_and_any_match_duckdb(pq_path, duck):
     assert answer_filter_any(nonempty._plan, nonempty._sources, _stats(nonempty), hub) is True
     # Cross-check the public terminals against DuckDB.
     assert empty.is_empty() is True
-    assert empty.any() is False
-    assert nonempty.any() is True
+    assert empty.has_rows is False
+    assert nonempty.has_rows is True
 
 
 def test_filter_count_through_projection(pq_path, duck):

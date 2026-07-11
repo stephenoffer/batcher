@@ -70,6 +70,12 @@ lint-layers:
 lint-structure:
     python tools/lint_structure.py
 
+# Public-API docstring style: one-line summary, `.. doctest::` examples, typeless
+# Args/Returns. Needs the engine built (it introspects the live objects). The
+# examples it insists on are actually executed by `just docs`.
+lint-docstrings:
+    python tools/lint_docstrings.py
+
 # Install the git pre-commit hook that runs the structure + ruff + layer gates.
 install-hooks:
     ln -sf ../../tools/git-hooks/pre-commit .git/hooks/pre-commit
@@ -110,6 +116,16 @@ bench-tpcds args="":
 # Run the operator-mix (single relational ops; includes PyArrow + Ray Data).
 bench-ops args="":
     python benchmarks/run.py --benchmark operators {{args}}
+
+# Run the parquet file-layout scan suite (one table; 1 big / 132MiB / many small files).
+# Re-reads its corpus from S3 per repeat, so it is excluded from `bench-all`.
+bench-scan args="":
+    python benchmarks/run.py --benchmark scan {{args}}
+
+# Run the multimodal image-ingest suite (list/decode/resize JPEGs) vs Ray Data + Daft.
+# Reads a JPEG corpus per repeat (opt-in, excluded from `bench-all`); scale sets the count.
+bench-images args="":
+    python benchmarks/run.py --benchmark images {{args}}
 
 # Run the multi-node lineup (batcher, ray, daft) across every dataset.
 bench-multi args="":

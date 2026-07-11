@@ -128,7 +128,7 @@ pub(crate) fn gather_join_output(
         let source = batch
             .column_by_name(&col.name)
             .ok_or_else(|| InterpError::UnknownJoinColumn(col.name.clone()))?;
-        let gathered = take(source.as_ref(), indices, None)?;
+        let gathered = bc_runtime::gather::take_column(source.as_ref(), indices)?;
         fields.push(Field::new(&col.alias, gathered.data_type().clone(), true));
         columns.push(gathered);
     }
@@ -136,6 +136,55 @@ pub(crate) fn gather_join_output(
         Arc::new(Schema::new(fields)),
         columns,
     )?)
+}
+
+/// The schema a join's gathered output carries: one nullable field per `output` column,
+/// typed from its source column (`take` preserves the source type).
+///
+/// Hoisted out of [`gather_join_output`] because the streaming broadcast probe gathers once
+/// per *morsel* — hundreds of times per join, all with the same schema — and building it
+/// each time allocates a `Field` per column and re-derives `Schema`'s name→index map. The
+/// two sides' schemas are fixed for the whole join, so the schema is too.
+pub(crate) fn join_output_schema(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    output: &[JoinOutputCol],
+) -> Result<Arc<Schema>, InterpError> {
+    let mut fields = Vec::with_capacity(output.len());
+    for col in output {
+        let batch = match col.side {
+            JoinSide::Left => left,
+            JoinSide::Right => right,
+        };
+        let source = batch
+            .column_by_name(&col.name)
+            .ok_or_else(|| InterpError::UnknownJoinColumn(col.name.clone()))?;
+        fields.push(Field::new(&col.alias, source.data_type().clone(), true));
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// [`gather_join_output`] against a schema the caller already built (see
+/// [`join_output_schema`]).
+pub(crate) fn gather_join_output_with(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    idx: &join::JoinIndices,
+    output: &[JoinOutputCol],
+    schema: Arc<Schema>,
+) -> Result<RecordBatch, InterpError> {
+    let mut columns = Vec::with_capacity(output.len());
+    for col in output {
+        let (batch, indices) = match col.side {
+            JoinSide::Left => (left, &idx.left),
+            JoinSide::Right => (right, &idx.right),
+        };
+        let source = batch
+            .column_by_name(&col.name)
+            .ok_or_else(|| InterpError::UnknownJoinColumn(col.name.clone()))?;
+        columns.push(take(source.as_ref(), indices, None)?);
+    }
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 pub(crate) fn columns_by_name(

@@ -13,6 +13,7 @@ reads the partition straight from this server's store with no socket hop.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
@@ -21,6 +22,9 @@ from batcher._native import ShuffleClient as _Client
 from batcher._native import flight_fetch as _fetch
 from batcher._native import gather_combine as _gather_combine
 from batcher._native import gather_concat as _gather_concat
+
+if TYPE_CHECKING:
+    from batcher.carbonite.transfer.tls import ShuffleTlsMaterial
 
 __all__ = ["FlightShuffleServer", "ShuffleClient", "ShuffleTicket", "fetch"]
 
@@ -49,8 +53,32 @@ class FlightShuffleServer:
     on other nodes can reach it. Omitted/empty keeps single-host loopback behavior.
     """
 
-    def __init__(self, advertise_host: str | None = None, token: str | None = None) -> None:
-        self._srv = _Server(advertise_host, token)
+    def __init__(
+        self,
+        advertise_host: str | None = None,
+        token: str | None = None,
+        tls: ShuffleTlsMaterial | None = None,
+    ) -> None:
+        if tls is None:
+            self._srv = _Server(advertise_host, token)
+        else:
+            # TLS-secured server: present this node's certificate, and (under mTLS)
+            # require a client certificate the cluster CA signed.
+            self._srv = _Server(
+                advertise_host,
+                token,
+                tls.server_cert_pem,
+                tls.server_key_pem,
+                tls.client_ca_pem,
+            )
+        # Shuffle output volume this server has made available for reducers to fetch — the
+        # network-egress magnitude a `spilled: bool` / credit window cannot show. Measurement
+        # only (Carbonite/Kyber consume it to reason about shuffle cost); never a result.
+        self._bytes_published = 0
+        # Bytes served over the same-node fast paths (DIRECT_MEMORY / SHARED_MEMORY) — no
+        # network hop. Against `bytes_published` this is the shuffle *locality* ratio: how
+        # much data placement kept local (cheap) vs forced over the wire (the reducer fetches).
+        self._bytes_served_locally = 0
 
     @property
     def addr(self) -> str:
@@ -59,7 +87,15 @@ class FlightShuffleServer:
 
     def publish(self, ticket: ShuffleTicket, batches: list[pa.RecordBatch]) -> None:
         """Expose `batches` under `ticket` for reducers to fetch."""
-        self._srv.publish(str(ticket), list(batches))
+        batches = list(batches)
+        self._bytes_published += sum(b.nbytes for b in batches)
+        self._srv.publish(str(ticket), batches)
+
+    @property
+    def bytes_published(self) -> int:
+        """Total bytes this server has exposed for shuffle fetches — the measured shuffle
+        output (network-egress) volume of this worker for the plan's lifetime."""
+        return self._bytes_published
 
     def local_fetch(self, ticket: ShuffleTicket) -> list[pa.RecordBatch] | None:
         """Read a partition this server published, with no network hop.
@@ -67,7 +103,16 @@ class FlightShuffleServer:
         The `DIRECT_MEMORY` path for a same-process reducer. `None` if `ticket`
         was never published here, so the caller falls back to a network fetch.
         """
-        return self._srv.local_fetch(str(ticket))
+        batches = self._srv.local_fetch(str(ticket))
+        if batches is not None:
+            self._bytes_served_locally += sum(b.nbytes for b in batches)
+        return batches
+
+    @property
+    def bytes_served_locally(self) -> int:
+        """Bytes served over the same-node fast paths (no network) — vs `bytes_published`,
+        the shuffle locality win from co-locating producer and reducer."""
+        return self._bytes_served_locally
 
     def publish_shared(self, ticket: ShuffleTicket, batches: list[pa.RecordBatch]) -> None:
         """Mirror `ticket`'s batches to a same-node shared-memory file (Arrow IPC over
@@ -79,7 +124,10 @@ class FlightShuffleServer:
         """Read a partition a same-node peer published under `(source_addr, ticket)` from
         shared memory, or `None` if absent — the `SHARED_MEMORY` path. `None` means the
         caller falls back to Flight (empty bucket / un-shm'd peer / shm off)."""
-        return self._srv.shm_fetch(source_addr, str(ticket))
+        batches = self._srv.shm_fetch(source_addr, str(ticket))
+        if batches is not None:
+            self._bytes_served_locally += sum(b.nbytes for b in batches)
+        return batches
 
     def clear_shared(self) -> None:
         """Remove every shared-memory file this server published (plan teardown)."""
@@ -207,14 +255,21 @@ class ShuffleClient:
 
         `token` is the shuffle auth secret presented to an auth-gated peer (N5).
         """
+        global _BYTES_FETCHED
         if credits is None:
-            return self._client.fetch(addr, str(ticket), token=token)
-        return self._client.fetch(addr, str(ticket), credits, token)
+            batches = self._client.fetch(addr, str(ticket), token=token)
+        else:
+            batches = self._client.fetch(addr, str(ticket), credits, token)
+        _BYTES_FETCHED += sum(b.nbytes for b in batches)
+        return batches
 
     @property
     def connection_count(self) -> int:
         """Number of peers with a live cached channel (telemetry/tests)."""
         return self._client.connection_count
+
+
+_BYTES_FETCHED = 0
 
 
 def fetch(addr: str, ticket: ShuffleTicket, credits: int | None = None) -> list[pa.RecordBatch]:
@@ -224,6 +279,14 @@ def fetch(addr: str, ticket: ShuffleTicket, credits: int | None = None) -> list[
     fetches so the gRPC channel is reused. `credits` is the flow-control window
     Carbonite grants; `None` uses the engine's conservative default window.
     """
-    if credits is None:
-        return _fetch(addr, str(ticket))
-    return _fetch(addr, str(ticket), credits)
+    global _BYTES_FETCHED
+    batches = _fetch(addr, str(ticket)) if credits is None else _fetch(addr, str(ticket), credits)
+    _BYTES_FETCHED += sum(b.nbytes for b in batches)
+    return batches
+
+
+def bytes_fetched() -> int:
+    """Total bytes this process has fetched over the shuffle network — its reducer-side
+    ingress volume, the counterpart to `FlightShuffleServer.bytes_published` (egress).
+    Measurement only; Carbonite/Kyber reason about shuffle network cost from the pair."""
+    return _BYTES_FETCHED

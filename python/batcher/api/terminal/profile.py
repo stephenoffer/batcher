@@ -122,15 +122,45 @@ def explain(
     return profile.render(analyze=analyze)
 
 
+def _io_throughput_decisions(sources: list[Source], hub) -> list:
+    """One `Decision` per source whose read throughput has been *measured* on a prior run —
+    surfacing the small-files scan pathology (a slow source shows a low MB/s) directly in
+    `explain()`, from the learned `io_stats` metadata. Empty on a cold store."""
+    from batcher.api.source_stats import _source_identity
+    from batcher.metadata.io_stats import load_source_throughput_mbps, predicted_read_seconds
+    from batcher.metadata.source_stats_store import load_source_stats
+    from batcher.plan.profile import Decision
+
+    out = []
+    for src in sources:
+        ident = _source_identity(src)
+        mbps = load_source_throughput_mbps(hub, ident)
+        if mbps is None:
+            continue
+        detail = {"identity": ident, "throughput_mbps": round(mbps, 1)}
+        summary = f"source read at {mbps:.0f} MB/s (learned)"
+        # When the source's byte size is known, turn the rate into a *predicted read cost* —
+        # the "predict" the optimizer/user can act on before running (a slow source stands out).
+        stats = load_source_stats(hub, ident) if hub is not None else None
+        byte_size = getattr(stats, "byte_size", None) if stats is not None else None
+        secs = predicted_read_seconds(hub, ident, byte_size) if byte_size else None
+        if secs is not None:
+            detail["predicted_read_seconds"] = round(secs, 2)
+            summary += f" — ~{secs:.1f}s to read"
+        out.append(Decision("core", "io", summary, detail))
+    return out
+
+
 def planned_profile(plan: LogicalPlan, sources: list[Source]) -> QueryProfile:
     """A planned-only `QueryProfile`: Kyber's optimized tree, estimates, and decisions."""
     from batcher import core, kyber
     from batcher.plan.profile import build_op_profiles
 
-    opt, decisions = kyber.optimize_traced(plan, sources=sources, hub=core.default_hub())
+    hub = core.default_hub()
+    opt, decisions = kyber.optimize_traced(plan, sources=sources, hub=hub)
     return QueryProfile(
         ops=build_op_profiles(opt.ir, opt.ops, None),
-        decisions=tuple(build_side_decisions(decisions)),
+        decisions=(*build_side_decisions(decisions), *_io_throughput_decisions(sources, hub)),
         logical_ir=plan.to_ir(),
         optimized_ir=opt.ir,
     )
@@ -180,4 +210,15 @@ def run_profiled(
     t0 = time.perf_counter()
     table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
     total_ms = (time.perf_counter() - t0) * 1000.0
-    return collector.to_profile(total_ms=total_ms, rows=table.num_rows, query_id=query_id)
+    # The soft memory envelope the run was admitted against, so the profile can report peak
+    # memory as a fraction of budget (the >80% memory-utilization target). Best-effort.
+    budget = 0
+    try:
+        from batcher.carbonite.memory.pressure import PressureMonitor
+
+        budget = PressureMonitor().budget_bytes()
+    except Exception:  # pragma: no cover - a missing budget just omits the memory-% line
+        budget = 0
+    return collector.to_profile(
+        total_ms=total_ms, rows=table.num_rows, query_id=query_id, memory_budget_bytes=budget
+    )

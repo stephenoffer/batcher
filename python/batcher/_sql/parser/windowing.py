@@ -108,6 +108,11 @@ def _window_frame(win) -> tuple[int | None, int | None] | None:
     spec = win.args.get("spec")
     if spec is None:
         return None
+    if spec.args.get("exclude") is not None:
+        # A frame EXCLUDE (TIES / GROUP / CURRENT ROW / NO OTHERS) changes which peer
+        # rows the frame drops; the engine has no such option, so honoring the frame
+        # while dropping EXCLUDE would silently give the wrong answer. Reject it.
+        raise NotImplementedError("window frame EXCLUDE (TIES/GROUP/CURRENT ROW) is not supported")
     kind = (spec.args.get("kind") or "").upper()
     if kind != "ROWS":
         if spec.args.get("start") is not None or spec.args.get("end") is not None:

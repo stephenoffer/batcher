@@ -20,6 +20,7 @@ use arrow::array::RecordBatch;
 use bc_runtime::agg::spill::{DiskSpillStore, SpillStore};
 use bc_runtime::{join, shuffle};
 use rayon::prelude::*;
+use std::sync::Arc;
 
 use crate::error::InterpError;
 use crate::ops;
@@ -49,7 +50,7 @@ pub(crate) fn spilling_hash_join_streaming(
     join_type: bc_ir::JoinType,
     output: &[bc_ir::JoinOutputCol],
     sp: &SpillOptions,
-) -> Result<Vec<RecordBatch>, InterpError> {
+) -> Result<(Vec<RecordBatch>, u64), InterpError> {
     // Enough partitions that each bucket's build side ≈ one budget — sized from the
     // build batches' total size without materializing them.
     let build_bytes: usize = right_batches
@@ -80,7 +81,9 @@ pub(crate) fn spilling_hash_join_streaming(
             bc_ir::JoinStrategy::Hash,
         )?);
     }
-    Ok(out)
+    // Both sides were streamed to disk; the spill volume is their combined written bytes.
+    let spill_bytes = lstore.spilled_bytes() + rstore.spilled_bytes();
+    Ok((out, spill_bytes))
 }
 
 /// Hash-partition each input batch by `keys` into `p` shards and append every shard
@@ -159,6 +162,64 @@ pub(crate) fn spilling_asof_join(
 /// driving (right) side is the chunked probe (each right row lands in one chunk, no
 /// duplication). **Full** must emit unmatched rows from *both* sides, which chunks
 /// would duplicate, so it runs as a single pass. All cases avoid the shuffle.
+/// Broadcast join **without materializing the probe side**: build the table once over the
+/// (small) build batch, then probe each probe morsel independently, across cores.
+///
+/// Returns `Ok(None)` when the join cannot be streamed — a build-driven join type
+/// (`Right`/`Full`), a non-integer key, or an empty probe side — and the caller keeps the
+/// materialized [`broadcast_join`] path. Nothing silently changes shape.
+///
+/// The win is the copy that does not happen: [`ops::materialize`] on the probe side
+/// concatenates the largest relation in the query into one `RecordBatch` before every
+/// broadcast join. Streaming skips it, and skips the `remorselize` that had to undo the
+/// concatenation afterwards — each morsel's output *is* a morsel. The emitted relation is
+/// identical: morsels are contiguous in-order row ranges, so probing them in order emits the
+/// same rows in the same order as slicing the concatenated batch by range (pinned by
+/// `bc_runtime::join::stream`'s `morsel_by_morsel_matches_the_whole_relation`).
+pub(crate) fn broadcast_join_streaming(
+    probe_batches: &[RecordBatch],
+    build: &RecordBatch,
+    probe_keys: &[String],
+    build_keys: &[String],
+    join_type: bc_ir::JoinType,
+    output: &[bc_ir::JoinOutputCol],
+) -> Result<Option<Vec<RecordBatch>>, InterpError> {
+    if probe_batches.is_empty() {
+        return Ok(None);
+    }
+    let tuning = bc_arrow::RuntimeTuning::default();
+    let build_key_cols = ops::columns_by_name(build, build_keys)?;
+    let probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
+    let Some(table) = join::BroadcastProbe::new(
+        &build_key_cols,
+        ops::map_join_type(join_type),
+        probe_rows,
+        tuning.bloom_fp_rate,
+        tuning.bloom_min_build_rows,
+    ) else {
+        return Ok(None);
+    };
+    // Every morsel shares one schema, so one shape check covers them all and the per-morsel
+    // probe below cannot fail.
+    let first_keys = ops::columns_by_name(&probe_batches[0], probe_keys)?;
+    if !table.accepts(&first_keys) {
+        return Ok(None);
+    }
+    // One schema for every morsel's output: both sides' schemas are fixed for the join.
+    let schema = ops::join_output_schema(&probe_batches[0], build, output)?;
+    let out = probe_batches
+        .par_iter()
+        .map(|morsel| {
+            let keys = ops::columns_by_name(morsel, probe_keys)?;
+            let idx = table
+                .probe(&keys)
+                .ok_or_else(|| InterpError::UnknownJoinColumn(probe_keys.join(", ")))?;
+            ops::gather_join_output_with(morsel, build, &idx, output, Arc::clone(&schema))
+        })
+        .collect::<Result<Vec<_>, InterpError>>()?;
+    Ok(Some(out))
+}
+
 pub(crate) fn broadcast_join(
     left: &RecordBatch,
     right: &RecordBatch,
@@ -168,9 +229,8 @@ pub(crate) fn broadcast_join(
     output: &[bc_ir::JoinOutputCol],
 ) -> Result<Vec<RecordBatch>, InterpError> {
     use bc_ir::{JoinSide, JoinStrategy, JoinType};
-    // Full: a single pass (chunks would duplicate both sides' unmatched rows).
-    if matches!(join_type, JoinType::Full) {
-        return Ok(vec![ops::join_batches(
+    let single_pass = || {
+        ops::join_batches(
             left,
             right,
             left_keys,
@@ -178,7 +238,26 @@ pub(crate) fn broadcast_join(
             join_type,
             output,
             JoinStrategy::Hash,
-        )?]);
+        )
+    };
+    // Full: a single pass (chunks would duplicate both sides' unmatched rows).
+    if matches!(join_type, JoinType::Full) {
+        return Ok(vec![single_pass()?]);
+    }
+    // An empty probe has no row-range chunks, so the chunked path below would produce
+    // *zero* batches — and a batch is the only thing that carries a schema. Every
+    // downstream pipeline breaker (join, aggregate, distinct) materializes its input and
+    // needs that schema even over zero rows, so an empty relation must still be one
+    // zero-row batch. The single-pass join produces exactly that. `Right` drives from
+    // the right side, so test the side that will become the probe.
+    let probe_is_right = matches!(join_type, JoinType::Right);
+    let probe_rows = if probe_is_right {
+        right.num_rows()
+    } else {
+        left.num_rows()
+    };
+    if probe_rows == 0 {
+        return Ok(vec![single_pass()?]);
     }
     // Right: chunk the driving (right) side, joined against the full left as a LEFT
     // join with flipped keys + output sides. Mirror of the left-driven path.

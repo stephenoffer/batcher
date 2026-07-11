@@ -111,8 +111,10 @@ def main() -> int:
 
         if single == "OOM":
             tag = "distributed OK" if dist_ok else "both OOM"
-            print(f"N={n / 1e6:6.0f}M  single-GPU cuDF: OOM  |  distributed 8xGPU: {tag}"
-                  + (f" ({n / dist_wall / 1e6:.0f} M rows/s)" if dist_ok else ""))
+            print(
+                f"N={n / 1e6:6.0f}M  single-GPU cuDF: OOM  |  distributed 8xGPU: {tag}"
+                + (f" ({n / dist_wall / 1e6:.0f} M rows/s)" if dist_ok else "")
+            )
         elif dist_ok:
             # correctness: distributed combined sums match single-GPU
             sk, ss = single[0]
@@ -120,8 +122,10 @@ def main() -> int:
             err = max(abs(smap[k] - dist_map[k]) for k in smap) if smap else 0.0
             speed = single[1] / dist_wall
             ok = "OK" if err < 1e-3 * max(1, n) else "MISMATCH"
-            print(f"N={n / 1e6:6.0f}M  single-GPU {n / single[1] / 1e6:6.0f} M rows/s  |  "
-                  f"distributed {n / dist_wall / 1e6:6.0f} M rows/s  -> {speed:.2f}x  [{ok}]")
+            print(
+                f"N={n / 1e6:6.0f}M  single-GPU {n / single[1] / 1e6:6.0f} M rows/s  |  "
+                f"distributed {n / dist_wall / 1e6:6.0f} M rows/s  -> {speed:.2f}x  [{ok}]"
+            )
         else:
             print(f"N={n / 1e6:6.0f}M  single-GPU OK, distributed OOM (unexpected)")
     return 0

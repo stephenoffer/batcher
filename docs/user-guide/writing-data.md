@@ -51,6 +51,34 @@ ds.write.json("output/data.json")
 Use CSV and JSON for interchange with tools that require them. Parquet is faster and
 preserves types, so prefer it for anything that will be read back by Batcher.
 
+## Other file and database sinks
+
+The write namespace mirrors the reader namespace: every format has a typed writer,
+and the generic `write(path, fmt=...)` reaches them all, each returning a
+`WriteManifest`. Beyond Parquet/CSV/JSON:
+
+| Writer | Writes | Needs |
+| --- | --- | --- |
+| `write.orc(path)` | ORC files | — |
+| `write.arrow(path)` | Arrow/Feather IPC files | — |
+| `write.avro(path)` | Avro files | `[avro]` |
+| `write.lance(path)` | A Lance dataset (columnar ML format) | `[lance]` |
+| `write.msgpack(path)` | MessagePack files | `[msgpack]` |
+| `write.sql(table, uri=...)` | A database table via ADBC/FlightSQL | driver + reachable DB |
+| `write.snowflake(table, ...)` | A Snowflake table | Snowflake account |
+| `write.mongo(collection, ...)` | A MongoDB collection | a running MongoDB |
+
+Delta, Iceberg, and Hudi table writes (transactional append and merge/upsert) are
+covered in [Lakehouse tables](lakehouse.md). The sinks that need an optional extra or
+a live service are shown but not executed:
+
+```python
+# docs: skip
+ds.write.msgpack("output/data.msgpack")
+ds.write.avro("output/data.avro")
+ds.write.snowflake("ORDERS", account="acct", warehouse="WH", database="DB")
+```
+
 ## Partitioned output
 
 `partition_by` writes one subdirectory per distinct value of the named columns, in
@@ -67,6 +95,25 @@ ds.write.parquet("output/events", partition_by=["category"])
 ```python
 # docs: skip
 ds.write("output/events", fmt="parquet", partition_by=["category"])
+```
+
+## Compacting small files
+
+Incremental or streaming writes leave many tiny part files, which slow later reads
+(the small-files problem). `compact` fixes a dataset in place: it reads `path`,
+repartitions to a target file size — or an exact `num_files` — writes the result
+back, and deletes the now-stale parts. It runs on local files, so it executes here:
+
+```python
+import glob
+
+comp_dir = tempfile.mkdtemp()
+_ = bt.from_pydict({"x": [1, 2, 3, 4]}).repartition(num_files=2).write(
+    comp_dir, format="parquet"
+)
+_ = bt.compact(comp_dir, num_files=1, format="parquet")
+print(len(glob.glob(os.path.join(comp_dir, "*.parquet"))))
+# 1
 ```
 
 ## Distributed writes
@@ -89,3 +136,4 @@ scheduled.
   slowly-changing dimensions.
 - [Data quality](data-quality.md): validate and quarantine before you write.
 - [Cloud storage](cloud-storage.md): write to object stores.
+- [IO API](../api/io.md): the full `ds.write` writer reference.

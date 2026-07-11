@@ -44,6 +44,12 @@ class FeasibilityVerdict:
     feasible: bool
     binding_constraint: str | None = None  # "memory" | "credits" | "parallelism" | None
     suggested_bounds: ResourceBounds | None = None
+    # Whether this verdict rests on a *guess* rather than a measurement or a proof — set
+    # when the operator that binds the constraint carries `Provenance.DEFAULT`. An
+    # advisory infeasibility should still steer the plan toward its out-of-core path, but
+    # it must never *fail* a query: a plan Kyber could not size may well fit. The
+    # conductor honours the routing and suppresses the error.
+    advisory: bool = False
 
 
 @dataclass(frozen=True, slots=True)

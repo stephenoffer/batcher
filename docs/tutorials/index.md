@@ -24,12 +24,19 @@ Run a model over Arrow batches with the `.ml` accessor.
 :link-type: doc
 Build test datasets in memory with Python and expressions.
 :::
+
+:::{grid-item-card} {octicon}`gear;1.1em` Feature engineering
+:link: feature-engineering
+:link-type: doc
+Build a model-ready feature matrix with fit/transform preprocessors and `Chain`.
+:::
 ::::
 
 ```{toctree}
-:maxdepth: 1
+:hidden:
 
 first-pipeline
 batch-inference
 synthetic-data-generation
+feature-engineering
 ```

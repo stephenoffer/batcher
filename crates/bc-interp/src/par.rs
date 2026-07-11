@@ -20,16 +20,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow::array::{Array, RecordBatch};
-use bc_ir::{EngineConfig, RelOp};
+use bc_ir::{AggFunc, AggregateItem, EngineConfig, ProjectionItem, RelOp};
 use bc_resource::{MemoryPool, MemoryReservation};
-use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore, SpillCodec};
+use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore, SpillCodec, SpillStore};
 use bc_runtime::{agg, shuffle};
 use rayon::prelude::*;
 
+use crate::agg_par;
 use crate::error::InterpError;
 use crate::join_par::{
-    broadcast_join, is_skewed_bucket, is_skewed_bucket_bytes, skew_salting_eligible,
-    spilling_asof_join, spilling_hash_join_streaming,
+    broadcast_join, broadcast_join_streaming, is_skewed_bucket, is_skewed_bucket_bytes,
+    skew_salting_eligible, spilling_asof_join, spilling_hash_join_streaming,
 };
 use crate::metrics::{ExecMetrics, IdGen, OpMetric, Stopwatch};
 use crate::ops;
@@ -300,15 +301,47 @@ pub fn execute_parallel_with_metrics(
     // `parallelism == 0` ("all cores") therefore resolves to `available_parallelism`, which
     // reads the now-applied affinity; a positive value pins the requested width. On a
     // single node this is the same width as the global pool, so the result is unchanged.
-    let width = if opts.parallelism > 0 {
-        opts.parallelism
-    } else {
-        std::thread::available_parallelism()
-            .map(|v| v.get())
-            .unwrap_or(1)
-    };
+    let width = auto_width(opts, sources);
     let out = pool_for(width)?.install(|| exec(plan, sources, opts, &mut m, &mut ids))?;
     Ok((out, m))
+}
+
+/// The worker count this execution runs on.
+///
+/// An explicit `EngineConfig.parallelism` is honored verbatim — the control plane asked
+/// for that width and the hash-shuffle bucket count keys off it. Otherwise the width is
+/// "all cores", **capped by the number of morsels the inputs can actually produce**.
+///
+/// A worker with no morsel to take does no work, but it is not free: rayon still wakes
+/// it, it contends for the pool's job queue, and — because a scoped pool is cached per
+/// width — a one-row query would otherwise install and spin a 96-thread pool. Batcher's
+/// stated goal of low fixed overhead on sub-second queries is exactly this case. The cap
+/// is an upper bound on useful parallelism at the leaves, so it can never remove
+/// parallelism a plan could have used, and it never changes a result (scheduling only).
+fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>]) -> usize {
+    if opts.parallelism > 0 {
+        return opts.parallelism;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    cores.min(max_useful_workers(opts, sources)).max(1)
+}
+
+/// An upper bound on workers that could have a morsel to process: the largest number of
+/// morsels any single source yields. Operators fan out over one input's morsels at a
+/// time, so the widest leaf bounds the widest `par_iter`.
+fn max_useful_workers(opts: &ExecOptions, sources: &[Vec<RecordBatch>]) -> usize {
+    let target_rows = opts.morsel_target().rows.max(1);
+    sources
+        .iter()
+        .map(|batches| {
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            rows.div_ceil(target_rows)
+        })
+        .max()
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// Process-wide cache of fixed-width rayon thread pools, keyed by worker count.
@@ -533,17 +566,31 @@ fn exec(
         } => {
             let parts = exec(input, sources, opts, m, ids)?;
             let rows_in = count_rows(&parts);
+            // Captured before the match, live through the fixed-count breaker's scan.
+            let in_bytes = batch_bytes(&parts);
             let t0 = Stopwatch::start();
-            let out: Vec<RecordBatch> = match n {
-                // Fixed-count: a breaker over all morsels (global n-smallest hashes).
-                Some(k) => ops::sample_n_batches(&parts, *k, *seed)?,
-                None => parts
-                    .par_iter()
-                    .map(|b| ops::sample_batch(b, *fraction, *seed))
-                    .collect::<Result<_, InterpError>>()?,
-            };
-            push_metric(m, op_id, "sample", rows_in, &out, t0, false, "interp");
-            Ok(out)
+            match n {
+                // Fixed-count: a breaker over all morsels (a global n-smallest-hash pass
+                // holds the whole input to pick the k winners), so record its input peak —
+                // a top-k over a huge input is not the ~0-peak streaming op `push_metric`
+                // would have logged.
+                Some(k) => {
+                    let out = ops::sample_n_batches(&parts, *k, *seed)?;
+                    push_breaker(
+                        m, op_id, "sample", rows_in, 0, in_bytes, &out, t0, false, "interp",
+                    );
+                    Ok(out)
+                }
+                // Fractional: streaming per-morsel; its peak is the sampled result alone.
+                None => {
+                    let out: Vec<RecordBatch> = parts
+                        .par_iter()
+                        .map(|b| ops::sample_batch(b, *fraction, *seed))
+                        .collect::<Result<_, InterpError>>()?;
+                    push_metric(m, op_id, "sample", rows_in, &out, t0, false, "interp");
+                    Ok(out)
+                }
+            }
         }
 
         RelOp::Aggregate {
@@ -551,21 +598,83 @@ fn exec(
             group_keys,
             aggregates,
         } => {
+            // Streaming Filter/Project → Aggregate fusion: fold each source morsel through
+            // the fusable linear chain and directly into its partial state, never
+            // materializing the full (often multi-GB) filtered/projected relation. Gated on
+            // the control plane opting into linear fusion, a fusable input, and every
+            // aggregate being constant-state — its out-of-core spill folds from *partials*
+            // via grace partitioning, whereas the value-list aggregates (median / quantile /
+            // distinct / mode / histogram) spill from the raw morsels and keep the
+            // materializing path. The partials are exactly those the unfused parallel path
+            // builds (same per-morsel partial-then-combine), so the result is identical
+            // within the float tolerance the parallel path already carries.
+            if opts.fuse_linear && is_fusable(input) && !needs_parts_for_spill(aggregates) {
+                return exec_agg_fused(input, op_id, group_keys, aggregates, sources, opts, m, ids);
+            }
             let parts = exec(input, sources, opts, m, ids)?;
             if parts.is_empty() {
                 return Err(InterpError::EmptyAggregateInput);
             }
             let rows_in = count_rows(&parts);
+            // Captured before the input vector is consumed below.
+            let in_bytes = batch_bytes(&parts);
             let t0 = Stopwatch::start();
             let funcs = ops::agg_funcs(aggregates);
             // Compile computed group keys / aggregate inputs once (e.g.
             // `SUM(price * qty)`); reused across every morsel's partial, amortizing
             // the compile cost exactly like Filter/Project. `parts` is non-empty here.
             let agg_jit = ops::compile_agg(group_keys, aggregates, &parts[0]);
-            let partials: Vec<agg::Partial> = parts
-                .par_iter()
-                .map(|b| ops::eval_partial_jit(b, group_keys, aggregates, &agg_jit))
-                .collect::<Result<_, InterpError>>()?;
+            // Measure what this group-by actually reduces before committing to a shape.
+            // Pre-aggregating a near-unique key builds a hash table per morsel only to throw
+            // it away in the merge; `agg_par` partitions the input instead and aggregates it
+            // once. When grouping does reduce, the sample's partials are the first slice of
+            // the work below, and are reused rather than recomputed.
+            let partition_keys = agg_par::partitionable(group_keys, &parts);
+            let partials = match agg_par::decide(
+                &parts,
+                group_keys,
+                aggregates,
+                &agg_jit,
+                partition_keys.as_deref(),
+            )? {
+                // The partition path holds the gathered relation where the reducing path can
+                // spill its partials, so the pool decides. Declining costs the sample only.
+                agg_par::AggPlan::Partition(keys) => {
+                    match admit(opts, op_id, agg_par::partition_footprint(in_bytes)) {
+                        Admit::InMemory(_reservation) => {
+                            let out = agg_par::partitioned_aggregate(
+                                &parts,
+                                &keys,
+                                group_keys,
+                                aggregates,
+                                &agg_jit,
+                                &funcs,
+                                rayon::current_num_threads().max(1),
+                            )?;
+                            // The partition path holds the gathered relation *and* the source
+                            // morsels at once (~2×), the same footprint it was admitted on —
+                            // recording 1× would under-count the non-reducing group-by.
+                            push_breaker(
+                                m,
+                                op_id,
+                                "aggregate",
+                                rows_in,
+                                0,
+                                agg_par::partition_footprint(in_bytes) as u64,
+                                &out,
+                                t0,
+                                false,
+                                "par-agg-partitioned",
+                            );
+                            return Ok(out);
+                        }
+                        Admit::Spill => {
+                            agg_par::partials(&parts, group_keys, aggregates, &agg_jit)?
+                        }
+                    }
+                }
+                agg_par::AggPlan::Partials(partials) => partials,
+            };
 
             // Spill once the partial state exceeds the per-operator budget *or* the
             // shared pool can't admit it (cross-operator pressure); otherwise merge
@@ -577,6 +686,7 @@ fn exec(
             // zero groups).
             let state_bytes = partial_state_bytes(&partials);
             let mut spilled = false;
+            let mut spill_vol = 0u64;
             let decision = if rows_in > 0 {
                 admit(opts, op_id, state_bytes)
             } else {
@@ -637,6 +747,8 @@ fn exec(
                                 &mut store,
                                 sp.memory_budget_bytes,
                             )?;
+                            spill_vol = store.spilled_bytes(); // measured grace-spill volume
+                            warn_if_skewed(op_id, "aggregate", &store);
                             (res.group_columns, res.agg_columns)
                         }
                     }
@@ -654,18 +766,41 @@ fn exec(
                 &group_columns,
                 &agg_cols,
             )?];
-            push_metric(m, op_id, "aggregate", rows_in, &out, t0, spilled, "interp");
+            push_breaker_spilled(
+                m,
+                op_id,
+                "aggregate",
+                rows_in,
+                0,
+                in_bytes,
+                &out,
+                t0,
+                spilled,
+                spill_vol,
+                "interp",
+            );
             Ok(out)
         }
 
         RelOp::Sort { input, keys, limit } => {
             let parts = exec(input, sources, opts, m, ids)?;
             let rows_in = count_rows(&parts);
+            // Captured before the input vector is consumed below.
+            let in_bytes = batch_bytes(&parts);
             let t0 = Stopwatch::start();
             if parts.is_empty() {
                 push_metric(m, op_id, "sort", rows_in, &[], t0, false, "interp");
                 return Ok(Vec::new());
             }
+            let mut spilled = false;
+            let mut sort_spill_vol = 0u64;
+            // Scratch the sort allocates on top of its materialized input, which
+            // `get_array_memory_size` (in `batch_bytes`) cannot see: a full in-memory sort
+            // builds a permutation index (`lexsort_to_indices`, ~one u32 per row) and, for
+            // the parallel sample-sort, transient range partitions. A top-N keeps only small
+            // per-morsel heaps, so it adds nothing. Folding this in stops the peak
+            // under-count that pushes a sort near the spill boundary the wrong way.
+            let mut sort_scratch = 0u64;
             let out = match limit {
                 // Top-N: each morsel computes its local top-k in parallel (cheap),
                 // then we merge only the P×k survivors and take the global top-k —
@@ -686,6 +821,7 @@ fn exec(
                     let bytes = batch_bytes(&parts);
                     match admit(opts, op_id, bytes as usize) {
                         Admit::Spill => {
+                            spilled = true;
                             let sp = opts.agg_spill.as_ref().expect("spill implies an envelope");
                             // Bound each sorted run to one morsel before spilling: an
                             // oversized upstream batch (a join/aggregate output that was
@@ -693,28 +829,56 @@ fn exec(
                             // larger than the working-set budget. The merge phase is
                             // already fan-in bounded, so this caps peak sort memory.
                             let parts = ops::remorselize(parts, opts.morsel_target());
-                            ops::external_merge_sort(
+                            let (sorted, vol) = ops::external_merge_sort(
                                 parts,
                                 keys,
                                 &sp.dir.join("sort"),
                                 opts.tuning.sort_merge_fanin,
                                 sp.codec,
-                            )?
+                            )?;
+                            sort_spill_vol = vol; // measured pass-0 spill volume
+                            sorted
                         }
                         Admit::InMemory(_reservation) => {
+                            // Permutation index (~4 B/row) plus sample-sort range scratch.
+                            sort_scratch = rows_in.saturating_mul(8);
                             let combined = ops::materialize(&parts)?;
                             // Parallel sample-sort for a large single float-key full sort
                             // (range-partition + per-range parallel sort); falls back to
                             // the serial sort where it doesn't apply.
                             match ops::parallel_sort_batch(&combined, keys, None)? {
-                                Some(sorted) => vec![sorted],
+                                // Ranges come back already in key order: the sorted
+                                // relation is their concatenation, so hand them to the
+                                // caller as-is rather than copying them into one batch.
+                                Some(sorted) => sorted,
                                 None => vec![ops::sort_batch(&combined, keys, None)?],
                             }
                         }
                     }
                 }
             };
-            push_metric(m, op_id, "sort", rows_in, &out, t0, false, "interp");
+            // A spilled sort holds only ~a sorted run plus the merge fan-in resident, not the
+            // whole input, so the input no longer bounds its peak; cap it at the operator
+            // budget so Carbonite's memory model isn't taught the in-core footprint. An
+            // in-memory sort adds its permutation/range scratch to the materialized input.
+            let peak_in = if spilled {
+                in_bytes.min(opts.op_budget(op_id).map(|b| b as u64).unwrap_or(in_bytes))
+            } else {
+                in_bytes.saturating_add(sort_scratch)
+            };
+            push_breaker_spilled(
+                m,
+                op_id,
+                "sort",
+                rows_in,
+                0,
+                peak_in,
+                &out,
+                t0,
+                spilled,
+                sort_spill_vol,
+                "interp",
+            );
             Ok(out)
         }
 
@@ -731,16 +895,18 @@ fn exec(
             // materialize and run the single-pass kernel.
             let parts = exec(input, sources, opts, m, ids)?;
             let rows_in = count_rows(&parts);
+            // Captured before the input vector is consumed below.
+            let in_bytes = batch_bytes(&parts);
             let t0 = Stopwatch::start();
             let bytes = batch_bytes(&parts);
             let has_keys = !partition_keys.is_empty();
-            let (out, spill) = match admit(opts, op_id, bytes as usize) {
+            let (out, spill, spill_vol) = match admit(opts, op_id, bytes as usize) {
                 // Grace-partition by PARTITION BY keys and run the kernel one bucket
                 // at a time (bounded memory).
                 Admit::Spill if has_keys => {
                     let global = opts.agg_spill.as_ref().expect("spill implies an envelope");
                     let budget = opts.op_budget(op_id).unwrap_or(global.memory_budget_bytes);
-                    let out = crate::window_spill::window_spilling(
+                    let (out, vol) = crate::window_spill::window_spilling(
                         &parts,
                         partition_keys,
                         order_keys,
@@ -750,7 +916,7 @@ fn exec(
                         &global.dir,
                         global.codec,
                     )?;
-                    (out, true)
+                    (out, true, vol)
                 }
                 // No PARTITION BY: the kernel needs the whole relation at once and
                 // cannot grace-partition, so spilling can't bound it. Fail with a
@@ -776,7 +942,7 @@ fn exec(
                         }
                         Err(_) => Vec::new(),
                     };
-                    (out, false)
+                    (out, false, 0)
                 }
             };
             // The window kernel emits its whole result as one (up to full-input-sized)
@@ -785,7 +951,9 @@ fn exec(
             // single-threaded). Re-morselize so the pipeline below the breaker fans back
             // out across cores; the split is zero-copy Arrow slices. Same rows, same order.
             let out = ops::remorselize(out, opts.morsel_target());
-            push_metric(m, op_id, "window", rows_in, &out, t0, spill, "interp");
+            push_breaker_spilled(
+                m, op_id, "window", rows_in, 0, in_bytes, &out, t0, spill, spill_vol, "interp",
+            );
             Ok(out)
         }
 
@@ -816,7 +984,11 @@ fn exec(
             // no key to partition on → one sequential pass, matching the oracle.
             let left_batches = exec(left, sources, opts, m, ids)?;
             let right_batches = exec(right, sources, opts, m, ids)?;
-            let rows_in = count_rows(&left_batches) + count_rows(&right_batches);
+            // The probe side (left) drives the per-row probe cost; the build side (right)
+            // drives the hash table's memory. Their sum made both meaningless.
+            let rows_in = count_rows(&left_batches);
+            let rows_build = count_rows(&right_batches);
+            let in_bytes = batch_bytes(&left_batches) + batch_bytes(&right_batches);
             let t0 = Stopwatch::start();
             let left = ops::materialize(&left_batches)?;
             let right = ops::materialize(&right_batches)?;
@@ -877,7 +1049,18 @@ fn exec(
                     }
                 }
             };
-            push_metric(m, op_id, "asof_join", rows_in, &out, t0, spilled, "interp");
+            push_breaker(
+                m,
+                op_id,
+                "asof_join",
+                rows_in,
+                rows_build,
+                in_bytes,
+                &out,
+                t0,
+                spilled,
+                "interp",
+            );
             Ok(out)
         }
 
@@ -892,7 +1075,19 @@ fn exec(
         } => {
             let left_batches = exec(left, sources, opts, m, ids)?;
             let right_batches = exec(right, sources, opts, m, ids)?;
-            let rows_in = count_rows(&left_batches) + count_rows(&right_batches);
+            // The probe side (left) drives the per-row probe cost; the build side (right)
+            // drives the hash table's memory. Their sum made both meaningless.
+            let rows_in = count_rows(&left_batches);
+            let rows_build = count_rows(&right_batches);
+            // The hash table / chain / null mask built over the build side is the join's
+            // largest allocation and is live alongside both materialized inputs at the
+            // probe's peak, yet `get_array_memory_size` (in `batch_bytes`) sees only the raw
+            // build columns. Add the structural overhead `estimate_build_bytes` accounts for
+            // (2–10× on narrow keys) — the same figure admission reserves against below — so
+            // the peak Carbonite learns from matches what the join actually holds.
+            let in_bytes = batch_bytes(&left_batches)
+                + batch_bytes(&right_batches)
+                + bc_runtime::join::estimate_build_bytes(rows_build as usize) as u64;
             let t0 = Stopwatch::start();
 
             // Byte-true build size computed from the build *batches* — WITHOUT
@@ -914,7 +1109,7 @@ fn exec(
                         .with_budget(opts.op_budget(op_id).unwrap_or(global.memory_budget_bytes));
                     // Stream both sides to disk batch-by-batch (never materializing
                     // the full build side), then join one bucket at a time.
-                    let out = spilling_hash_join_streaming(
+                    let (out, spill_vol) = spilling_hash_join_streaming(
                         &left_batches,
                         &right_batches,
                         left_keys,
@@ -923,34 +1118,102 @@ fn exec(
                         output,
                         sp,
                     )?;
-                    push_metric(m, op_id, "hash_join", rows_in, &out, t0, true, "interp");
+                    push_breaker_spilled(
+                        m,
+                        op_id,
+                        "hash_join",
+                        rows_in,
+                        rows_build,
+                        in_bytes,
+                        &out,
+                        t0,
+                        true,
+                        spill_vol,
+                        "interp",
+                    );
                     return Ok(out);
                 }
                 Admit::InMemory(reservation) => reservation,
             };
 
-            // Fits in memory: now materialize both sides for the in-memory path.
-            let left = ops::materialize(&left_batches)?;
-            let right = ops::materialize(&right_batches)?;
-
             // Broadcast: the planner found the right side small enough to replicate.
             // Probe the large left side without shuffling it (no key partitioning).
             if *strategy == bc_ir::JoinStrategy::Broadcast {
+                // The build side is concatenated here (it is the small one, and one hash
+                // table is built over the whole of it). The probe side is NOT — a broadcast
+                // join streams it morsel by morsel, and that copy is the query's largest.
+                // The shuffle path below never concatenates either side.
+                let right = ops::materialize(&right_batches)?;
+                // Stream the probe wherever it is provably safe (a probe-driven join type
+                // over integer keys); otherwise fall back to concatenating it. The relation
+                // is the same either way — see `broadcast_join_streaming`.
+                if let Some(out) = broadcast_join_streaming(
+                    &left_batches,
+                    &right,
+                    left_keys,
+                    right_keys,
+                    *join_type,
+                    output,
+                )? {
+                    // The streaming broadcast never materializes the probe (the query's
+                    // largest relation) — it flows one morsel at a time — so its true peak is
+                    // the build side (columns + hash table) plus a single probe morsel and the
+                    // result, not the whole probe `in_bytes` includes. Recording `in_bytes`
+                    // here over-provisioned the broadcast strategy and biased the planner away
+                    // from it (its whole point is to avoid holding the probe).
+                    let probe_morsel = left_batches
+                        .iter()
+                        .map(|b| batch_bytes(std::slice::from_ref(b)))
+                        .max()
+                        .unwrap_or(0);
+                    let build_live = batch_bytes(&right_batches)
+                        + bc_runtime::join::estimate_build_bytes(rows_build as usize) as u64;
+                    push_breaker(
+                        m,
+                        op_id,
+                        "hash_join",
+                        rows_in,
+                        rows_build,
+                        build_live.saturating_add(probe_morsel),
+                        &out,
+                        t0,
+                        false,
+                        "interp",
+                    );
+                    return Ok(out);
+                }
+                let left = ops::materialize(&left_batches)?;
                 let out = broadcast_join(&left, &right, left_keys, right_keys, *join_type, output)?;
                 // The broadcast probe emits only ~`probe_rows/build_rows` chunks (as few as
                 // a handful when the build side is large), which would run every downstream
                 // operator on those few big batches single-threaded. Re-morselize (zero-copy
                 // slices) so the pipeline below fans back out across cores.
                 let out = ops::remorselize(out, opts.morsel_target());
-                push_metric(m, op_id, "hash_join", rows_in, &out, t0, false, "interp");
+                push_breaker(
+                    m,
+                    op_id,
+                    "hash_join",
+                    rows_in,
+                    rows_build,
+                    in_bytes,
+                    &out,
+                    t0,
+                    false,
+                    "interp",
+                );
                 return Ok(out);
             }
 
             let p = rayon::current_num_threads().max(1);
-            let li = ops::key_indices(&left, left_keys)?;
-            let ri = ops::key_indices(&right, right_keys)?;
-            let lb = shuffle::partition_by_keys(&left, &li, p)?;
-            let rb = shuffle::partition_by_keys(&right, &ri, p)?;
+
+            // Bucket both sides straight from their morsels, gathering each row **once**.
+            // `materialize(&batches)` here used to concatenate a relation only for
+            // `partition_by_keys` to gather every row again a moment later — two full copies
+            // where one does. The buckets, their contents, and the row order within each are
+            // identical (`ops::repartition`), so the per-bucket join and the `seq == par`
+            // oracle see exactly what they saw before.
+            let rb = ops::partition_morsels(&right_batches, right_keys, p)?;
+            let lb = ops::partition_morsels(&left_batches, left_keys, p)?;
 
             // Skew handling: a hot key sends all its rows to one bucket, making that
             // per-bucket join a straggler. Detect it for free from the partition
@@ -962,9 +1225,16 @@ fn exec(
             let salt = skew_salting_eligible(*join_type);
             let driving_is_right = matches!(*join_type, bc_ir::JoinType::Right);
             let driving_bucket = |i: usize| if driving_is_right { &rb[i] } else { &lb[i] };
-            let driving_side = if driving_is_right { &right } else { &left };
-            let avg = driving_side.num_rows() / p.max(1);
-            let avg_bytes = driving_side.get_array_memory_size() / p.max(1);
+            let (driving_rows, driving_bytes) = if driving_is_right {
+                (build_rows, batch_bytes(&right_batches) as usize)
+            } else {
+                (
+                    count_rows(&left_batches) as usize,
+                    batch_bytes(&left_batches) as usize,
+                )
+            };
+            let avg = driving_rows / p.max(1);
+            let avg_bytes = driving_bytes / p.max(1);
             // Hot by rows OR by bytes: a hot key of wide rows concentrates work even
             // at a modest row count, which the row-only test cannot see. Salting is
             // result-invisible, so widening the trigger never changes the output.
@@ -1017,17 +1287,32 @@ fn exec(
                 (false, true) => "interp-smj",
                 (false, false) => "interp",
             };
-            push_metric(m, op_id, "hash_join", rows_in, &out, t0, false, backend);
+            push_breaker(
+                m,
+                op_id,
+                "hash_join",
+                rows_in,
+                rows_build,
+                in_bytes,
+                &out,
+                t0,
+                false,
+                backend,
+            );
             Ok(out)
         }
 
         RelOp::Distinct { input } => {
             let parts = exec(input, sources, opts, m, ids)?;
             let rows_in = count_rows(&parts);
+            // Captured before the input vector is consumed below.
+            let in_bytes = batch_bytes(&parts);
             let t0 = Stopwatch::start();
-            let (batch, spilled) = distinct(&parts, opts, op_id)?;
+            let (batch, spilled, spill_vol) = distinct(&parts, opts, op_id)?;
             let out = vec![batch];
-            push_metric(m, op_id, "distinct", rows_in, &out, t0, spilled, "interp");
+            push_breaker_spilled(
+                m, op_id, "distinct", rows_in, 0, in_bytes, &out, t0, spilled, spill_vol, "interp",
+            );
             Ok(out)
         }
 
@@ -1040,15 +1325,24 @@ fn exec(
                 all.extend(exec(inp, sources, opts, m, ids)?);
             }
             let rows_in = count_rows(&all);
+            // Captured before `all` is consumed: the dedup path materializes and hashes it.
+            let in_bytes = batch_bytes(&all);
             let t0 = Stopwatch::start();
-            let (out, spilled) = if *dedup {
-                let (batch, sp) = distinct(&all, opts, op_id)?;
-                (vec![batch], sp)
+            if *dedup {
+                // A deduplicating UNION runs the full grace-capable `distinct` (materialize
+                // + hash + possible spill) — a breaker holding its input plus the deduped
+                // result — not the ~0-peak streaming op `push_metric` recorded.
+                let (batch, spilled, spill_vol) = distinct(&all, opts, op_id)?;
+                let out = vec![batch];
+                push_breaker_spilled(
+                    m, op_id, "union", rows_in, 0, in_bytes, &out, t0, spilled, spill_vol, "interp",
+                );
+                Ok(out)
             } else {
-                (all, false)
-            };
-            push_metric(m, op_id, "union", rows_in, &out, t0, spilled, "interp");
-            Ok(out)
+                // UNION ALL streams: it concatenates handles and holds only the result.
+                push_metric(m, op_id, "union", rows_in, &all, t0, false, "interp");
+                Ok(all)
+            }
         }
     }
 }
@@ -1243,10 +1537,203 @@ fn exec_fused(
             cpu_ns: cpu,
             threads,
             peak_bytes,
+            result_bytes: peak_bytes,
+            rows_build: 0,
             spilled: false,
+            spill_bytes: 0,
+            peak_rss_bytes: 0,
             backend: stage.backend(),
         });
     }
+    Ok(out)
+}
+
+/// Whether any aggregate needs the raw input morsels (not just partials) for its
+/// out-of-core spill — the value-list aggregates whose per-group state is unbounded.
+/// Those keep the materializing path; everything else spills from partials via grace.
+fn needs_parts_for_spill(aggregates: &[AggregateItem]) -> bool {
+    aggregates.iter().any(|a| {
+        matches!(
+            a.func,
+            AggFunc::Median
+                | AggFunc::Quantile
+                | AggFunc::CountDistinct
+                | AggFunc::Mode
+                | AggFunc::Histogram
+                | AggFunc::ListAgg
+                | AggFunc::ApproxCountDistinct
+                | AggFunc::ApproxQuantile
+        )
+    })
+}
+
+/// Fused Filter/Project → Aggregate: build each morsel's partial state directly from the
+/// linear chain's per-morsel output, without ever collecting the transformed relation.
+/// The chain is numbered and metered exactly as the recursive `exec` would (so adaptive
+/// metadata and the metric tree are unchanged), and the partials feed the same
+/// `combine`/grace-spill path as the unfused aggregate. Caller has checked the input is a
+/// fusable chain and no aggregate needs raw morsels for spill.
+#[allow(clippy::too_many_arguments)]
+fn exec_agg_fused(
+    input: &RelOp,
+    op_id: u32,
+    group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
+    sources: &[Vec<RecordBatch>],
+    opts: &ExecOptions,
+    m: &mut ExecMetrics,
+    ids: &mut IdGen,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    // Number the fusable chain (Filter/Project) below the aggregate, then execute the
+    // first non-fusable input — the exact pre-order numbering the recursive `exec` uses.
+    let mut chain: Vec<(u32, &RelOp)> = vec![(ids.next(), input)];
+    let mut base = fusable_input(input).expect("a fusable op has an input");
+    while is_fusable(base) {
+        chain.push((ids.next(), base));
+        base = fusable_input(base).expect("a fusable op has an input");
+    }
+    let base_morsels = exec(base, sources, opts, m, ids)?;
+    if base_morsels.is_empty() {
+        return Err(InterpError::EmptyAggregateInput);
+    }
+    let base_rows = count_rows(&base_morsels);
+    // The materialized input relation stays live through the whole fold (the `par_iter`
+    // below only borrows it), so it is part of the aggregate's peak working set — exactly
+    // as the unfused parallel path records via `push_breaker`. Recording only the tiny
+    // grouped output (the former `push_metric`) reintroduced the peak under-count the
+    // metrics contract exists to prevent: a 60M-row group-by over 4 groups reported ~0.
+    let base_bytes = batch_bytes(&base_morsels);
+
+    let stage_t0 = Stopwatch::start();
+    // Compile each linear stage innermost→outermost against the schema it sees, then the
+    // aggregate's expressions against the post-chain sample (mirrors the unfused compiles).
+    let mut sample = base_morsels.first().cloned();
+    let mut stages: Vec<FusedStage> = Vec::with_capacity(chain.len());
+    for (id, op) in chain.iter().rev() {
+        let stage = compile_stage(*id, op, sample.as_ref());
+        if let Some(s) = &sample {
+            sample = Some(stage.apply(s)?);
+        }
+        stages.push(stage);
+    }
+    let agg_sample = sample.as_ref().expect("non-empty base has a sample");
+    let agg_jit = ops::compile_agg(group_keys, aggregates, agg_sample);
+
+    // Per morsel: run the chain, then fold the result straight into a partial. Track the
+    // row count after each stage so the fused ops keep exact selectivity metrics.
+    let n = stages.len();
+    let results: Vec<(agg::Partial, Vec<u64>)> = base_morsels
+        .par_iter()
+        .map(|b| {
+            let mut cur = b.clone();
+            let mut stage_rows = Vec::with_capacity(n);
+            for stage in &stages {
+                cur = stage.apply(&cur)?;
+                stage_rows.push(cur.num_rows() as u64);
+            }
+            let partial = ops::eval_partial_jit(&cur, group_keys, aggregates, &agg_jit)?;
+            Ok((partial, stage_rows))
+        })
+        .collect::<Result<Vec<_>, InterpError>>()?;
+
+    let mut totals = vec![0u64; n];
+    let mut partials = Vec::with_capacity(results.len());
+    for (partial, rows) in results {
+        for (i, r) in rows.iter().enumerate() {
+            totals[i] += r;
+        }
+        partials.push(partial);
+    }
+    // Emit one metric per fused linear op (children before parents), as `exec_fused` does.
+    let stage_elapsed = stage_t0.elapsed_ns().max(1) / n as u64;
+    let stage_cpu = stage_t0.cpu_ns() / n as u64;
+    let threads = rayon::current_num_threads().max(1) as u32;
+    for (i, stage) in stages.iter().enumerate() {
+        let rows_in = if i == 0 { base_rows } else { totals[i - 1] };
+        m.record(OpMetric {
+            op_id: stage.op_id(),
+            kind: stage.kind(),
+            rows_in,
+            rows_out: totals[i],
+            elapsed_ns: stage_elapsed,
+            cpu_ns: stage_cpu,
+            threads,
+            peak_bytes: 0,
+            result_bytes: 0,
+            rows_build: 0,
+            spilled: false,
+            spill_bytes: 0,
+            peak_rss_bytes: 0,
+            backend: stage.backend(),
+        });
+    }
+
+    // Combine the partials — the same in-memory / grace-spill path as the unfused
+    // aggregate (no value-list aggregate reaches here, so no raw-morsel spill is needed).
+    let agg_t0 = Stopwatch::start();
+    let funcs = ops::agg_funcs(aggregates);
+    let rows_in = *totals.last().unwrap_or(&base_rows);
+    let state_bytes = partial_state_bytes(&partials);
+    let mut spilled = false;
+    let mut spill_vol = 0u64;
+    let decision = if rows_in > 0 {
+        admit(opts, op_id, state_bytes)
+    } else {
+        Admit::InMemory(None)
+    };
+    let (group_columns, agg_cols) = match decision {
+        Admit::Spill => {
+            let global = opts.agg_spill.as_ref().expect("spill implies an envelope");
+            let sp =
+                &global.with_budget(opts.op_budget(op_id).unwrap_or(global.memory_budget_bytes));
+            spilled = true;
+            let p = grace_partitions(&partials, sp.memory_budget_bytes);
+            let mut store =
+                DiskSpillStore::with_codec(sp.dir.join(format!("agg-{p}p")), p, sp.codec)?;
+            let res =
+                combine_finalize_spilling(partials, &funcs, &mut store, sp.memory_budget_bytes)?;
+            spill_vol = store.spilled_bytes(); // measured volume routed to disk
+            warn_if_skewed(op_id, "aggregate", &store);
+            (res.group_columns, res.agg_columns)
+        }
+        Admit::InMemory(_reservation) => {
+            let merged =
+                agg::combine_with(&partials, &funcs, opts.tuning.radix_parallel_threshold)?;
+            let agg_cols = agg::finalize(&funcs, &merged)?;
+            (merged.group_columns, agg_cols)
+        }
+    };
+    let out = vec![ops::build_agg_batch(
+        group_keys,
+        aggregates,
+        &group_columns,
+        &agg_cols,
+    )?];
+    // A spilled fold holds only ~the budget resident, not the whole input, so the input
+    // relation no longer bounds its peak; cap it at the operator's resolved budget so
+    // Carbonite doesn't learn that a bounded-memory spill "needed" the full input.
+    let peak_in = if spilled {
+        base_bytes.min(
+            opts.op_budget(op_id)
+                .map(|b| b as u64)
+                .unwrap_or(base_bytes),
+        )
+    } else {
+        base_bytes
+    };
+    push_breaker_spilled(
+        m,
+        op_id,
+        "aggregate",
+        rows_in,
+        0,
+        peak_in,
+        &out,
+        agg_t0,
+        spilled,
+        spill_vol,
+        "interp",
+    );
     Ok(out)
 }
 
@@ -1261,16 +1748,101 @@ fn push_metric(
     spilled: bool,
     backend: &'static str,
 ) {
+    let bytes = batch_bytes(out);
+    let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
     m.record(OpMetric {
         op_id,
         kind,
         rows_in,
+        rows_build: 0,
         rows_out: count_rows(out),
         elapsed_ns: t0.elapsed_ns(),
-        cpu_ns: t0.cpu_ns(),
+        cpu_ns,
         threads: rayon::current_num_threads().max(1) as u32,
-        peak_bytes: batch_bytes(out),
+        peak_bytes: bytes,
+        result_bytes: bytes,
         spilled,
+        spill_bytes: 0,
+        peak_rss_bytes,
+        backend,
+    });
+}
+
+/// Record a **pipeline breaker**: it materializes `in_bytes` of input and builds its
+/// result at the same time, so both are live at its peak. `rows_build` is a join's
+/// build-side rows (0 elsewhere). Streaming operators use `push_metric`, whose peak is
+/// its result alone.
+#[allow(clippy::too_many_arguments)]
+fn push_breaker(
+    m: &mut ExecMetrics,
+    op_id: u32,
+    kind: &'static str,
+    rows_in: u64,
+    rows_build: u64,
+    in_bytes: u64,
+    out: &[RecordBatch],
+    t0: Stopwatch,
+    spilled: bool,
+    backend: &'static str,
+) {
+    push_breaker_spilled(
+        m, op_id, kind, rows_in, rows_build, in_bytes, out, t0, spilled, 0, backend,
+    );
+}
+
+/// Above this spill skew (largest partition / mean), one partition dominates badly enough
+/// that the grace merge thrashes on it — worth telling the operator so they can salt the key.
+const SPILL_SKEW_WARN: f32 = 3.0;
+
+/// Emit an operator-visible diagnostic when a spill's partitions are badly imbalanced (a hot
+/// key piled one partition). Surfaced through the tracing bridge; salting the shuffle key or
+/// raising the partition count is the fix. Pure side effect — never changes a result.
+fn warn_if_skewed(op_id: u32, kind: &str, store: &DiskSpillStore) {
+    let skew = store.spill_skew();
+    if skew > SPILL_SKEW_WARN {
+        tracing::warn!(
+            target: "batcher.engine",
+            op_id,
+            kind,
+            skew,
+            "skewed spill: one partition dominates — salt the key or raise the partition count"
+        );
+    }
+}
+
+/// A breaker that also reports its measured **spill volume** (`spill_bytes`). The spill
+/// sites that own their `SpillStore` call this with `store.spilled_bytes()`; every other
+/// breaker uses [`push_breaker`], which passes `0` (did not spill / unmeasured).
+#[allow(clippy::too_many_arguments)]
+fn push_breaker_spilled(
+    m: &mut ExecMetrics,
+    op_id: u32,
+    kind: &'static str,
+    rows_in: u64,
+    rows_build: u64,
+    in_bytes: u64,
+    out: &[RecordBatch],
+    t0: Stopwatch,
+    spilled: bool,
+    spill_bytes: u64,
+    backend: &'static str,
+) {
+    let result_bytes = batch_bytes(out);
+    let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
+    m.record(OpMetric {
+        op_id,
+        kind,
+        rows_in,
+        rows_build,
+        rows_out: count_rows(out),
+        elapsed_ns: t0.elapsed_ns(),
+        cpu_ns,
+        threads: rayon::current_num_threads().max(1) as u32,
+        peak_bytes: in_bytes.saturating_add(result_bytes),
+        result_bytes,
+        spilled,
+        spill_bytes,
+        peak_rss_bytes,
         backend,
     });
 }
@@ -1318,11 +1890,13 @@ fn grace_partitions(partials: &[agg::Partial], budget_bytes: usize) -> usize {
 /// spills through the *same* grace path as aggregation when the partial state
 /// exceeds the memory envelope — high-cardinality DISTINCT/UNION stays bounded
 /// instead of OOMing. Returns the deduplicated batch and whether it spilled.
+/// Returns `(deduped batch, spilled, spill_bytes)` — the measured spill volume is `0`
+/// unless the grace path engaged.
 fn distinct(
     parts: &[RecordBatch],
     opts: &ExecOptions,
     op_id: u32,
-) -> Result<(RecordBatch, bool), InterpError> {
+) -> Result<(RecordBatch, bool, u64), InterpError> {
     if parts.is_empty() {
         return Err(InterpError::EmptyAggregateInput);
     }
@@ -1338,6 +1912,13 @@ fn distinct(
     //     arbitrary raw value, which could split two equal null-bearing rows across buckets;
     //     a nullable DISTINCT keeps the row-encoded `partial`/`combine` (nulls compare equal).
     //   * in-memory — a spilling DISTINCT still streams through the grace `combine`.
+    // A single dense integer column needs neither hash nor gather: `DISTINCT` over it is a
+    // presence bitmap indexed by `value - min`, two linear passes and no partial state.
+    // Declines (returning `None`) for anything wider, nullable, non-integer, or sparse.
+    if let Some(out) = agg::distinct_dense(parts)? {
+        return Ok((out, false, 0));
+    }
+
     let ncols = schema.fields().len();
     let no_nulls = ncols > 0
         && parts
@@ -1353,7 +1934,7 @@ fn distinct(
             let batch = ops::materialize(parts)?;
             let p = rayon::current_num_threads().max(1);
             let out = agg::distinct_batch(&batch, p)?;
-            return Ok((out, false));
+            return Ok((out, false, 0));
         }
     }
 
@@ -1362,7 +1943,7 @@ fn distinct(
         .map(ops::distinct_partial)
         .collect::<Result<_, InterpError>>()?;
     let state_bytes = partial_state_bytes(&partials);
-    let (group_columns, spilled) = match admit(opts, op_id, state_bytes) {
+    let (group_columns, spilled, spill_vol) = match admit(opts, op_id, state_bytes) {
         Admit::Spill => {
             let global = opts.agg_spill.as_ref().expect("spill implies an envelope");
             let budget = opts.op_budget(op_id).unwrap_or(global.memory_budget_bytes);
@@ -1372,14 +1953,20 @@ fn distinct(
             let mut store = DiskSpillStore::with_codec(dir, p, sp.codec)?;
             // No aggregates: `&[]` makes this a pure dedup over the group columns.
             let res = combine_finalize_spilling(partials, &[], &mut store, sp.memory_budget_bytes)?;
-            (res.group_columns, true)
+            warn_if_skewed(op_id, "distinct", &store);
+            (res.group_columns, true, store.spilled_bytes())
         }
         Admit::InMemory(_reservation) => (
             agg::combine_with(&partials, &[], opts.tuning.radix_parallel_threshold)?.group_columns,
             false,
+            0,
         ),
     };
-    Ok((RecordBatch::try_new(schema, group_columns)?, spilled))
+    Ok((
+        RecordBatch::try_new(schema, group_columns)?,
+        spilled,
+        spill_vol,
+    ))
 }
 
 #[cfg(test)]
@@ -1396,6 +1983,332 @@ mod tests {
             ("v", Arc::new(Int64Array::from(vals.to_vec())) as ArrayRef),
         ])
         .unwrap()
+    }
+
+    /// Peak working-set measurement contract for the *parallel* breakers (the metrics
+    /// contract integration test covers only the sequential oracle). These guard the
+    /// under-counts Carbonite's per-family memory model would otherwise learn.
+    mod peak_bytes_contract {
+        use super::*;
+        use bc_expr::{BinaryOp, Expr, Literal};
+        use bc_ir::{AggFunc, AggregateItem, ProjectionItem};
+
+        fn peak(m: &ExecMetrics, kind: &str) -> (u64, u64) {
+            let op = m
+                .ops
+                .iter()
+                .find(|o| o.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind} metric in {:?}", m.ops));
+            (op.peak_bytes, op.result_bytes)
+        }
+
+        /// A fused Filter→Aggregate must report the input it holds, not its tiny grouped
+        /// output. This is the exact 60M-rows/4-groups under-count the contract exists to
+        /// stop — the fused path used to record `push_metric` (peak == output).
+        #[test]
+        fn fused_aggregate_reports_input_peak_not_tiny_output() {
+            let plan = RelOp::Aggregate {
+                input: Box::new(RelOp::Filter {
+                    input: Box::new(RelOp::Scan { source_id: 0 }),
+                    predicate: Expr::Binary {
+                        op: BinaryOp::Ge,
+                        left: Box::new(Expr::Col { name: "v".into() }),
+                        right: Box::new(Expr::Lit {
+                            value: Literal::Int(0),
+                        }),
+                    },
+                }),
+                group_keys: vec![ProjectionItem {
+                    expr: Expr::Col { name: "k".into() },
+                    alias: "k".into(),
+                }],
+                aggregates: vec![AggregateItem {
+                    func: AggFunc::Sum,
+                    input: Some(Expr::Col { name: "v".into() }),
+                    input2: None,
+                    alias: "s".into(),
+                    param: None,
+                }],
+            };
+            // 4 groups; the filter keeps every row so the fold materializes the whole input.
+            let keys: Vec<i64> = (0..4_000).map(|i| i % 4).collect();
+            let vals: Vec<i64> = (0..4_000).collect();
+            let opts = ExecOptions {
+                morsel_rows: 128,
+                fuse_linear: true,
+                ..ExecOptions::default()
+            };
+            let (out, m) =
+                execute_parallel_with_metrics(&plan, &[vec![batch(&keys, &vals)]], &opts).unwrap();
+            assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+            let (peak, result) = peak(&m, "aggregate");
+            assert!(
+                peak >= 4_000 * 16,
+                "fused aggregate peak {peak} must account for the 4000-row (16 B/row) input"
+            );
+            assert!(
+                result * 50 < peak,
+                "grouped output {result} must be a tiny fraction of peak {peak}"
+            );
+        }
+
+        /// A hash join's peak must include the build-side hash table / chain / null mask —
+        /// the join's largest allocation, invisible to `get_array_memory_size`.
+        #[test]
+        fn hash_join_peak_includes_build_structure() {
+            let plan = RelOp::HashJoin {
+                left: Box::new(RelOp::Scan { source_id: 0 }),
+                right: Box::new(RelOp::Scan { source_id: 1 }),
+                left_keys: vec!["k".into()],
+                right_keys: vec!["k".into()],
+                join_type: bc_ir::JoinType::Inner,
+                output: vec![
+                    bc_ir::JoinOutputCol {
+                        side: bc_ir::JoinSide::Left,
+                        name: "v".into(),
+                        alias: "lv".into(),
+                    },
+                    bc_ir::JoinOutputCol {
+                        side: bc_ir::JoinSide::Right,
+                        name: "v".into(),
+                        alias: "rv".into(),
+                    },
+                ],
+                strategy: bc_ir::JoinStrategy::Hash,
+            };
+            let probe: Vec<i64> = (0..2_000).map(|i| i % 500).collect();
+            let build: Vec<i64> = (0..500).collect();
+            let (_out, m) = execute_parallel_with_metrics(
+                &plan,
+                &[vec![batch(&probe, &probe)], vec![batch(&build, &build)]],
+                &ExecOptions::default(),
+            )
+            .unwrap();
+            let (peak, _result) = peak(&m, "hash_join");
+            let raw_inputs = (2_000 + 500) * 16;
+            assert!(
+                peak > raw_inputs,
+                "join peak {peak} must exceed raw input bytes {raw_inputs} by the hash structure"
+            );
+        }
+
+        /// A spilling aggregate reports its measured spill *volume*, not just a bool — the
+        /// magnitude Carbonite sizes spill scratch and disk bandwidth from.
+        #[test]
+        fn a_spilling_aggregate_reports_its_spill_volume() {
+            let plan = RelOp::Aggregate {
+                input: Box::new(RelOp::Scan { source_id: 0 }),
+                group_keys: vec![ProjectionItem {
+                    expr: Expr::Col { name: "k".into() },
+                    alias: "k".into(),
+                }],
+                aggregates: vec![AggregateItem {
+                    func: AggFunc::Sum,
+                    input: Some(Expr::Col { name: "v".into() }),
+                    input2: None,
+                    alias: "s".into(),
+                    param: None,
+                }],
+            };
+            // 20k distinct keys → a large hash state; a 1 KiB budget forces the grace spill.
+            let keys: Vec<i64> = (0..20_000).collect();
+            let vals: Vec<i64> = (0..20_000).collect();
+            let opts = ExecOptions {
+                morsel_rows: 512,
+                agg_spill: Some(super::SpillOptions {
+                    memory_budget_bytes: 1024,
+                    dir: std::env::temp_dir(),
+                    codec: super::SpillCodec::None,
+                }),
+                ..ExecOptions::default()
+            };
+            let (out, m) =
+                execute_parallel_with_metrics(&plan, &[vec![batch(&keys, &vals)]], &opts).unwrap();
+            assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 20_000);
+            let agg = m
+                .ops
+                .iter()
+                .find(|o| o.kind == "aggregate")
+                .expect("aggregate metric");
+            assert!(agg.spilled, "a 1 KiB budget over 20k groups must spill");
+            assert!(
+                agg.spill_bytes > 0,
+                "a spilling aggregate must report a measured spill volume, got {}",
+                agg.spill_bytes
+            );
+        }
+
+        /// A spilling sort reports its measured pass-0 spill volume, not just `spilled`.
+        #[test]
+        fn a_spilling_sort_reports_its_spill_volume() {
+            let plan = RelOp::Sort {
+                input: Box::new(RelOp::Scan { source_id: 0 }),
+                keys: vec![bc_ir::SortKey {
+                    expr: Expr::Col { name: "v".into() },
+                    descending: false,
+                    nulls_first: false,
+                }],
+                limit: None,
+            };
+            let vals: Vec<i64> = (0..20_000).rev().collect();
+            let opts = ExecOptions {
+                morsel_rows: 512,
+                agg_spill: Some(super::SpillOptions {
+                    memory_budget_bytes: 1024,
+                    dir: std::env::temp_dir(),
+                    codec: super::SpillCodec::None,
+                }),
+                ..ExecOptions::default()
+            };
+            let (_out, m) =
+                execute_parallel_with_metrics(&plan, &[vec![batch(&vals, &vals)]], &opts).unwrap();
+            let sort = m
+                .ops
+                .iter()
+                .find(|o| o.kind == "sort")
+                .expect("sort metric");
+            assert!(sort.spilled, "a 1 KiB budget over 20k rows must spill");
+            assert!(
+                sort.spill_bytes > 0,
+                "a spilling sort must report a measured spill volume, got {}",
+                sort.spill_bytes
+            );
+        }
+
+        /// A spilling window reports its measured spill volume too (all spilling operators —
+        /// aggregate, distinct, union, hash_join, sort, window — now do).
+        #[test]
+        fn a_spilling_window_reports_its_spill_volume() {
+            use bc_ir::{SortKey, WindowFn, WindowFunc};
+
+            let plan = RelOp::Window {
+                input: Box::new(RelOp::Scan { source_id: 0 }),
+                partition_keys: vec![Expr::Col { name: "k".into() }],
+                order_keys: vec![SortKey {
+                    expr: Expr::Col { name: "v".into() },
+                    descending: false,
+                    nulls_first: false,
+                }],
+                functions: vec![WindowFunc {
+                    func: WindowFn::Sum,
+                    input: Some(Expr::Col { name: "v".into() }),
+                    offset: 1,
+                    frame: None,
+                    alias: "s".into(),
+                }],
+                rank_limit: None,
+            };
+            let keys: Vec<i64> = (0..8_000).map(|i| i % 50).collect();
+            let vals: Vec<i64> = (0..8_000).collect();
+            let opts = ExecOptions {
+                agg_spill: Some(super::SpillOptions {
+                    memory_budget_bytes: 1024,
+                    dir: std::env::temp_dir(),
+                    codec: super::SpillCodec::None,
+                }),
+                ..ExecOptions::default()
+            };
+            let (_out, m) =
+                execute_parallel_with_metrics(&plan, &[vec![batch(&keys, &vals)]], &opts).unwrap();
+            let w = m
+                .ops
+                .iter()
+                .find(|o| o.kind == "window")
+                .expect("window metric");
+            assert!(
+                w.spilled,
+                "a 1 KiB budget must force the window grace spill"
+            );
+            assert!(
+                w.spill_bytes > 0,
+                "a spilling window must report a measured spill volume, got {}",
+                w.spill_bytes
+            );
+        }
+
+        /// A full in-memory sort allocates a permutation index on top of its materialized
+        /// input, so its peak must exceed the sorted result it emits (equal row count).
+        #[test]
+        fn in_memory_sort_peak_exceeds_result_by_scratch() {
+            let plan = RelOp::Sort {
+                input: Box::new(RelOp::Scan { source_id: 0 }),
+                keys: vec![bc_ir::SortKey {
+                    expr: Expr::Col { name: "v".into() },
+                    descending: false,
+                    nulls_first: false,
+                }],
+                limit: None,
+            };
+            let vals: Vec<i64> = (0..8_000).rev().collect();
+            let (_out, m) = execute_parallel_with_metrics(
+                &plan,
+                &[vec![batch(&vals, &vals)]],
+                &ExecOptions::default(),
+            )
+            .unwrap();
+            let (peak, result) = peak(&m, "sort");
+            assert!(
+                peak > result,
+                "sort peak {peak} must exceed its result {result} by the permutation scratch"
+            );
+        }
+    }
+
+    /// An explicit `parallelism` is the control plane's decision and is never overridden —
+    /// the hash-shuffle bucket count keys off exactly this width.
+    #[test]
+    fn explicit_parallelism_is_honored_verbatim() {
+        let opts = ExecOptions {
+            parallelism: 7,
+            ..ExecOptions::default()
+        };
+        // One tiny source: the morsel cap would say 1, but the explicit width wins.
+        assert_eq!(auto_width(&opts, &[vec![batch(&[1], &[1])]]), 7);
+    }
+
+    /// A worker with no morsel to take still costs a wake-up and queue contention, so the
+    /// automatic width never exceeds the morsels the inputs can yield. A one-row query
+    /// must not install a 96-thread pool.
+    #[test]
+    fn auto_width_never_exceeds_available_morsels() {
+        let opts = ExecOptions {
+            parallelism: 0,
+            morsel_rows: 2,
+            ..ExecOptions::default()
+        };
+        // 1 row → 1 morsel → 1 worker.
+        assert_eq!(auto_width(&opts, &[vec![batch(&[1], &[1])]]), 1);
+        // 5 rows at 2 rows/morsel → 3 morsels; capped further by the machine's cores.
+        let cores = std::thread::available_parallelism().map_or(1, |v| v.get());
+        let five = vec![batch(&[1, 2, 3, 4, 5], &[1, 2, 3, 4, 5])];
+        assert_eq!(auto_width(&opts, &[five]), 3.min(cores));
+    }
+
+    /// The bound is the *widest* source, not their sum: an operator fans out over one
+    /// input's morsels at a time, so a large probe side must not be throttled by a tiny
+    /// build side.
+    #[test]
+    fn auto_width_uses_the_widest_source() {
+        let opts = ExecOptions {
+            parallelism: 0,
+            morsel_rows: 1,
+            ..ExecOptions::default()
+        };
+        let small = vec![batch(&[1], &[1])];
+        let large = vec![batch(&[1, 2, 3, 4], &[1, 2, 3, 4])];
+        let cores = std::thread::available_parallelism().map_or(1, |v| v.get());
+        assert_eq!(auto_width(&opts, &[small, large]), 4.min(cores));
+    }
+
+    /// No sources (a literal-only plan) still needs one worker, never zero.
+    #[test]
+    fn auto_width_is_at_least_one() {
+        let opts = ExecOptions {
+            parallelism: 0,
+            ..ExecOptions::default()
+        };
+        assert_eq!(auto_width(&opts, &[]), 1);
+        assert_eq!(auto_width(&opts, &[vec![]]), 1);
     }
 
     fn str_batch(vals: &[&str]) -> RecordBatch {
@@ -3285,6 +4198,67 @@ mod tests {
                 rows(&bcast),
                 "broadcast join type {jt:?} mismatch"
             );
+        }
+    }
+
+    /// A broadcast join whose probe side is empty must still emit **one zero-row batch**,
+    /// not zero batches.
+    ///
+    /// A batch is the only carrier of a schema. The chunked probe path produces one batch
+    /// per probe row-range, so an empty probe yields no chunks and therefore no batches —
+    /// and every downstream pipeline breaker (join / aggregate / distinct) materializes
+    /// its input and fails with `EmptyJoinInput` when handed none. Empty intermediates are
+    /// routine (an incremental batch with no changes, a filter that matches nothing), so
+    /// the invariant is: an operator whose input carried a schema returns a batch.
+    #[test]
+    fn broadcast_join_over_an_empty_probe_still_carries_a_schema() {
+        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+
+        let join_plan = |jt: JoinType| RelOp::HashJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["k".into()],
+            join_type: jt,
+            output: vec![JoinOutputCol {
+                side: JoinSide::Left,
+                name: "k".into(),
+                alias: "lk".into(),
+            }],
+            strategy: JoinStrategy::Broadcast,
+        };
+        let empty = vec![batch(&[], &[])];
+        let full = vec![batch(&[2, 3], &[1, 2])];
+
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            // `Right` drives from the right, so give each join type an empty probe side.
+            let (l, r) = if matches!(jt, JoinType::Right) {
+                (full.clone(), empty.clone())
+            } else {
+                (empty.clone(), full.clone())
+            };
+            let out = execute_parallel_with(
+                &join_plan(jt),
+                &[l.clone(), r.clone()],
+                &ExecOptions::default(),
+            )
+            .unwrap();
+            assert!(
+                !out.is_empty(),
+                "{jt:?}: empty probe produced no batch, losing the schema"
+            );
+            assert_eq!(out[0].schema().field(0).name(), "lk", "{jt:?}");
+            // The relation itself is still whatever the sequential oracle says — a `Full`
+            // join over an empty probe legitimately emits the other side's unmatched rows.
+            let oracle = execute(&join_plan(jt), &[l, r]).unwrap();
+            assert_eq!(rows(&oracle), rows(&out), "{jt:?}: relation changed");
         }
     }
 

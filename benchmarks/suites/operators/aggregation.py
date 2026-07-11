@@ -60,7 +60,14 @@ def groupby_2key(ctx: Context):
             }
         )
 
-    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow)
+    def ray(rd) -> pa.Table:
+        from ray.data.aggregate import Count, Sum
+
+        g = rd.groupby(["l_returnflag", "l_linestatus"]).aggregate(Sum("l_quantity"), Count())
+        df = g.to_pandas().rename(columns={"sum(l_quantity)": "s", "count()": "n"})
+        return pa.Table.from_pandas(df, preserve_index=False)
+
+    return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
 
 @agg.case("op-global-sum")

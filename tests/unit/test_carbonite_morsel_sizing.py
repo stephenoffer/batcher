@@ -29,7 +29,8 @@ from batcher.config.config import ExecutionConfig
 )
 def test_recommend_morsel_target_scales_with_pressure(level, factor, monkeypatch):
     rm = ResourceManager()
-    monkeypatch.setattr(rm._pressure, "level", lambda: level)
+    # `recommend_morsel_target` is a pure *reader* of pressure (`classify`), not its sampler.
+    monkeypatch.setattr(rm._pressure, "classify", lambda: level)
     base = rm._config.execution
     got = rm.recommend_morsel_target()
     if factor is None:
@@ -43,7 +44,7 @@ def test_recommend_morsel_target_floors_tiny_morsels(monkeypatch):
     cfg = Config().replace(execution=ExecutionConfig(morsel_rows=2000, morsel_bytes=100_000))
     with config_context(cfg):
         rm = ResourceManager()
-        monkeypatch.setattr(rm._pressure, "level", lambda: PressureLevel.CRITICAL)
+        monkeypatch.setattr(rm._pressure, "classify", lambda: PressureLevel.CRITICAL)
         rows, nbytes = rm.recommend_morsel_target()
         assert rows == 1024  # _MIN_MORSEL_ROWS, not 500
         assert nbytes == 64 * 1024  # _MIN_MORSEL_BYTES, not 25_000
@@ -51,12 +52,38 @@ def test_recommend_morsel_target_floors_tiny_morsels(monkeypatch):
 
 def test_recommended_config_carries_scaled_morsel(monkeypatch):
     rm = ResourceManager()
-    monkeypatch.setattr(rm._pressure, "level", lambda: PressureLevel.SPILL)
+    monkeypatch.setattr(rm._pressure, "classify", lambda: PressureLevel.SPILL)
     adapted = rm.recommended_config()
     assert adapted is not None
     assert adapted.execution.morsel_rows == int(rm._config.execution.morsel_rows * 0.25)
     # Everything else is preserved (only the morsel target changes).
     assert adapted.memory == rm._config.memory
+
+
+def test_morsel_cap_restricted_to_plan_families(monkeypatch):
+    # C10: a wide family (a big aggregate) learned in an earlier query must not throttle a
+    # narrow scan/filter plan. Passing that plan's own families leaves its morsel untouched;
+    # passing the wide family (or nothing) tightens it.
+    from batcher.carbonite.memory.learned import LearnedMemoryModel
+
+    rm = ResourceManager()
+    monkeypatch.setattr(rm._pressure, "classify", lambda: PressureLevel.NORMAL)
+    ex = rm._config.execution
+    # A learned aggregate width that fills a morsel to 4× the byte budget.
+    wide = LearnedMemoryModel(
+        _bytes_per_row={"aggregate": (4.0 * ex.morsel_bytes) / ex.morsel_rows},
+        _alpha=0.5,
+        _clamp=4.0,
+        _row_bytes=8,
+        _spill_per_row={},
+    )
+    monkeypatch.setattr(rm, "_mem_model", wide)
+    # A plan touching only scan/filter is unaffected by the aggregate's width.
+    assert rm.recommend_morsel_target(["Scan", "Filter"]) is None
+    # A plan that includes the aggregate (or the global default) is tightened.
+    tightened = rm.recommend_morsel_target(["Aggregate"])
+    assert tightened is not None and tightened[0] < ex.morsel_rows
+    assert rm.recommend_morsel_target()[0] < ex.morsel_rows  # global default still tightens
 
 
 def test_adaptive_morsel_sizing_is_result_invariant(monkeypatch):
@@ -69,7 +96,11 @@ def test_adaptive_morsel_sizing_is_result_invariant(monkeypatch):
 
     baseline = query()
 
-    monkeypatch.setattr(ResourceManager, "recommend_morsel_target", lambda self: (1024, 64 * 1024))
+    monkeypatch.setattr(
+        ResourceManager,
+        "recommend_morsel_target",
+        lambda self, families=None: (1024, 64 * 1024),
+    )
     with config_context(Config().replace(execution=ExecutionConfig(adaptive_morsel_sizing=True))):
         adapted = query()
 

@@ -242,6 +242,8 @@ def record_join_outcomes(
     logical_opt: LogicalPlan,
     decisions: list[BuildSideDecision],
     wall_ms: float,
+    *,
+    distributed: bool = False,
 ) -> None:
     """Record an executed join's strategy, side sizes and timing so the bandit learns.
 
@@ -255,6 +257,7 @@ def record_join_outcomes(
         return
     try:
         from batcher.kyber.learned_tuning import (
+            record_broadcast_timing,
             record_join_sides,
             record_join_strategy,
             record_sort_merge_timing,
@@ -268,10 +271,25 @@ def record_join_outcomes(
         sig = plan_signature(join)
         strategy = join.strategy or "hash"
         record_join_sides(hub, sig, float(dec.left_rows), float(dec.right_rows))
-        record_join_strategy(hub, sig, strategy, wall_ms)
+        # The bandit's reward must not depend on how much data this particular run saw: the
+        # same signature runs over 1M rows today and 50M tomorrow, and a raw wall-time reward
+        # would permanently condemn whichever arm drew the large input. Hand it the join's
+        # total input size so it can price the arms per row.
+        record_join_strategy(hub, sig, strategy, wall_ms, float(dec.left_rows + dec.right_rows))
         if strategy in ("hash", "sort_merge"):
-            build_rows = min(dec.left_rows, dec.right_rows) if dec.swapped else dec.right_rows
+            # `BuildSideDecision` records the *pre-swap* orientation, so a swap moves the
+            # left side into the build position. This is the x-axis of the hash-vs-sort_merge
+            # crossover fit; feeding it `min(l, r)` mislabels every byte-driven swap.
+            build_rows = dec.left_rows if dec.swapped else dec.right_rows
             record_sort_merge_timing(hub, strategy, float(build_rows), wall_ms)
+        # Feed the broadcast-vs-shuffle crossover, whose recorder had no caller at all —
+        # so `learned_broadcast_max_bytes` always returned `None` and the threshold never
+        # moved off its static default. Only on the distributed path: broadcasting is
+        # replication *across workers*, so a single-node hash join is not a "shuffle" and
+        # would poison the fit.
+        if distributed and dec.build_bytes > 0.0:
+            arm = "broadcast" if dec.broadcast else "shuffle"
+            record_broadcast_timing(hub, arm, float(dec.build_bytes), wall_ms)
     except Exception:  # pragma: no cover - recording must never break a query
         return
 
@@ -304,7 +322,7 @@ def record_distributed(
 ) -> None:
     """Close a distributed run's loops: persist its shuffle window and feed the join bandit."""
     record_shuffle_outcome(hub, plan, credits)
-    record_join_outcomes(hub, logical_opt, decisions, wall_ms)
+    record_join_outcomes(hub, logical_opt, decisions, wall_ms, distributed=True)
 
 
 # --- small shared helpers --------------------------------------------------------------------

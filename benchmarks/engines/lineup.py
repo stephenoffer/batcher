@@ -12,6 +12,7 @@ from .base import Engine
 from .batcher import BatcherEngine
 from .daft import DaftEngine
 from .duckdb import DuckDBEngine
+from .duckdb_arrow import DuckDBArrowEngine
 from .polars import PolarsEngine
 from .pyarrow import PyArrowEngine
 from .ray import RayEngine
@@ -23,6 +24,7 @@ _ADAPTERS: dict[str, Engine] = {
     for e in (
         BatcherEngine(),
         DuckDBEngine(),
+        DuckDBArrowEngine(),
         PolarsEngine(),
         PyArrowEngine(),
         SparkEngine(),

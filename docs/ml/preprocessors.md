@@ -6,8 +6,149 @@ it is distributed and spillable for free); `transform` is a lazy column rewrite.
 on the training set, then `transform` the training **and** validation sets with the
 same learned state.
 
-Compose several preprocessors by sequencing them: fit each on the previous step's
-output, then transform any split through the same fitted objects.
+Every preprocessor is importable from `batcher.ml` as well as
+`batcher.ml.preprocessors`.
+
+## Splitting first
+
+`fit` must see the training rows only — fitting on the whole frame leaks held-out
+statistics into the features. `ds.ml.train_test_split` gives disjoint parts that
+together cover every row, assigned by a reproducible hash of each row's own content.
+Each part is a plain row-wise filter, so the split streams, distributes, and is
+*partition-independent*: a row lands in the same part however the data is laid out.
+
+```python
+import batcher as bt
+
+ds = bt.range(0, 1000)
+train, test = ds.ml.train_test_split(0.2, seed=42)
+print(train.count() + test.count())
+# 1000
+```
+
+`ds.ml.random_split([0.7, 0.15, 0.15], seed=42)` generalizes it to a
+train/validation/test split.
+
+Pass `key=` to hash only the columns that identify a row:
+
+```python
+users = bt.range(0, 1000).select(id=bt.col("value"), score=bt.col("value") * 2)
+train, test = users.ml.train_test_split(0.2, seed=42, key="id")
+print(train.count() + test.count())
+# 1000
+```
+
+Then re-deriving a feature column does not move rows between train and test — the split
+follows `id` alone, so recomputing `score` leaves every row where it was:
+
+```python
+rescored = users.with_columns(score=bt.col("id") * 3)
+again, _ = rescored.ml.train_test_split(0.2, seed=42, key="id")
+print(sorted(again.to_pydict()["id"]) == sorted(train.to_pydict()["id"]))
+# True
+```
+
+Without `key=` every column is hashed, which is correct but re-splits whenever any value
+changes.
+
+## Fuzzy deduplication
+
+Exact deduplication is `distinct()`. On a web-scale training corpus it barely helps: the
+duplicates are the same article behind a different header, or the same page with a
+changed timestamp. Removing *those* is the highest-leverage preprocessing step for an LLM
+pretraining set.
+
+`ds.ml.near_duplicates` finds the pairs; `ds.ml.drop_near_duplicates` removes them,
+keeping one representative per cluster.
+
+```python
+import batcher as bt
+
+docs = bt.from_pydict({"text": [
+    "the quick brown fox jumps over the lazy dog",
+    "the quick brown fox jumps over the lazy dog!",   # near-duplicate
+    "a treatise on the migratory habits of geese",
+]})
+print(docs.ml.drop_near_duplicates("text", threshold=0.7).count())
+# 2
+print(docs.distinct().count())   # exact dedup keeps all three
+# 3
+```
+
+Under the hood: `str.minhash` reduces each document to a fixed-length signature whose
+positional agreement rate (`list.jaccard`) estimates the documents' Jaccard similarity,
+and LSH banding turns the similarity join into an equi-join on a band hash. Every
+returned pair is then **verified** against the threshold, so banding only costs recall,
+never precision. `bands` is the dial: more bands, more candidates, more recall, more work.
+
+Both are ordinary relational plans — a projection, an `explode`, and joins — so they run
+wherever a join runs.
+
+## Matching on meaning: `similarity_join`
+
+MinHash answers "are these two documents made of the same words". It says nothing about
+two rows that *mean* the same thing in different words. That is a question for embeddings,
+and `ds.ml.similarity_join` is the same two-stage recipe with the signature swapped:
+`.list.simhash` replaces `str.minhash`, and the verification is the **exact**
+`list.cosine_similarity` over the original vectors.
+
+```python
+import batcher as bt
+
+catalog = bt.from_pydict({"sku": [1, 2], "v": [[1.0, 0.0], [0.0, 1.0]]})
+feed = bt.from_pydict({"ref": [10], "v": [[1.0, 0.02]]})
+pairs = catalog.ml.similarity_join(
+    feed, left_on="v", threshold=0.9, left_key="sku", right_key="ref"
+)
+print(pairs.select("key_a", "key_b").to_pydict())
+# {'key_a': [1], 'key_b': [10]}
+```
+
+This is entity resolution — a product catalogue against a supplier feed, a CRM against a
+billing system — and retrieval over a corpus, wherever the join key is "means the same
+thing" rather than "is the same string".
+
+`simhash` is Charikar's random-hyperplane LSH: `num_bits` hyperplanes are drawn through
+the origin and each bit records which side of one the vector falls on. Two vectors an
+angle `θ` apart agree on each bit with probability `1 - θ/π`, so the fraction of agreeing
+bits estimates the angle — the vector-space counterpart of MinHash's Jaccard estimate.
+The hyperplanes are derived by hashing `(seed, bit, dimension)` rather than stored, so
+every partition and every machine draws the same ones and a signature computed on one
+node is comparable with one computed on another.
+
+Exactly as in fuzzy dedup, banding governs **recall, never precision**: no pair below
+`threshold` is ever returned, but a pair above it can miss every band. `bands` is the
+dial. Rows whose vector is null or empty have no direction, cannot clear any threshold,
+and are dropped rather than banded — left in, they would all collide and blow the
+candidate set up quadratically.
+
+## Chaining steps
+
+`Chain` is the sklearn `Pipeline` equivalent: it fits each step on the **previous
+step's output** and replays the fitted steps, in order, over any split. Doing this by
+hand means fitting step *i* on data that steps *0..i-1* have already transformed — easy
+to get subtly wrong, and a mistake that leaks held-out statistics into training features
+without ever failing.
+
+```python
+import batcher as bt
+from batcher.ml import Chain, SimpleImputer, StandardScaler
+
+ds = bt.from_pydict({"age": [10.0, 20.0, None, 40.0, 30.0, 50.0]})
+train, test = ds.ml.train_test_split(0.3, seed=0)
+
+chain = Chain(SimpleImputer(["age"]), StandardScaler(["age"])).fit(train)
+train_x, test_x = chain.transform(train), chain.transform(test)
+print(chain)
+# Chain(SimpleImputer, StandardScaler)
+```
+
+`fit` on the training split only; `transform` both. A `Chain` is itself a
+`Preprocessor`, so it nests. Its steps stay introspectable (`chain[0]`, `len(chain)`)
+to read a fitted step's learned state.
+
+Or compose several preprocessors by sequencing them by hand: fit each on the previous
+step's output, then transform any split through the same fitted objects.
 
 ```python
 from batcher.ml.preprocessors import StandardScaler, SimpleImputer
@@ -331,3 +472,10 @@ print(prepared_val.collect().column_names)
 result is computed by a terminal op like `collect()` or `write.parquet(...)` — single
 node or distributed. Use preprocessors before a training loop
 ([PyTorch integration](pytorch.md)) or before batch [inference](inference.md).
+
+## Next steps
+
+- [Feature engineering tutorial](../tutorials/feature-engineering.md): the full raw
+  table → model-ready matrix workflow, end to end, with `Chain`.
+- [PyTorch integration](pytorch.md): hand the assembled features to a training loop.
+- [ML API reference](../api/ml.md): the complete `Preprocessor` surface.

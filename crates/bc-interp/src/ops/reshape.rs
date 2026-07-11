@@ -104,8 +104,11 @@ fn explode_list<O: OffsetSizeTrait>(
     list: &GenericListArray<O>,
 ) -> Result<(Vec<u32>, ArrayRef), InterpError> {
     let offsets = list.value_offsets();
-    let mut parent_idx: Vec<u32> = Vec::new();
-    let mut child_idx: Vec<u32> = Vec::new();
+    // The explosion emits one (parent, child) pair per non-null child element, so both
+    // index vectors are bounded by the child length — pre-size to skip the push reallocs.
+    let n_child = list.values().len();
+    let mut parent_idx: Vec<u32> = Vec::with_capacity(n_child);
+    let mut child_idx: Vec<u32> = Vec::with_capacity(n_child);
     for i in 0..list.len() {
         if list.is_null(i) {
             continue;
@@ -263,7 +266,7 @@ pub(crate) fn sample_n_batches(
     for (_, _, bi, ri) in heap {
         per_batch[bi].push(ri as u32);
     }
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(batches.len());
     for (bi, b) in batches.iter().enumerate() {
         if per_batch[bi].is_empty() {
             continue;

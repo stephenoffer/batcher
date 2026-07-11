@@ -7,13 +7,14 @@ string→string transforms are generated from `_STR_TRANSFORMS` (data, not code)
 
 from __future__ import annotations
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Cast, Expr
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
 
 
 class _StrNamespace:
-    """String functions: ``col("s").str.upper()``, ``.str.contains("x")``, …
+    """String functions on a text column: ``col("s").str.upper()``, ``.str.contains("x")``.
 
     The parameterless string→string transforms are **data, not code**
     (``_STR_TRANSFORMS``: accessor name → ``bc-expr`` ``StrFunc`` tag) and are
@@ -22,6 +23,14 @@ class _StrNamespace:
 
     Every method returns a new lazy :class:`Expr`; null inputs propagate to null
     outputs throughout.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"s": ["Hello", "world"]})
+            >>> ds.select(bt.col("s").str.upper().alias("r")).to_pydict()
+            {'r': ['HELLO', 'WORLD']}
     """
 
     __slots__ = ("_e",)
@@ -30,10 +39,17 @@ class _StrNamespace:
         """Wrap the parent :class:`Expr` so its `.str` methods can build on it."""
         self._e = e
 
+    def __repr__(self) -> str:
+        """Show the accessor and its parent, e.g. ``<.str accessor of col('name')>``."""
+        return f"<.str accessor of {self._e!r}>"
+
     def len(self) -> StrFunc:
         """Count the characters in the string (→ Int64).
 
         Counts Unicode characters, not bytes (see :meth:`octet_length`). Null → null.
+
+        Returns:
+            A new Int64 expression: the character count.
 
         Examples:
             .. doctest::
@@ -51,6 +67,9 @@ class _StrNamespace:
         Stable across partitions, runs, and machines — the basis for surrogate keys
         and slowly-changing-dimension change detection. Null → null.
 
+        Returns:
+            A new Int64 expression: the FNV-1a hash.
+
         Examples:
             .. doctest::
 
@@ -65,6 +84,9 @@ class _StrNamespace:
         """Compute the MD5 digest as lowercase hex (DuckDB ``md5``).
 
         Returns Utf8; null → null.
+
+        Returns:
+            A new Utf8 expression: the lowercase hex digest.
 
         Examples:
             .. doctest::
@@ -81,6 +103,9 @@ class _StrNamespace:
 
         Returns Utf8; null → null.
 
+        Returns:
+            A new Utf8 expression: the lowercase hex digest.
+
         Examples:
             .. doctest::
 
@@ -95,6 +120,9 @@ class _StrNamespace:
         """Compute the SHA-256 digest as lowercase hex (DuckDB ``sha256``).
 
         Returns Utf8; null → null.
+
+        Returns:
+            A new Utf8 expression: the lowercase hex digest.
 
         Examples:
             .. doctest::
@@ -112,6 +140,9 @@ class _StrNamespace:
         Returns Int64 — an integrity check, not a sharding hash (use
         :meth:`xxhash64`).
 
+        Returns:
+            A new Int64 expression: the CRC-32 checksum.
+
         Examples:
             .. doctest::
 
@@ -126,6 +157,9 @@ class _StrNamespace:
         """Compute a fast non-cryptographic 64-bit xxHash of the bytes (→ Int64).
 
         The standard bucketing/sharding hash, deterministic across machines. Null → null.
+
+        Returns:
+            A new Int64 expression: the xxHash value.
 
         Examples:
             .. doctest::
@@ -147,6 +181,9 @@ class _StrNamespace:
         Args:
             format: A chrono/strftime pattern, e.g. ``"%Y-%m-%d %H:%M:%S"``.
 
+        Returns:
+            A new Timestamp expression; unmatched values are null.
+
         Examples:
             .. doctest::
 
@@ -167,6 +204,9 @@ class _StrNamespace:
         Args:
             format: A chrono/strftime pattern; defaults to ISO ``"%Y-%m-%d"``.
 
+        Returns:
+            A new Date32 expression; unmatched values are null.
+
         Examples:
             .. doctest::
 
@@ -185,6 +225,9 @@ class _StrNamespace:
         Args:
             pattern: The literal substring to search for.
 
+        Returns:
+            A new Boolean expression.
+
         Examples:
             .. doctest::
 
@@ -201,6 +244,9 @@ class _StrNamespace:
         Args:
             pattern: The literal prefix to test for.
 
+        Returns:
+            A new Boolean expression.
+
         Examples:
             .. doctest::
 
@@ -216,6 +262,9 @@ class _StrNamespace:
 
         Args:
             pattern: The literal suffix to test for.
+
+        Returns:
+            A new Boolean expression.
 
         Examples:
             .. doctest::
@@ -237,6 +286,9 @@ class _StrNamespace:
             start: 1-based index of the first character to keep.
             length: Number of characters to take; all remaining if omitted.
 
+        Returns:
+            A new Utf8 expression: the extracted substring.
+
         Examples:
             .. doctest::
 
@@ -253,6 +305,9 @@ class _StrNamespace:
         Args:
             n: Number of leading characters to keep.
 
+        Returns:
+            A new Utf8 expression: the leading characters.
+
         Examples:
             .. doctest::
 
@@ -268,6 +323,9 @@ class _StrNamespace:
 
         Args:
             n: Repeat count; ``n`` ≤ 0 yields an empty string.
+
+        Returns:
+            A new Utf8 expression: the repeated string.
 
         Examples:
             .. doctest::
@@ -286,6 +344,9 @@ class _StrNamespace:
             width: Target character width.
             fill: Pad string, cycled as needed; defaults to a space.
 
+        Returns:
+            A new Utf8 expression: the left-padded string.
+
         Examples:
             .. doctest::
 
@@ -302,6 +363,9 @@ class _StrNamespace:
         Args:
             width: Target character width.
             fill: Pad string, cycled as needed; defaults to a space.
+
+        Returns:
+            A new Utf8 expression: the right-padded string.
 
         Examples:
             .. doctest::
@@ -320,6 +384,9 @@ class _StrNamespace:
 
         Args:
             pattern: The literal substring to locate.
+
+        Returns:
+            A new Int64 expression: the 1-based index, or 0.
 
         Examples:
             .. doctest::
@@ -340,6 +407,9 @@ class _StrNamespace:
         Args:
             delimiter: The delimiter to count occurrences of.
             count: Which occurrence to cut at; sign selects the direction.
+
+        Returns:
+            A new Utf8 expression: the substring before the cut.
 
         Examples:
             .. doctest::
@@ -362,6 +432,9 @@ class _StrNamespace:
             pos: 1-based index where the replacement begins.
             length: Characters to overwrite; defaults to ``len(replacement)``.
 
+        Returns:
+            A new Utf8 expression with the range replaced.
+
         Examples:
             .. doctest::
 
@@ -380,6 +453,9 @@ class _StrNamespace:
 
         Args:
             pattern: The regular expression to match.
+
+        Returns:
+            A new List<Utf8> expression of all matches.
 
         Examples:
             .. doctest::
@@ -401,6 +477,9 @@ class _StrNamespace:
         Args:
             pattern: The regular expression to match.
 
+        Returns:
+            A new Int64 expression: the match count.
+
         Examples:
             .. doctest::
 
@@ -420,6 +499,9 @@ class _StrNamespace:
         Args:
             target: The literal string to measure distance to.
 
+        Returns:
+            A new Int64 expression: the edit distance.
+
         Examples:
             .. doctest::
 
@@ -434,6 +516,9 @@ class _StrNamespace:
         """Compute the American Soundex phonetic code, a 4-character key.
 
         Groups words that sound alike (DuckDB ``soundex``). Returns Utf8.
+
+        Returns:
+            A new Utf8 expression: the 4-character Soundex code.
 
         Examples:
             .. doctest::
@@ -451,6 +536,9 @@ class _StrNamespace:
         Args:
             n: Number of trailing characters to keep.
 
+        Returns:
+            A new Utf8 expression: the trailing characters.
+
         Examples:
             .. doctest::
 
@@ -465,6 +553,9 @@ class _StrNamespace:
         """Return the Unicode codepoint of the first character, 0 if empty (→ Int64).
 
         Despite the name, returns the full codepoint, not just ASCII.
+
+        Returns:
+            A new Int64 expression: the first codepoint, or 0.
 
         Examples:
             .. doctest::
@@ -484,6 +575,9 @@ class _StrNamespace:
         Args:
             delimiter: The literal separator to split on.
 
+        Returns:
+            A new List<Utf8> expression of the split fields.
+
         Examples:
             .. doctest::
 
@@ -494,6 +588,131 @@ class _StrNamespace:
         """
         return StrFunc("split", self._e, pattern=delimiter)
 
+    def strip_html(self) -> StrFunc:
+        """Recover the readable text of an HTML document → Utf8.
+
+        The first stage of an unstructured-text ingest: scraped pages, product
+        descriptions, and email bodies arrive as markup and must become prose before
+        chunking, embedding, or training on them.
+
+        This is strictly more correct than the ``regexp_replace('<[^>]*>', '')`` idiom,
+        which quietly poisons a corpus in three ways. It leaves the *contents* of
+        ``<script>`` and ``<style>`` in the text; it leaves ``&amp;`` and ``&nbsp;``
+        undecoded; and it welds ``<p>a</p><p>b</p>`` into ``ab``. Here, tags and comments
+        are dropped along with script/style content, entities (named, ``&#38;``, and
+        ``&#x26;``) are decoded, element boundaries become a single space, and runs of
+        whitespace collapse.
+
+        It is a text extractor, not an HTML parser — it builds no DOM and validates no
+        nesting. Malformed markup never raises: a ``<`` that never closes is kept as
+        literal text, and an unclosed ``<script>`` consumes the rest of the value (the
+        safe direction — the alternative is emitting JavaScript as prose). Null → null.
+
+        Returns:
+            A Utf8 expression carrying the extracted text.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"page": ["<p>Tom &amp; Jerry</p><p>x</p>"]})
+                >>> ds.select(text=bt.col("page").str.strip_html()).to_pydict()
+                {'text': ['Tom & Jerry x']}
+
+                >>> noisy = bt.from_pydict({"page": ["<div>hi<script>f()</script></div>"]})
+                >>> noisy.select(text=bt.col("page").str.strip_html()).to_pydict()
+                {'text': ['hi']}
+        """
+        return StrFunc("strip_html", self._e)
+
+    def chunk(self, size: int, overlap: int = 0) -> StrFunc:
+        """Slice text into fixed-size overlapping windows → List<Utf8>.
+
+        The *split* stage of a RAG ingest pipeline: chunk each document, `explode` the
+        list into one row per chunk, then embed. Chunks start every ``size - overlap``
+        characters and stop once one reaches the end of the text, so the last chunk may
+        be shorter but is never wholly contained in its predecessor. `overlap` carries
+        context across a boundary, so a sentence cut in half still appears whole in one
+        chunk.
+
+        Sizes are in **characters** (Unicode scalar values, as :meth:`len` counts them),
+        never bytes, so a chunk boundary never splits a codepoint. An empty string
+        yields an empty list; null yields null.
+
+        Args:
+            size: Characters per chunk. Must be at least 1.
+            overlap: Characters each chunk repeats from the previous one. Must be in
+                ``[0, size)`` — an overlap equal to `size` would never advance.
+
+        Returns:
+            A List<Utf8> expression, one element per chunk.
+
+        Raises:
+            PlanError: If `size` < 1 or `overlap` is outside ``[0, size)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"doc": ["abcdefg"]})
+                >>> ds.select(r=bt.col("doc").str.chunk(3)).to_pydict()
+                {'r': [['abc', 'def', 'g']]}
+
+                >>> ds.select(r=bt.col("doc").str.chunk(4, overlap=2)).to_pydict()
+                {'r': [['abcd', 'cdef', 'efg']]}
+        """
+        if size < 1:
+            raise PlanError(f"str.chunk(): size must be >= 1, got {size}")
+        if not 0 <= overlap < size:
+            raise PlanError(f"str.chunk(): overlap must be in [0, {size}), got {overlap}")
+        # `length` carries the chunk size and `start` the overlap — the same reuse of
+        # the two scalar slots that `repeat`/`right`/`split_part` already make.
+        return StrFunc("chunk", self._e, start=overlap, length=size)
+
+    def minhash(self, num_perm: int = 128, ngram: int = 5) -> StrFunc:
+        """A MinHash signature of the text → List<Int64> of `num_perm` values.
+
+        The primitive behind fuzzy deduplication. Two signatures agree on a fraction of
+        their positions that estimates the documents' **Jaccard similarity** over their
+        character `ngram`-shingles — see :meth:`~batcher.plan.expr_ir._ListNamespace.jaccard`.
+        So near-duplicates are found by comparing 128 integers rather than two documents,
+        which is what makes deduplicating a web-scale corpus tractable.
+
+        The estimator's standard error is ``1/sqrt(num_perm)``: 128 permutations resolve
+        Jaccard to about ±0.09, 256 to ±0.06. Signature values are bounded to 32 bits so
+        `jaccard` counts agreements exactly.
+
+        `ds.ml.near_duplicates` / `ds.ml.drop_near_duplicates` build the LSH banding on
+        top of this; reach for those first.
+
+        Args:
+            num_perm: Hash permutations — the signature length. More is more accurate
+                and proportionally slower.
+            ngram: Shingle width in **characters**. Larger is stricter (fewer accidental
+                matches on short common substrings).
+
+        Returns:
+            A List<Int64> expression: the row's signature. Null text → null signature.
+
+        Raises:
+            PlanError: If `num_perm` or `ngram` is less than 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": ["the quick brown fox"]})
+                >>> len(ds.select(s=bt.col("t").str.minhash(64)).to_pydict()["s"][0])
+                64
+        """
+        if num_perm < 1:
+            raise PlanError(f"str.minhash(): num_perm must be >= 1, got {num_perm}")
+        if ngram < 1:
+            raise PlanError(f"str.minhash(): ngram must be >= 1, got {ngram}")
+        # `length` carries num_perm and `start` the shingle width — the same reuse of the
+        # two scalar slots `chunk`/`repeat`/`split_part` make.
+        return StrFunc("minhash", self._e, start=ngram, length=num_perm)
+
     def regexp_matches(self, pattern: str) -> StrFunc:
         """Test whether the regex ``pattern`` matches anywhere in the string (→ Bool).
 
@@ -501,6 +720,9 @@ class _StrNamespace:
 
         Args:
             pattern: The regular expression to test.
+
+        Returns:
+            A new Boolean expression.
 
         Examples:
             .. doctest::
@@ -520,6 +742,9 @@ class _StrNamespace:
         Args:
             pattern: A SQL ``LIKE`` pattern using ``%`` and ``_`` wildcards.
 
+        Returns:
+            A new Boolean expression.
+
         Examples:
             .. doctest::
 
@@ -535,6 +760,9 @@ class _StrNamespace:
 
         Args:
             pattern: A SQL ``LIKE`` pattern using ``%`` and ``_`` wildcards.
+
+        Returns:
+            A new Boolean expression.
 
         Examples:
             .. doctest::
@@ -555,6 +783,9 @@ class _StrNamespace:
             pattern: The regular expression to match.
             replacement: The replacement text; ``$1``…​ refer to capture groups.
 
+        Returns:
+            A new Utf8 expression with the first match replaced.
+
         Examples:
             .. doctest::
 
@@ -571,6 +802,9 @@ class _StrNamespace:
         Args:
             pattern: The regular expression to match.
             group: Capture group index; 0 (default) is the whole match.
+
+        Returns:
+            A new Utf8 expression: the captured group, or ``''``.
 
         Examples:
             .. doctest::
@@ -592,6 +826,9 @@ class _StrNamespace:
             pattern: The literal substring to find.
             replacement: The literal text to substitute.
 
+        Returns:
+            A new Utf8 expression with every match replaced.
+
         Examples:
             .. doctest::
 
@@ -611,6 +848,9 @@ class _StrNamespace:
         Args:
             chars: The set of characters to strip; whitespace if omitted.
 
+        Returns:
+            A new Utf8 expression: the trimmed string.
+
         Examples:
             .. doctest::
 
@@ -626,6 +866,9 @@ class _StrNamespace:
 
         The common text-cleanup step for messy free-text columns. Composes
         existing ops (``regexp_replace_all`` + ``trim``), no new IR.
+
+        Returns:
+            A new Utf8 expression: the whitespace-normalized string.
 
         Examples:
             .. doctest::
@@ -645,6 +888,9 @@ class _StrNamespace:
         Args:
             chars: The set of characters to strip; whitespace if omitted.
 
+        Returns:
+            A new Utf8 expression: the left-trimmed string.
+
         Examples:
             .. doctest::
 
@@ -660,6 +906,9 @@ class _StrNamespace:
 
         Args:
             chars: The set of characters to strip; whitespace if omitted.
+
+        Returns:
+            A new Utf8 expression: the right-trimmed string.
 
         Examples:
             .. doctest::
@@ -680,6 +929,9 @@ class _StrNamespace:
             delimiter: The literal separator to split on.
             n: 1-based index of the field to return.
 
+        Returns:
+            A new Utf8 expression: the selected field, or ``''``.
+
         Examples:
             .. doctest::
 
@@ -699,6 +951,9 @@ class _StrNamespace:
             pattern: The regular expression to match.
             replacement: The replacement text; ``$1``…​ refer to capture groups.
 
+        Returns:
+            A new Utf8 expression with every match replaced.
+
         Examples:
             .. doctest::
 
@@ -711,8 +966,13 @@ class _StrNamespace:
         return StrFunc("regexp_replace_all", self._e, pattern=pattern, replacement=replacement)
 
     def initcap(self) -> StrFunc:
-        """Uppercase each word's first letter, lowercasing the rest; a word starts after
-        whitespace or punctuation, so ``"a-b c"`` → ``"A-B C"`` (``initcap``; null → null).
+        """Title-case each word: uppercase its first letter, lowercase the rest (``initcap``).
+
+        A word starts after whitespace or punctuation, so ``"a-b c"`` → ``"A-B C"``;
+        null → null.
+
+        Returns:
+            A new Utf8 expression with each word title-cased.
 
         Examples:
             .. doctest::
@@ -725,8 +985,12 @@ class _StrNamespace:
         return StrFunc("initcap", self._e)
 
     def octet_length(self) -> StrFunc:
-        """Count the UTF-8 bytes (not characters) in the string (→ Int64); differs from
-        :meth:`len` (character count) for multi-byte text; null → null.
+        """Count the UTF-8 bytes, not characters, in the string (→ Int64).
+
+        Differs from :meth:`len` (character count) for multi-byte text; null → null.
+
+        Returns:
+            A new Int64 expression: the byte length of each string.
 
         Examples:
             .. doctest::
@@ -741,6 +1005,9 @@ class _StrNamespace:
     def bit_length(self) -> StrFunc:
         """Count the bits in the string, i.e. UTF-8 bytes times 8 (→ Int64); null → null.
 
+        Returns:
+            A new Int64 expression: the bit length.
+
         Examples:
             .. doctest::
 
@@ -753,6 +1020,9 @@ class _StrNamespace:
 
     def hex(self) -> StrFunc:
         """Encode the UTF-8 bytes as uppercase hexadecimal; inverse of :meth:`unhex` (→ Utf8).
+
+        Returns:
+            A new Utf8 expression: the uppercase hex encoding.
 
         Examples:
             .. doctest::
@@ -767,6 +1037,9 @@ class _StrNamespace:
     def base64(self) -> StrFunc:
         """Encode the UTF-8 bytes as standard base64; inverse of :meth:`from_base64` (→ Utf8).
 
+        Returns:
+            A new Utf8 expression: the base64 encoding.
+
         Examples:
             .. doctest::
 
@@ -780,6 +1053,9 @@ class _StrNamespace:
     def from_base64(self) -> StrFunc:
         """Decode standard base64 to a UTF-8 string; null if invalid or null (→ Utf8).
 
+        Returns:
+            A new Utf8 expression: the decoded string, or null.
+
         Examples:
             .. doctest::
 
@@ -792,6 +1068,9 @@ class _StrNamespace:
 
     def unhex(self) -> StrFunc:
         """Decode pairs of hex digits to a UTF-8 string; null if invalid or null (→ Utf8).
+
+        Returns:
+            A new Utf8 expression: the decoded string, or null.
 
         Examples:
             .. doctest::
@@ -814,6 +1093,9 @@ class _StrNamespace:
             to_chars: Characters to map to, positionally; shorter than
                 ``from_chars`` deletes the surplus.
 
+        Returns:
+            A new Utf8 expression with characters mapped.
+
         Examples:
             .. doctest::
 
@@ -834,9 +1116,27 @@ _STR_TRANSFORMS = {
 }
 
 
+def _str_transform_doc(name: str) -> str:
+    """Fallback docstring for a ``.str`` transform without a curated entry.
+
+    ``upper``/``lower`` carry curated entries; only ``reverse`` falls through to
+    here, so the summary and example reflect a character-reversing transform.
+    """
+    return (
+        f"Return each string with its characters {name}d.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"s": ["Hello"]})\n'
+        f'        >>> ds.select(r=bt.col("s").str.{name}()).to_pydict()\n'
+        "        {'r': ['olleH']}"
+    )
+
+
 _bind_accessors(
     _StrNamespace,
     _STR_TRANSFORMS,
     lambda e, t: StrFunc(t, e),
-    lambda n: f"Return the string with {n} applied.",
+    _str_transform_doc,
+    "A new string :class:`~batcher.Expr` with the transform applied.",
 )

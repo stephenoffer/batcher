@@ -234,7 +234,7 @@ pub(crate) fn bounded_group_quantile(
         nulls_first: true,
     });
 
-    let Some(mut store) = external_sort_to_final_store(
+    let Some((mut store, _)) = external_sort_to_final_store(
         flat,
         &sort_keys,
         dir,
@@ -307,7 +307,7 @@ pub(crate) fn bounded_group_quantile(
         for batch in reader {
             let batch = batch?;
             let vcol = batch.column(n_keys).as_primitive::<Float64Type>();
-            let mut firsts: Vec<u32> = Vec::new();
+            let mut firsts: Vec<u32> = Vec::with_capacity(batch.num_rows());
             for i in 0..batch.num_rows() {
                 if within == 0 {
                     n = counts[g];
@@ -438,7 +438,7 @@ pub(crate) fn bounded_group_distinct(
         return Ok((Vec::new(), Arc::new(Int64Array::from(Vec::<i64>::new()))));
     };
     let sort_keys = native_value_sort_keys(n_keys);
-    let Some(mut store) = external_sort_to_final_store(
+    let Some((mut store, _)) = external_sort_to_final_store(
         flat,
         &sort_keys,
         dir,
@@ -479,7 +479,7 @@ pub(crate) fn bounded_group_distinct(
             } else {
                 None
             };
-            let mut firsts: Vec<u32> = Vec::new();
+            let mut firsts: Vec<u32> = Vec::with_capacity(batch.num_rows());
             for i in 0..batch.num_rows() {
                 let group = grows.as_ref().map(|g| g.row(i).owned());
                 let new_group = !started || (n_keys > 0 && prev_group != group);
@@ -556,7 +556,7 @@ pub(crate) fn bounded_group_mode(
         return Ok((Vec::new(), new_empty_array(&value_type)));
     };
     let sort_keys = native_value_sort_keys(n_keys);
-    let Some(mut store) = external_sort_to_final_store(
+    let Some((mut store, _)) = external_sort_to_final_store(
         flat,
         &sort_keys,
         dir,
@@ -607,7 +607,7 @@ pub(crate) fn bounded_group_mode(
             } else {
                 None
             };
-            let mut firsts: Vec<u32> = Vec::new();
+            let mut firsts: Vec<u32> = Vec::with_capacity(batch.num_rows());
             for i in 0..batch.num_rows() {
                 let group = grows.as_ref().map(|g| g.row(i).owned());
                 if !started || (n_keys > 0 && prev_group != group) {

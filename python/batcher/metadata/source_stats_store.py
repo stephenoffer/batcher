@@ -54,6 +54,10 @@ def _encode(stats: SourceStatistics) -> dict[str, Any]:
         "row_count": stats.row_count,
         "byte_size": stats.byte_size,
         "exact_rows": stats.exact_rows,
+        # Physical properties drive redundant-sort removal and partition pruning; without
+        # them a Batcher-written footerless source (CSV/JSON) loses its ordering on reload.
+        "sorted_by": list(stats.sorted_by),
+        "partition_keys": list(stats.partition_keys),
         "columns": columns,
     }
 
@@ -79,6 +83,8 @@ def _decode(blob: dict[str, Any]) -> SourceStatistics | None:
             row_count=blob.get("row_count"),
             byte_size=blob.get("byte_size"),
             columns=columns,
+            sorted_by=tuple(blob.get("sorted_by", ())),
+            partition_keys=tuple(blob.get("partition_keys", ())),
             exact_rows=bool(blob.get("exact_rows", True)),
         )
     except Exception:

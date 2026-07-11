@@ -29,8 +29,44 @@ _FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 
 
 def _literal(ir: dict[str, Any]) -> Any:
-    """Unwrap a literal IR ``{"e":"lit","value":{"int":5}}`` to its Python value."""
-    return next(iter(ir["value"].values()))
+    """Unwrap a literal IR ``{"e":"lit","value":{"int":5}}`` to its Python value.
+
+    Temporal kinds (``date`` days, ``timestamp`` micros, ``time`` micros) unwrap to a
+    plain Python ``date``/``datetime`` so a backend that types its own scalars (SQL,
+    iceberg, mongo) gets a real temporal value, not a raw epoch offset.
+    """
+    ((kind, value),) = ir["value"].items()
+    if kind == "date":
+        import datetime as _dt
+
+        return _dt.date(1970, 1, 1) + _dt.timedelta(days=value)
+    if kind == "timestamp":
+        import datetime as _dt
+
+        return _dt.datetime(1970, 1, 1) + _dt.timedelta(microseconds=value)
+    return value
+
+
+def _pa_literal(ir: dict[str, Any]) -> Any:
+    """A pyarrow scalar for a literal IR, typed for temporal kinds.
+
+    A bare ``date``/``timestamp`` literal is an epoch offset (days / micros); handed to
+    pyarrow as a Python ``int`` it infers ``int16``/``int64`` and the comparison kernel
+    against a ``date32``/``timestamp`` column has no match (``greater_equal(date32,
+    int16)``). Building an explicitly-typed ``date32``/``timestamp[us]`` scalar makes the
+    column-vs-literal comparison type-check and enables row-group/page pruning on date
+    columns (the common TPC-H shipdate/orderdate filters).
+    """
+    import pyarrow as pa
+
+    ((kind, value),) = ir["value"].items()
+    if kind == "date":
+        return pa.scalar(value, pa.date32())
+    if kind == "timestamp":
+        return pa.scalar(value, pa.timestamp("us"))
+    if kind == "time":
+        return pa.scalar(value, pa.time64("us"))
+    return value
 
 
 def _col_and_literal(left: dict[str, Any], right: dict[str, Any]) -> tuple[str, Any, bool] | None:
@@ -39,6 +75,17 @@ def _col_and_literal(left: dict[str, Any], right: dict[str, Any]) -> tuple[str, 
         return left["name"], _literal(right), False
     if left.get("e") == "lit" and right.get("e") == "col":
         return right["name"], _literal(left), True
+    return None
+
+
+def _col_and_pa_literal(
+    left: dict[str, Any], right: dict[str, Any]
+) -> tuple[str, Any, bool] | None:
+    """Like :func:`_col_and_literal`, but the value is a typed pyarrow scalar."""
+    if left.get("e") == "col" and right.get("e") == "lit":
+        return left["name"], _pa_literal(right), False
+    if left.get("e") == "lit" and right.get("e") == "col":
+        return right["name"], _pa_literal(left), True
     return None
 
 
@@ -70,7 +117,7 @@ def _to_pa(ir: dict[str, Any], ds: Any) -> Any | None:
             return None
         return (left & right) if op == "and" else (left | right)
     if op in _CMP:
-        parsed = _col_and_literal(ir["left"], ir["right"])
+        parsed = _col_and_pa_literal(ir["left"], ir["right"])
         if parsed is None:
             return None
         col, value, flipped = parsed

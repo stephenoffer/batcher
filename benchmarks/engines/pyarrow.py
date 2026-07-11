@@ -9,8 +9,10 @@ itself (PyArrow is also the cross-engine interchange format).
 from __future__ import annotations
 
 import importlib.util
+from typing import Any
 
 import pyarrow as pa
+import pyarrow.fs as pafs
 
 from .base import Engine
 
@@ -31,3 +33,11 @@ class PyArrowEngine(Engine):
         import pyarrow.dataset as ds
 
         return ds.dataset(uri).to_table()
+
+    def scan_handle(self, filesystem: pafs.FileSystem, paths: list[str]) -> Any:
+        import pyarrow.dataset as ds
+
+        # `ds.dataset` cannot expand a glob, so the scan suite hands it the listed paths.
+        # The returned Dataset is lazy: it opens each file's footer when scanned, which
+        # is the per-file metadata cost the many-small-files layout is measuring.
+        return ds.dataset(paths, filesystem=filesystem, format="parquet")

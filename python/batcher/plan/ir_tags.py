@@ -65,6 +65,7 @@ class ExprTag:
     GREATEST: Final = "greatest"
     LEAST: Final = "least"
     ARRAY: Final = "array"
+    HASH: Final = "hash"
     SEQUENCE: Final = "sequence"
     DATE: Final = "date"
     DATE_TRUNC: Final = "date_trunc"
@@ -78,6 +79,7 @@ class ExprTag:
     LIST_BINARY: Final = "list_binary"
     LIST_JOIN: Final = "list_join"
     LIST_GET: Final = "list_get"
+    LIST_SIMHASH: Final = "list_simhash"
     LIST_CONTAINS: Final = "list_contains"
     LIST_POSITION: Final = "list_position"
     LIST_SET: Final = "list_set"
@@ -99,5 +101,11 @@ WINDOW_RANKING: Final = frozenset(
     {"row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile"}
 )
 WINDOW_AGGREGATES: Final = frozenset({"sum", "avg", "min", "max", "count"})
-WINDOW_VALUE: Final = frozenset({"first_value", "last_value", "lag", "lead", "nth_value"})
+# The fills select by *nullness* rather than by offset, but share the value functions'
+# contract: input required, output type = input type, no explicit frame (theirs is
+# implied). Unlike the other value functions they are meaningless without an order.
+WINDOW_FILL: Final = frozenset({"forward_fill", "backward_fill"})
+WINDOW_VALUE: Final = (
+    frozenset({"first_value", "last_value", "lag", "lead", "nth_value"}) | WINDOW_FILL
+)
 WINDOW_FUNCS: Final = WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE

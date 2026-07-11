@@ -1,4 +1,4 @@
-"""The `Dataset.scd` namespace — slowly-changing-dimension upserts.
+"""The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds.
 
 Breadth on `Dataset` lives on accessors. SCD maintenance composes existing ops
 (merge / join / union / with_columns) — no new IR:
@@ -7,6 +7,12 @@ Breadth on `Dataset` lives on accessors. SCD maintenance composes existing ops
 - ``type2`` — full history via effective-dating columns (`valid_from`/`valid_to`/
   `is_current`): expire the current row of a changed key and append a new version.
 - ``type3`` — keep the previous value in a ``<attr>_prev`` column.
+- ``apply_changes`` — apply a **change feed** (CDC) rather than a snapshot: deletes,
+  redeliveries, and out-of-order rows, reconciled idempotently.
+
+The first three take a clean snapshot of the dimension as it is *now*. `apply_changes`
+takes the stream of what *happened*, which is what a database's change-data-capture
+connector actually produces, and is the harder and more common ETL shape.
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ from __future__ import annotations
 from functools import reduce
 from typing import TYPE_CHECKING
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Col, Expr, lit, nullif
 
 
@@ -34,6 +41,18 @@ class DatasetSCD:
     """Accessor for slowly-changing-dimension upserts over a `Dataset` (``ds.scd``).
 
     The dataset is the *incoming* dimension snapshot (natural keys + attributes).
+
+    Examples:
+        .. doctest::
+
+            >>> import os
+            >>> import tempfile
+
+            >>> import batcher as bt
+            >>> target = os.path.join(tempfile.mkdtemp(), "dim.parquet")
+            >>> _ = bt.from_pydict({"id": [1], "city": ["NYC"]}).scd.type1(target, keys="id")
+            >>> bt.read.parquet(target).to_pydict()
+            {'id': [1], 'city': ['NYC']}
     """
 
     __slots__ = ("_ds",)
@@ -43,8 +62,17 @@ class DatasetSCD:
         self._ds = ds
 
     def type1(self, target: str, *, keys: str | list[str], **opts) -> WriteManifest:
-        """SCD type 1 — overwrite changed attributes in place (no history). A keyed
-        upsert into `target` (delegates to `ds.write.merge`).
+        """SCD type 1 — overwrite changed attributes in place (no history).
+
+        A keyed upsert into `target` (delegates to `ds.write.merge`).
+
+        Args:
+            target: Path of the dimension table to upsert into.
+            keys: The natural key column(s) identifying a row.
+            **opts: Forwarded to `ds.write.merge`.
+
+        Returns:
+            The `WriteManifest` of the rewritten target.
 
         Examples:
             .. doctest::
@@ -82,6 +110,20 @@ class DatasetSCD:
         appended (``valid_from = as_of``, ``valid_to = NULL``, ``is_current = True``).
         Brand-new keys are inserted as a first version; unchanged keys are untouched.
         `as_of` is the effective timestamp (e.g. the batch date), stored as a string.
+
+        Args:
+            target: Path of the dimension table to maintain.
+            keys: The natural key column(s) identifying a row.
+            track: The attribute columns whose change triggers a new version.
+            as_of: The effective timestamp for this batch, stored as a string.
+            valid_from: Name of the version-start column.
+            valid_to: Name of the version-end column (NULL while current).
+            is_current: Name of the boolean current-version flag column.
+            format: Target format; inferred from the path when omitted.
+            **opts: Forwarded to the writer.
+
+        Returns:
+            The `WriteManifest` of the rewritten target.
 
         Examples:
             .. doctest::
@@ -151,10 +193,21 @@ class DatasetSCD:
         format: str | None = None,
         **opts,
     ) -> WriteManifest:
-        """SCD type 3 — keep the immediately previous value of each `track` attribute
-        in a ``<attr>_prev`` column (limited history). For a matched key the existing
-        current value moves to ``<attr>_prev`` and the incoming value becomes current;
-        new keys get NULL previous values; untouched target keys are preserved.
+        """SCD type 3 — keep each `track` attribute's previous value in a ``<attr>_prev`` column.
+
+        Limited history. For a matched key the existing current value moves to
+        ``<attr>_prev`` and the incoming value becomes current; new keys get NULL
+        previous values; untouched target keys are preserved.
+
+        Args:
+            target: Path of the dimension table to maintain.
+            keys: The natural key column(s) identifying a row.
+            track: The attribute columns whose previous value is kept.
+            format: Target format; inferred from the path when omitted.
+            **opts: Forwarded to the writer.
+
+        Returns:
+            The `WriteManifest` of the rewritten target.
 
         Examples:
             .. doctest::
@@ -193,3 +246,127 @@ class DatasetSCD:
         old = existing.select(*key_list, *track)
         updated = incoming.join(old, on=key_list, how="left", suffix="_prev")
         return survivors.union(updated).write(target, fmt, mode="overwrite", **opts)
+
+    def apply_changes(
+        self,
+        target: str,
+        *,
+        keys: str | list[str],
+        sequence_by: str,
+        deletes: Expr | None = None,
+        columns: list[str] | None = None,
+        format: str | None = None,
+        **opts,
+    ) -> WriteManifest:
+        """Apply a change feed (CDC) to `target`: a sequenced upsert that honors deletes.
+
+        The dataset is a **change feed**, not a snapshot: it may carry deletes, redeliver
+        rows it has already sent, and present them out of order. That is what a database
+        CDC connector (Debezium, a Delta change feed, a Snowflake stream) emits, and it
+        is why `type1` — which assumes a clean current-state snapshot — cannot consume it.
+
+        Reconciliation follows Delta Live Tables' ``APPLY CHANGES INTO ... STORED AS SCD
+        TYPE 1``:
+
+        * Within the batch, only the greatest-`sequence_by` change per key survives.
+        * A change applies only if its key is new, or its sequence is **at least** the
+          sequence already stored for that key. So a redelivered change is a no-op and a
+          late change that lost a race is discarded, rather than resurrecting old data.
+        * A row matching `deletes` removes the target row and inserts nothing. A delete
+          for an absent key is a tombstone and changes nothing.
+
+        `sequence_by` is stored in the target — that is what lets a *later* run recognize
+        a stale change. It must be unique per key; ties are broken arbitrarily.
+
+        Re-applying a batch is therefore a no-op, and applying batches in non-decreasing
+        sequence order converges on the source's state. Like `type1`, it is a copy-on-write
+        overwrite of `target`, so it is single-writer only.
+
+        .. warning::
+            The apply is idempotent but not commutative. A delete is physical, not a
+            tombstone, so a deleted key stores no sequence to compare against — replaying
+            an *old insert* for a key that was since deleted will resurrect it. Feed
+            batches in sequence order (which a CDC reader does), and treat a full replay
+            from the beginning of a feed containing deletes as a rebuild, not a resume.
+
+        Examples:
+            .. doctest::
+
+                >>> import os
+                >>> import tempfile
+
+                >>> import batcher as bt
+                >>> target = os.path.join(tempfile.mkdtemp(), "customers.parquet")
+                >>> feed = bt.from_pydict(
+                ...     {
+                ...         "id": [1, 2, 1],
+                ...         "city": ["NYC", "LA", "SF"],
+                ...         "op": ["INSERT", "INSERT", "UPDATE"],
+                ...         "seq": [1, 2, 3],
+                ...     }
+                ... )
+                >>> _ = feed.scd.apply_changes(
+                ...     target,
+                ...     keys="id",
+                ...     sequence_by="seq",
+                ...     deletes=bt.col("op") == "DELETE",
+                ...     columns=["id", "city"],
+                ... )
+                >>> bt.read.parquet(target).sort("id").select("id", "city").to_pydict()
+                {'id': [1, 2], 'city': ['SF', 'LA']}
+
+                A later batch deletes a row; a stale change for it is ignored.
+
+                >>> later = bt.from_pydict(
+                ...     {
+                ...         "id": [2, 1],
+                ...         "city": ["LA", "OLD"],
+                ...         "op": ["DELETE", "UPDATE"],
+                ...         "seq": [4, 0],
+                ...     }
+                ... )
+                >>> _ = later.scd.apply_changes(
+                ...     target,
+                ...     keys="id",
+                ...     sequence_by="seq",
+                ...     deletes=bt.col("op") == "DELETE",
+                ...     columns=["id", "city"],
+                ... )
+                >>> bt.read.parquet(target).sort("id").select("id", "city").to_pydict()
+                {'id': [1], 'city': ['SF']}
+
+        Args:
+            target: Path of the table to maintain. Created if it does not exist.
+            keys: The natural key column(s) identifying a row across changes.
+            sequence_by: Column ordering the changes for a key (a log offset, a commit
+                timestamp, a version). Persisted in `target`.
+            deletes: Predicate that is TRUE for a change representing a deletion. NULL
+                counts as "not a delete". Omit if the feed carries no deletes.
+            columns: The columns to store, excluding CDC control columns such as the
+                operation. Defaults to every column of the feed. `keys` and
+                `sequence_by` are always stored.
+            format: Target format; inferred from the path when omitted.
+            **opts: Forwarded to the writer.
+
+        Returns:
+            The `WriteManifest` of the rewritten target.
+
+        Raises:
+            PlanError: If a named column is absent from the feed, or the existing
+                target's columns do not match the ones being applied.
+        """
+        from batcher.api.merge import cdc_stored_columns, compose_cdc_apply
+        from batcher.api.session import read as _read
+        from batcher.io.detect import detect_format
+        from batcher.io.filesystem import resolve_filesystem
+
+        key_list = [keys] if isinstance(keys, str) else list(keys)
+        if not key_list:
+            raise PlanError("apply_changes() requires at least one key column")
+        fmt = detect_format(target, format)
+        stored = cdc_stored_columns(self._ds.columns, key_list, sequence_by, columns)
+
+        exists = resolve_filesystem(target).exists(target)
+        existing = _read(target, format=fmt) if exists else None
+        result = compose_cdc_apply(self._ds, existing, key_list, sequence_by, stored, deletes)
+        return result.write(target, fmt, mode="overwrite", **opts)

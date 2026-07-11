@@ -80,6 +80,57 @@ def test_bytes_per_row_learned_from_measured_peaks():
     assert model.max_bytes_per_row() == 256.0
 
 
+def test_peak_rss_high_water_dominates_the_arrow_estimate():
+    # When the measured process RSS high-water exceeds the Arrow-size estimate (scratch,
+    # fragmentation, off-pool buffers), the learned model fits against the RSS — never
+    # under-sizing the true footprint.
+    hub = _hub()
+    rows = 1000
+    for _ in range(30):
+        hub.record(
+            OperatorFeedback(
+                op_id=OpId(1),
+                kind="aggregate",
+                n_actual=rows // 10,
+                t_op_ms=1.0,
+                m_peak_bytes=100 * rows,  # Arrow estimate: 100 B/row
+                peak_rss_bytes=250 * rows,  # measured RSS high-water: 250 B/row (the truth)
+                selectivity=0.1,
+                batch_size=16384,
+                n_input=rows,
+            )
+        )
+    assert learned_memory_model(hub).bytes_per_row("Aggregate") == 250.0
+
+
+def test_learned_spill_volume_is_fit_and_predicted():
+    # Measured spill volume per row is learned for families that spilled, then multiplied by
+    # a new plan's estimated rows to predict its spill volume (sizes spill partitions).
+    hub = _hub()
+    rows = 1000
+    for _ in range(30):
+        hub.record(
+            OperatorFeedback(
+                op_id=OpId(1),
+                kind="aggregate",
+                n_actual=rows // 10,
+                t_op_ms=1.0,
+                m_peak_bytes=64 * rows,
+                spill_bytes=200 * rows,  # 200 B/row actually spilled
+                selectivity=0.1,
+                batch_size=16384,
+                n_input=rows,
+            )
+        )
+    model = learned_memory_model(hub)
+    assert model.spill_bytes_per_row("Aggregate") == 200.0
+    # A cold family (never spilled) predicts nothing.
+    assert model.spill_bytes_per_row("Filter") is None
+    # predicted_spill scales with the plan op's estimated rows (peak ÷ row_bytes).
+    assert model.predicted_spill_bytes(_plan("Aggregate", 64 * 5000).ops) > 0
+    assert model.predicted_spill_bytes(_plan("Filter", 64 * 5000).ops) == 0
+
+
 def test_cold_store_is_pass_through():
     model = learned_memory_model(_hub())  # no feedback recorded
     assert model.bytes_per_row("Aggregate") is None

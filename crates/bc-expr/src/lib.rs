@@ -154,6 +154,18 @@ pub enum Expr {
     /// per-row element values (all elements coerced to a common type).
     Array { elements: Vec<Expr> },
 
+    /// `hash(e0, e1, …, seed)` — a deterministic 64-bit hash of the row's *values* → Int64.
+    ///
+    /// Typed, not textual: an integer hashes its bits, a float its (canonicalized) bits, a
+    /// string its UTF-8. Order-sensitive, and null is a distinct positional value. Stable
+    /// across partitions, runs, machines and versions (pinned by golden tests) — which is
+    /// what a reproducible split, a surrogate key, and hash bucketing all rest on.
+    Hash {
+        inputs: Vec<Expr>,
+        #[serde(default)]
+        seed: i64,
+    },
+
     /// `sequence(start, stop, step)` — the integer series from `start` to `stop`
     /// **inclusive**, stepping by `step` (Spark `sequence`). → `List<Int64>`.
     Sequence {
@@ -219,6 +231,12 @@ pub enum Expr {
     /// `list[index]` — the element at 0-based `index` of each row's `List`
     /// (null where the row is null or the index is out of range). Type-preserving.
     ListGet { input: Box<Expr>, index: i64 },
+
+    /// A random-hyperplane (SimHash) signature of an embedding → `List<Int64>` of
+    /// `num_bits` bits: the blocking key a vector similarity join needs, as
+    /// `.str.minhash` is for Jaccard. See `eval::list_ops::simhash`.
+    #[rustfmt::skip]
+    ListSimhash { input: Box<Expr>, num_bits: i64, #[serde(default)] seed: i64 },
 
     /// `struct.field` — extract a named field from a `Struct` column
     /// (type-preserving; null where the struct row is null).
@@ -333,6 +351,10 @@ pub enum ListBinaryFunc {
     CosineSimilarity,
     /// Euclidean distance `sqrt(Σ (aᵢ−bᵢ)²)` between the two vectors.
     L2Distance,
+    /// The fraction of positions where the two lists hold the same value. Over a pair of
+    /// `minhash` signatures this is the standard unbiased estimator of the documents'
+    /// Jaccard similarity; over arbitrary lists it is simply the agreement rate.
+    Jaccard,
 }
 
 /// Two-argument math functions (→ Float64).
@@ -532,6 +554,22 @@ pub enum StrFunc {
     Ascii,
     /// Split on `pattern` → a `List<Utf8>` (null input → null list).
     Split,
+    /// A MinHash signature of the text → `List<Int64>` of `length` (`num_perm`) values,
+    /// each bounded to 32 bits; `start` is the character shingle width. The fraction of
+    /// positions two signatures agree on estimates the documents' Jaccard similarity
+    /// (`.list.jaccard`) — fuzzy dedup compares 128 integers, not two documents.
+    ///
+    /// `rename` pins the wire tag (`snake_case` would spell it `min_hash`).
+    #[serde(rename = "minhash")]
+    MinHash,
+    /// Slice into fixed-size overlapping windows → a `List<Utf8>`: the document
+    /// chunker a RAG ingest pipeline needs before embedding. `length` is the chunk
+    /// size and `start` the overlap, both in **characters** (Unicode scalar values,
+    /// as `Substr`/`Len` count them), so a chunk never splits a codepoint. Chunks
+    /// start every `length - start` characters while a start remains inside the
+    /// string, so the final chunk may be shorter. Empty string → empty list; null →
+    /// null list.
+    Chunk,
     /// True where `pattern` (a regex) matches anywhere in the string. → Boolean.
     RegexpMatches,
     /// Replace the first match of regex `pattern` with `replacement`. → Utf8.
@@ -621,6 +659,28 @@ pub enum StrFunc {
     Levenshtein,
     /// American Soundex phonetic code, a 4-character key (DuckDB `soundex`). → Utf8.
     Soundex,
+    /// HMAC-SHA-256 keyed by `pattern` (the key's raw UTF-8 bytes), lowercase hex.
+    /// The pseudonymization primitive — deterministic, so pseudonyms still join across
+    /// tables, but irreversible and (unlike a bare `sha256`) not brute-forceable over a
+    /// low-entropy domain such as email addresses. Null → null. → Utf8.
+    HmacSha256,
+    /// AES-256-GCM-SIV encryption under the 32-byte key in `pattern` (64 hex chars or
+    /// base64); base64 of `ciphertext || tag`. Deterministic by design so the encrypted
+    /// column stays joinable/groupable — which means it leaks equality; see
+    /// `eval::security::crypto`. Null → null. → Utf8.
+    AesEncrypt,
+    /// Inverse of `AesEncrypt` under the same key. A value that is not base64, fails
+    /// authentication (wrong key, tampered ciphertext), or is not UTF-8 → null, so one
+    /// unreadable row cannot abort a scan. → Utf8 (nullable).
+    AesDecrypt,
+    /// Replace every character outside the first `start` and last `length` with the
+    /// single character in `pattern` (default `X`). Character-length preserving; when
+    /// the revealed windows overlap the value is returned unmasked. Null → null. → Utf8.
+    Mask,
+    /// Readable text of an HTML document: drops tags *and* `<script>`/`<style>` bodies
+    /// and comments, decodes entities, collapses whitespace, and separates elements with
+    /// a space. Lenient on malformed markup. Null → null. → Utf8. See `eval::str::html`.
+    StripHtml,
 }
 
 /// Date/time field extractions (→ Int64). Wire tags are snake_case (the contract

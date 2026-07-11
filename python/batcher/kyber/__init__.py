@@ -16,6 +16,7 @@ estimators, and join ordering land on top of this seam.
 from __future__ import annotations
 
 from batcher.kyber.learning import (
+    NDV_KEY,
     load_learned_stats,
     record_column_stats,
     record_execution,
@@ -42,6 +43,7 @@ from batcher.kyber.optimizer import (
 )
 
 __all__ = [
+    "NDV_KEY",
     "Optimizer",
     "answer_aggregate",
     "answer_column_summary",

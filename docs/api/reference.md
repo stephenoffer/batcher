@@ -52,6 +52,7 @@ Each returns a new lazy Dataset.
 | `.rename({old: new})` | rename columns |
 | `.sort(*by, descending=False, nulls_first=False)` | order rows |
 | `.limit(n, offset=0)` / `.head(n=5)` | take a prefix |
+| `.tail(n=5)` | take a suffix (executes a `count` first) |
 | `.distinct()` | drop duplicate rows |
 | `.union(*others, distinct=False)` | concatenate datasets |
 | `.intersect(other)` / `.except_(other)` | set operations |
@@ -64,6 +65,7 @@ Each returns a new lazy Dataset.
 | `.sample(fraction=None, n=None, seed=None)` | deterministic seeded row sample |
 | `.cast(dtypes)` | cast one column (`"Int64"`) or many (`{col: dtype}`) |
 | `.fill_null(value)` | replace nulls (scalar or `{col: value}`) |
+| `.fill_null(strategy=...)` | fill from a statistic (`"zero"`/`"mean"`/`"min"`/`"max"`) or carry a neighbour (`"forward"`/`"backward"`, which require `order_by`) |
 | `.drop_nulls(subset=None)` | drop rows with nulls (optionally in `subset`) |
 | `.map_batches(fn, ...)` | run a Python callable over whole Arrow batches |
 
@@ -112,6 +114,7 @@ These compute (or read) a small result and so are eager.
 | `.null_count()` | null count per column |
 | `.approx_quantile(column, q)` | a sketch-based quantile estimate |
 | `.stats()` | the last run's measured `RunStats` |
+| `__arrow_c_stream__()` | Arrow PyCapsule export — `pl.DataFrame(ds)`, `duckdb.sql("… FROM ds")`, `pa.table(ds)` consume a `Dataset` directly, lazily and zero-copy |
 
 ```python
 out = ds.filter(bt.col("price") >= 20).sort("price", descending=True)
@@ -147,12 +150,27 @@ print(out.to_pydict())
 | `bt.greatest(*exprs)` / `bt.least(*exprs)` | row-wise extreme |
 | `bt.array(*exprs)` | build a list column |
 | `bt.atan2(y, x)` | two-argument arctangent |
+
+## Column selectors
+
+Each stands for every column matching a predicate, and expands against the input
+schema wherever a column is expected. They produce a `Selector`.
+
+| Call | Selects |
+| --- | --- |
+| `bt.all()` | every column |
+| `bt.numeric()` / `bt.integer()` / `bt.floating()` | numeric / integer / float columns |
+| `bt.string()` / `bt.boolean()` / `bt.temporal()` | string / boolean / date-time columns |
+| `bt.exclude(*names)` | every column except the named ones |
 | `bt.count()` | COUNT(*) aggregate |
 | `bt.iff(condition, if_true, if_false)` | `if_true` where `condition` is true, else `if_false` (DuckDB `IFF`) |
 | `bt.nanvl(value, fallback)` | `value` unless it is NaN, then `fallback` (Spark `nanvl`) |
 | `bt.concat(*exprs)` | concatenate values into one string |
 | `bt.concat_ws(separator, *exprs)` | concatenate values with `separator` between them |
 | `bt.format_string(format, *exprs)` | interpolate values into a `{}` template (Polars `format`) |
+| `bt.mask(e, show_first=0, show_last=0, char="X")` | redact a string, optionally revealing its ends |
+| `bt.hmac_sha256(e, key)` | keyed, irreversible pseudonym that still joins |
+| `bt.aes_encrypt(e, key)` / `bt.aes_decrypt(e, key)` | deterministic AES-256-GCM-SIV column encryption |
 | `bt.log(base, value)` | logarithm of `value` in the given `base` (→ Float64) |
 | `bt.gcd(a, b)` / `bt.lcm(a, b)` | greatest common divisor / least common multiple |
 | `bt.hypot(a, b)` | Euclidean norm `sqrt(a² + b²)` |
@@ -161,9 +179,14 @@ print(out.to_pydict())
 | `bt.sequence(start, stop, step=1)` | per-row integer list `[start..stop]` inclusive (DuckDB `generate_series`) |
 | `bt.element()` | the current element inside `list.transform` / `list.filter` (Polars) |
 | `bt.sum_horizontal(*exprs)` / `bt.mean_horizontal(*exprs)` | row-wise sum / mean across columns, ignoring nulls (Polars) |
+| `bt.min_horizontal(*exprs)` / `bt.max_horizontal(*exprs)` | row-wise min / max across columns, ignoring nulls (Polars) |
+| `bt.all_horizontal(*exprs)` / `bt.any_horizontal(*exprs)` | row-wise boolean AND / OR across columns (Polars) |
+| `bt.hash_rows(*exprs, seed=0)` | deterministic 64-bit row digest (also `expr.hash(seed=0)`) |
 | `bt.count_if(condition)` | count rows where `condition` is true (aggregate) |
 | `bt.corr(x, y)` | Pearson correlation (aggregate) |
 | `bt.covar_pop(x, y)` / `bt.covar_samp(x, y)` | population / sample covariance (aggregate) |
+| `bt.lag(expr, n=1)` / `bt.lead(expr, n=1)` | the value `n` rows before / after the current row (window) |
+| `bt.first_value(expr)` / `bt.last_value(expr)` | the first / last value of the ordered partition (window) |
 | `bt.nth_value(expr, n)` | the `n`-th value of the ordered partition (window) |
 | `bt.current_timestamp()` | current timestamp, bound at plan-build time |
 | `bt.current_date()` | today's date, bound at plan-build time |
@@ -182,19 +205,33 @@ print(out.to_pydict())
 ## Expression methods
 
 - Operators: `+ - * / % **`; `== != > >= < <=`; `& | ~`
-- Types and nulls: `.cast("Int64")`, `.is_null()`, `.is_not_null()`, `.is_in([...])`,
-  `.between(low, high)`, `.fill_null(value)`, `.is_nan()`, `.is_not_nan()`,
-  `.is_finite()`, `.is_infinite()`, `.clip(lower, upper)`
+- Types and nulls: `.cast("Int64")`, `.try_cast("Int64")`, `.is_null()`,
+  `.is_not_null()`, `.is_in([...])`, `.between(low, high)`, `.fill_null(value)`,
+  `.fill_nan(value)`, `.eq_missing(other)`, `.is_nan()`, `.is_not_nan()`,
+  `.is_finite()`, `.is_infinite()`, `.clip(lower, upper)`, `.alias(name)`
+- Binning and gap-filling: `.cut(breaks, labels=None, left_closed=False)`,
+  `.forward_fill()` / `.backward_fill()` (window functions — bind with
+  `.over(order_by=[...])`; an order is required)
 - Math: `.abs()`, `.round(digits)`, `.pow(e)`, `.sqrt()`, `.floor()`, `.ceil()`,
   `.ln()`, `.log10()`, `.log2()`, `.exp()`, `.sin()`, `.cos()`, `.tan()`, `.asin()`,
   `.acos()`, `.atan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`, `.sign()`,
-  `.trunc()`, `.cbrt()`, `.degrees()`, `.radians()`
+  `.trunc()`, `.cbrt()`, `.degrees()`, `.radians()`, `.factorial()`
+- Bitwise (integers): `.bitwise_and(o)`, `.bitwise_or(o)`, `.bitwise_xor(o)`,
+  `.bitwise_left_shift(o)`, `.bitwise_right_shift(o)`, `.bit_count()`
 - Aggregates (inside `.agg`): `.sum()`, `.min()`, `.max()`, `.mean()`, `.var()`,
-  `.std()`, `.median()`, `.quantile(q)`, `.count()`, `.n_unique()`, `.mode()`,
-  `.first()`, `.last()`, `.arg_min()`, `.arg_max()`, `.bool_and()`, `.bool_or()`,
-  `.array_agg()`
-- Approximate aggregates (sketch-backed, mergeable — for scale): `.approx_n_unique()`
-  (HyperLogLog), `.approx_quantile(q)` / `.approx_median()` (KLL)
+  `.std()`, `.median()`, `.quantile(q)`, `.skewness()`, `.kurtosis()`, `.count()`,
+  `.n_unique()` / `.count_distinct()`, `.mode()`, `.first()`, `.last()`,
+  `.arg_min()`, `.arg_max()`, `.bool_and()`, `.bool_or()`,
+  `.bit_and()` / `.bit_or()` / `.bit_xor()`, `.histogram()`, `.array_agg()`
+- Approximate aggregates (sketch-backed, mergeable — for scale): `.approx_n_unique()` /
+  `.approx_count_distinct()` (HyperLogLog), `.approx_quantile(q)` / `.approx_median()` (KLL)
+- Cumulative & window analytics (bind with `.over(...)`): `.cum_sum()` / `.cum_min()` /
+  `.cum_max()` / `.cum_count()`, `.rolling_sum(k)` / `.rolling_mean(k)` /
+  `.rolling_min(k)` / `.rolling_max(k)` / `.rolling_count(k)`, `.diff(n=1)`,
+  `.pct_change(n=1)`, `.shift(n)`, `.rank(method="min")`, `.is_duplicated()` /
+  `.is_unique()`
+- Full list, plus the `.str` / `.dt` / `.list` / `.struct` / `.json` / `.map` /
+  `.image` / `.audio` / `.video` accessors: the [expressions API page](expressions.md).
 
 ```python
 out = ds.select(
@@ -210,9 +247,9 @@ print(out.to_pydict())
 
 | Namespace | Covers |
 | --- | --- |
-| `.str` | casing, trim, search, slice, pad, encode (`upper`, `contains`, `like`, `ilike`, `substr`, `split`, `regexp_replace`, ...) |
+| `.str` | casing, trim, search, slice, pad, encode (`upper`, `contains`, `like`, `ilike`, `substr`, `split`, `regexp_replace`, ...) plus unstructured-text ingest: `strip_html()`, `chunk(size, overlap)`, `minhash(num_perm, ngram)` |
 | `.dt` | calendar parts (`year`, `month`, `day`, `hour`, `dayname`, `quarter`, `truncate`, ...) |
-| `.list` | list reductions and reshaping (`len`, `sum`, `sort`, `get`, `join`, `contains`, ...) plus vector ops for retrieval/RAG (`cosine_similarity`, `cosine_distance`, `l2_distance`, `dot`, `normalize`) |
+| `.list` | list reductions and reshaping (`len`, `sum`, `sort`, `get`, `join`, `contains`, ...) plus vector ops for retrieval/RAG (`cosine_similarity`, `cosine_distance`, `l2_distance`, `dot`, `normalize`, `jaccard`) and the LSH blocking key `simhash(num_bits, seed=0)` |
 | `.struct` | `field(name)` |
 | `.map` | Arrow `Map` columns: `keys()`, `values()`, `get(key)` |
 | `.json` | `extract_string(path)` |
@@ -242,6 +279,29 @@ model once per worker.
 | `ds.ml.map_batches(fn, ...)` | arbitrary batch transform |
 | `ds.ml.infer(model, ...)` | batched inference |
 | `ds.ml.embed(model, ...)` | batched embeddings |
+| `ds.ml.generate(engine, ...)` | offline LLM text generation |
+| `ds.ml.extract(engine, schema=...)` | LLM → **typed** columns (AI-powered ETL) |
+| `ds.ml.classify(engine, labels=[...])` | zero-shot labelling, domain pinned to `labels` |
+| `ds.ml.near_duplicates(col)` / `drop_near_duplicates(col)` | MinHash+LSH fuzzy dedup |
+| `ds.ml.similarity_join(other, left_on=...)` | join two datasets on embedding similarity |
+
+## Preprocessors
+
+`batcher.ml.preprocessors` holds the scikit-learn-style `fit`/`transform` estimators.
+Fit on the training split, transform both; `Chain` composes them into one pipeline.
+
+| Class | Learns |
+| --- | --- |
+| `StandardScaler` / `MinMaxScaler` / `MaxAbsScaler` / `RobustScaler` | per-column scaling statistics |
+| `Normalizer` | stateless per-row vector normalization |
+| `OneHotEncoder` / `MultiHotEncoder` / `LabelEncoder` / `OrdinalEncoder` | the category vocabulary |
+| `KBinsDiscretizer` | bin edges (quantile or uniform) |
+| `SimpleImputer` | the fill statistic (mean/median/most-frequent/constant) |
+| `Tokenizer` / `Concatenator` | stateless text split / feature-vector assembly |
+| `Chain` | each step, fit on the previous step's output |
+
+See the [preprocessors guide](../ml/preprocessors.md) for the workflow and the
+[ML API page](ml.md) for the per-class reference.
 
 ## Configuration
 

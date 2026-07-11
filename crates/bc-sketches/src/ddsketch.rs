@@ -215,7 +215,9 @@ impl DDSketch {
     /// `[neg_len: u64]{[index: i32][count: u64]}×neg_len`.
     /// `gamma`/`ln_gamma` are derived from `alpha` on load.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        // Exact wire size: 5×8 header + per map (u64 len + entries×(i32+u64)) — one allocation.
+        let entries = self.positive.len() + self.negative.len();
+        let mut out = Vec::with_capacity(40 + 2 * 8 + entries * 12);
         out.extend_from_slice(&self.alpha.to_le_bytes());
         out.extend_from_slice(&self.zeros.to_le_bytes());
         out.extend_from_slice(&self.n.to_le_bytes());

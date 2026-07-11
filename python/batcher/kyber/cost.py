@@ -23,6 +23,7 @@ from dataclasses import dataclass, replace
 # unchanged.
 from batcher.config import CostCoefficients, CostWeights, active_config
 from batcher.kyber.cardinality import CardinalityEstimator
+from batcher.kyber.expr_cost import expr_cost, expr_cost_factor
 from batcher.plan.logical import (
     Aggregate,
     Distinct,
@@ -35,6 +36,7 @@ from batcher.plan.logical import (
     Scan,
     Sort,
     Union,
+    Unnest,
     Window,
 )
 from batcher.plan.visitor import children
@@ -88,6 +90,46 @@ class CostModel:
     def _rows(self, node: LogicalPlan) -> float:
         return self._est.estimate(node).rows
 
+    def expr_factor(self, node: LogicalPlan) -> float:
+        """The per-row expression-cost multiplier for `node`'s own work.
+
+        A `Filter` pays for its predicate; a `Project` pays for every column it computes
+        (ten regexes cost ten regexes). Every other operator's per-row work is structural,
+        not expression-driven, so it carries no multiplier.
+
+        Priced at the *measured* JIT speedup, so an expression the Cranelift tier compiles
+        is charged what that tier actually costs. Public because Core stamps this factor
+        onto each operator's feedback: `calibration` divides it back out, which is what
+        keeps the fitted `filter_row` / `project_row` coefficients a property of the
+        engine rather than of whichever expressions a workload happened to contain.
+
+        Args:
+            node: The plan node whose own per-row work is being priced.
+
+        Returns:
+            A multiplier, 1.0 for operators with no expression cost.
+        """
+        speedup = self._c.jit_speedup
+        if isinstance(node, Filter):
+            return expr_cost_factor(node.predicate, speedup)
+        if isinstance(node, Project):
+            return sum(expr_cost_factor(item.expr, speedup) for item in node.items)
+        return 1.0
+
+    def expr_cost(self, expr) -> float:
+        """Per-row cost of a scalar expression, at the measured JIT speedup.
+
+        The seam cost-based rules use so they price expressions exactly as the cost model
+        does, instead of importing the module-level default speedup.
+
+        Args:
+            expr: The scalar expression to price.
+
+        Returns:
+            Cost in work-units, where an interpreted numeric comparison is 1.0.
+        """
+        return expr_cost(expr, self._c.jit_speedup)
+
     def row_bytes(self, node: LogicalPlan) -> float:
         """Estimated average bytes per output row of `node` — the byte-true width
         the memory/IO axes need. Uses learned per-column widths, falling back to
@@ -96,8 +138,49 @@ class CostModel:
         broadcast eligibility in bytes."""
         return self._est.row_width(node, self._c.bytes_per_row)
 
+    def join_op_cost(self, node: Join) -> Cost:
+        """A join's own cost at the orientation the plan will *actually* run.
+
+        `op_cost` prices a join as written — build on the right — because that is exactly
+        what the build-side rule needs: it compares the two orientations against each
+        other. But that rule runs in SELECTION, *after* JOIN_REORDER, so the reorder was
+        ranking orders by the cost of an orientation the physical plan would then flip.
+        With `hash_build_row` (2.0) twice `hash_probe_row` (1.0), that is not a rounding
+        error: it penalizes every order that happens to put the large table on the right,
+        even though SELECTION would have swapped it.
+
+        An inner join is commutative, so its cost is the cheaper of the two build sides —
+        which is the one SELECTION will pick. A non-inner join is not commutative and its
+        build side is fixed, so it is priced as written.
+
+        Args:
+            node: The join to price.
+
+        Returns:
+            The join's own cost, excluding its inputs.
+        """
+        base = self.op_cost(node)
+        if node.join_type != "inner":
+            return base
+        c = self._c
+        left, right = self._rows(node.left), self._rows(node.right)
+        swapped_cpu = c.hash_build_row * left + c.hash_probe_row * right
+        as_written_cpu = c.hash_build_row * right + c.hash_probe_row * left
+        if swapped_cpu >= as_written_cpu:
+            return base
+        return replace(
+            base,
+            cpu=base.cpu - as_written_cpu + swapped_cpu,
+            mem=self.row_bytes(node.left) * left,
+        )
+
     def op_cost(self, node: LogicalPlan) -> Cost:
-        """Cost of `node` itself, excluding its inputs."""
+        """Cost of `node` itself, excluding its inputs.
+
+        A `Join` is priced **as written** (build on the right). Join *ordering* should use
+        `join_op_cost`, which prices the orientation SELECTION will choose; the build-side
+        rule needs this one, since it compares the orientations against each other.
+        """
         c = self._c
         out_rows = self._rows(node)
 
@@ -106,10 +189,16 @@ class CostModel:
 
         if isinstance(node, Filter):
             in_rows = self._rows(node.input)
-            return Cost(cpu=c.filter_row * in_rows)
+            # A predicate is not a unit of work: `x > 5` compiles to a vector compare,
+            # `regexp_matches(s, ...)` runs an automaton per row. Scaling by the
+            # expression's relative cost is what lets the optimizer prefer evaluating
+            # the cheap, selective conjunct first (see `split_expensive_filter`).
+            return Cost(cpu=c.filter_row * in_rows * self.expr_factor(node))
 
         if isinstance(node, Project):
-            return Cost(cpu=c.project_row * out_rows)
+            # A projection's cost is the sum over the columns it computes: ten regexes
+            # cost ten regexes, not one `project_row`.
+            return Cost(cpu=c.project_row * out_rows * self.expr_factor(node))
 
         if isinstance(node, MapBatches):
             # A GPU model forward pass is orders of magnitude costlier per row than a
@@ -131,12 +220,15 @@ class CostModel:
 
         if isinstance(node, Sort):
             n = max(1.0, self._rows(node.input))
-            limit = node.limit
-            # Top-N (fused limit) avoids a full sort: heap of size `limit`.
-            sort_factor = math.log2(limit) if limit else math.log2(n)
+            # Top-N (fused limit) avoids a full sort: one pass over `n` maintaining a heap
+            # of size `min(limit, n)`. The heap can never hold more rows than exist, so a
+            # `LIMIT` larger than the input degenerates to a full sort — it must not be
+            # costed *above* one, which `log2(limit)` did whenever `limit > n`.
+            heap = min(node.limit, n) if node.limit else n
+            sort_factor = math.log2(max(2.0, heap))
             return Cost(
-                cpu=c.sort_row * n * max(1.0, sort_factor),
-                mem=self.row_bytes(node) * (limit if limit else n),
+                cpu=c.sort_row * n * sort_factor,
+                mem=self.row_bytes(node) * heap,
             )
 
         if isinstance(node, Join):
@@ -162,6 +254,13 @@ class CostModel:
                 cpu=c.sort_row * in_rows * max(1.0, math.log2(max(1.0, in_rows))),
                 mem=self.row_bytes(node) * in_rows,
             )
+
+        if isinstance(node, Unnest):
+            # Explode is stateless and row-wise, but it *emits* the fanned-out rows: the
+            # cost is per output row, not per input row. Costing it at zero would let
+            # Kyber move an explode below a filter or ahead of an inference stage, where
+            # it multiplies the rows that stage must pay for.
+            return Cost(cpu=c.project_row * out_rows)
 
         if isinstance(node, Union):
             return Cost(cpu=c.union_row * out_rows)

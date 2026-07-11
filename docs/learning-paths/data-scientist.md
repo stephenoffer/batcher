@@ -60,6 +60,7 @@ print(counts.to_pydict())
 Run any of these directly with `python examples/<name>.py`:
 
 - `feature_engineering.py` — scaling, bucketing, encoding, and imputation with expressions.
+- `preprocessors.py` — the same features with fit/transform preprocessor objects and `Chain`.
 - `timeseries.py` — date-part extraction, resampling, and period-over-period change.
 - `window_functions.py` — ranking and rolling aggregates with `.over(...)`.
 - `sql.py` — the same questions in SQL, composed with the DataFrame API.

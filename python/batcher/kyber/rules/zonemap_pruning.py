@@ -33,7 +33,7 @@ from batcher.plan.logical import (
     Sort,
     Union,
 )
-from batcher.plan.stats import RelStats
+from batcher.plan.stats import ColumnStat, RelStats
 
 __all__ = ["propagate_empty_relation", "zonemap_prune_filter"]
 
@@ -164,6 +164,39 @@ def _is_null_status(input_expr: Expr, stats: RelStats, *, negate: bool) -> bool 
     return None
 
 
+def _bloom_domain(value: object) -> str | None:
+    """The index domain `value` would be hashed in, or `None` if it is not indexable.
+
+    Mirrors `plan.bloom_index.canonical_bytes` and `bc_py::build_column_bloom`, which index
+    only Int64 (8-byte little-endian) and Utf8 (raw bytes). `bool` is excluded even though
+    it is an `int` subclass, exactly as both encoders exclude it.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, str):
+        return "str"
+    return None
+
+
+def _same_bloom_domain(col: ColumnStat, value: object) -> bool:
+    """Whether `value` lives in the same index domain the column's bloom was built over.
+
+    The column's own `min`/`max` bounds witness its domain — they are Python values read
+    from the same source that built the index. When no bound is known the domain cannot be
+    established, so the bloom is not consulted: refusing to prune costs a scan, whereas
+    probing across domains would delete rows that are present.
+    """
+    value_domain = _bloom_domain(value)
+    if value_domain is None:
+        return False
+    witness = col.min if col.min is not None else col.max
+    if witness is None:
+        return False
+    return _bloom_domain(witness) == value_domain
+
+
 def _comparison_status(expr: Binary, stats: RelStats) -> bool | None:
     """Decide a `col OP literal` comparison against the column's bounds and bloom."""
     side = comparison_col_side(expr)
@@ -176,7 +209,15 @@ def _comparison_status(expr: Binary, stats: RelStats) -> bool | None:
     # the predicate always-false — catching point lookups *inside* [min, max] that
     # min/max can't (`id = 9700123` over a 10M-row column). `IN` reaches this via the
     # OR-of-equalities split. No false negatives, so absence is definitive.
-    if op == "eq" and col.bloom is not None:
+    #
+    # This is the one place a bug **drops rows**: `contains() -> False` deletes the whole
+    # relation. Absence is only a proof when the literal is encoded in the *same domain*
+    # the index was built over — a bloom over Int64 values hashes 8 little-endian bytes,
+    # while the string `"5"` hashes one byte, so probing one with the other reports a
+    # definitive absence for a value that is present. Today a cross-domain comparison is
+    # wrapped in a `Cast` (so `comparison_col_side` returns `None` and never reaches here),
+    # but that is an implicit guard on a silent-wrong-answer path. Make it explicit.
+    if op == "eq" and col.bloom is not None and _same_bloom_domain(col, value):
         index = BloomIndex.from_bytes(col.bloom)
         if index is not None and not index.contains(value):
             return _FALSE

@@ -244,6 +244,9 @@ pub(crate) fn analyze(
         Expr::Coalesce { .. } => Err(CodegenError::Unsupported("coalesce".into())),
         Expr::InList { .. } => Err(CodegenError::Unsupported("in_list".into())),
         Expr::Array { .. } => Err(CodegenError::Unsupported("array literal".into())),
+        // The row hash reads whole typed values (strings, canonicalized floats); the
+        // JIT's numeric subset cannot express it, so the interpreter runs it.
+        Expr::Hash { .. } => Err(CodegenError::Unsupported("hash".into())),
         Expr::Sequence { .. } => Err(CodegenError::Unsupported("sequence".into())),
         Expr::ListSet { .. } => Err(CodegenError::Unsupported("list set op".into())),
         Expr::ListTransform { .. } => Err(CodegenError::Unsupported("list transform".into())),
@@ -301,6 +304,7 @@ pub(crate) fn analyze(
             Ok(ScalarTy::F64)
         }
         Expr::ListGet { .. } => Err(CodegenError::Unsupported("list index".into())),
+        Expr::ListSimhash { .. } => Err(CodegenError::Unsupported("list simhash".into())),
         Expr::StructField { .. } => Err(CodegenError::Unsupported("struct field".into())),
         Expr::ListContains { .. } => Err(CodegenError::Unsupported("list contains".into())),
         Expr::ListPosition { .. } => Err(CodegenError::Unsupported("list position".into())),

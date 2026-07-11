@@ -50,8 +50,10 @@ tests you wrote pass.
 11. **Python stays clean.** `ruff check` + `ruff format` clean, fully typed, no
     duplication, no dead code, and a small curated public API with **Google-style
     docstrings** (one-line summary inline with the quotes; `Args:`/`Returns:` carry
-    no types; runnable `Examples:` in a `.. doctest::` block).
-    → `.claude/rules/python-quality.md`
+    no types; runnable `Examples:` in a `.. doctest::` block). Enforced by
+    `just lint-docstrings`; every public name must also be mentioned in `docs/`,
+    rendered by Sphinx autodoc, and *taught* in a guide/tutorial/`examples/` script —
+    not only listed in the reference. → `.claude/rules/python-quality.md`
 12. **Structure stays bounded.** File/dir/class size limits (Python ≤500 lines, Rust
     ≤800 excl. tests, ≤12 files/dir, ≤5 levels deep, `__init__` ≤120 re-export-only);
     "many small things" grow as grouped-by-family modules + a registry, never a god
@@ -100,6 +102,7 @@ just test-py      # pytest  (requires `just build` first)
 just test         # CI: check → test-rust → build → test-py
 just fmt          # cargo fmt + clippy -D warnings
 just lint-py      # ruff check + ruff format --check  (Python quality gate)
+just lint-docstrings  # public-API docstring style (summary/Examples/Args/Returns)
 just lint-layers  # import-linter — enforces the three-subsystem independence
 just docs         # build the docs site (warnings = errors: orphans, broken refs)
 just bench        # operator-mix benchmark vs DuckDB/Polars (also bench-tpch, bench-dist)

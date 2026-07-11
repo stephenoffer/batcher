@@ -132,3 +132,19 @@ def test_local_reads_are_never_cached(tmp_path, monkeypatch):
     with config_context(cfg), fs.open(str(src)) as fh:
         assert fh.read() == b"data"
     assert downloads == []  # local path bypassed the cache entirely
+
+
+def test_stats_report_hit_rate(tmp_path):
+    # Hit/miss counters make a warm-vs-cold read win visible: a low hit-rate over a repeated
+    # read means the byte budget is too small, not that storage is slow.
+    cache = FileBytesCache(str(tmp_path / "c"), max_bytes=10_000)
+    fetch = _writer(b"x" * 100)
+    cache.get_or_fetch("s3://b/a", fetch)  # miss
+    cache.get_or_fetch("s3://b/a", fetch)  # hit
+    cache.get_or_fetch("s3://b/a", fetch)  # hit
+    s = cache.stats()
+    assert s["hits"] == 2
+    assert s["misses"] == 1
+    assert s["hit_rate"] == pytest.approx(2 / 3)
+    assert s["used_bytes"] == 100
+    assert FileBytesCache(str(tmp_path / "c2"), 10).stats()["hit_rate"] == 0.0  # cold cache

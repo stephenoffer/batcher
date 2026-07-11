@@ -1,9 +1,9 @@
 """Config-driven fault-tolerance, recovery, and skew policies for the distributed
 executor.
 
-These are pure ``active_config()`` → policy/option builders plus the two map-stage
-resilience helpers (``gather_map_results``, ``draining_workers``). They hold no Ray
-lifecycle state, so they import nothing from the rest of the package.
+These are pure ``active_config()`` → policy/option builders plus the map-stage
+resilience helpers (``gather_map_results``, ``map_barrier``, ``draining_workers``). They
+hold no Ray lifecycle state, so they import nothing from the rest of the package.
 """
 
 from __future__ import annotations
@@ -16,6 +16,31 @@ from batcher.config import active_config
 # Fallback in-flight cap for the map submission window when the live cluster size is
 # unreadable (Ray down / test stubs) — bounds a high-fan-out job without a topology read.
 _DEFAULT_PENDING_WINDOW = 1024
+
+# `RayError` subclasses that are NOT worker loss and that a retry cannot fix. A recovery
+# loop that reads these as a dead worker blames a perfectly healthy host, marks the whole
+# fleet dead one retry at a time, and finally reports "no surviving worker" instead of the
+# real cause. Deliberately narrow: an `OutOfMemoryError` (Ray's memory monitor killing a
+# task under node pressure) stays retryable, because rescheduling it onto a less-loaded
+# node genuinely can succeed. Matched by name so a Ray version lacking one — or a test's
+# stub `ray.exceptions` — degrades to the old catch-all instead of failing at import.
+_FATAL_RAY_ERROR_NAMES = (
+    "RuntimeEnvSetupError",  # the worker environment is broken — every retry re-breaks it
+    "TaskCancelledError",  # we cancelled it (e.g. a speculation loser); not a death
+    "GetTimeoutError",  # a caller-imposed deadline, not a death
+)
+
+
+def _is_fatal_ray_error(exc: BaseException) -> bool:
+    """Whether `exc` is a Ray error that a worker-loss retry must NOT absorb."""
+    try:
+        import ray.exceptions as ray_exc
+    except Exception:  # pragma: no cover - ray optional
+        return False
+    fatal = tuple(
+        t for t in (getattr(ray_exc, n, None) for n in _FATAL_RAY_ERROR_NAMES) if t is not None
+    )
+    return bool(fatal) and isinstance(exc, fatal)
 
 
 def speculation_policy():
@@ -177,7 +202,9 @@ def _pending_window() -> int:
     return max(1, int(cores) * max(1, d.pending_window_factor))
 
 
-def gather_map_results(submit, n: int, policy=None, *, max_pending: int | None = None) -> list:
+def gather_map_results(
+    submit, n: int, policy=None, *, max_pending: int | None = None, on_lost=None, on_done=None
+) -> list:
     """Gather `n` partition results, resubmitting any whose task died to preemption.
 
     `submit(idx)` launches partition `idx` and returns a Ray ``ObjectRef``; it is
@@ -186,6 +213,14 @@ def gather_map_results(submit, n: int, policy=None, *, max_pending: int | None =
     policy's `max_attempts` resubmissions per partition; a deterministic application
     error (`RayTaskError`) re-raises immediately rather than wasting attempts on a
     fault a rerun cannot fix.
+
+    `on_lost(idx)`, when given, is called with the failed partition *before* it is
+    requeued, and `on_done(idx)` after one completes. Stateless tasks need neither (Ray
+    reschedules them anywhere), but a barrier over pinned **actors** must record which
+    worker died so `submit` can retarget the retry at a survivor, and which workers have
+    proven themselves alive so it retargets at one of *those* — see `map_barrier`. When
+    `on_lost` returns truthy the failure *revealed a newly-dead worker*, and the retry is
+    not charged to `max_attempts` (discovering the cluster is not the partition's fault).
 
     Submissions are bounded to an in-flight **window** (`max_pending` when given, else
     `_pending_window()`) so a high-fan-out stage does not flood Ray's scheduler /
@@ -230,14 +265,97 @@ def gather_map_results(submit, n: int, policy=None, *, max_pending: int | None =
         idx = inflight.pop(ref)
         try:
             results[idx] = ray.get(ref)
+            if on_done is not None:
+                on_done(idx)
         except RayTaskError:
             raise  # a deterministic UDF error — resubmitting cannot help
-        except RayError:
+        except RayError as exc:
             # Worker / actor / node loss (preemption). Requeue at the front so the
-            # survivor-resubmit keeps priority for the next free slot.
-            attempts[idx] += 1
-            if attempts[idx] > policy.max_attempts:
+            # survivor-resubmit keeps priority for the next free slot. A `RayError` that
+            # is *not* a death (broken runtime_env, OOM, cancellation) is re-raised: it
+            # would otherwise be retried onto healthy workers and, via `on_lost`, blame
+            # each of them in turn until the fleet looked entirely dead.
+            if _is_fatal_ray_error(exc):
                 raise
+            # A failure that taught us a worker is dead is *progress*, not a wasted try:
+            # in a correlated preemption wave a retry can land on a host that is already
+            # gone but not yet observed, and charging that to the partition's budget can
+            # exhaust it while survivors still exist. Progress is bounded (each worker is
+            # discovered dead at most once), and `submit` raises once none are left.
+            progressed = bool(on_lost(idx)) if on_lost is not None else False
+            if not progressed:
+                attempts[idx] += 1
+                if attempts[idx] > policy.max_attempts:
+                    raise
             pending.appendleft(idx)
         _fill()
     return results
+
+
+def map_barrier(workers: int, launch, policy=None, dead: set[int] | None = None) -> tuple:
+    """Run a shuffle MAP barrier under worker-loss recovery. Returns `(results, dead)`.
+
+    `launch(host, src)` must issue source `src`'s map-publish on actor `host` and return
+    an ``ObjectRef`` resolving to whatever the barrier collects — the address of the
+    Flight server the buckets landed on, or (for a sampling barrier) the sample itself.
+    On a clean run every source maps to its own actor (`host == src`), so the returned
+    `results[src]` is exactly the fleet's address list and behavior is unchanged.
+
+    `dead` seeds (and is mutated with) the known-lost workers, so a stage with several
+    barriers — the sort's sample, then its range-publish — shares one view of the fleet
+    instead of rediscovering each loss.
+
+    A worker preempted *during* the barrier is the common spot failure — the map phase
+    reads the source from object storage and is usually the longest part of a query — and
+    a bare ``ray.get`` over pinned actors would fail the whole query there. Instead the
+    lost worker is recorded in `dead` and its source is republished on a survivor under
+    the **same `src`**, so the reducers' `(stage, src, bucket)` tickets still resolve. The
+    map partition is a deterministic function of its durable descriptor, so the
+    regenerated buckets are byte-identical: recovery changes *where* a partial lives,
+    never *what* it holds. Bounded by the recovery policy's `max_attempts` per source;
+    with every worker gone it raises `ResourceError` rather than looping.
+
+    The returned `dead` set must be threaded into the reduce stage so it never hosts a
+    reducer on a worker known to be gone.
+    """
+    from batcher._internal.errors import ResourceError
+
+    # slot -> the worker its latest attempt was launched on. Initially `src`, but a
+    # relocated source diverges, and it is the *host* that died, not the source id.
+    assigned: dict[int, int] = {}
+    dead = set() if dead is None else dead
+    # Hosts that have *completed* a source. In a correlated preemption wave several
+    # workers are already gone but only the ones whose slot has failed are known; a
+    # relocation onto an unobserved-dead host burns one of the source's `max_attempts`
+    # and can exhaust the budget. Retargeting onto a host that just returned a result
+    # proves liveness at the moment we choose it, so a wave costs one attempt per source.
+    confirmed: set[int] = set()
+    rotation = 0
+
+    def _pick_live() -> int:
+        nonlocal rotation
+        live = [i for i in confirmed if i not in dead] or [
+            i for i in range(workers) if i not in dead
+        ]
+        if not live:
+            raise ResourceError("no surviving worker to recompute the lost map partition on")
+        rotation += 1
+        return sorted(live)[rotation % len(live)]  # spread relocations, don't pile on one host
+
+    def _submit(src: int):
+        host = src if src not in dead else _pick_live()
+        assigned[src] = host
+        return launch(host, src)
+
+    def _on_lost(src: int) -> bool:
+        host = assigned.get(src, src)  # the HOST died; `src` may be a relocated slot
+        newly_dead = host not in dead
+        dead.add(host)
+        confirmed.discard(host)  # a host that completed earlier can still be preempted
+        return newly_dead  # progress: don't charge this retry to `src`'s budget
+
+    def _on_done(src: int) -> None:
+        confirmed.add(assigned[src])
+
+    results = gather_map_results(_submit, workers, policy, on_lost=_on_lost, on_done=_on_done)
+    return results, dead

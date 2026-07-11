@@ -20,8 +20,9 @@ from collections.abc import Callable
 
 import pyarrow as pa
 
+from batcher._internal.hardware import available_cpu_count
 from batcher._internal.registry import Registry
-from batcher.api._join_helpers import _empty_schema
+from batcher.api._join_helpers import _empty_result_schema
 from batcher.api.orchestration import run_relational
 from batcher.api.terminal._metadata import collect_source_metadata
 from batcher.core import ExecutionContext, Executor
@@ -80,7 +81,7 @@ class UdfExecutor:
         from batcher import core
 
         batches = core.execute_with_udfs(plan, sources)
-        schema = batches[0].schema if batches else _empty_schema(ctx.columns)
+        schema = batches[0].schema if batches else _empty_result_schema(plan, ctx.columns)
         table = pa.Table.from_batches(batches, schema=schema)
         collect_source_metadata(ctx.hub, sources)
         return table
@@ -163,12 +164,12 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
       node than fit — the OOM protection Carbonite gives the relational path.
     * **`accelerator_type`** — pins GPU actors to a device model when requested.
     """
-    import os
-
     from batcher.config import active_config
     from batcher.ml.gpu import (
+        actors_per_gpu_from_learned_vram,
         gpu_feedback_key,
         gpu_vram_gb,
+        load_gpu_peak_vram,
         load_gpu_utilization,
         recommend_gpu_fraction,
         recommend_inflight_depth,
@@ -192,21 +193,32 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
     vram = gpu_vram_gb() if model_gb > 0 and requested_gpus >= 1.0 else None
     if vram:
         base_gpus = recommend_gpu_fraction(model_gb, vram)
-    util = load_gpu_utilization(hub, gpu_feedback_key(plan))
+    key = gpu_feedback_key(plan)
+    util = load_gpu_utilization(hub, key)
     num_gpus = recommend_num_gpus(util, base_gpus)
+    # Refine packing from the MEASURED peak VRAM a prior run of this pipeline actually used,
+    # not just the declared model size: if the model really consumed more VRAM than declared,
+    # pack fewer actors per GPU (a larger num_gpus fraction) so it doesn't OOM. `max` means
+    # the measurement only ever tightens toward safety — it never packs looser than declared,
+    # so this can prevent an OOM but never cause one. Result-invariant (a scheduling hint).
+    peak_vram = load_gpu_peak_vram(hub, key)
+    packed = actors_per_gpu_from_learned_vram(peak_vram)
+    if packed is not None and num_gpus > 0:
+        num_gpus = min(1.0, max(num_gpus, round(1.0 / packed, 2)))
 
     # Per-actor submit-ahead depth: raise it from a prior low-utilization measurement so a
     # starved GPU is kept fed across the dispatch/gather round-trip (the ml layer owns the
     # heuristic; `dist` only turns the number into pipeline slots). Adaptation only ever
-    # increases the configured floor, so a first run is unchanged.
+    # increases the configured floor, so a first run is unchanged — and a VRAM-tight pipeline
+    # (learned peak VRAM) keeps the shallow depth so deep submission can't OOM the device.
     dc = cfg.distributed
     inflight_depth = (
-        recommend_inflight_depth(util, dc.map_inflight_depth)
+        recommend_inflight_depth(util, dc.map_inflight_depth, peak_vram)
         if dc.map_inflight_adaptive
         else max(1, dc.map_inflight_depth)
     )
 
-    n_tasks = num_workers or (cfg.execution.parallelism or os.cpu_count() or 4)
+    n_tasks = num_workers or (cfg.execution.parallelism or available_cpu_count())
     # A CPU-only map stage (no GPU) is usually IO/decode-bound preprocessing — request
     # a fractional CPU so more actors pack per node, mirroring the GPU-fraction packing
     # above. A GPU stage keeps a full CPU (the GPU is the binding resource there).

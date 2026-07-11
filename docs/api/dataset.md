@@ -65,6 +65,7 @@ Each method returns a new `Dataset`. They chain.
 | `.sort(*by, descending=False, nulls_first=False)` | Order rows. `by` is a name or expression. |
 | `.limit(n, offset=0)` | Take `n` rows after skipping `offset`. |
 | `.head(n=5)` | Take the first `n` rows. |
+| `.tail(n=5)` | Take the last `n` rows (executes a `count` first). |
 | `.sample(fraction=None, *, n=None, seed=None)` | Sample a `fraction` of rows or a fixed count `n`. Deterministic and partition-independent (a stable seeded content hash), so identical single-node or distributed. |
 | `.distinct()` | Drop duplicate rows. |
 | `.union(*others, distinct=False)` | Concatenate datasets; set `distinct=True` to dedupe. |
@@ -244,6 +245,13 @@ is an aggregate expression. {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; 
 `.sum()` and `.mean()` are methods on an expression. There is no `.alias` on an
 aggregate; the keyword is the name.
 
+For reducing every value column the same way, `GroupBy` also has the shortcut
+methods `sum`, `mean`, `min`, `max`, `median`, `quantile(q)`, `n_unique`, `std`,
+`var`, `count` (non-null values per column), and `len` (per-group row count) — each
+reduces all non-key columns by default, or the column names / selector you pass.
+`agg` also accepts a bare positional aggregate (`agg(col("x").sum())`) that keeps
+its source column name.
+
 ```python
 summary = (
     ds.with_columns(total=bt.col("price") * bt.col("qty"))
@@ -270,6 +278,9 @@ A terminal operation executes the plan.
 | `.to_pydict()` | A `dict[str, list]`. |
 | `.to_pylist()` | A `list[dict]`, one dict per row. |
 | `.count()` | Row count as an `int`. |
+| `.min(column)`, `.max(column)`, `.sum(column)`, `.mean(column)`, `.std(column)`, `.var(column)`, `.n_unique(column)` | A single-column reduction as a scalar (nulls ignored). |
+| `.median(column)` / `.quantile(column, q)` | The exact median / `q`-quantile as a scalar. |
+| `.corr(x, y)` / `.cov(x, y, ddof=1)` | Pearson correlation / covariance of two columns. |
 | `.iter_batches(batch_size=None)` | An iterator of pyarrow `RecordBatch`es. |
 | `.explain()` | The plan as a `str`. |
 | `.show(limit=10)` | Prints a preview; returns `None`. |
@@ -316,14 +327,37 @@ ds.write("output/", fmt="parquet", partition_by=["category"])
 
 ## Introspection
 
-`.columns` is a property listing the output column names. There is no `.schema`
-property and no `.to_pandas` / `.to_arrow` on a `Dataset`; `collect()` already
-returns a pyarrow `Table`, so call `.to_pandas()` on that if you need pandas.
+`.columns` lists the output column names and `.schema` gives the pyarrow `Schema` —
+both without executing the plan.
 
 ```python
 print(ds.columns)
 # ['category', 'price', 'qty']
 ```
+
+## Interoperability
+
+A `Dataset` implements the Arrow **PyCapsule stream interface**
+(`__arrow_c_stream__`), so any library that speaks the Arrow C Data Interface consumes
+one directly — no `to_arrow()`, no copy, and no conversion through Python objects.
+
+```python
+# docs: skip
+import duckdb
+import polars as pl
+import pyarrow as pa
+
+pl.DataFrame(ds)                  # Polars
+duckdb.sql("SELECT * FROM ds")    # DuckDB, by variable name
+pa.table(ds)                      # pyarrow
+```
+
+The stream is **lazy**: batches are pulled from the plan as the consumer reads them, so
+a result larger than memory streams into DuckDB rather than landing in it first. Because
+the consumer's iteration is what drives execution, this is a terminal operation.
+
+`collect()` returns a pyarrow `Table` when you want the whole result in hand, and
+`to_pandas()` / `to_arrow()` are there for the direct conversions.
 
 ## Reshaping
 
@@ -365,7 +399,7 @@ print(ds.null_count().to_pydict())
 | Accessor | Purpose |
 | --- | --- |
 | `.dq` | Data-quality expectations. Constraint methods accumulate (returning a new `DatasetDQ`); a terminal method (`fail` / `drop` / `quarantine` / `validate`) applies them. |
-| `.scd` | Slowly-changing-dimension upserts. The dataset is the incoming dimension snapshot (natural keys + attributes). |
+| `.scd` | Dimension maintenance. `type1` / `type2` / `type3` take an incoming snapshot (natural keys + attributes); `apply_changes` takes a CDC change feed, with deletes, redeliveries, and out-of-order rows. |
 
 ## Next steps
 

@@ -51,3 +51,17 @@ class BatcherEngine(Engine):
         for name, tbl in tables.items():
             session.register(name, tbl)
         return lambda query: session.sql(query).collect(distributed=_DISTRIBUTED)
+
+    def sql_runner_scan(self, uris: dict[str, str]) -> SqlRunner:
+        session = bt.Session()
+        for name, uri in uris.items():
+            session.register(name, bt.read.parquet(uri))
+        return lambda query: session.sql(query).collect(distributed=_DISTRIBUTED)
+
+    def scan_sql_runner(self, glob: str) -> SqlRunner:
+        def run(query: str) -> pa.Table:
+            session = bt.Session()
+            session.register("t", bt.read.parquet(glob))
+            return session.sql(query).collect(distributed=_DISTRIBUTED)
+
+        return run

@@ -126,26 +126,36 @@ def qualify_to_partition_topn(node: Filter, _ctx: OptimizerContext) -> LogicalPl
 
 @rule(name="count_over_filter_to_count_if", phase=Phase.FUSION, matches=(Aggregate,))
 def count_over_filter_to_count_if(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """`COUNT(*)` over a `Filter(p)` → `count_if(p)` over the filter's input.
+    """`COUNT(*)` over a `Filter(p)` → `COUNT(p ? 1 : NULL)` over the filter's input.
 
     A keyless `SELECT COUNT(*) ... WHERE p` materializes every passing row just to
-    count it. `count_if(p)` (`sum(iff(p, 1, 0))`) counts the predicate mask directly —
-    no filtered batch is built — so the filter and its per-row row-copy disappear.
+    count it. Counting a mask instead — 1 where `p` holds, NULL elsewhere, and `count`
+    skips nulls — counts the predicate directly, so the filter and its per-row row-copy
+    disappear.
+
+    The mask must be counted, not summed. `count_if(p)` is `sum(iff(p, 1, 0))`, and
+    `SUM` over **zero rows is NULL** while `COUNT` is 0 — so summing would turn
+    ``SELECT COUNT(*) FROM empty WHERE p`` from 0 into NULL. That is invisible until
+    the filter's input happens to be empty (an empty join, a pruned scan), which is
+    exactly when a count matters most. `COUNT` carries the right identity for free.
 
     Gated to a keyless aggregate whose every output is `count_star`: with GROUP BY the
-    filter also drops groups whose rows all fail `p` (which `count_if` would instead
+    filter also drops groups whose rows all fail `p` (which the mask count would instead
     report as 0), and a non-count aggregate over the filtered rows is not a plain mask
     count. Returns None otherwise, so the rule is a no-op on everything else.
     """
-    from batcher.plan.functions.aggregate import count_if
+    from batcher.plan.expr_ir import AggExpr, Lit, nullif, when
 
     if node.group_keys or not isinstance(node.input, Filter):
         return None
     if not node.aggregates or any(s.agg.func != "count_star" for s in node.aggregates):
         return None
     predicate = node.input.predicate
+    # `nullif(1, 1)` is an Int64 NULL: a null (or false) predicate yields null, which
+    # `count` skips — matching `WHERE p`, where a null predicate drops the row.
+    mask = when(predicate).then(Lit(1)).otherwise(nullif(Lit(1), Lit(1)))
     new_aggs = tuple(
-        AggregateSpec(alias=s.alias, agg=count_if(predicate)) for s in node.aggregates
+        AggregateSpec(alias=s.alias, agg=AggExpr("count", mask)) for s in node.aggregates
     )
     return dataclasses.replace(node, input=node.input.input, aggregates=new_aggs)
 

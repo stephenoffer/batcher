@@ -72,6 +72,39 @@ def test_await_termination_timeout_returns_false_then_true():
 
 
 @pytest.mark.integration
+def test_exception_is_none_on_clean_stop():
+    q = _slow_stream(n=1000).write.memory("life_exc", trigger=bt.Trigger.processing_time(0))
+    time.sleep(0.05)
+    assert q.exception() is None  # healthy while running
+    q.stop()
+    assert q.exception() is None  # clean stop, no error
+
+
+@pytest.mark.integration
+def test_query_is_a_context_manager():
+    with _slow_stream(n=1000).write.memory(
+        "life_cm", trigger=bt.Trigger.processing_time(0)
+    ) as q:
+        assert q.is_active is True
+        assert "active" in repr(q)
+    # Leaving the `with` block stops the query.
+    assert q.is_active is False
+    assert "stopped" in repr(q)
+
+
+@pytest.mark.integration
+def test_await_any_termination():
+    # No active queries → returns immediately.
+    assert bt.await_any_termination(timeout=0.0) is True
+    q = _slow_stream(n=1000).write.memory("life_any", trigger=bt.Trigger.processing_time(0))
+    # A running query → the poll times out.
+    assert bt.await_any_termination(timeout=0.05) is False
+    q.stop()
+    # After it stops → returns True.
+    assert bt.await_any_termination(timeout=1.0) is True
+
+
+@pytest.mark.integration
 def test_processing_time_trigger_drains_bounded_stream():
     # A finite unbounded source drains under processing_time and the query ends.
     q = _slow_stream(n=5, delay=0.0).write.memory(

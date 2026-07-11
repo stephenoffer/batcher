@@ -140,6 +140,7 @@ streaming
 :caption: Trust
 
 data-quality
+governance
 ```
 
 ```{toctree}

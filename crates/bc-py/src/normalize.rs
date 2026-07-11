@@ -58,6 +58,16 @@ pub(crate) fn widen_to(dt: &DataType) -> Option<DataType> {
 /// is **decoded** to its value type (then widened if that value is a narrow numeric),
 /// so every operator sees plain primitive/string columns and never has to special-
 /// case dictionary encoding — the same rationale as numeric widening.
+///
+/// NOTE (2026-07-10): `assign_groups` *does* now have a dictionary fast path (grouping on
+/// codes is ~7x faster than the decoded string), so preserving a string dictionary here
+/// would win group-by/distinct/window. It is **not** yet safe to do so: the logical plan's
+/// schema treats a column by its Arrow type, so a preserved `Dictionary` propagates through
+/// intermediate schemas, and an operator that decodes it (e.g. `distinct`'s rep column) then
+/// produces a `Utf8` batch that fails the plan's `Dictionary` schema check. Enabling this is
+/// RFC `rfc-streaming-executor.md` Proposal 3: separate the plan's *logical* type (value
+/// type) from the morsel's *physical* encoding (dictionary), so the encoding is an internal
+/// optimization the schema does not see. Until then, decode at the boundary.
 fn normalize_to(dt: &DataType) -> Option<DataType> {
     match dt {
         DataType::Dictionary(_, value) => {

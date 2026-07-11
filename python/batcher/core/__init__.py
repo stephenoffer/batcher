@@ -23,6 +23,7 @@ from batcher.core.executor import (
 )
 from batcher.core.runtime import default_hub, reset_default_hub
 from batcher.core.stats import (
+    column_ndv,
     column_statistics,
     heavy_hitters,
     tail_quantiles,
@@ -37,6 +38,7 @@ __all__ = [
     "Executor",
     "LocalExecutor",
     "StreamingQueryEngine",
+    "column_ndv",
     "column_statistics",
     "default_hub",
     "execute_local",

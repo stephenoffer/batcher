@@ -54,11 +54,18 @@ class BinarySource:
     def schema(self) -> pa.Schema:
         return _SCHEMA
 
+    def _read_one(self, path: str) -> bytes:
+        with self._fs.open(path) as fh:
+            return fh.read()
+
     def _batch(self, files: list[str]) -> pa.RecordBatch:
+        from batcher.io._concurrent import read_each_file
+
+        # Read the chunk's files concurrently — a serial per-file open leaves a many-file
+        # blob scan latency-bound on one connection (the same fix as the media reader).
+        payloads = read_each_file(self._fs, files, lambda _fs, p: self._read_one(p))
         uris, blobs, sizes, mimes = [], [], [], []
-        for f in files:
-            with self._fs.open(f) as fh:
-                data = fh.read()
+        for f, data in zip(files, payloads, strict=True):
             uris.append(f)
             blobs.append(data)
             sizes.append(len(data))

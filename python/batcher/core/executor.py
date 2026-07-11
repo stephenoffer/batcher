@@ -5,7 +5,7 @@ handing the lowered IR to the native engine, then transcribes the native
 engine's per-operator `ExecMetrics` into `OperatorFeedback` for the MetadataHub.
 Core *measures* — it does not optimize: it faithfully reports what the data plane
 observed (rows in/out, time, peak bytes, spill, backend), keyed by the same
-pre-order operator id Kyber assigns in `_annotate_ops`. The morsel scheduler, JIT
+pre-order operator id Kyber assigns in `annotate_ops`. The morsel scheduler, JIT
 tier-up, and the `bc-adapt` re-optimization loop replace the single
 `execute_plan_metered` call without changing this interface.
 """
@@ -13,26 +13,33 @@ tier-up, and the `bc-adapt` re-optimization loop replace the single
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 
 import pyarrow as pa
 
 from batcher.config import active_config
 from batcher.plan.feedback import FeedbackSink, OperatorFeedback, cpu_utilization
 from batcher.plan.ids import OpId
-from batcher.plan.physical import PhysicalPlan
+from batcher.plan.physical import PhysicalOp, PhysicalPlan
 
 __all__ = ["LocalExecutor", "execute_local", "execute_local_metered", "record_exec_metrics"]
 
 
-def record_exec_metrics(sink: FeedbackSink | None, metrics_json: str, batch_size: int) -> None:
+def record_exec_metrics(
+    sink: FeedbackSink | None,
+    metrics_json: str,
+    batch_size: int,
+    planned: Sequence[PhysicalOp] = (),
+) -> None:
     """Transcribe a native `ExecMetrics` document into per-operator `OperatorFeedback`.
 
     The one place the engine's measured runtime facts (rows in/out, time, peak
     bytes, spill, backend) become feedback — shared by the single-node executor and
     the distributed workers (which run sub-plans and ship their metrics back to the
     driver). Calibration buckets by operator `kind`, so the sub-plan-local `op_id`s a
-    distributed worker reports need no global correlation. Best-effort: a malformed
-    or empty document drops silently rather than failing the query.
+    distributed worker reports need no global correlation — such a caller passes no
+    `planned` ops and its rows carry no signature. Best-effort: a malformed or empty
+    document drops silently rather than failing the query.
     """
     if sink is None:
         return
@@ -40,7 +47,7 @@ def record_exec_metrics(sink: FeedbackSink | None, metrics_json: str, batch_size
         ops = json.loads(metrics_json).get("ops", [])
     except (ValueError, TypeError):
         return
-    _record_op_feedback(sink, ops, batch_size)
+    _record_op_feedback(sink, ops, batch_size, planned)
 
 
 _tracing_started = False
@@ -69,14 +76,29 @@ def _ensure_native_tracing(native) -> None:
         _tracing_started = True
 
 
-def _record_op_feedback(sink: FeedbackSink, ops: list[dict], batch_size: int) -> None:
-    """Build and record one `OperatorFeedback` per already-parsed `ExecMetrics` op."""
+def _record_op_feedback(
+    sink: FeedbackSink,
+    ops: list[dict],
+    batch_size: int,
+    planned: Sequence[PhysicalOp] = (),
+) -> None:
+    """Build and record one `OperatorFeedback` per already-parsed `ExecMetrics` op.
+
+    `planned` are Kyber's annotated operators for the plan that produced `ops`, indexed
+    by `op_id` (both are the plan's pre-order walk). When supplied, each feedback row
+    carries the operator's stable `signature` and the *uncorrected* row estimate, which
+    is what closes Kyber's cardinality-correction loop. It is omitted by the distributed
+    workers, whose `op_id`s address their own sub-plan and cannot be correlated with the
+    driver's tree — they still feed the per-`kind` cost calibration.
+    """
     for op in ops:
         rows_in = op.get("rows_in", 0)
         rows_out = op.get("rows_out", 0)
+        op_id = int(op.get("op_id", 0))
+        annotated = planned[op_id] if 0 <= op_id < len(planned) else None
         sink.record(
             OperatorFeedback(
-                op_id=OpId(int(op.get("op_id", 0))),
+                op_id=OpId(op_id),
                 kind=op.get("kind", ""),
                 n_actual=int(rows_out),
                 t_op_ms=op.get("elapsed_ns", 0) / 1e6,
@@ -85,12 +107,33 @@ def _record_op_feedback(sink: FeedbackSink, ops: list[dict], batch_size: int) ->
                 batch_size=batch_size,
                 backend=op.get("backend", "interp"),
                 algorithm="spill" if op.get("spilled") else "",
+                spill_bytes=int(op.get("spill_bytes", 0) or 0),
+                peak_rss_bytes=int(op.get("peak_rss_bytes", 0) or 0),
                 cpu_utilization=cpu_utilization(
                     op.get("cpu_ns", 0), op.get("elapsed_ns", 0), op.get("threads", 1)
                 ),
+                threads=int(op.get("threads", 0) or 0),
                 n_input=int(rows_in),
+                n_build=int(op.get("rows_build", 0) or 0),
+                result_bytes=int(op.get("result_bytes", op.get("peak_bytes", 0)) or 0),
+                signature=_signature_of(annotated),
+                n_estimated=_raw_estimate_of(annotated),
+                expr_factor=annotated.properties.expr_factor if annotated else 1.0,
             )
         )
+
+
+def _signature_of(op: PhysicalOp | None) -> str:
+    """The annotated operator's stable signature, or `""` when it is unavailable."""
+    return op.properties.signature if op is not None else ""
+
+
+def _raw_estimate_of(op: PhysicalOp | None) -> float:
+    """The pre-correction row estimate, or `0.0` when unavailable/not a number."""
+    if op is None:
+        return 0.0
+    raw = op.properties.est_rows_raw
+    return float(raw) if raw == raw and raw > 0 else 0.0  # NaN-safe
 
 
 class LocalExecutor:
@@ -120,7 +163,7 @@ class LocalExecutor:
             return _native.execute_plan(plan.to_json(), sources, engine_cfg)
 
         out, metrics_json = _native.execute_plan_metered(plan.to_json(), sources, engine_cfg)
-        record_exec_metrics(self._feedback, metrics_json, cfg.execution.morsel_rows)
+        record_exec_metrics(self._feedback, metrics_json, cfg.execution.morsel_rows, plan.ops)
         return out
 
 
@@ -161,5 +204,5 @@ def execute_local_metered(
     except (ValueError, TypeError):
         ops = []
     if feedback is not None and ops:
-        _record_op_feedback(feedback, ops, cfg.execution.morsel_rows)
+        _record_op_feedback(feedback, ops, cfg.execution.morsel_rows, plan.ops)
     return out, ops

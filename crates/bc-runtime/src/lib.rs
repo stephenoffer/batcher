@@ -13,9 +13,11 @@
 
 pub mod agg;
 mod error;
+pub mod gather;
 pub mod join;
 pub mod shuffle;
 pub mod window;
+mod window_fill;
 pub mod window_frame;
 mod window_parallel;
 mod window_partition_agg;

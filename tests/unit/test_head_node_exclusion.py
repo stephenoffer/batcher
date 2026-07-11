@@ -56,3 +56,23 @@ def test_even_cpu_share_ignores_head(monkeypatch):
     _nodes(monkeypatch, [(64.0, True), (16.0, False), (16.0, False)])
     # min over WORKER nodes is 16 (not the head's 64), and total worker CPU is 32.
     assert ex._even_cpu_share(2) == 16.0
+
+
+def test_homogeneous_stays_one_worker_per_node(monkeypatch):
+    # No change for a homogeneous cluster: one worker per node, granted the node's cores.
+    _nodes(monkeypatch, [(32.0, False)] * 16)
+    assert ex._cluster_fill_workers() == (16, 32.0)
+
+
+def test_heterogeneous_fills_bigger_nodes(monkeypatch):
+    # 8x32-core + 8x64-core: the 64-core nodes each host 2 min(=32)-core workers so their
+    # extra cores are used, not stranded. 8*1 + 8*2 = 24 workers, each 32 cores.
+    _nodes(monkeypatch, [(32.0, False)] * 8 + [(64.0, False)] * 8)
+    assert ex._cluster_fill_workers() == (24, 32.0)
+
+
+def test_heterogeneous_head_excluded_from_fill(monkeypatch):
+    # The head (even with the most cores) never hosts workers, and never inflates the fill.
+    _nodes(monkeypatch, [(128.0, True), (16.0, False), (48.0, False)])
+    # min worker node = 16; 16->1 slot, 48->floor(48/16)=3 slots. 4 workers, 16 cores each.
+    assert ex._cluster_fill_workers() == (4, 16.0)

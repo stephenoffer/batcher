@@ -83,16 +83,29 @@ class BufferPool:
 
     def __init__(self, limit_bytes: int) -> None:
         self._pool = _make_native_pool(limit_bytes)
+        # High-water mark of concurrently-reserved bytes — how close this envelope actually
+        # came to its limit over the process's life. `peak_used / limit` is the measured
+        # memory pressure a workload hit: near 1 means it ran at the edge (spill/OOM risk),
+        # low means the budget was oversized. Measurement only; never gates a reservation.
+        self._peak_used = 0
 
     @contextmanager
     def reserve(self, n_bytes: int) -> Iterator[bool]:
         """Account `n_bytes` for the block; release on exit. Yields whether it fit."""
         granted = self._pool.try_reserve(n_bytes)
+        if granted and self._pool.used > self._peak_used:
+            self._peak_used = self._pool.used
         try:
             yield granted
         finally:
             if granted:
                 self._pool.release(n_bytes)
+
+    @property
+    def peak_used(self) -> int:
+        """The high-water mark of concurrently-reserved bytes over this pool's life — the
+        measured memory pressure (`peak_used / limit`) the workload actually hit."""
+        return self._peak_used
 
     def set_limit(self, limit_bytes: int) -> None:
         """Resize the envelope. Existing reservations are untouched; only the cap
