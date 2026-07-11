@@ -526,6 +526,32 @@ fn bytes1_multi_group_ids(cols: &[ArrayRef], num_rows: usize) -> Option<(Vec<u32
         debug_assert!(offsets_len1);
         byte_cols.push(data);
     }
+    // Two single-byte keys (the `GROUP BY l_returnflag, l_linestatus` shape — TPC-H Q1) are the
+    // dominant case, so serve them with a **single pass**: the two bytes form a 16-bit index
+    // `b0 | b1<<8` into a 64 k-slot direct map, exactly as the one-byte path dense-maps 256 slots.
+    // This replaces the general path's three passes (build a `u64` key per row, scan it for its
+    // min/max span, then map) with one. The 256 KiB map is zeroed per morsel, but that cost is
+    // trivial next to the passes it removes and fully parallel across morsels. Distinct byte pairs
+    // map to distinct indices, so the groups and first-seen reps are identical to the oracle.
+    if let [c0, c1] = byte_cols[..] {
+        let mut slot = vec![u32::MAX; 1 << 16];
+        let mut reps: Vec<u32> = Vec::new();
+        let mut group_ids = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            let idx = (c0[i] as usize) | ((c1[i] as usize) << 8);
+            let s = &mut slot[idx];
+            if *s == u32::MAX {
+                *s = reps.len() as u32;
+                reps.push(i as u32);
+            }
+            group_ids.push(*s);
+        }
+        return Some((group_ids, reps));
+    }
+    // Three or more single-byte columns: pack one byte per column into a `u64` (injective, since
+    // every length is 1) and route to the integer dense-map. A 3+-byte index would need a map too
+    // large to zero per morsel, so the packed `int_group_ids` (which dense-spans the actual value
+    // range) is the right shape here.
     let mut keys: Vec<u64> = Vec::with_capacity(num_rows);
     for i in 0..num_rows {
         let mut k = 0u64;
