@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr, _wrap
 from batcher.plan.expr_ir.func_nodes import (
     ListBinary,
@@ -17,6 +18,7 @@ from batcher.plan.expr_ir.func_nodes import (
     ListGet,
     ListPosition,
     ListSet,
+    ListSimhash,
     ListSlice,
     ListTransform,
     MapFunc,
@@ -28,13 +30,26 @@ from batcher.plan.expr_ir.nodes import ListJoin
 
 
 class _StructNamespace:
-    """Struct accessors: ``col("s").struct.field("x")``."""
+    """Struct accessors: ``col("s").struct.field("x")``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"s": [{"x": 1, "y": "a"}]})
+            >>> ds.select(bt.col("s").struct.field("x").alias("x")).to_pydict()
+            {'x': [1]}
+    """
 
     __slots__ = ("_e",)
 
     def __init__(self, e: Expr) -> None:
         """Wrap the parent :class:`Expr` so its `.struct` methods can build on it."""
         self._e = e
+
+    def __repr__(self) -> str:
+        """Show the accessor and its parent, e.g. ``<.struct accessor of col('c')>``."""
+        return f"<.struct accessor of {self._e!r}>"
 
     def field(self, name: str) -> StructField:
         """Extract the named field from a struct column as its own column.
@@ -44,6 +59,9 @@ class _StructNamespace:
 
         Args:
             name: The struct field to project out.
+
+        Returns:
+            A new expression: the projected field, keeping its type and per-row nulls.
 
         Examples:
             .. doctest::
@@ -57,13 +75,26 @@ class _StructNamespace:
 
 
 class _JsonNamespace:
-    """JSON accessors on a string column: ``col("j").json.extract_string("$.a.b")``."""
+    """JSON accessors on a string column: ``col("j").json.extract_string("$.a.b")``.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"j": ['{"a": {"b": 7}}', "{}"]})
+            >>> ds.select(bt.col("j").json.extract_int("$.a.b").alias("r")).to_pydict()
+            {'r': [7, None]}
+    """
 
     __slots__ = ("_e",)
 
     def __init__(self, e: Expr) -> None:
         """Wrap the parent :class:`Expr` so its `.json` methods can build on it."""
         self._e = e
+
+    def __repr__(self) -> str:
+        """Show the accessor and its parent, e.g. ``<.json accessor of col('c')>``."""
+        return f"<.json accessor of {self._e!r}>"
 
     def extract_string(self, path: str) -> StrFunc:
         """Read the value at a JSON path as text (→ Utf8); null if the path is absent.
@@ -73,6 +104,9 @@ class _JsonNamespace:
 
         Args:
             path: A JSONPath, e.g. ``"$.a.b"`` or ``"$.items[0]"``.
+
+        Returns:
+            A new Utf8 expression, or null if the path is absent.
 
         Examples:
             .. doctest::
@@ -90,6 +124,9 @@ class _JsonNamespace:
         Args:
             path: A JSONPath, e.g. ``"$.a.b"``.
 
+        Returns:
+            A new Int64 expression, or null if absent or non-integral.
+
         Examples:
             .. doctest::
 
@@ -105,6 +142,9 @@ class _JsonNamespace:
 
         Args:
             path: A JSONPath, e.g. ``"$.price"``.
+
+        Returns:
+            A new Float64 expression, or null if absent or non-numeric.
 
         Examples:
             .. doctest::
@@ -122,6 +162,9 @@ class _JsonNamespace:
         Args:
             path: A JSONPath, e.g. ``"$.active"``.
 
+        Returns:
+            A new Boolean expression, or null if absent or non-boolean.
+
         Examples:
             .. doctest::
 
@@ -138,6 +181,16 @@ class _MapNamespace:
 
     For an Arrow ``Map`` column (``map<K, V>``). `keys`/`values` return `List`
     columns; `get(key)` looks up the value for a literal key (null if absent).
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> import pyarrow as pa
+            >>> col = pa.array([[("a", 1), ("b", 2)]], type=pa.map_(pa.string(), pa.int64()))
+            >>> ds = bt.from_arrow(pa.table({"m": col}))
+            >>> ds.select(bt.col("m").map.keys().alias("k")).to_pydict()
+            {'k': [['a', 'b']]}
     """
 
     __slots__ = ("_e",)
@@ -146,8 +199,15 @@ class _MapNamespace:
         """Wrap the parent :class:`Expr` so its `.map` methods can build on it."""
         self._e = e
 
+    def __repr__(self) -> str:
+        """Show the accessor and its parent, e.g. ``<.map accessor of col('c')>``."""
+        return f"<.map accessor of {self._e!r}>"
+
     def keys(self) -> MapFunc:
         """Return each row's map keys as a ``List`` column (DuckDB ``map_keys``).
+
+        Returns:
+            A new List expression of each row's map keys.
 
         Examples:
             .. doctest::
@@ -166,6 +226,9 @@ class _MapNamespace:
         """Return each row's map values as a ``List`` column (DuckDB ``map_values``).
 
         Keys and values stay positionally aligned with :meth:`keys`.
+
+        Returns:
+            A new List expression of each row's map values.
 
         Examples:
             .. doctest::
@@ -188,6 +251,9 @@ class _MapNamespace:
         Args:
             key: The map key to look up in every row.
 
+        Returns:
+            A new expression: the value for ``key``, or null if absent.
+
         Examples:
             .. doctest::
 
@@ -203,10 +269,18 @@ class _MapNamespace:
 
 
 class _ListNamespace:
-    """List/array reductions: ``col("a").list.len()``, ``.list.sum()``, …
+    """List/array reductions and transforms: ``col("a").list.len()``, ``.list.sum()``.
 
     Generated from ``_LIST_FUNCS`` (accessor name → ``bc-expr`` ``ListFunc`` tag) —
     a single table entry adds a reduction. `get` carries an index, so it is explicit.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [[3, 1, 2]]})
+            >>> ds.select(bt.col("a").list.sum().alias("s")).to_pydict()
+            {'s': [6.0]}
     """
 
     __slots__ = ("_e",)
@@ -214,6 +288,10 @@ class _ListNamespace:
     def __init__(self, e: Expr) -> None:
         """Wrap the parent :class:`Expr` so its `.list` methods can build on it."""
         self._e = e
+
+    def __repr__(self) -> str:
+        """Show the accessor and its parent, e.g. ``<.list accessor of col('c')>``."""
+        return f"<.list accessor of {self._e!r}>"
 
     def get(self, index: int) -> ListGet:
         """Return the element at ``index`` of each list; null if out of range.
@@ -223,6 +301,9 @@ class _ListNamespace:
 
         Args:
             index: 0-based position; negatives index from the end.
+
+        Returns:
+            A new expression: the element at ``index``, or null.
 
         Examples:
             .. doctest::
@@ -239,6 +320,9 @@ class _ListNamespace:
 
         The idiomatic spelling of ``.list.get(0)``.
 
+        Returns:
+            A new expression: the first element, or null.
+
         Examples:
             .. doctest::
 
@@ -253,6 +337,9 @@ class _ListNamespace:
         """Return the last element of each list; null if the list is null or empty.
 
         The idiomatic spelling of ``.list.get(-1)``.
+
+        Returns:
+            A new expression: the last element, or null.
 
         Examples:
             .. doctest::
@@ -272,6 +359,9 @@ class _ListNamespace:
         Args:
             value: The literal to search for.
 
+        Returns:
+            A new Boolean expression.
+
         Examples:
             .. doctest::
 
@@ -290,6 +380,9 @@ class _ListNamespace:
         Args:
             value: The literal to locate.
 
+        Returns:
+            A new Int64 expression: the 1-based index, or null.
+
         Examples:
             .. doctest::
 
@@ -301,8 +394,15 @@ class _ListNamespace:
         return ListPosition(self._e, value)
 
     def intersect(self, other: Any) -> ListSet:
-        """The distinct elements present in **both** this list and ``other`` (Spark
-        ``array_intersect``), in this list's order. → List.
+        """The distinct elements present in both this list and ``other`` (→ List).
+
+        Spark ``array_intersect``, in this list's order.
+
+        Args:
+            other: The other list column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List expression of the shared distinct elements.
 
         Examples:
             .. doctest::
@@ -315,8 +415,15 @@ class _ListNamespace:
         return ListSet("array_intersect", self._e, _wrap(other))
 
     def difference(self, other: Any) -> ListSet:
-        """The distinct elements in this list but **not** in ``other`` (Spark
-        ``array_except``), in this list's order. → List.
+        """The distinct elements in this list but not in ``other`` (→ List).
+
+        Spark ``array_except``, in this list's order.
+
+        Args:
+            other: The other list column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List expression of the elements unique to this list.
 
         Examples:
             .. doctest::
@@ -329,9 +436,16 @@ class _ListNamespace:
         return ListSet("array_except", self._e, _wrap(other))
 
     def union(self, other: Any) -> ListSet:
-        """The distinct elements in **either** this list or ``other`` (Spark
-        ``array_union``) — this list's distinct elements followed by the new ones from
-        ``other``. → List.
+        """The distinct elements in either this list or ``other`` (→ List).
+
+        Spark ``array_union``: this list's distinct elements followed by the new ones
+        from ``other``.
+
+        Args:
+            other: The other list column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List expression of the combined distinct elements.
 
         Examples:
             .. doctest::
@@ -344,9 +458,16 @@ class _ListNamespace:
         return ListSet("array_union", self._e, _wrap(other))
 
     def transform(self, func: Any) -> ListTransform:
-        """Apply `func` to every element, preserving lengths (DuckDB ``list_transform``;
-        Polars ``list.eval``). `func` is an expression over ``element()`` (the current
-        element), e.g. ``col("a").list.transform(element() * 2)``. → List.
+        """Apply ``func`` to every element, preserving list lengths (→ List).
+
+        DuckDB ``list_transform`` / Polars ``list.eval``. ``func`` is an expression over
+        ``element()`` (the current element), e.g. ``col("a").list.transform(element() * 2)``.
+
+        Args:
+            func: An expression over ``element()`` applied to each list element.
+
+        Returns:
+            A new List expression with ``func`` applied element-wise.
 
         Examples:
             .. doctest::
@@ -359,9 +480,16 @@ class _ListNamespace:
         return ListTransform(self._e, _wrap(func))
 
     def filter(self, predicate: Any) -> ListFilter:
-        """Keep the elements where `predicate` (an expression over ``element()``) is
-        true (DuckDB ``list_filter``), e.g. ``col("a").list.filter(element() > 0)``.
-        → List.
+        """Keep the elements where ``predicate`` is true (→ List).
+
+        DuckDB ``list_filter``. ``predicate`` is an expression over ``element()`` (the
+        current element), e.g. ``col("a").list.filter(element() > 0)``.
+
+        Args:
+            predicate: A boolean expression over ``element()`` selecting elements to keep.
+
+        Returns:
+            A new List expression of the elements satisfying ``predicate``.
 
         Examples:
             .. doctest::
@@ -373,6 +501,66 @@ class _ListNamespace:
         """
         return ListFilter(self._e, _wrap(predicate))
 
+    def simhash(self, num_bits: int = 64, *, seed: int = 0) -> ListSimhash:
+        """A random-hyperplane (SimHash) signature of an embedding → List<Int64> of bits.
+
+        The vector-space counterpart of :meth:`~batcher.Expr.str.minhash`. `minhash`
+        estimates *Jaccard* similarity between sets of shingles and says nothing about
+        vectors; `simhash` estimates the *cosine* similarity between embeddings. Two
+        vectors separated by an angle ``θ`` agree on each bit with probability
+        ``1 - θ/π``, so the fraction of positions two signatures agree on
+        (:meth:`jaccard`, which is exactly that fraction) estimates their angle.
+
+        This is the blocking key a similarity join needs. Comparing every pair of `n`
+        embeddings is ``O(n²)``; banding the bits and hashing each band means two rows
+        become candidates only when they are close, and the exact
+        :meth:`cosine_similarity` then scores the survivors. LSH governs recall, never
+        precision — see :meth:`~batcher.Dataset.ml.similarity_join`.
+
+        The hyperplanes are derived by hashing ``(seed, bit, dimension)``, never stored,
+        so every partition and every machine draws the same ones: a signature computed
+        on one node is comparable with one computed on another. A null or empty list has
+        no direction and yields null; a null element reads as ``0.0``. Only the vector's
+        *direction* matters, so the signature is scale-invariant.
+
+        Each bit occupies a whole Int64 element. That is deliberately fat — it gives the
+        signature the same ``List<Int64>`` shape as a MinHash signature, so one banding
+        implementation serves both — and a signature is a transient blocking key, not
+        something you store.
+
+        Args:
+            num_bits: Signature length, in ``[1, 4096]``. More bits sharpen the estimate
+                and cost proportionally. Choose a multiple of the band count.
+            seed: Selects the set of hyperplanes. Two datasets must share a seed for
+                their signatures to be comparable.
+
+        Returns:
+            A List<Int64> expression of `num_bits` values, each 0 or 1.
+
+        Raises:
+            PlanError: If `num_bits` is outside ``[1, 4096]``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"v": [[1.0, 0.0], [10.0, 0.0], [0.0, 1.0]]})
+                >>> sig = ds.select(s=bt.col("v").list.simhash(8))
+                >>> sig.to_pydict()["s"][0] == sig.to_pydict()["s"][1]
+                True
+
+                >>> # Agreement estimates the angle: parallel rows agree everywhere,
+                >>> # orthogonal rows agree about half the time.
+                >>> pairs = ds.select(
+                ...     a=bt.col("v").list.simhash(256), b=bt.col("v").list.simhash(256)
+                ... )
+                >>> pairs.select(same=bt.col("a").list.jaccard(bt.col("b"))).to_pydict()["same"]
+                [1.0, 1.0, 1.0]
+        """
+        if not 1 <= num_bits <= 4096:
+            raise PlanError(f"list.simhash(): num_bits must be in [1, 4096], got {num_bits}")
+        return ListSimhash(self._e, num_bits, seed)
+
     def slice(self, offset: int, length: int | None = None) -> ListSlice:
         """Return the 0-based sub-range ``[offset, offset+length)`` of each list.
 
@@ -382,6 +570,9 @@ class _ListNamespace:
         Args:
             offset: 0-based start index.
             length: Number of elements to take; ``None`` means to the end.
+
+        Returns:
+            A new List expression: the selected sub-range.
 
         Examples:
             .. doctest::
@@ -402,6 +593,9 @@ class _ListNamespace:
         Args:
             separator: The text inserted between consecutive elements.
 
+        Returns:
+            A new Utf8 expression: the joined string, or null.
+
         Examples:
             .. doctest::
 
@@ -417,6 +611,9 @@ class _ListNamespace:
 
         DuckDB ``flatten``: one level of nesting is removed. Null inner lists are
         skipped; a null row stays null.
+
+        Returns:
+            A new List expression with one level of nesting removed.
 
         Examples:
             .. doctest::
@@ -436,6 +633,9 @@ class _ListNamespace:
         Args:
             other: The other vector column (or an ``array(...)`` literal).
 
+        Returns:
+            A new Float64 expression: the dot product.
+
         Examples:
             .. doctest::
 
@@ -453,6 +653,12 @@ class _ListNamespace:
         documents' Jaccard similarity — the near-duplicate score. Over arbitrary equal
         length lists it is simply the agreement rate. Null if either list is null, and
         null for two empty lists (no positions to agree on).
+
+        Args:
+            other: The other equal-length list column to compare position-by-position.
+
+        Returns:
+            A new Float64 expression: the fraction of agreeing positions.
 
         Examples:
             .. doctest::
@@ -475,6 +681,9 @@ class _ListNamespace:
         Args:
             other: The other vector column (or an ``array(...)`` literal).
 
+        Returns:
+            A new Float64 expression in ``[-1, 1]``, or null.
+
         Examples:
             .. doctest::
 
@@ -496,6 +705,9 @@ class _ListNamespace:
         Args:
             other: The other vector column (or an ``array(...)`` literal).
 
+        Returns:
+            A new Float64 expression: ``1 - cosine_similarity``.
+
         Examples:
             .. doctest::
 
@@ -514,6 +726,9 @@ class _ListNamespace:
 
         Args:
             other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A new Float64 expression: the Euclidean distance.
 
         Examples:
             .. doctest::
@@ -548,9 +763,27 @@ _LIST_FUNCS = {
 }
 
 
+def _list_reduction_doc(name: str) -> str:
+    """Fallback docstring for a ``.list`` reduction without a curated entry.
+
+    Every reduction but ``reverse`` carries a curated entry; only ``reverse`` falls
+    through to here, so the summary and example reflect an element-reversing list op.
+    """
+    return (
+        f"Return each list with its elements {name}d.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
+        f'        >>> ds.select(r=bt.col("xs").list.{name}()).to_pydict()\n'
+        "        {'r': [[3, 2, 1]]}"
+    )
+
+
 _bind_accessors(
     _ListNamespace,
     _LIST_FUNCS,
     lambda e, t: ListFunc(t, e),
-    lambda n: f"Per-row {n} over each list value.",
+    _list_reduction_doc,
+    "A new :class:`~batcher.Expr` carrying the per-row reduction.",
 )

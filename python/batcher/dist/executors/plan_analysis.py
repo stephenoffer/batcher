@@ -42,11 +42,29 @@ def _has_breaker(node: LogicalPlan) -> bool:
     plain map input to a distributed sort)."""
     if isinstance(node, (Aggregate, Sort, Join, Distinct, Limit)):
         return True
-    if isinstance(node, (Filter, Project, Unnest)):
-        # `Unnest` multiplies rows but holds no state and materializes nothing, so it
-        # never breaks the pipeline — it just changes how many rows flow through it.
+    if _is_row_wise(node):
         return _has_breaker(node.input)
     return isinstance(node, Scan) is False  # unknown node → be conservative
+
+
+def _is_row_wise(node: LogicalPlan) -> bool:
+    """Whether `node` is a stateless, partition-independent transform of its input.
+
+    Running these on each partition and concatenating gives exactly the single-node result:
+    `Unnest` (explode) and `Unpivot` (melt) multiply rows but hold no state, and a
+    **fraction** `Sample` keeps a row iff a seeded hash of its values falls under the
+    fraction — a per-row predicate, so partitioning cannot change which rows survive. (That
+    hash reads every column, which is why `kyber.rules.projections` must not prune below a
+    `Sample`; with pruning, a worker sampled a different column set than single-node did.)
+
+    A *fixed-count* `Sample` (`n=`) is NOT row-wise: it keeps the `n` smallest-hash rows of
+    the WHOLE relation, so running it per partition would keep `n` rows on every worker.
+    """
+    from batcher.plan.logical import Sample, Unpivot
+
+    if isinstance(node, Sample):
+        return node.n is None
+    return isinstance(node, (Filter, Project, Unnest, Unpivot))
 
 
 def _split_at(plan: LogicalPlan, breaker_type: type):
@@ -80,18 +98,21 @@ def _relabel_single_source(plan: LogicalPlan) -> tuple[LogicalPlan, int]:
 
 
 def _is_linear_map_pipeline(plan: LogicalPlan) -> bool:
-    """True if the plan is a linear chain of scan / filter / project / map_batches /
-    unnest (no relational breakers) — embarrassingly parallel per partition.
+    """True if the plan is a linear chain of scan / filter / project / map_batches and the
+    row-wise reshapers (`unnest`, `unpivot`, fraction `sample`) — embarrassingly parallel per
+    partition, with no relational breaker.
 
-    `Unnest` (explode) belongs here: it is stateless and row-wise, so running it on each
-    partition and concatenating gives exactly the single-node result. Excluding it forced
-    the whole RAG ingest shape — scan, chunk, explode, embed — onto one node.
+    These are stateless and row-wise, so running them on each partition and concatenating
+    gives exactly the single-node result. Excluding `Unnest` once forced the whole RAG
+    ingest shape — scan, chunk, explode, embed — onto one node; `Unpivot` and fraction
+    `sample` were likewise stranded, though `plan.logical.is_streamable` already called them
+    partition-independent.
     """
     node = plan
     while True:
         if isinstance(node, Scan):
             return True
-        if isinstance(node, (Filter, Project, MapBatches, Unnest)):
+        if isinstance(node, MapBatches) or _is_row_wise(node):
             node = node.input
         else:
             return False
@@ -213,3 +234,89 @@ def _source_ids(plan: LogicalPlan) -> set[int]:
                 if isinstance(v, LogicalPlan):
                     ids |= _source_ids(v)
     return ids
+
+
+def requires_staging(plan: LogicalPlan) -> bool:
+    """Whether distributing `plan` in one shot is impossible, but staging it would work.
+
+    Two shapes qualify, both because a single-shot executor would have to run a subplan
+    **once per partition**, which is only sound for a map-only (breaker-free) subplan:
+
+    1. *A join whose operand spans two sources* — every 3+-table (star/snowflake) query. The
+       dispatcher co-partitions exactly two sources per join, so there is no one-shot path.
+    2. *A breaker beneath a breaker* — `limit(100).group_by(k).agg(...)`, `agg(agg(x))`,
+       `limit(5).join(dim)`, `window(limit(...))`. The aggregate and join executors ship the
+       inner plan to every worker as a "map prefix"; a `Limit` then keeps `limit` rows **per
+       partition** and a nested `Aggregate` produces per-partition partial groups the outer
+       aggregate re-aggregates. Both silently return wrong answers, not errors.
+
+    Staged, the lowest breaker runs distributed on its own, its result is materialized, and
+    the operator above it then sees a breaker-free scan — which is exactly the contract each
+    executor already assumes. So this is a *routing* fact, not a missing operator.
+
+    An `Aggregate` over a `Join` or a clean `Distinct` is excluded: the dispatcher has real
+    fused paths for those. Shapes no amount of staging can distribute (an ordered global
+    window, `sample`, `row_id`) are not listed here and still surface loudly.
+    """
+    from batcher.plan.logical import AsofJoin, Window
+
+    if isinstance(plan, (Join, AsofJoin)):
+        for side in (plan.left, plan.right):
+            if len(_source_ids(side)) > 1 or _has_breaker(side):
+                return True
+    elif isinstance(plan, Aggregate) and _has_breaker(plan.input):
+        if not _dispatcher_handles_aggregate_input(plan.input):
+            return True
+    elif isinstance(plan, Window) and _has_breaker(plan.input):
+        return True  # `Window` is not a `_split_at` pass-through, so nothing carries it up
+    return any(
+        requires_staging(child)
+        for child in _child_plans(plan)  # a breaker nested under any operator counts
+    )
+
+
+def _dispatcher_handles_aggregate_input(node: LogicalPlan) -> bool:
+    """Whether `_dispatch` has a real fused path for an aggregate over this (breaker) input.
+
+    A join is fused into the aggregate's reducers (or staged by `_staged_aggregate_over_join`),
+    and a breaker-free `Distinct` is the `COUNT(DISTINCT)` rewrite the dispatcher redirects.
+    Everything else would be run per-partition as a map prefix, which is unsound.
+    """
+    from batcher.plan.logical import AsofJoin
+
+    if isinstance(node, (Join, AsofJoin)):
+        return True
+    return isinstance(node, Distinct) and not _has_breaker(node.input)
+
+
+def _child_plans(plan: LogicalPlan):
+    """The `LogicalPlan` children of `plan`, in field order (including tuple fields)."""
+    for field in dataclasses.fields(plan):
+        value = getattr(plan, field.name)
+        if isinstance(value, LogicalPlan):
+            yield value
+        elif isinstance(value, tuple):
+            for v in value:
+                if isinstance(v, LogicalPlan):
+                    yield v
+
+
+def empty_result_table(plan: LogicalPlan, names: list[str]) -> pa.Table:
+    """A zero-row table carrying the plan's REAL column types, in `names` order.
+
+    A distributed stage that produced no rows must return the schema a stage with rows would,
+    or `distributed == single-node` is false for every empty result and a downstream concat /
+    `write_parquet` / typed projection breaks only on the empty case. Falls back to null-typed
+    placeholders when the plan cannot state its types (an opaque `map_batches` output) or when
+    they disagree with `names` — strictly safer than trusting a mismatched schema.
+    """
+    schema = plan.available_schema()
+    if schema is None or list(schema.arrow.names) != list(names):
+        return pa.table({n: pa.array([], pa.null()) for n in names})
+    return pa.Table.from_batches([], schema=schema.arrow)
+
+
+def _empty_agg_table(agg: Aggregate) -> pa.Table:
+    """The typed, zero-row result of an aggregate that saw no rows."""
+    names = [k.alias for k in agg.group_keys] + [s.alias for s in agg.aggregates]
+    return empty_result_table(agg, names)

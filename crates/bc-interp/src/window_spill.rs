@@ -32,7 +32,7 @@ pub(crate) fn window_spilling(
     budget_bytes: usize,
     dir: &Path,
     codec: SpillCodec,
-) -> Result<Vec<RecordBatch>, InterpError> {
+) -> Result<(Vec<RecordBatch>, u64), InterpError> {
     let p = (batch_bytes(parts) as usize)
         .div_ceil(budget_bytes.max(1))
         .max(2);
@@ -51,7 +51,8 @@ pub(crate) fn window_spilling(
             }
         }
     }
-    let mut out = Vec::new();
+    let spill_bytes = store.spilled_bytes(); // measured volume routed to disk
+    let mut out = Vec::with_capacity(p);
     for i in 0..p {
         let bucket = store.read(i)?;
         if bucket.is_empty() {
@@ -66,5 +67,5 @@ pub(crate) fn window_spilling(
             rank_limit,
         )?);
     }
-    Ok(out)
+    Ok((out, spill_bytes))
 }

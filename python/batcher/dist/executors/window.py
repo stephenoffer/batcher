@@ -23,6 +23,7 @@ from batcher.dist.executors.ray_runtime import (
     _ensure_ray,
     _rmtree,
     engine_config_json,
+    record_worker_metrics,
     shuffle_partitions,
 )
 from batcher.io.source import Source
@@ -30,7 +31,11 @@ from batcher.plan.logical import LogicalPlan, Window
 
 
 def _distributed_window(
-    above: list[LogicalPlan], window: Window, sources: list[Source], workers: int
+    above: list[LogicalPlan],
+    window: Window,
+    sources: list[Source],
+    workers: int,
+    hub=None,
 ) -> pa.Table:
     """Run `window` across `workers` by hash-shuffling rows by its partition keys."""
     from batcher.carbonite.resilience import gather_with_backups
@@ -68,18 +73,24 @@ def _distributed_window(
                 map_ir, json.dumps(pk_indices), partitions[mid], n_reducers, work_dir, mid, cfg_json
             )
 
-        shuffle_paths = gather_with_backups(
+        map_results = gather_with_backups(
             [_map_for(mid) for mid in range(len(partitions))], _map_for, pol
-        )  # shuffle_paths[mapper][reducer] = path
+        )
+        shuffle_paths = [paths for paths, _metrics in map_results]  # [mapper][reducer] = path
+        record_worker_metrics(hub, (m for _paths, m in map_results))
 
         def _reduce_for(r: int):
             return _reduce_task.remote(
                 win_json, [paths[r] for paths in shuffle_paths], work_dir, r, cfg_json
             )
 
-        result_paths = gather_with_backups(
+        reduce_results = gather_with_backups(
             [_reduce_for(r) for r in range(n_reducers)], _reduce_for, pol
         )
+        result_paths = [path for path, _metrics in reduce_results]
+        # The reduce runs the window operator over a whole partition — the breaker whose
+        # measured time and peak bytes the cost model and memory model are fit from.
+        record_worker_metrics(hub, (m for _path, m in reduce_results))
 
         from batcher.dist.shuffle_io import read_ipc
 
@@ -103,9 +114,10 @@ def _map_task(map_ir, pk_indices_json, part_path, n_reducers, work_dir, mapper_i
 
     import batcher._native as nat
     from batcher.dist.executors.partition_io import read_partition
+    from batcher.dist.executors.ray_runtime import execute_metered
     from batcher.dist.shuffle_io import write_ipc
 
-    rows = nat.execute_plan(map_ir, [read_partition(part_path)], engine_config)
+    rows, metrics_json = execute_metered(map_ir, [read_partition(part_path)], engine_config)
     pk_indices = json.loads(pk_indices_json)
     buckets = nat.partition_batches(rows, pk_indices, n_reducers)
     paths = []
@@ -113,25 +125,25 @@ def _map_task(map_ir, pk_indices_json, part_path, n_reducers, work_dir, mapper_i
         path = _os.path.join(work_dir, f"wm{mapper_id}_r{r}.arrow")
         write_ipc(bucket, path)
         paths.append(path)
-    return paths
+    return paths, metrics_json
 
 
 def _reduce_task(win_json, input_paths, work_dir, reducer_id, engine_config):
     import os as _os
 
-    import batcher._native as nat
+    from batcher.dist.executors.ray_runtime import execute_metered
     from batcher.dist.shuffle_io import read_ipc, write_ipc
 
     batches: list = []
     for path in input_paths:
         batches.extend(read_ipc(path))
     if not batches:
-        return None
+        return (None, "")
     # The whole window partition for every key in this bucket is present, so the
     # window operator computes the same values it would single-node.
-    result = nat.execute_plan(win_json, [batches], engine_config)
+    result, metrics_json = execute_metered(win_json, [batches], engine_config)
     if not result or sum(b.num_rows for b in result) == 0:
-        return None
+        return (None, metrics_json)
     path = _os.path.join(work_dir, f"winreduce_{reducer_id}.arrow")
     write_ipc(result, path)
-    return path
+    return (path, metrics_json)

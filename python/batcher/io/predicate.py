@@ -35,7 +35,7 @@ def _literal(ir: dict[str, Any]) -> Any:
     plain Python ``date``/``datetime`` so a backend that types its own scalars (SQL,
     iceberg, mongo) gets a real temporal value, not a raw epoch offset.
     """
-    (kind, value), = ir["value"].items()
+    ((kind, value),) = ir["value"].items()
     if kind == "date":
         import datetime as _dt
 
@@ -59,7 +59,7 @@ def _pa_literal(ir: dict[str, Any]) -> Any:
     """
     import pyarrow as pa
 
-    (kind, value), = ir["value"].items()
+    ((kind, value),) = ir["value"].items()
     if kind == "date":
         return pa.scalar(value, pa.date32())
     if kind == "timestamp":

@@ -120,3 +120,4 @@ print(enriched.to_pydict())
 
 - [Aggregations](aggregations.md): summarize joined results.
 - [Window functions](window-functions.md): per-row computations over partitions.
+- [Dataset API](../api/dataset.md): the `join` and `join_asof` reference.

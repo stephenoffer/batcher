@@ -128,6 +128,39 @@ pub trait SpillStore {
     /// used to recursively re-partition an over-large partition during the merge phase
     /// (a disk store nests a subdirectory; a memory store makes another memory store).
     fn child(&self, partitions: usize) -> Result<Box<dyn SpillStore>, RuntimeError>;
+    /// Total logical bytes routed to this store's spill path (the sum of appended
+    /// batches' in-memory size). This is the measured *spill volume* Carbonite needs to
+    /// size spill scratch and disk bandwidth and to tell a 1 GB spill from a 100 GB one —
+    /// a `spilled: bool` cannot. `0` for a store that spilled nothing (or does not track).
+    fn spilled_bytes(&self) -> u64 {
+        0
+    }
+    /// Spill *skew*: the largest partition's bytes over the mean non-empty partition's — `1.0`
+    /// for a perfectly even spill, ≫ `1` when a hot key piles one partition. `1.0` for a store
+    /// that spilled nothing or does not track per-partition sizes.
+    fn spill_skew(&self) -> f32 {
+        1.0
+    }
+}
+
+/// Max-over-mean of the non-zero entries — the skew factor (`1.0` when even or fewer than
+/// two non-empty partitions).
+fn skew_of(bytes_per_partition: &[u64]) -> f32 {
+    let nonzero: Vec<u64> = bytes_per_partition
+        .iter()
+        .copied()
+        .filter(|&b| b > 0)
+        .collect();
+    if nonzero.len() < 2 {
+        return 1.0;
+    }
+    let max = *nonzero.iter().max().unwrap() as f64;
+    let mean = nonzero.iter().sum::<u64>() as f64 / nonzero.len() as f64;
+    if mean <= 0.0 {
+        1.0
+    } else {
+        (max / mean) as f32
+    }
 }
 
 /// In-memory partitions. Does not reduce resident memory — it exists to test the
@@ -180,6 +213,14 @@ pub struct DiskSpillStore {
     /// Resolved on the first append (when the spilled schema is known, which `Auto`
     /// needs to classify) and reused for every partition's writer.
     write_options: Option<IpcWriteOptions>,
+    /// Running sum of appended batches' in-memory size — the logical spill volume this
+    /// store has written. The measured signal Carbonite sizes spill scratch from.
+    bytes_written: u64,
+    /// Bytes written to each partition, indexed by partition. The spread across these (max
+    /// vs mean) is the spill *skew*: an even hash gives ~equal partitions (skew ~1), a hot
+    /// key piles one partition many times its share (skew ≫ 1) — the signal that a family's
+    /// spill thrashes and should shard into more, salted partitions next run.
+    bytes_per_partition: Vec<u64>,
 }
 
 impl DiskSpillStore {
@@ -216,6 +257,8 @@ impl DiskSpillStore {
             writers: (0..n).map(|_| None).collect(),
             codec,
             write_options: None,
+            bytes_written: 0,
+            bytes_per_partition: vec![0; n],
         })
     }
 
@@ -263,7 +306,22 @@ impl SpillStore for DiskSpillStore {
             .as_mut()
             .expect("writer just created")
             .write(batch)?;
+        // Count the logical volume spilled (in-memory size, codec-independent) so the
+        // control plane can size spill scratch from a measured magnitude, not a bool.
+        let n = batch.get_array_memory_size() as u64;
+        self.bytes_written += n;
+        if let Some(slot) = self.bytes_per_partition.get_mut(partition) {
+            *slot += n;
+        }
         Ok(())
+    }
+
+    fn spilled_bytes(&self) -> u64 {
+        self.bytes_written
+    }
+
+    fn spill_skew(&self) -> f32 {
+        skew_of(&self.bytes_per_partition)
     }
 
     fn read(&mut self, partition: usize) -> Result<Vec<RecordBatch>, RuntimeError> {
@@ -340,8 +398,8 @@ pub fn combine_finalize_spilling(
     }
 
     // --- merge phase: combine + finalize one partition at a time ---------------
-    let mut group_parts: Vec<Vec<ArrayRef>> = Vec::new();
-    let mut agg_parts: Vec<Vec<ArrayRef>> = Vec::new();
+    let mut group_parts: Vec<Vec<ArrayRef>> = Vec::with_capacity(partitions);
+    let mut agg_parts: Vec<Vec<ArrayRef>> = Vec::with_capacity(partitions);
     for pi in 0..partitions {
         let batches = store.read(pi)?;
         if batches.is_empty() {
@@ -410,8 +468,8 @@ fn merge_partition(
     }
     drop(batches); // release the over-large partition before merging its sub-partitions
 
-    let mut group_parts: Vec<Vec<ArrayRef>> = Vec::new();
-    let mut agg_parts: Vec<Vec<ArrayRef>> = Vec::new();
+    let mut group_parts: Vec<Vec<ArrayRef>> = Vec::with_capacity(sub_p);
+    let mut agg_parts: Vec<Vec<ArrayRef>> = Vec::with_capacity(sub_p);
     for pi in 0..sub_p {
         let sub = child.read(pi)?;
         if sub.is_empty() {
@@ -537,7 +595,7 @@ fn route_salted(
         buckets[bucket as usize].push(i as u32);
     }
 
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(buckets.len());
     for (pi, idxs) in buckets.into_iter().enumerate() {
         if idxs.is_empty() {
             continue;
@@ -564,6 +622,20 @@ mod tests {
     use crate::agg::{group_aggregate, partial, AggCall};
     use arrow::array::{Float64Array, Int64Array, StringArray};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn skew_of_measures_partition_imbalance() {
+        assert_eq!(skew_of(&[]), 1.0); // nothing spilled
+        assert_eq!(skew_of(&[100]), 1.0); // one partition — no imbalance
+        assert_eq!(skew_of(&[100, 100, 100]), 1.0); // perfectly even
+        assert_eq!(skew_of(&[400, 0, 0]), 1.0); // empty partitions ignored → one non-empty
+                                                // One partition ~3x its peers: mean = 500/3 ≈ 166.7, max = 300 → ~1.8.
+        let s = skew_of(&[300, 100, 100]);
+        assert!(
+            (1.5..2.0).contains(&s),
+            "skew {s} should reflect the imbalance"
+        );
+    }
 
     fn strs(v: &[&str]) -> ArrayRef {
         Arc::new(StringArray::from(v.to_vec()))

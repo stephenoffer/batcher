@@ -143,6 +143,22 @@ def test_rows_that_teach_nothing_are_ignored():
 
 
 @pytest.mark.unit
+def test_incremental_fold_matches_a_from_scratch_recompute(narrow_window):
+    # The q-error fold is maintained incrementally across reads (only rows recorded since
+    # the last read are absorbed). Reading the correction after every record must yield
+    # exactly what a single cold hub reading the same history at the end computes — the
+    # incremental cursor cannot drift from a full re-fold.
+    backend = InProcessBackend()
+    hub = MetadataHub(backend)
+    qs = [(100, 400), (100, 1600), (100, 100), (100, 6400)]  # window keeps the last 2
+    for est, actual in qs:
+        _feed(hub, "sig", est=est, actual=actual)
+        _corrections(hub)  # force an incremental fold after each record
+    cold = _corrections(MetadataHub(backend))  # a fresh hub folds the whole history once
+    assert _corrections(hub)["sig"] == pytest.approx(cold["sig"])
+
+
+@pytest.mark.unit
 def test_op_stats_with_signature_is_chronological_and_filtered():
     hub = _hub()
     _feed(hub, "a", est=1, actual=1)

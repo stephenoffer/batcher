@@ -47,6 +47,24 @@ def test_pool_admits_until_full_then_rejects():
     assert pool.used == 0  # both reservations released on exit
 
 
+def test_pool_tracks_peak_used_high_water():
+    pool = BufferPool(1000)
+    assert pool.peak_used == 0
+    with pool.reserve(400):
+        assert pool.peak_used == 400
+        with pool.reserve(300):
+            assert pool.peak_used == 700  # concurrent high-water
+        # Releasing the inner block does not lower the recorded high-water.
+        assert pool.used == 400
+        assert pool.peak_used == 700
+    # A rejected reservation (over limit) never raises the high-water.
+    with pool.reserve(900) as granted, pool.reserve(900) as granted_2:
+        assert granted is True and granted_2 is False
+        assert pool.peak_used == 900
+    assert pool.used == 0
+    assert pool.peak_used == 900  # survives release — it's a lifetime mark
+
+
 def test_pool_releases_on_exception():
     pool = BufferPool(1000)
     with pytest.raises(ValueError), pool.reserve(500) as granted:
@@ -97,6 +115,75 @@ def test_pressure_monitor_reports_sane_memory():
     assert snap.total > 0
     assert 0 <= snap.available <= snap.total
     assert 0.0 <= snap.used_fraction <= 1.0
+
+
+def test_available_capped_to_cgroup_headroom(monkeypatch):
+    """A cgroup-limited container must not read the host's free RAM as its own headroom —
+    on a big host it would over-admit and OOM at the cgroup cap. The available reading is
+    clamped to `limit - current`."""
+    from batcher.carbonite.memory import pressure
+
+    # Big host (180 GB free) but an 8 GB container already using 3 GB → 5 GB real headroom.
+    monkeypatch.setattr(pressure, "_cgroup_limit_bytes", lambda: 8 * 1024**3)
+    monkeypatch.setattr(pressure, "_cgroup_current_bytes", lambda: 3 * 1024**3)
+    assert pressure._cap_to_cgroup_headroom(180 * 1024**3) == 5 * 1024**3
+    # When the host figure is already below the cgroup headroom, it wins (no inflation).
+    assert pressure._cap_to_cgroup_headroom(2 * 1024**3) == 2 * 1024**3
+    # Over-budget container (current > limit) clamps to 0, never negative.
+    monkeypatch.setattr(pressure, "_cgroup_current_bytes", lambda: 9 * 1024**3)
+    assert pressure._cap_to_cgroup_headroom(180 * 1024**3) == 0
+    # No cgroup cap (bare metal) leaves the host reading untouched.
+    monkeypatch.setattr(pressure, "_cgroup_limit_bytes", lambda: None)
+    assert pressure._cap_to_cgroup_headroom(180 * 1024**3) == 180 * 1024**3
+
+
+def test_available_reading_is_shared_within_the_ttl(monkeypatch):
+    """The expensive live OS read is sampled once per TTL window and reused, so the
+    per-query control-plane cost does not pay it on every decision / back-to-back query.
+    """
+    from batcher.carbonite.memory import pressure
+
+    pressure.reset_memory_sampling()
+    calls = {"n": 0}
+
+    def _counting_read() -> int:
+        calls["n"] += 1
+        return 8 * 1024**3
+
+    monkeypatch.setattr(pressure.PressureMonitor, "_read_available_bytes", _counting_read)
+    mon = pressure.PressureMonitor()
+    # Many reads across fresh monitors — all served from the one cached sample.
+    for _ in range(50):
+        assert mon.available_bytes() > 0
+        pressure.PressureMonitor().envelope_bytes()
+    assert calls["n"] == 1, "the live OS read must be shared across the TTL window"
+
+    # A reset forces the next sample to re-read (the seam tests use after patching).
+    pressure.reset_memory_sampling()
+    mon.available_bytes()
+    assert calls["n"] == 2
+    pressure.reset_memory_sampling()  # don't leak the patched sample into later tests
+
+
+def test_host_ram_is_memoized(monkeypatch):
+    """Host RAM is process-constant, so `total_memory_bytes` must not re-run syscalls
+    on every call — only the (cheap, live) container-usage figure stays uncached."""
+    from batcher.carbonite.memory import pressure
+
+    pressure.reset_memory_sampling()
+    sysconf_calls = {"n": 0}
+    real_sysconf = pressure.os.sysconf
+
+    def _counting_sysconf(name):
+        sysconf_calls["n"] += 1
+        return real_sysconf(name)
+
+    monkeypatch.setattr(pressure.os, "sysconf", _counting_sysconf)
+    first = pressure.total_memory_bytes()
+    for _ in range(100):
+        assert pressure.total_memory_bytes() == first
+    # Two sysconf calls for the one first read (SC_PAGE_SIZE + SC_PHYS_PAGES), then memoized.
+    assert sysconf_calls["n"] <= 2
 
 
 def test_pressure_level_escalates_instantly_on_a_spike(monkeypatch):

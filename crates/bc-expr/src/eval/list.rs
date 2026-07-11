@@ -125,7 +125,9 @@ where
 
     let offsets = list.value_offsets();
     let child = list.values();
-    let mut take_idx: Vec<u32> = Vec::new();
+    // Each kept index references a child element at most once, so the gather list never
+    // exceeds the child length — pre-size to it and skip the extend loop's reallocations.
+    let mut take_idx: Vec<u32> = Vec::with_capacity(child.len());
     let mut new_offsets: Vec<i32> = Vec::with_capacity(list.len() + 1);
     new_offsets.push(0);
     for i in 0..list.len() {
@@ -166,7 +168,8 @@ fn eval_flatten(list: &arrow::array::GenericListArray<i32>) -> Result<ArrayRef, 
     let outer_off = list.value_offsets();
     let inner_off = inner_list.value_offsets();
 
-    let mut take_idx: Vec<u32> = Vec::new();
+    // Every grandchild element is gathered at most once — pre-size to that upper bound.
+    let mut take_idx: Vec<u32> = Vec::with_capacity(grandchild.len());
     let mut new_offsets: Vec<i32> = Vec::with_capacity(list.len() + 1);
     new_offsets.push(0);
     for i in 0..list.len() {

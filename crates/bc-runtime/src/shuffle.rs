@@ -16,7 +16,7 @@ use arrow::array::{
     Array, ArrayRef, Float64Array, GenericStringArray, LargeStringArray, OffsetSizeTrait,
     RecordBatch, StringArray, UInt32Array,
 };
-use arrow::compute::{cast, take};
+use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
 use rayon::prelude::*;
@@ -65,38 +65,170 @@ pub fn partition_by_key_arrays(
     if num_partitions == 1 {
         return Ok(vec![batch.clone()]);
     }
-    let n = batch.num_rows();
-
-    // One hash pass → the bucket id per row. An empty key set routes every row to
-    // bucket 0 (hashing an empty row is ill-defined). A single integer key hashes its
-    // native values directly, skipping the `RowConverter` encoding the general path
-    // needs — the bucket id is a deterministic function of the key value either way,
-    // and both sides of a join shuffle dispatch on the same key type, so equal keys
-    // still co-partition (the invariant the distributed/parallel join relies on).
-    let part_of: Vec<u32> = if keys.is_empty() {
-        vec![0u32; n]
-    } else if let Some(part) = partition_int_key(keys, num_partitions) {
-        part
-    } else {
-        let fields: Vec<SortField> = keys
-            .iter()
-            .map(|a| SortField::new(a.data_type().clone()))
-            .collect();
-        let converter = RowConverter::new(fields)?;
-        let rows = converter.convert_columns(keys)?;
-        if n >= PAR_HASH_MIN_ROWS {
-            (0..n)
-                .into_par_iter()
-                .map(|i| bucket_of(SEED.hash_one(rows.row(i)), num_partitions))
-                .collect()
-        } else {
-            (0..n)
-                .map(|i| bucket_of(SEED.hash_one(rows.row(i)), num_partitions))
-                .collect()
-        }
-    };
-
+    let part_of = bucket_of_rows(keys, batch.num_rows(), num_partitions)?;
     scatter_into_buckets(batch, &part_of, num_partitions)
+}
+
+/// The bucket each row's key hashes to, one `u32` per row.
+///
+/// Split out of [`partition_by_key_arrays`] so a caller holding a *relation* as morsels can
+/// bucket each morsel and gather the payload once, rather than concatenating the relation
+/// first and gathering twice. The bucket is a deterministic function of the key *value*, so a
+/// row lands in the same bucket whichever morsel carries it — the co-partitioning invariant
+/// the parallel and distributed joins rely on.
+///
+/// An empty key set routes every row to bucket 0 (hashing an empty row is ill-defined). A
+/// single integer key hashes its native values directly, skipping the `RowConverter` encoding
+/// the general path needs; both sides of a join dispatch on the same key type, so equal keys
+/// still co-partition either way.
+pub fn bucket_of_rows(
+    keys: &[ArrayRef],
+    rows: usize,
+    num_partitions: usize,
+) -> Result<Vec<u32>, RuntimeError> {
+    if keys.is_empty() {
+        return Ok(vec![0u32; rows]);
+    }
+    if let Some(part) = partition_int_key(keys, num_partitions) {
+        return Ok(part);
+    }
+    let fields: Vec<SortField> = keys
+        .iter()
+        .map(|a| SortField::new(a.data_type().clone()))
+        .collect();
+    let converter = RowConverter::new(fields)?;
+    let encoded = converter.convert_columns(keys)?;
+    Ok(if rows >= PAR_HASH_MIN_ROWS {
+        (0..rows)
+            .into_par_iter()
+            .map(|i| bucket_of(SEED.hash_one(encoded.row(i)), num_partitions))
+            .collect()
+    } else {
+        (0..rows)
+            .map(|i| bucket_of(SEED.hash_one(encoded.row(i)), num_partitions))
+            .collect()
+    })
+}
+
+/// Compute a per-row bucket id across every core on a large input.
+///
+/// `part_of[i]` depends only on row `i`, so this is a pure map — the result is identical to
+/// the serial loop, whatever the thread count. It matters most for a *string* key, whose
+/// `partition_point` costs ~log2(buckets) full string comparisons per row: a 5 M-row string
+/// `ORDER BY` spent 330 ms of its 461 ms here before this ran in parallel.
+fn map_rows<F>(n: usize, f: F) -> Vec<u32>
+where
+    F: Fn(usize) -> u32 + Send + Sync,
+{
+    if n >= PAR_HASH_MIN_ROWS {
+        (0..n).into_par_iter().map(f).collect()
+    } else {
+        (0..n).map(f).collect()
+    }
+}
+
+/// The bucket nulls route to: whichever end the caller's final concatenation places
+/// first/last. A descending sort concatenates buckets high→low, so its "front" bucket is
+/// `n_buckets - 1`.
+fn null_bucket_of(n_buckets: usize, nulls_first: bool, descending: bool) -> u32 {
+    let front = if descending { n_buckets - 1 } else { 0 };
+    (if nulls_first {
+        front
+    } else {
+        n_buckets - 1 - front
+    }) as u32
+}
+
+/// The row indices of each bucket, in input order, as one flat array plus offsets.
+///
+/// The `Vec<Vec<u32>>` shape [`bucket_indices`] returns costs one heap allocation per
+/// bucket, and the per-bucket lists grow by reallocation. That is invisible on one large
+/// relation and ruinous per morsel: hash-partitioning 3,663 morsels into 96 buckets asks
+/// for ~350,000 vectors and, with each doubling from capacity 4 to ~170 rows, on the order
+/// of a million allocations — for a partition step whose actual work is one pass over the
+/// bucket ids.
+///
+/// This bins the same rows into a **CSR layout**: `rows[offsets[b]..offsets[b + 1]]` is
+/// bucket `b`'s row indices, ascending, exactly as `bucket_indices(part_of, p)[b]` would
+/// give them. Two allocations, no growth: a histogram fixes every bucket's extent before a
+/// single scatter pass fills it. Every `part_of[i]` must be `< num_partitions`.
+pub fn bucket_csr(part_of: &[u32], num_partitions: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut offsets = vec![0u32; num_partitions + 1];
+    for &b in part_of {
+        offsets[b as usize + 1] += 1;
+    }
+    for b in 0..num_partitions {
+        offsets[b + 1] += offsets[b];
+    }
+    // `cursor[b]` is the next free slot in bucket `b`'s extent. Rows are visited in
+    // ascending order, so each bucket's slice comes out ascending — the order the
+    // per-bucket join and the `seq == par` oracle depend on.
+    let mut cursor: Vec<u32> = offsets[..num_partitions].to_vec();
+    let mut rows = vec![0u32; part_of.len()];
+    for (i, &b) in part_of.iter().enumerate() {
+        let slot = &mut cursor[b as usize];
+        rows[*slot as usize] = i as u32;
+        *slot += 1;
+    }
+    (rows, offsets)
+}
+
+/// The row indices of each bucket, in input order — [`scatter_into_buckets`] without the
+/// gather.
+///
+/// A caller that is going to permute a bucket's rows anyway (the parallel sample-sort
+/// sorts each range) can compose its permutation with these indices and gather the payload
+/// **once**, instead of gathering into buckets and then gathering again to sort. Every
+/// `part_of[i]` must be `< num_partitions`.
+pub fn bucket_indices(part_of: &[u32], num_partitions: usize) -> Vec<Vec<u32>> {
+    let n = part_of.len();
+    if n < PAR_HASH_MIN_ROWS {
+        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); num_partitions];
+        for (i, &b) in part_of.iter().enumerate() {
+            buckets[b as usize].push(i as u32);
+        }
+        return buckets;
+    }
+    // Stable parallel counting sort: each row-range chunk bins its own rows, then bucket
+    // `b`'s list is the chunks' `b`-lists concatenated in chunk order (each already
+    // ascending), which reproduces the serial scatter's per-bucket ordering exactly.
+    let nthreads = rayon::current_num_threads().max(1);
+    let chunk = n.div_ceil(nthreads).max(1);
+    let per_chunk: Vec<Vec<Vec<u32>>> = part_of
+        .par_chunks(chunk)
+        .enumerate()
+        .map(|(ci, slice)| {
+            // Pre-size each bucket to the uniform-key expectation so the scatter's hot
+            // push loop reallocates only under real skew. (`vec![v; n]` can't be used —
+            // Vec::clone drops capacity, so each cloned bucket would start at zero.)
+            let cap = slice.len() / num_partitions + 1;
+            let mut buckets: Vec<Vec<u32>> = (0..num_partitions)
+                .map(|_| Vec::with_capacity(cap))
+                .collect();
+            let base = (ci * chunk) as u32;
+            for (j, &b) in slice.iter().enumerate() {
+                buckets[b as usize].push(base + j as u32);
+            }
+            buckets
+        })
+        .collect();
+    (0..num_partitions)
+        .into_par_iter()
+        .map(|b| {
+            let total: usize = per_chunk.iter().map(|c| c[b].len()).sum();
+            let mut idx = Vec::with_capacity(total);
+            for c in &per_chunk {
+                idx.extend_from_slice(&c[b]);
+            }
+            idx
+        })
+        .collect()
+}
+
+/// Gather `batch`'s rows at `idx` (used by the sample-sort once it has composed a bucket's
+/// indices with that bucket's sort permutation).
+pub fn gather_rows(batch: &RecordBatch, idx: &[u32]) -> Result<RecordBatch, RuntimeError> {
+    take_rows(batch, idx)
 }
 
 /// Counting-sort scatter: given a per-row bucket id, gather each bucket's rows into
@@ -148,7 +280,11 @@ fn scatter_into_buckets(
         .par_chunks(chunk)
         .enumerate()
         .map(|(ci, slice)| {
-            let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); num_partitions];
+            // Uniform-key pre-size (see `bucket_indices`): reallocate only under real skew.
+            let cap = slice.len() / num_partitions + 1;
+            let mut buckets: Vec<Vec<u32>> = (0..num_partitions)
+                .map(|_| Vec::with_capacity(cap))
+                .collect();
             let base = (ci * chunk) as u32;
             for (j, &b) in slice.iter().enumerate() {
                 buckets[b as usize].push(base + j as u32);
@@ -300,6 +436,45 @@ pub fn range_partition_by_key_array(
     scatter_into_buckets(batch, &part_of, n_buckets)
 }
 
+/// The per-row bucket id [`range_partition_by_key_array`] would scatter by.
+pub fn range_part_of_f64(
+    key_col: &ArrayRef,
+    boundaries: &[f64],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<u32>, RuntimeError> {
+    let null_bucket = null_bucket_of(n_buckets, nulls_first, descending);
+    let dt = key_col.data_type();
+    let key = if dt.is_numeric() {
+        cast(key_col, &DataType::Float64)?
+    } else if is_temporal_key(dt) {
+        cast(&temporal_to_i64(key_col)?, &DataType::Float64)?
+    } else {
+        return Err(RuntimeError::NonNumericRangeKey {
+            dtype: dt.to_string(),
+        });
+    };
+    let key = key.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+        RuntimeError::NonNumericRangeKey {
+            dtype: key_col.data_type().to_string(),
+        }
+    })?;
+    Ok(map_rows(key.len(), |i| {
+        if key.is_null(i) {
+            null_bucket
+        } else {
+            let v = key.value(i);
+            let id = if v.is_nan() {
+                boundaries.len()
+            } else {
+                boundaries.partition_point(|&b| b <= v)
+            };
+            id as u32
+        }
+    }))
+}
+
 /// Like [`range_partition_by_key_array`], but for an **integer** leading key compared
 /// **exactly** as `i64` (boundaries are `i64` quantiles) — no `f64` cast, so a key beyond
 /// `2^53` is routed without precision loss. Any signed/unsigned integer width is widened
@@ -317,13 +492,20 @@ pub fn range_partition_by_i64_key(
     if n_buckets == 1 {
         return Ok(vec![batch.clone()]);
     }
-    let front = if descending { n_buckets - 1 } else { 0 };
-    let null_bucket = if nulls_first {
-        front
-    } else {
-        n_buckets - 1 - front
-    } as u32;
+    let part_of = range_part_of_i64(key_col, boundaries, n_buckets, nulls_first, descending)?;
+    scatter_into_buckets(batch, &part_of, n_buckets)
+}
 
+/// The per-row bucket id [`range_partition_by_i64_key`] would scatter by — the routing
+/// without the gather, for callers that permute the rows themselves.
+pub fn range_part_of_i64(
+    key_col: &ArrayRef,
+    boundaries: &[i64],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<u32>, RuntimeError> {
+    let null_bucket = null_bucket_of(n_buckets, nulls_first, descending);
     if !matches!(key_col.data_type(), t if t.is_integer()) {
         return Err(RuntimeError::NonNumericRangeKey {
             dtype: key_col.data_type().to_string(),
@@ -336,18 +518,13 @@ pub fn range_partition_by_i64_key(
         .ok_or_else(|| RuntimeError::NonNumericRangeKey {
             dtype: key_col.data_type().to_string(),
         })?;
-
-    let part_of: Vec<u32> = (0..batch.num_rows())
-        .map(|i| {
-            if key.is_null(i) {
-                null_bucket
-            } else {
-                boundaries.partition_point(|&b| b <= key.value(i)) as u32
-            }
-        })
-        .collect();
-
-    scatter_into_buckets(batch, &part_of, n_buckets)
+    Ok(map_rows(key.len(), |i| {
+        if key.is_null(i) {
+            null_bucket
+        } else {
+            boundaries.partition_point(|&b| b <= key.value(i)) as u32
+        }
+    }))
 }
 
 /// Like [`range_partition_by_i64_key`], but for a **string** leading key compared
@@ -371,59 +548,73 @@ pub fn range_partition_by_str_key(
     if n_buckets == 1 {
         return Ok(vec![batch.clone()]);
     }
-    let front = if descending { n_buckets - 1 } else { 0 };
-    let null_bucket = if nulls_first {
-        front
-    } else {
-        n_buckets - 1 - front
-    } as u32;
+    let null_bucket = null_bucket_of(n_buckets, nulls_first, descending);
+    let part_of = str_part_of(key_col, boundaries, null_bucket)?;
+    scatter_into_buckets(batch, &part_of, n_buckets)
+}
 
-    // `partition_point(|b| b <= v)` routes a value equal to a boundary consistently to
-    // the higher bucket, so equal keys never straddle a boundary — the property the
-    // concatenation-without-merge relies on.
-    fn route<O: OffsetSizeTrait>(
-        arr: &GenericStringArray<O>,
-        boundaries: &[String],
-        null_bucket: u32,
-    ) -> Vec<u32> {
-        (0..arr.len())
-            .map(|i| {
-                if arr.is_null(i) {
-                    null_bucket
-                } else {
-                    let v = arr.value(i);
-                    boundaries.partition_point(|b| b.as_str() <= v) as u32
-                }
-            })
-            .collect()
-    }
+/// The per-row bucket id [`range_partition_by_str_key`] would scatter by — the routing
+/// without the gather.
+pub fn range_part_of_str(
+    key_col: &ArrayRef,
+    boundaries: &[String],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<u32>, RuntimeError> {
+    str_part_of(
+        key_col,
+        boundaries,
+        null_bucket_of(n_buckets, nulls_first, descending),
+    )
+}
 
-    let part_of = match key_col.data_type() {
-        DataType::Utf8 => {
-            let a = key_col
+/// `partition_point(|b| b <= v)` routes a value equal to a boundary consistently to the
+/// higher bucket, so equal keys never straddle a boundary — the property the
+/// concatenation-without-merge relies on.
+fn route_str<O: OffsetSizeTrait>(
+    arr: &GenericStringArray<O>,
+    boundaries: &[String],
+    null_bucket: u32,
+) -> Vec<u32> {
+    map_rows(arr.len(), |i| {
+        if arr.is_null(i) {
+            null_bucket
+        } else {
+            let v = arr.value(i);
+            boundaries.partition_point(|b| b.as_str() <= v) as u32
+        }
+    })
+}
+
+/// Dispatch a string key to its `Utf8` / `LargeUtf8` array and route every row.
+fn str_part_of(
+    key_col: &ArrayRef,
+    boundaries: &[String],
+    null_bucket: u32,
+) -> Result<Vec<u32>, RuntimeError> {
+    let bad = || RuntimeError::NonNumericRangeKey {
+        dtype: key_col.data_type().to_string(),
+    };
+    match key_col.data_type() {
+        DataType::Utf8 => Ok(route_str(
+            key_col
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| RuntimeError::NonNumericRangeKey {
-                    dtype: key_col.data_type().to_string(),
-                })?;
-            route(a, boundaries, null_bucket)
-        }
-        DataType::LargeUtf8 => {
-            let a = key_col
+                .ok_or_else(bad)?,
+            boundaries,
+            null_bucket,
+        )),
+        DataType::LargeUtf8 => Ok(route_str(
+            key_col
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| RuntimeError::NonNumericRangeKey {
-                    dtype: key_col.data_type().to_string(),
-                })?;
-            route(a, boundaries, null_bucket)
-        }
-        other => {
-            return Err(RuntimeError::NonNumericRangeKey {
-                dtype: other.to_string(),
-            })
-        }
-    };
-    scatter_into_buckets(batch, &part_of, n_buckets)
+                .ok_or_else(bad)?,
+            boundaries,
+            null_bucket,
+        )),
+        _ => Err(bad()),
+    }
 }
 
 /// Skew-aware partitioning for a **single-key** distributed join: a *hot* key's
@@ -463,7 +654,11 @@ pub fn salted_partition_by_keys(
         .as_ref()
         .and_then(|a| a.as_any().downcast_ref::<StringArray>());
 
-    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); num_partitions];
+    // Uniform-key pre-size; hot-key replication adds only a bounded few extra per bucket.
+    let cap = n / num_partitions + 1;
+    let mut buckets: Vec<Vec<u32>> = (0..num_partitions)
+        .map(|_| Vec::with_capacity(cap))
+        .collect();
     let mut cursor: u32 = 0;
     // Reused dedup marks (all-false between rows) so a replicated build row lands in
     // each DISTINCT salt bucket exactly once — see the `replicate` branch.
@@ -582,17 +777,51 @@ fn bucket_of(hash: u64, num_partitions: usize) -> u32 {
 
 /// Gather the given row indices out of every column of `batch`.
 fn take_rows(batch: &RecordBatch, idx: &[u32]) -> Result<RecordBatch, RuntimeError> {
+    // NB: fanning the per-column `take`s across cores (nested inside the outer parallel
+    // loop over ranges/buckets) was measured and does NOT help: 119.9 -> 118.9 ms on a
+    // 5 M-row, 6-column sort. The gather is memory-bandwidth bound, not core bound —
+    // raising the range count from 64 to 192 likewise bought nothing.
     let indices = UInt32Array::from(idx.to_vec());
     let columns = batch
         .columns()
         .iter()
-        .map(|c| take(c.as_ref(), &indices, None))
+        .map(|c| crate::gather::take_column(c.as_ref(), &indices))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 #[cfg(test)]
 mod tests {
+    /// The CSR binning must be indistinguishable from the `Vec<Vec<u32>>` one — same
+    /// buckets, same ascending order inside each. Everything downstream assumes it.
+    #[test]
+    fn bucket_csr_matches_bucket_indices() {
+        for parts in [1usize, 2, 3, 8, 64] {
+            for n in [0usize, 1, 5, 100, 1000] {
+                let part_of: Vec<u32> = (0..n).map(|i| ((i * 7 + 3) % parts) as u32).collect();
+                let nested = bucket_indices(&part_of, parts);
+                let (rows, offsets) = bucket_csr(&part_of, parts);
+                assert_eq!(offsets.len(), parts + 1);
+                assert_eq!(*offsets.last().unwrap() as usize, n);
+                for b in 0..parts {
+                    let slice = &rows[offsets[b] as usize..offsets[b + 1] as usize];
+                    assert_eq!(
+                        slice,
+                        nested[b].as_slice(),
+                        "parts={parts} n={n} bucket={b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A bucket that receives every row, and one that receives none.
+    #[test]
+    fn bucket_csr_handles_degenerate_partitions() {
+        let (rows, offsets) = bucket_csr(&[0, 0, 0], 3);
+        assert_eq!(rows, vec![0, 1, 2]);
+        assert_eq!(offsets, vec![0, 3, 3, 3]);
+    }
     use super::*;
     use arrow::array::Int64Array;
     use std::sync::Arc;

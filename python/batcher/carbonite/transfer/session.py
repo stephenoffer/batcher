@@ -32,6 +32,7 @@ from batcher.carbonite.transfer.server import FlightShuffleServer, ShuffleClient
 if TYPE_CHECKING:
     from batcher.carbonite.memory.pressure import PressureMonitor
     from batcher.carbonite.policies import AIMDFlowControl
+    from batcher.carbonite.transfer.tls import ShuffleTlsMaterial
 
 __all__ = ["ShuffleSession"]
 
@@ -107,8 +108,9 @@ class ShuffleSession:
         advertise_host: str | None = None,
         token: str | None = None,
         shm: bool = False,
+        tls: ShuffleTlsMaterial | None = None,
     ) -> None:
-        self._server = FlightShuffleServer(advertise_host, token)
+        self._server = FlightShuffleServer(advertise_host, token, tls)
         self._credits = credits
         self._token = token
         # Same-node shared-memory transfer (opt-in): a mapper mirrors each bucket to an
@@ -189,7 +191,8 @@ class ShuffleSession:
             return True
         from batcher.carbonite.memory.pressure import PressureLevel
 
-        return self._pressure.level() < PressureLevel.SPILL
+        # Pure read — `_observe_backpressure` is this session's sampler.
+        return self._pressure.classify() < PressureLevel.SPILL
 
     def fetch(self, addr: str, ticket: ShuffleTicket) -> list[pa.RecordBatch]:
         """Fetch one partition from `addr`, choosing the cheapest transfer mode.

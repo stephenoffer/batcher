@@ -102,10 +102,14 @@ mod handler;
 mod shared;
 mod store;
 mod ticket;
+mod tls;
+#[cfg(test)]
+mod tls_test_certs;
 
 pub use exchange::{classify, ClientPool, FetchFault, ShuffleExchange};
 pub use shared::{clear_shared, fetch_shared, publish_shared, shm_available};
 pub use ticket::ShuffleTicket;
+pub use tls::{TlsClientConfig, TlsIdentity, TlsServerConfig};
 
 /// Default number of in-flight `RecordBatch` credits for a credit-bounded
 /// exchange when the caller does not specify one.
@@ -249,11 +253,28 @@ mod tunables {
             ms => Some(Duration::from_millis(ms)),
         }
     }
+
+    /// Process-wide client TLS for outbound fetches. A reducer dials every peer in the
+    /// same cluster with the same trust settings, so — like the other transport
+    /// tunables — this is set once per worker rather than threaded through every
+    /// `fetch`. `None` (the default) keeps outbound connections plaintext.
+    static CLIENT_TLS: std::sync::RwLock<Option<std::sync::Arc<crate::TlsClientConfig>>> =
+        std::sync::RwLock::new(None);
+
+    /// Install (or clear, with `None`) the process-wide client TLS config.
+    pub fn set_client_tls(cfg: Option<crate::TlsClientConfig>) {
+        *CLIENT_TLS.write().unwrap_or_else(|e| e.into_inner()) = cfg.map(std::sync::Arc::new);
+    }
+
+    /// The active client TLS config, if any.
+    pub fn client_tls() -> Option<std::sync::Arc<crate::TlsClientConfig>> {
+        CLIENT_TLS.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 pub use tunables::{
-    compression, connections_per_peer, fetch_idle_timeout, keepalive, set_compression,
-    set_connections_per_peer, set_transport_timeouts,
+    client_tls, compression, connections_per_peer, fetch_idle_timeout, keepalive, set_client_tls,
+    set_compression, set_connections_per_peer, set_transport_timeouts,
 };
 
 impl From<tonic::Status> for TransportError {
@@ -272,6 +293,7 @@ pub(crate) type TransportResult<T> = Result<T, TransportError>;
 pub struct FlightServer {
     store: Arc<PartitionStore>,
     token: Option<String>,
+    tls: Option<TlsServerConfig>,
 }
 
 impl Default for FlightServer {
@@ -286,14 +308,37 @@ impl FlightServer {
         Self {
             store: Arc::new(PartitionStore::default()),
             token: None,
+            tls: None,
         }
     }
 
-    /// Build a server over a shared store (so a [`ShuffleExchange`] keeps its own
-    /// handle to register partitions after start), optionally requiring `token` for
-    /// `do_exchange` (N5). `None` disables the auth check.
-    pub(crate) fn with_store_and_token(store: Arc<PartitionStore>, token: Option<String>) -> Self {
-        Self { store, token }
+    /// Build a server over a shared store with both the shuffle `token` and TLS. `tls`
+    /// encrypts the connection (and, when it carries a client CA, mutually authenticates
+    /// peers); `None` keeps the server plaintext.
+    pub(crate) fn with_store_token_tls(
+        store: Arc<PartitionStore>,
+        token: Option<String>,
+        tls: Option<TlsServerConfig>,
+    ) -> Self {
+        Self { store, token, tls }
+    }
+
+    /// Apply this server's TLS config to a tonic builder, or leave it plaintext.
+    fn tls_builder(&self) -> TransportResult<Server> {
+        let builder = tuned_server();
+        match &self.tls {
+            None => Ok(builder),
+            Some(cfg) => {
+                tls::check_pem("server certificate", &cfg.identity.cert_pem)?;
+                tls::check_pem("server private key", &cfg.identity.key_pem)?;
+                if let Some(ca) = &cfg.client_ca_pem {
+                    tls::check_pem("client CA", ca)?;
+                }
+                builder
+                    .tls_config(cfg.to_tonic())
+                    .map_err(|e| tls::tls_error("server tls config", e))
+            }
+        }
     }
 
     /// Register a named partition. The `ticket` is the routing key reducers use
@@ -308,11 +353,12 @@ impl FlightServer {
     /// task) to run until the process exits. Prefer [`Self::serve_ephemeral`]
     /// when you need to learn the bound port.
     pub async fn serve(self, addr: SocketAddr) -> TransportResult<()> {
+        let mut builder = self.tls_builder()?;
         let svc = FlightServiceServer::new(FlightHandler {
             store: self.store,
             token: self.token,
         });
-        tuned_server()
+        builder
             .add_service(svc)
             .serve(addr)
             .await
@@ -346,16 +392,15 @@ impl FlightServer {
             .map_err(|e| TransportError::Io(format!("from_std: {e}")))?;
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
+        let mut builder = self.tls_builder()?;
         let svc = FlightServiceServer::new(FlightHandler {
             store: self.store,
             token: self.token,
         });
-        let handle = tokio::spawn(async move {
-            tuned_server()
-                .add_service(svc)
-                .serve_with_incoming(incoming)
-                .await
-        });
+        let handle =
+            tokio::spawn(
+                async move { builder.add_service(svc).serve_with_incoming(incoming).await },
+            );
 
         Ok((local_addr, ServerHandle { task: handle }))
     }
@@ -407,16 +452,41 @@ impl FlightClient {
         ))
     }
 
+    /// Connect with an explicit TLS config rather than the process-wide default — the
+    /// peer's certificate is verified against `tls.ca_pem`, and (under mTLS) this node's
+    /// `tls.identity` is presented. The connection dials `https`.
+    pub async fn connect_tls(
+        addr: impl AsRef<str>,
+        tls: &crate::TlsClientConfig,
+    ) -> TransportResult<Self> {
+        Ok(Self::from_channel(
+            Self::build_channel_tls(addr.as_ref(), Some(tls)).await?,
+        ))
+    }
+
     /// Establish a tonic [`Channel`] to `addr`, accepting a bare `host:port` or a
     /// full URI. Exposed so a [`ClientPool`] can cache and reuse the channel across
     /// fetches instead of reconnecting per partition.
     ///
     /// [`ClientPool`]: crate::exchange::ClientPool
     pub async fn build_channel(addr: &str) -> TransportResult<Channel> {
-        let uri = if addr.contains("://") {
-            addr.to_string()
-        } else {
-            format!("http://{addr}")
+        // The production reducer path reads the process-wide client TLS (set once per
+        // worker); `build_channel_tls` is the shared implementation an explicit
+        // `connect_tls` also uses.
+        Self::build_channel_tls(addr, crate::client_tls().as_deref()).await
+    }
+
+    /// Build a channel to `addr`, applying `client_tls` when given (else plaintext).
+    pub(crate) async fn build_channel_tls(
+        addr: &str,
+        client_tls: Option<&crate::TlsClientConfig>,
+    ) -> TransportResult<Channel> {
+        // With TLS the channel must dial `https` and carry the tonic TLS config;
+        // otherwise it stays plaintext `http` as before.
+        let uri = match client_tls {
+            Some(_) => tls::https_uri(addr),
+            None if addr.contains("://") => addr.to_string(),
+            None => format!("http://{addr}"),
         };
         let mut endpoint = Channel::from_shared(uri.into_bytes())
             .map_err(|e| TransportError::Io(format!("invalid uri: {e}")))?
@@ -428,6 +498,12 @@ impl FlightClient {
             .initial_stream_window_size(Some(crate::H2_STREAM_WINDOW))
             .initial_connection_window_size(Some(crate::H2_CONNECTION_WINDOW))
             .tcp_nodelay(true);
+        if let Some(cfg) = client_tls {
+            tls::check_pem("peer CA", &cfg.ca_pem)?;
+            endpoint = endpoint
+                .tls_config(cfg.to_tonic())
+                .map_err(|e| tls::tls_error("client tls config", e))?;
+        }
         // Keepalive pings detect a silently-dropped peer connection (a crashed node
         // whose TCP never RSTs) faster than the between-batch idle timeout, so the
         // fetch surfaces a retryable fault promptly instead of hanging a full window.
@@ -437,6 +513,25 @@ impl FlightClient {
                 .http2_keep_alive_interval(interval);
         }
         Ok(endpoint.connect().await?)
+    }
+
+    /// Connect and present `token` (if any) on every `DoGet`, as an `authorization:
+    /// Bearer <token>` header — the credential a token-secured [`FlightServer`] requires.
+    pub async fn connect_with_token(
+        addr: impl AsRef<str>,
+        token: Option<&str>,
+    ) -> TransportResult<Self> {
+        let mut client = Self::connect(addr).await?;
+        if let Some(token) = token.filter(|t| !t.is_empty()) {
+            let value = format!("{}{token}", crate::handler::AUTH_SCHEME)
+                .parse()
+                .map_err(|e| TransportError::Io(format!("invalid shuffle token: {e}")))?;
+            client
+                .inner
+                .metadata_mut()
+                .insert(crate::handler::AUTH_HEADER, value);
+        }
+        Ok(client)
     }
 
     /// Wrap an already-established [`Channel`] (cheap; channels are clonable and
@@ -775,6 +870,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wide_window_batches_credit_refills_within_the_bound() {
+        // A wide window is where low-watermark refill engages (refill_at = WINDOW/2):
+        // the consumer replenishes in bulk instead of one grant per batch. The transfer
+        // must still deliver every batch in order AND never let the producer run more
+        // than WINDOW batches ahead — batching refills can only tighten the effective
+        // window, never loosen it, so the bound is preserved exactly.
+        const N: i64 = 500;
+        const WINDOW: u32 = 32;
+
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(9, 1, 0, 0, 0);
+        producer.publish(&ticket, seq_batches(0, N)).await;
+
+        let got = ShuffleExchange::fetch_with_credits(&addr, &ticket, WINDOW)
+            .await
+            .unwrap();
+
+        assert_eq!(got.len() as i64, N, "received every batch");
+        for (i, b) in got.iter().enumerate() {
+            let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(col.value(0), i as i64, "batch {i} out of order");
+        }
+        let max_inflight = producer.max_inflight(&ticket).await.unwrap();
+        assert!(
+            max_inflight >= 1 && max_inflight <= WINDOW as i64,
+            "in-flight high-water mark {max_inflight} must stay within (0, {WINDOW}]",
+        );
+
+        // The point of the batched refill: control-message traffic collapses from one
+        // grant per batch (~N) to ~2N/window. Assert it is far below the batch count —
+        // a per-batch regression would push this back up to ~N.
+        let grants = producer.grant_messages(&ticket).await.unwrap();
+        let per_batch_ceiling = N / 4; // generously below N, far above ~2N/window (~31)
+        assert!(
+            grants > 0 && grants < per_batch_ceiling,
+            "batched refill must send far fewer than one grant per batch: \
+             {grants} grants for {N} batches at window {WINDOW}",
+        );
+    }
+
+    #[tokio::test]
     async fn client_pool_pools_per_peer_and_stripes_bounded() {
         // Fetches to one peer share a single per-peer pool (one entry, so O(edges)
         // reconnects collapse to O(peers) at scale), and the pool stripes across at
@@ -933,5 +1070,245 @@ mod tests {
             max_inflight >= 1 && max_inflight <= WINDOW as i64,
             "blocking credit fetch must honor window {WINDOW}, got {max_inflight}",
         );
+    }
+
+    /// A token-protected exchange must not be readable through the un-credited `DoGet`.
+    ///
+    /// `do_exchange` — the production reducer path — rejects a wrong or missing token, but
+    /// `do_get` is registered on the *same* gRPC service and its ticket space is a handful
+    /// of small integers. If it did not check the token, enabling `shuffle_token` would buy
+    /// nothing: anyone who can reach the port could enumerate tickets and read every
+    /// shuffle partition of every query, including columns a masking policy hid.
+    #[tokio::test]
+    async fn do_get_requires_the_shuffle_token_too() {
+        let producer = ShuffleExchange::bind_secured("127.0.0.1:0", None, Some("s3cret".into()))
+            .await
+            .unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
+        producer.publish(&ticket, vec![batch_a()]).await;
+
+        let mut anonymous = FlightClient::connect(&addr).await.unwrap();
+        let err = anonymous
+            .fetch(ticket.to_string())
+            .await
+            .expect_err("an unauthenticated do_get must not return partition data");
+        assert!(
+            format!("{err}").contains("nauthenticated"),
+            "expected Unauthenticated, got: {err}"
+        );
+    }
+
+    /// The same fetch succeeds once the caller presents the token.
+    #[tokio::test]
+    async fn do_get_succeeds_with_the_shuffle_token() {
+        let producer = ShuffleExchange::bind_secured("127.0.0.1:0", None, Some("s3cret".into()))
+            .await
+            .unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
+        producer.publish(&ticket, vec![batch_a()]).await;
+
+        let mut client = FlightClient::connect_with_token(&addr, Some("s3cret"))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.fetch(ticket.to_string()).await.unwrap(),
+            vec![batch_a()]
+        );
+    }
+
+    /// With no token configured the server is open, as before — the single-host default.
+    #[tokio::test]
+    async fn do_get_is_open_when_no_token_is_configured() {
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
+        producer.publish(&ticket, vec![batch_a()]).await;
+
+        let mut client = FlightClient::connect(&addr).await.unwrap();
+        assert_eq!(
+            client.fetch(ticket.to_string()).await.unwrap(),
+            vec![batch_a()]
+        );
+    }
+
+    // --- TLS / mTLS ----------------------------------------------------------
+    // These use `connect_tls` (explicit per-connection TLS) rather than the process-wide
+    // `set_client_tls`, so they never race the plaintext tests on the global.
+
+    use crate::tls_test_certs as certs;
+
+    fn server_identity() -> crate::TlsIdentity {
+        crate::TlsIdentity::from_pem(certs::SERVER_CRT, certs::SERVER_KEY)
+    }
+
+    /// A trusted client over server-auth TLS reads its partition; the bytes are encrypted
+    /// on the wire, and the client has verified the server's certificate against the CA.
+    #[tokio::test]
+    async fn tls_client_reads_over_an_encrypted_connection() {
+        let server_tls = crate::TlsServerConfig::new(server_identity());
+        let producer = ShuffleExchange::bind_tls("127.0.0.1:0", None, None, Some(server_tls))
+            .await
+            .unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
+        producer.publish(&ticket, vec![batch_a()]).await;
+
+        let client_tls = crate::TlsClientConfig::new(certs::CA_CRT, "localhost");
+        let mut client = FlightClient::connect_tls(&addr, &client_tls).await.unwrap();
+        assert_eq!(
+            client.fetch(ticket.to_string()).await.unwrap(),
+            vec![batch_a()]
+        );
+    }
+
+    /// A plaintext client cannot talk to a TLS server — the handshake fails, so an
+    /// eavesdropper who never completes TLS gets nothing.
+    #[tokio::test]
+    async fn plaintext_client_cannot_reach_a_tls_server() {
+        let server_tls = crate::TlsServerConfig::new(server_identity());
+        let producer = ShuffleExchange::bind_tls("127.0.0.1:0", None, None, Some(server_tls))
+            .await
+            .unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
+        producer.publish(&ticket, vec![batch_a()]).await;
+
+        // A plaintext client either fails to connect or fails the fetch; either way it
+        // never receives partition data.
+        let outcome = async {
+            let mut c = FlightClient::connect(&addr).await?;
+            c.fetch(ticket.to_string()).await
+        }
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a plaintext client must not read from a TLS server"
+        );
+    }
+
+    /// A client trusting the wrong CA rejects the server's certificate.
+    #[tokio::test]
+    async fn client_rejects_a_server_signed_by_an_untrusted_ca() {
+        let server_tls = crate::TlsServerConfig::new(server_identity());
+        let producer = ShuffleExchange::bind_tls("127.0.0.1:0", None, None, Some(server_tls))
+            .await
+            .unwrap();
+        let addr = producer.addr().to_string();
+
+        let wrong = crate::TlsClientConfig::new(certs::ROGUE_CA_CRT, "localhost");
+        let outcome = FlightClient::connect_tls(&addr, &wrong).await;
+        assert!(
+            outcome.is_err(),
+            "a server whose cert does not chain to the trusted CA must be rejected"
+        );
+    }
+
+    /// Under mTLS a client presenting a certificate the server's CA signed is accepted.
+    #[tokio::test]
+    async fn mtls_accepts_a_client_signed_by_the_trusted_ca() {
+        let server_tls =
+            crate::TlsServerConfig::new(server_identity()).with_client_ca(certs::CA_CRT);
+        let producer = ShuffleExchange::bind_tls("127.0.0.1:0", None, None, Some(server_tls))
+            .await
+            .unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
+        producer.publish(&ticket, vec![batch_a()]).await;
+
+        let client_tls = crate::TlsClientConfig::new(certs::CA_CRT, "localhost").with_identity(
+            crate::TlsIdentity::from_pem(certs::CLIENT_CRT, certs::CLIENT_KEY),
+        );
+        let mut client = FlightClient::connect_tls(&addr, &client_tls).await.unwrap();
+        assert_eq!(
+            client.fetch(ticket.to_string()).await.unwrap(),
+            vec![batch_a()]
+        );
+    }
+
+    /// Under mTLS a client whose certificate the server's CA did not sign is rejected —
+    /// the network-level analogue of a wrong shuffle token, enforced at the handshake.
+    #[tokio::test]
+    async fn mtls_rejects_a_client_with_an_untrusted_certificate() {
+        let server_tls =
+            crate::TlsServerConfig::new(server_identity()).with_client_ca(certs::CA_CRT);
+        let producer = ShuffleExchange::bind_tls("127.0.0.1:0", None, None, Some(server_tls))
+            .await
+            .unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
+        producer.publish(&ticket, vec![batch_a()]).await;
+
+        // A rogue client cert signed by an unrelated CA.
+        let rogue = crate::TlsClientConfig::new(certs::CA_CRT, "localhost").with_identity(
+            crate::TlsIdentity::from_pem(certs::ROGUE_CRT, certs::ROGUE_KEY),
+        );
+        let outcome = async {
+            let mut c = FlightClient::connect_tls(&addr, &rogue).await?;
+            c.fetch(ticket.to_string()).await
+        }
+        .await;
+        assert!(
+            outcome.is_err(),
+            "an mTLS client with an untrusted certificate must be rejected"
+        );
+    }
+
+    /// A client with no certificate is rejected by an mTLS server (client auth required).
+    #[tokio::test]
+    async fn mtls_rejects_a_client_with_no_certificate() {
+        let server_tls =
+            crate::TlsServerConfig::new(server_identity()).with_client_ca(certs::CA_CRT);
+        let producer = ShuffleExchange::bind_tls("127.0.0.1:0", None, None, Some(server_tls))
+            .await
+            .unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
+        producer.publish(&ticket, vec![batch_a()]).await;
+
+        // Server-auth only (no client identity) against a server that requires one.
+        let no_cert = crate::TlsClientConfig::new(certs::CA_CRT, "localhost");
+        let outcome = async {
+            let mut c = FlightClient::connect_tls(&addr, &no_cert).await?;
+            c.fetch(ticket.to_string()).await
+        }
+        .await;
+        assert!(
+            outcome.is_err(),
+            "an mTLS server must reject a client that presents no certificate"
+        );
+    }
+
+    /// TLS and the shuffle token compose: the wire is encrypted *and* the token is
+    /// still required. Both layers hold at once.
+    #[tokio::test]
+    async fn tls_and_token_compose() {
+        let server_tls = crate::TlsServerConfig::new(server_identity());
+        let producer =
+            ShuffleExchange::bind_tls("127.0.0.1:0", None, Some("s3cret".into()), Some(server_tls))
+                .await
+                .unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
+        producer.publish(&ticket, vec![batch_a()]).await;
+
+        let client_tls = crate::TlsClientConfig::new(certs::CA_CRT, "localhost");
+        // Right cert, wrong (absent) token → rejected over the encrypted connection.
+        let mut anon = FlightClient::connect_tls(&addr, &client_tls).await.unwrap();
+        assert!(anon.fetch(ticket.to_string()).await.is_err());
+    }
+
+    #[test]
+    fn https_uri_upgrades_bare_and_http_addresses() {
+        assert_eq!(tls::https_uri("1.2.3.4:50"), "https://1.2.3.4:50");
+        assert_eq!(tls::https_uri("http://1.2.3.4:50"), "https://1.2.3.4:50");
+        assert_eq!(tls::https_uri("https://1.2.3.4:50"), "https://1.2.3.4:50");
+    }
+
+    #[test]
+    fn malformed_pem_is_rejected_early_with_a_clear_error() {
+        let err = tls::check_pem("server certificate", "not a pem").unwrap_err();
+        assert!(format!("{err}").contains("not PEM-encoded"));
     }
 }

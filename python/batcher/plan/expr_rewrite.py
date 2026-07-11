@@ -38,6 +38,7 @@ from batcher.plan.expr_ir import (
     ListFunc,
     ListGet,
     ListJoin,
+    ListSimhash,
     ListSlice,
     Math2Expr,
     MathExpr,
@@ -48,6 +49,20 @@ from batcher.plan.expr_ir import (
     WindowExpr,
 )
 from batcher.plan.expr_ir.core import IsInf
+from batcher.plan.expr_ir.func_nodes import (
+    ConvertTimezone,
+    DateOffset,
+    ListBinary,
+    ListFilter,
+    ListPosition,
+    ListSet,
+    ListTransform,
+    MapFunc,
+    Strftime,
+    Strptime,
+    WindowBuckets,
+    WindowStart,
+)
 from batcher.plan.expr_ir.image import ImageFunc
 from batcher.plan.expr_ir.nodes import HashRows
 from batcher.plan.logical import (
@@ -294,6 +309,7 @@ _EXPR_KIDS: dict[type, Callable[[Any], tuple[Expr, ...]]] = {
     DateTrunc: lambda e: (e.input,),
     ListFunc: lambda e: (e.input,),
     ListGet: lambda e: (e.input,),
+    ListSimhash: lambda e: (e.input,),
     ListContains: lambda e: (e.input,),
     ListSlice: lambda e: (e.input,),
     StructField: lambda e: (e.input,),
@@ -307,6 +323,21 @@ _EXPR_KIDS: dict[type, Callable[[Any], tuple[Expr, ...]]] = {
     Array: lambda e: tuple(e.elements),
     NullIf: lambda e: (e.left, e.right),
     Math2Expr: lambda e: (e.left, e.right),
+    ListBinary: lambda e: (e.left, e.right),
+    ListSet: lambda e: (e.left, e.right),
+    ListPosition: lambda e: (e.input,),
+    MapFunc: lambda e: (e.input,),
+    ConvertTimezone: lambda e: (e.input,),
+    DateOffset: lambda e: (e.input,),
+    Strftime: lambda e: (e.input,),
+    Strptime: lambda e: (e.input,),
+    WindowStart: lambda e: (e.input,),
+    WindowBuckets: lambda e: (e.input,),
+    # `func`/`pred` are element-scoped sub-expressions (they close over `element()`,
+    # not over the outer relation's columns), so a rewrite of the outer projection
+    # must not descend into them. `walk.remap_columns` draws the line in the same place.
+    ListTransform: lambda e: (e.input,),
+    ListFilter: lambda e: (e.input,),
     Case: _case_kids,
 }
 
@@ -324,6 +355,7 @@ _EXPR_REBUILD: dict[type, Callable[[Any, tuple[Expr, ...]], Expr]] = {
     DateTrunc: lambda e, k: DateTrunc(k[0], e.unit),
     ListFunc: lambda e, k: ListFunc(e.fn, k[0]),
     ListGet: lambda e, k: ListGet(k[0], e.index),
+    ListSimhash: lambda e, k: ListSimhash(k[0], e.num_bits, e.seed),
     ListContains: lambda e, k: ListContains(k[0], e.value),
     ListSlice: lambda e, k: ListSlice(k[0], e.offset, e.length),
     StructField: lambda e, k: StructField(k[0], e.field),
@@ -344,6 +376,18 @@ _EXPR_REBUILD: dict[type, Callable[[Any, tuple[Expr, ...]], Expr]] = {
     Array: lambda _e, k: Array(list(k)),
     NullIf: lambda _e, k: NullIf(k[0], k[1]),
     Math2Expr: lambda e, k: Math2Expr(e.fn, k[0], k[1]),
+    ListBinary: lambda e, k: ListBinary(e.fn, k[0], k[1]),
+    ListSet: lambda e, k: ListSet(e.fn, k[0], k[1]),
+    ListPosition: lambda e, k: ListPosition(k[0], e.value),
+    MapFunc: lambda e, k: MapFunc(e.fn, k[0], e.key),
+    ConvertTimezone: lambda e, k: ConvertTimezone(k[0], e.from_tz, e.to_tz),
+    DateOffset: lambda e, k: DateOffset(k[0], e.months, e.days, e.micros),
+    Strftime: lambda e, k: Strftime(k[0], e.format),
+    Strptime: lambda e, k: Strptime(k[0], e.format),
+    WindowStart: lambda e, k: WindowStart(k[0], e.width_micros, e.origin_micros),
+    WindowBuckets: lambda e, k: WindowBuckets(k[0], e.width_micros, e.slide_micros),
+    ListTransform: lambda e, k: ListTransform(k[0], e.func),
+    ListFilter: lambda e, k: ListFilter(k[0], e.pred),
     Case: _case_rebuild,
 }
 

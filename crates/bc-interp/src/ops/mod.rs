@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow::compute::SortOptions;
-use arrow::compute::{filter_record_batch, lexsort_to_indices, sort_to_indices, take, SortColumn};
+use arrow::compute::{filter_record_batch, lexsort_to_indices, sort_to_indices, SortColumn};
 use arrow::datatypes::{Field, Schema};
 use bc_ir::{
     AggFunc, AggregateItem, FrameBound, FrameUnits, ProjectionItem, SortKey, WindowFn, WindowFrame,
@@ -30,13 +30,14 @@ mod mixed_spill;
 mod morsel;
 mod quantile_spill;
 mod radix_sort;
+mod repartition;
 mod reshape;
 mod sample_sort;
 mod str_sort;
 pub(crate) use external_sort::{external_merge_sort, external_sort_to_final_store};
 pub(crate) use joins::{
-    asof_join_batches, columns_by_name, gather_join_output, join_batches, join_batches_with,
-    key_indices, map_join_type,
+    asof_join_batches, columns_by_name, gather_join_output, gather_join_output_with, join_batches,
+    join_batches_with, join_output_schema, key_indices, map_join_type,
 };
 pub(crate) use materialize::materialize;
 pub(crate) use mixed_spill::try_bounded_mixed_spill;
@@ -45,6 +46,7 @@ pub(crate) use quantile_spill::{
     try_bounded_distinct_spill, try_bounded_histogram_spill, try_bounded_mode_spill,
     try_bounded_quantile_spill,
 };
+pub(crate) use repartition::partition_morsels;
 pub(crate) use reshape::{
     add_row_ids, sample_batch, sample_n_batches, unnest_batch, unpivot_batch,
 };
@@ -377,32 +379,57 @@ fn sort_indices(
             }),
         });
         lexsort_to_indices(&sort_columns, limit)?
-    } else if let [k] = keys {
+    } else {
+        let vals: Vec<ArrayRef> = keys
+            .iter()
+            .map(|k| k.expr.eval(batch))
+            .collect::<Result<_, _>>()?;
+        return sort_indices_of(&vals, keys);
+    };
+    Ok(indices)
+}
+
+/// The permutation that sorts already-evaluated key columns — the full-sort core of
+/// [`sort_indices`], split out so the parallel sample-sort can evaluate each key once over
+/// the whole batch and reuse the arrays per range.
+pub(crate) fn sort_indices_of(
+    vals: &[ArrayRef],
+    keys: &[SortKey],
+) -> Result<arrow::array::UInt32Array, InterpError> {
+    if let ([k], [v]) = (keys, vals) {
         // Single-key *full* sort uses arrow's specialized per-type `sort_to_indices` (a
         // dedicated primitive path) rather than the general multi-column `lexsort`.
         let opts = SortOptions {
             descending: k.descending,
             nulls_first: k.nulls_first,
         };
-        let vals = k.expr.eval(batch)?;
         // A string key sorts through the stable permutation builder: arrow's
         // `sort_to_indices` leaves ties in an arbitrary, input-size-dependent order, which
         // would make the parallel sample-sort's per-range results disagree with this
         // sequential oracle. Ties resolve to input order instead — deterministic, and the
         // same guarantee the radix path already gives fixed-width keys.
-        if let Some(idx) = str_sort::stable_sort_indices_str(&vals, opts) {
+        if let Some(idx) = str_sort::stable_sort_indices_str(v, opts) {
             return Ok(idx);
         }
         // Radix fast path on a fixed-width integer/temporal key: O(n) vs the comparison
         // sort's O(n log n), producing the identical relation. Falls back for other types.
-        match radix_sort::radix_sort_indices(&vals, opts) {
+        return Ok(match radix_sort::radix_sort_indices(v, opts) {
             Some(idx) => idx,
-            None => sort_to_indices(&vals, Some(opts), None)?,
-        }
-    } else {
-        lexsort_to_indices(&eval_sort_columns(batch, keys)?, None)?
-    };
-    Ok(indices)
+            None => sort_to_indices(v, Some(opts), None)?,
+        });
+    }
+    let columns: Vec<SortColumn> = vals
+        .iter()
+        .zip(keys)
+        .map(|(values, k)| SortColumn {
+            values: values.clone(),
+            options: Some(SortOptions {
+                descending: k.descending,
+                nulls_first: k.nulls_first,
+            }),
+        })
+        .collect();
+    Ok(lexsort_to_indices(&columns, None)?)
 }
 
 /// Gather `batch`'s rows in `indices` order (a single-threaded take of every column).
@@ -413,7 +440,7 @@ fn take_batch(
     let columns = batch
         .columns()
         .iter()
-        .map(|c| take(c.as_ref(), indices, None))
+        .map(|c| bc_runtime::gather::take_column(c.as_ref(), indices))
         .collect::<Result<Vec<ArrayRef>, _>>()?;
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
@@ -574,6 +601,8 @@ fn map_window_func(f: WindowFn) -> window::WindowFn {
         WindowFn::Lag => window::WindowFn::Lag,
         WindowFn::Lead => window::WindowFn::Lead,
         WindowFn::NthValue => window::WindowFn::NthValue,
+        WindowFn::ForwardFill => window::WindowFn::ForwardFill,
+        WindowFn::BackwardFill => window::WindowFn::BackwardFill,
     }
 }
 
@@ -629,7 +658,7 @@ pub(crate) fn limit(batches: Vec<RecordBatch>, n: usize, offset: usize) -> Vec<R
     let schema = batches.first().map(|b| b.schema());
     let mut remaining_skip = offset;
     let mut remaining_take = n;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(batches.len());
     for batch in batches {
         if remaining_take == 0 {
             break;
@@ -874,9 +903,12 @@ mod sort_tests {
         nulls_first: bool,
     ) {
         let serial = sort_batch(batch, keys, None).unwrap();
-        let parallel = parallel_sort_batch(batch, keys, None)
+        // The sample-sort returns its ranges in key order; the sorted relation is their
+        // concatenation.
+        let ranges = parallel_sort_batch(batch, keys, None)
             .unwrap()
             .expect("parallel sort should engage");
+        let parallel = arrow::compute::concat_batches(&batch.schema(), ranges.iter()).unwrap();
 
         // Encode a column's values as comparable tokens (null distinct from any value).
         let col_tokens = |b: &RecordBatch, name: &str| -> Vec<(u8, u64)> {
@@ -970,9 +1002,10 @@ mod sort_tests {
                 descending,
                 nulls_first,
             }];
-            let par = parallel_sort_batch(&str_batch, &keys, None)
+            let ranges = parallel_sort_batch(&str_batch, &keys, None)
                 .unwrap()
                 .expect("string sample-sort should engage on a large input");
+            let par = arrow::compute::concat_batches(&str_batch.schema(), ranges.iter()).unwrap();
             let seq = sort_batch(&str_batch, &keys, None).unwrap();
             assert_eq!(
                 seq, par,

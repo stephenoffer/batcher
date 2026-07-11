@@ -20,13 +20,14 @@ with it.
 
 from __future__ import annotations
 
-import math
-
+from batcher._internal.logging import get_logger
 from batcher.config import Config, active_config
+from batcher.kyber import plan_cache
+from batcher.kyber.annotate import annotate_ops
 from batcher.kyber.calibration import calibrate
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.cost import CostModel
-from batcher.kyber.cpu_shares import class_ir_tag, load_cpu_utilization, recommend_num_cpus
+from batcher.kyber.cpu_shares import load_cpu_utilization
 from batcher.kyber.learning import load_learned_stats
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
@@ -37,145 +38,12 @@ from batcher.kyber.rules.projections import (
 )
 from batcher.kyber.rules.selection import BuildSideDecision
 from batcher.metadata import MetadataHub
-from batcher.plan.ids import OpId
 from batcher.plan.logical import LogicalPlan
-from batcher.plan.physical import PhysicalOp, PhysicalPlan, PlanProperties
-from batcher.plan.resource import ResourceBounds
+from batcher.plan.physical import PhysicalPlan
 from batcher.plan.stats import RelStats
 from batcher.plan.visitor import children, transform_up, walk
 
 __all__ = ["Optimizer", "optimize", "optimize_traced"]
-
-# Memory-budgeting model (consumed by Carbonite admission). Materializing
-# operators ("breakers") hold ~all their rows; streaming operators hold ~one morsel.
-# The tunables (row footprint, morsel size, unknown-size threshold) live in `Config`.
-_BREAKER_KINDS = frozenset({"Aggregate", "Sort", "Distinct", "Join", "Window"})
-
-# CPU-light, IO/decode-bound streaming operators: one task running these waits on IO
-# more than it saturates a core, so it asks for a fractional CPU share (`cpu_share_io`)
-# and the cluster packs more than one per core. Breakers (hash/sort) and anything not
-# listed here keep the full `cpus_per_task` share — an unknown op never under-requests.
-_CPU_LIGHT_KINDS = frozenset(
-    {"Scan", "Filter", "Project", "Limit", "Sample", "RowId", "Union", "Unnest", "Unpivot"}
-)
-
-
-def _cpu_share(
-    kind: str, cpu_light: float, cpu_heavy: float, learned_cpu: dict[str, float], config: Config
-) -> float:
-    """Per-task CPU share for an operator of `kind`.
-
-    The static per-kind prior (a CPU-light streaming op asks for a fraction; breakers
-    and unknown ops keep the full share) is overridden by the measured CPU utilization
-    of this operator family when a prior run recorded one — so `num_cpus` adapts to
-    how CPU-bound the operator actually is.
-    """
-    base = cpu_light if kind in _CPU_LIGHT_KINDS else cpu_heavy
-    tag = class_ir_tag(kind)
-    return recommend_num_cpus(learned_cpu.get(tag) if tag else None, base, config)
-
-
-def _annotate_ops(
-    plan: LogicalPlan,
-    estimator: CardinalityEstimator,
-    config: Config,
-    cost_model: CostModel,
-    cpu_util: dict[str, float] | None = None,
-) -> tuple[PhysicalOp, ...]:
-    """Tag each operator with its estimated rows + memory envelope for Carbonite.
-
-    Kyber measures; Carbonite protects: these per-operator `ResourceBounds` are what
-    the admission policy checks a plan's feasibility against, without either layer
-    importing the other (the bounds travel on the `PhysicalPlan`).
-
-    `cpu_util` is the learned per-kind CPU utilization (from prior runs); when a kind
-    has a measurement it overrides the static CPU-share prior, so the per-task
-    `num_cpus` request adapts to how CPU-bound each operator family actually is.
-
-    Each op also carries the feedback keys Core echoes back (see `PlanProperties`).
-    """
-    learned_cpu = cpu_util or {}
-    row_bytes = config.optimizer.row_bytes
-    morsel_rows = config.execution.morsel_rows
-    morsel_bytes = max(1, config.execution.morsel_bytes)
-    target_rows = max(1, config.optimizer.target_rows_per_task)
-    fc = config.flow_control
-    credit_ceiling = max(1, fc.default_credits * fc.credit_ceiling_factor)
-    cpu_heavy = config.execution.cpus_per_task
-    cpu_light = config.execution.cpu_share_io
-    # At/above this, a cardinality is a placeholder (unknown source size), not a real
-    # estimate — such operators are left unbudgeted so a guess never fails a real query.
-    unknown_rows = config.optimizer.cardinality.unknown_rows
-    ops: list[PhysicalOp] = []
-    try:
-        nodes = list(walk(plan))
-        for i, node in enumerate(nodes):
-            est = estimator.estimate(node)
-            rows = est.rows
-            kind = type(node).__name__
-            known = 0.0 <= rows < unknown_rows
-            # Byte-true width: learned per-column widths when measured, else the flat
-            # `row_bytes` default (so a cold-start envelope is unchanged). A column of
-            # wide payloads (blobs, embeddings) now inflates the envelope correctly.
-            width = estimator.row_width(node, row_bytes)
-            if not known:
-                mem = 0  # unknown size — don't budget (never fail a real query on a guess)
-            elif kind in _BREAKER_KINDS:
-                mem = int(rows * width)  # materialized state
-            else:
-                # streaming: ~one morsel in flight, byte-bounded.
-                mem = min(int(morsel_rows * width), morsel_bytes)
-            # Desired parallelism: a breaker wants enough tasks that each handles
-            # ~`target_rows` of the data it *shuffles* — its input volume, not its
-            # (possibly tiny) grouped output. Streaming ops inherit the pipeline's
-            # width (0 = unset). Carbonite clamps the request to the cpu budget.
-            prefers_local = False
-            if known and kind in _BREAKER_KINDS:
-                in_rows = sum(estimator.estimate(c).rows for c in children(node)) or rows
-                n_par = max(1, math.ceil(in_rows / target_rows))
-                # A breaker whose shuffle volume is small enough to keep node-local
-                # (≤ the broadcast threshold — the existing "small enough to not pay
-                # the network" knob) prefers PACK over SPREAD: co-locating its few
-                # workers avoids a cross-node shuffle that buys nothing. Large shuffles
-                # keep SPREAD so the network load distributes. dist makes the final call.
-                prefers_local = int(in_rows * width) <= config.optimizer.broadcast_max_bytes
-            else:
-                n_par = 0
-            # Desired credit window: enough in-flight batch slots to cover one task's
-            # partition of the materialized state, clamped to the configured ceiling.
-            if n_par > 0 and mem > 0:
-                partition_bytes = mem / n_par
-                c_max = max(1, min(credit_ceiling, math.ceil(partition_bytes / morsel_bytes)))
-            else:
-                c_max = 0  # no estimate → Carbonite supplies the default window
-            c_cpu = _cpu_share(kind, cpu_light, cpu_heavy, learned_cpu, config)
-            ops.append(
-                PhysicalOp(
-                    op_id=OpId(i),
-                    kind=kind,
-                    backend="native",
-                    algorithm="",
-                    bounds=ResourceBounds(
-                        m_max_bytes=mem,
-                        c_max_credits=c_max,
-                        n_max_parallelism=n_par,
-                        c_cpu_shares=c_cpu,
-                        prefers_locality=prefers_local,
-                    ),
-                    inputs=(),
-                    properties=PlanProperties(
-                        est_rows=rows,
-                        provenance=est.provenance,
-                        signature=estimator.signature_of(node),
-                        est_rows_raw=estimator.reportable_estimate(node),
-                        expr_factor=cost_model.expr_factor(node),
-                    ),
-                )
-            )
-    except Exception:
-        return ()  # estimation unavailable (e.g. unbound sources) → Carbonite abstains
-    return tuple(ops)
-
 
 # Confluent rewrite phases iterate to a fixpoint (bounded by
 # `OptimizerConfig.fixpoint_iterations`, which caps pathological non-convergence);
@@ -223,19 +91,36 @@ def _run_phase(
         return plan, None
     if present is None:  # standalone callers (tests) don't precompute it
         present = _present(plan)
+    # A phase that iterates to a fixpoint may fuse its node rules into one traversal: a
+    # rewrite the fused pass skipped (a rule that built a new subtree) is picked up on the
+    # next iteration. A once-run phase has no next iteration, so it must not fuse.
+    fuse = max_iterations > 1
     current_ir = None  # lazily computed, only on the identity-says-changed path
     changed = False
+    converged = False
     for _ in range(max_iterations):
-        updated = _apply_rules(plan, _applicable(rules, present), ctx)
+        updated = _apply_rules(plan, _applicable(rules, present), ctx, fuse=fuse)
         if updated is plan:  # structural sharing → confirmed fixpoint, O(1)
+            converged = True
             break
         if current_ir is None:
             current_ir = plan.to_ir()
         updated_ir = updated.to_ir()
         if updated_ir == current_ir:  # equal-but-new tree (an unconditional rebuilder)
+            converged = True
             break
         plan, current_ir, present = updated, updated_ir, _present(updated)
         changed = True
+    if fuse and not converged:
+        # The iteration cap was hit while the plan was still changing. The plan a query
+        # gets then depends on `fixpoint_iterations`, which means some rule in this phase
+        # is non-confluent or oscillating. Results stay correct (every rule is
+        # semantics-preserving) but plan quality is silently non-reproducible, so say so.
+        get_logger("kyber").warning(
+            "phase did not reach a fixpoint in %d iterations; plan quality may depend on "
+            "`OptimizerConfig.fixpoint_iterations` (a non-confluent rule?)",
+            max_iterations,
+        )
     # `current_ir` tracks the latest plan's IR, so when the phase changed the plan it
     # is exactly the returned plan's IR; on a no-op phase we computed nothing new.
     return plan, (current_ir if changed else None)
@@ -246,15 +131,27 @@ def _present(plan: LogicalPlan) -> frozenset[type]:
     return frozenset(type(n) for n in walk(plan))
 
 
-def _apply_rules(plan: LogicalPlan, rules: list[Rule], ctx: OptimizerContext) -> LogicalPlan:
-    """Apply a phase's rules in registered order, fusing each maximal run of
-    consecutive node-local rules into a *single* bottom-up traversal.
+def _apply_rules(
+    plan: LogicalPlan, rules: list[Rule], ctx: OptimizerContext, *, fuse: bool
+) -> LogicalPlan:
+    """Apply a phase's rules in registered order.
 
-    Previously every node-local rule did its own `transform_up`, so N rules meant N
-    full tree walks per fixpoint iteration; here a run of node rules is applied in one
-    walk. Whole-plan rules (join reorder, projection pruning, build-side selection)
-    still run individually, and the registered order is preserved exactly — so the
-    fused pass is observationally identical, just cheaper."""
+    With `fuse`, each maximal run of consecutive node-local rules shares a *single*
+    bottom-up traversal instead of one walk per rule. That is cheaper but **not**
+    observationally identical, contrary to what this once claimed: `transform_up` has
+    already visited a node's children by the time a rule fires on it, so when a rule
+    rewrites a node into a *new subtree* the later rules in that run never see the new
+    children. A fixpoint phase recovers them on its next iteration, which is why fusing is
+    sound there — and only there.
+
+    The once-run phases (SELECTION, ENFORCE) have no next iteration, so a rewrite the fused
+    pass skipped would be lost outright. They run unfused: one `transform_up` per rule,
+    exactly the sequential semantics. That costs a few extra walks over the handful of
+    rules those phases hold, and nothing at all in the hot fixpoint phases.
+
+    Whole-plan rules (join reorder, projection pruning, build-side selection) always run
+    individually; the registered order is preserved in every case.
+    """
     out = plan
     i, n = 0, len(rules)
     while i < n:
@@ -265,7 +162,12 @@ def _apply_rules(plan: LogicalPlan, rules: list[Rule], ctx: OptimizerContext) ->
         j = i
         while j < n and rules[j].node_fn is not None:
             j += 1
-        out = _apply_node_rules(out, rules[i:j], ctx)
+        run = rules[i:j]
+        if fuse:
+            out = _apply_node_rules(out, run, ctx)
+        else:
+            for r in run:
+                out = _apply_node_rules(out, [r], ctx)
         i = j
     return out
 
@@ -273,13 +175,7 @@ def _apply_rules(plan: LogicalPlan, rules: list[Rule], ctx: OptimizerContext) ->
 def _apply_node_rules(
     plan: LogicalPlan, node_rules: list[Rule], ctx: OptimizerContext
 ) -> LogicalPlan:
-    """One bottom-up pass applying every node-local rule at each node, in order.
-
-    A node-local rule inspects only a node and its already-rewritten subtree (never
-    its ancestors), so applying `[r1, r2, …]` at each node in a single `transform_up`
-    yields the same tree as running each rule's own `transform_up` in sequence — the
-    phase's fixpoint loop still handles rewrites that must propagate up across levels.
-    """
+    """One bottom-up pass applying every node-local rule at each node, in order."""
 
     def visit(node: LogicalPlan) -> LogicalPlan:
         for r in node_rules:
@@ -387,7 +283,7 @@ class Optimizer:
         phys = PhysicalPlan(
             ir=ir if ir is not None else plan.to_ir(),
             output_schema=None,
-            ops=_annotate_ops(
+            ops=annotate_ops(
                 plan,
                 ctx.estimator,
                 ctx.config,
@@ -476,8 +372,28 @@ def optimize_full(
     hub: MetadataHub | None = None,
     source_stats: list | None = None,
 ) -> tuple[PhysicalPlan, LogicalPlan, list[BuildSideDecision]]:
-    """Convenience wrapper around `Optimizer.optimize_full` (physical + logical + decisions)."""
-    return Optimizer(config, sources, hub, source_stats=source_stats).optimize_full(logical)
+    """Optimize once (physical + logical + decisions), reusing a cached plan when one exists.
+
+    Optimization is pure in `(logical, sources, config, learned stats)`, so an identical
+    query need not be re-planned — see `kyber.plan_cache` for what the key captures and why
+    an in-memory source is keyed by object identity. `optimizer.plan_cache_entries = 0`
+    disables the memo; a cold plan is computed exactly as before.
+    """
+    cfg = config if config is not None else active_config()
+    max_entries = cfg.optimizer.plan_cache_entries
+    if max_entries <= 0:
+        return Optimizer(cfg, sources, hub, source_stats=source_stats).optimize_full(logical)
+
+    key = plan_cache.cache_key(logical.content_key(), sources, cfg, hub)
+    cached = plan_cache.lookup(key)
+    if cached is not None:
+        phys, plan, decisions = cached
+        return phys, plan, list(decisions)  # decisions are telemetry; hand out a copy
+
+    result = Optimizer(cfg, sources, hub, source_stats=source_stats).optimize_full(logical)
+    plan_cache.store(key, result, sources, max_entries)
+    phys, plan, decisions = result
+    return phys, plan, list(decisions)
 
 
 def optimize_logical(
@@ -496,5 +412,22 @@ def optimize_logical(
     that constrains a cross join and execute a cartesian product. This is that
     structure (the same `_run` `optimize`/`optimize_traced` use, stopping before the
     PhysicalPlan wrapping so the loop can still splice `Scan`s into it).
+
+    Memoized on the same key as `optimize_full` (see `kyber.plan_cache`) — the adaptive
+    executor runs this once per collect over the query's base sources, which is the case
+    the memo exists for. `LogicalPlan` nodes are frozen, so a hit hands out a value the
+    caller rewrites by transformation, never in place.
     """
-    return Optimizer(config, sources, hub, source_stats=source_stats).logical_rewrite(logical)
+    cfg = config if config is not None else active_config()
+    max_entries = cfg.optimizer.plan_cache_entries
+    if max_entries <= 0:
+        return Optimizer(cfg, sources, hub, source_stats=source_stats).logical_rewrite(logical)
+
+    key = plan_cache.cache_key(logical.content_key(), sources, cfg, hub, kind="logical")
+    cached = plan_cache.lookup(key)
+    if cached is not None:
+        return cached
+
+    result = Optimizer(cfg, sources, hub, source_stats=source_stats).logical_rewrite(logical)
+    plan_cache.store(key, result, sources, max_entries)
+    return result

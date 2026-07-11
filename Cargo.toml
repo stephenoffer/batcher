@@ -41,6 +41,21 @@ bc-interp = { path = "crates/bc-interp" }
 bc-transport = { path = "crates/bc-transport" }
 bc-io = { path = "crates/bc-io" }
 
+# The engine's global allocator (installed once, in `bc-py`). Every operator allocates
+# per-morsel output buffers, and glibc's malloc serves those through `mmap`/`munmap`:
+# each free unmaps pages, which broadcasts a TLB shootdown IPI to every core. On a
+# 96-core box that turns a parallel filter into a serialization point — measured 5.3 ms
+# vs 1.9 ms for the same 6M-row filter. mimalloc's per-thread heaps keep the pages.
+#
+# `local_dynamic_tls` is REQUIRED: this allocator is statically linked into `_native.abi3.so`,
+# a cdylib Python `dlopen`s at import. mimalloc's default `initial-exec` TLS model wants a slot
+# in the *static* TLS block, which the dynamic loader reserves at thread start and is usually
+# already full by the time a late-`dlopen`'d module needs it — so import fails hard with
+# `cannot allocate memory in static TLS block`. The `local-dynamic` model allocates the slot
+# on first use instead, which is the correct model for a dlopen'd library. Tiny per-access cost,
+# and it makes the allocator load reliably regardless of what Python imported first.
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
+
 # Shared utility deps.
 thiserror = "2"
 ahash = "0.8"

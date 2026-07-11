@@ -21,14 +21,12 @@ from __future__ import annotations
 
 import contextlib
 import fnmatch
-import hashlib
+import functools
 import io
 import os
 import posixpath
-import threading
 import uuid
-from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from typing import IO, Any, Protocol, runtime_checkable
 
 import pyarrow as pa
@@ -36,7 +34,17 @@ import pyarrow.fs as pafs
 
 from batcher._internal.errors import IOError
 
-__all__ = ["FileSystem", "LocalFileSystem", "resolve_filesystem"]
+# The local-SSD read-through cache lives in a sibling module (its own responsibility);
+# re-exported here since the filesystem is its only caller and tests import it by this path.
+from batcher.io._file_cache import FileBytesCache, get_file_cache
+
+__all__ = [
+    "FileBytesCache",
+    "FileSystem",
+    "LocalFileSystem",
+    "get_file_cache",
+    "resolve_filesystem",
+]
 
 # Object stores where a single PUT is already atomic (no partial-read visibility),
 # so a write goes straight to the destination — a temp-then-rename would only add a
@@ -47,6 +55,35 @@ _OBJECT_STORE_SCHEMES = frozenset(
 )
 # Cloud scheme aliases → the canonical scheme `from_uri` / fsspec understand.
 _SCHEME_ALIASES = {"s3a": "s3", "gcs": "gs", "abfss": "abfs", "wasbs": "wasb"}
+# Read-ahead buffer for a remote handle-path read — 1 MiB coalesces the split readers'
+# tiny reads into few large GETs instead of the 8 KiB `BufferedReader` default.
+_REMOTE_READ_BUFFER = 1 << 20
+
+
+@functools.cache
+def ensure_io_threads() -> None:
+    """Lift pyarrow's IO thread pool above its 8-thread default, once per process.
+
+    A wide object-store read is otherwise throttled to ~8 concurrent GETs, so a
+    many-small-files scan can't saturate the link. Idempotent/cached; a no-op if the pool
+    is already wider. `BATCHER_IO_THREADS` overrides the target (default 32)."""
+    target = max(8, int(os.environ.get("BATCHER_IO_THREADS", "32")))
+    if pa.io_thread_count() < target:
+        pa.set_io_thread_count(target)
+    cap_arrow_cpu_threads()
+
+
+def cap_arrow_cpu_threads() -> None:
+    """Cap pyarrow's CPU thread pool to the cores this process may actually use.
+
+    pyarrow sizes its compute/decode pool to `os.cpu_count()` (host cores), so under a
+    cgroup CPU quota (a Kubernetes/Ray pod) its kernels over-subscribe cores the container
+    never gets, thrashing the scheduler. Only ever *lowers* the count. Result-invariant."""
+    from batcher._internal.hardware import available_cpu_count
+
+    usable = available_cpu_count()
+    if pa.cpu_count() > usable:
+        pa.set_cpu_count(usable)
 
 
 def _scheme(path: str) -> str:
@@ -71,12 +108,29 @@ def _is_data_file(path: str) -> bool:
 class FileSystem(Protocol):
     """The minimal filesystem surface the IO bases depend on."""
 
-    def expand(self, path: str, *, suffix: str) -> list[str]:
-        """Resolve a file, directory, or glob into a sorted list of file paths."""
+    def expand(self, path: str, *, suffix: str | tuple[str, ...]) -> list[str]:
+        """Resolve a file, directory, or glob into a sorted list of file paths.
+
+        ``suffix`` may be a single extension or a tuple of them; a directory listing
+        keeps files matching *any* of them in one pass (a source with several accepted
+        extensions must not re-list the directory once per extension).
+        """
         ...
 
     def open(self, path: str, mode: str = "rb") -> IO[Any]:
         """Open a single file for reading; the handle is accepted by pyarrow."""
+        ...
+
+    def native_read_target(self, path: str) -> tuple[Any, str] | None:
+        """The `(pyarrow.fs.FileSystem, in_path)` pair for `path`, or None.
+
+        A reader handed this pair does its own I/O in C++ — pre-buffering, parallel column
+        chunks, no GIL. Handed a Python file object it round-trips every read through the
+        interpreter, serializing its decode threads: a four-column read of a 16 GB Parquet
+        file took 2,831 ms through a handle against 1,653 ms through this pair (one column
+        is identical — the cost is per column chunk). None when the backend cannot expose
+        one (a read-through byte cache serves reads through `open`).
+        """
         ...
 
     def atomic_writer(self, path: str) -> contextlib.AbstractContextManager[IO[Any]]:
@@ -159,10 +213,23 @@ class _ArrowFileSystem:
         """An in-filesystem path → the full path/URI callers see."""
         return f"{self._prefix}{in_path}" if self._prefix else in_path
 
+    def native_read_target(self, path: str) -> tuple[pafs.FileSystem, str] | None:
+        """This backend *is* a pyarrow filesystem, so hand it over directly.
+
+        Withheld when a read-through byte cache is configured: that cache serves reads
+        through `open`, and bypassing it would silently disable it.
+        """
+        if self._cacheable and get_file_cache() is not None:
+            return None
+        return self._fs, self._p(path)
+
     # ---- shared surface ----------------------------------------------------
-    def expand(self, path: str, *, suffix: str) -> list[str]:
+    def expand(self, path: str, *, suffix: str | tuple[str, ...]) -> list[str]:
         if any(ch in path for ch in "*?["):
             return self._glob(path)
+        # `str.endswith` takes a tuple directly, so a multi-extension source lists the
+        # directory once and keeps any matching file — not once per extension.
+        suffixes = (suffix,) if isinstance(suffix, str) else tuple(suffix)
         # A trailing slash on an object-store directory (``s3://bucket/dir/``) makes
         # pyarrow's `get_file_info` return `NotFound` — object stores have no real
         # directories, so the key ``dir/`` does not exist as an object. Strip it (but
@@ -179,11 +246,11 @@ class _ArrowFileSystem:
                 fi.path
                 for fi in self._fs.get_file_info(sel)
                 if fi.type == pafs.FileType.File
-                and fi.path.endswith(suffix)
+                and fi.path.endswith(suffixes)
                 and _is_data_file(fi.path)
             )
             if not files:
-                raise IOError(f"no {suffix} files found in directory {path!r}")
+                raise IOError(f"no {'/'.join(suffixes)} files found in directory {path!r}")
             return [self._uri(f) for f in files]
         if info.type == pafs.FileType.NotFound:
             raise IOError(f"path {path!r} does not exist")
@@ -191,6 +258,13 @@ class _ArrowFileSystem:
 
     def _glob(self, pattern: str) -> list[str]:
         in_pat = self._p(pattern)
+        # Fast path: push the glob's literal key-prefix to the store's own prefix-scoped
+        # LIST (via fsspec) — globbing `dir/00000*.jpg` in a 200k-object bucket is one LIST
+        # of the ~10 matches, not a page of every object. Opt-only: it short-circuits only
+        # on a positive hit, so the pyarrow listing below stays the correctness backstop.
+        fast = self._glob_prefix_scoped(pattern, in_pat)
+        if fast is not None:
+            return fast
         # The directory portion before the first wildcard is the listing root.
         base = in_pat
         for i, ch in enumerate(in_pat):
@@ -210,15 +284,49 @@ class _ArrowFileSystem:
             raise IOError(f"glob {pattern!r} matched no files")
         return [self._uri(m) for m in matches]
 
+    def _glob_prefix_scoped(self, pattern: str, in_pat: str) -> list[str] | None:
+        """A prefix-scoped remote glob via fsspec, or ``None`` to fall back to pyarrow.
+
+        Returns matched URIs only when fsspec is installed for the scheme *and* found files,
+        so an empty/errored probe never masks the pyarrow listing (which owns the empty-is-
+        error and credential-failure semantics). Local/backendless schemes return ``None``.
+        """
+        scheme = _scheme(pattern)
+        if scheme in ("", "file"):
+            return None  # local globbing is already a cheap single-directory listing.
+        # Only worth it when the *filename* has a literal prefix before its wildcard
+        # (``dir/PREFIX*.ext``) — that prefix scopes the LIST; a bare ``dir/*.ext`` lists
+        # the whole directory either way, so skip fsspec and let pyarrow do it.
+        last = in_pat.rsplit("/", 1)[-1]
+        first_wild = min((last.find(c) for c in "*?[" if c in last), default=len(last))
+        if first_wild <= 0:
+            return None
+        try:
+            import fsspec
+        except ImportError:
+            return None
+        try:
+            backend = fsspec.filesystem(scheme)
+            matches = backend.glob(in_pat)
+        except Exception:
+            return None  # missing backend (e.g. s3fs), credential, or API issue → pyarrow.
+        files = sorted(self._uri(m) for m in matches if _is_data_file(m))
+        return files or None
+
     def open(self, path: str, mode: str = "rb") -> IO[Any]:  # noqa: ARG002 (read-only façade)
-        # A buffered wrapper over the pyarrow input file gives the full Python file
-        # protocol (read/readline/seek) the byte-range split readers rely on, while
-        # staying acceptable to every pyarrow reader.
+        # A buffered wrapper over the pyarrow input file gives the full Python file protocol
+        # (read/readline/seek) the byte-range split readers rely on, and pyarrow accepts it.
         in_path = self._p(path)
         local = self._cached_local(in_path)
         if local is not None:
             return io.BufferedReader(open(local, "rb"))
-        return io.BufferedReader(self._fs.open_input_file(in_path))  # type: ignore[arg-type]
+        # A 1 MiB buffer (not the 8 KiB default) coalesces the tiny reads the byte-range
+        # split readers issue into far fewer, larger GETs against object storage — the
+        # small-request tax on a high-latency remote path. Matches `_download`'s chunk size.
+        return io.BufferedReader(
+            self._fs.open_input_file(in_path),  # type: ignore[arg-type]
+            buffer_size=_REMOTE_READ_BUFFER,
+        )
 
     def _cached_local(self, in_path: str) -> str | None:
         """The local-cache copy of a remote file, fetching it on a miss; `None` when
@@ -325,11 +433,29 @@ def resolve_filesystem(path: str) -> FileSystem:
     if scheme in ("", "file"):
         prefix = _local_prefix(path)
         return _ArrowFileSystem(pafs.LocalFileSystem(), prefix, atomic_rename=True)
+    # Cache the resolved object-store filesystem per (scheme, authority, query-options): every
+    # `from_uri` re-walks the credential chain (an IMDS round-trip on S3) and opens a fresh
+    # connection pool, and the scan path resolves a filesystem *per split / footer / open* —
+    # precisely the many-small-files tax. The FS is stateless/thread-safe and identical for
+    # every object key in the same bucket + config, so it is safe to memoize (the native store
+    # cache does the same). The object *path* is dropped from the key so all keys share one FS.
+    base = path.split("?", 1)[0]
+    query = path.split("?", 1)[1] if "?" in path else ""
+    authority = base.split("://", 1)[1].split("/", 1)[0] if "://" in base else ""
+    return _resolve_uri_fs(f"{scheme}://{authority}" + (f"?{query}" if query else ""))
+
+
+@functools.lru_cache(maxsize=128)
+def _resolve_uri_fs(uri: str) -> FileSystem:
+    """Build (once, cached) the `pyarrow.fs` façade for an object-store `uri` reduced to
+    `scheme://authority?query` (see `resolve_filesystem`)."""
+    scheme = _scheme(uri)
     try:
-        fs, in_path = pafs.FileSystem.from_uri(path)
+        fs, in_path = pafs.FileSystem.from_uri(uri)
     except (ValueError, OSError, pa.ArrowInvalid, pa.ArrowNotImplementedError):
         # A scheme pyarrow.fs doesn't implement natively → fsspec fallback.
-        return _fsspec_backed(scheme, path)
+        return _fsspec_backed(scheme, uri)
+    path = uri
     # The prefix is `scheme://authority`; compute it from the path with any `?query`
     # (config like endpoint_override) removed, since pyarrow's in_path excludes both.
     # `from_uri` also strips a trailing slash from `in_path` (``…/dir/`` → ``…/dir``),
@@ -372,107 +498,3 @@ def _fsspec_backed(scheme: str, path: str) -> FileSystem:
     return _ArrowFileSystem(
         fs, prefix, atomic_rename=protocol not in _OBJECT_STORE_SCHEMES, strip_query=False
     )
-
-
-# --- Local-SSD read-through file cache (the Disk-Cache analog) ----------------
-# A remote object-store read may be served from a local-SSD copy: the first read of
-# a remote file streams it here; later reads of the same file hit local disk, sparing
-# the object-store round-trip. It lives with the filesystem that opens files (not in
-# the `carbonite` subsystem) because `core`/`kyber` depend on `io`, so an io→carbonite
-# edge would transitively break their independence; the budget comes from config. The
-# cache is transparent and ephemeral — a miss just re-fetches, never a wrong result.
-
-
-class FileBytesCache:
-    """A byte-bounded, LRU local-disk cache of whole remote files.
-
-    Keyed by the remote path; the cached copy lives at ``<cache_dir>/<sha256(path)>``.
-    Thread-safe. Fetching happens outside the lock (it is slow I/O) into a unique temp
-    file that is atomically renamed into place, so concurrent readers never observe a
-    half-written file.
-    """
-
-    __slots__ = ("_dir", "_entries", "_lock", "_max_bytes", "_used")
-
-    def __init__(self, cache_dir: str, max_bytes: int) -> None:
-        """Create the cache rooted at `cache_dir`, bounded to `max_bytes` on disk."""
-        self._dir = cache_dir
-        self._max_bytes = max(0, int(max_bytes))
-        self._lock = threading.Lock()
-        # key → on-disk size; insertion/most-recent order drives LRU eviction.
-        self._entries: OrderedDict[str, int] = OrderedDict()
-        self._used = 0
-        os.makedirs(cache_dir, exist_ok=True)
-
-    def get_or_fetch(self, remote_path: str, fetch: Callable[[str], None]) -> str:
-        """Return the local path of the cached copy of `remote_path`.
-
-        On a miss, `fetch(local_tmp_path)` is called to materialize the bytes (it must
-        write the full file to the given path); the result is then admitted under the
-        byte budget, evicting the least-recently-used entries if needed.
-        """
-        key = hashlib.sha256(remote_path.encode("utf-8")).hexdigest()
-        local = os.path.join(self._dir, key)
-        with self._lock:
-            if key in self._entries:
-                self._entries.move_to_end(key)  # mark most-recently-used
-                return local
-
-        # Miss: fetch outside the lock (slow remote I/O) to a unique temp, then rename.
-        tmp = f"{local}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
-        try:
-            fetch(tmp)
-            size = os.path.getsize(tmp)
-            os.replace(tmp, local)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.remove(tmp)
-            raise
-
-        with self._lock:
-            # A racing thread may have admitted the same key first; only one accounts
-            # for the bytes (the file content is identical, so the rename is harmless).
-            if key not in self._entries:
-                self._entries[key] = size
-                self._used += size
-                self._evict_locked()
-            else:
-                self._entries.move_to_end(key)
-        return local
-
-    def _evict_locked(self) -> None:
-        """Drop least-recently-used entries until within budget (caller holds lock)."""
-        while self._used > self._max_bytes and self._entries:
-            old_key, old_size = self._entries.popitem(last=False)
-            self._used -= old_size
-            with contextlib.suppress(OSError):
-                os.remove(os.path.join(self._dir, old_key))
-
-    @property
-    def used_bytes(self) -> int:
-        """Total bytes currently held on disk by the cache."""
-        with self._lock:
-            return self._used
-
-
-_CACHES: dict[str, FileBytesCache] = {}
-_CACHES_LOCK = threading.Lock()
-
-
-def get_file_cache() -> FileBytesCache | None:
-    """The process-wide file cache for the active config, or `None` when disabled.
-
-    Memoized per cache directory, so `config_context` overriding `file_cache_dir`
-    (e.g. in a test) yields a distinct cache without disturbing the default one.
-    """
-    from batcher.config import active_config
-
-    mem = active_config().memory
-    if not mem.file_cache_dir:
-        return None
-    with _CACHES_LOCK:
-        cache = _CACHES.get(mem.file_cache_dir)
-        if cache is None:
-            cache = FileBytesCache(mem.file_cache_dir, mem.file_cache_max_bytes)
-            _CACHES[mem.file_cache_dir] = cache
-        return cache

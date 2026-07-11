@@ -92,6 +92,18 @@ Credit-based backpressure for the shuffle, the Carbonite flow-control model.
 | `backpressure_high` | `0.70` | Buffer occupancy at which the producer is throttled. |
 | `backpressure_low` | `0.40` | Buffer occupancy at which the producer resumes. |
 
+These fields are the {py:class}`FlowControlConfig <batcher.FlowControlConfig>`
+dataclass (the API reference lists them all). Construct one and swap it onto
+`Config` to retune the shuffle:
+
+```python
+from batcher import Config, FlowControlConfig
+
+cfg = Config().replace(flow_control=FlowControlConfig(default_credits=8))
+print(cfg.flow_control.default_credits)
+# 8
+```
+
 ## optimizer
 
 Kyber's planning thresholds, cost model, and learned-stats behavior. This section
@@ -115,6 +127,18 @@ nests three sub-sections: `cardinality`, `cost_coeffs`, and `cost_weights`.
 | `cardinality` | `CardinalityConfig()` | Selinger-style fallback selectivities (sub-section below). |
 | `cost_coeffs` | `CostCoefficients()` | Per-unit operator costs (sub-section below). |
 | `cost_weights` | `CostWeights()` | Relative weight of CPU, IO, and network when collapsing cost to a scalar (sub-section below). |
+
+This section is the {py:class}`OptimizerConfig <batcher.OptimizerConfig>` dataclass
+(its full field list, including the three nested sub-sections, is in the API
+reference). Construct one and swap it onto `Config`:
+
+```python
+from batcher import Config, OptimizerConfig
+
+cfg = Config().replace(optimizer=OptimizerConfig(join_dp_max_tables=8))
+print(cfg.optimizer.join_dp_max_tables)
+# 8
+```
 
 ### optimizer.cardinality
 
@@ -171,6 +195,17 @@ the Rust data plane so the Python and Rust controllers never drift.
 | `integral_clamp` | `5.0` | Anti-windup bound on the integral term. |
 | `max_step_fraction` | `0.5` | Cap on a single step's size change (plus or minus 50%). |
 
+These gains are the {py:class}`PIDConfig <batcher.PIDConfig>` dataclass (the full
+field list is in the API reference). Construct one and swap it onto `Config`:
+
+```python
+from batcher import Config, PIDConfig
+
+cfg = Config().replace(pid=PIDConfig(kp=0.6))
+print(cfg.pid.kp)
+# 0.6
+```
+
 ## metadata
 
 Where learned statistics (the MetadataHub) live and how fast confidence decays.
@@ -180,6 +215,18 @@ Where learned statistics (the MetadataHub) live and how fast confidence decays.
 | `backend` | `"in_process"` | Storage backend: `"in_process"`, `"sqlite"`, `"redis"`, or `"object_storage"`. |
 | `uri` | `None` | Connection or path for a non-in-process backend. |
 | `decay_per_day` | `0.1` | Daily confidence decay for learned stats (roughly a one-week half-life). |
+
+These fields are the {py:class}`MetadataConfig <batcher.MetadataConfig>` dataclass
+(the full field list is in the API reference). Construct one and swap it onto
+`Config` — e.g. to persist learned stats across restarts:
+
+```python
+from batcher import Config, MetadataConfig
+
+cfg = Config().replace(metadata=MetadataConfig(backend="sqlite"))
+print(cfg.metadata.backend)
+# sqlite
+```
 
 ## distributed
 

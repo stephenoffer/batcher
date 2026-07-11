@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -10,6 +9,7 @@ from typing import IO, Any
 
 import pyarrow as pa
 
+from batcher._internal.hardware import available_cpu_count
 from batcher.config import active_config
 from batcher.io.base import FileSink, FileSource
 from batcher.io.filesystem import resolve_filesystem
@@ -93,14 +93,23 @@ class CSVSource(FileSource):
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
         import pyarrow.csv as pacsv
 
-        return pacsv.read_csv(fh).schema
+        # Infer the schema from the first block only (the streaming reader's schema is known
+        # after one block) instead of reading the whole file — schema inference for a scan
+        # runs during planning, so reading a multi-GB CSV end-to-end here would read it once
+        # for the schema and again for the data. First-block inference is what pyarrow's own
+        # streaming read commits to (and what DuckDB/Polars sample), so the schema matches.
+        return pacsv.open_csv(fh).schema
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
         import pyarrow.csv as pacsv
 
-        table = pacsv.read_csv(fh)
-        if projection is not None:
-            table = table.select(projection)
+        # Push the projection into the parse (`include_columns`) so pyarrow only *converts*
+        # the wanted columns — a projected scan skips the (often costly) string/decimal
+        # conversion of the columns it drops, instead of parsing all then selecting.
+        convert = (
+            pacsv.ConvertOptions(include_columns=projection) if projection is not None else None
+        )
+        table = pacsv.read_csv(fh, convert_options=convert)
         return table.to_batches()
 
     def _file_splits(self, path: str, target_size: int | None) -> list[Split]:
@@ -136,7 +145,7 @@ class CSVSink(FileSink):
         # ranges CONCURRENTLY (pyarrow's CSV encoder releases the GIL) into in-memory
         # buffers — only the first carries the header — and write them back to back.
         n = table.num_rows
-        workers = min(n // _CSV_PARALLEL_MIN_ROWS, os.cpu_count() or 1)
+        workers = min(n // _CSV_PARALLEL_MIN_ROWS, available_cpu_count())
         if workers <= 1:
             pacsv.write_csv(table, fh)
             return
@@ -193,7 +202,7 @@ class CSVSink(FileSink):
             )
             return sink.getvalue()
 
-        cores = os.cpu_count() or 1
+        cores = available_cpu_count()
         window = max(1, cores * _CSV_STREAM_WINDOW_PER_CORE)
         rows = 0
         buf: list[pa.RecordBatch] = []

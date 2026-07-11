@@ -48,6 +48,16 @@ class Principal:
     def has_role(self, role: str) -> bool:
         """Whether this principal holds `role`.
 
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> p = bt.Principal("ana", roles=["analyst"])
+                >>> p.has_role("analyst")
+                True
+                >>> p.has_role("admin")
+                False
+
         Args:
             role: The role name to test.
 
@@ -61,6 +71,16 @@ class Principal:
 
         The exemption test: a masking or row-access policy is skipped for a principal
         holding any of the policy's exempt roles.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> p = bt.Principal("ana", roles=["analyst", "auditor"])
+                >>> p.has_any_role(["admin", "auditor"])
+                True
+                >>> p.has_any_role([])
+                False
 
         Args:
             roles: Role names to test against.

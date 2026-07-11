@@ -23,6 +23,24 @@ class GovernanceEvent:
 
     Carries no timestamp: `enforce` is a pure function, and stamping a clock inside it
     would make the plan rewrite non-deterministic. The emitter stamps the event.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ev = bt.GovernanceEvent(
+            ...     principal="ana",
+            ...     roles=("analyst",),
+            ...     table="/data/customers.parquet",
+            ...     visible=("id", "email"),
+            ...     denied=("ssn",),
+            ...     masked=("email",),
+            ...     row_filters=(),
+            ... )
+            >>> ev.allowed
+            True
+            >>> ev.visible
+            ('id', 'email')
     """
 
     principal: str
@@ -39,6 +57,18 @@ class GovernanceEvent:
 
         False exactly when no column is visible — the case that raises
         `AccessDeniedError`, and the event a security review most wants to find.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.GovernanceEvent("ana", (), "t", ("id",), (), (), ()).allowed
+                True
+                >>> bt.GovernanceEvent("ana", (), "t", (), ("id",), (), ()).allowed
+                False
+
+        Returns:
+            True unless no column is visible.
         """
         return bool(self.visible)
 

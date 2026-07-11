@@ -24,6 +24,8 @@ def _distributed_distinct(
     transport: str = "disk",
     *,
     materialize: bool = True,
+    hub=None,
+    metrics_out=None,
 ):
     """Run `distinct` across `workers` by routing it through the aggregate shuffle.
 
@@ -44,4 +46,6 @@ def _distributed_distinct(
         # `materialize=False` path: with an ambient fleet the deduped result stays on the
         # workers (a `FlightMaterializedSource`) instead of collecting on the head.
         return execute_aggregate_flight(above, agg, sources, workers, materialize=materialize)
-    return _distributed_aggregate(above, agg, sources, workers, materialize=materialize)
+    return _distributed_aggregate(
+        above, agg, sources, workers, hub, materialize=materialize, metrics_out=metrics_out
+    )

@@ -148,6 +148,75 @@ stream), and the [LLM engines](../ml/llm.md). A *callable* model passed to `map_
 receives the whole batch and picks its own columns (no `input_columns=` keyword); the
 model-identifier form of `infer`/`embed` instead takes the `column` to run on.
 
+## Preprocessors
+
+`batcher.ml.preprocessors` holds the fit/transform feature-engineering estimators.
+Each one `fit`s over a `Dataset` to learn its statistics, then `transform`s any
+`Dataset` with them; `Chain` composes several into one pipeline. See the
+[preprocessors guide](../ml/preprocessors.md) for how they fit into a training
+workflow.
+
+```{eval-rst}
+.. currentmodule:: batcher.ml.preprocessors
+
+.. autoclass:: Preprocessor
+   :members:
+
+.. autoclass:: Chain
+   :members:
+```
+
+### Scalers and normalizers
+
+```{eval-rst}
+.. autoclass:: StandardScaler
+   :members:
+
+.. autoclass:: MinMaxScaler
+   :members:
+
+.. autoclass:: MaxAbsScaler
+   :members:
+
+.. autoclass:: RobustScaler
+   :members:
+
+.. autoclass:: Normalizer
+   :members:
+```
+
+### Encoders
+
+```{eval-rst}
+.. autoclass:: OneHotEncoder
+   :members:
+
+.. autoclass:: MultiHotEncoder
+   :members:
+
+.. autoclass:: LabelEncoder
+   :members:
+
+.. autoclass:: OrdinalEncoder
+   :members:
+```
+
+### Binning, imputation, text, and assembly
+
+```{eval-rst}
+.. autoclass:: KBinsDiscretizer
+   :members:
+
+.. autoclass:: SimpleImputer
+   :members:
+
+.. autoclass:: Tokenizer
+   :members:
+
+.. autoclass:: Concatenator
+   :members:
+```
+
 ## Next steps
 
 - [Inference](../ml/inference.md): batch prediction and embeddings.

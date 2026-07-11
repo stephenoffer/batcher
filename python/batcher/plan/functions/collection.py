@@ -23,6 +23,12 @@ def struct(**fields: IntoExpr) -> Expr:
     ``struct(x=col("a"), y=col("b") + 1)`` produces a struct ``{x, y}`` per row; read
     a field back with ``col("s").struct.field("x")``. Requires at least one field.
 
+    Args:
+        fields: The struct fields as ``name=expr`` keyword arguments.
+
+    Returns:
+        A struct-typed expression with one field per keyword argument.
+
     Examples:
         .. doctest::
 
@@ -41,6 +47,12 @@ def named_struct(*args: object) -> Expr:
 
     ``named_struct("x", col("a"), "y", col("b"))`` is equivalent to
     ``struct(x=col("a"), y=col("b"))``. Field names must be strings.
+
+    Args:
+        args: Alternating field ``name, value`` positional arguments.
+
+    Returns:
+        A struct-typed expression with one field per name/value pair.
 
     Examples:
         .. doctest::
@@ -69,6 +81,14 @@ def sequence(start: IntoExpr, stop: IntoExpr, step: IntoExpr = 1) -> Expr:
     argument yields a null list, and a ``step`` of 0 raises. Pair with ``explode`` to
     fan a range out into rows.
 
+    Args:
+        start: The first value of the range (column or literal, cast to Int64).
+        stop: The inclusive last value of the range.
+        step: The increment between successive values (defaults to 1).
+
+    Returns:
+        A list-typed expression holding the integer range for each row.
+
     Examples:
         .. doctest::
 
@@ -81,12 +101,14 @@ def sequence(start: IntoExpr, stop: IntoExpr, step: IntoExpr = 1) -> Expr:
 
 
 def element() -> Expr:
-    """The current element inside ``list.transform`` / ``list.filter`` (Polars
-    ``element()``).
+    """The current element inside ``list.transform`` / ``list.filter`` (Polars ``element``).
 
     Use it to build the per-element expression: ``col("a").list.transform(element() * 2)``
     doubles each element, ``col("a").list.filter(element() > 0)`` keeps the positives.
     Outside a list higher-order op it has no binding.
+
+    Returns:
+        An expression referencing the current list element.
 
     Examples:
         .. doctest::

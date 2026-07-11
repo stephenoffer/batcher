@@ -41,6 +41,18 @@ class DatasetSCD:
     """Accessor for slowly-changing-dimension upserts over a `Dataset` (``ds.scd``).
 
     The dataset is the *incoming* dimension snapshot (natural keys + attributes).
+
+    Examples:
+        .. doctest::
+
+            >>> import os
+            >>> import tempfile
+
+            >>> import batcher as bt
+            >>> target = os.path.join(tempfile.mkdtemp(), "dim.parquet")
+            >>> _ = bt.from_pydict({"id": [1], "city": ["NYC"]}).scd.type1(target, keys="id")
+            >>> bt.read.parquet(target).to_pydict()
+            {'id': [1], 'city': ['NYC']}
     """
 
     __slots__ = ("_ds",)
@@ -50,8 +62,17 @@ class DatasetSCD:
         self._ds = ds
 
     def type1(self, target: str, *, keys: str | list[str], **opts) -> WriteManifest:
-        """SCD type 1 — overwrite changed attributes in place (no history). A keyed
-        upsert into `target` (delegates to `ds.write.merge`).
+        """SCD type 1 — overwrite changed attributes in place (no history).
+
+        A keyed upsert into `target` (delegates to `ds.write.merge`).
+
+        Args:
+            target: Path of the dimension table to upsert into.
+            keys: The natural key column(s) identifying a row.
+            **opts: Forwarded to `ds.write.merge`.
+
+        Returns:
+            The `WriteManifest` of the rewritten target.
 
         Examples:
             .. doctest::
@@ -89,6 +110,20 @@ class DatasetSCD:
         appended (``valid_from = as_of``, ``valid_to = NULL``, ``is_current = True``).
         Brand-new keys are inserted as a first version; unchanged keys are untouched.
         `as_of` is the effective timestamp (e.g. the batch date), stored as a string.
+
+        Args:
+            target: Path of the dimension table to maintain.
+            keys: The natural key column(s) identifying a row.
+            track: The attribute columns whose change triggers a new version.
+            as_of: The effective timestamp for this batch, stored as a string.
+            valid_from: Name of the version-start column.
+            valid_to: Name of the version-end column (NULL while current).
+            is_current: Name of the boolean current-version flag column.
+            format: Target format; inferred from the path when omitted.
+            **opts: Forwarded to the writer.
+
+        Returns:
+            The `WriteManifest` of the rewritten target.
 
         Examples:
             .. doctest::
@@ -158,10 +193,21 @@ class DatasetSCD:
         format: str | None = None,
         **opts,
     ) -> WriteManifest:
-        """SCD type 3 — keep the immediately previous value of each `track` attribute
-        in a ``<attr>_prev`` column (limited history). For a matched key the existing
-        current value moves to ``<attr>_prev`` and the incoming value becomes current;
-        new keys get NULL previous values; untouched target keys are preserved.
+        """SCD type 3 — keep each `track` attribute's previous value in a ``<attr>_prev`` column.
+
+        Limited history. For a matched key the existing current value moves to
+        ``<attr>_prev`` and the incoming value becomes current; new keys get NULL
+        previous values; untouched target keys are preserved.
+
+        Args:
+            target: Path of the dimension table to maintain.
+            keys: The natural key column(s) identifying a row.
+            track: The attribute columns whose previous value is kept.
+            format: Target format; inferred from the path when omitted.
+            **opts: Forwarded to the writer.
+
+        Returns:
+            The `WriteManifest` of the rewritten target.
 
         Examples:
             .. doctest::

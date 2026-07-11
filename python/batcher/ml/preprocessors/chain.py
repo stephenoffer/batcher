@@ -68,15 +68,53 @@ class Chain(Preprocessor):
         self.steps = list(steps)
 
     def __len__(self) -> int:
-        """How many steps the chain holds."""
+        """How many steps the chain holds.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.ml.preprocessors import Chain, SimpleImputer, StandardScaler
+                >>> len(Chain(SimpleImputer(["a"]), StandardScaler(["a"])))
+                2
+
+        Returns:
+            The number of steps.
+        """
         return len(self.steps)
 
     def __iter__(self) -> Iterator[Preprocessor]:
-        """Iterate the steps in application order."""
+        """Iterate the steps in application order.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.ml.preprocessors import Chain, SimpleImputer, StandardScaler
+                >>> ch = Chain(SimpleImputer(["a"]), StandardScaler(["a"]))
+                >>> [type(s).__name__ for s in ch]
+                ['SimpleImputer', 'StandardScaler']
+
+        Returns:
+            An iterator over the steps, in application order.
+        """
         return iter(self.steps)
 
     def __getitem__(self, index: int) -> Preprocessor:
-        """The step at `index` — useful to read a fitted step's learned state."""
+        """The step at `index` — useful to read a fitted step's learned state.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.ml.preprocessors import Chain, SimpleImputer, StandardScaler
+                >>> ch = Chain(SimpleImputer(["a"]), StandardScaler(["a"]))
+                >>> type(ch[0]).__name__
+                'SimpleImputer'
+
+        Args:
+            index: The position of the step to return.
+
+        Returns:
+            The step at `index`.
+        """
         return self.steps[index]
 
     def __repr__(self) -> str:
@@ -89,6 +127,15 @@ class Chain(Preprocessor):
         This is the whole point of the class: step *i* must learn its statistics from
         data that steps *0..i-1* have already transformed, or it learns them from a
         distribution that will never be fed to it again.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import Chain, SimpleImputer
+                >>> ch = Chain(SimpleImputer(["a"])).fit(bt.from_pydict({"a": [1.0, None, 3.0]}))
+                >>> ch[0].statistics_
+                {'a': 2.0}
 
         Args:
             ds: The **training** split. Fitting on anything else leaks into the model.
@@ -109,6 +156,21 @@ class Chain(Preprocessor):
         Lazy: each step contributes an `Expr` projection, so the whole chain is one
         plan the engine optimizes and executes as a unit.
 
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import Chain, SimpleImputer
+                >>> ch = Chain(SimpleImputer(["a"])).fit(bt.from_pydict({"a": [1.0, None, 3.0]}))
+                >>> ch.transform(bt.from_pydict({"a": [None, 4.0]})).to_pydict()
+                {'a': [2.0, 4.0]}
+
+        Args:
+            ds: The dataset (e.g. the held-out split) to run the fitted steps over.
+
+        Returns:
+            A new lazy `Dataset` with every fitted step applied in order.
+
         Raises:
             PlanError: If the chain has not been fitted.
         """
@@ -122,6 +184,22 @@ class Chain(Preprocessor):
 
         Overridden so the chain does not transform `ds` twice: `fit` already threaded
         the data through every step, so its final output *is* the answer.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import Chain, SimpleImputer, StandardScaler
+                >>> train = bt.from_pydict({"age": [10.0, 20.0, None, 40.0]})
+                >>> chain = Chain(SimpleImputer(["age"]), StandardScaler(["age"]))
+                >>> [round(v, 3) for v in chain.fit_transform(train).to_pydict()["age"]]
+                [-1.234, -0.309, 0.0, 1.543]
+
+        Args:
+            ds: The **training** split to fit on and transform in one pass.
+
+        Returns:
+            A new lazy `Dataset` with every step fitted and applied.
         """
         current = ds
         for step in self.steps:

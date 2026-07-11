@@ -71,6 +71,18 @@ print(out.to_pydict())
 # {'name': ['Ann', 'bob', 'CARL'], 'tier': ['low', 'mid', 'high']}
 ```
 
+When there are exactly two branches, {py:obj}`bt.iff(cond, if_true, if_false) <batcher.iff>`
+is the terse form of a single `when/then/otherwise` — the SQL `IF`/`IFF`.
+
+```python
+out = ds.select(
+    "name",
+    size=bt.iff(bt.col("price") >= 20, bt.lit("big"), bt.lit("small")),
+)
+print(out.to_pydict())
+# {'name': ['Ann', 'bob', 'CARL'], 'size': ['small', 'big', 'big']}
+```
+
 ## Null handling
 
 {py:obj}`bt.coalesce <batcher.coalesce>` returns the first non-null argument. {py:obj}`bt.nullif(a, b) <batcher.nullif>` returns null
@@ -86,6 +98,19 @@ out = nulls.select(
 )
 print(out.to_pydict())
 # {'first_present': [1, 8, 3], 'filled': [1, 0, 3], 'bigger': [9, 8, 7]}
+```
+
+A floating-point `NaN` is distinct from null. {py:obj}`bt.nanvl(value, fallback) <batcher.nanvl>`
+(Spark's `nanvl`) substitutes `fallback` only where `value` is `NaN`, leaving real
+numbers — and nulls — untouched.
+
+```python
+import math
+
+floats = bt.from_pydict({"v": [1.0, math.nan, 3.0]})
+out = floats.select(clean=bt.nanvl(bt.col("v"), bt.lit(0.0)))
+print(out.to_pydict())
+# {'clean': [1.0, 0.0, 3.0]}
 ```
 
 ## Row-wise (horizontal) reductions
@@ -143,6 +168,34 @@ print(out.to_pydict())
 # {'root': [1.0, 2.0, 3.0], 'third': [0.33, 1.33, 3.0], 'squared': [1.0, 16.0, 81.0]}
 ```
 
+A few math functions take two columns. {py:obj}`bt.gcd <batcher.gcd>` and
+{py:obj}`bt.lcm <batcher.lcm>` are integer number-theory helpers;
+{py:obj}`bt.hypot(a, b) <batcher.hypot>` is the Euclidean norm `sqrt(a² + b²)`
+(like `atan2`, a top-level two-argument form).
+
+```python
+pairs = bt.from_pydict({"a": [12.0, 15.0], "b": [18.0, 20.0], "x": [3.0, 5.0], "y": [4.0, 12.0]})
+out = pairs.select(
+    g=bt.gcd(bt.col("a"), bt.col("b")),
+    l=bt.lcm(bt.col("a"), bt.col("b")),
+    dist=bt.hypot(bt.col("x"), bt.col("y")),
+)
+print(out.to_pydict())
+# {'g': [6.0, 5.0], 'l': [36.0, 60.0], 'dist': [5.0, 13.0]}
+```
+
+{py:obj}`bt.width_bucket(value, low, high, count) <batcher.width_bucket>` assigns each
+value to one of `count` equal-width histogram buckets spanning `[low, high)` — the
+result is `1..count`, with `0` for values below the range and `count + 1` above it.
+Reach for it to bin a continuous column without a chain of `when`s.
+
+```python
+scores = bt.from_pydict({"score": [5.0, 55.0, 95.0, 120.0]})
+out = scores.select(bucket=bt.width_bucket(bt.col("score"), bt.lit(0.0), bt.lit(100.0), 4))
+print(out.to_pydict())
+# {'bucket': [1.0, 3.0, 4.0, 5.0]}
+```
+
 ## String accessor: .str
 
 The `.str` namespace covers casing, trimming, search, slicing, padding, and
@@ -160,10 +213,95 @@ print(out.to_pydict())
 # {'upper': ['ANN', 'BOB', 'CARL'], 'length': [3, 3, 4], 'has_a': [True, False, True], 'first_two': ['An', 'bo']}
 ```
 
+More predicates and slicers round out the namespace: `ends_with` mirrors
+`starts_with` for a literal suffix, `split_part(delimiter, n)` returns the `n`-th
+1-based field of a split, `substring_index(delimiter, count)` keeps everything up
+to the `count`-th delimiter, and `normalize_whitespace` collapses each run of
+whitespace to one space and trims the ends.
+
+```python
+paths = bt.from_pydict({"path": ["etc/app/conf", "usr/local/bin", "  a   b  "]})
+out = paths.select(
+    is_conf=bt.col("path").str.ends_with("conf"),
+    second=bt.col("path").str.split_part("/", 2),
+    head=bt.col("path").str.substring_index("/", 2),
+    tidy=bt.col("path").str.normalize_whitespace(),
+)
+print(out.to_pydict())
+# {'is_conf': [True, False, False], 'second': ['app', 'local', ''], 'head': ['etc/app', 'usr/local', '  a   b  '], 'tidy': ['etc/app/conf', 'usr/local/bin', 'a b']}
+```
+
+`ascii` returns the codepoint of the first character; `bit_length` and
+`octet_length` measure the encoded size in bits and UTF-8 bytes (not characters);
+`levenshtein(target)` is the edit distance to a constant string and `soundex` its
+phonetic key — both useful for fuzzy matching and deduplication.
+
+```python
+words = bt.from_pydict({"w": ["Robert", "Rupert", "café"]})
+out = words.select(
+    code=bt.col("w").str.ascii(),
+    bytes=bt.col("w").str.octet_length(),
+    dist=bt.col("w").str.levenshtein("Ruperts"),
+    phonetic=bt.col("w").str.soundex(),
+)
+print(out.to_pydict())
+# {'code': [82, 82, 99], 'bytes': [6, 6, 5], 'dist': [3, 1, 7], 'phonetic': ['R163', 'R163', 'C100']}
+```
+
 Other `.str` methods include `lower`, `trim`, `lstrip`, `rstrip`, `reverse`,
-`substr`, `right`, `repeat`, `lpad`, `rpad`, `position`, `split`, `regexp_matches`,
-`regexp_replace`, `regexp_extract`, `replace`, `initcap`, `hex`, `base64`,
-`from_base64`, `unhex`, and `translate`.
+`substr`, `right`, `repeat`, `lpad`, `rpad`, `position`, `split`, `replace`,
+`initcap`, `hex`, `base64`, `from_base64`, `unhex`, and `translate`.
+
+### Regex
+
+Alongside the single-match `regexp_matches`, `regexp_replace`, and `regexp_extract`,
+three methods work over *every* match in a string: `regexp_count` tallies the
+matches, `regexp_extract_all` gathers them into a list, and
+`regexp_replace_all(pattern, replacement)` substitutes them all.
+
+```python
+codes = bt.from_pydict({"s": ["a1b2c3", "xyz", "p4q5"]})
+out = codes.select(
+    digits=bt.col("s").str.regexp_count("[0-9]"),
+    found=bt.col("s").str.regexp_extract_all("[0-9]"),
+    masked=bt.col("s").str.regexp_replace_all("[0-9]", "#"),
+)
+print(out.to_pydict())
+# {'digits': [3, 0, 2], 'found': [['1', '2', '3'], [], ['4', '5']], 'masked': ['a#b#c#', 'xyz', 'p#q#']}
+```
+
+### Building strings from several columns
+
+Two top-level helpers assemble one string from many expressions.
+{py:obj}`bt.format_string(template, *exprs) <batcher.format_string>` interpolates
+values into a template at each `{}` placeholder (Polars' `format`), while
+{py:obj}`bt.concat_ws(separator, *exprs) <batcher.concat_ws>` joins values with a
+separator between them (DuckDB/Spark `concat_ws`).
+
+```python
+out = ds.select(
+    label=bt.format_string("{} x{}", bt.col("name"), bt.col("qty")),
+    key=bt.concat_ws("-", bt.col("name"), bt.col("qty").cast("utf8")),
+)
+print(out.to_pydict())
+# {'label': ['Ann x1', 'bob x2', 'CARL x3'], 'key': ['Ann-1', 'bob-2', 'CARL-3']}
+```
+
+### Parsing text into dates
+
+Parsing string columns into temporal types also lives on `.str`:
+`to_date(format)` yields a `Date` and `to_datetime(format)` a `Timestamp`, each
+reading a chrono/strftime pattern. Once parsed, reach for the `.dt` accessor below.
+
+```python
+day_strs = bt.from_pydict({"d": ["2024-01-15", "2024-06-01"]})
+print(day_strs.select(day=bt.col("d").str.to_date("%Y-%m-%d")).to_pydict())
+# {'day': [datetime.date(2024, 1, 15), datetime.date(2024, 6, 1)]}
+
+stamp_strs = bt.from_pydict({"t": ["2024-01-15 09:30", "2024-06-01 18:00"]})
+print(stamp_strs.select(stamp=bt.col("t").str.to_datetime("%Y-%m-%d %H:%M")).to_pydict())
+# {'stamp': [datetime.datetime(2024, 1, 15, 9, 30), datetime.datetime(2024, 6, 1, 18, 0)]}
+```
 
 ## Datetime accessor: .dt
 
@@ -186,7 +324,65 @@ print(out.to_pydict())
 
 Also available: `day`, `hour`, `minute`, `second`, `quarter`, `week`,
 `dayofweek`, `dayofyear`, `epoch`, `monthname`, `isodow`, `century`, `decade`,
-`millennium`, `last_day`, and `truncate(unit)`.
+`millennium`, `last_day`, and `truncate(unit)`. `iso_year` gives the ISO 8601
+week-numbering year, and `is_leap_year` / `days_in_month` answer calendar
+questions per row.
+
+```python
+out = events.select(
+    iso=bt.col("ts").dt.iso_year(),
+    leap=bt.col("ts").dt.is_leap_year(),
+    month_len=bt.col("ts").dt.days_in_month(),
+)
+print(out.to_pydict())
+# {'iso': [2024, 2024], 'leap': [True, True], 'month_len': [31, 30]}
+```
+
+`strftime(format)` renders a timestamp as text with a chrono/strftime pattern;
+`offset_by(by)` shifts it by a Polars-style duration string (`"1mo"`, `"3d"`,
+`"-1h"`), preserving the type; and `convert_timezone(from_tz, to_tz)` re-reads each
+naive wall-clock from one zone in another, DST-aware.
+
+```python
+out = events.select(
+    text=bt.col("ts").dt.strftime("%Y/%m/%d"),
+    next_month=bt.col("ts").dt.offset_by("1mo"),
+    in_ny=bt.col("ts").dt.convert_timezone("UTC", "America/New_York"),
+)
+print(out.select(text=bt.col("text"), next=bt.col("next_month").dt.month(), ny_hour=bt.col("in_ny").dt.hour()).to_pydict())
+# {'text': ['2024/01/15', '2024/06/01'], 'next': [2, 7], 'ny_hour': [4, 14]}
+```
+
+### Top-level date/time functions
+
+Some date arithmetic reads better as a function than as an accessor call.
+{py:obj}`bt.date_part(part, expr) <batcher.date_part>` extracts a named field (the
+SQL spelling of `.dt.<part>()`); {py:obj}`bt.date_add(expr, days) <batcher.date_add>`
+and {py:obj}`bt.date_sub(expr, days) <batcher.date_sub>` shift by a whole number of
+days.
+
+```python
+out = events.select(
+    part=bt.date_part("month", bt.col("ts")),
+    later=bt.date_add(bt.col("ts"), 7),
+    earlier=bt.date_sub(bt.col("ts"), 7),
+)
+print(out.select(part=bt.col("part"), later=bt.col("later").dt.day(), earlier=bt.col("earlier").dt.day()).to_pydict())
+# {'part': [1, 6], 'later': [22, 8], 'earlier': [8, 25]}
+```
+
+{py:obj}`bt.current_date() <batcher.current_date>` and
+{py:obj}`bt.current_timestamp() <batcher.current_timestamp>` capture "now" as a
+literal, bound once at plan-build time (so every row sees the same value). Because
+the value depends on the wall clock, compare it to Python's clock rather than a
+fixed constant.
+
+```python
+today = bt.from_pydict({"z": [1]}).select(d=bt.current_date()).to_pydict()["d"][0]
+now = bt.from_pydict({"z": [1]}).select(t=bt.current_timestamp()).to_pydict()["t"][0]
+print(today == datetime.date.today(), isinstance(now, datetime.datetime))
+# True True
+```
 
 ## List accessor: .list
 
@@ -222,6 +418,16 @@ print(out.to_pydict())
 # {'x': [1, 3], 'y': [2, 4]}
 ```
 
+Going the other way, {py:obj}`bt.named_struct(name, value, ...) <batcher.named_struct>`
+packs several columns into one struct from alternating name/value arguments —
+handy for nesting a group of fields before a write or a `.struct.field` lookup.
+
+```python
+out = ds.select(row=bt.named_struct("who", bt.col("name"), "n", bt.col("qty")))
+print(out.to_pydict())
+# {'row': [{'who': 'Ann', 'n': 1}, {'who': 'bob', 'n': 2}, {'who': 'CARL', 'n': 3}]}
+```
+
 ## JSON accessor: .json
 
 `.json.extract_string(path)` reads a string value from a JSON text column using a
@@ -232,6 +438,24 @@ docs = bt.from_pydict({"doc": ['{"a": {"b": "hi"}}', '{"a": {"b": "bye"}}']})
 out = docs.select(value=bt.col("doc").json.extract_string("$.a.b"))
 print(out.to_pydict())
 # {'value': ['hi', 'bye']}
+```
+
+The typed variants read a JSON value directly as a scalar instead of text:
+`extract_bool`, `extract_int`, and `extract_float` return `Boolean`, `Int64`, and
+`Float64` columns, yielding null when the path is absent or the value has the wrong
+type — no separate cast step.
+
+```python
+records = bt.from_pydict(
+    {"r": ['{"ok": true, "n": 3, "score": 4.5}', '{"ok": false, "n": 7, "score": 9.0}']}
+)
+out = records.select(
+    ok=bt.col("r").json.extract_bool("$.ok"),
+    n=bt.col("r").json.extract_int("$.n"),
+    score=bt.col("r").json.extract_float("$.score"),
+)
+print(out.to_pydict())
+# {'ok': [True, False], 'n': [3, 7], 'score': [4.5, 9.0]}
 ```
 
 ## Aggregate expressions
@@ -249,3 +473,12 @@ out = ds.group_by().agg(
 print(out.to_pydict())
 # {'total': [60.0], 'avg_qty': [2.0], 'rows': [3]}
 ```
+
+## Next steps
+
+- [Expressions API](../api/expressions.md): every `Expr` method and accessor
+  (`.str`/`.dt`/`.list`/`.struct`/`.json`/`.map`/`.image`/`.audio`/`.video`) in one
+  exhaustive reference.
+- [Aggregations](aggregations.md) and [Window functions](window-functions.md): where
+  aggregate and windowed expressions are used.
+- [SQL](sql.md): the same column language, spelled as SQL.

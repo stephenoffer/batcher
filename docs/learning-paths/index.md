@@ -33,7 +33,7 @@ Configuration, resources, and operating the engine.
 ::::
 
 ```{toctree}
-:maxdepth: 1
+:hidden:
 
 data-engineer
 data-scientist

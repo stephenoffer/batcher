@@ -16,16 +16,24 @@ from __future__ import annotations
 from batcher.governance.audit import GovernanceEvent
 from batcher.governance.catalog import SecurityCatalog
 from batcher.governance.enforce import enforce
+from batcher.governance.filters import AttributeIn, MatchesAttribute
 from batcher.governance.lineage import Origin, column_lineage
+from batcher.governance.masks import Encrypt, Nullify, Pseudonymize, Redact
 from batcher.governance.policy import ColumnMask, Grant, RowFilter, TagMask
 from batcher.governance.principal import Principal
 
 __all__ = [
+    "AttributeIn",
     "ColumnMask",
+    "Encrypt",
     "GovernanceEvent",
     "Grant",
+    "MatchesAttribute",
+    "Nullify",
     "Origin",
     "Principal",
+    "Pseudonymize",
+    "Redact",
     "RowFilter",
     "SecurityCatalog",
     "TagMask",

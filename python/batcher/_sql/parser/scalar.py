@@ -7,6 +7,7 @@ nested subqueries via `tr.statement`. They hold no state of their own.
 
 from __future__ import annotations
 
+from batcher._sql.parser.core_utils import _columns_selector
 from batcher._sql.parser.literals import (
     _BINOPS,
     _DATE_PART,
@@ -55,6 +56,8 @@ def _scalar(tr, node) -> Expr:
             return col(entry[0])
     if isinstance(node, exp.Paren):
         return tr._scalar(node.this)
+    if isinstance(node, exp.Columns):
+        return _columns_selector(node)
     if isinstance(node, exp.Column):
         return col(node.name)
     if isinstance(node, exp.Literal):

@@ -31,6 +31,7 @@ from typing import IO, Any, ClassVar
 import pyarrow as pa
 
 from batcher._internal.errors import IOError as BatcherIOError
+from batcher._internal.hardware import available_cpu_count
 from batcher.io.filesystem import resolve_filesystem
 
 __all__ = ["MediaSource", "MediaSplit", "read_blob_bytes"]
@@ -116,26 +117,21 @@ class MediaSource:
 
     # ---- shared, do-not-override ------------------------------------------
     def _files(self) -> list[str]:
-        """List every media file under the path (sorted, deduped across suffixes).
+        """List every media file under the path (sorted, matching any accepted suffix).
 
-        Each suffix is expanded independently; a suffix that matches nothing is
-        skipped (a directory of mixed media legitimately lacks some extensions).
-        An empty overall listing is an error.
+        All accepted extensions are resolved in a *single* listing pass — a directory of
+        many files must never be re-listed once per extension (that turned one read into
+        one full object-store listing per suffix). A directory legitimately lacking some
+        extensions is fine; only an empty overall listing is an error.
         """
         if self._files_cache is None:
-            seen: dict[str, None] = {}
-            for suffix in self.suffixes:
-                try:
-                    matches = self._fs.expand(self._path, suffix=suffix)
-                except BatcherIOError:
-                    continue  # this extension matched no files; try the next.
-                for f in matches:
-                    seen.setdefault(f, None)
-            if not seen:
+            try:
+                matches = self._fs.expand(self._path, suffix=self.suffixes)
+            except BatcherIOError as exc:
                 raise BatcherIOError(
                     f"no {self.format_name} files ({', '.join(self.suffixes)}) under {self._path!r}"
-                )
-            self._files_cache = sorted(seen)
+                ) from exc
+            self._files_cache = sorted(matches)
         return self._files_cache
 
     def schema(self) -> pa.Schema:
@@ -189,8 +185,7 @@ class MediaSource:
         mimes: list[str] = []
         meta_rows: list[dict[str, Any]] = []
         meta_fields = self._meta_fields() if self._with_meta else []
-        for path in chunk:
-            header, payload, size = self._read_payload(path)
+        for path, (header, payload, size) in zip(chunk, self._read_chunk(chunk), strict=True):
             uris.append(path)
             blobs.append(payload)  # None in reference mode
             sizes.append(size)
@@ -208,6 +203,25 @@ class MediaSource:
             arrays.append(pa.array([row.get(name) for row in meta_rows], dtype))
             names.append(name)
         return pa.RecordBatch.from_arrays(arrays, names=names)
+
+    def _read_chunk(self, chunk: list[str]) -> list[tuple[bytes, bytes | None, int]]:
+        """Read every file in ``chunk`` concurrently, preserving order.
+
+        Each media file is one object-store round trip; the read releases the GIL, so a
+        serial per-file loop leaves a many-file scan latency-bound on a single connection
+        (the ingest bottleneck for a directory of many small images/clips). The pool is
+        capped so a large chunk does not open an unbounded number of connections at once.
+        """
+        if len(chunk) <= 1:
+            return [self._read_payload(chunk[0])] if chunk else []
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Latency-bound tiny-file reads scale with concurrency well past core count; cap
+        # at the chunk size so a full chunk reads in one concurrent wave (raw byte reads
+        # are thread-safe under fan-out — unlike a footer *parse*, which is not).
+        workers = min(len(chunk), max(8, available_cpu_count() * 2), 64)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(self._read_payload, chunk))  # order preserved
 
     def _read_payload(self, path: str) -> tuple[bytes, bytes | None, int]:
         """Return ``(header_bytes, payload_or_None, size)`` for one file.

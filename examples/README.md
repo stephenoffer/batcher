@@ -35,6 +35,7 @@ that references a removed or renamed API fails the test suite instead of rotting
 | Script | Shows |
 | --- | --- |
 | `ml_inference.py` | batch inference — score every row with a model-shaped callable via `ds.ml.map_batches` |
+| `preprocessors.py` | build a model-ready feature matrix with fit/transform preprocessors and `Chain` |
 | `streaming_pipeline.py` | a Kafka → windowed-aggregate → Delta micro-batch pipeline (skipped; needs a broker) |
 
 **Operating the engine**
@@ -50,9 +51,10 @@ that references a removed or renamed API fails the test suite instead of rotting
 
 - **Data engineer** — `quickstart`, `transformations_aggregations_joins`, `data_quality`,
   `lakehouse_scd`, `timeseries`, `window_functions`, `spill`.
-- **Data scientist** — `quickstart`, `sql`, `feature_engineering`, `timeseries`,
-  `window_functions`.
-- **ML engineer** — `ml_inference`, `feature_engineering`, `streaming_pipeline`.
+- **Data scientist** — `quickstart`, `sql`, `feature_engineering`, `preprocessors`,
+  `timeseries`, `window_functions`.
+- **ML engineer** — `ml_inference`, `feature_engineering`, `preprocessors`,
+  `streaming_pipeline`.
 - **Platform engineer** — `performance_caching`, `spill`, `adaptive_optimization`,
   `distributed`.
 

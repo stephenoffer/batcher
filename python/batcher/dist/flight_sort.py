@@ -132,10 +132,10 @@ def execute_sort_flight(
     bucket whose worker dies before the reduce fetches it. `_fault_inject` /
     `_fault_inject_map` are test-only hooks: worker ids to kill after / before the map
     barrier."""
-    import ray
-
     import os as _os0
     import time as _tt0
+
+    import ray
 
     _profE = _os0.environ.get("BATCHER_SORT_PROFILE")
     _enter = _tt0.perf_counter()
@@ -264,7 +264,10 @@ def execute_sort_flight(
         pa.Table.from_batches(out) if out else pa.table({c: [] for c in sort.available_columns()})
     )
     if _prof0:
-        print(f"[sort] driver_concat {_tt.perf_counter() - _pc:.1f}s ({table.num_rows} rows)", flush=True)
+        print(
+            f"[sort] driver_concat {_tt.perf_counter() - _pc:.1f}s ({table.num_rows} rows)",
+            flush=True,
+        )
     if sort.limit is not None:
         table = table.slice(0, sort.limit)
     if _prof0:

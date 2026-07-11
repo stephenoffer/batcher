@@ -53,6 +53,9 @@ def window(time_col: IntoExpr, duration: str, slide: str | None = None) -> Expr:
         duration: Fixed-length window width, e.g. ``"1h"`` or ``"30m"``.
         slide: Optional hop for sliding windows; ``None`` gives tumbling windows.
 
+    Returns:
+        The window-start timestamp to group by (a list of starts when ``slide`` is set).
+
     Raises:
         PlanError: If a duration uses a calendar unit or is not positive.
 
@@ -159,6 +162,9 @@ def date_part(part: str, expr: IntoExpr) -> Expr:
         part: The calendar field name (case-insensitive), e.g. ``"year"`` or ``"dow"``.
         expr: The date/time column to read.
 
+    Returns:
+        An integer expression holding the requested calendar field.
+
     Raises:
         PlanError: If ``part`` is not a recognized unit.
 
@@ -189,6 +195,9 @@ def date_add(expr: IntoExpr, days: int) -> Expr:
         expr: The date/time column to shift.
         days: Number of days to add (may be negative).
 
+    Returns:
+        The date/time column shifted forward by ``days`` days.
+
     Examples:
         .. doctest::
 
@@ -209,6 +218,9 @@ def date_sub(expr: IntoExpr, days: int) -> Expr:
     Args:
         expr: The date/time column to shift.
         days: Number of days to subtract (may be negative).
+
+    Returns:
+        The date/time column shifted back by ``days`` days.
 
     Examples:
         .. doctest::

@@ -17,6 +17,7 @@
 use arrow::array::RecordBatch;
 use bc_ir::RelOp;
 
+mod agg_par;
 pub mod dist;
 mod error;
 mod join_par;
@@ -38,11 +39,18 @@ pub(crate) fn count_rows(batches: &[RecordBatch]) -> u64 {
     batches.iter().map(|b| b.num_rows() as u64).sum()
 }
 
-/// Total Arrow buffer bytes across a set of morsels (coarse working-set proxy).
+/// Total Arrow buffer bytes across a set of morsels.
+///
+/// Uses each column's **slice** size, not `get_array_memory_size()`. The latter reports the
+/// whole parent buffer for a sliced array, so morselizing one 32 MB table into 122 morsels
+/// made this report 3.9 GB — every morsel re-counting the entire buffer. Carbonite fits its
+/// memory model on this figure, so the over-count would have it budget ~100x the real
+/// footprint and spill (or reject) plans that fit comfortably.
 pub(crate) fn batch_bytes(batches: &[RecordBatch]) -> u64 {
     batches
         .iter()
-        .map(|b| b.get_array_memory_size() as u64)
+        .flat_map(|b| b.columns().iter())
+        .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0) as u64)
         .sum()
 }
 
@@ -76,7 +84,7 @@ fn exec_seq(
     ids: &mut IdGen,
 ) -> Result<Vec<RecordBatch>, InterpError> {
     // Pre-order id: numbered before recursing into children so parents precede
-    // children (matches the Python control plane's `_annotate_ops` numbering).
+    // children (matches the Python control plane's `annotate_ops` numbering).
     let op_id = ids.next();
     match plan {
         RelOp::Scan { source_id } => {
@@ -90,6 +98,7 @@ fn exec_seq(
                 })?;
             let rows = count_rows(&batches);
             let bytes = batch_bytes(&batches);
+            let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
             m.record(OpMetric {
                 op_id,
                 kind: "scan",
@@ -97,11 +106,13 @@ fn exec_seq(
                 rows_build: 0,
                 rows_out: rows,
                 elapsed_ns: t0.elapsed_ns(),
-                cpu_ns: t0.cpu_ns(),
+                cpu_ns,
                 threads: 1,
                 peak_bytes: bytes,
                 result_bytes: bytes,
                 spilled: false,
+                spill_bytes: 0,
+                peak_rss_bytes,
                 backend: "interp",
             });
             Ok(batches)
@@ -186,17 +197,26 @@ fn exec_seq(
         } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
+            let in_bytes = batch_bytes(&batches);
             let t0 = Stopwatch::start();
-            let out: Vec<RecordBatch> = match n {
-                // Fixed-count: keep the n smallest-hash rows (a breaker).
-                Some(k) => ops::sample_n_batches(&batches, *k, *seed)?,
-                None => batches
-                    .iter()
-                    .map(|b| ops::sample_batch(b, *fraction, *seed))
-                    .collect::<Result<_, _>>()?,
-            };
-            record_op(m, op_id, "sample", rows_in, &out, t0, false);
-            Ok(out)
+            match n {
+                // Fixed-count: a global n-smallest-hash pass holds the whole input, so it
+                // is a breaker (its peak is that input), not a ~0-peak streaming op.
+                Some(k) => {
+                    let out = ops::sample_n_batches(&batches, *k, *seed)?;
+                    record_breaker(m, op_id, "sample", rows_in, 0, in_bytes, &out, t0, false);
+                    Ok(out)
+                }
+                // Fractional: streaming per-batch; peak is the sampled result alone.
+                None => {
+                    let out: Vec<RecordBatch> = batches
+                        .iter()
+                        .map(|b| ops::sample_batch(b, *fraction, *seed))
+                        .collect::<Result<_, _>>()?;
+                    record_op(m, op_id, "sample", rows_in, &out, t0, false);
+                    Ok(out)
+                }
+            }
         }
 
         RelOp::Aggregate {
@@ -218,7 +238,17 @@ fn exec_seq(
                 &partial.group_columns,
                 &agg_cols,
             )?];
-            record_breaker(m, op_id, "aggregate", rows_in, 0, batch_bytes(&batches), &out, t0, false);
+            record_breaker(
+                m,
+                op_id,
+                "aggregate",
+                rows_in,
+                0,
+                batch_bytes(&batches),
+                &out,
+                t0,
+                false,
+            );
             Ok(out)
         }
 
@@ -230,7 +260,17 @@ fn exec_seq(
                 Ok(combined) => vec![ops::sort_batch(&combined, keys, *limit)?],
                 Err(_) => Vec::new(),
             };
-            record_breaker(m, op_id, "sort", rows_in, 0, batch_bytes(&batches), &out, t0, false);
+            record_breaker(
+                m,
+                op_id,
+                "sort",
+                rows_in,
+                0,
+                batch_bytes(&batches),
+                &out,
+                t0,
+                false,
+            );
             Ok(out)
         }
 
@@ -254,7 +294,17 @@ fn exec_seq(
                 )?],
                 Err(_) => Vec::new(),
             };
-            record_breaker(m, op_id, "window", rows_in, 0, batch_bytes(&batches), &out, t0, false);
+            record_breaker(
+                m,
+                op_id,
+                "window",
+                rows_in,
+                0,
+                batch_bytes(&batches),
+                &out,
+                t0,
+                false,
+            );
             Ok(out)
         }
 
@@ -300,7 +350,17 @@ fn exec_seq(
                 output,
                 bc_ir::JoinStrategy::Hash,
             )?];
-            record_breaker(m, op_id, "hash_join", rows_in, rows_build, in_bytes, &out, t0, false);
+            record_breaker(
+                m,
+                op_id,
+                "hash_join",
+                rows_in,
+                rows_build,
+                in_bytes,
+                &out,
+                t0,
+                false,
+            );
             Ok(out)
         }
 
@@ -327,7 +387,17 @@ fn exec_seq(
             let out = vec![ops::asof_join_batches(
                 &left, &right, left_on, right_on, left_by, right_by, *backward, output,
             )?];
-            record_breaker(m, op_id, "asof_join", rows_in, rows_build, in_bytes, &out, t0, false);
+            record_breaker(
+                m,
+                op_id,
+                "asof_join",
+                rows_in,
+                rows_build,
+                in_bytes,
+                &out,
+                t0,
+                false,
+            );
             Ok(out)
         }
 
@@ -336,7 +406,17 @@ fn exec_seq(
             let rows_in = count_rows(&batches);
             let t0 = Stopwatch::start();
             let out = vec![distinct(&batches)?];
-            record_breaker(m, op_id, "distinct", rows_in, 0, batch_bytes(&batches), &out, t0, false);
+            record_breaker(
+                m,
+                op_id,
+                "distinct",
+                rows_in,
+                0,
+                batch_bytes(&batches),
+                &out,
+                t0,
+                false,
+            );
             Ok(out)
         }
 
@@ -349,10 +429,19 @@ fn exec_seq(
                 all.extend(exec_seq(inp, sources, m, ids)?);
             }
             let rows_in = count_rows(&all);
+            let in_bytes = batch_bytes(&all);
             let t0 = Stopwatch::start();
-            let out = if *dedup { vec![distinct(&all)?] } else { all };
-            record_op(m, op_id, "union", rows_in, &out, t0, false);
-            Ok(out)
+            if *dedup {
+                // A deduplicating UNION materializes and hashes its input — a breaker whose
+                // peak is that input plus the deduped result.
+                let out = vec![distinct(&all)?];
+                record_breaker(m, op_id, "union", rows_in, 0, in_bytes, &out, t0, false);
+                Ok(out)
+            } else {
+                // UNION ALL streams: it holds only the concatenated result.
+                record_op(m, op_id, "union", rows_in, &all, t0, false);
+                Ok(all)
+            }
         }
     }
 }
@@ -369,6 +458,7 @@ fn record_op(
     spilled: bool,
 ) {
     let bytes = batch_bytes(out);
+    let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
     m.record(OpMetric {
         op_id,
         kind,
@@ -376,18 +466,21 @@ fn record_op(
         rows_build: 0,
         rows_out: count_rows(out),
         elapsed_ns: t0.elapsed_ns(),
-        cpu_ns: t0.cpu_ns(),
+        cpu_ns,
         threads: 1,
         peak_bytes: bytes,
         result_bytes: bytes,
         spilled,
+        spill_bytes: 0,
+        peak_rss_bytes,
         backend: "interp",
     });
 }
 
 /// Record a **pipeline breaker**: it materializes `in_bytes` of input and builds its
 /// result at the same time, so both are live at its peak. `rows_build` is the join's
-/// build-side rows (0 elsewhere).
+/// build-side rows (0 elsewhere). The sequential oracle does not spill, so `spill_bytes`
+/// is always 0 here (the field carries a magnitude only on the parallel/spilling paths).
 #[allow(clippy::too_many_arguments)]
 fn record_breaker(
     m: &mut ExecMetrics,
@@ -401,6 +494,7 @@ fn record_breaker(
     spilled: bool,
 ) {
     let result_bytes = batch_bytes(out);
+    let (cpu_ns, peak_rss_bytes) = t0.cpu_and_rss();
     m.record(OpMetric {
         op_id,
         kind,
@@ -408,11 +502,13 @@ fn record_breaker(
         rows_build,
         rows_out: count_rows(out),
         elapsed_ns: t0.elapsed_ns(),
-        cpu_ns: t0.cpu_ns(),
+        cpu_ns,
         threads: 1,
         peak_bytes: in_bytes.saturating_add(result_bytes),
         result_bytes,
         spilled,
+        spill_bytes: 0,
+        peak_rss_bytes,
         backend: "interp",
     });
 }

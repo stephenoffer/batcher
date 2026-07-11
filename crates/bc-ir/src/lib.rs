@@ -423,6 +423,13 @@ pub enum WindowFn {
     /// `nth_value(expr, n)` — value of the `offset`-th row (1-based) of the
     /// partition in order; null if the partition has fewer than `offset` rows.
     NthValue,
+    /// Carry the last non-null value forward along the ordered partition; rows before
+    /// the first non-null stay null. SQL spells this
+    /// `last_value(x IGNORE NULLS) OVER (… ROWS UNBOUNDED PRECEDING)`; because the
+    /// frame is implied, no `frame` is needed here. Requires ORDER BY.
+    ForwardFill,
+    /// The mirror of `ForwardFill`: carry the next non-null value backward.
+    BackwardFill,
 }
 
 /// One output column of a `Project`: an expression and the name it is bound to.

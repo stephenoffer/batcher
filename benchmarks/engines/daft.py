@@ -46,3 +46,11 @@ class DaftEngine(Engine):
 
         frames = {name: daft.read_parquet(uri) for name, uri in uris.items()}
         return lambda query: daft.sql(query, **frames).to_arrow()
+
+    def scan_sql_runner(self, glob: str) -> SqlRunner:
+        import daft
+
+        def run(query: str) -> pa.Table:
+            return daft.sql(query, t=daft.read_parquet(glob)).to_arrow()
+
+        return run

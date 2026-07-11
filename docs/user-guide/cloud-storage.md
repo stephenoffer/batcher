@@ -119,3 +119,10 @@ result = ds.group_by("region").agg(total=bt.col("amount").sum()).collect(
     distributed=True, num_workers=16
 )
 ```
+
+## Next steps
+
+- [Reading data](reading-data.md) and [Writing data](writing-data.md): the full reader
+  and writer surface.
+- [Lakehouse](lakehouse.md): Delta, Iceberg, and Hudi tables on object storage.
+- [IO API](../api/io.md): the `bt.read` / `ds.write` reference.

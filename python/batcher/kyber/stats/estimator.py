@@ -105,7 +105,7 @@ class StatsEstimator:
         # estimator's lifetime, so `estimate(node)` and a node's structural signature
         # are pure functions of the node. Without memoization `estimate` re-descends
         # to the leaves on every call and is invoked O(nodes) times per optimize (once
-        # per node in `_annotate_ops`, plus every cost-based rule), so planning is
+        # per node in `annotate_ops`, plus every cost-based rule), so planning is
         # super-linear in plan depth and `plan_signature` re-hashes whole subtrees.
         # Each entry holds a strong reference to its keyed node alongside the value so
         # a freed node's reused `id()` can never produce a stale hit.

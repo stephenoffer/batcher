@@ -20,16 +20,17 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
-import os
 
 import pyarrow as pa
+
+from batcher._internal.hardware import available_cpu_count
 
 # Re-exported (`X as X`) so the Flight + spill paths can keep importing these
 # helpers from `batcher.dist.executor` after the split.
 from batcher.dist.executors.partition_io import _apply_above as _apply_above
-from batcher.dist.executors.partition_io import _empty_agg_table as _empty_agg_table
 from batcher.dist.executors.partition_io import _partition_source as _partition_source
 from batcher.dist.executors.partition_io import source_pushdown
+from batcher.dist.executors.plan_analysis import _empty_agg_table as _empty_agg_table
 
 # Used by the dispatcher below.
 from batcher.dist.executors.plan_analysis import (
@@ -37,6 +38,7 @@ from batcher.dist.executors.plan_analysis import (
     _is_linear_map_pipeline,
     _single_source,
     _split_at,
+    empty_result_table,
 )
 from batcher.dist.executors.plan_analysis import _relabel_single_source as _relabel_single_source
 from batcher.dist.executors.plan_analysis import _source_ids as _source_ids
@@ -65,6 +67,7 @@ from batcher.plan.logical import (
     Join,
     Limit,
     LogicalPlan,
+    RowId,
     Sort,
     Union,
     Window,
@@ -109,7 +112,7 @@ def execute_distributed(
     if envelope is not None and num_workers is None:
         workers = max(1, envelope.n_tasks)
     else:
-        workers = num_workers or (os.cpu_count() or 4)
+        workers = num_workers or available_cpu_count()
 
     # Set the grant first so the up-front `_ensure_ray` wraps tasks with it; then ask
     # the autoscaler for the cores this query wants (released in the `finally` so a
@@ -362,6 +365,23 @@ def _collapse_limits(lim: Limit) -> tuple[int, int, LogicalPlan]:
     return n, offset, base
 
 
+def _join_sides_are_map_only(join) -> bool:
+    """Whether both join operands are a single source with a breaker-free (map-only) plan.
+
+    Each side is shipped to every worker and re-run against that worker's partition, so a
+    breaker on a side is evaluated per-partition: `limit(5).join(dim)` kept 5 rows on each of
+    4 workers and returned 20. Such joins are `requires_staging` — the inner breaker runs as
+    its own distributed stage first — so refusing here turns a wrong answer into the staged
+    path (or, with `adaptive=False`, a loud error).
+    """
+    return (
+        _single_source(join.left)
+        and _single_source(join.right)
+        and not _has_breaker(join.left)
+        and not _has_breaker(join.right)
+    )
+
+
 def _fusable_join_aggregate(agg: Aggregate) -> bool:
     """Whether `agg` is an aggregate over an inner join, grouped by (a superset of) the
     join key — so it can be distributed by reusing the join's co-partitioning.
@@ -374,7 +394,7 @@ def _fusable_join_aggregate(agg: Aggregate) -> bool:
     j = agg.input
     if not isinstance(j, Join) or j.join_type != "inner":
         return False
-    if not (_single_source(j.left) and _single_source(j.right)):
+    if not _join_sides_are_map_only(j):
         return False
     group_cols = {gk.expr.name for gk in agg.group_keys if isinstance(gk.expr, Col)}
     return bool(j.left_keys) and set(j.left_keys) <= group_cols
@@ -390,7 +410,189 @@ def _aggregate_over_join(agg: Aggregate) -> bool:
     whole join to the head to aggregate it single-node (the 70s→~1s join fix).
     """
     j = agg.input
-    return isinstance(j, Join) and _single_source(j.left) and _single_source(j.right)
+    return isinstance(j, Join) and _join_sides_are_map_only(j)
+
+
+# A whole-relation window aggregate is the same computation as the equivalent GROUP BY
+# aggregate over zero keys; only the SQL spelling of `avg` differs from the engine's `mean`.
+_WINDOW_AGG_TO_AGG = {"sum": "sum", "avg": "mean", "min": "min", "max": "max", "count": "count"}
+
+
+def _is_empty_relation(plan: LogicalPlan) -> bool:
+    """Whether `plan` provably yields zero rows, so there is nothing to distribute.
+
+    Kyber folds a predicate it can prove false against the source's statistics into
+    `Limit(0)`. Every row-preserving or row-reducing operator above it still yields zero
+    rows. The walk stops at an `Aggregate` (a zero-key aggregate over an empty relation
+    returns exactly ONE row), a `Join` (an outer join emits the surviving side), and a
+    `Union` (another branch may have rows) — none of those is empty just because an input is.
+    """
+    from batcher.plan.logical import Filter, Project, Unnest
+
+    node = plan
+    while True:
+        if isinstance(node, Limit) and node.n == 0:
+            return True
+        if isinstance(node, (Filter, Project, Sort, Distinct, Limit, Window, Unnest)):
+            node = node.input
+            continue
+        return False
+
+
+def _is_broadcastable_global_window(window: Window) -> bool:
+    """Whether `window` is `<agg>(x) OVER ()` — one scalar per function, over every row.
+
+    With no PARTITION BY *and* no ORDER BY, an aggregate window's frame is the whole
+    relation, so every row receives the same value. That is exactly a zero-key aggregate,
+    which is mergeable — so it distributes, unlike an ordered global window (a running sum,
+    `row_number()`, `lag`), which needs one global row order and has no distributed path.
+    An explicit frame re-introduces per-row bounds, so it is excluded too.
+    """
+    return (
+        not window.partition_keys
+        and not window.order_keys
+        and window.rank_limit is None
+        and all(
+            f.func in _WINDOW_AGG_TO_AGG and f.frame is None and f.input is not None
+            for f in window.functions
+        )
+    )
+
+
+def _distributed_global_window(
+    above: list[LogicalPlan], window: Window, sources: list[Source], workers: int, transport: str
+) -> pa.Table:
+    """`<agg>(x) OVER ()` — aggregate the whole relation, then broadcast the scalars.
+
+    Two distributed passes, both linear: a zero-key mergeable aggregate reduces the relation
+    to one row on the driver (O(1) memory, not O(rows)), then a stateless map appends each
+    result as a literal column. Collecting every row onto one node to compute the window —
+    what a naive "one partition" implementation does — is precisely the cliff this avoids.
+    """
+    from batcher.plan.expr_ir import AggExpr, Lit
+    from batcher.plan.logical import Aggregate, AggregateSpec, Project, Projection
+
+    totals = _dispatch(
+        Aggregate(
+            input=window.input,
+            group_keys=(),
+            aggregates=tuple(
+                AggregateSpec(alias=f.alias, agg=AggExpr(_WINDOW_AGG_TO_AGG[f.func], f.input))
+                for f in window.functions
+            ),
+        ),
+        sources,
+        workers,
+        transport,
+    )
+    if totals.num_rows == 0:
+        # No input rows ⇒ no output rows; the window preserves its input's cardinality.
+        result = empty_result_table(window, window.available_columns())
+        return result if not above else _apply_above(above, result)
+
+    scalars = totals.to_pydict()
+    columns = window.input.available_columns()
+    broadcast = Project(
+        input=window.input,
+        items=(
+            *(Projection(alias=c, expr=Col(c)) for c in columns),
+            *(Projection(alias=f.alias, expr=Lit(scalars[f.alias][0])) for f in window.functions),
+        ),
+    )
+    result = _dispatch(broadcast, sources, workers, transport)
+    return result if not above else _apply_above(above, result)
+
+
+def _hoist_computed_sort_key(sort: Sort):
+    """Rewrite `ORDER BY <expr>, …` so the LEADING key is a plain column.
+
+    Returns `(sort', drop_key)` — a sort over a `Project` that materializes the computed
+    leading key as a hidden column, plus the `Project` that drops it again — or `None` when
+    the leading key is already a column (the common case, left byte-identical).
+
+    The distributed sort range-partitions on the leading key's *values*, which it can only
+    read from a column, so `df.sort(col("a") + col("b"))` had no distributed path at all.
+    Materializing the key once per row in the map prefix is exactly what the single-node
+    sort does internally, so this is a rewrite, not an approximation: the hidden column is
+    computed before the shuffle, drives the partitioning, and is projected away afterwards.
+    """
+    from batcher.plan.logical import Project, Projection, SortKeySpec
+
+    key = sort.keys[0]
+    if isinstance(key.expr, Col):
+        return None
+
+    columns = sort.input.available_columns()
+    hidden = "__sort_key"
+    while hidden in columns:  # never shadow a user column
+        hidden += "_"
+
+    with_key = Project(
+        input=sort.input,
+        items=(
+            *(Projection(alias=c, expr=Col(c)) for c in columns),
+            Projection(alias=hidden, expr=key.expr),
+        ),
+    )
+    rewritten = dataclasses.replace(
+        sort,
+        input=with_key,
+        keys=(
+            SortKeySpec(Col(hidden), descending=key.descending, nulls_first=key.nulls_first),
+            *sort.keys[1:],
+        ),
+    )
+    drop_key = Project(
+        input=rewritten, items=tuple(Projection(alias=c, expr=Col(c)) for c in columns)
+    )
+    return rewritten, drop_key
+
+
+def _staged_aggregate_over_join(
+    above: list[LogicalPlan],
+    agg: Aggregate,
+    sources: list[Source],
+    workers: int,
+    hub=None,
+    metrics_out=None,
+) -> pa.Table:
+    """Disk-transport aggregate over an arbitrary join: shuffle the join, then the aggregate.
+
+    The Flight path folds the partial aggregate into the join's reducers, so only partials
+    cross the network — strictly better, and it stays the flight branch. The disk shuffle has
+    no such fold, and collecting the whole join to the driver to aggregate it single-node is
+    the exact cliff `_unsupported` exists to prevent. So run two distributed shuffles: the
+    join keeps its result partitioned on disk (`materialize=False`), and the aggregate then
+    treats that intermediate as an ordinary splittable source. Driver memory stays O(groups),
+    and the result is the single-node one (both stages are mergeable).
+    """
+    from batcher.dist.executors.aggregate import _distributed_aggregate
+    from batcher.dist.executors.join import _distributed_join
+    from batcher.plan.logical import Scan
+    from batcher.plan.schema import SchemaRef
+
+    joined = _distributed_join([], agg.input, sources, workers, materialize=False, hub=hub)
+    if isinstance(joined, pa.Table):
+        # The join shape had no partitioned form and already collected; aggregate it here
+        # rather than re-shuffling a table the driver is holding anyway.
+        from batcher.io.source import InMemorySource
+
+        intermediate: Source = InMemorySource(joined.to_batches())
+        cleanup = None
+    else:
+        intermediate, cleanup = joined, joined.cleanup
+
+    sid = len(sources)
+    staged = dataclasses.replace(
+        agg, input=Scan(source_id=sid, schema=SchemaRef(intermediate.schema()))
+    )
+    try:
+        return _distributed_aggregate(
+            above, staged, [*sources, intermediate], workers, hub, metrics_out=metrics_out
+        )
+    finally:
+        if cleanup is not None:
+            cleanup()
 
 
 def _dispatch(
@@ -403,6 +605,14 @@ def _dispatch(
     materialize: bool = True,
     metrics_out=None,
 ):
+    # A provably-empty relation (Kyber folded a false predicate to `Limit(0)`) has no data
+    # to distribute, so run it on one node: correct, instant, and not the perf cliff
+    # `_unsupported` guards against. Without this, `filter(<provably false>)` under an
+    # operator that is not a `_split_at` pass-through (a window) reached `_unsupported` and
+    # raised, purely because the folded `Limit` reads as a pipeline breaker.
+    if _is_empty_relation(plan):
+        return _single_node(plan, sources)
+
     # Batch-inference / embedding pipelines (map_batches): distribute the linear
     # map chain across workers — the Ray Data competitor path.
     from batcher.core.udf import has_map_batches
@@ -482,6 +692,31 @@ def _dispatch(
                 table = table.slice(offset, n)
                 return table if not above else _apply_above(above, table)
 
+    # `with_row_index` — a single global counter, so a per-partition run would restart it at
+    # zero on every worker. Instead run the (row-wise) input distributed and number the rows
+    # on the driver: `_distributed_map` assembles partitions BY INDEX, so their concatenation
+    # is the source's own row order and the counter lands on exactly the rows single-node
+    # numbers. `with_random` (position-keyed hash) and `tail` (row index + filter) both lower
+    # to `RowId`, so all three distribute through this one path.
+    rowid_split = _split_at(plan, RowId)
+    if rowid_split is not None:
+        above, rowid = rowid_split
+        if _single_source(rowid.input) and _is_linear_map_pipeline(rowid.input):
+            sid = next(iter(_source_ids(rowid.input)))
+            if sid < len(sources) and _is_splittable_source(sources[sid]):
+                from batcher.dist.executors.map import _distributed_map
+
+                table = _distributed_map(rowid.input, sources, workers, None)
+                index = pa.array(
+                    range(rowid.offset, rowid.offset + table.num_rows), type=pa.int64()
+                )
+                # `RowId.available_columns()` puts the index FIRST, and the engine emits it
+                # non-nullable (a counter is never null). Match both exactly, or the schema
+                # differs from single-node and `pa.concat_tables` rejects the pair.
+                field = pa.field(rowid.alias, pa.int64(), nullable=False)
+                table = table.add_column(0, field, index)
+                return table if not above else _apply_above(above, table)
+
     agg_split = _split_at(plan, Aggregate)
     if agg_split is not None:
         above, agg = agg_split
@@ -504,14 +739,25 @@ def _dispatch(
             from batcher.dist.executors.distinct import _distributed_distinct
 
             return _distributed_distinct(
-                [*above, agg], agg.input, sources, workers, transport, materialize=materialize
+                [*above, agg],
+                agg.input,
+                sources,
+                workers,
+                transport,
+                materialize=materialize,
+                hub=hub,
+                metrics_out=metrics_out,
             )
         # The map/shuffle aggregate path: run `agg.input` as the per-partition map prefix, then
-        # partial-aggregate + shuffle + combine. Correct over a breaker-free prefix and over a
-        # NESTED aggregate/sort whose per-partition result composes under this aggregate (the
-        # dominant case); a `Distinct` prefix was already redirected above. A join input has two
-        # sources, so `_single_source` skips it to the join handlers below.
-        if _single_source(agg.input):
+        # partial-aggregate + shuffle + combine. Sound ONLY over a breaker-free prefix — a map
+        # prefix is evaluated independently on every partition. A `Limit` prefix would then keep
+        # `n` rows *per partition* (`limit(100).group_by(k).agg(count())` counted 4x on 4
+        # workers), and a nested `Aggregate` would hand this one per-partition partial groups
+        # (`max(sum per k)` read a per-partition max). Both returned wrong answers silently.
+        # Such shapes are `requires_staging`, so the staged executor runs the inner breaker
+        # first; here we refuse rather than compute. A join input has two sources, so
+        # `_single_source` skips it to the join handlers below.
+        if _single_source(agg.input) and not _has_breaker(agg.input):
             if transport == "flight":
                 from batcher.dist.flight_aggregate import execute_aggregate_flight
 
@@ -535,29 +781,32 @@ def _dispatch(
                 return execute_join_flight(above, agg.input, sources, workers, fused_agg=agg)
             from batcher.dist.executors.join import _distributed_join_aggregate
 
-            return _distributed_join_aggregate(above, agg, agg.input, sources, workers)
-        # General aggregate over a (non-key-aligned, or non-inner) join: distribute via
-        # partial-per-reducer + driver combine over Flight, so the join is aggregated on
-        # the workers instead of collected whole to the driver (the disk path falls
-        # through to a single-node-local collect, where there is no network to save).
-        if transport == "flight" and _aggregate_over_join(agg):
-            from batcher.dist.flight_join import execute_join_flight
+            return _distributed_join_aggregate(above, agg, agg.input, sources, workers, hub)
+        # General aggregate over a (non-key-aligned, or non-inner) join.
+        if _aggregate_over_join(agg):
+            if transport == "flight":
+                # Fold the partial aggregate into the join's reducers, so only partials
+                # cross the network and the join never collects on the head.
+                from batcher.dist.flight_join import execute_join_flight
 
-            return execute_join_flight(
-                above, agg.input, sources, workers, fused_agg=agg, combine_partials=True
-            )
+                return execute_join_flight(
+                    above, agg.input, sources, workers, fused_agg=agg, combine_partials=True
+                )
+            return _staged_aggregate_over_join(above, agg, sources, workers, hub, metrics_out)
 
     join_split = _split_at(plan, Join)
     if join_split is not None:
         above, join = join_split
-        if _single_source(join.left) and _single_source(join.right):
+        if _join_sides_are_map_only(join):
             if transport == "flight":
                 from batcher.dist.flight_join import execute_join_flight
 
                 return execute_join_flight(above, join, sources, workers)
             from batcher.dist.executors.join import _distributed_join
 
-            return _distributed_join(above, join, sources, workers, materialize=materialize)
+            return _distributed_join(
+                above, join, sources, workers, materialize=materialize, hub=hub
+            )
 
     # ASOF join with `by` keys: co-partition both sides by the `by` keys (equal `by`
     # values hash together, so each bucket is an independent ASOF join). A keyless
@@ -565,22 +814,22 @@ def _dispatch(
     asof_split = _split_at(plan, AsofJoin)
     if asof_split is not None:
         above, asof = asof_split
-        if asof.left_by and _single_source(asof.left) and _single_source(asof.right):
+        if asof.left_by and _join_sides_are_map_only(asof):
             return _distributed_asof(above, asof, sources, workers)
 
-    # A top-level sort over a scannable input distributes via range partitioning on
-    # the leading key (which must be a plain column); secondary keys may be anything.
+    # A top-level sort over a scannable input distributes via range partitioning on the
+    # leading key. That key must be a plain COLUMN (the range partitioner splits on its
+    # values); a computed one — `ORDER BY a + b`, `ORDER BY lower(name)` — is hoisted into a
+    # hidden column first. Secondary keys may be any expression: only the leading key drives
+    # the partitioning, the rest are evaluated by each reducer's local sort.
     sort_split = _split_at(plan, Sort)
     if sort_split is not None:
         above, sort = sort_split
-        from batcher.plan.expr_ir import Col
-
-        if (
-            _single_source(sort.input)
-            and sort.keys
-            and isinstance(sort.keys[0].expr, Col)
-            and not _has_breaker(sort.input)
-        ):
+        if _single_source(sort.input) and sort.keys and not _has_breaker(sort.input):
+            hoisted = _hoist_computed_sort_key(sort)
+            if hoisted is not None:
+                sort, drop_key = hoisted
+                above = [*above, drop_key]  # innermost: drops the hidden key from the result
             if transport == "flight":
                 from batcher.dist.flight_sort import execute_sort_flight, execute_topn_flight
 
@@ -590,7 +839,7 @@ def _dispatch(
                 return execute_sort_flight(above, sort, sources, workers)
             from batcher.dist.executors.sort import _distributed_sort
 
-            return _distributed_sort(above, sort, sources, workers)
+            return _distributed_sort(above, sort, sources, workers, hub)
 
     # DISTINCT over a breaker-free single source: dedup via the aggregate shuffle.
     distinct_split = _split_at(plan, Distinct)
@@ -600,29 +849,35 @@ def _dispatch(
             from batcher.dist.executors.distinct import _distributed_distinct
 
             return _distributed_distinct(
-                above, distinct, sources, workers, transport, materialize=materialize
+                above,
+                distinct,
+                sources,
+                workers,
+                transport,
+                materialize=materialize,
+                hub=hub,
+                metrics_out=metrics_out,
             )
 
     # A window partitioned by plain columns over a breaker-free source: hash-shuffle
     # rows by the partition keys so each partition is computed whole on one reducer.
+    # A window with NO partition keys has nothing to shuffle on; when it is also
+    # order-free it is a whole-relation aggregate broadcast, which distributes (an
+    # *ordered* global window needs one global row order and still has no path).
     window_split = _split_at(plan, Window)
     if window_split is not None:
         above, window = window_split
-        from batcher.plan.expr_ir import Col
+        if _single_source(window.input) and not _has_breaker(window.input):
+            if _is_broadcastable_global_window(window):
+                return _distributed_global_window(above, window, sources, workers, transport)
+            if window.partition_keys and all(isinstance(k, Col) for k in window.partition_keys):
+                if transport == "flight":
+                    from batcher.dist.flight_window import execute_window_flight
 
-        if (
-            _single_source(window.input)
-            and not _has_breaker(window.input)
-            and window.partition_keys
-            and all(isinstance(k, Col) for k in window.partition_keys)
-        ):
-            if transport == "flight":
-                from batcher.dist.flight_window import execute_window_flight
+                    return execute_window_flight(above, window, sources, workers)
+                from batcher.dist.executors.window import _distributed_window
 
-                return execute_window_flight(above, window, sources, workers)
-            from batcher.dist.executors.window import _distributed_window
-
-            return _distributed_window(above, window, sources, workers)
+                return _distributed_window(above, window, sources, workers, hub)
 
     # UNION: distribute each branch independently, then concatenate (+ dedup).
     union_split = _split_at(plan, Union)
@@ -657,12 +912,25 @@ def _unsupported(plan: LogicalPlan, sources: list[Source], reason: str):
     read_ids = _source_ids(plan)
     if any(_is_splittable_source(sources[i]) for i in read_ids if i < len(sources)):
         from batcher._internal.errors import PlanError
+        from batcher.dist.executors.plan_analysis import requires_staging
 
+        # A join over a multi-source operand HAS a distributed path — the staged one. The
+        # caller reached here only by forcing `adaptive=False`, so say that rather than
+        # implying the operator is missing.
+        hint = (
+            "this shape distributes stage by stage (a join whose operand spans two sources, "
+            "or a pipeline breaker beneath another breaker); it was disabled by an explicit "
+            '`adaptive=False`. Re-run with `adaptive=True` (or the default `"auto"`). '
+            "Running it in one shot would evaluate the inner plan once per partition and "
+            "return wrong values, so it is refused rather than computed."
+            if requires_staging(plan)
+            else "File/extend the distributed operator, or run with distributed=False "
+            "to force single-node explicitly."
+        )
         raise PlanError(
             "distributed execution has no path for this plan shape "
             f"({reason}); refusing to silently fall back to single-node on distributed "
-            "data. File/extend the distributed operator, or run with distributed=False "
-            "to force single-node explicitly."
+            f"data. {hint}"
         )
     return _single_node(plan, sources)
 
@@ -674,6 +942,30 @@ def _unsupported(plan: LogicalPlan, sources: list[Source], reason: str):
 # bucket on both sides, so each bucket is an independent ASOF join whose union is the
 # full result. It reuses the equi-join's generic map/reduce tasks verbatim — only the
 # partition keys (`by`) and the reducer IR (`asof_join`) differ.
+
+
+def _require_shared_scratch(op: str) -> None:
+    """Refuse a disk-shuffle-only operator on a multi-node cluster with no shared scratch.
+
+    The disk shuffle hands only *paths* between tasks, so `work_dir` must resolve on every
+    node. Every other operator is steered off disk by `resolve_transport` (which picks
+    Flight the moment the cluster spans more than one node), but `op` has no Flight path, so
+    nothing protects it: a worker would open a driver-local `/tmp` path that does not exist
+    on its own node — a `FileNotFoundError` at best, and silently missing rows if a
+    same-named directory happens to exist there. Fail with the fix instead.
+    """
+    from batcher.dist.shuffle_io import shared_scratch_root
+
+    if shared_scratch_root() is not None or alive_node_count() <= 1:
+        return
+    from batcher._internal.errors import PlanError
+
+    raise PlanError(
+        f"distributed `{op}` uses the disk shuffle, which needs a scratch directory every "
+        "worker node can reach, and this cluster has no shared mount. Point "
+        "`MemoryConfig.spill_dir` at a shared filesystem, or run it single-node "
+        "(`distributed=False`)."
+    )
 
 
 def _asof_reducer_ir(asof: AsofJoin) -> dict:
@@ -702,6 +994,7 @@ def _distributed_asof(
     from batcher.dist.shuffle_io import read_ipc
 
     _ensure_ray(workers)
+    _require_shared_scratch("asof_join")
     cfg_json = engine_config_json()  # driver config → shipped to workers
 
     left_plan, left_sid = _relabel_single_source(asof.left)
@@ -758,15 +1051,17 @@ def _distributed_asof(
         )
 
         batches: list[pa.RecordBatch] = []
-        for p, _rows in result_paths:
-            if p is not None:
-                batches.extend(read_ipc(p))
+        # `_join_reduce_task` yields `(path, rows, ...)` — it grew a trailing metrics field —
+        # so unpack only what this path needs rather than pinning the tuple's arity.
+        for entry in result_paths:
+            path = entry[0]
+            if path is not None:
+                batches.extend(read_ipc(path))
     finally:
         _rmtree(work_dir)
 
     if not batches:
-        names = [o.alias for o in asof.output]
-        result = pa.table({n: pa.array([], pa.null()) for n in names})
+        result = empty_result_table(asof, [o.alias for o in asof.output])
     else:
         result = pa.Table.from_batches(batches)
     return result if not above else _apply_above(above, result)

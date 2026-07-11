@@ -13,6 +13,7 @@ import pytest
 
 import batcher as bt
 from batcher import col, count
+from batcher._internal.errors import PlanError
 
 pytest.importorskip("ray", reason="ray not installed")
 pytest.importorskip("batcher._native", reason="native engine not built")
@@ -1111,3 +1112,452 @@ def test_distributed_empty_limit_result_keeps_its_schema(tmp_path):
     assert single.num_rows == 0 and dist.num_rows == 0
     assert single.schema == dist.schema
     assert [str(f.type) for f in single.schema] == ["int64", "string"]
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_multi_table_join_matches_single_node(tmp_path, transport):
+    """Star/snowflake joins (3 and 4 tables) distribute and equal the single-node result.
+
+    The one-shot dispatcher co-partitions exactly two sources per join, so a join whose
+    operand is itself a join has no single-shot path; `resolve_adaptive` routes these to the
+    staged executor instead of raising. Previously `a.join(b).join(c)` raised `PlanError` on
+    any Parquet source — the canonical analytics shape.
+    """
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(11)
+    n = 30_000
+    fact = pa.table(
+        {"k": rng.integers(0, 40, n).astype("int64"), "v": rng.integers(0, 100, n).astype("int64")}
+    )
+    d1 = pa.table({"k": np.arange(40, dtype="int64"), "d1": (np.arange(40) % 7).astype("int64")})
+    d2 = pa.table({"d1": np.arange(7, dtype="int64"), "d2": (np.arange(7) % 3).astype("int64")})
+    d3 = pa.table({"d2": np.arange(3, dtype="int64"), "label": [f"g{i}" for i in range(3)]})
+    paths = []
+    for name, tbl, rg in [("f", fact, 3_000), ("d1", d1, 5), ("d2", d2, 2), ("d3", d3, 1)]:
+        p = str(tmp_path / f"{name}.parquet")
+        pq.write_table(tbl, p, row_group_size=rg)
+        paths.append(p)
+    pf, p1, p2, p3 = paths
+
+    def read():
+        return (bt.read.parquet(pf), bt.read.parquet(p1), bt.read.parquet(p2), bt.read.parquet(p3))
+
+    def three(f, a, b, _c):
+        return f.join(a, on="k").join(b, on="d1")
+
+    def four(f, a, b, c):
+        return f.join(a, on="k").join(b, on="d1").join(c, on="d2")
+
+    def agg_over_four(f, a, b, c):
+        return four(f, a, b, c).group_by("label").agg(s=col("v").sum())
+
+    for build in (three, four, agg_over_four):
+        single = build(*read()).collect(distributed=False)
+        dist = build(*read()).collect(distributed=True, num_workers=4, transport=transport)
+        assert single.schema == dist.schema
+        assert _norm(single) == _norm(dist)
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_aggregate_over_join_grouped_by_non_key(tmp_path, transport):
+    """An aggregate over a join grouped by a column that is NOT the join key.
+
+    The Flight path folds the partial aggregate into the join's reducers; the disk path has
+    no such fold and used to raise rather than collect the whole join to the driver. It now
+    stages: distributed join (kept partitioned) → distributed aggregate over it.
+    """
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(5)
+    n = 40_000
+    fact = pa.table(
+        {"k": rng.integers(0, 50, n).astype("int64"), "v": rng.integers(0, 100, n).astype("int64")}
+    )
+    dim = pa.table({"k": np.arange(50, dtype="int64"), "grp": (np.arange(50) % 6).astype("int64")})
+    pf = str(tmp_path / "f.parquet")
+    pd_ = str(tmp_path / "d.parquet")
+    pq.write_table(fact, pf, row_group_size=4_000)
+    pq.write_table(dim, pd_, row_group_size=10)
+
+    def q(f, d):
+        return f.join(d, on="k").group_by("grp").agg(s=col("v").sum(), n=count())
+
+    single = q(bt.read.parquet(pf), bt.read.parquet(pd_)).collect(distributed=False)
+    dist = q(bt.read.parquet(pf), bt.read.parquet(pd_)).collect(
+        distributed=True, num_workers=4, transport=transport
+    )
+    assert _norm(single) == _norm(dist)
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_empty_results_keep_their_types(tmp_path, transport):
+    """A filter matching nothing must give the same SCHEMA distributed as single-node.
+
+    A zero-row result still has types. Fabricating `null`-typed placeholder columns made
+    `distributed == single-node` false for every empty result, and any downstream concat /
+    write_parquet / typed projection then broke only on the empty case. The `distinct` shape
+    additionally crashed: a zero-row table has no Arrow batches (pyarrow drops empty chunks)
+    and the post-operator replay built an `InMemorySource` from that empty list.
+    """
+    import pyarrow.parquet as pq
+
+    n = 20_000
+    fact = pa.table(
+        {"k": (np.arange(n) % 50).astype("int64"), "v": (np.arange(n) % 97).astype("int64")}
+    )
+    dim = pa.table({"k": np.arange(50, dtype="int64"), "lbl": [f"g{i}" for i in range(50)]})
+    pf, pd_ = str(tmp_path / "f.parquet"), str(tmp_path / "d.parquet")
+    pq.write_table(fact, pf, row_group_size=2_000)
+    pq.write_table(dim, pd_, row_group_size=10)
+
+    never = col("v") > 10**9
+    shapes = {
+        "aggregate": lambda **k: (
+            bt.read.parquet(pf)
+            .filter(never)
+            .group_by("k")
+            .agg(s=col("v").sum(), n=count())
+            .collect(**k)
+        ),
+        "join": lambda **k: (
+            bt.read.parquet(pf)
+            .filter(col("k") > 10**9)
+            .join(bt.read.parquet(pd_), on="k")
+            .collect(**k)
+        ),
+        "distinct": lambda **k: (
+            bt.read.parquet(pf).filter(never).select("k").distinct().collect(**k)
+        ),
+    }
+    for name, q in shapes.items():
+        single = q(distributed=False)
+        dist = q(distributed=True, num_workers=4, transport=transport)
+        assert single.num_rows == 0 and dist.num_rows == 0, name
+        assert single.schema == dist.schema, f"{name}: {single.schema} != {dist.schema}"
+        assert all(str(f.type) != "null" for f in dist.schema), name
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_sort_by_computed_key_matches_single_node(tmp_path, transport):
+    """`ORDER BY <expression>` distributes by hoisting the key into a hidden column.
+
+    The range partitioner splits on the leading key's *values*, so it needs a column;
+    `df.sort(col("a") + col("b"))` used to raise `PlanError` on any Parquet source. The
+    rewrite materializes the key in the map prefix, partitions on it, and projects it away.
+
+    Oracle: the ordered sequence of KEY values must match single-node exactly, and the rows
+    must be the same multiset. Row order *within* a tie is unspecified for any sort, so an
+    ordered row comparison would not be a valid oracle.
+    """
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(3)
+    n = 30_000
+    t = pa.table(
+        {
+            "a": rng.integers(0, 50, n).astype("int64"),
+            "b": rng.integers(0, 50, n).astype("int64"),
+            "s": [f"n{i % 37}" for i in range(n)],
+        }
+    )
+    path = str(tmp_path / "t.parquet")
+    pq.write_table(t, path, row_group_size=3_000)
+
+    def rowset(tb):
+        return sorted(map(str, tb.to_pylist()))
+
+    cases = [
+        (
+            lambda d: d.sort(col("a") + col("b")),
+            lambda tb: [
+                x + y
+                for x, y in zip(tb.column("a").to_pylist(), tb.column("b").to_pylist(), strict=True)
+            ],
+        ),
+        (
+            lambda d: d.sort(col("a") + col("b"), descending=True),
+            lambda tb: [
+                x + y
+                for x, y in zip(tb.column("a").to_pylist(), tb.column("b").to_pylist(), strict=True)
+            ],
+        ),
+        (
+            lambda d: d.sort(col("a") * 2).filter(col("b") > 10),
+            lambda tb: [x * 2 for x in tb.column("a").to_pylist()],
+        ),
+        (
+            lambda d: d.sort(col("s").str.upper()),
+            lambda tb: [x.upper() for x in tb.column("s").to_pylist()],
+        ),
+        (
+            lambda d: d.sort(col("a") + col("b"), col("b")),
+            lambda tb: [
+                x + y
+                for x, y in zip(tb.column("a").to_pylist(), tb.column("b").to_pylist(), strict=True)
+            ],
+        ),
+    ]
+    for build, keyseq in cases:
+        single = build(bt.read.parquet(path)).collect(distributed=False)
+        dist = build(bt.read.parquet(path)).collect(
+            distributed=True, num_workers=4, transport=transport
+        )
+        assert single.schema == dist.schema  # the hidden sort key never leaks
+        assert "__sort_key" not in dist.column_names
+        assert keyseq(single) == keyseq(dist)  # globally ordered, same key sequence
+        assert rowset(single) == rowset(dist)  # same rows
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_global_window_matches_single_node(tmp_path, transport):
+    """`<agg>(x) OVER ()` — no PARTITION BY, no ORDER BY — distributes as a whole-relation
+    aggregate broadcast: a zero-key mergeable aggregate, then a stateless map that appends
+    the scalar. It used to raise `PlanError` (nothing to hash-shuffle on).
+
+    An *ordered* global window (`row_number() OVER (ORDER BY v)`) needs one global row order
+    and still has no distributed path — it must keep failing loudly, not silently run on one
+    node with a quiet perf cliff.
+    """
+    import pyarrow.parquet as pq
+
+    from batcher import row_number
+
+    rng = np.random.default_rng(9)
+    n = 30_000
+    t = pa.table(
+        {"k": rng.integers(0, 20, n).astype("int64"), "v": rng.integers(0, 100, n).astype("int64")}
+    )
+    path = str(tmp_path / "t.parquet")
+    pq.write_table(t, path, row_group_size=3_000)
+
+    def rowset(tb):
+        return sorted(map(str, tb.to_pylist()))
+
+    cases = [
+        lambda d: d.with_columns(total=col("v").sum().over()),
+        lambda d: d.with_columns(s=col("v").sum().over(), m=col("v").max().over()),
+        lambda d: d.with_columns(a=col("v").mean().over()),
+        lambda d: d.with_columns(t=col("v").sum().over()).with_columns(share=col("v") / col("t")),
+        lambda d: d.with_columns(t=col("v").sum().over("k")),  # partitioned: regression guard
+    ]
+    for build in cases:
+        single = build(bt.read.parquet(path)).collect(distributed=False)
+        dist = build(bt.read.parquet(path)).collect(
+            distributed=True, num_workers=4, transport=transport
+        )
+        assert single.schema == dist.schema
+        assert rowset(single) == rowset(dist)
+
+    # An ordered global window has no distributed path; it must raise, not fall back.
+    with pytest.raises(PlanError):
+        bt.read.parquet(path).with_columns(r=row_number().over(order_by="v")).collect(
+            distributed=True, num_workers=4, transport=transport
+        )
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_provably_empty_relation_runs_everywhere(tmp_path, transport):
+    """Kyber folds a provably-false predicate to `Limit(0)`. Every operator above it must
+    still execute — there is no data to distribute, so one node is the *optimal* plan, not a
+    perf cliff. `window` used to raise, because the folded `Limit` reads as a pipeline
+    breaker and `Window` is not a `_split_at` pass-through.
+    """
+    import pyarrow.parquet as pq
+
+    n = 20_000
+    t = pa.table(
+        {"k": (np.arange(n) % 20).astype("int64"), "v": (np.arange(n) % 97).astype("int64")}
+    )
+    path = str(tmp_path / "t.parquet")
+    pq.write_table(t, path, row_group_size=2_000)
+
+    never = col("v") > 10**9
+    shapes = [
+        lambda d: d.filter(never).sort("v"),
+        lambda d: d.filter(never).select("k").distinct(),
+        lambda d: d.filter(never).with_columns(t=col("v").sum().over("k")),
+        lambda d: d.filter(never).with_columns(t=col("v").sum().over()),
+        lambda d: d.filter(never).group_by("k").agg(s=col("v").sum()),
+        lambda d: d.filter(never).limit(5),
+    ]
+    for build in shapes:
+        single = build(bt.read.parquet(path)).collect(distributed=False)
+        dist = build(bt.read.parquet(path)).collect(
+            distributed=True, num_workers=4, transport=transport
+        )
+        assert dist.num_rows == 0 and single.num_rows == 0
+        assert single.schema == dist.schema
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_breaker_beneath_breaker_is_not_run_per_partition(tmp_path, transport):
+    """A pipeline breaker beneath another breaker must not be run as a per-partition map prefix.
+
+    The aggregate and join executors ship the inner plan to every worker and re-run it against
+    that worker's partition. That is sound only for a map-only prefix. With a breaker inside:
+
+    * `limit(100).group_by(k).agg(count())` kept 100 rows **per partition**, so on 4 workers
+      every count came back 4x too large;
+    * `group_by(k).agg(sum).group_by().agg(max)` handed the outer aggregate per-partition
+      partial groups, so `max` read a partial sum;
+    * `limit(5).join(dim)` returned `workers x 5` rows.
+
+    All three returned WRONG VALUES silently — no error. They are now `requires_staging`, so
+    the inner breaker runs as its own distributed stage first.
+    """
+    import pyarrow.parquet as pq
+
+    n = 20_000
+    t = pa.table(
+        {"k": (np.arange(n) % 20).astype("int64"), "v": (np.arange(n) % 97).astype("int64")}
+    )
+    dim = pa.table({"k": np.arange(20, dtype="int64"), "lbl": [f"g{i}" for i in range(20)]})
+    pm, pd_ = str(tmp_path / "m.parquet"), str(tmp_path / "d.parquet")
+    pq.write_table(t, pm, row_group_size=2_000)
+    pq.write_table(dim, pd_, row_group_size=5)
+
+    def rowset(tb):
+        return sorted(map(str, tb.to_pylist()))
+
+    cases = [
+        lambda: bt.read.parquet(pm).limit(100).group_by("k").agg(n=count()),
+        lambda: bt.read.parquet(pm).limit(100).group_by().agg(s=col("v").sum()),
+        lambda: (
+            bt.read.parquet(pm).group_by("k").agg(s=col("v").sum()).group_by().agg(m=col("s").max())
+        ),
+        lambda: bt.read.parquet(pm).limit(5).join(bt.read.parquet(pd_), on="k"),
+        lambda: bt.read.parquet(pm).limit(100).with_columns(s=col("v").sum().over("k")),
+        lambda: (
+            bt.read.parquet(pm)
+            .limit(200)
+            .group_by("k")
+            .agg(s=col("v").sum())
+            .group_by()
+            .agg(m=col("s").max())
+        ),
+    ]
+    for build in cases:
+        single = build().collect(distributed=False)
+        dist = build().collect(distributed=True, num_workers=4, transport=transport)
+        assert single.num_rows == dist.num_rows
+        assert rowset(single) == rowset(dist)  # VALUES, not just row counts
+
+
+def test_unsound_one_shot_shape_raises_rather_than_returning_wrong_values(tmp_path):
+    """With staging explicitly disabled, a breaker-under-breaker must FAIL, never compute.
+
+    Silently evaluating the inner plan per partition is the wrong-answer bug above; refusing
+    is the only safe one-shot answer, and the error says how to fix it.
+    """
+    import pyarrow.parquet as pq
+
+    n = 5_000
+    t = pa.table(
+        {"k": (np.arange(n) % 20).astype("int64"), "v": (np.arange(n) % 97).astype("int64")}
+    )
+    path = str(tmp_path / "m.parquet")
+    pq.write_table(t, path, row_group_size=1_000)
+
+    with pytest.raises(PlanError, match="stage by stage"):
+        bt.read.parquet(path).limit(100).group_by("k").agg(n=count()).collect(
+            distributed=True, num_workers=4, transport="disk", adaptive=False
+        )
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_row_wise_reshapers_and_row_index(tmp_path, transport):
+    """`unpivot`, `with_row_index`, `with_random` and `tail` distribute exactly.
+
+    `unpivot` (melt) is stateless and row-wise — the neutral `plan.logical.is_streamable`
+    already said so, but the distributed dispatcher kept its own list and had drifted.
+
+    `with_row_index` is a single global counter, so a per-partition run would restart it at
+    zero on every worker. It runs its row-wise input distributed and numbers the rows on the
+    driver, where `_distributed_map` has already assembled the partitions in source order.
+    `with_random` (position-keyed hash) and `tail` (row index + filter) both lower to `RowId`,
+    so all three ride the same path — hence the ordered comparison here.
+    """
+    import pyarrow.parquet as pq
+
+    n = 20_000
+    t = pa.table(
+        {
+            "k": (np.arange(n) % 20).astype("int64"),
+            "v": (np.arange(n) % 97).astype("int64"),
+            "w": (np.arange(n) % 13).astype("int64"),
+        }
+    )
+    path = str(tmp_path / "t.parquet")
+    pq.write_table(t, path, row_group_size=2_000)
+
+    unordered = [lambda d: d.select("k", "v", "w").unpivot(index="k")]
+    ordered = [
+        lambda d: d.with_row_index("i"),
+        lambda d: d.with_row_index("i", offset=100),
+        lambda d: d.with_random("r", seed=7),
+        lambda d: d.tail(10),
+        lambda d: d.with_row_index("i").filter(col("i") < 5),
+    ]
+    for build in unordered:
+        single = build(bt.read.parquet(path)).collect(distributed=False)
+        dist = build(bt.read.parquet(path)).collect(
+            distributed=True, num_workers=4, transport=transport
+        )
+        assert single.schema == dist.schema
+        assert sorted(map(str, single.to_pylist())) == sorted(map(str, dist.to_pylist()))
+    for build in ordered:
+        single = build(bt.read.parquet(path)).collect(distributed=False)
+        dist = build(bt.read.parquet(path)).collect(
+            distributed=True, num_workers=4, transport=transport
+        )
+        assert single.schema == dist.schema  # incl. the index's non-nullable field
+        assert single.to_pydict() == dist.to_pydict()  # row-for-row, in order
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_sample_matches_single_node(tmp_path, transport):
+    """`sample(fraction)` is a per-row predicate — a seeded hash of the row's values — so it
+    distributes exactly. A *fixed-count* `sample(n=)` keeps the `n` smallest-hash rows of the
+    whole relation, so it is a breaker and must NOT run per partition (each worker would keep
+    its own `n`); it stays refused.
+
+    This only holds because projection pushdown no longer prunes columns beneath a `Sample`:
+    the hash reads every column, so a worker that read a pruned scan sampled a different row
+    set than single-node did.
+    """
+    import pyarrow.parquet as pq
+
+    n = 20_000
+    t = pa.table(
+        {
+            "k": (np.arange(n) % 20).astype("int64"),
+            "v": (np.arange(n) % 97).astype("int64"),
+            "w": (np.arange(n) % 13).astype("int64"),
+        }
+    )
+    path = str(tmp_path / "t.parquet")
+    pq.write_table(t, path, row_group_size=2_000)
+
+    def rowset(tb):
+        return sorted(map(str, tb.to_pylist()))
+
+    cases = [
+        lambda d: d.sample(0.1, seed=42),
+        lambda d: d.sample(0.1, seed=42).select("k"),  # projection must not move the sample
+        lambda d: d.sample(0.1, seed=42).group_by("k").agg(s=col("v").sum()),
+        lambda d: d.filter(col("v") > 10).sample(0.2, seed=1),
+    ]
+    for build in cases:
+        single = build(bt.read.parquet(path)).collect(distributed=False)
+        dist = build(bt.read.parquet(path)).collect(
+            distributed=True, num_workers=4, transport=transport
+        )
+        assert single.schema == dist.schema
+        assert rowset(single) == rowset(dist)
+
+    # Fixed-count sample is a breaker: refuse rather than keep `n` rows per worker.
+    with pytest.raises(PlanError):
+        bt.read.parquet(path).sample(n=5, seed=3).collect(
+            distributed=True, num_workers=4, transport=transport
+        )

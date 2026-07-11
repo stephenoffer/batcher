@@ -64,7 +64,10 @@ readers below are explicit. Some connectors need an optional dependency — the
 | Reader | Reads |
 | --- | --- |
 | `bt.read.kafka(topic)` | a Kafka topic as an unbounded streaming source |
-| `bt.read.kinesis(stream)` | an AWS Kinesis stream as an unbounded source |
+| `bt.read.kinesis(stream_name)` | an AWS Kinesis stream as an unbounded source |
+| `bt.read.pulsar(topic)` | an Apache Pulsar topic as an unbounded source |
+| `bt.read.pubsub(subscription)` | a Google Cloud Pub/Sub subscription as an unbounded source |
+| `bt.read.eventhubs(hub)` | an Azure Event Hubs stream as an unbounded source |
 
 ### Multimodal and ML formats
 
@@ -110,3 +113,10 @@ explicit. Each executes the plan and returns a `WriteManifest`.
 | `ds.write.snowflake(table)` | a Snowflake table |
 | `ds.write.sql(...)` | a database table via ADBC / FlightSQL |
 | `ds.write.mongo(...)` | a MongoDB collection |
+
+## See also
+
+- [Reading data](../user-guide/reading-data.md) and [Writing data](../user-guide/writing-data.md):
+  the guided tour of these readers and writers.
+- [Cloud storage](../user-guide/cloud-storage.md): credentials and object-store paths.
+- [Lakehouse](../user-guide/lakehouse.md): Delta, Iceberg, and Hudi tables.

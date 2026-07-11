@@ -315,8 +315,12 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
             node.value_name,
         )
     if isinstance(node, Sample):
-        # Sample preserves the schema; its child needs exactly what's needed above.
-        child = _rewrite(node.input, set(need))
+        # Sample preserves the schema, but it does NOT preserve the ROWS under pruning: a row
+        # is kept iff a seeded hash of ALL its values falls under the fraction, so dropping a
+        # column changes which rows survive. Its child therefore needs its full schema, not
+        # just what is needed above — pruning here made `sample(0.1).select("k")` return a
+        # different row count than `sample(0.1)`.
+        child = _rewrite(node.input, set(node.input.available_columns()))
         return node if child is node.input else Sample(child, node.fraction, node.seed, node.n)
     if isinstance(node, Limit):
         child = _rewrite(node.input, set(need))
@@ -522,7 +526,9 @@ def _visit(node: LogicalPlan, need: set[str], acc: dict[int, list[str]]) -> None
         _visit(node.input, set(node.index) | set(node.on), acc)
 
     elif isinstance(node, Sample):
-        _visit(node.input, set(need), acc)
+        # The sample hash reads every column of its input (see `_rewrite`), so the scan below
+        # must supply them all; pruning to `need` would change which rows are sampled.
+        _visit(node.input, set(node.input.available_columns()), acc)
 
     else:  # pragma: no cover - defensive
         raise TypeError(f"projection pushdown: unhandled node {type(node).__name__}")

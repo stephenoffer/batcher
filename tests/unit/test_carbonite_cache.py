@@ -41,6 +41,23 @@ def test_lru_eviction_keeps_within_budget():
     assert store.used_bytes <= store.max_bytes
 
 
+def test_bulk_eviction_drops_lowest_value_first_and_stays_ordered():
+    # A bulk eviction (budget shrinks to half) must drop the lowest keep-value entries
+    # first, exactly as a per-victim min-scan would — the batched sort is only a speed
+    # change, never a policy change. Equal-value entries evict oldest-first (stable).
+    store = CacheStore(max_bytes=1 << 30)
+    n = 200
+    # Same size, distinct cost so keep-value = (cost + eps) / size is strictly ordered.
+    for i in range(n):
+        store.put(f"k{i}", _table(50), cost=float(i))
+    total = store.used_bytes
+    store._evict_to(total // 2)  # force a bulk eviction
+    survivors = set(store._entries)
+    # The half with the *highest* cost (value) must survive; the cheap half is gone.
+    assert survivors == {f"k{i}" for i in range(n // 2, n)}
+    assert store.used_bytes <= total // 2
+
+
 def test_oversized_entry_is_not_cached():
     big = _table(1000)
     store = CacheStore(max_bytes=big.nbytes // 2)  # the table alone exceeds the budget
@@ -82,6 +99,48 @@ def test_on_pressure_ladder_yields_storage_to_execution():
     assert store.used_bytes <= store.max_bytes // 2
     store.on_pressure(PressureLevel.CRITICAL)  # evict everything
     assert store.used_bytes == 0
+
+
+def test_reserve_invokes_the_pressure_ladder(monkeypatch):
+    """The ladder existed but had no production caller — the two budgets were disjoint.
+
+    `CacheStore` bytes are not accounted against the buffer pool, so a cache sitting at its
+    full `result_cache_max_bytes` silently eats the headroom every other Carbonite decision
+    assumes. `ResourceManager.reserve` — the moment execution asks for memory — now applies
+    the ladder before checking the deficit. Evicting a cache only costs a recompute, so this
+    is result-invariant.
+    """
+    from batcher.carbonite import cache as cache_module
+    from batcher.carbonite.manager import ResourceManager
+
+    one = _table(100).nbytes
+    store = CacheStore(max_bytes=8 * one)
+    monkeypatch.setattr(cache_module, "_result_cache", store)
+    manager = ResourceManager()
+
+    def _refill() -> int:
+        store.clear()
+        for i in range(8):
+            store.put(f"k{i}", _table(100))
+        return store.used_bytes
+
+    # NORMAL must not touch the cache: the common path pays nothing.
+    full = _refill()
+    monkeypatch.setattr(manager._pressure, "classify", lambda: PressureLevel.NORMAL)
+    with manager.reserve(1024):
+        pass
+    assert store.used_bytes == full
+
+    for level, ceiling in (
+        (PressureLevel.ELEVATED, store.max_bytes * 3 // 4),
+        (PressureLevel.SPILL, store.max_bytes // 2),
+        (PressureLevel.CRITICAL, 0),
+    ):
+        _refill()
+        monkeypatch.setattr(manager._pressure, "classify", lambda level=level: level)
+        with manager.reserve(1024):
+            pass
+        assert store.used_bytes <= ceiling, f"cache did not yield at {level.name}"
 
 
 def test_cost_aware_eviction_keeps_expensive_result_over_cheap():
@@ -135,3 +194,19 @@ def test_reserve_reclaims_cache_when_pool_is_tight(monkeypatch):
             with rm.reserve(5000):  # available ~3000 < 5000 → deficit forces reclaim
                 pass
             assert store.used_bytes < before  # storage yielded RAM to execution
+
+
+def test_cache_store_stats_hit_rate():
+    import pyarrow as pa
+
+    from batcher.carbonite.cache import CacheStore
+
+    c = CacheStore(max_bytes=10_000_000)
+    t = pa.table({"x": list(range(100))})
+    c.put("k", t)
+    assert c.get("k") is not None  # hit
+    assert c.get("missing") is None  # miss
+    s = c.stats()
+    assert s["hits"] == 1 and s["misses"] == 1
+    assert s["hit_rate"] == 0.5
+    assert CacheStore(1).stats()["hit_rate"] == 0.0  # cold

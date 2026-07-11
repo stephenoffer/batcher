@@ -21,9 +21,20 @@ ds = bt.from_pydict(
 
 ## group_by and agg
 
-`group_by` takes the grouping keys; `agg` takes the output aggregates as keyword
-arguments. {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; the column aggregates (`.sum()`, `.mean()`,
-and so on) are methods on an expression.
+`group_by` takes the grouping keys; `agg` takes the output aggregates. Pass them as
+keywords to name the output, or positionally to keep the source column's name.
+{py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; the column aggregates are methods
+on an expression (`.sum()`, `.mean()`, …) or the top-level shorthands
+{py:obj}`bt.sum("x") <batcher.sum>`, `bt.mean`, `bt.min`, `bt.max`, `bt.median`,
+`bt.std`, `bt.var`, `bt.n_unique` — where `bt.sum("x")` reads as
+`col("x").sum()` (the Polars `pl.sum` convention).
+
+```python
+# Positional shorthands keep the column name; keywords rename.
+by_user = ds.group_by("category").agg(bt.sum("price"), bt.mean("qty")).sort("category")
+print(by_user.to_pydict())
+# {'category': ['a', 'b'], 'price': [90.0, 60.0], 'qty': [3.0, 3.0]}
+```
 
 ```python
 out = (
@@ -36,11 +47,41 @@ print(out.to_pydict())
 # {'category': ['a', 'b'], 'revenue': [350.0, 200.0], 'orders': [3, 2]}
 ```
 
+## Shortcut reductions
+
+When you reduce *every* value column the same way, the shortcut methods —
+`sum`, `mean`, `min`, `max`, `median`, `quantile(q)`, `n_unique`, `std`, `var`,
+`count` (non-null values per column), and `len` (the per-group row count) — are
+shorter than spelling out `agg`. With no arguments they reduce every non-key
+column, keeping its name; pass column names or a
+[selector](transformations.md) to reduce a subset. The arithmetic reductions
+(`sum`, `mean`, `median`, `quantile`, `std`, `var`) default to numeric columns
+only, like pandas' ``numeric_only``.
+
+```python
+print(ds.group_by("category").sum().sort("category").to_pydict())
+# {'category': ['a', 'b'], 'price': [90.0, 60.0], 'qty': [9, 6]}
+
+print(ds.group_by("category").mean("price").sort("category").to_pydict())
+# {'category': ['a', 'b'], 'price': [30.0, 30.0]}
+
+print(ds.group_by("category").len().sort("category").to_pydict())
+# {'category': ['a', 'b'], 'len': [3, 2]}
+```
+
+`len` counts rows; `count` counts non-null values of each column (they differ only
+when a column has nulls). Reach for `agg` when the reductions differ per column,
+when you want custom output names, or when you need a windowed aggregate or a
+two-column statistic.
+
 ## Aggregate functions
 
 The aggregate methods available inside `agg` are `sum`, `min`, `max`, `mean`,
 `var`, `std`, `median`, `quantile(q)`, `count`, and `n_unique` (also spelled
-`count_distinct`). {py:obj}`bt.count() <batcher.count>` counts rows.
+`count_distinct`). {py:obj}`bt.count() <batcher.count>` counts rows. Each of these
+builds an {py:class}`AggExpr <batcher.AggExpr>` — the aggregate type that `agg(...)`
+consumes and that `.over(...)` lifts into a [window function](window-functions.md);
+you rarely name it directly.
 
 ```python
 stats = ds.group_by("category").agg(
@@ -73,6 +114,34 @@ adv = ds.group_by("category").agg(
 print(adv.to_pydict())
 # {'category': ['a', 'b'], 'any_big': [True, True], 'all_big': [False, False],
 #  'costliest': [50.0, 40.0]}
+```
+
+## Bivariate aggregates
+
+The two-column statistical aggregates summarize how a pair of columns move
+together within each group. {py:obj}`bt.corr(x, y) <batcher.corr>` is the Pearson
+correlation coefficient in `[-1, 1]` (SQL `CORR`); {py:obj}`bt.covar_pop(x, y)
+<batcher.covar_pop>` and {py:obj}`bt.covar_samp(x, y) <batcher.covar_samp>` are the
+population and sample covariance (SQL `COVAR_POP` / `COVAR_SAMP`, dividing by `n`
+and `n - 1` respectively). Reach for `corr` to score the strength and sign of a
+relationship — for instance whether ad spend tracks revenue per region:
+
+```python
+market = bt.from_pydict(
+    {
+        "region": ["west", "west", "west", "east", "east", "east"],
+        "spend": [1.0, 2.0, 3.0, 1.0, 2.0, 3.0],
+        "revenue": [10.0, 20.0, 30.0, 30.0, 20.0, 10.0],
+    }
+)
+bivariate = market.group_by("region").agg(
+    r=bt.corr(bt.col("spend"), bt.col("revenue")),
+    cov_p=bt.covar_pop(bt.col("spend"), bt.col("revenue")),
+    cov_s=bt.covar_samp(bt.col("spend"), bt.col("revenue")),
+).sort("region")
+print(bivariate.to_pydict())
+# {'region': ['east', 'west'], 'r': [-1.0, 1.0],
+#  'cov_p': [-6.666666666666667, 6.666666666666667], 'cov_s': [-10.0, 10.0]}
 ```
 
 ## Approximate aggregates
@@ -154,3 +223,5 @@ print(buckets.to_pydict())
   rows.
 - [Performance and memory](performance.md): cache a reused rollup and spill large
   aggregations.
+- [Expressions API](../api/expressions.md): every aggregate and approximate-aggregate
+  method in one place.

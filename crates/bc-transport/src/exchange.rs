@@ -115,10 +115,26 @@ impl ShuffleExchange {
         advertise_host: Option<&str>,
         token: Option<String>,
     ) -> TransportResult<Self> {
+        Self::bind_tls(bind, advertise_host, token, None).await
+    }
+
+    /// The full secured bind: a shuffle `token` (application-level auth) plus `tls`
+    /// (transport encryption, and mutual authentication when it carries a client CA).
+    ///
+    /// The two layers are independent and complementary: TLS proves *who the peer is*
+    /// and hides the bytes on the wire, while the token authorizes *this shuffle* — a
+    /// leaked cert cannot read another cluster's partitions, and a shared token cannot be
+    /// sniffed off an encrypted link. A cross-untrusted-network deployment wants both.
+    pub async fn bind_tls(
+        bind: &str,
+        advertise_host: Option<&str>,
+        token: Option<String>,
+        tls: Option<crate::TlsServerConfig>,
+    ) -> TransportResult<Self> {
         let store = Arc::new(PartitionStore::default());
         // Reuse FlightServer's binding logic but keep our own handle on the
         // store so publish() can register after the server is running.
-        let server = FlightServer::with_store_and_token(store.clone(), token);
+        let server = FlightServer::with_store_token_tls(store.clone(), token, tls);
         let (addr, handle) = server.serve_on(bind).await?;
         let advertised = match advertise_host {
             Some(host) if !host.is_empty() => format!("{host}:{}", addr.port()),
@@ -177,6 +193,16 @@ impl ShuffleExchange {
     /// never published. Used to verify the credit bound; also useful telemetry.
     pub async fn max_inflight(&self, ticket: &ShuffleTicket) -> Option<i64> {
         self.store.gauge(&ticket.to_string()).await.map(|g| g.max())
+    }
+
+    /// Total credit-grant control messages the consumer sent for `ticket`, or `None`
+    /// if never published. With low-watermark batched refill this is ~`2N/window`
+    /// rather than one-per-batch — the control-message traffic the batching cuts.
+    pub async fn grant_messages(&self, ticket: &ShuffleTicket) -> Option<i64> {
+        self.store
+            .gauge(&ticket.to_string())
+            .await
+            .map(|g| g.grant_messages())
     }
 
     /// Evict one published partition (its reducers have fetched it), freeing it.
@@ -339,9 +365,24 @@ async fn credit_exchange_inner(
 
     let mut response = client.do_exchange(request_stream).await?;
 
-    // Consume the producer's data stream, topping up one credit per consumed batch.
-    // The window stays ~`credits` deep: the producer is allowed to be at most
-    // `credits` batches ahead of what we've pulled.
+    // Consume the producer's data stream, replenishing credits in *low-watermark
+    // batches* rather than one grant per batch. A grant is a control message on the
+    // exchange stream (an mpsc send + a wire frame + a producer-side wakeup and
+    // semaphore top-up); at one per batch it is a fixed per-batch tax that caps a
+    // large shuffle's throughput and burns CPU on both peers. Instead we accumulate
+    // consumed slots and send a single grant once `refill_at` (~half the window) have
+    // freed, cutting control-message traffic by ~`refill_at`x (exactly HTTP/2's
+    // window-update strategy).
+    //
+    // This never loosens the credit bound: total credits granted only ever *lag*
+    // consumption (a grant is deferred, never anticipated), so the producer's
+    // in-flight high-water mark stays <= the initial window — batching can only make
+    // the effective window tighter, never wider. Liveness holds because we refill
+    // after every batch the moment the accumulator crosses the low watermark, and the
+    // watermark is <= half the window, so a blocked producer is always released by the
+    // slots the consumer is still draining (see the crate's flow-control tests).
+    let refill_at = (credits / 2).max(1);
+    let mut pending: u32 = 0;
     let mut batches = Vec::new();
     loop {
         // Idle timeout (C24): a hung/dead peer must not block the reducer forever.
@@ -356,19 +397,23 @@ async fn credit_exchange_inner(
         };
         let Some(batch) = batch else { break };
         batches.push(batch);
-        // Grant one more credit now that a slot has freed up. Use `send().await`
-        // rather than `try_send` (C28) so a momentarily-full control channel never
-        // *drops* a grant — a dropped grant would stall the credit-gated producer.
-        // A closed channel means the producer already finished; that is benign.
-        if grant_tx
-            .send(FlightData {
-                app_metadata: encode_credits(1).into(),
-                ..Default::default()
-            })
-            .await
-            .is_err()
-        {
-            break;
+        // A slot freed. Grant back in bulk once we've drained the low watermark. Use
+        // `send().await` rather than `try_send` (C28) so a momentarily-full control
+        // channel never *drops* a grant — a dropped grant would stall the credit-gated
+        // producer. A closed channel means the producer already finished; benign.
+        pending += 1;
+        if pending >= refill_at {
+            if grant_tx
+                .send(FlightData {
+                    app_metadata: encode_credits(pending).into(),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+            pending = 0;
         }
     }
     Ok(batches)

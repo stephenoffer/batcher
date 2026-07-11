@@ -123,6 +123,23 @@ def test_window_survives_worker_loss(killed):
 
 
 @pytest.mark.parametrize("killed", [{1}, {0, 2}])
+def test_window_survives_worker_loss_during_map(killed):
+    """A worker preempted during the window's map barrier has its row bucket republished on
+    a survivor; the Flight window shuffle still equals single-node."""
+    from batcher.dist.flight_window import execute_window_flight
+
+    t = _data()
+    expected = bt.from_arrow(t).window(partition_by=["k"], functions={"s": ("sum", "v")}).collect()
+
+    ds = bt.from_arrow(t).window(partition_by=["k"], functions={"s": ("sum", "v")})
+    recovered = execute_window_flight(
+        [], ds._plan, ds._sources, workers=4, _fault_inject_map=killed
+    )
+
+    assert _norm(recovered) == _norm(expected)
+
+
+@pytest.mark.parametrize("killed", [{1}, {0, 2}])
 def test_sort_survives_worker_loss_during_map(killed):
     """A worker preempted during the sample/range-publish barriers has its split
     reprocessed on a survivor; the range-sort still produces the global order."""

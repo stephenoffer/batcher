@@ -61,6 +61,10 @@ pub enum WindowFn {
     /// Value of the `offset`-th row (1-based) of the partition in order; null if the
     /// partition has fewer than `offset` rows (SQL `nth_value`).
     NthValue,
+    /// Nearest non-null value at or before the current row of the ordered partition.
+    ForwardFill,
+    /// Nearest non-null value at or after the current row of the ordered partition.
+    BackwardFill,
 }
 
 impl WindowFn {
@@ -82,6 +86,8 @@ impl WindowFn {
             WindowFn::Lag => "lag",
             WindowFn::Lead => "lead",
             WindowFn::NthValue => "nth_value",
+            WindowFn::ForwardFill => "forward_fill",
+            WindowFn::BackwardFill => "backward_fill",
         }
     }
 
@@ -96,7 +102,8 @@ impl WindowFn {
     }
 
     /// Positional "value" functions select a row's value by offset rather than
-    /// reducing the partition; they preserve the input column's type.
+    /// reducing the partition; they preserve the input column's type. The fills select
+    /// by *nullness* rather than by offset, but share the same take-based shape.
     fn is_value(self) -> bool {
         matches!(
             self,
@@ -105,7 +112,14 @@ impl WindowFn {
                 | WindowFn::Lag
                 | WindowFn::Lead
                 | WindowFn::NthValue
+                | WindowFn::ForwardFill
+                | WindowFn::BackwardFill
         )
+    }
+
+    /// The null-carrying functions (`forward_fill`/`backward_fill`).
+    pub(crate) fn is_fill(self) -> bool {
+        matches!(self, WindowFn::ForwardFill | WindowFn::BackwardFill)
     }
 }
 
@@ -308,6 +322,9 @@ fn value_window(
     offset: i64,
     num_rows: usize,
 ) -> Result<ArrayRef, RuntimeError> {
+    if func.is_fill() {
+        return crate::window_fill::fill_window(func, ordered, values, num_rows);
+    }
     let off = offset.max(0) as usize;
     let mut src: Vec<Option<u32>> = vec![None; num_rows];
     for part in ordered {
@@ -321,7 +338,7 @@ fn value_window(
                 // nth_value: the `off`-th row (1-based), same for every row of the
                 // partition; null if the partition is shorter than `off`.
                 WindowFn::NthValue => (off >= 1 && off <= len).then_some(off - 1),
-                _ => unreachable!("value_window on non-value function"),
+                _ => unreachable!("value_window on non-value/non-fill function"),
             };
             src[row] = take_pos.map(|p| part[p] as u32);
         }
@@ -1157,5 +1174,154 @@ mod tests {
         }];
         let out = window(&[part], &[], &funcs, 3).unwrap();
         assert_eq!(floats(&out[0]), vec![1.5, 1.5, 10.0]);
+    }
+
+    // --- forward_fill / backward_fill ------------------------------------------------
+
+    fn opt_i64s(v: &[Option<i64>]) -> ArrayRef {
+        Arc::new(Int64Array::from(v.to_vec()))
+    }
+    fn opt_ints(a: &ArrayRef) -> Vec<Option<i64>> {
+        let x = a.as_any().downcast_ref::<Int64Array>().unwrap();
+        (0..x.len())
+            .map(|i| (!x.is_null(i)).then(|| x.value(i)))
+            .collect()
+    }
+    fn fill(func: WindowFn, part: &[ArrayRef], ord: ArrayRef, vals: ArrayRef) -> Vec<Option<i64>> {
+        let n = vals.len();
+        let funcs = [WindowCall {
+            func,
+            values: Some(vals),
+            offset: 1,
+            frame: None,
+        }];
+        let out = window(part, &[asc(ord)], &funcs, n).unwrap();
+        opt_ints(&out[0])
+    }
+
+    #[test]
+    fn forward_fill_carries_the_last_non_null() {
+        let ord = i64s(&[0, 1, 2, 3, 4]);
+        let vals = opt_i64s(&[Some(1), None, None, Some(4), None]);
+        let got = fill(WindowFn::ForwardFill, &[], ord, vals);
+        assert_eq!(got, vec![Some(1), Some(1), Some(1), Some(4), Some(4)]);
+    }
+
+    #[test]
+    fn backward_fill_carries_the_next_non_null() {
+        let ord = i64s(&[0, 1, 2, 3, 4]);
+        let vals = opt_i64s(&[None, Some(2), None, None, Some(5)]);
+        let got = fill(WindowFn::BackwardFill, &[], ord, vals);
+        assert_eq!(got, vec![Some(2), Some(2), Some(5), Some(5), Some(5)]);
+    }
+
+    #[test]
+    fn leading_nulls_have_nothing_to_carry_and_stay_null() {
+        let ord = i64s(&[0, 1, 2]);
+        let vals = opt_i64s(&[None, None, Some(3)]);
+        assert_eq!(
+            fill(WindowFn::ForwardFill, &[], ord.clone(), vals.clone()),
+            vec![None, None, Some(3)]
+        );
+        // ... and symmetrically, trailing nulls under a backward fill.
+        let vals = opt_i64s(&[Some(1), None, None]);
+        assert_eq!(
+            fill(WindowFn::BackwardFill, &[], ord, vals),
+            vec![Some(1), None, None]
+        );
+    }
+
+    #[test]
+    fn an_all_null_partition_stays_all_null() {
+        let ord = i64s(&[0, 1]);
+        let vals = opt_i64s(&[None, None]);
+        assert_eq!(
+            fill(WindowFn::ForwardFill, &[], ord, vals),
+            vec![None, None]
+        );
+    }
+
+    #[test]
+    fn a_fill_never_crosses_a_partition_boundary() {
+        // Two series interleaved in arrival order. `b`'s leading null must NOT pick up
+        // `a`'s value — that is the bug a naive whole-relation scan would ship.
+        let part = strs(&["a", "b", "a", "b"]);
+        let ord = i64s(&[0, 0, 1, 1]);
+        let vals = opt_i64s(&[Some(10), None, None, Some(20)]);
+        let got = fill(WindowFn::ForwardFill, &[part], ord, vals);
+        assert_eq!(got, vec![Some(10), None, Some(10), Some(20)]);
+    }
+
+    #[test]
+    fn the_fill_follows_the_order_key_not_arrival_order() {
+        // Rows arrive out of order; the fill must respect ORDER BY t.
+        let ord = i64s(&[2, 0, 1]);
+        let vals = opt_i64s(&[None, Some(7), None]);
+        let got = fill(WindowFn::ForwardFill, &[], ord, vals);
+        // t=0 -> 7, t=1 -> 7 (row 2), t=2 -> 7 (row 0).
+        assert_eq!(got, vec![Some(7), Some(7), Some(7)]);
+    }
+
+    #[test]
+    fn a_fill_is_the_identity_where_the_column_is_non_null() {
+        let ord = i64s(&[0, 1, 2]);
+        let vals = opt_i64s(&[Some(1), Some(2), Some(3)]);
+        assert_eq!(
+            fill(WindowFn::ForwardFill, &[], ord.clone(), vals.clone()),
+            vec![Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(
+            fill(WindowFn::BackwardFill, &[], ord, vals),
+            vec![Some(1), Some(2), Some(3)]
+        );
+    }
+
+    #[test]
+    fn fill_is_type_generic() {
+        let ord = i64s(&[0, 1, 2]);
+        let vals: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("c")]));
+        let funcs = [WindowCall {
+            func: WindowFn::ForwardFill,
+            values: Some(vals),
+            offset: 1,
+            frame: None,
+        }];
+        let out = window(&[], &[asc(ord)], &funcs, 3).unwrap();
+        let s = out[0].as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            (0..3).map(|i| s.value(i)).collect::<Vec<_>>(),
+            vec!["a", "a", "c"]
+        );
+    }
+
+    /// The parallel bucket path hash-partitions on the PARTITION BY keys, so a fill —
+    /// which carries state along a partition — must be identical to the serial kernel.
+    #[test]
+    fn parallel_matches_serial_for_fills() {
+        let n = 600usize;
+        let part = i64s(&(0..n as i64).map(|i| i % 40).collect::<Vec<_>>());
+        let ord = i64s(
+            &(0..n as i64)
+                .map(|i| (i * 7 + 13) % 100)
+                .collect::<Vec<_>>(),
+        );
+        // Every third row is null, so each partition has real gaps to carry across.
+        let vals = opt_i64s(
+            &(0..n as i64)
+                .map(|i| (i % 3 != 0).then_some(i * 2 - 5))
+                .collect::<Vec<_>>(),
+        );
+        for func in [WindowFn::ForwardFill, WindowFn::BackwardFill] {
+            let funcs = [WindowCall {
+                func,
+                values: Some(vals.clone()),
+                offset: 1,
+                frame: None,
+            }];
+            let order = [asc(ord.clone())];
+            let serial = window_with(&[part.clone()], &order, &funcs, n, usize::MAX).unwrap();
+            let parallel = window_with(&[part.clone()], &order, &funcs, n, 1).unwrap();
+            assert_eq!(opt_ints(&serial[0]), opt_ints(&parallel[0]), "{func:?}");
+        }
     }
 }

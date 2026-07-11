@@ -368,6 +368,23 @@
       "name": "b"
     }
   },
+  "list_simhash": {
+    "e": "list_simhash",
+    "input": {
+      "e": "col",
+      "name": "v"
+    },
+    "num_bits": 64
+  },
+  "list_simhash_seeded": {
+    "e": "list_simhash",
+    "input": {
+      "e": "col",
+      "name": "v"
+    },
+    "num_bits": 64,
+    "seed": 3
+  },
   "list_slice_full": {
     "e": "list_slice",
     "input": {

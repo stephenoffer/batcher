@@ -13,11 +13,11 @@ the non-file sources (in-memory, streaming-iterator) plus the `Source` protocol.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from typing import Protocol, runtime_checkable
 
 import pyarrow as pa
 
 from batcher.io.formats import SOURCES, CSVSource, JSONSource, ParquetSource
+from batcher.io.source.base import Checkpointable, Source, is_checkpointable
 from batcher.io.splits import IpcFileSplit, Split, WholeSourceSplit
 from batcher.plan.source_stats import SourceStatistics
 
@@ -130,77 +130,6 @@ def read_source(
     return [pa.RecordBatch.from_pylist([], schema=schema)]
 
 
-@runtime_checkable
-class Source(Protocol):
-    """A lazily-readable relation.
-
-    `bounded` (default ``True``) marks whether the source is finite. Unbounded
-    sources (Kafka and other brokers, incremental file discovery) set it ``False``
-    so terminal operations choose a streaming path and `collect()` refuses to
-    materialize an infinite stream. Read it via `is_bounded` to honor the default.
-    """
-
-    bounded: bool
-
-    def schema(self) -> pa.Schema:
-        """The full schema of the source, without reading the data."""
-        ...
-
-    def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        """Read the source, optionally only `projection` columns."""
-        ...
-
-    def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        """Yield record batches lazily (the streaming read path)."""
-        ...
-
-    def row_count(self) -> int | None:
-        """The number of rows, if known cheaply without reading data (else None)."""
-        ...
-
-    def identity(self) -> str:
-        """A stable identifier for this source (for keyed metadata/learning)."""
-        ...
-
-    # Optional (duck-typed via `source_statistics`): a connector may also expose
-    #   def statistics(self) -> SourceStatistics | None
-    # returning footer/manifest/catalog row counts and per-column min/max/null/ndv
-    # known without scanning. Sources that don't implement it fall back to
-    # `row_count()`. Not a required Protocol method so `runtime_checkable` still
-    # accepts the many sources that predate it.
-
-    def splits(self, target_size: int | None = None) -> list[Split]:
-        """Independently-readable slices for distributed/parallel reads.
-
-        A source that cannot subdivide returns a single `WholeSourceSplit`.
-        """
-        ...
-
-    # Optional (duck-typed via `is_checkpointable`): a *replayable* streaming source
-    # may also expose
-    #   def snapshot_position(self) -> dict        # what it has read through
-    #   def seek(self, position: dict) -> None     # resume from a recorded position
-    # so a streaming query can checkpoint offsets and resume exactly-once after a
-    # restart (Kafka offsets, Kinesis sequence numbers, a rate cursor). Not required
-    # Protocol methods, so non-replayable sources are simply at-least-once.
-
-
-@runtime_checkable
-class Checkpointable(Protocol):
-    """A streaming source whose read position can be snapshotted and resumed."""
-
-    def snapshot_position(self) -> dict: ...
-
-    def seek(self, position: dict) -> None: ...
-
-
-def is_checkpointable(source: Source) -> bool:
-    """Whether `source` supports offset snapshot/seek for exactly-once recovery."""
-    return callable(getattr(source, "snapshot_position", None)) and callable(
-        getattr(source, "seek", None)
-    )
-
-
 # Overflow-safe narrow → wide numeric widenings the engine normalizes to at the FFI
 # boundary anyway (Int8/16/32, UInt8/16/32 → Int64; Float16/32 → Float64). Doing it once
 # here — instead of the Rust boundary re-casting on *every* query — turns a per-query
@@ -235,10 +164,15 @@ class InMemorySource:
     ``shrink_output_dtypes`` is on — that opt-in path re-narrows pass-through outputs from
     the source widths, which pre-widening would erase — so that path keeps the Rust
     boundary as the (correctness-equivalent) fallback.
+
+    `zone_maps=False` drops the O(rows) column-bounds pass in `statistics()`, leaving the
+    exact row count. Pass it for a relation the engine produced and consumes exactly once (an
+    adaptive stage boundary), whose bounds would be rebuilt and discarded every run.
     """
 
     __slots__ = (
         "_batches",
+        "_bounds_cache",
         "_cache",
         "_mean_cache",
         "_ndv_cache",
@@ -247,6 +181,7 @@ class InMemorySource:
         "_sum_cache",
         "_targets",
         "_valuecount_cache",
+        "_zone_maps",
     )
     bounded = True
     # The batches are already in RAM, so a statistics pass over them costs no I/O. The
@@ -255,18 +190,19 @@ class InMemorySource:
     # learns its ndv from the batches a run already scanned, rather than re-reading them.
     resident = True
     # `identity()` is shape-based for in-memory data (see `identity`), so two *different*
-    # in-memory relations that share a schema+size collide on it. That is fine for the
-    # optimizer's shape keys, but NOT for the cross-query source-stats cache, whose entries
-    # (row count, column min/max) depend on the actual data. So in-memory stats are never
-    # stored under the shared identity — they are memoized per instance in `statistics()`.
+    # in-memory relations sharing a schema+size collide on it. Fine for the optimizer's shape
+    # keys, but NOT for the cross-query source-stats cache, whose entries (row count, column
+    # min/max) depend on the actual data — so in-memory stats are never stored under the
+    # shared identity; they are memoized per instance in `statistics()`.
     stable_stats_identity = False
 
-    def __init__(self, batches: list[pa.RecordBatch]) -> None:
+    def __init__(self, batches: list[pa.RecordBatch], *, zone_maps: bool = True) -> None:
         if not batches:
             raise ValueError("InMemorySource requires at least one record batch")
         from batcher.config import active_config
 
         self._batches = batches
+        self._zone_maps = zone_maps
         src_schema = batches[0].schema
         if active_config().execution.shrink_output_dtypes:
             self._targets: dict[str, pa.DataType] = {}
@@ -280,6 +216,7 @@ class InMemorySource:
         self._mean_cache: dict[str, float | None] = {}
         self._sum_cache: dict[str, float | int | None] = {}
         self._valuecount_cache: dict[tuple[str, str, object], int | None] = {}
+        self._bounds_cache: dict[str, object] = {}
 
     def schema(self) -> pa.Schema:
         return self._schema
@@ -313,6 +250,23 @@ class InMemorySource:
             self._sum_cache[name] = inmemory_stats.column_sum(self._build_column, name)
         return self._sum_cache[name]
 
+    def column_bounds(self, name: str):
+        """EXACT `ColumnStat` (min/max/null-count) of `name`, computed once and cached.
+
+        The single-column form of `statistics()`: the conductor requests bounds only for
+        the columns a query's predicate references, so a filter over one column of a wide
+        relation scans that column alone instead of every column (see
+        `api.source_stats.collect_source_stats`). `None` for a non-ordered / all-null
+        column, exactly as `statistics()` skips it."""
+        if name not in self._bounds_cache:
+            from batcher.io.source import inmemory_stats
+
+            field = self._schema.field(name)
+            self._bounds_cache[name] = inmemory_stats.column_bounds(
+                self._build_column, field.type, name
+            )
+        return self._bounds_cache[name]
+
     def column_predicate_count(self, op: str, name: str, value: object) -> int | None:
         """EXACT surviving count of ``name <op> value`` (nulls excluded), cached per key.
 
@@ -333,12 +287,16 @@ class InMemorySource:
         An in-memory relation is immutable, so its column bounds are exact and constant; the
         one vectorized pass (memoized per instance) lets Kyber answer an unfiltered
         ``MIN``/``MAX`` from metadata on every subsequent run — the learned-metadata moat a
-        static optimizer can't match. See `io.inmemory_stats` for the computation.
+        static optimizer can't match. See `io.inmemory_stats` for the computation. The pass
+        is O(rows), so it pays for itself only on a relation queried more than once;
+        `zone_maps=False` reports the row count alone (see the constructor).
         """
         if self._stats is None:
+            rows = sum(b.num_rows for b in self._batches)
+            if not self._zone_maps:
+                return SourceStatistics(row_count=rows)
             from batcher.io.source import inmemory_stats
 
-            rows = sum(b.num_rows for b in self._batches)
             self._stats = inmemory_stats.statistics(self._build_column, self._schema, rows)
         return self._stats
 

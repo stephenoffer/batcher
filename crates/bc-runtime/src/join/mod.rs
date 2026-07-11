@@ -30,8 +30,8 @@ mod sort_merge;
 mod stream;
 
 pub use asof::asof_join_indices;
-pub use stream::BroadcastProbe;
 pub use sort_merge::sort_merge_join_indices;
+pub use stream::BroadcastProbe;
 
 /// False-positive rate for the probe-side runtime bloom (see [`use_probe_bloom_with`]).
 /// At 1% a bloom costs ~1.2 bytes/key — far less than the ~9 bytes/entry chained
@@ -94,6 +94,76 @@ pub enum JoinType {
 pub struct JoinIndices {
     pub left: UInt32Array,
     pub right: UInt32Array,
+}
+
+/// The sentinel an [`IndexBuf`] stores for a NULL join index.
+///
+/// A real row index can never reach it: indices are already `u32`, so a relation of
+/// `u32::MAX` rows would have overflowed the join long before this. Asserted on push.
+const NULL_INDEX: u32 = u32::MAX;
+
+/// One side's join indices under construction — a flat `Vec<u32>` with a NULL sentinel.
+///
+/// The obvious `Vec<Option<u32>>` is **eight bytes per output row**, and there are two of
+/// them: a 60 M-row join writes 960 MB of scratch, then `UInt32Array::from` reads it all
+/// back to build a 240 MB values buffer and a bitmap. On a probe loop that is already
+/// memory-bandwidth bound, that is most of a gigabyte of traffic spent encoding a null
+/// that inner joins never emit.
+///
+/// Storing `u32` with a sentinel halves the scratch, and `finish` skips the null buffer
+/// entirely when nothing null was ever pushed — which is every inner join, the dominant
+/// analytical shape. `any_null` is a single branch-free `|=` on the hot path.
+#[derive(Default)]
+pub(crate) struct IndexBuf {
+    idx: Vec<u32>,
+    any_null: bool,
+}
+
+impl IndexBuf {
+    pub(crate) fn with_capacity(rows: usize) -> Self {
+        Self {
+            idx: Vec::with_capacity(rows),
+            any_null: false,
+        }
+    }
+
+    /// Append a real row index.
+    #[inline]
+    fn push(&mut self, row: u32) {
+        debug_assert_ne!(row, NULL_INDEX, "row index collides with the NULL sentinel");
+        self.idx.push(row);
+    }
+
+    /// Append a NULL (an unmatched outer row, or the unused side of a semi/anti join).
+    #[inline]
+    fn push_null(&mut self) {
+        self.idx.push(NULL_INDEX);
+        self.any_null = true;
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.idx.len()
+    }
+
+    /// The Arrow column. No null buffer is built unless a NULL was actually pushed.
+    pub(crate) fn finish(self) -> UInt32Array {
+        if !self.any_null {
+            return UInt32Array::from(self.idx);
+        }
+        self.idx
+            .into_iter()
+            .map(|v| (v != NULL_INDEX).then_some(v))
+            .collect()
+    }
+}
+
+impl JoinIndices {
+    pub(crate) fn from_bufs(left: IndexBuf, right: IndexBuf) -> Self {
+        Self {
+            left: left.finish(),
+            right: right.finish(),
+        }
+    }
 }
 
 /// Compute join output indices from the (pre-evaluated) key columns of each side.
@@ -459,8 +529,8 @@ impl JoinTable {
         range: std::ops::Range<usize>,
         left_null: &[bool],
         join_type: JoinType,
-        left_out: &mut Vec<Option<u32>>,
-        right_out: &mut Vec<Option<u32>>,
+        left_out: &mut IndexBuf,
+        right_out: &mut IndexBuf,
         mut right_matched: Option<&mut [bool]>,
     ) {
         let emit_left_unmatched = matches!(join_type, JoinType::Left | JoinType::Full);
@@ -469,14 +539,14 @@ impl JoinTable {
             match join_type {
                 JoinType::Semi => {
                     if head.is_some() {
-                        left_out.push(Some(i as u32));
-                        right_out.push(None);
+                        left_out.push(i as u32);
+                        right_out.push_null();
                     }
                 }
                 JoinType::Anti => {
                     if head.is_none() {
-                        left_out.push(Some(i as u32));
-                        right_out.push(None);
+                        left_out.push(i as u32);
+                        right_out.push_null();
                     }
                 }
                 _ => match head {
@@ -486,8 +556,8 @@ impl JoinTable {
                             if let Some(rm) = right_matched.as_deref_mut() {
                                 rm[r as usize] = true;
                             }
-                            left_out.push(Some(i as u32));
-                            right_out.push(Some(r));
+                            left_out.push(i as u32);
+                            right_out.push(r);
                             let nxt = self.next[r as usize];
                             if nxt == u32::MAX {
                                 break;
@@ -497,8 +567,8 @@ impl JoinTable {
                     }
                     None => {
                         if emit_left_unmatched {
-                            left_out.push(Some(i as u32));
-                            right_out.push(None);
+                            left_out.push(i as u32);
+                            right_out.push_null();
                         }
                     }
                 },
@@ -573,8 +643,8 @@ fn radix_join_scalar<O: Copy + std::hash::Hash + Eq + Send + Sync>(
 
     // One table, reused per partition (each partition's build rows are disjoint).
     let mut heads: HashTable<u32> = HashTable::with_capacity(RADIX_PART_ROWS);
-    let mut left_out: Vec<Option<u32>> = Vec::with_capacity(probe_rows);
-    let mut right_out: Vec<Option<u32>> = Vec::with_capacity(probe_rows);
+    let mut left_out = IndexBuf::with_capacity(probe_rows);
+    let mut right_out = IndexBuf::with_capacity(probe_rows);
     for (b, probe) in build_parts.iter().zip(&probe_parts) {
         join_partition_into(
             b,
@@ -588,10 +658,7 @@ fn radix_join_scalar<O: Copy + std::hash::Hash + Eq + Send + Sync>(
     }
     emit_null_probe_unmatched(probe_null, join_type, &mut left_out, &mut right_out);
 
-    JoinIndices {
-        left: UInt32Array::from(left_out),
-        right: UInt32Array::from(right_out),
-    }
+    JoinIndices::from_bufs(left_out, right_out)
 }
 
 /// Parallel cache-radix join for the broadcast path: one [`JoinIndices`] per partition,
@@ -617,8 +684,8 @@ fn radix_join_scalar_parallel<O: Copy + std::hash::Hash + Eq + Send + Sync>(
         .zip(probe_parts.par_iter())
         .map(|(b, probe)| {
             let mut heads: HashTable<u32> = HashTable::with_capacity(b.len());
-            let mut left_out: Vec<Option<u32>> = Vec::with_capacity(probe.len());
-            let mut right_out: Vec<Option<u32>> = Vec::with_capacity(probe.len());
+            let mut left_out = IndexBuf::with_capacity(probe.len());
+            let mut right_out = IndexBuf::with_capacity(probe.len());
             join_partition_into(
                 b,
                 probe,
@@ -628,21 +695,15 @@ fn radix_join_scalar_parallel<O: Copy + std::hash::Hash + Eq + Send + Sync>(
                 &mut left_out,
                 &mut right_out,
             );
-            JoinIndices {
-                left: UInt32Array::from(left_out),
-                right: UInt32Array::from(right_out),
-            }
+            JoinIndices::from_bufs(left_out, right_out)
         })
         .collect();
     // Null-key probe rows (Left/Anti keep them as unmatched) — one extra piece.
-    let mut left_out = Vec::new();
-    let mut right_out = Vec::new();
+    let mut left_out = IndexBuf::default();
+    let mut right_out = IndexBuf::default();
     emit_null_probe_unmatched(probe_null, join_type, &mut left_out, &mut right_out);
-    if !left_out.is_empty() {
-        out.push(JoinIndices {
-            left: UInt32Array::from(left_out),
-            right: UInt32Array::from(right_out),
-        });
+    if left_out.len() > 0 {
+        out.push(JoinIndices::from_bufs(left_out, right_out));
     }
     out
 }
@@ -676,8 +737,8 @@ fn radix_partition<O: Copy + std::hash::Hash + Eq + Send + Sync>(
     // Both scatters run histogram → prefix-sum → parallel write (`join::radix`), which
     // reproduces the serial `push` loop's per-partition row order exactly while spreading
     // the pass — the join's dominant sequential prefix — across every worker.
-    let build_parts = radix::partition_side(&build_key, build_null, parts, &part_of);
-    let probe_parts = radix::partition_side(&probe_key, probe_null, parts, &part_of);
+    let build_parts = radix::partition_side(&build_key, build_null, parts, part_of);
+    let probe_parts = radix::partition_side(&probe_key, probe_null, parts, part_of);
     let _ = probe_rows; // row counts arrive via the null masks; kept for a symmetric signature
     (state, build_parts, probe_parts)
 }
@@ -692,8 +753,8 @@ fn join_partition_into<O: Copy + std::hash::Hash + Eq>(
     state: &ahash::RandomState,
     join_type: JoinType,
     heads: &mut HashTable<u32>,
-    left_out: &mut Vec<Option<u32>>,
-    right_out: &mut Vec<Option<u32>>,
+    left_out: &mut IndexBuf,
+    right_out: &mut IndexBuf,
 ) {
     let hash = |k: &O| state.hash_one(k);
     let emit_left_unmatched = matches!(join_type, JoinType::Left);
@@ -720,14 +781,14 @@ fn join_partition_into<O: Copy + std::hash::Hash + Eq>(
         let head = heads.find(hash(&k), |&s| b[s as usize].0 == k).copied();
         match head {
             Some(_) if is_semi => {
-                left_out.push(Some(labs));
-                right_out.push(None);
+                left_out.push(labs);
+                right_out.push_null();
             }
             Some(mut s) => {
                 if !is_anti {
                     loop {
-                        left_out.push(Some(labs));
-                        right_out.push(Some(b[s as usize].1));
+                        left_out.push(labs);
+                        right_out.push(b[s as usize].1);
                         let nxt = next_local[s as usize];
                         if nxt == u32::MAX {
                             break;
@@ -738,8 +799,8 @@ fn join_partition_into<O: Copy + std::hash::Hash + Eq>(
             }
             None => {
                 if emit_left_unmatched || is_anti {
-                    left_out.push(Some(labs));
-                    right_out.push(None);
+                    left_out.push(labs);
+                    right_out.push_null();
                 }
             }
         }
@@ -751,14 +812,14 @@ fn join_partition_into<O: Copy + std::hash::Hash + Eq>(
 fn emit_null_probe_unmatched(
     probe_null: &[bool],
     join_type: JoinType,
-    left_out: &mut Vec<Option<u32>>,
-    right_out: &mut Vec<Option<u32>>,
+    left_out: &mut IndexBuf,
+    right_out: &mut IndexBuf,
 ) {
     if matches!(join_type, JoinType::Left | JoinType::Anti) {
         for (l, &is_null) in probe_null.iter().enumerate() {
             if is_null {
-                left_out.push(Some(l as u32));
-                right_out.push(None);
+                left_out.push(l as u32);
+                right_out.push_null();
             }
         }
     }
@@ -781,8 +842,8 @@ fn build_probe_flat<K: JoinKeys>(
 
     // Probe with the left side. Pre-size outputs to the left row count — the lower
     // bound for inner/left; outer and duplicate-key cases grow from there.
-    let mut left_out: Vec<Option<u32>> = Vec::with_capacity(left_rows);
-    let mut right_out: Vec<Option<u32>> = Vec::with_capacity(left_rows);
+    let mut left_out = IndexBuf::with_capacity(left_rows);
+    let mut right_out = IndexBuf::with_capacity(left_rows);
     let emit_right_unmatched = matches!(join_type, JoinType::Right | JoinType::Full);
     let mut right_matched = emit_right_unmatched.then(|| vec![false; right_rows]);
 
@@ -801,16 +862,13 @@ fn build_probe_flat<K: JoinKeys>(
         // match nothing (NULL != NULL) but are still part of the right relation.
         for (r, matched) in right_matched.iter().enumerate() {
             if !matched {
-                left_out.push(None);
-                right_out.push(Some(r as u32));
+                left_out.push_null();
+                right_out.push(r as u32);
             }
         }
     }
 
-    JoinIndices {
-        left: UInt32Array::from(left_out),
-        right: UInt32Array::from(right_out),
-    }
+    JoinIndices::from_bufs(left_out, right_out)
 }
 
 /// Build the hash table over the right (build) side **once**, then probe the left
@@ -865,8 +923,8 @@ pub fn broadcast_hash_join_indices(
             ranges
                 .par_iter()
                 .map(|r| {
-                    let mut left_out: Vec<Option<u32>> = Vec::with_capacity(r.len());
-                    let mut right_out: Vec<Option<u32>> = Vec::with_capacity(r.len());
+                    let mut left_out = IndexBuf::with_capacity(r.len());
+                    let mut right_out = IndexBuf::with_capacity(r.len());
                     table.probe_range(
                         &$keys,
                         r.clone(),
@@ -876,10 +934,7 @@ pub fn broadcast_hash_join_indices(
                         &mut right_out,
                         None,
                     );
-                    JoinIndices {
-                        left: UInt32Array::from(left_out),
-                        right: UInt32Array::from(right_out),
-                    }
+                    JoinIndices::from_bufs(left_out, right_out)
                 })
                 .collect()
         }};
@@ -958,6 +1013,44 @@ mod tests {
 
     fn keys(v: &[i64]) -> Vec<ArrayRef> {
         vec![Arc::new(Int64Array::from(v.to_vec())) as ArrayRef]
+    }
+
+    /// An inner join emits no NULL index, so `finish` must build no null buffer — that is
+    /// where the halved traffic comes from. And a buffer that *did* see a NULL must
+    /// reproduce it exactly, sentinel and all.
+    #[test]
+    fn index_buf_encodes_nulls_without_paying_for_them() {
+        let mut inner = IndexBuf::with_capacity(3);
+        inner.push(0);
+        inner.push(7);
+        inner.push(NULL_INDEX - 1); // the largest index that is not the sentinel
+        let arr = inner.finish();
+        assert_eq!(arr.null_count(), 0);
+        assert!(
+            arr.nulls().is_none(),
+            "an inner join must build no null buffer"
+        );
+        assert_eq!(arr.values(), &[0, 7, NULL_INDEX - 1]);
+
+        let mut outer = IndexBuf::default();
+        outer.push(5);
+        outer.push_null();
+        outer.push(6);
+        let arr = outer.finish();
+        assert_eq!(arr.null_count(), 1);
+        assert!(arr.is_null(1));
+        assert_eq!((arr.value(0), arr.value(2)), (5, 6));
+    }
+
+    /// An empty buffer is an empty column, not a panic.
+    #[test]
+    fn index_buf_finishes_empty() {
+        assert_eq!(IndexBuf::default().finish().len(), 0);
+        let mut only_null = IndexBuf::default();
+        only_null.push_null();
+        let arr = only_null.finish();
+        assert_eq!(arr.len(), 1);
+        assert!(arr.is_null(0));
     }
 
     fn pairs(idx: &JoinIndices) -> Vec<(Option<u32>, Option<u32>)> {

@@ -52,13 +52,23 @@ def parquet_row_group_bounds(
     """
     import pyarrow.parquet as pq
 
+    from batcher.io._concurrent import read_each_file
+
     want = set(columns) if columns is not None else None
-    out: list[RowGroupBounds] = []
-    for path in files:
+
+    def _meta(filesystem: Any, path: str) -> Any:
         try:
-            with fs.open(path) as fh:
-                meta = pq.ParquetFile(fh).metadata
+            with filesystem.open(path) as fh:
+                return pq.ParquetFile(fh).metadata
         except Exception:
+            return None  # unreadable footer → skipped below (best-effort pruning)
+
+    # Read every footer concurrently (each is one round trip); the bounds accumulation
+    # below is cheap CPU work kept serial. Order preserved so pruning is deterministic.
+    metas = read_each_file(fs, files, _meta)
+    out: list[RowGroupBounds] = []
+    for path, meta in zip(files, metas, strict=True):
+        if meta is None:
             continue
         names = meta.schema.names
         for rg in range(meta.num_row_groups):

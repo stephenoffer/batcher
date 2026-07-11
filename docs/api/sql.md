@@ -36,13 +36,13 @@ shape of a query:
 
 | Clause / feature | Notes |
 | --- | --- |
-| `SELECT` | Column lists, derived expressions, `AS` aliases, `*`. |
+| `SELECT` | Column lists, derived expressions, `AS` aliases, `*`, the `* EXCLUDE (…)` / `* REPLACE (… AS c)` / `* RENAME (c AS d)` star modifiers, and `COLUMNS(*)` / `COLUMNS('regex')` dynamic columns (including `func(COLUMNS(...))`). |
 | `WHERE` | Boolean predicates over scalar expressions. |
-| `GROUP BY` | With aggregates in the projection; `ROLLUP` / `CUBE` / `GROUPING SETS`. |
+| `GROUP BY` | With aggregates in the projection; `ROLLUP` / `CUBE` / `GROUPING SETS`. Positional `GROUP BY <n>` refers to a `SELECT` item. |
 | `HAVING` | Filters on aggregated results. |
-| `ORDER BY` | `ASC` / `DESC`. |
+| `ORDER BY` | `ASC` / `DESC`, `NULLS FIRST` / `NULLS LAST` (default `NULLS LAST`), and positional `ORDER BY <n>`. |
 | `LIMIT` / `OFFSET` | Row caps, with optional row skip. |
-| `JOIN` | Inner, left, right, full, and cross joins on equi-keys; an extra non-equi `AND` condition is applied as a filter on the join result. |
+| `JOIN` | Inner, left, right, full, cross, and `NATURAL` joins on equi-keys (`ON` / `USING` / shared columns); an extra non-equi `AND` condition is applied as a filter on the join result. |
 | Set operations | `UNION` / `UNION ALL`, `INTERSECT`, `EXCEPT`. |
 | `WITH` | Common table expressions (CTEs). |
 | Subqueries | Derived tables, `IN` / `NOT IN`, `EXISTS` / `NOT EXISTS`, correlated scalar subqueries. |
@@ -96,6 +96,40 @@ out = bt.sql(
 print(out.to_pydict())
 # {'tier': ['low', 'low', 'high', 'high', 'high'],
 #  'amount_int': [10, 20, 30, 40, 50]}
+```
+
+### Star modifiers
+
+`SELECT *` accepts DuckDB's modifiers, so a wide table needs no exhaustive column
+list to drop, rewrite, or rename a few columns. `EXCLUDE (…)` omits columns,
+`REPLACE (expr AS c)` swaps a column's expression in place, and `RENAME (c AS d)`
+renames one — each keeps every other column in its original position.
+
+```python
+out = bt.sql(
+    "SELECT * EXCLUDE (id) REPLACE (amount * 2 AS amount) FROM events ORDER BY category, amount",
+    events=events,
+)
+print(out.to_pydict())
+# {'category': ['a', 'a', 'a', 'b', 'b'], 'amount': [20.0, 60.0, 100.0, 40.0, 80.0]}
+```
+
+`ORDER BY` places nulls last by default (matching DuckDB); write `NULLS FIRST` or
+`NULLS LAST` per key to control it explicitly.
+
+### Dynamic columns with COLUMNS(...)
+
+DuckDB's `COLUMNS(*)` and `COLUMNS('regex')` project a set of columns chosen at plan
+time, and a function applied to `COLUMNS(...)` runs on each matched column — so a
+wide-table transform needs no exhaustive column list.
+
+```python
+metrics = bt.from_pydict(
+    {"day": ["mon", "tue"], "sales_us": [10, 20], "sales_eu": [30, 40]}
+)
+out = bt.sql("SELECT day, COLUMNS('sales_.*') * 2 FROM metrics", metrics=metrics)
+print(out.to_pydict())
+# {'day': ['mon', 'tue'], 'sales_us': [20, 40], 'sales_eu': [60, 80]}
 ```
 
 ### Joins
@@ -206,5 +240,6 @@ print(out.to_pydict())
 
 ## Next steps
 
+- [SQL user guide](../user-guide/sql.md): a guided tour with runnable queries.
 - [Dataset](dataset.md): the DataFrame surface SQL lowers to.
 - [Expressions](expressions.md): the scalar functions available in projections.

@@ -82,6 +82,57 @@ pub fn read_parquet(
     runtime().block_on(read_parquet_async(uri, row_groups, columns, batch_size))
 }
 
+/// How many whole files to read concurrently in a batched multi-file read. A
+/// many-small-files scan is latency-bound on per-file footer+chunk GETs, so overlapping
+/// files (on top of each file's own row-group concurrency) is the throughput lever.
+fn file_concurrency() -> usize {
+    static C: OnceLock<usize> = OnceLock::new();
+    *C.get_or_init(|| {
+        std::env::var("BATCHER_PARQUET_FILE_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(64)
+    })
+}
+
+/// Read many whole Parquet objects in ONE runtime pass, returning per-file batches in URI
+/// order. This is the many-small-files throughput path: calling [`read_parquet`] once per
+/// file pays a `block_on` + GIL round trip and a fresh future per file, serializing at the
+/// FFI boundary; here all files' footer + column-chunk GETs overlap under one global
+/// concurrency budget (`BATCHER_PARQUET_FILE_CONCURRENCY`), decoded on the shared runtime.
+/// Each file reads all row-groups with the projection pushed into the decode.
+pub fn read_parquet_many(
+    uris: &[String],
+    columns: Option<&[String]>,
+    batch_size: usize,
+) -> Result<Vec<Vec<RecordBatch>>, IoError> {
+    runtime().block_on(async {
+        // Each file is `tokio::spawn`ed onto the runtime's worker pool — NOT merely
+        // `buffered`, which polls futures cooperatively on the calling thread and would
+        // serialize the CPU-bound Parquet decode (only overlapping the I/O). A shared
+        // semaphore caps how many run at once; results are joined back in URI order.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(file_concurrency()));
+        let handles: Vec<_> = uris
+            .iter()
+            .map(|uri| {
+                let uri = uri.clone();
+                let cols = columns.map(<[String]>::to_vec);
+                let sem = sem.clone();
+                tokio::spawn(async move {
+                    let _permit = sem.acquire_owned().await;
+                    read_parquet_async(&uri, &[], cols.as_deref(), batch_size).await
+                })
+            })
+            .collect();
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(h.await.map_err(|e| IoError::Store(e.to_string()))??);
+        }
+        Ok(out)
+    })
+}
+
 /// Process-wide cache of parsed Parquet footers, keyed by URI: `(file_size, metadata)`.
 /// Parquet files are write-once, so the footer is immutable and safe to cache. This is
 /// the "never read the same metadata twice" guarantee: multiple splits of one file, and

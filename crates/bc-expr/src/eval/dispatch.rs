@@ -220,6 +220,14 @@ impl Expr {
                 let arr = input.eval(batch)?;
                 eval_list_get(&arr, *index)
             }
+            Expr::ListSimhash {
+                input,
+                num_bits,
+                seed,
+            } => {
+                let arr = input.eval(batch)?;
+                crate::eval::list_ops::eval_list_simhash(&arr, *num_bits, *seed)
+            }
             Expr::StructField { input, field } => {
                 let arr = input.eval(batch)?;
                 eval_struct_field(&arr, field)

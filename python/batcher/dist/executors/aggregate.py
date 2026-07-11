@@ -14,15 +14,15 @@ import pyarrow as pa
 
 from batcher.dist.executors.partition_io import (
     _apply_above,
-    _empty_agg_table,
     _partition_source,
     source_pushdown,
 )
-from batcher.dist.executors.plan_analysis import _relabel_single_source
+from batcher.dist.executors.plan_analysis import _empty_agg_table, _relabel_single_source
 from batcher.dist.executors.ray_runtime import (
     _ensure_ray,
     _rmtree,
     engine_config_json,
+    record_worker_metrics,
     shuffle_partitions,
 )
 from batcher.io.source import Source
@@ -101,7 +101,7 @@ def _distributed_aggregate(
         # not single-node-only). Best-effort, by operator kind.
         map_results = gather_with_backups(map_refs, _map_for, pol)
         shuffle_paths = [paths for paths, _metrics in map_results]
-        _record_worker_metrics(hub, (m for _paths, m in map_results), metrics_out)
+        record_worker_metrics(hub, (m for _paths, m in map_results), metrics_out)
 
         # REDUCE: each reducer combines+finalizes the partials routed to it.
         def _reduce_for(r: int):
@@ -140,32 +140,6 @@ def _distributed_aggregate(
     return _apply_above(above, agg_table)
 
 
-def _record_worker_metrics(hub, metrics_jsons, metrics_out=None) -> None:
-    """Record distributed workers' sub-plan metrics into the hub (driver side).
-
-    Calibration buckets by operator kind, so the workers' sub-plan-local op_ids need
-    no global correlation. When `metrics_out` is given, each worker's parsed op-list is
-    also appended to it — the channel the conductor's `QueryProfile` uses to surface the
-    distributed map sub-plan (a separate op-id space, shown as its own section). Best-effort
-    — never breaks a query."""
-    import contextlib
-    import json
-
-    from batcher.config import active_config
-
-    morsel_rows = active_config().execution.morsel_rows
-    for metrics_json in metrics_jsons:
-        if not metrics_json:
-            continue
-        if hub is not None:
-            from batcher import core
-
-            core.record_exec_metrics(hub, metrics_json, morsel_rows)
-        if metrics_out is not None:
-            with contextlib.suppress(ValueError, TypeError):
-                metrics_out.append(json.loads(metrics_json).get("ops", []))
-
-
 def _map_task(
     map_ir,
     group_keys_json,
@@ -181,13 +155,12 @@ def _map_task(
 
     import batcher._native as nat
     from batcher.dist.executors.partition_io import read_partition
+    from batcher.dist.executors.ray_runtime import execute_metered
     from batcher.dist.shuffle_io import write_ipc
 
     # Metered: the worker measures its sub-plan's per-operator runtime facts and
     # ships them back so the driver can feed the cost-model calibration loop.
-    rows, metrics_json = nat.execute_plan_metered(
-        map_ir, [read_partition(part_path)], engine_config
-    )
+    rows, metrics_json = execute_metered(map_ir, [read_partition(part_path)], engine_config)
     partial = nat.partial_aggregate(group_keys_json, aggregates_json, rows)
 
     if n_keys == 0:

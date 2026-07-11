@@ -12,10 +12,11 @@ import sys
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
-from batcher._sql.parser.core_utils import _has_aggregate, _unwrap_alias
+from batcher._sql.parser.core_utils import _has_aggregate, _positional, _unwrap_alias
 from batcher.api.dataset import Dataset
 from batcher.api.session import from_arrow
 from batcher.plan.expr_ir import lit
+from batcher.plan.schema import suggest_columns
 
 
 def _bool_agg_to_filter(node):
@@ -147,7 +148,16 @@ def _select(tr, node) -> Dataset:
             ds = ds.select(**named)
 
     # SELECT DISTINCT: dedup the projected rows.
-    if node.args.get("distinct"):
+    distinct = node.args.get("distinct")
+    if distinct is not None:
+        if distinct.args.get("on") is not None:
+            # DISTINCT ON (keys) keeps one row per key (chosen by ORDER BY), not a
+            # full-row dedup — silently running a plain DISTINCT would drop the wrong
+            # rows. Not yet supported; reject rather than mislead.
+            raise NotImplementedError(
+                "SELECT DISTINCT ON (...) is not supported; use GROUP BY or a window "
+                "function (row_number() ... QUALIFY) to keep one row per key"
+            )
         ds = ds.distinct()
 
     if limit is not None or offset is not None:
@@ -189,9 +199,21 @@ def _from(tr, node) -> Dataset:
         right = _table(tr, join.this)
         on = join.args.get("on")
         using = join.args.get("using")
+        natural = (join.args.get("method") or "").upper() == "NATURAL"
         how = (join.side or "inner").lower()  # "" → inner; "LEFT" → left; "FULL" → full
         how = how if how in {"inner", "left", "right", "full"} else "inner"
-        if using:
+        if natural:
+            # NATURAL JOIN is USING every column the two sides share, in left order.
+            # (Without it we would fall through to the cross-join branch and silently
+            # return a cartesian product.)
+            keys = [c for c in ds.columns if c in set(right.columns)]
+            if not keys:
+                raise PlanError(
+                    "NATURAL JOIN needs at least one shared column name between the "
+                    f"two relations; left has {ds.columns}, right has {right.columns}"
+                )
+            ds = ds.join(right, on=keys, how=how)
+        elif using:
             keys = [u.name for u in using]
             ds = ds.join(right, on=keys, how=how)
         elif on is None:
@@ -321,6 +343,16 @@ def _table(tr, node) -> Dataset:
 
     from batcher._sql.parser import udf
 
+    # A PIVOT / UNPIVOT modifier on the table reshapes it; sqlglot attaches it as
+    # `pivots` and we do not apply it, so honoring it would silently return the
+    # unpivoted base table. Reject rather than mislead. (The relational `pivot` /
+    # `unpivot` Dataset methods are the supported path.)
+    if getattr(node, "args", None) and node.args.get("pivots"):
+        kind = "UNPIVOT" if node.args["pivots"][0].args.get("unpivot") else "PIVOT"
+        raise NotImplementedError(
+            f"SQL {kind} is not supported; use the Dataset.{kind.lower()}(...) method"
+        )
+
     # FROM f(t) — a registered table function (`f` wraps the relation argument).
     if isinstance(node, exp.Table) and isinstance(node.this, exp.Anonymous):
         fname = node.this.name
@@ -339,7 +371,10 @@ def _table(tr, node) -> Dataset:
     else:
         name = node.name
         if name not in tr._registry:
-            raise KeyError(f"unknown table {name!r}; registered: {list(tr._registry)}")
+            known = list(tr._registry)
+            raise PlanError(
+                f"unknown table {name!r}; registered: {known}{suggest_columns(name, known)}"
+            )
         ds = tr._registry[name]
     return _apply_tablesample(ds, node)
 
@@ -373,10 +408,14 @@ def _order(tr, ds: Dataset, order, projections=None) -> Dataset:
 
     keys: list = []
     desc: list[bool] = []
+    nulls_first: list[bool] = []
     for o in order.expressions:
         target = o.this
         if projections is not None and isinstance(target, exp.Literal) and not target.is_string:
-            target = _unwrap_alias(projections[int(target.this) - 1])
+            target = _unwrap_alias(_positional(projections, target, "ORDER BY"))
         keys.append(tr._scalar(target))
         desc.append(bool(o.args.get("desc")))
-    return ds.sort(*keys, descending=desc)
+        # sqlglot normalizes an absent NULLS clause to `nulls_first=False`, which is
+        # exactly the SQL default this engine (and DuckDB) use for both ASC and DESC.
+        nulls_first.append(bool(o.args.get("nulls_first")))
+    return ds.sort(*keys, descending=desc, nulls_first=nulls_first)

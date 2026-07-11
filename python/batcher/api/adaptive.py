@@ -50,7 +50,14 @@ class AdaptiveResult:
     stages: int
 
 
-def resolve_adaptive(adaptive: bool | str, plan: LogicalPlan, sources: list[Source], hub) -> bool:
+def resolve_adaptive(
+    adaptive: bool | str,
+    plan: LogicalPlan,
+    sources: list[Source],
+    hub,
+    *,
+    distributed: bool = False,
+) -> bool:
     """Resolve ``adaptive="auto"`` to a concrete on/off decision.
 
     ``"auto"`` (the default) turns stage-by-stage re-optimization on *only* when it
@@ -61,9 +68,19 @@ def resolve_adaptive(adaptive: bool | str, plan: LogicalPlan, sources: list[Sour
     confidently sized — from source statistics, sketches, or a prior run — gains nothing
     from the extra per-stage materialization, so it stays on the cheaper one-shot path
     (zero adaptive overhead). An explicit ``True``/``False`` always wins.
+
+    When `distributed`, ``"auto"`` ALSO turns it on for a shape the one-shot dispatcher
+    cannot route at all — a join whose operand already spans two sources (every 3+-table
+    star/snowflake query), which used to raise `PlanError`. There staging is not an
+    optimization but the only distributed path. Explicit ``adaptive=False`` still wins.
     """
     if adaptive != "auto":
         return bool(adaptive)
+    if distributed:
+        from batcher.dist import requires_staging
+
+        if requires_staging(plan):
+            return True
     # The cold heuristic (a join over a breaker-produced, guessed-size operand) fires on
     # the first run. Once history exists, ALSO enable for any signature whose measured
     # re-optimization actually *flipped* a plan often enough — a shape whose estimates the
@@ -312,6 +329,8 @@ def _execute_adaptive(
     from batcher.config import active_config
 
     reopt_error = active_config().optimizer.reoptimize_error
+    from batcher.dist import requires_staging  # lazy: ray is optional
+
     try:
         while True:
             target = _lowest_breaker(plan)
@@ -334,9 +353,8 @@ def _execute_adaptive(
             # An intermediate whose measured size missed its estimate is exactly a stage
             # where re-optimizing on the real cardinality can flip a downstream choice —
             # learn that this signature benefits from staying adaptive.
-            if isinstance(result, pa.Table) and not _estimate_accurate(
-                result.num_rows, est_rows, reopt_error
-            ):
+            measured = _stage_row_count(result)
+            if measured is not None and not _estimate_accurate(measured, est_rows, reopt_error):
                 flipped = True
             # Splice a Scan over the breaker's result (exact-size) for the rest of the
             # plan. A `MaterializedSource` is scanned in place; a collected table is
@@ -359,8 +377,14 @@ def _execute_adaptive(
             # would re-plan to the same shape, so finish in one shot and stop breaking the
             # pipeline. Single-node (collected-table) path only; a distributed partitioned
             # intermediate stays adaptive and keeps measuring each stage.
-            if isinstance(result, pa.Table) and _estimate_accurate(
-                result.num_rows, est_rows, reopt_error
+            #
+            # Never shortcut while the *residual* plan still has no one-shot distributed
+            # path (a 4+-table bushy join) — the dispatcher would refuse it. The early exit
+            # may skip re-optimization, never the staging the plan structurally requires.
+            if (
+                isinstance(result, pa.Table)
+                and _estimate_accurate(result.num_rows, est_rows, reopt_error)
+                and not (distributed and requires_staging(plan))
             ):
                 break
 
@@ -427,16 +451,35 @@ def _as_table(result: pa.Table | Source, node: LogicalPlan) -> pa.Table:
     return _table(list(result.iter_batches()), node)
 
 
+def _stage_row_count(result: pa.Table | Source) -> int | None:
+    """A stage's measured output rows, or `None` when the count is not known exactly.
+
+    A distributed stage parks a `MaterializedSource`/`FlightMaterializedSource`, not a
+    `pa.Table`; both carry an exact `row_count` from their reduce tasks. Reading only
+    `pa.Table.num_rows` silently skipped the estimate-accuracy check on the distributed
+    path, so `learned_adaptive_helps` could never turn on for a distributed shape.
+    """
+    if isinstance(result, pa.Table):
+        return result.num_rows
+    row_count = getattr(result, "row_count", None)
+    return row_count() if callable(row_count) else None
+
+
 def _stage_source(result: pa.Table | Source) -> tuple[Source, SchemaRef]:
     """A source + schema to splice in for the next stage's scan over `result`.
 
     A `MaterializedSource` is passed through (scanned in place, shared-nothing); a
     collected table is wrapped as an `InMemorySource` (its exact `row_count` still
     feeds the optimizer).
+
+    The wrap asks for no zone maps: this relation lives for one stage, so an O(rows)
+    min/max pass over it would be recomputed and discarded on every run of the query —
+    at sf10 that was 130-200 ms per collect, 13-17% of TPC-H Q9. The measured
+    `row_count`, which is what re-optimization actually reads, costs nothing.
     """
     if isinstance(result, pa.Table):
         batches = result.to_batches() or [pa.RecordBatch.from_pylist([], schema=result.schema)]
-        return InMemorySource(batches), SchemaRef.from_arrow(result.schema)
+        return InMemorySource(batches, zone_maps=False), SchemaRef.from_arrow(result.schema)
     return result, SchemaRef.from_arrow(result.schema())
 
 

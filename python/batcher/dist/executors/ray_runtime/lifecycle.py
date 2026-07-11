@@ -309,8 +309,13 @@ def _single_node(plan: LogicalPlan, sources: list[Source]) -> pa.Table:
         for i, src in enumerate(sources)
     ]
     batches = core.execute_local(physical, resolved)
-    schema = batches[0].schema if batches else None
-    return pa.Table.from_batches(batches, schema=schema)
+    if not batches:
+        # `Table.from_batches([], schema=None)` raises, and a null-typed guess would make an
+        # empty result's schema differ from a non-empty one. The plan knows its own types.
+        from batcher.dist.executors.plan_analysis import empty_result_table
+
+        return empty_result_table(plan, plan.available_columns())
+    return pa.Table.from_batches(batches, schema=batches[0].schema)
 
 
 def _rmtree(path: str) -> None:

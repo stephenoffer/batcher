@@ -24,6 +24,41 @@ def test_aimd_starts_at_default_window():
     assert _aimd(default_credits=4).window == 4
 
 
+def test_credit_ceiling_shrinks_for_wide_learned_rows():
+    # C9: the credit→bytes conversion assumes a `morsel_bytes` batch. When the learned
+    # row width fills a `morsel_rows` batch to far more than that (embeddings/blobs), the
+    # ceiling must hand out fewer credits so the channel's buffered bytes stay in budget.
+    from batcher.carbonite.base import ResourceContext
+    from batcher.carbonite.memory.learned import LearnedMemoryModel
+    from batcher.carbonite.policies import (
+        StaticCreditFlowControl,
+        _learned_channel_morsel_bytes,
+        credit_ceiling,
+    )
+
+    cfg = Config().replace(
+        flow_control=FlowControlConfig(
+            default_credits=64, credit_ceiling_factor=8, credit_byte_budget=64 << 20
+        )
+    )
+    narrow = credit_ceiling(cfg)  # byte bound at the assumed morsel_bytes
+    wide_model = LearnedMemoryModel(
+        _bytes_per_row={"aggregate": 2000.0},  # 2 KB/row → a morsel is ~32 MB, not 1 MB
+        _alpha=0.5,
+        _clamp=4.0,
+        _row_bytes=8,
+        _spill_per_row={},
+    )
+    ctx = ResourceContext(config=cfg, memory_model=wide_model)
+    eff = _learned_channel_morsel_bytes(ctx)
+    assert eff is not None and eff > cfg.execution.morsel_bytes
+    assert credit_ceiling(cfg, eff) < narrow
+    # The static policy grants the tighter window for the wide-row channel.
+    wide_grant = StaticCreditFlowControl().grant(1000, ctx)
+    narrow_grant = StaticCreditFlowControl().grant(1000, ResourceContext(config=cfg))
+    assert wide_grant < narrow_grant
+
+
 def test_aimd_grows_additively_when_uncongested():
     a = _aimd(default_credits=4, aimd_alpha=1)
     assert a.observe(congested=False) == 5

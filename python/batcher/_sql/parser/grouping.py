@@ -7,10 +7,12 @@ their first argument.
 
 from __future__ import annotations
 
-from batcher._sql.parser.core_utils import _alias_of, _unwrap_alias
+from batcher._internal.errors import PlanError
+from batcher._sql.parser.core_utils import _alias_of, _positional, _unwrap_alias
 from batcher._sql.parser.literals import _AGG_FUNCS
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import AggExpr, Expr, col
+from batcher.plan.expr_ir.selectors import expand_selectors, has_selector
 
 
 def _grouping_sets_union(tr, node, group) -> Dataset:
@@ -79,6 +81,45 @@ def _grouping_level_node(node, active: set[str], every: set[str]):
     return m
 
 
+def _expand_star(tr, star, visible: list[str]) -> dict[str, Expr]:
+    """Expand `SELECT *` with DuckDB's star modifiers into name -> expression.
+
+    Supports `EXCLUDE`/`EXCEPT (cols)` (drop columns), `REPLACE (expr AS c)`
+    (substitute a column's expression, keeping its position), and `RENAME (c AS d)`
+    (rename in place). A modifier this translator cannot express is rejected rather
+    than silently dropped — ignoring one would return the wrong columns.
+    """
+    if star.args.get("ilike") is not None:
+        raise PlanError(
+            "SELECT * ILIKE is not supported; list the columns explicitly or use "
+            "EXCLUDE / REPLACE / RENAME"
+        )
+
+    excluded = {c.name for c in star.args.get("except_") or ()}
+    replaced = {a.alias: _unwrap_alias(a) for a in star.args.get("replace") or ()}
+    renamed = {a.this.name: a.alias for a in star.args.get("rename") or ()}
+
+    for label, referenced in (
+        ("EXCLUDE", excluded),
+        ("REPLACE", set(replaced)),
+        ("RENAME", set(renamed)),
+    ):
+        unknown = sorted(referenced - set(visible))
+        if unknown:
+            raise PlanError(
+                f"SELECT * {label} names unknown column(s) {unknown}; available: {visible}"
+            )
+
+    out: dict[str, Expr] = {}
+    for c in visible:
+        if c in excluded:
+            continue
+        # REPLACE keeps the column's name and position, swapping its expression.
+        # RENAME keeps the expression, swapping the output name.
+        out[renamed.get(c, c)] = tr._scalar(replaced[c]) if c in replaced else col(c)
+    return out
+
+
 def _projection_map(tr, ds: Dataset, projections) -> dict[str, Expr]:
     from sqlglot import expressions as exp
 
@@ -88,18 +129,26 @@ def _projection_map(tr, ds: Dataset, projections) -> dict[str, Expr]:
         # all current columns. (Qualified `t.*` expands to every column; in a
         # single-table query that is exactly t's columns.)
         if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star)):
+            star = p if isinstance(p, exp.Star) else p.this
             # Internal columns materialized by UDF hoisting (`__bc_…`) are an
             # implementation detail and must never leak through `*`.
-            for c in ds.columns:
-                if not c.startswith("__bc_"):
-                    named[c] = col(c)
+            visible = [c for c in ds.columns if not c.startswith("__bc_")]
+            named.update(_expand_star(tr, star, visible))
             continue
         alias = _alias_of(p)
         if tr._is_window(p):
             # The window pass already materialized this column under `alias`.
             named[alias] = col(alias)
+            continue
+        expr = tr._scalar(_unwrap_alias(p))
+        if has_selector(expr):
+            # A `COLUMNS(*)` / `COLUMNS('regex')` item (possibly wrapped in a scalar
+            # function) expands to one output per matched column, named by that column
+            # — reusing the DataFrame selector engine.
+            visible = [c for c in ds.columns if not c.startswith("__bc_")]
+            named.update(expand_selectors(expr, visible, ds._plan.available_schema()))
         else:
-            named[alias] = tr._scalar(_unwrap_alias(p))
+            named[alias] = expr
     return named
 
 
@@ -122,7 +171,7 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
         for i, g in enumerate(group.expressions):
             # GROUP BY <n> refers to the n-th (1-based) SELECT item.
             if isinstance(g, exp.Literal) and not g.is_string:
-                g = _unwrap_alias(projections[int(g.this) - 1])
+                g = _unwrap_alias(_positional(projections, g, "GROUP BY"))
             # GROUP BY <select-alias> of a derived expression resolves to that expression
             # (skip when the alias just re-names a same-named column — that's a real key).
             if isinstance(g, exp.Column) and g.name in select_aliases:

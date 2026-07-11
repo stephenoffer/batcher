@@ -41,6 +41,15 @@ class StandardScaler(Preprocessor):
     mergeable `mean` aggregate. A constant column (zero variance) scales by 1.0
     (the column becomes its centered value), never dividing by zero.
 
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import StandardScaler
+            >>> ds = bt.from_pydict({"x": [1.0, 3.0]})
+            >>> StandardScaler(["x"]).fit_transform(ds).to_pydict()
+            {'x': [-1.0, 1.0]}
+
     Args:
         columns: the numeric columns to standardize (replaced in place).
         with_mean: subtract the mean (center) when True.
@@ -59,6 +68,26 @@ class StandardScaler(Preprocessor):
         self.scale_: dict[str, float] = {}
 
     def fit(self, ds: Dataset) -> StandardScaler:
+        """Learn each column's mean and population standard deviation from `ds`.
+
+        Both come from one mergeable pass: `mean_[c]` is ``E[x]`` and `scale_[c]` is
+        ``sqrt(E[x^2] - E[x]^2)`` (1.0 for a zero-variance column).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import StandardScaler
+                >>> pre = StandardScaler(["x"]).fit(bt.from_pydict({"x": [1.0, 3.0]}))
+                >>> pre.mean_, pre.scale_
+                ({'x': 2.0}, {'x': 1.0})
+
+        Args:
+            ds: The dataset to compute the per-column mean and std from.
+
+        Returns:
+            ``self``, fitted.
+        """
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__m"] = col(c).mean()
@@ -75,6 +104,27 @@ class StandardScaler(Preprocessor):
         return self
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Replace each column with its standardized value ``(x - mean) / std``.
+
+        Uses the statistics learned in `fit`; only the fitted columns are rewritten,
+        all others pass through unchanged.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import StandardScaler
+                >>> ds = bt.from_pydict({"x": [1.0, 3.0]})
+                >>> pre = StandardScaler(["x"]).fit(ds)
+                >>> pre.transform(bt.from_pydict({"x": [2.0, 4.0]})).to_pydict()
+                {'x': [0.0, 2.0]}
+
+        Args:
+            ds: The dataset to standardize.
+
+        Returns:
+            A new lazy `Dataset` with the fitted columns standardized in place.
+        """
         self._require_fitted()
         new = {}
         for c in self.columns:
@@ -92,6 +142,19 @@ class MinMaxScaler(Preprocessor):
 
     ``x' = (x - min) / (max - min) * (hi - lo) + lo``. A constant column maps to
     `lo` (range collapses), never dividing by zero.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import MinMaxScaler
+            >>> ds = bt.from_pydict({"x": [0.0, 5.0, 10.0]})
+            >>> MinMaxScaler(["x"]).fit_transform(ds).to_pydict()
+            {'x': [0.0, 0.5, 1.0]}
+
+    Args:
+        columns: the numeric columns to scale (replaced in place).
+        feature_range: the ``(lo, hi)`` target range (``hi`` must exceed ``lo``).
     """
 
     __slots__ = ("columns", "data_max_", "data_min_", "feature_range")
@@ -108,6 +171,25 @@ class MinMaxScaler(Preprocessor):
         self.data_max_: dict[str, float] = {}
 
     def fit(self, ds: Dataset) -> MinMaxScaler:
+        """Learn each column's min and max from `ds` (one mergeable aggregate).
+
+        Stored as `data_min_[c]` / `data_max_[c]`; `transform` reads them as constants.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import MinMaxScaler
+                >>> pre = MinMaxScaler(["x"]).fit(bt.from_pydict({"x": [0.0, 5.0, 10.0]}))
+                >>> pre.data_min_, pre.data_max_
+                ({'x': 0.0}, {'x': 10.0})
+
+        Args:
+            ds: The dataset to compute the per-column min and max from.
+
+        Returns:
+            ``self``, fitted.
+        """
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__min"] = col(c).min()
@@ -122,6 +204,23 @@ class MinMaxScaler(Preprocessor):
         return self
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Rescale each fitted column into ``feature_range`` in place.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import MinMaxScaler
+                >>> ds = bt.from_pydict({"x": [0.0, 5.0, 10.0]})
+                >>> MinMaxScaler(["x"]).fit(ds).transform(ds).to_pydict()
+                {'x': [0.0, 0.5, 1.0]}
+
+        Args:
+            ds: The dataset to rescale.
+
+        Returns:
+            A new lazy `Dataset` with the fitted columns rescaled in place.
+        """
         self._require_fitted()
         lo, hi = self.feature_range
         new = {}
@@ -140,6 +239,18 @@ class MaxAbsScaler(Preprocessor):
 
     ``x' = x / max(|x|)``; preserves sparsity (no centering). An all-zero column is
     left unchanged (scale 1.0).
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import MaxAbsScaler
+            >>> ds = bt.from_pydict({"x": [-2.0, 1.0, 4.0]})
+            >>> MaxAbsScaler(["x"]).fit_transform(ds).to_pydict()
+            {'x': [-0.5, 0.25, 1.0]}
+
+    Args:
+        columns: the numeric columns to scale (replaced in place).
     """
 
     __slots__ = ("columns", "max_abs_")
@@ -149,6 +260,26 @@ class MaxAbsScaler(Preprocessor):
         self.max_abs_: dict[str, float] = {}
 
     def fit(self, ds: Dataset) -> MaxAbsScaler:
+        """Learn each column's maximum absolute value from `ds`.
+
+        Computed as ``max(|min|, |max|)`` (stored in `max_abs_`) so `fit` reuses the
+        mergeable min/max aggregates.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import MaxAbsScaler
+                >>> pre = MaxAbsScaler(["x"]).fit(bt.from_pydict({"x": [-2.0, 1.0, 4.0]}))
+                >>> pre.max_abs_
+                {'x': 4.0}
+
+        Args:
+            ds: The dataset to compute each column's max absolute value from.
+
+        Returns:
+            ``self``, fitted.
+        """
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__min"] = col(c).min()
@@ -164,6 +295,23 @@ class MaxAbsScaler(Preprocessor):
         return self
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Divide each fitted column by its max absolute value in place.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import MaxAbsScaler
+                >>> ds = bt.from_pydict({"x": [-2.0, 1.0, 4.0]})
+                >>> MaxAbsScaler(["x"]).fit(ds).transform(ds).to_pydict()
+                {'x': [-0.5, 0.25, 1.0]}
+
+        Args:
+            ds: The dataset to scale.
+
+        Returns:
+            A new lazy `Dataset` with the fitted columns scaled into ``[-1, 1]``.
+        """
         self._require_fitted()
         new = {}
         for c in self.columns:
@@ -176,6 +324,19 @@ class RobustScaler(Preprocessor):
     """Scale columns by the median and interquartile range (outlier-robust).
 
     ``x' = (x - median) / (q75 - q25)``. A zero-IQR column scales by 1.0.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import RobustScaler
+            >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0]})
+            >>> RobustScaler(["x"]).fit_transform(ds).to_pydict()
+            {'x': [-1.0, -0.5, 0.0, 0.5, 1.0]}
+
+    Args:
+        columns: the numeric columns to scale (replaced in place).
+        quantile_range: the ``(lo, hi)`` percentiles bounding the IQR (default 25/75).
     """
 
     __slots__ = ("center_", "columns", "iqr_", "quantile_range")
@@ -192,6 +353,27 @@ class RobustScaler(Preprocessor):
         self.iqr_: dict[str, float] = {}
 
     def fit(self, ds: Dataset) -> RobustScaler:
+        """Learn each column's median (`center_`) and interquartile range (`iqr_`).
+
+        Both come from one mergeable quantile aggregate; a zero-IQR column keeps a
+        scale of 1.0.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import RobustScaler
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0]})
+                >>> pre = RobustScaler(["x"]).fit(ds)
+                >>> pre.center_, pre.iqr_
+                ({'x': 3.0}, {'x': 2.0})
+
+        Args:
+            ds: The dataset to compute each column's median and IQR from.
+
+        Returns:
+            ``self``, fitted.
+        """
         q_lo, q_hi = self.quantile_range
         aggs = {}
         for c in self.columns:
@@ -210,6 +392,23 @@ class RobustScaler(Preprocessor):
         return self
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Center each fitted column by its median and scale by its IQR in place.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import RobustScaler
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0]})
+                >>> RobustScaler(["x"]).fit(ds).transform(ds).to_pydict()
+                {'x': [-1.0, -0.5, 0.0, 0.5, 1.0]}
+
+        Args:
+            ds: The dataset to scale.
+
+        Returns:
+            A new lazy `Dataset` with the fitted columns robustly scaled in place.
+        """
         self._require_fitted()
         new = {}
         for c in self.columns:
@@ -221,13 +420,25 @@ class RobustScaler(Preprocessor):
 
 
 class Normalizer(Preprocessor):
-    """Scale each **row** to unit norm across the given columns (sklearn
-    ``Normalizer``) — a per-row operation, so it is **stateless** (no `fit`).
+    """Scale each **row** to unit norm across the given columns (sklearn ``Normalizer``).
 
-    ``norm="l2"`` (default) divides each value by ``sqrt(Σ xᵢ²)`` over the row's
-    columns; ``"l1"`` by ``Σ|xᵢ|``; ``"max"`` by ``max|xᵢ|``. A zero-norm row (all
-    zeros) is left unchanged. The whole transform is one `Expr` per column — no
-    per-row Python.
+    A per-row operation, so it is **stateless** (no `fit`). ``norm="l2"`` (default)
+    divides each value by ``sqrt(Σ xᵢ²)`` over the row's columns; ``"l1"`` by
+    ``Σ|xᵢ|``; ``"max"`` by ``max|xᵢ|``. A zero-norm row (all zeros) is left unchanged.
+    The whole transform is one `Expr` per column — no per-row Python.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import Normalizer
+            >>> ds = bt.from_pydict({"a": [3.0, 0.0], "b": [4.0, 0.0]})
+            >>> Normalizer(["a", "b"]).fit_transform(ds).to_pydict()
+            {'a': [0.6, 0.0], 'b': [0.8, 0.0]}
+
+    Args:
+        columns: the numeric columns that together form each row's vector.
+        norm: the norm to divide by — ``"l1"``, ``"l2"``, or ``"max"``.
     """
 
     __slots__ = ("columns", "norm")
@@ -240,6 +451,23 @@ class Normalizer(Preprocessor):
         self._fitted = True  # stateless
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Divide each column by the row's norm across all the given columns.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import Normalizer
+                >>> ds = bt.from_pydict({"a": [3.0, 0.0], "b": [4.0, 0.0]})
+                >>> Normalizer(["a", "b"]).transform(ds).to_pydict()
+                {'a': [0.6, 0.0], 'b': [0.8, 0.0]}
+
+        Args:
+            ds: The dataset whose rows to normalize.
+
+        Returns:
+            A new lazy `Dataset` with each column divided by the per-row norm.
+        """
         cols = [col(c) for c in self.columns]
         if self.norm == "l2":
             norm = functools.reduce(operator.add, (c * c for c in cols)).sqrt()

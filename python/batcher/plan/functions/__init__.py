@@ -10,7 +10,20 @@ through the `batcher.api.functions` façade.
 
 from __future__ import annotations
 
-from batcher.plan.functions.aggregate import corr, count_if, covar_pop, covar_samp
+from batcher.plan.functions.aggregate import (
+    corr,
+    count_if,
+    covar_pop,
+    covar_samp,
+    max,
+    mean,
+    median,
+    min,
+    n_unique,
+    std,
+    sum,
+    var,
+)
 from batcher.plan.functions.collection import element, named_struct, sequence, struct
 from batcher.plan.functions.conditional import iff, nanvl
 from batcher.plan.functions.horizontal import (
@@ -58,14 +71,22 @@ __all__ = [
     "lcm",
     "log",
     "mask",
+    "max",
     "max_horizontal",
+    "mean",
     "mean_horizontal",
+    "median",
+    "min",
     "min_horizontal",
+    "n_unique",
     "named_struct",
     "nanvl",
     "sequence",
+    "std",
     "struct",
+    "sum",
     "sum_horizontal",
+    "var",
     "width_bucket",
     "window",
 ]

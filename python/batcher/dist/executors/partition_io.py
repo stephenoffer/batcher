@@ -8,8 +8,7 @@ storage. A source that cannot subdivide (in-memory / iterator) falls back to the
 eager read-and-range-slice path, reproducing the previous behavior exactly.
 
 `read_partition` is the worker-side reader that accepts either kind of partition
-file. `_apply_above` re-runs operators carried above a breaker single-node;
-`_empty_agg_table` builds the schema-only empty aggregate result.
+file, and `_apply_above` re-runs operators carried above a breaker single-node.
 
 `merge_boundaries` + `bucketize` are the *range*-partitioning helpers (the distributed
 sort's split-by-value step), shared by the disk and Flight sort paths so they stay in
@@ -32,7 +31,7 @@ from batcher.dist.executors.scan_read import (
 )
 from batcher.io.source import InMemorySource, Source
 from batcher.io.splits import Split, WholeSourceSplit
-from batcher.plan.logical import Aggregate, LogicalPlan, Scan
+from batcher.plan.logical import LogicalPlan, Scan
 from batcher.plan.schema import SchemaRef
 
 
@@ -438,12 +437,11 @@ def _apply_above(above: list[LogicalPlan], agg_table: pa.Table) -> pa.Table:
     plan: LogicalPlan = Scan(0, SchemaRef.from_arrow(agg_table.schema))
     for node in reversed(above):  # innermost (closest to agg) first
         plan = dataclasses.replace(node, input=plan)
-    return Dataset(plan, [InMemorySource(agg_table.to_batches())]).collect()
-
-
-def _empty_agg_table(agg: Aggregate) -> pa.Table:
-    names = [k.alias for k in agg.group_keys] + [s.alias for s in agg.aggregates]
-    return pa.table({n: pa.array([], pa.null()) for n in names})
+    # A zero-row table has NO batches (pyarrow drops empty chunks) and `InMemorySource`
+    # needs one, so `filter(<no match>).distinct()` used to die here. Feed it a schema-only
+    # batch: same rows, same schema, no crash.
+    batches = agg_table.to_batches() or [pa.RecordBatch.from_pylist([], schema=agg_table.schema)]
+    return Dataset(plan, [InMemorySource(batches)]).collect()
 
 
 def merge_boundaries(grids: list[tuple[list[float], int]], workers: int) -> list[float]:

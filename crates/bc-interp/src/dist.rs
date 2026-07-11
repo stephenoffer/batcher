@@ -97,8 +97,10 @@ fn partial_to_batch(
     group_keys: &[ProjectionItem],
     partial: &agg::Partial,
 ) -> Result<RecordBatch, InterpError> {
-    let mut fields = Vec::new();
-    let mut columns = Vec::new();
+    // Exact wire width: one column per group key plus every aggregate's state columns.
+    let ncols = group_keys.len() + partial.states.iter().map(|s| s.len()).sum::<usize>();
+    let mut fields = Vec::with_capacity(ncols);
+    let mut columns = Vec::with_capacity(ncols);
     for (k, c) in group_keys.iter().zip(&partial.group_columns) {
         fields.push(Field::new(&k.alias, c.data_type().clone(), true));
         columns.push(c.clone());

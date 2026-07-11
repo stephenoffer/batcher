@@ -27,6 +27,7 @@ __all__ = [
     "ResourceError",
     "RetryableShuffleError",
     "SchemaError",
+    "SecurityWarning",
     "TransportError",
 ]
 
@@ -38,6 +39,14 @@ class PerformanceWarning(UserWarning):
     e.g. a plain-function UDF on a GPU stage that reloads the model every batch. The
     query still runs and returns the right answer; the warning points at the faster
     spelling."""
+
+
+class SecurityWarning(UserWarning):
+    """A usage pattern that works but weakens security.
+
+    Raised (via `warnings.warn`) when a crypto key is passed inline instead of as a
+    reference (`env:NAME` / `file:PATH`), so the secret is embedded in the query and its
+    serialized plan. The query is correct; the warning points at the safer spelling."""
 
 
 class BatcherError(Exception):

@@ -72,6 +72,10 @@ class CacheStore:
         # the budget; eviction is cost-aware (see `_Entry.value`).
         self._entries: dict[str, _Entry] = {}
         self._used = 0
+        # Store-level hit/miss counters (distinct from per-entry `hits`, which drives keep
+        # value): the aggregate hit-rate tells whether the result cache is *earning its RAM*.
+        self._hits = 0
+        self._misses = 0
         self._lock = threading.Lock()
 
     @property
@@ -90,8 +94,22 @@ class CacheStore:
             entry = self._entries.get(key)
             if entry is not None:
                 entry.hits += 1  # access frequency feeds the keep-value
+                self._hits += 1
                 return entry.table
+            self._misses += 1
             return None
+
+    def stats(self) -> dict[str, int | float]:
+        """Result-cache effectiveness: hits, misses, aggregate hit-rate, and bytes held —
+        the signal for whether the cache is earning its RAM. Hit-rate is `0.0` before any get."""
+        with self._lock:
+            total = self._hits + self._misses
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": (self._hits / total) if total else 0.0,
+                "used_bytes": self._used,
+            }
 
     def put(self, key: str, table: pa.Table, keepalive: object = None, cost: float = 0.0) -> None:
         """Cache `table` under `key`, evicting low-value entries to stay within budget.
@@ -163,13 +181,26 @@ class CacheStore:
     def _evict_to(self, target_bytes: int) -> None:
         """Evict the lowest-value entries until `used <= target_bytes`.
 
-        Caller holds the lock. Each round drops the entry with the smallest
-        `_Entry.value` (cheap, cold, large → goes first); ties break by insertion order
-        (the oldest), so a never-hit zero-cost set degrades to size-then-FIFO.
+        Caller holds the lock. Entries are dropped smallest-`_Entry.value` first (cheap,
+        cold, large → goes first); ties break by insertion order (the oldest), so a
+        never-hit zero-cost set degrades to size-then-FIFO.
+
+        An entry's keep-value is independent of which *other* entries remain, so the
+        eviction order is a single stable sort — not a fresh O(n) min-scan per victim.
+        That makes a bulk eviction (`on_pressure` halving the cache, a large insert
+        pushing out many small entries) O(n log n) instead of O(n²), and computes each
+        `value()` once instead of once per comparison per round.
         """
-        while self._used > target_bytes and self._entries:
-            victim = min(self._entries, key=lambda k: self._entries[k].value())
-            self._used -= self._entries.pop(victim).table.nbytes
+        if self._used <= target_bytes or not self._entries:
+            return
+        # Stable sort keeps insertion order among equal values → oldest evicted first,
+        # matching the previous per-round `min` tie-break exactly.
+        victims = sorted(self._entries.items(), key=lambda kv: kv[1].value())
+        for key, entry in victims:
+            if self._used <= target_bytes:
+                break
+            del self._entries[key]
+            self._used -= entry.table.nbytes
 
 
 _result_cache: CacheStore | None = None

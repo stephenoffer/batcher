@@ -102,6 +102,30 @@ def column_predicate_count(build: ColumnBuilder, op: str, name: str, value: obje
         return None
 
 
+def column_bounds(build: ColumnBuilder, dtype: pa.DataType, name: str):
+    """EXACT `ColumnStat` (min/max/null-count) for one column, or `None` if not derivable.
+
+    A single vectorized ``min_max`` pass. Returns `None` for a non-ordered type
+    (string/nested), an all-null column (its SQL ``MIN``/``MAX`` is NULL — let a run
+    return it), or an unsupported kernel — the same skips [`statistics`] makes per column.
+    """
+    if not (
+        pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_temporal(dtype)
+    ):
+        return None
+    from batcher.plan.stats import ColumnStat, Provenance
+
+    try:
+        col = build(name)
+        mm = pc.min_max(col, skip_nulls=True)
+        lo, hi = mm["min"].as_py(), mm["max"].as_py()
+    except _ARROW_ERRORS:
+        return None
+    if lo is None:  # all-null column
+        return None
+    return ColumnStat(min=lo, max=hi, null_count=col.null_count, provenance=Provenance.EXACT)
+
+
 def statistics(build: ColumnBuilder, schema: pa.Schema, rows: int) -> SourceStatistics:
     """EXACT per-column min/max/null-count over the ordered (numeric/temporal) columns.
 
@@ -110,25 +134,11 @@ def statistics(build: ColumnBuilder, schema: pa.Schema, rows: int) -> SourceStat
     `SourceStatistics` Kyber answers unfiltered bounds queries from on subsequent runs.
     """
     from batcher.plan.source_stats import SourceStatistics
-    from batcher.plan.stats import ColumnStat, Provenance
+    from batcher.plan.stats import ColumnStat
 
     columns: dict[str, ColumnStat] = {}
     for f in schema:
-        if not (
-            pa.types.is_integer(f.type)
-            or pa.types.is_floating(f.type)
-            or pa.types.is_temporal(f.type)
-        ):
-            continue
-        try:
-            col = build(f.name)
-            mm = pc.min_max(col, skip_nulls=True)
-            lo, hi = mm["min"].as_py(), mm["max"].as_py()
-        except _ARROW_ERRORS:
-            continue
-        if lo is None:  # all-null column: SQL MIN/MAX is NULL — let a run return it
-            continue
-        columns[f.name] = ColumnStat(
-            min=lo, max=hi, null_count=col.null_count, provenance=Provenance.EXACT
-        )
+        stat = column_bounds(build, f.type, f.name)
+        if stat is not None:
+            columns[f.name] = stat
     return SourceStatistics(row_count=rows, columns=columns)

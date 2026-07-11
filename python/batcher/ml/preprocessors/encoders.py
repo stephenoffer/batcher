@@ -37,6 +37,15 @@ def _ordinal_expr(column: str, categories: list[Any], unknown_value: int) -> Exp
 class OrdinalEncoder(Preprocessor):
     """Map each categorical column to an integer code by sorted category order.
 
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import OrdinalEncoder
+            >>> ds = bt.from_pydict({"c": ["b", "a", "c", "a"]})
+            >>> OrdinalEncoder(["c"]).fit_transform(ds).to_pydict()
+            {'c': [1, 0, 2, 0]}
+
     Args:
         columns: the categorical columns to encode in place.
         unknown_value: the code for values unseen at fit time (and nulls).
@@ -52,12 +61,51 @@ class OrdinalEncoder(Preprocessor):
         self.categories_: dict[str, list[Any]] = {}
 
     def fit(self, ds: Dataset) -> OrdinalEncoder:
+        """Learn each column's sorted distinct categories from `ds`.
+
+        Stored in `categories_[c]`; the code assigned to a value at transform time is
+        its index into that sorted list.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import OrdinalEncoder
+                >>> pre = OrdinalEncoder(["c"]).fit(bt.from_pydict({"c": ["b", "a", "c"]}))
+                >>> pre.categories_
+                {'c': ['a', 'b', 'c']}
+
+        Args:
+            ds: The dataset to learn each column's category set from.
+
+        Returns:
+            ``self``, fitted.
+        """
         for c in self.columns:
             self.categories_[c] = distinct_values(ds, c)
         self._fitted = True
         return self
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Replace each fitted column with its integer category code.
+
+        Values unseen at fit time (and nulls) map to `unknown_value`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import OrdinalEncoder
+                >>> ds = bt.from_pydict({"c": ["b", "a", "c", "a"]})
+                >>> OrdinalEncoder(["c"]).fit(ds).transform(ds).to_pydict()
+                {'c': [1, 0, 2, 0]}
+
+        Args:
+            ds: The dataset to encode.
+
+        Returns:
+            A new lazy `Dataset` with each fitted column replaced by its codes.
+        """
         self._require_fitted()
         new = {c: _ordinal_expr(c, self.categories_[c], self.unknown_value) for c in self.columns}
         return ds.with_columns(**new)
@@ -67,6 +115,19 @@ class LabelEncoder(Preprocessor):
     """Encode a single (target) column's labels as integers ``0..k-1``.
 
     The 1-D analogue of `OrdinalEncoder` for a label column `y`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import LabelEncoder
+            >>> ds = bt.from_pydict({"y": ["cat", "dog", "cat"]})
+            >>> LabelEncoder("y").fit_transform(ds).to_pydict()
+            {'y': [0, 1, 0]}
+
+    Args:
+        column: the single label column to encode in place.
+        unknown_value: the code for labels unseen at fit time (and nulls).
     """
 
     __slots__ = ("classes_", "column", "unknown_value")
@@ -77,11 +138,46 @@ class LabelEncoder(Preprocessor):
         self.classes_: list[Any] = []
 
     def fit(self, ds: Dataset) -> LabelEncoder:
+        """Learn the sorted distinct labels of the column into `classes_`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import LabelEncoder
+                >>> LabelEncoder("y").fit(bt.from_pydict({"y": ["dog", "cat"]})).classes_
+                ['cat', 'dog']
+
+        Args:
+            ds: The dataset to learn the label set from.
+
+        Returns:
+            ``self``, fitted.
+        """
         self.classes_ = distinct_values(ds, self.column)
         self._fitted = True
         return self
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Replace the label column with each row's integer class index.
+
+        Labels unseen at fit time (and nulls) map to `unknown_value`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import LabelEncoder
+                >>> ds = bt.from_pydict({"y": ["cat", "dog", "cat"]})
+                >>> LabelEncoder("y").fit(ds).transform(ds).to_pydict()
+                {'y': [0, 1, 0]}
+
+        Args:
+            ds: The dataset to encode.
+
+        Returns:
+            A new lazy `Dataset` with the label column replaced by its codes.
+        """
         self._require_fitted()
         expr = _ordinal_expr(self.column, self.classes_, self.unknown_value)
         return ds.with_columns(**{self.column: expr})
@@ -92,6 +188,15 @@ class OneHotEncoder(Preprocessor):
 
     The encoded columns are dropped and replaced by ``{column}_{category}`` indicators
     (the scikit-learn convention). Unseen values produce all-zero indicators.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import OneHotEncoder
+            >>> ds = bt.from_pydict({"c": ["a", "b", "a"]})
+            >>> OneHotEncoder(["c"]).fit_transform(ds).to_pydict()
+            {'c_a': [1, 0, 1], 'c_b': [0, 1, 0]}
 
     Args:
         columns: the categorical columns to one-hot encode.
@@ -108,12 +213,48 @@ class OneHotEncoder(Preprocessor):
         self.categories_: dict[str, list[Any]] = {}
 
     def fit(self, ds: Dataset) -> OneHotEncoder:
+        """Learn each column's sorted distinct categories (one indicator per category).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import OneHotEncoder
+                >>> pre = OneHotEncoder(["c"]).fit(bt.from_pydict({"c": ["a", "b", "a"]}))
+                >>> pre.categories_
+                {'c': ['a', 'b']}
+
+        Args:
+            ds: The dataset to learn each column's category set from.
+
+        Returns:
+            ``self``, fitted.
+        """
         for c in self.columns:
             self.categories_[c] = distinct_values(ds, c)
         self._fitted = True
         return self
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Drop each fitted column and emit its ``{column}_{category}`` 0/1 indicators.
+
+        Non-encoded columns pass through; unseen values yield all-zero indicators.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import OneHotEncoder
+                >>> ds = bt.from_pydict({"c": ["a", "b", "a"]})
+                >>> OneHotEncoder(["c"]).fit(ds).transform(ds).to_pydict()
+                {'c_a': [1, 0, 1], 'c_b': [0, 1, 0]}
+
+        Args:
+            ds: The dataset to encode.
+
+        Returns:
+            A new lazy `Dataset` with indicator columns replacing the fitted ones.
+        """
         self._require_fitted()
         encoded = set(self.columns)
         keep = [c for c in ds.columns if c not in encoded]
@@ -126,13 +267,22 @@ class OneHotEncoder(Preprocessor):
 
 
 class MultiHotEncoder(Preprocessor):
-    """Multi-hot encode a **list** column into one 0/1 indicator column per category
-    (the multi-label counterpart of `OneHotEncoder`).
+    """Multi-hot encode a **list** column into one 0/1 indicator column per category.
 
-    `fit` learns the distinct elements across all the column's lists (explode +
-    distinct); `transform` emits ``{column}_{category}`` columns, each 1 where that
-    category appears in the row's list (via ``.list.contains``), 0 otherwise. Useful
-    for tag/label sets. Pass `categories` to fix the vocabulary and skip `fit`.
+    The multi-label counterpart of `OneHotEncoder`. `fit` learns the distinct elements
+    across all the column's lists (explode + distinct); `transform` emits
+    ``{column}_{category}`` columns, each 1 where that category appears in the row's
+    list (via ``.list.contains``), 0 otherwise. Useful for tag/label sets. Pass
+    `categories` to fix the vocabulary and skip `fit`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import MultiHotEncoder
+            >>> ds = bt.from_pydict({"tags": [["x", "y"], ["y"]]})
+            >>> MultiHotEncoder("tags").fit_transform(ds).to_pydict()
+            {'tags': [['x', 'y'], ['y']], 'tags_x': [1, 0], 'tags_y': [1, 1]}
 
     Args:
         column: the list column to encode (kept alongside the indicators).
@@ -147,6 +297,25 @@ class MultiHotEncoder(Preprocessor):
         self._fitted = categories is not None
 
     def fit(self, ds: Dataset) -> MultiHotEncoder:
+        """Learn the distinct elements across all the column's lists into `categories_`.
+
+        A no-op when an explicit `categories` vocabulary was given to the constructor.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import MultiHotEncoder
+                >>> ds = bt.from_pydict({"tags": [["x", "y"], ["y"]]})
+                >>> MultiHotEncoder("tags").fit(ds).categories_
+                ['x', 'y']
+
+        Args:
+            ds: The dataset whose list column supplies the category vocabulary.
+
+        Returns:
+            ``self``, fitted.
+        """
         if self.categories_ is None:
             exploded = ds.select(self.column).explode(self.column)
             self.categories_ = distinct_values(exploded, self.column)
@@ -154,6 +323,26 @@ class MultiHotEncoder(Preprocessor):
         return self
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Add one ``{column}_{category}`` 0/1 indicator per learned category.
+
+        Each indicator is 1 where the category is in the row's list. The source list
+        column is kept.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import MultiHotEncoder
+                >>> ds = bt.from_pydict({"tags": [["x", "y"], ["y"]]})
+                >>> MultiHotEncoder("tags").fit(ds).transform(ds).to_pydict()
+                {'tags': [['x', 'y'], ['y']], 'tags_x': [1, 0], 'tags_y': [1, 1]}
+
+        Args:
+            ds: The dataset to encode.
+
+        Returns:
+            A new lazy `Dataset` with an indicator column per category added.
+        """
         self._require_fitted()
         assert self.categories_ is not None
         indicators = {

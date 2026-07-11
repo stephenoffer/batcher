@@ -8,6 +8,8 @@ an in-memory fsspec filesystem when fsspec is available.
 
 from __future__ import annotations
 
+import shutil
+
 import pyarrow as pa
 import pytest
 
@@ -48,6 +50,50 @@ def test_no_remote_stays_local_even_over_budget(tmp_path):
     store = TieredSpillStore(str(tmp_path / "spill"), local_budget_bytes=1)
     handle = store.spill([_batch(50)])
     assert handle.tier is SpillTier.LOCAL
+
+
+def test_local_budget_is_clamped_to_free_disk(tmp_path):
+    # An unrealistically large configured budget is clamped to a safe fraction of the
+    # scratch volume's measured free space, so the local tier can't fill the filesystem
+    # before overflow triggers.
+    free = shutil.disk_usage(str(tmp_path)).free
+    store = TieredSpillStore(str(tmp_path / "spill"), local_budget_bytes=free * 1000)
+    assert store._local_budget is not None
+    assert store._local_budget <= free
+    assert store._local_budget < free * 1000
+
+
+def test_clamp_to_free_disk_stats_nearest_existing_ancestor(tmp_path):
+    # A spill dir that does not exist yet (created lazily on first spill) must still be
+    # clamped — by stat'ing its nearest existing ancestor (the same filesystem), not by
+    # silently dropping the disk-aware bound and keeping the too-large configured budget.
+    from batcher.carbonite.spill import _clamp_to_free_disk
+
+    free = shutil.disk_usage(str(tmp_path)).free
+    missing = str(tmp_path / "does" / "not" / "exist" / "yet")
+    clamped = _clamp_to_free_disk(missing, free * 1000)
+    assert clamped is not None
+    assert clamped <= free  # bounded by the ancestor's real free space, not the raw budget
+
+
+def test_local_budget_derived_from_free_disk_when_unset(tmp_path):
+    # With no configured budget the store still bounds the local tier to measured free
+    # disk rather than leaving it unbounded.
+    store = TieredSpillStore(str(tmp_path / "spill"))
+    assert store._local_budget is not None and store._local_budget > 0
+
+
+def test_remote_tier_always_compresses_even_when_local_is_raw():
+    # C13: the remote tier is slow object storage priced by bytes transferred, so it
+    # compresses even when the local NVMe tier is left uncompressed.
+    from batcher.carbonite.spill import _ipc_options, _remote_ipc_options
+
+    if _ipc_options("lz4") is None:
+        pytest.skip("lz4 codec not built into this pyarrow")
+    assert _ipc_options(None) is None  # local honors "no compression"
+    assert _remote_ipc_options(None) is not None  # remote upgrades to LZ4
+    assert _remote_ipc_options("auto") is not None
+    assert _remote_ipc_options("zstd") is not None  # an explicit codec is honored
 
 
 def test_empty_partition_is_tolerated(tmp_path):

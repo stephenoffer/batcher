@@ -138,8 +138,49 @@ class CostModel:
         broadcast eligibility in bytes."""
         return self._est.row_width(node, self._c.bytes_per_row)
 
+    def join_op_cost(self, node: Join) -> Cost:
+        """A join's own cost at the orientation the plan will *actually* run.
+
+        `op_cost` prices a join as written — build on the right — because that is exactly
+        what the build-side rule needs: it compares the two orientations against each
+        other. But that rule runs in SELECTION, *after* JOIN_REORDER, so the reorder was
+        ranking orders by the cost of an orientation the physical plan would then flip.
+        With `hash_build_row` (2.0) twice `hash_probe_row` (1.0), that is not a rounding
+        error: it penalizes every order that happens to put the large table on the right,
+        even though SELECTION would have swapped it.
+
+        An inner join is commutative, so its cost is the cheaper of the two build sides —
+        which is the one SELECTION will pick. A non-inner join is not commutative and its
+        build side is fixed, so it is priced as written.
+
+        Args:
+            node: The join to price.
+
+        Returns:
+            The join's own cost, excluding its inputs.
+        """
+        base = self.op_cost(node)
+        if node.join_type != "inner":
+            return base
+        c = self._c
+        left, right = self._rows(node.left), self._rows(node.right)
+        swapped_cpu = c.hash_build_row * left + c.hash_probe_row * right
+        as_written_cpu = c.hash_build_row * right + c.hash_probe_row * left
+        if swapped_cpu >= as_written_cpu:
+            return base
+        return replace(
+            base,
+            cpu=base.cpu - as_written_cpu + swapped_cpu,
+            mem=self.row_bytes(node.left) * left,
+        )
+
     def op_cost(self, node: LogicalPlan) -> Cost:
-        """Cost of `node` itself, excluding its inputs."""
+        """Cost of `node` itself, excluding its inputs.
+
+        A `Join` is priced **as written** (build on the right). Join *ordering* should use
+        `join_op_cost`, which prices the orientation SELECTION will choose; the build-side
+        rule needs this one, since it compares the orientations against each other.
+        """
         c = self._c
         out_rows = self._rows(node)
 

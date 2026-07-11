@@ -78,7 +78,12 @@ def case_with_ray(name: str, query: str) -> Callable[[Context], EngineQueries]:
         fns = sql_build(ctx)
 
         def native(engine: str, impl: Callable[[dict[str, Any]], Any]) -> None:
-            if impl is not None and engine in ctx.names():
+            # The native (DataFrame / Ray) impls build on in-memory table handles. In scan
+            # mode there are none (`ctx.tables` is empty — each table is a lazy parquet
+            # scan), so registering the impl here would hand it an empty handle map and it
+            # would `KeyError` on its first table lookup, shadowing the SQL runner that does
+            # work in scan mode. Skip native entirely when there are no in-memory tables.
+            if impl is not None and engine in ctx.names() and ctx.tables:
                 handles = {t: ctx.handle(t, engine) for t in _TPCH_TABLES if t in ctx.tables}
                 fns[engine] = lambda: impl(handles)
 

@@ -40,21 +40,26 @@ class StrFunc(IRNode):
     length: int | None = scalar(omit_none=True, default=None)
 
     def __repr__(self) -> str:
-        """Render the node, redacting `pattern` for the keyed (crypto) functions.
+        """Render the node, redacting an inline `pattern` key for the crypto functions.
 
-        For `aes_encrypt`/`aes_decrypt`/`hmac_sha256` the ``pattern`` slot holds the
-        encryption key. A `repr` is the value that ends up in tracebacks, debugger
-        frames, notebook cells, and log lines, so it is the most likely place for a key
-        to escape; `to_ir()` is unaffected — the engine still receives the real key.
-        `dataclass` leaves an explicitly-declared ``__repr__`` in place, so this wins
-        over the generated one.
+        For `aes_encrypt`/`aes_decrypt`/`hmac_sha256` the ``pattern`` slot holds the key.
+        A `repr` is the value that ends up in tracebacks, debugger frames, notebook cells,
+        and log lines, so it is the most likely place for a key to escape; an *inline*
+        literal is shown as ``'***'``. A key *reference* (``env:NAME`` / ``file:PATH``) is
+        not secret — it names where the key lives, not the key — so it is shown verbatim,
+        which is what an operator needs to see. `to_ir()` is unaffected — the engine
+        still receives the pattern as written. `dataclass` leaves an explicitly-declared
+        ``__repr__`` in place, so this wins over the generated one.
         """
-        pattern = "'***'" if self.fn in KEYED_STR_FNS and self.pattern else repr(self.pattern)
-        return (
-            f"StrFunc(fn={self.fn!r}, input={self.input!r}, pattern={pattern}, "
-            f"replacement={self.replacement!r}, start={self.start!r}, "
-            f"length={self.length!r})"
-        )
+        p = self.pattern
+        is_secret = self.fn in KEYED_STR_FNS and p and not p.startswith(("env:", "file:"))
+        args = []
+        if p is not None:
+            args.append("'***'" if is_secret else repr(p))
+        for extra in (self.replacement, self.start, self.length):
+            if extra is not None:
+                args.append(repr(extra))
+        return f"{self.input!r}.str.{self.fn}({', '.join(args)})"
 
 
 @expr_node
@@ -211,6 +216,18 @@ class ListGet(IRNode):
     tag = ExprTag.LIST_GET
     input: Expr = child()
     index: int = scalar()
+
+
+@expr_node
+class ListSimhash(IRNode):
+    """A random-hyperplane (SimHash) signature of an embedding → `List<Int64>` of
+    `num_bits` bits. The fraction of positions two signatures agree on estimates the
+    cosine similarity of the originals. Null/empty list → null."""
+
+    tag = ExprTag.LIST_SIMHASH
+    input: Expr = child()
+    num_bits: int = scalar()
+    seed: int = scalar(omit_falsy=True, default=0)
 
 
 @expr_node

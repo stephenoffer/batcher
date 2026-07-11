@@ -1,28 +1,32 @@
 //! Single-node parallel full sort by **sample-sort**.
 //!
-//! Range-partition the rows by the leading key (sampled quantile boundaries), sort each
-//! range in parallel, and concatenate in key order — no final merge, because the ranges
-//! are globally ordered relative to each other. Each range sorts (and gathers) a
-//! contiguous, cache-resident subset in parallel, which is why this beats a single global
-//! permutation plus one random-access gather (that gather is memory-bandwidth bound and
-//! cache-hostile across the whole table).
+//! Range-partition the rows by the leading key (sampled quantile boundaries) and sort each
+//! range in parallel. The ranges are globally ordered relative to each other, so the sorted
+//! relation is simply the ranges in key order — no final merge, and no concat: the executor
+//! consumes a `Vec<RecordBatch>` already.
+//!
+//! **The payload is gathered exactly once.** Routing produces per-range *row indices*, not
+//! range batches; each range sorts a cheap gather of just its key columns, then composes
+//! that permutation with its row indices and gathers every column once. Materializing the
+//! ranges up front (and again to sort them, and a third time to concatenate) copied every
+//! column three times — on a 5 M-row, 6-column sort that was two thirds of the work.
 //!
 //! This is the single-node form of the distributed range sort (`dist/flight_sort.py`), so
 //! one implementation serves both: the boundaries and the routing come from the same
 //! `bc_runtime::shuffle` range partitioners.
 
-use arrow::array::{Array, GenericStringArray, OffsetSizeTrait, RecordBatch};
-use arrow::compute::concat_batches;
+use arrow::array::{
+    Array, ArrayRef, GenericStringArray, OffsetSizeTrait, RecordBatch, UInt32Array,
+};
+use arrow::compute::take;
 use arrow::datatypes::DataType;
 use bc_ir::SortKey;
 use rayon::prelude::*;
 
 use crate::error::InterpError;
 
-use super::sort_batch;
-
 /// Rows below which the single-node sample-sort stays serial — the sampling + range
-/// partition + concat overhead only pays off on a large full sort.
+/// partition overhead only pays off on a large full sort.
 const PARALLEL_SORT_MIN_ROWS: usize = 1 << 17;
 
 /// Rows sampled to estimate the quantile boundaries. Enough to balance 64 ranges well
@@ -42,18 +46,32 @@ pub(crate) fn parallel_sort_batch(
     batch: &RecordBatch,
     keys: &[SortKey],
     limit: Option<usize>,
-) -> Result<Option<RecordBatch>, InterpError> {
+) -> Result<Option<Vec<RecordBatch>>, InterpError> {
     let Some(k0) = keys.first() else {
         return Ok(None);
     };
     if limit.is_some() || batch.num_rows() < PARALLEL_SORT_MIN_ROWS {
         return Ok(None);
     }
-    let key = k0.expr.eval(batch)?;
+    // Evaluate every sort key once over the whole batch: the per-range sorts reuse these
+    // arrays, so a computed `ORDER BY` expression is evaluated once, not once per range.
+    let key_arrays: Vec<ArrayRef> = keys
+        .iter()
+        .map(|k| k.expr.eval(batch))
+        .collect::<Result<_, _>>()?;
+    let key = &key_arrays[0];
+    // 64 ranges saturate the gather: measured 32/64/96/128/192 ranges on 96 cores at
+    // 157/123/124/120/116 ms — past 64 the sort is memory-bandwidth bound, not
+    // parallelism bound, so more ranges only add sampling and concat overhead.
     let parts = rayon::current_num_threads().clamp(2, 64);
-    let buckets = match key.data_type() {
+
+    // Route each row to a range, as *indices only*. Gathering the payload into range
+    // batches here (and again to sort each one, and a third time to concatenate) copies
+    // every column three times; composing the range's indices with its sort permutation
+    // gathers exactly once.
+    let part_of = match key.data_type() {
         DataType::Float64 | DataType::Float32 => {
-            let key_f64 = arrow::compute::cast(&key, &DataType::Float64)?;
+            let key_f64 = arrow::compute::cast(key, &DataType::Float64)?;
             let keyv = key_f64
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
@@ -61,8 +79,7 @@ pub(crate) fn parallel_sort_batch(
             let Some(b) = sample_boundaries_f64(keyv, parts) else {
                 return Ok(None);
             };
-            bc_runtime::shuffle::range_partition_by_key_array(
-                batch,
+            bc_runtime::shuffle::range_part_of_f64(
                 &key_f64,
                 &b,
                 parts,
@@ -78,14 +95,7 @@ pub(crate) fn parallel_sort_batch(
             let Some(b) = sample_boundaries_str(a, parts) else {
                 return Ok(None);
             };
-            bc_runtime::shuffle::range_partition_by_str_key(
-                batch,
-                &key,
-                &b,
-                parts,
-                k0.nulls_first,
-                k0.descending,
-            )?
+            bc_runtime::shuffle::range_part_of_str(key, &b, parts, k0.nulls_first, k0.descending)?
         }
         DataType::LargeUtf8 => {
             let a = key
@@ -95,17 +105,10 @@ pub(crate) fn parallel_sort_batch(
             let Some(b) = sample_boundaries_str(a, parts) else {
                 return Ok(None);
             };
-            bc_runtime::shuffle::range_partition_by_str_key(
-                batch,
-                &key,
-                &b,
-                parts,
-                k0.nulls_first,
-                k0.descending,
-            )?
+            bc_runtime::shuffle::range_part_of_str(key, &b, parts, k0.nulls_first, k0.descending)?
         }
         dt if dt.is_integer() => {
-            let key_i64 = arrow::compute::cast(&key, &DataType::Int64)?;
+            let key_i64 = arrow::compute::cast(key, &DataType::Int64)?;
             let keyv = key_i64
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
@@ -113,8 +116,7 @@ pub(crate) fn parallel_sort_batch(
             let Some(b) = sample_boundaries_i64(keyv, parts) else {
                 return Ok(None);
             };
-            bc_runtime::shuffle::range_partition_by_i64_key(
-                batch,
+            bc_runtime::shuffle::range_part_of_i64(
                 &key_i64,
                 &b,
                 parts,
@@ -124,16 +126,31 @@ pub(crate) fn parallel_sort_batch(
         }
         _ => return Ok(None),
     };
-    let sorted: Vec<RecordBatch> = buckets
+    let buckets = bc_runtime::shuffle::bucket_indices(&part_of, parts);
+
+    // Each range sorts independently: gather only its *key* columns (one or two narrow
+    // arrays), sort those, then map the range-local permutation back through the range's
+    // row indices and gather the payload once.
+    let mut sorted: Vec<RecordBatch> = buckets
         .par_iter()
-        .map(|b| sort_batch(b, keys, None))
+        .map(|idx| -> Result<RecordBatch, InterpError> {
+            let take_idx = UInt32Array::from(idx.clone());
+            let range_keys: Vec<ArrayRef> = key_arrays
+                .iter()
+                .map(|a| take(a.as_ref(), &take_idx, None))
+                .collect::<Result<_, _>>()?;
+            let local = super::sort_indices_of(&range_keys, keys)?;
+            let global: Vec<u32> = local.values().iter().map(|&l| idx[l as usize]).collect();
+            Ok(bc_runtime::shuffle::gather_rows(batch, &global)?)
+        })
         .collect::<Result<_, InterpError>>()?;
-    let ordered: Vec<&RecordBatch> = if k0.descending {
-        sorted.iter().rev().collect()
-    } else {
-        sorted.iter().collect()
-    };
-    Ok(Some(concat_batches(&batch.schema(), ordered)?))
+
+    // Ranges are globally ordered relative to each other, so the sorted relation is simply
+    // the ranges in key order.
+    if k0.descending {
+        sorted.reverse();
+    }
+    Ok(Some(sorted))
 }
 
 /// Sample `parts-1` ascending f64 quantile boundaries from a float key column. Returns
@@ -220,11 +237,19 @@ fn sample_boundaries_str<O: OffsetSizeTrait>(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::compute::concat_batches;
     use arrow::datatypes::{Field, Schema};
     use bc_expr::Expr;
 
+    use super::super::sort_batch;
     use super::*;
+
+    /// The sample-sort returns the ranges in key order; the sorted relation is their
+    /// concatenation, which is what the serial oracle produces as one batch.
+    fn concat_ranges(schema: &std::sync::Arc<Schema>, ranges: Vec<RecordBatch>) -> RecordBatch {
+        concat_batches(schema, ranges.iter()).unwrap()
+    }
 
     fn str_batch(vals: Vec<Option<&str>>, payload: Vec<i64>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -247,10 +272,10 @@ mod tests {
     /// The sample-sort must produce exactly what the serial `sort_batch` oracle produces.
     fn assert_matches_serial(batch: &RecordBatch, keys: &[SortKey]) {
         let want = sort_batch(batch, keys, None).unwrap();
-        let got = parallel_sort_batch(batch, keys, None)
+        let ranges = parallel_sort_batch(batch, keys, None)
             .unwrap()
             .expect("sample-sort should engage");
-        assert_eq!(want, got);
+        assert_eq!(want, concat_ranges(&batch.schema(), ranges));
     }
 
     fn big_str_batch(n: usize, nulls: bool) -> RecordBatch {
@@ -311,7 +336,7 @@ mod tests {
         // result equals the serial oracle whichever path is taken.
         let want = sort_batch(&b, &key(false, false), None).unwrap();
         let got = match parallel_sort_batch(&b, &key(false, false), None).unwrap() {
-            Some(g) => g,
+            Some(ranges) => concat_ranges(&b.schema(), ranges),
             None => sort_batch(&b, &key(false, false), None).unwrap(),
         };
         assert_eq!(want, got);

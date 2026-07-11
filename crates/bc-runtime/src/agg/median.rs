@@ -17,8 +17,10 @@ pub(crate) fn median_state(
     group_ids: &[u32],
     num_groups: usize,
 ) -> Result<ArrayRef, RuntimeError> {
-    let mut keep: Vec<u32> = Vec::new();
-    let mut kept_groups: Vec<i64> = Vec::new();
+    // Bounded by the row count (the kept subset never exceeds it) — pre-size to skip
+    // the geometric reallocations these two parallel Vecs would otherwise churn through.
+    let mut keep: Vec<u32> = Vec::with_capacity(group_ids.len());
+    let mut kept_groups: Vec<i64> = Vec::with_capacity(group_ids.len());
     for (i, &g) in group_ids.iter().enumerate() {
         if values.is_valid(i) {
             keep.push(i as u32);
@@ -39,8 +41,9 @@ pub(crate) fn merge_median(
     let list = state.as_list::<i32>();
     let offsets = list.value_offsets();
     let child = list.values();
-    let mut elem_idx: Vec<u32> = Vec::new();
-    let mut elem_groups: Vec<i64> = Vec::new();
+    // Total flattened element count is exactly the child length — pre-size both.
+    let mut elem_idx: Vec<u32> = Vec::with_capacity(child.len());
+    let mut elem_groups: Vec<i64> = Vec::with_capacity(child.len());
     for row in 0..list.len() {
         let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
         let g = group_ids[row] as i64;
@@ -230,8 +233,9 @@ pub(crate) fn finalize_histogram(state: &ArrayRef) -> Result<ArrayRef, RuntimeEr
     let rows = converter.convert_columns(std::slice::from_ref(child))?;
     let offsets = list.value_offsets();
 
-    let mut key_idx: Vec<u32> = Vec::new();
-    let mut counts: Vec<i64> = Vec::new();
+    // Distinct-run entries are bounded above by the total element count — pre-size to it.
+    let mut key_idx: Vec<u32> = Vec::with_capacity(child.len());
+    let mut counts: Vec<i64> = Vec::with_capacity(child.len());
     let mut map_offsets: Vec<i32> = Vec::with_capacity(list.len() + 1);
     // A group with no values (all-null) yields a NULL map, not an empty one (DuckDB).
     let mut valid: Vec<bool> = Vec::with_capacity(list.len());

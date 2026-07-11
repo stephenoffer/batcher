@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import pyarrow as pa
 import pytest
 
@@ -17,7 +15,11 @@ _gpu_aware_pool_default = gpu_aware_pool_default
 
 
 def test_resolve_num_workers_auto_cpu_uses_all_cores():
-    assert _resolve_num_workers("auto", 0.0) == max(1, os.cpu_count() or 1)
+    # A CPU stage fans across the cores the process may actually use (cgroup/affinity aware),
+    # not the host core count — so a throttled container doesn't over-subscribe its worker pool.
+    from batcher._internal.hardware import available_cpu_count
+
+    assert _resolve_num_workers("auto", 0.0) == available_cpu_count()
 
 
 def test_resolve_num_workers_auto_gpu_is_one_context():

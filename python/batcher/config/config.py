@@ -270,6 +270,17 @@ class MemoryConfig:
         The explicit `streaming_state_max_bytes` when set, else the hard memory budget
         (`max_memory_bytes` or `default_total_bytes`, scaled by `hard_limit`) so the
         cap scales with the configured envelope rather than a fixed magic number.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import MemoryConfig
+                >>> cfg = MemoryConfig(streaming_state_max_bytes=256 << 20)
+                >>> cfg.streaming_state_budget_bytes()
+                268435456
+
+        Returns:
+            The per-operator streaming-state cap, in bytes.
         """
         if self.streaming_state_max_bytes > 0:
             return self.streaming_state_max_bytes
@@ -444,7 +455,19 @@ class OptimizerConfig:
     # build side actually exceeds it (the estimate was wrong), the executor falls back
     # to a shuffle join instead of OOMing the driver by replicating an over-large side.
     broadcast_max_bytes: int = 10 * 1024 * 1024  # 10 MiB
-    learning_smoothing_alpha: float = 0.5  # exp-smoothing toward new observations
+    # Static blend weight, NOT an EWMA rate: how far a *single* decision moves from its
+    # plan estimate toward a measured value (`LearnedMemoryModel.blend_peak`, the pressure
+    # EWMA, GPU/stream autobatch). Per-signature scalars that accumulate observations use
+    # `learned_scalar_alpha_floor` instead — the two were one knob, with one value serving
+    # two incompatible meanings.
+    learning_smoothing_alpha: float = 0.5
+    # Floor on the step of a per-signature scalar's exponential moving average
+    # (`kyber.learning._smooth`, `kyber.learned_tuning._smooth`). The step is
+    # `max(floor, 1/(n_obs+1))`: a running mean while evidence is thin, then an EWMA with a
+    # ~`1/floor`-observation memory. A floor of 0.5 — the old shared value — meant the
+    # newest run always carried half the weight, so a learned join size or partition count
+    # never converged and one anomalous run swung it by 50%.
+    learned_scalar_alpha_floor: float = 0.1
     # Learned cardinality correction: Core reports, per operator, the rows it actually
     # produced against the rows Kyber estimated *before* correction. The geometric mean
     # of that q-error, per operator signature, multiplies the next structural estimate —
@@ -477,6 +500,13 @@ class OptimizerConfig:
     # peaks at 23 GB on TPC-H Q8 at sf10 alone. A source past the ceiling keeps learning
     # its ndv from the post-run pass. Result-invariant either way: ndv only steers choice.
     ndv_sketch_max_cells: int = 1 << 31
+    # How many optimized plans to memoize (`kyber.plan_cache`); 0 disables the cache.
+    # Optimization is a pure function of the plan, its sources, this config, and the learned
+    # statistics, so re-issuing an identical query need not re-derive an identical plan —
+    # and on a join-heavy query that derivation costs more than the engine's execution.
+    # Bounded LRU: a cached entry pins its in-memory sources alive, so the cap also bounds
+    # what the cache can keep from being collected.
+    plan_cache_entries: int = 256
     cardinality: CardinalityConfig = CardinalityConfig()
     cost_coeffs: CostCoefficients = CostCoefficients()
     cost_weights: CostWeights = CostWeights()
@@ -484,11 +514,12 @@ class OptimizerConfig:
 
 @dataclass(frozen=True, slots=True)
 class PIDConfig:
-    """Gains for the adaptive batch-size controller — a PID loop over relative
-    latency error that grows/shrinks the per-batch row count toward a target
-    latency. Implemented identically in `bc-udf::BatchSizeController` (data plane)
-    and `ml.inference._LatencyController` (Python); shipped to Rust as `EngineConfig`
-    so the two never drift.
+    """Gains for the adaptive batch-size PID controller over batch-latency error.
+
+    The loop grows/shrinks the per-batch row count toward a target latency. It is
+    implemented identically in `bc-udf::BatchSizeController` (data plane) and
+    `ml.inference._LatencyController` (Python); shipped to Rust as `EngineConfig` so
+    the two never drift.
 
     Examples:
         .. doctest::
@@ -549,6 +580,42 @@ AUTOSCALE_WAIT_AUTO: float = -1.0
 
 
 @dataclass(frozen=True, slots=True)
+class ShuffleTlsConfig:
+    """TLS for the inter-node Arrow Flight shuffle — encrypt the wire, authenticate peers.
+
+    The shuffle moves query data (including already-decrypted or masked columns) directly
+    between worker processes. On any network the operator does not fully control, that
+    traffic must be encrypted and the peers mutually authenticated. These are **file
+    paths** to PEM material the platform mounts on every worker (a Kubernetes secret
+    volume, cert-manager, a cloud private-CA); Batcher reads them at worker start and
+    issues no certificates itself — minting and rotating them is a platform concern.
+
+    Off by default (`enabled=False`) for a plaintext shuffle on a trusted network. One
+    cluster CA typically signs both the server and the client certificates, so
+    `ca_cert_path` is the trust root for both directions; set `require_client_auth` to
+    turn on mTLS (a connecting peer must present a certificate that CA signed).
+    Overridable via ``BATCHER_DISTRIBUTED_TLS_<FIELD>`` env vars.
+    """
+
+    enabled: bool = False
+    # The CA a peer's certificate must chain to (trust root for both server and client).
+    ca_cert_path: str = ""
+    # This node's server certificate + private key (what it presents on its Flight port).
+    server_cert_path: str = ""
+    server_key_path: str = ""
+    # This node's client certificate + key, presented under mTLS when fetching from a
+    # peer. Empty → outbound connections are server-auth only.
+    client_cert_path: str = ""
+    client_key_path: str = ""
+    # Server side: require and verify a client certificate on every incoming fetch (mTLS).
+    require_client_auth: bool = False
+    # The name verified against a peer certificate's SAN. Peers are dialed by address, so
+    # the certificate rarely matches the literal host; set this to the name the cluster's
+    # certificates actually carry.
+    server_name: str = "batcher-shuffle"
+
+
+@dataclass(frozen=True, slots=True)
 class DistributedConfig:
     """How the engine attaches to and shuffles across a Ray cluster.
 
@@ -562,6 +629,8 @@ class DistributedConfig:
     ray_address: str | None = None
     # Ray namespace for batcher's shuffle actors, so they're isolatable.
     namespace: str = "batcher"
+    # TLS/mTLS for the inter-node shuffle wire (off by default). See `ShuffleTlsConfig`.
+    tls: ShuffleTlsConfig = ShuffleTlsConfig()
     # ``runtime_env`` dict shipped to workers (e.g. ``{"working_dir": ...}`` or
     # ``{"py_modules": [...]}``) so ``batcher`` + its native extension are present
     # cluster-wide. None when batcher is already installed on every node.
@@ -919,12 +988,16 @@ class DistributedConfig:
     # The custom resource CPU-only nodes advertise for `heterogeneous_node_isolation`.
     cpu_node_resource: str = "cpu_node"
     # Submit-ahead depth per GPU/inference actor — how many partitions an actor may have in
-    # flight at once. `1` (default) is the old one-at-a-time behavior. A depth > 1 keeps a
-    # GPU fed across the dispatch/gather round-trip (Ray Data's `max_tasks_in_flight`
-    # guidance: shallow pipelines leave GPUs idle, depth 8-16 can multiply utilization).
-    # Bounded by `_MAP_INFLIGHT_MAX` in the executor. Result-identical (assembly is
-    # index-addressed; only pipeline depth changes).
-    map_inflight_depth: int = 1
+    # flight at once. `2` (default) double-buffers: one partition executes on the device while
+    # the next is dispatched/gathered, so the GPU stays fed across that round-trip instead of
+    # idling one-at-a-time (`1`) — the out-of-the-box lever toward >90% GPU utilization on the
+    # *first* run, before any measurement. It is deliberately not deeper by default: with no
+    # learned peak VRAM yet, a VRAM-heavy model at depth 8-16 could OOM; the adaptive loop
+    # (`map_inflight_adaptive`) raises it further only once a run has *measured* low utilization
+    # and headroom. Ray Data's `max_tasks_in_flight` guidance (depth 8-16 can multiply
+    # utilization) is reached that way, safely. Bounded by `_MAP_INFLIGHT_MAX` in the executor.
+    # Result-identical (assembly is index-addressed; only pipeline depth changes).
+    map_inflight_depth: int = 2
     # Let measured GPU utilization RAISE the per-actor depth above `map_inflight_depth`
     # (bounded): a stage whose prior runs recorded low utilization submits deeper to fill
     # the GPU; a near-saturated stage keeps the shallow default. On by default; only ever
@@ -970,6 +1043,12 @@ class ObservabilityConfig:
     log_format: str = "human"
     # Write a structured per-query event log (the Spark event-log analog). On by default.
     event_log: bool = True
+    # Emit an OpenTelemetry span per query (with a child span per operator) into the
+    # host's globally-configured tracer, so the engine's work appears in the enterprise's
+    # existing traces. Off by default; requires `opentelemetry` installed *and* a provider
+    # the host app configured (Batcher owns no exporter). Uses the same measured profile
+    # as the event log, so turning it on adds only the span emit, not extra measurement.
+    otel_traces: bool = False
     # Directory for event-log documents. Empty → ``$BATCHER_HOME/logs`` (or
     # ``~/.batcher/logs``), resolved at write time so `config` stays free of filesystem I/O.
     event_log_dir: str = ""
@@ -1015,7 +1094,23 @@ class Config:
     observability: ObservabilityConfig = ObservabilityConfig()
 
     def replace(self, **section_overrides: object) -> Config:
-        """Return a new Config with whole sections replaced."""
+        """Return a new Config with whole sections replaced.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config, ExecutionConfig
+                >>> cfg = Config().replace(execution=ExecutionConfig(morsel_rows=4096))
+                >>> cfg.execution.morsel_rows
+                4096
+
+        Args:
+            **section_overrides: Whole config sections to swap in, keyed by section
+                name (``execution``, ``memory``, ``optimizer``, ...).
+
+        Returns:
+            A new Config with the given sections replaced; the original is unchanged.
+        """
         return replace(self, **section_overrides)  # type: ignore[arg-type]
 
     def engine_config_json(self) -> str:
@@ -1035,6 +1130,18 @@ class Config:
         The result is memoized by the knob values: a frozen `Config` re-serializes
         the same string on every native call (and every streaming micro-batch), so
         the `json.dumps` runs once per distinct value tuple rather than per call.
+
+        Examples:
+            .. doctest::
+
+                >>> import json
+                >>> from batcher.config import Config
+                >>> knobs = json.loads(Config().engine_config_json())
+                >>> knobs["morsel_rows"]
+                16384
+
+        Returns:
+            A JSON string of the Rust-relevant execution knobs.
         """
         return _engine_config_json(self._engine_config_values())
 
@@ -1049,6 +1156,22 @@ class Config:
         the operator id. An empty map reproduces `engine_config_json` exactly, so
         callers with no `PhysicalOp` DAG (streaming, UDFs, distributed workers) are
         unaffected.
+
+        Examples:
+            .. doctest::
+
+                >>> import json
+                >>> from batcher.config import Config
+                >>> knobs = json.loads(Config().engine_config_json_with({0: 1 << 20}))
+                >>> knobs["op_budgets"]
+                {'0': 1048576}
+
+        Args:
+            op_budgets: Per-operator byte envelopes keyed by pre-order ``op_id``.
+
+        Returns:
+            A JSON string extending `engine_config_json` with the per-operator
+            budgets; an empty map reproduces `engine_config_json` exactly.
         """
         if not op_budgets:
             return self.engine_config_json()
@@ -1089,6 +1212,20 @@ class Config:
         points so they fail early and clearly instead of surfacing as a confusing
         runtime failure. Returns `self` so it can be chained. Pure (no side effects).
         The checks live in `config.validation` to keep this module focused.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config
+                >>> cfg = Config()
+                >>> cfg.validate() is cfg
+                True
+
+        Returns:
+            This Config, unchanged, so the call can be chained.
+
+        Raises:
+            ConfigError: If a tunable is out of range or inconsistent.
         """
         from batcher.config.validation import validate_config
 
@@ -1119,6 +1256,21 @@ class Config:
 
         Nested sections compose by path, e.g.
         ``BATCHER_OPTIMIZER_CARDINALITY_EQ_SELECTIVITY``.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config
+                >>> cfg = Config.from_env({"BATCHER_EXECUTION_MORSEL_ROWS": "4096"})
+                >>> cfg.execution.morsel_rows
+                4096
+
+        Args:
+            environ: The environment mapping to read, or None for ``os.environ``.
+            base: The config to overlay onto, or None for the defaults.
+
+        Returns:
+            A new Config with the matching env vars applied over `base`.
         """
         env = os.environ if environ is None else environ
         return _resolved(_overlay_env(base if base is not None else cls(), "BATCHER", env))
@@ -1129,6 +1281,24 @@ class Config:
 
         The JSON mirrors the section structure, e.g.
         ``{"execution": {"morsel_rows": 4096}, "optimizer": {"cardinality": {...}}}``.
+
+        Examples:
+            .. doctest::
+
+                >>> import json, tempfile
+                >>> from pathlib import Path
+                >>> from batcher.config import Config
+                >>> path = Path(tempfile.mkdtemp()) / "cfg.json"
+                >>> _ = path.write_text(json.dumps({"execution": {"morsel_rows": 4096}}))
+                >>> Config.from_file(path).execution.morsel_rows
+                4096
+
+        Args:
+            path: The JSON document to read.
+            base: The config to overlay onto, or None for the defaults.
+
+        Returns:
+            A new Config with the document's overrides applied over `base`.
         """
         data = json.loads(Path(path).read_text())
         return _resolved(_overlay_dict(base if base is not None else cls(), data))
@@ -1231,6 +1401,9 @@ def set_config(config: Config) -> None:
             >>> active_config().execution.morsel_rows
             4096
             >>> set_config(Config())  # restore defaults
+
+    Args:
+        config: The Config to make active. It is validated before being installed.
     """
     _active.set(_resolved(config))
 
@@ -1251,6 +1424,12 @@ def config_context(config: Config) -> Iterator[Config]:
             4096
             >>> active_config().execution.morsel_rows
             16384
+
+    Args:
+        config: The Config to activate for the block. It is validated on entry.
+
+    Yields:
+        The resolved Config that is active inside the block.
     """
     resolved = _resolved(config)
     token = _active.set(resolved)

@@ -8,6 +8,7 @@ from typing import IO, Any
 
 import pyarrow as pa
 
+from batcher._internal.hardware import available_cpu_count
 from batcher.config import active_config
 from batcher.io.base import FileSink, FileSource
 from batcher.io.formats.base import SINKS, SOURCES
@@ -180,7 +181,7 @@ class JSONSink(FileSink):
         # its own shard file (no result IPC); the driver just streams them back to back. Any
         # failure (no pandas, non-import-safe entrypoint) falls back to a correct serial path.
         n = table.num_rows
-        workers = min(n // _JSON_PARALLEL_MIN_ROWS, os.cpu_count() or 1) if n else 0
+        workers = min(n // _JSON_PARALLEL_MIN_ROWS, available_cpu_count()) if n else 0
         if workers > 1 and not _JSON_PROC_DISABLED:
             try:
                 self._write_parallel(table, fh, workers)
@@ -210,7 +211,7 @@ class JSONSink(FileSink):
             for ci, start in enumerate(range(0, n, max_rows_per_file))
         ]
         try:
-            pool = _json_pool(min(len(tasks), os.cpu_count() or 1))
+            pool = _json_pool(min(len(tasks), available_cpu_count()))
             parts = list(pool.map(_json_write_part, tasks))
         except Exception:
             # A non-import-safe entrypoint can't fork a worker; fall back to the base's

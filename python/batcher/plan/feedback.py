@@ -38,7 +38,7 @@ class OperatorFeedback:
     kind: str
     n_actual: int  # actual output rows
     t_op_ms: float  # wall-clock time
-    m_peak_bytes: int  # observed peak memory
+    m_peak_bytes: int  # observed peak working set (materialized input + result)
     selectivity: float  # n_out / n_in  (1.0 when not applicable)
     batch_size: int  # morsel size used
     backend: str = "interp"  # execution tier/backend that ran it
@@ -48,6 +48,12 @@ class OperatorFeedback:
     # 1.0, an IO-bound one stays low. 0.0 means unmeasured (an older engine that
     # reports no `cpu_ns`), which the adaptive CPU-share loop treats as "no signal".
     cpu_utilization: float = 0.0
+    # Worker threads the operator actually ran across (rayon's live count; 1 for the
+    # sequential oracle). `cpu_utilization` folds this into a per-core fraction, but the raw
+    # count is what a per-task `num_cpus` sizing loop needs to tell a fully-busy 8-core
+    # breaker (needs ~8 cores) from a fully-busy 1-core one — the fraction alone caps at 1.
+    # 0 means unmeasured (an older engine that reports no thread count).
+    threads: int = 0
     # Actual *input* rows the operator consumed. Cost calibration fits the per-row
     # coefficients of the input-bound families (filter, distinct, aggregate,
     # hash_join) against this, not `n_actual` (output rows) — a selective filter's
@@ -55,6 +61,24 @@ class OperatorFeedback:
     # engine, or a source op with no input), in which case calibration reconstructs
     # it from `n_actual / selectivity`.
     n_input: int = 0
+    # Rows fed into a join's *build* side (the hashed input). 0 for every other operator.
+    # A join's memory scales with the side it hashes, not with the side it probes, so the
+    # learned memory model divides `m_peak_bytes` by this rather than by `n_input`.
+    n_build: int = 0
+    # Bytes of this operator's *result* alone. `m_peak_bytes` is now the true peak working
+    # set (a breaker's materialized input plus its result); this is what that field used to
+    # hold, kept so the profiler can still report output size honestly.
+    result_bytes: int = 0
+    # Logical bytes this operator routed to its out-of-core spill path (0 when it ran in
+    # memory, or when the spill volume was not measured). The magnitude `algorithm="spill"`
+    # cannot carry: Carbonite sizes spill scratch, disk bandwidth, and partition counts from
+    # a measured 1 GB-vs-100 GB spill, and Kyber can cost the grace path from real volume.
+    spill_bytes: int = 0
+    # Measured growth in the process's peak resident set (bytes) during this operator, from
+    # `getrusage(ru_maxrss)`. The ground-truth memory high-water that `m_peak_bytes` (an
+    # Arrow-size estimate) cannot see: transient scratch, allocator fragmentation, off-pool
+    # buffers. 0 means the op set no new high-water or the platform can't report RSS.
+    peak_rss_bytes: int = 0
     # The operator's structural plan signature — a stable identity across executions
     # (`op_id` is only a position in one plan's walk). Empty when the reporter has no
     # plan to correlate against: a distributed worker runs a sub-plan whose `op_id`s

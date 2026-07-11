@@ -54,8 +54,21 @@ def distinct_values(ds: Dataset, column: str) -> list[Any]:
 class Preprocessor(abc.ABC):
     """A stateful column transform with a `fit` / `transform` / `fit_transform` API.
 
-    Subclasses implement `fit` (learn state, return ``self``) and `transform`
-    (return a new lazy `Dataset`). `fit` executes; `transform` stays lazy.
+    Subclasses implement `fit` (learn state from a dataset, return ``self``) and
+    `transform` (return a new lazy `Dataset` that applies the learned rewrite). `fit`
+    executes a small mergeable aggregate; `transform` stays lazy and adds only `Expr`
+    projections, so it runs no work until a terminal op. Fit on the training split and
+    `transform` the held-out split with the *same* statistics.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import StandardScaler
+            >>> train = bt.from_pydict({"x": [1.0, 3.0]})
+            >>> pre = StandardScaler(["x"]).fit(train)
+            >>> pre.transform(train).to_pydict()
+            {'x': [-1.0, 1.0]}
     """
 
     _fitted: bool = False
@@ -65,7 +78,22 @@ class Preprocessor(abc.ABC):
 
         The default is the stateless case: there is nothing to learn, so it just marks
         the preprocessor fitted. Stateful preprocessors (scalers, encoders, imputers)
-        override this to run their aggregate.
+        override this to run their aggregate over `ds`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import StandardScaler
+                >>> pre = StandardScaler(["x"]).fit(bt.from_pydict({"x": [1.0, 3.0]}))
+                >>> pre.mean_, pre.scale_
+                ({'x': 2.0}, {'x': 1.0})
+
+        Args:
+            ds: The dataset to learn the statistics from (the training split).
+
+        Returns:
+            ``self``, marked fitted, so `fit` chains straight into `transform`.
         """
         _ = ds  # stateless default — no statistics to learn
         self._fitted = True
@@ -73,10 +101,46 @@ class Preprocessor(abc.ABC):
 
     @abc.abstractmethod
     def transform(self, ds: Dataset) -> Dataset:
-        """Apply the fitted transform to `ds`, returning a new lazy `Dataset`."""
+        """Apply the fitted transform to `ds`, returning a new lazy `Dataset`.
+
+        Each subclass contributes `Expr` projections (via `with_columns` / `select`),
+        so the returned dataset is lazy and runs no work until a terminal op. Must be
+        called after `fit` (or `fit_transform`).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import StandardScaler
+                >>> pre = StandardScaler(["x"]).fit(bt.from_pydict({"x": [1.0, 3.0]}))
+                >>> pre.transform(bt.from_pydict({"x": [2.0, 4.0]})).to_pydict()
+                {'x': [0.0, 2.0]}
+
+        Args:
+            ds: The dataset to rewrite (may differ from the one `fit` saw).
+
+        Returns:
+            A new lazy `Dataset` with the fitted transform applied.
+        """
 
     def fit_transform(self, ds: Dataset) -> Dataset:
-        """`fit(ds)` then `transform(ds)` — the common single-dataset path."""
+        """`fit(ds)` then `transform(ds)` — the common single-dataset path.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import StandardScaler
+                >>> ds = bt.from_pydict({"x": [1.0, 3.0]})
+                >>> StandardScaler(["x"]).fit_transform(ds).to_pydict()
+                {'x': [-1.0, 1.0]}
+
+        Args:
+            ds: The dataset to fit on and then transform.
+
+        Returns:
+            A new lazy `Dataset` with the just-fitted transform applied.
+        """
         return self.fit(ds).transform(ds)
 
     def _require_fitted(self) -> None:

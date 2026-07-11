@@ -143,3 +143,33 @@ def test_hmac_differs_from_the_unkeyed_digest(duck):
         .to_arrow()
     )
     assert_same(got, duck.sql("SELECT false AS same FROM users"))
+
+
+# --- Key references (env: / file:) --------------------------------------------
+def test_an_env_key_reference_round_trips_like_an_inline_key(duck, monkeypatch):
+    """The engine resolves `env:NAME` at execution; the result equals the plaintext."""
+    monkeypatch.setenv("BC_DIFF_AES_KEY", KEY)
+    ds = _cards(duck)
+    got = ds.select(
+        card=bt.aes_decrypt(
+            bt.aes_encrypt(col("card"), "env:BC_DIFF_AES_KEY"), "env:BC_DIFF_AES_KEY"
+        )
+    ).to_arrow()
+    assert_same(got, duck.sql("SELECT card FROM cards"))
+
+
+def test_a_file_key_reference_round_trips(duck, tmp_path):
+    keyfile = tmp_path / "aes.key"
+    keyfile.write_text(KEY + "\n")  # trailing newline must be trimmed by the engine
+    ref = f"file:{keyfile}"
+    ds = _cards(duck)
+    got = ds.select(card=bt.aes_decrypt(bt.aes_encrypt(col("card"), ref), ref)).to_arrow()
+    assert_same(got, duck.sql("SELECT card FROM cards"))
+
+
+def test_a_key_reference_never_appears_in_the_plan_ir(duck, monkeypatch):
+    """Only the reference is in the IR — the secret is read on the executing node."""
+    monkeypatch.setenv("BC_DIFF_AES_KEY", KEY)
+    e = bt.aes_encrypt(col("card"), "env:BC_DIFF_AES_KEY")
+    assert e.to_ir()["pattern"] == "env:BC_DIFF_AES_KEY"
+    assert KEY not in str(e.to_ir())

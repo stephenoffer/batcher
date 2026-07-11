@@ -18,7 +18,12 @@ and its lineage-recovery contract without a circular import.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from batcher.carbonite.transfer import ShuffleTicket
+
+if TYPE_CHECKING:
+    from batcher.config.config import ShuffleTlsConfig
 
 __all__ = [
     "_FlightWorker",
@@ -118,6 +123,7 @@ try:
             plan_id: int = _DEFAULT_PLAN_ID,
             shm: bool = False,
             preemption: bool = False,
+            tls_config: ShuffleTlsConfig | None = None,
         ) -> None:
             import batcher._native as nat
             from batcher.carbonite.transfer import ShuffleSession
@@ -145,6 +151,23 @@ try:
                 idle_timeout_ms, keepalive_ms, connections_per_peer, compression
             )
 
+            # Shuffle TLS (off unless the operator mounted certs and enabled it). Read
+            # this node's mounted PEM files, install the process-wide *client* TLS for
+            # outbound fetches, and keep the *server* material to hand to the session's
+            # Flight server below. A misconfigured deployment raises here, at worker
+            # startup, rather than at the first cross-node fetch.
+            shuffle_tls = None
+            if tls_config is not None and tls_config.enabled:
+                from batcher.carbonite.transfer.tls import load_shuffle_tls
+
+                shuffle_tls = load_shuffle_tls(tls_config)
+                nat.set_flight_client_tls(
+                    shuffle_tls.ca_pem,
+                    shuffle_tls.server_name,
+                    shuffle_tls.client_cert_pem,
+                    shuffle_tls.client_key_pem,
+                )
+
             self.id = worker_id
             # The node's routable IP, so this worker's Flight server advertises a
             # cross-node-reachable address instead of loopback (which a reducer on
@@ -166,10 +189,15 @@ try:
                     advertise_host=advertise_host,
                     token=shuffle_token,
                     shm=shm,
+                    tls=shuffle_tls,
                 )
             else:
                 self.session = ShuffleSession(
-                    credits, advertise_host=advertise_host, token=shuffle_token, shm=shm
+                    credits,
+                    advertise_host=advertise_host,
+                    token=shuffle_token,
+                    shm=shm,
+                    tls=shuffle_tls,
                 )
             # The driver's EngineConfig (this worker process can't see the driver's
             # config_context), used for every local execute_plan on this actor.
@@ -518,6 +546,7 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
             plan_id,
             shm,
             preemption,
+            dc.tls,
         )
         for i in range(workers)
     ]

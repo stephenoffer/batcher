@@ -30,6 +30,15 @@ pub enum ExprError {
     #[error("{func}: key must be 32 bytes, given as 64 hex characters or as base64")]
     InvalidKey { func: &'static str },
 
+    /// A key *reference* (`env:NAME` / `file:PATH`) could not be resolved on this node.
+    /// The reference is named (it is not secret and is what an operator needs to fix the
+    /// misconfiguration); the resolved key never appears here.
+    #[error("{func}: could not resolve key reference {reference}")]
+    KeyRefUnresolved {
+        func: &'static str,
+        reference: String,
+    },
+
     #[error("integer division or modulo by zero")]
     DivideByZero,
 

@@ -81,6 +81,32 @@ def mirror_tpch(con: duckdb.DuckDBPyConnection, scale: int, base: str, out: str)
         print(f"  sf{scale}/{table}: {size:.2f} GB in {time.perf_counter() - t0:.1f}s", flush=True)
 
 
+# ClickBench stores its temporal columns as integers: `EventDate` is days since the epoch
+# (uint16), the `*EventTime` columns are unix seconds (int64). The *loaded* path rebuilds them
+# in memory (`benchmarks/sources.py::_reconstruct_clickbench_temporals`), but a **scan** hands
+# each engine the raw file — so the four queries that call `toMonth`/`toHour` on them (q18,
+# q36, q37, q41) fail on every engine, ours included. Normalizing them once, on disk, is what
+# makes ClickBench runnable in scan mode at its full 100 M rows.
+_CLICKBENCH_DATE_COLUMNS = ("EventDate",)
+_CLICKBENCH_TIME_COLUMNS = ("EventTime", "ClientEventTime", "LocalEventTime")
+
+
+def _clickbench_select(con: duckdb.DuckDBPyConnection, uri: str) -> str:
+    """`SELECT` list that rebuilds ClickBench's DATE/TIMESTAMP columns, passing the rest."""
+    names = [r[0] for r in con.sql(f"DESCRIBE SELECT * FROM read_parquet('{uri}')").fetchall()]
+    parts = []
+    for name in names:
+        if name in _CLICKBENCH_DATE_COLUMNS:
+            days = f'CAST("{name}" AS INTEGER)'
+            parts.append(f"CAST(DATE '1970-01-01' + INTERVAL ({days}) DAY AS DATE) AS \"{name}\"")
+        elif name in _CLICKBENCH_TIME_COLUMNS:
+            secs = f'CAST("{name}" AS BIGINT)'
+            parts.append(f'CAST(TO_TIMESTAMP({secs}) AS TIMESTAMP) AS "{name}"')
+        else:
+            parts.append(f'"{name}"')
+    return ", ".join(parts)
+
+
 def mirror_clickbench(con: duckdb.DuckDBPyConnection, parts: int, base: str, out: str) -> None:
     dest = os.path.join(out, "clickbench", "hits", "part-0.parquet")
     if os.path.exists(dest):
@@ -88,7 +114,8 @@ def mirror_clickbench(con: duckdb.DuckDBPyConnection, parts: int, base: str, out
         return
     uris = ", ".join(f"'{base}/hits_{i}.parquet'" for i in range(parts))
     t0 = time.perf_counter()
-    _copy(con, f"SELECT * FROM read_parquet([{uris}])", dest)
+    sel = _clickbench_select(con, f"{base}/hits_0.parquet")
+    _copy(con, f"SELECT {sel} FROM read_parquet([{uris}])", dest)
     size = os.path.getsize(dest) / 1e9
     print(f"  clickbench/hits: {size:.2f} GB in {time.perf_counter() - t0:.1f}s", flush=True)
 

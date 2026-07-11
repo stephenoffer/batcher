@@ -6,8 +6,7 @@ via `to_ir()` to the exact JSON document the Rust `bc-expr` crate deserializes â
 the same IR consumed by both the interpreter and (later) the JIT. The wire tags
 here (`e`, `op`, literal kind) are a contract with the engine; keep them in sync.
 
-This package re-exports the full expression surface from its submodules: ``core``,
-``namespaces`` (the `.str`/`.dt`/`.list`/â€¦ accessors), ``walk``, ``constructors``.
+Re-exports the full surface: ``core``, ``namespaces``, ``walk``, ``constructors``.
 """
 
 from __future__ import annotations
@@ -49,6 +48,7 @@ from batcher.plan.expr_ir.namespaces import (
     ListContains,
     ListFunc,
     ListGet,
+    ListSimhash,
     ListSlice,
     StrFunc,
     StructField,
@@ -94,6 +94,7 @@ __all__ = [
     "ListFunc",
     "ListGet",
     "ListJoin",
+    "ListSimhash",
     "ListSlice",
     "Lit",
     "Math2Expr",

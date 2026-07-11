@@ -32,11 +32,24 @@ train/validation/test split.
 Pass `key=` to hash only the columns that identify a row:
 
 ```python
-train, test = ds.ml.train_test_split(0.2, seed=42, key="id")
+users = bt.range(0, 1000).select(id=bt.col("value"), score=bt.col("value") * 2)
+train, test = users.ml.train_test_split(0.2, seed=42, key="id")
+print(train.count() + test.count())
+# 1000
 ```
 
-Then re-deriving a feature column does not move rows between train and test. Without
-`key=` every column is hashed, which is correct but re-splits whenever any value changes.
+Then re-deriving a feature column does not move rows between train and test — the split
+follows `id` alone, so recomputing `score` leaves every row where it was:
+
+```python
+rescored = users.with_columns(score=bt.col("id") * 3)
+again, _ = rescored.ml.train_test_split(0.2, seed=42, key="id")
+print(sorted(again.to_pydict()["id"]) == sorted(train.to_pydict()["id"]))
+# True
+```
+
+Without `key=` every column is hashed, which is correct but re-splits whenever any value
+changes.
 
 ## Fuzzy deduplication
 
@@ -70,6 +83,44 @@ never precision. `bands` is the dial: more bands, more candidates, more recall, 
 
 Both are ordinary relational plans — a projection, an `explode`, and joins — so they run
 wherever a join runs.
+
+## Matching on meaning: `similarity_join`
+
+MinHash answers "are these two documents made of the same words". It says nothing about
+two rows that *mean* the same thing in different words. That is a question for embeddings,
+and `ds.ml.similarity_join` is the same two-stage recipe with the signature swapped:
+`.list.simhash` replaces `str.minhash`, and the verification is the **exact**
+`list.cosine_similarity` over the original vectors.
+
+```python
+import batcher as bt
+
+catalog = bt.from_pydict({"sku": [1, 2], "v": [[1.0, 0.0], [0.0, 1.0]]})
+feed = bt.from_pydict({"ref": [10], "v": [[1.0, 0.02]]})
+pairs = catalog.ml.similarity_join(
+    feed, left_on="v", threshold=0.9, left_key="sku", right_key="ref"
+)
+print(pairs.select("key_a", "key_b").to_pydict())
+# {'key_a': [1], 'key_b': [10]}
+```
+
+This is entity resolution — a product catalogue against a supplier feed, a CRM against a
+billing system — and retrieval over a corpus, wherever the join key is "means the same
+thing" rather than "is the same string".
+
+`simhash` is Charikar's random-hyperplane LSH: `num_bits` hyperplanes are drawn through
+the origin and each bit records which side of one the vector falls on. Two vectors an
+angle `θ` apart agree on each bit with probability `1 - θ/π`, so the fraction of agreeing
+bits estimates the angle — the vector-space counterpart of MinHash's Jaccard estimate.
+The hyperplanes are derived by hashing `(seed, bit, dimension)` rather than stored, so
+every partition and every machine draws the same ones and a signature computed on one
+node is comparable with one computed on another.
+
+Exactly as in fuzzy dedup, banding governs **recall, never precision**: no pair below
+`threshold` is ever returned, but a pair above it can miss every band. `bands` is the
+dial. Rows whose vector is null or empty have no direction, cannot clear any threshold,
+and are dropped rather than banded — left in, they would all collide and blow the
+candidate set up quadratically.
 
 ## Chaining steps
 
@@ -421,3 +472,10 @@ print(prepared_val.collect().column_names)
 result is computed by a terminal op like `collect()` or `write.parquet(...)` — single
 node or distributed. Use preprocessors before a training loop
 ([PyTorch integration](pytorch.md)) or before batch [inference](inference.md).
+
+## Next steps
+
+- [Feature engineering tutorial](../tutorials/feature-engineering.md): the full raw
+  table → model-ready matrix workflow, end to end, with `Chain`.
+- [PyTorch integration](pytorch.md): hand the assembled features to a training loop.
+- [ML API reference](../api/ml.md): the complete `Preprocessor` surface.

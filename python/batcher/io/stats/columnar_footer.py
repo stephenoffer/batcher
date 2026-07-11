@@ -33,10 +33,61 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.hardware import available_cpu_count
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
 
 __all__ = ["is_exact_minmax_type", "orc_statistics", "parquet_statistics"]
+
+
+def _read_footers(fs: Any, files: list[str], pq: Any) -> list[Any]:
+    """Each file's Parquet metadata (footer), read concurrently, in file order.
+
+    The footer read is one object-store round trip whose C++ parse releases the GIL, so
+    a many-file dataset must not read them one at a time (that serial loop is the bulk of
+    a small-many-files query's wall clock). A per-file failure maps to ``None`` (skipped
+    by the caller) rather than failing the whole statistics pass.
+
+    Concurrency uses pyarrow's **native** filesystem read (`read_metadata(path,
+    filesystem=…)`) when the backend exposes one — that reads the footer C++-side without a
+    Python file handle, which is both faster and thread-safe under fan-out (a buffered
+    Python handle per thread is not). Backends with no native target fall back to the
+    handle, read serially to stay safe.
+    """
+    target = getattr(fs, "native_read_target", None)
+
+    def _native(path: str) -> Any:
+        try:
+            resolved = target(path) if target is not None else None
+            if resolved is None:
+                return _handle(path)
+            native_fs, in_path = resolved
+            return pq.read_metadata(in_path, filesystem=native_fs)
+        except Exception:
+            return None
+
+    def _handle(path: str) -> Any:
+        try:
+            with fs.open(path) as fh:
+                return pq.ParquetFile(fh).metadata
+        except Exception:
+            return None
+
+    if len(files) <= 1:
+        return [_native(files[0])] if files else []
+    # No native target → the buffered-handle path is not safe to fan out, so read serially.
+    if target is None or target(files[0]) is None:
+        return [_handle(p) for p in files]
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Footer reads are latency-bound (network round trips), not CPU-bound, so oversubscribe
+    # the cores — many small concurrent GETs saturate object-store bandwidth where
+    # one-per-core would stall on latency — but cap the pool so a huge dataset does not
+    # open thousands of connections at once.
+    workers = min(len(files), max(8, available_cpu_count() * 2), 64)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_native, files))  # order preserved
+
 
 # Arrow types whose footer/manifest min/max is the exact value (never truncated).
 _EXACT_MINMAX_TYPES = (
@@ -85,11 +136,14 @@ def parquet_statistics(fs: Any, files: list[str], schema: pa.Schema) -> SourceSt
     # every contributing chunk reported a null_count (else null_count is unknown).
     acc: dict[str, _ColAcc] = {}
     saw_any = False
-    for path in files:
-        try:
-            with fs.open(path) as fh:
-                meta = pq.ParquetFile(fh).metadata
-        except Exception:
+    # Reading each file's footer is one object-store round trip (~40 ms), and over a
+    # many-file dataset a serial loop dominates a query's wall clock (100 small Parquet
+    # files ≈ 4 s of pure footer I/O — more than the data read itself). The footer read
+    # releases the GIL in the C++ layer, so fan it across a thread pool: the metadata
+    # objects come back in file order, then the (cheap, CPU-only) accumulation stays
+    # serial. Best-effort per file is preserved — an unreadable footer maps to None.
+    for meta in _read_footers(fs, files, pq):
+        if meta is None:
             continue
         saw_any = True
         total_rows += meta.num_rows
@@ -124,18 +178,20 @@ def orc_statistics(fs: Any, files: list[str]) -> SourceStatistics | None:
     """
     import pyarrow.orc as orc
 
-    total = 0
-    saw_any = False
-    for path in files:
-        try:
-            with fs.open(path) as fh:
-                total += orc.ORCFile(fh).nrows
-        except Exception:
-            return None
-        saw_any = True
-    if not saw_any:
+    from batcher.io._concurrent import read_each_file
+
+    if not files:
         return None
-    return SourceStatistics(row_count=total, exact_rows=True)
+
+    def _nrows(filesystem: Any, path: str) -> int:
+        with filesystem.open(path) as fh:
+            return orc.ORCFile(fh).nrows
+
+    try:
+        counts = read_each_file(fs, files, _nrows)  # concurrent footer reads, in order
+    except Exception:
+        return None  # any unreadable footer → not an exact count
+    return SourceStatistics(row_count=sum(counts), exact_rows=True)
 
 
 class _ColAcc:

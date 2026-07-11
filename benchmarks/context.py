@@ -12,6 +12,10 @@ styles need:
 There is no data generation here and no per-engine duplication of the load: the same
 normalized Arrow tables back every engine, which is what lets the correctness gate
 compare them.
+
+The scan suite is the one exception (``build_corpus``): it benchmarks scan planning, so
+it loads nothing and instead exposes the parquet ``corpora`` for each case to open
+inside its own timed call.
 """
 
 from __future__ import annotations
@@ -22,7 +26,14 @@ from typing import Any
 import pyarrow as pa
 
 from engines import Engine
-from sources import load_tables, table_uris
+from sources import (
+    ImageCorpus,
+    ScanCorpus,
+    image_corpus,
+    load_tables,
+    scan_corpora,
+    table_uris,
+)
 
 # A benchmark dataset name -> the public source benchmark it reads from. The
 # operator-mix runs over the TPC-H tables (a real lineitem/orders join, real dates
@@ -34,6 +45,11 @@ SOURCE_FOR = {
     "operators": "tpch",
 }
 
+# Datasets built from a file *corpus* rather than named tables: the cases construct each
+# engine's reader themselves (inside the timed call), so no table is loaded or bound here.
+# ``scan`` is structured parquet in three layouts; ``images`` is unstructured JPEGs.
+CORPUS_BENCHMARKS = frozenset({"scan", "images"})
+
 
 @dataclass
 class Context:
@@ -43,6 +59,8 @@ class Context:
     tables: dict[str, pa.Table]
     engines: list[Engine]
     uris: dict[str, str] = field(default_factory=dict)
+    corpora: dict[str, ScanCorpus] = field(default_factory=dict)
+    images: ImageCorpus | None = None
     _runners: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _handles: dict[tuple[str, str], Any] = field(default_factory=dict, init=False, repr=False)
 
@@ -73,6 +91,35 @@ class Context:
         """
         uris = table_uris(SOURCE_FOR[benchmark], scale, source)
         return cls(benchmark=benchmark, tables={}, engines=engines, uris=uris)
+
+    @classmethod
+    def build_corpus(
+        cls,
+        benchmark: str,
+        scale: float,
+        engines: list[Engine],
+        source: str | None = None,
+    ) -> Context:
+        """Corpus context: a file corpus at ``scale``, with nothing loaded or bound.
+
+        The corpus suites measure the read/decode path itself, so each case builds its
+        engine's reader inside the timed call — there is no table to preload and no runner
+        to pre-register. ``scan`` fills ``corpora`` (three parquet layouts); ``images``
+        fills ``images`` (one JPEG corpus).
+        """
+        if benchmark == "images":
+            return cls(
+                benchmark=benchmark,
+                tables={},
+                engines=engines,
+                images=image_corpus(scale, source),
+            )
+        return cls(
+            benchmark=benchmark,
+            tables={},
+            engines=engines,
+            corpora=scan_corpora(scale, source),
+        )
 
     def table(self, name: str) -> pa.Table:
         """The normalized Arrow table registered under ``name``."""

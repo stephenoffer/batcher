@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
-from batcher.api.orchestration import _SOURCE_STATS_CACHE, invalidate_source_stats
+from batcher.api.source_stats import _SOURCE_STATS_CACHE, invalidate_source_stats
 
 pytestmark = pytest.mark.integration
 

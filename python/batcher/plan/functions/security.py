@@ -22,26 +22,52 @@ Where that is unacceptable, drop the column instead of protecting it.
 These are the primitives that `batcher.governance` column-masking policies lower to;
 they are also usable directly.
 
-.. warning::
-    A key passed here is embedded in the query's JSON plan IR, which crosses the FFI
-    boundary and may be captured by plan logging or the profile/event log. Source keys
-    from a secret manager, and treat a serialized plan as secret material. `Expr`'s
-    `repr` redacts the key (so tracebacks and notebook echoes do not leak it), but
-    `to_ir()` necessarily does not.
+**Keys by reference (recommended).** Pass ``key="env:NAME"`` or ``key="file:PATH"``
+instead of the raw key. Only the reference travels in the plan IR — plan logs, the
+profile, ``explain()``, and the FFI boundary never see the secret. The data plane reads
+the key on the machine that runs the query (from *its* environment or a mounted secret
+file), so a distributed query resolves the key on each worker and never ships it over
+the wire. An inline literal still works for local development but emits a
+`SecurityWarning`, because it embeds the secret in the query and its serialized plan.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import warnings
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, SecurityWarning
 from batcher.plan.expr_ir.core import Expr, IntoExpr, _wrap
 from batcher.plan.expr_ir.func_nodes import StrFunc
 
 __all__ = ["aes_decrypt", "aes_encrypt", "hmac_sha256", "mask"]
 
 _AES_KEY_BYTES = 32
+
+#: Key-reference schemes resolved by the data plane at execution time (never in Python).
+_KEY_REF_SCHEMES = ("env:", "file:")
+
+
+def _is_key_ref(key: str) -> bool:
+    """Whether `key` is a reference (`env:NAME` / `file:PATH`) the engine resolves.
+
+    A reference travels in the plan IR verbatim; the raw secret is read on the executing
+    node from the environment or a mounted file. A bare value is an inline literal.
+    """
+    return isinstance(key, str) and key.startswith(_KEY_REF_SCHEMES)
+
+
+def _warn_inline_key(func: str) -> None:
+    """Warn that an inline key is embedded in the query and its serialized plan."""
+    warnings.warn(
+        f"{func}(): an inline key is embedded in the query plan (and any plan log / "
+        f"profile / explain output). Prefer a reference — key='env:MY_KEY' or "
+        f"key='file:/run/secrets/key' — which the engine resolves at execution time so "
+        f"the secret never enters the plan.",
+        SecurityWarning,
+        stacklevel=3,
+    )
 
 
 def _as_text(e: IntoExpr) -> Expr:
@@ -55,12 +81,18 @@ def _as_text(e: IntoExpr) -> Expr:
 
 
 def _validated_key(func: str, key: str) -> str:
-    """Return `key` if it decodes to 32 bytes (64 hex characters or base64), else raise.
+    """Return the `key` (or key reference) to store in the plan IR, validated.
 
-    Validated here, at plan-build time, rather than left to the engine: a bad key would
-    otherwise surface as an error from inside a scan, after the query has been
-    optimized and admitted. The `PlanError` deliberately does not quote the key.
+    A reference (`env:`/`file:`) is passed through verbatim — it is resolved on the
+    executing node, so it cannot be validated here (the secret may not be present on the
+    machine building the plan). An inline literal is validated to decode to 32 bytes now,
+    at plan-build time, so a bad key fails before the query is optimized and admitted
+    rather than from inside a scan; and a `SecurityWarning` flags that the secret is being
+    embedded in the plan. The `PlanError` deliberately does not quote the key.
     """
+    if _is_key_ref(key):
+        return key
+    _warn_inline_key(func)
     if not isinstance(key, str) or not key:
         raise PlanError(f"{func}(): key must be a non-empty string")
     try:
@@ -152,6 +184,8 @@ def hmac_sha256(e: IntoExpr, key: str) -> Expr:
     """
     if not key:
         raise PlanError("hmac_sha256(): key must be a non-empty string")
+    if not _is_key_ref(key):
+        _warn_inline_key("hmac_sha256")
     return StrFunc("hmac_sha256", _as_text(e), pattern=key)
 
 

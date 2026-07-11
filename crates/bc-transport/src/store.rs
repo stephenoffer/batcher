@@ -16,6 +16,11 @@ use tokio::sync::RwLock;
 pub(crate) struct InflightGauge {
     current: std::sync::atomic::AtomicI64,
     max: std::sync::atomic::AtomicI64,
+    /// How many credit-grant *control messages* the consumer sent (one per pump
+    /// wakeup, regardless of how many credits it carried). With per-batch grants this
+    /// equals the batch count; with low-watermark batched refill it is ~`2N/window` —
+    /// so it *proves* the control-message reduction the batched refill exists for.
+    grant_messages: std::sync::atomic::AtomicI64,
 }
 
 impl InflightGauge {
@@ -37,9 +42,22 @@ impl InflightGauge {
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// One credit-grant control message arrived from the consumer (independent of
+    /// how many credits it carried). Counts the exchange's control-message traffic.
+    pub(crate) fn on_grant_message(&self) {
+        self.grant_messages
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// High-water mark of simultaneously in-flight batches.
     pub(crate) fn max(&self) -> i64 {
         self.max.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total credit-grant control messages the consumer sent for this exchange.
+    pub(crate) fn grant_messages(&self) -> i64 {
+        self.grant_messages
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

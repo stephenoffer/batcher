@@ -216,12 +216,78 @@ answers = llm_generate(
 )
 ```
 
+## AI-powered ETL: typed columns, not strings
+
+Generation gives you a *string*. A string is not a column an analyst can filter, join, or
+aggregate — turning it into one is the actual ETL step, and it is where these pipelines
+break. Two Dataset methods do it.
+
+`ds.ml.extract(engine, schema=...)` appends one **typed** column per declared field. The
+declaration — not what the model happened to emit — decides the Arrow type:
+
+```python
+import batcher as bt
+
+notes = bt.from_pydict({"note": ["Paid 42 USD to Acme"]})
+stub = lambda: (lambda ps: ['{"vendor": "Acme", "total": "42"}'] * len(ps))
+print(notes.ml.extract(stub, schema={"vendor": "string", "total": "float64"}, prompt_column="note").to_pydict())
+# {'note': ['Paid 42 USD to Acme'], 'vendor': ['Acme'], 'total': [42.0]}
+```
+
+This is why `extract` exists rather than `generate(parse_json=True)`: `parse_json` infers
+the struct type from whatever came back **in that batch**. Ask for `{label, score}`, have
+the model omit `score` on one batch, and the two batches carry incompatible struct types —
+the scan dies at concat time with the GPU work already paid for. A declared schema pins
+every batch to the same types and makes the missing value a null. Note also that `"42"`
+came back as a *string* and landed in a `float64` column: values are coerced per row.
+
+Failures degrade one row, never the batch — an unparseable response, a missing key, or a
+value that will not coerce becomes null, and the damage is countable:
+
+```python
+# docs: skip
+bad = extracted.filter(bt.col("total").is_null()).count()
+```
+
+`ds.ml.classify(engine, labels=[...])` labels each row with exactly one of `labels`. A
+model asked for `"positive"` will answer `"Positive."` or `"The sentiment is positive."`;
+taken verbatim those give a category column with a long tail that never groups together.
+`classify` resolves the answer against the declared set and **nulls anything else**, so the
+column's domain is exactly `labels`:
+
+```python
+import batcher as bt
+
+reviews = bt.from_pydict({"review": ["loved it", "awful"]})
+stub = lambda: (lambda ps: ["Positive." if "loved" in p else "negative" for p in ps])
+print(reviews.ml.classify(stub, labels=["positive", "negative"], prompt_column="review").to_pydict())
+# {'review': ['loved it', 'awful'], 'label': ['positive', 'negative']}
+```
+
+Pair `extract` with guided decoding so that every row parses in the first place —
+`json_schema(schema)` builds the JSON Schema for you:
+
+```python
+# docs: skip
+from batcher.ml import json_schema, vllm_engine
+
+schema = {"vendor": "string", "total": "float64"}
+engine = vllm_engine("meta-llama/Llama-3-8B", guided_json=json_schema(schema))
+invoices = bt.read.parquet("s3://bucket/invoices.parquet").ml.extract(
+    engine, schema=schema, prompt_column="body", num_gpus=1
+)
+```
+
+Both lower to `map_batches`, so they are linear maps: they stream, they distribute across
+GPU actors, and they compose with the rest of the engine like any other projection.
+
 ## Structured output
 
 Constrain generation to a JSON schema so every row is parseable, then parse it into a
 struct column. `guided_json` on the engine forces the model's decoding to the schema,
 and `parse_json=True` on `llm_generate` parses each output into a struct; a row that
-fails to parse gets a null rather than failing the batch. Pair the two — guided
+fails to parse gets a null rather than failing the batch. Prefer `ds.ml.extract` above
+when the fields are known — it pins the Arrow types. Pair the two — guided
 decoding makes the output well-formed, and `parse_json` turns it into typed columns
 you can query downstream.
 
@@ -296,3 +362,9 @@ For a model Batcher does not wrap directly, `ds.ml.embed` also takes any load-on
 callable or class that maps a batch to vectors, and `ds.ml.infer` does the same for
 general model scoring — both accept `concurrency`, `num_gpus`, and `batch_size` the
 same way.
+
+## Next steps
+
+- [Inference](inference.md): the general batch-inference and embedding path.
+- [Serving](serving.md): expose a model behind an endpoint.
+- [GPU scheduling](gpu.md): how `num_gpus` and `concurrency` map to actors.

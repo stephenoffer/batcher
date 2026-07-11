@@ -28,6 +28,15 @@ _STRATEGIES = ("mean", "median", "most_frequent", "constant")
 class SimpleImputer(Preprocessor):
     """Fill missing values in `columns` using a per-column statistic.
 
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import SimpleImputer
+            >>> ds = bt.from_pydict({"a": [1.0, None, 3.0]})
+            >>> SimpleImputer(["a"]).fit_transform(ds).to_pydict()
+            {'a': [1.0, 2.0, 3.0]}
+
     Args:
         columns: the columns to impute in place.
         strategy: ``"mean"``, ``"median"``, ``"most_frequent"``, or ``"constant"``.
@@ -55,6 +64,28 @@ class SimpleImputer(Preprocessor):
         self.statistics_: dict[str, Any] = {}
 
     def fit(self, ds: Dataset) -> SimpleImputer:
+        """Learn each column's fill value into `statistics_` per the chosen strategy.
+
+        ``"mean"`` / ``"median"`` run one mergeable aggregate; ``"most_frequent"`` a
+        grouped count; ``"constant"`` just reuses `fill_value`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import SimpleImputer
+                >>> SimpleImputer(["a"]).fit(bt.from_pydict({"a": [1.0, None, 3.0]})).statistics_
+                {'a': 2.0}
+
+        Args:
+            ds: The dataset to compute each column's fill value from.
+
+        Returns:
+            ``self``, fitted.
+
+        Raises:
+            PlanError: If a column has no non-null values to learn a statistic from.
+        """
         if self.strategy == "constant":
             self.statistics_ = dict.fromkeys(self.columns, self.fill_value)
         elif self.strategy == "most_frequent":
@@ -86,6 +117,26 @@ class SimpleImputer(Preprocessor):
         return grouped.column(column)[0].as_py() if grouped.num_rows else None
 
     def transform(self, ds: Dataset) -> Dataset:
+        """Replace nulls in each fitted column with its learned fill value.
+
+        Lowered to ``coalesce(col, fill)``; ``"mean"``/``"median"`` first cast the
+        column to float (the scikit-learn convention).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import SimpleImputer
+                >>> ds = bt.from_pydict({"a": [1.0, None, 3.0]})
+                >>> SimpleImputer(["a"]).fit(ds).transform(ds).to_pydict()
+                {'a': [1.0, 2.0, 3.0]}
+
+        Args:
+            ds: The dataset to fill.
+
+        Returns:
+            A new lazy `Dataset` with nulls in the fitted columns filled.
+        """
         self._require_fitted()
         cast_float = self.strategy in ("mean", "median")
         new = {}

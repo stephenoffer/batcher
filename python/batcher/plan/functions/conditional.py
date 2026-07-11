@@ -15,6 +15,14 @@ def iff(condition: Expr, if_true: IntoExpr, if_false: IntoExpr) -> Expr:
 
     The two-branch shorthand for ``when(condition).then(if_true).otherwise(if_false)``.
 
+    Args:
+        condition: The boolean predicate selecting the branch per row.
+        if_true: The value where ``condition`` is true.
+        if_false: The value where ``condition`` is false or null.
+
+    Returns:
+        An expression yielding ``if_true`` or ``if_false`` per row.
+
     Examples:
         .. doctest::
 
@@ -31,6 +39,13 @@ def nanvl(value: IntoExpr, fallback: IntoExpr) -> Expr:
 
     Distinct from `coalesce` — this replaces IEEE NaN, not NULL. A NULL `value`
     passes through unchanged (NULL is not NaN).
+
+    Args:
+        value: The value to return unless it is NaN.
+        fallback: The replacement used where ``value`` is NaN.
+
+    Returns:
+        An expression yielding ``value``, or ``fallback`` where ``value`` is NaN.
 
     Examples:
         .. doctest::

@@ -161,3 +161,11 @@ print(s.sql("SELECT * FROM cheap ORDER BY price").to_pydict())
 print(ds.sql("SELECT category FROM self WHERE price >= 50 ORDER BY price").to_pydict())
 # {'category': ['a', 'c']}
 ```
+
+## Next steps
+
+- [SQL API](../api/sql.md): the `Session`, function registration, and the supported
+  SQL surface.
+- [Expressions](expressions.md): the DataFrame column language SQL lowers to.
+- [Joins](joins.md) and [Window functions](window-functions.md): the relational
+  operations behind `JOIN` and `OVER`.

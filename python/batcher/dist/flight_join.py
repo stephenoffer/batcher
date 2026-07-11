@@ -17,6 +17,7 @@ import pyarrow as pa
 
 from batcher.dist.executor import _apply_above, _ensure_ray, _relabel_single_source
 from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
+from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
     map_barrier,
@@ -183,14 +184,14 @@ def execute_join_flight(
     elif fused_agg is not None:
         table = _empty_fused(fused_agg)
     else:
-        table = pa.table({o.alias: [] for o in join.output})
+        table = empty_result_table(join, [o.alias for o in join.output])
     return table if not above else _apply_above(above, table)
 
 
 def _empty_fused(fused_agg: Aggregate) -> pa.Table:
     """The empty result table for a fused post-join aggregate (group keys + aggregates)."""
     keys = [k.alias for k in fused_agg.group_keys]
-    return pa.table({c: [] for c in keys + [s.alias for s in fused_agg.aggregates]})
+    return empty_result_table(fused_agg, keys + [s.alias for s in fused_agg.aggregates])
 
 
 def _project_join_side(side: LogicalPlan, needed: set[str]) -> LogicalPlan:

@@ -131,7 +131,7 @@ def test_actor_pool_replaces_a_dead_actor(monkeypatch):
     monkeypatch.setattr(mapmod, "_MapActor", _FakeMapActor)
 
     parts = ["p0", "p1", "p2"]
-    results, _util = mapmod._drive_actor_pool(
+    results, _util, _vram = mapmod._drive_actor_pool(
         plan0=None,
         partitions=parts,
         opts={},

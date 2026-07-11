@@ -69,13 +69,22 @@ def parse_offset(by: str) -> tuple[int, int, int]:
 
 
 class _DtNamespace:
-    """Date/time field extractions: ``col("d").dt.year()``, ``.dt.hour()``, …
+    """Date/time field extractions on a temporal column: ``col("d").dt.year()``, ``.dt.hour()``.
 
     The available extractors are **data, not code**: each is one row in
     ``_DT_FIELDS`` (Python accessor name → ``bc-expr`` ``DateFunc`` wire tag) and
     the no-argument accessor is generated below. Adding a field extractor is a
     single table entry — the pattern that keeps the namespace maintainable as it
     grows to hundreds of functions.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> import datetime as dt
+            >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45, 30)]})
+            >>> ds.select(bt.col("d").dt.year().alias("y")).to_pydict()
+            {'y': [2024]}
     """
 
     __slots__ = ("_e",)
@@ -83,6 +92,10 @@ class _DtNamespace:
     def __init__(self, e: Expr) -> None:
         """Wrap the parent :class:`Expr` so its `.dt` methods can build on it."""
         self._e = e
+
+    def __repr__(self) -> str:
+        """Show the accessor and its parent, e.g. ``<.dt accessor of col('ts')>``."""
+        return f"<.dt accessor of {self._e!r}>"
 
     def truncate(self, unit: str) -> DateTrunc:
         """Truncate each timestamp down to the start of ``unit``.
@@ -93,6 +106,9 @@ class _DtNamespace:
 
         Args:
             unit: One of ``year``/``month``/``day``/``hour``/``minute``/``second``.
+
+        Returns:
+            A new Timestamp expression floored to ``unit``.
 
         Examples:
             .. doctest::
@@ -111,6 +127,9 @@ class _DtNamespace:
         Follows the proleptic Gregorian rule: divisible by 4, except centuries that
         are not divisible by 400. Null → null.
 
+        Returns:
+            A new Boolean expression.
+
         Examples:
             .. doctest::
 
@@ -128,6 +147,9 @@ class _DtNamespace:
         Accounts for leap years (February yields 29 in a leap year, else 28). Null →
         null.
 
+        Returns:
+            A new Int64 expression: the day count.
+
         Examples:
             .. doctest::
 
@@ -144,6 +166,9 @@ class _DtNamespace:
 
         May differ from the calendar year for dates in the first or last days of a
         year (e.g. 2021-01-01 can belong to ISO year 2020).
+
+        Returns:
+            A new Int64 expression: the ISO week-numbering year.
 
         Examples:
             .. doctest::
@@ -163,6 +188,9 @@ class _DtNamespace:
 
         Args:
             format: A strftime pattern, e.g. ``"%Y-%m-%d"`` or ``"%H:%M:%S"``.
+
+        Returns:
+            A new Utf8 expression: the formatted text.
 
         Examples:
             .. doctest::
@@ -186,6 +214,9 @@ class _DtNamespace:
             by: Signed counts with units ``y``/``mo``/``w``/``d``/``h``/``m``/``s``,
                 combinable, e.g. ``"1mo15d"``, ``"-3d"``, ``"1h30m"``.
 
+        Returns:
+            A new expression shifted by the offset, type-preserved.
+
         Examples:
             .. doctest::
 
@@ -208,6 +239,9 @@ class _DtNamespace:
         Args:
             from_tz: IANA zone the naive timestamp is currently expressed in, e.g. ``"UTC"``.
             to_tz: IANA zone to convert the wall-clock to, e.g. ``"America/New_York"``.
+
+        Returns:
+            A new Timestamp expression, or null for invalid local times.
 
         Examples:
             .. doctest::
@@ -251,4 +285,5 @@ _bind_accessors(
     _DT_FIELDS,
     lambda e, t: DateFunc(t, e),
     lambda n: f"Extract the {n} field of a date/time column (→ Int64).",
+    "A new :class:`~batcher.Expr` carrying the extracted field.",
 )

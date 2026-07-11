@@ -32,7 +32,7 @@
 //! [`BroadcastProbe::new`] returns `None` for anything else, and the caller keeps its old
 //! path. Nothing silently changes shape.
 
-use arrow::array::{ArrayRef, UInt32Array};
+use arrow::array::ArrayRef;
 
 use super::{
     null_mask, use_probe_bloom_with, I64Keys, I64x2Keys, JoinIndices, JoinTable, JoinType,
@@ -100,6 +100,15 @@ impl BroadcastProbe {
         }
         let shape = KeyShape::of(build_keys)?;
         let build_rows = build_keys.first().map_or(0, |a| a.len());
+        // A build past the cache-radix floor belongs on the partitioned path, whose
+        // per-partition table stays cache-resident. Streaming would probe one flat table
+        // that no longer fits L3 and pay a miss per probe row — the very cliff
+        // `RADIX_MIN_BUILD_ROWS_BROADCAST` exists to avoid. Those joins keep the
+        // materialized radix path, whose probe-side concatenation the partition pass needs
+        // anyway (it addresses probe rows by absolute index).
+        if build_rows > super::RADIX_MIN_BUILD_ROWS_BROADCAST {
+            return None;
+        }
         let build_null = null_mask(build_keys, build_rows);
         let use_bloom = use_probe_bloom_with(build_rows, probe_rows, bloom_min_build_rows);
         // The build loop reads only the right side of a `JoinKeys`, so the left may be the
@@ -139,8 +148,8 @@ impl BroadcastProbe {
         }
         let rows = probe_keys.first().map_or(0, |a| a.len());
         let probe_null = null_mask(probe_keys, rows);
-        let mut left: Vec<Option<u32>> = Vec::with_capacity(rows);
-        let mut right: Vec<Option<u32>> = Vec::with_capacity(rows);
+        let mut left = super::IndexBuf::with_capacity(rows);
+        let mut right = super::IndexBuf::with_capacity(rows);
         match self.shape {
             KeyShape::I64 => {
                 let keys = I64Keys::try_new(probe_keys, &self.build_keys)?;
@@ -168,8 +177,8 @@ impl BroadcastProbe {
             }
         }
         Some(JoinIndices {
-            left: UInt32Array::from(left),
-            right: UInt32Array::from(right),
+            left: left.finish(),
+            right: right.finish(),
         })
     }
 }
@@ -230,6 +239,18 @@ mod tests {
         for jt in [JoinType::Right, JoinType::Full] {
             assert!(BroadcastProbe::new(&build, jt, 1, 0.01, 1 << 16).is_none());
         }
+    }
+
+    /// A build too large for one cache-resident table stays on the radix path.
+    #[test]
+    fn an_oversized_build_is_refused() {
+        let big = vec![i64s(&vec![
+            1i64;
+            super::super::RADIX_MIN_BUILD_ROWS_BROADCAST + 1
+        ])];
+        assert!(BroadcastProbe::new(&big, JoinType::Inner, 1, 0.01, 1 << 16).is_none());
+        let ok = vec![i64s(&vec![1i64; 1024])];
+        assert!(BroadcastProbe::new(&ok, JoinType::Inner, 1, 0.01, 1 << 16).is_some());
     }
 
     /// A non-integer or wide key falls back rather than silently taking a different path.

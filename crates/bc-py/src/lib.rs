@@ -15,6 +15,24 @@ use bc_ir::{EngineConfig, RelOp};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
+/// The engine's allocator, installed here because this crate is the cdylib every
+/// `bc-*` crate is linked into — one `#[global_allocator]` covers the whole data plane.
+///
+/// Every morsel-parallel operator allocates its output buffers per morsel, and glibc's
+/// malloc serves buffers of that size (~64 KB and up) through `mmap`/`munmap`. Each
+/// `munmap` must invalidate the mapping on every core, so it broadcasts a TLB-shootdown
+/// IPI; with 96 workers freeing a buffer per morsel, that interrupt storm is a
+/// serialization point in the middle of an embarrassingly parallel scan. Measured on a
+/// 6M-row filter: 21.4 ms sequential, and parallel wall time bottoming out at 4.0 ms
+/// (a 5.3x speedup on 96 cores) before *regressing* past 32 workers. mimalloc's
+/// per-thread heaps recycle the pages instead of returning them, and the same filter
+/// scales to 1.46 ms (15x) with no regression.
+///
+/// This changes no result — only where the bytes come from. It is invisible to
+/// `cargo test` on the pure crates (which link no allocator and keep the system one).
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod bloom;
 mod errors;
 mod normalize;
@@ -207,6 +225,28 @@ fn read_parquet(
     Ok(batches.into_iter().map(PyArrowType).collect())
 }
 
+/// Native read of MANY whole Parquet objects in one pass, returning per-file batch lists.
+///
+/// The many-small-files throughput path: one GIL release and one runtime pass overlap every
+/// file's footer + column-chunk GETs under a global concurrency budget, instead of a
+/// `read_parquet` call (and FFI round trip) per file. `columns` `None` = all.
+#[pyfunction]
+#[pyo3(signature = (uris, columns, batch_size))]
+fn read_parquet_many(
+    py: Python<'_>,
+    uris: Vec<String>,
+    columns: Option<Vec<String>>,
+    batch_size: usize,
+) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
+    let per_file = py
+        .allow_threads(|| bc_io::read_parquet_many(&uris, columns.as_deref(), batch_size))
+        .map_err(to_pyerr)?;
+    Ok(per_file
+        .into_iter()
+        .map(|batches| batches.into_iter().map(PyArrowType).collect())
+        .collect())
+}
+
 /// A process-wide memory accounting pool (Carbonite's reserve-before-allocate
 /// enforcement primitive, from `bc-resource`). Carbonite sets the limit from its
 /// memory envelope and reserves/releases against it so the engine spills instead
@@ -286,24 +326,52 @@ impl FlightShuffleServer {
     /// `{advertise_host}:{port}` so reducers on *other* nodes can reach it — the
     /// fix for a cross-node cluster, where a loopback `127.0.0.1` advertise is
     /// unreachable. Omitted/empty keeps the single-host loopback behavior.
+    /// `tls_cert_pem` / `tls_key_pem` (when both given) make the server present a TLS
+    /// certificate so the inter-node shuffle is encrypted; `tls_client_ca_pem` in
+    /// addition turns on mTLS — a connecting peer must present a certificate that CA
+    /// signed. All PEM is minted by the operator's own PKI; Batcher issues nothing.
     #[new]
-    #[pyo3(signature = (advertise_host=None, token=None))]
-    fn new(advertise_host: Option<String>, token: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (advertise_host=None, token=None, tls_cert_pem=None, tls_key_pem=None, tls_client_ca_pem=None))]
+    fn new(
+        advertise_host: Option<String>,
+        token: Option<String>,
+        tls_cert_pem: Option<String>,
+        tls_key_pem: Option<String>,
+        tls_client_ca_pem: Option<String>,
+    ) -> PyResult<Self> {
         let host = advertise_host.filter(|h| !h.is_empty());
         let token = token.filter(|t| !t.is_empty());
-        let exchange = shared_runtime()
-            .block_on(async {
-                match (host.as_deref(), token) {
-                    (Some(h), tok) => {
-                        bc_transport::ShuffleExchange::bind_secured("0.0.0.0:0", Some(h), tok).await
-                    }
-                    (None, None) => bc_transport::ShuffleExchange::bind_ephemeral().await,
-                    (None, tok @ Some(_)) => {
-                        // Auth on a single-host loopback server (e.g. tests).
-                        bc_transport::ShuffleExchange::bind_secured("127.0.0.1:0", None, tok).await
-                    }
+        let tls = match (tls_cert_pem, tls_key_pem) {
+            (Some(cert), Some(key)) => {
+                let mut cfg = bc_transport::TlsServerConfig::new(
+                    bc_transport::TlsIdentity::from_pem(cert, key),
+                );
+                if let Some(ca) = tls_client_ca_pem.filter(|c| !c.is_empty()) {
+                    cfg = cfg.with_client_ca(ca);
                 }
-            })
+                Some(cfg)
+            }
+            (None, None) => None,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "shuffle TLS requires both a certificate and a private key",
+                ))
+            }
+        };
+        // A loopback bind for the single-host case; all-interfaces when a routable
+        // advertise host is given so cross-node reducers can dial it.
+        let bind = if host.is_some() {
+            "0.0.0.0:0"
+        } else {
+            "127.0.0.1:0"
+        };
+        let exchange = shared_runtime()
+            .block_on(bc_transport::ShuffleExchange::bind_tls(
+                bind,
+                host.as_deref(),
+                token,
+                tls,
+            ))
             .map_err(to_pyerr)?;
         let addr = exchange.advertised_addr().to_string();
         Ok(Self { exchange, addr })
@@ -476,6 +544,40 @@ fn set_flight_transport_config(
     }
 }
 
+/// Install (or clear) the process-wide client TLS for outbound shuffle fetches.
+///
+/// `ca_pem` is the CA a peer's server certificate must chain to and `server_name` the
+/// name verified against it; `client_cert_pem`/`client_key_pem` (when both given) present
+/// this node's certificate under mTLS. Passing an empty `ca_pem` clears it (plaintext).
+/// Called once per worker from the control plane, alongside `set_flight_transport_config`.
+#[pyfunction]
+#[pyo3(signature = (ca_pem, server_name, client_cert_pem=None, client_key_pem=None))]
+fn set_flight_client_tls(
+    ca_pem: &str,
+    server_name: &str,
+    client_cert_pem: Option<String>,
+    client_key_pem: Option<String>,
+) -> PyResult<()> {
+    if ca_pem.is_empty() {
+        bc_transport::set_client_tls(None);
+        return Ok(());
+    }
+    let mut cfg = bc_transport::TlsClientConfig::new(ca_pem, server_name);
+    match (client_cert_pem, client_key_pem) {
+        (Some(cert), Some(key)) => {
+            cfg = cfg.with_identity(bc_transport::TlsIdentity::from_pem(cert, key));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "client mTLS requires both a certificate and a private key",
+            ))
+        }
+    }
+    bc_transport::set_client_tls(Some(cfg));
+    Ok(())
+}
+
 /// Whether a same-node shared-memory transfer directory is usable on this host (so the
 /// control plane can avoid selecting SHARED_MEMORY where it would never work).
 #[pyfunction]
@@ -537,6 +639,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(execute_plan, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_metered, m)?)?;
     m.add_function(wrap_pyfunction!(read_parquet, m)?)?;
+    m.add_function(wrap_pyfunction!(read_parquet_many, m)?)?;
     m.add_function(wrap_pyfunction!(partial_aggregate, m)?)?;
     m.add_function(wrap_pyfunction!(combine, m)?)?;
     m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;
@@ -562,6 +665,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FlightShuffleServer>()?;
     m.add_function(wrap_pyfunction!(flight_fetch, m)?)?;
     m.add_function(wrap_pyfunction!(set_flight_transport_config, m)?)?;
+    m.add_function(wrap_pyfunction!(set_flight_client_tls, m)?)?;
     m.add_function(wrap_pyfunction!(shm_available, m)?)?;
     m.add_function(wrap_pyfunction!(supported_cast_dtypes, m)?)?;
     m.add_class::<ShuffleClient>()?;

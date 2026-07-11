@@ -1,6 +1,6 @@
 """`PhysicalPlan.op_budgets()` — the per-operator spill budgets Core ships to the
 engine (W1). The map keys are the pre-order `op_id`s Kyber assigns in
-`_annotate_ops`; only positively-sized (breaker) operators appear, so unsized
+`annotate_ops`; only positively-sized (breaker) operators appear, so unsized
 streaming/unknown operators fall back to the global budget in the data plane.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 import batcher as bt
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.cost import CostModel
-from batcher.kyber.optimizer import _annotate_ops
+from batcher.kyber.annotate import annotate_ops
 from batcher.plan.ids import OpId
 from batcher.plan.physical import PhysicalOp, PhysicalPlan
 from batcher.plan.resource import ResourceBounds
@@ -46,7 +46,7 @@ def test_op_budgets_empty_when_no_ops():
 
 
 def test_op_budget_ids_are_preorder_and_align_with_annotation():
-    """The op ids `_annotate_ops` assigns are a contiguous pre-order range, and
+    """The op ids `annotate_ops` assigns are a contiguous pre-order range, and
     `op_budgets()` keys are a subset of it — so they line up with the pre-order
     numbering the Rust `IdGen` hands the engine."""
     from batcher.config import active_config
@@ -54,7 +54,7 @@ def test_op_budget_ids_are_preorder_and_align_with_annotation():
     cfg = active_config()
     ds = bt.from_pydict({"k": [1, 2, 1], "v": [3, 4, 5]}).group_by("k").agg(s=bt.col("v").sum())
     est = CardinalityEstimator([])
-    ops = _annotate_ops(ds._plan, est, cfg, CostModel(est))
+    ops = annotate_ops(ds._plan, est, cfg, CostModel(est))
     ids = [int(op.op_id) for op in ops]
     assert ids == list(range(len(ops)))  # contiguous pre-order
 

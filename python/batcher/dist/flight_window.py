@@ -21,6 +21,7 @@ from batcher.dist.executor import _apply_above, _ensure_ray, _relabel_single_sou
 from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
+    map_barrier,
     release_placement,
     shuffle_partitions,
 )
@@ -38,13 +39,18 @@ def execute_window_flight(
     sources: list[Source],
     workers: int,
     _fault_inject: set[int] | None = None,
+    *,
+    _fault_inject_map: set[int] | None = None,
 ) -> pa.Table:
     """Hash-shuffle rows by the window's partition keys over Flight, window per bucket.
 
     Mappers publish their key-hashed row buckets on their own Flight servers
     (shuffle stage 0); reducer r fetches bucket r from every mapper and runs the
-    window operator over the whole partition. `_fault_inject` is a test-only hook:
-    worker ids to kill after the map barrier to exercise lineage recovery."""
+    window operator over the whole partition. Worker loss is survived in both phases:
+    `map_barrier` relocates a source whose worker dies while mapping, `ShuffleRecovery`
+    recomputes one whose worker dies before the reduce fetches it. `_fault_inject` /
+    `_fault_inject_map` are test-only hooks: worker ids to kill after / before the map
+    barrier."""
     import ray
 
     _ensure_ray(workers)
@@ -62,7 +68,7 @@ def execute_window_flight(
 
     # Borrow the query-lifetime fleet if installed (every Flight operator must, or a
     # second placement group deadlocks against the fleet's bundles); else spawn our own.
-    actors, pg, addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
+    actors, pg, _addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = shuffle_partitions(workers)
     try:
         # Read only the columns/rows the window's map prefix needs (see flight_aggregate).
@@ -71,11 +77,19 @@ def execute_window_flight(
             sources[sid], workers, projection=projection, predicate=predicate
         )
 
-        ray.get(
-            [
-                actors[i].map_publish_raw.remote(map_ir, key_names, parts[i], n_buckets, 0)
-                for i in range(workers)
-            ]
+        if _fault_inject_map:  # test hook: kill before the barrier, so nothing publishes
+            for i in _fault_inject_map:
+                ray.kill(actors[i])
+
+        # MAP barrier under worker-loss recovery: a worker preempted while mapping has its
+        # source republished on a survivor under the same `src`, so the reducers' tickets
+        # still resolve. A bare `ray.get` here failed the whole query on one preemption —
+        # in the map phase, which reads the source and dominates the query's runtime.
+        addrs, dead = map_barrier(
+            workers,
+            lambda host, src: actors[host].map_publish_raw.remote(
+                map_ir, key_names, parts[src], n_buckets, 0, src
+            ),
         )
 
         if _fault_inject:
@@ -83,7 +97,7 @@ def execute_window_flight(
                 ray.kill(actors[i])
 
         batches = _window_reduce_with_recovery(
-            actors, list(addrs), parts, map_ir, key_names, win_json, n_buckets, workers
+            actors, addrs, parts, map_ir, key_names, win_json, n_buckets, workers, dead=dead
         )
     finally:
         if owns:
@@ -101,14 +115,14 @@ def execute_window_flight(
 
 
 def _window_reduce_with_recovery(
-    actors, addrs, parts, map_ir, key_names, win_json, n_buckets, workers
+    actors, addrs, parts, map_ir, key_names, win_json, n_buckets, workers, dead=None
 ):
     """Run the window reduce under recompute-on-worker-loss recovery.
 
     A reducer that reports an unreachable mapper (or whose host died) drives a
     recompute of that worker's row bucket from its on-disk source partition onto a
     survivor, then a retry — matching the aggregate/join paths. Returns the windowed
-    batches.
+    batches. `dead` seeds the workers the map barrier already lost.
     """
     import ray
 
@@ -120,7 +134,7 @@ def _window_reduce_with_recovery(
         speculation_policy,
     )
 
-    dead: set[int] = set()
+    dead: set[int] = set(dead or ())
 
     def _pick_live(avoid: set[int]) -> int:
         for i in range(workers):

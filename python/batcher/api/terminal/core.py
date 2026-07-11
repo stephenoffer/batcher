@@ -86,7 +86,14 @@ def _collect(
             from batcher import core
             from batcher.api.orchestration import collect_source_stats
 
-            source_stats = collect_source_stats(sources, core.default_hub())
+            # Only MIN/MAX read a source's column bounds (and only for the aggregated
+            # column); COUNT answers from the row count, and SUM/MEAN/COUNT DISTINCT from
+            # the source's lazy per-column methods — none of which need the O(rows)
+            # zone-map scan. So a keyless SUM/COUNT over a fresh in-memory source no longer
+            # pays to build bounds it never reads, and a MIN(x) scans only column x.
+            source_stats = collect_source_stats(
+                sources, core.default_hub(), need_columns=_global_agg_bound_columns(plan)
+            )
     metadata = metadata_aggregate_table(plan, sources, source_stats)
     if metadata is not None:
         return metadata
@@ -117,11 +124,15 @@ def _collect(
     distributed = _resolve_distributed(distributed, plan, sources)
     # Resolve `adaptive="auto"` to a concrete decision before the fast-path checks
     # below ("auto" is a truthy string). Join-less plans short-circuit to False without
-    # touching source stats, so the common path pays nothing.
+    # touching source stats, so the common path pays nothing. `distributed` is passed so
+    # a shape the one-shot dispatcher can't route (a 3+-table join) takes the staged path
+    # rather than raising.
     from batcher import core
     from batcher.api.adaptive import resolve_adaptive
 
-    adaptive = resolve_adaptive(adaptive, plan, sources, core.default_hub())
+    adaptive = resolve_adaptive(
+        adaptive, plan, sources, core.default_hub(), distributed=distributed
+    )
 
     # `head(n)` / `limit(n)` over a breaker-free pipeline reads the source only until
     # `n` rows are produced, then stops — no whole-source scan (Ray's `limit` does not
@@ -215,6 +226,34 @@ def _explain(
     return explain(plan, sources, columns, analyze=analyze, fmt=fmt)
 
 
+def _global_agg_bound_columns(plan: LogicalPlan) -> set[str] | None:
+    """The columns whose min/max bounds a keyless aggregate's metadata answer reads.
+
+    Only ``MIN``/``MAX`` read bounds (from `SourceStatistics.columns`), and only of their
+    own input column; ``COUNT`` answers from the row count and ``SUM``/``MEAN``/``COUNT
+    DISTINCT`` from the source's lazy per-column methods. So the needed set is the plain
+    input columns of the min/max aggregates — empty when there are none (skip the scan),
+    and `None` (collect everything, be safe) when the shape isn't the expected keyless
+    aggregate or a min/max input is a computed expression rather than a bare column.
+    """
+    from batcher.plan.expr_ir import Col
+    from batcher.plan.logical import Aggregate, Project
+
+    node = plan
+    while isinstance(node, Project):
+        node = node.input
+    if not isinstance(node, Aggregate):
+        return None  # not the expected shape — be safe and collect full bounds
+    needed: set[str] = set()
+    for spec in node.aggregates:
+        if spec.agg.func in ("min", "max"):
+            if isinstance(spec.agg.input, Col):
+                needed.add(spec.agg.input.name)
+            else:
+                return None  # min/max over a computed expr — fall back to full bounds
+    return needed
+
+
 def _shared_source_stats(plan: LogicalPlan, sources: list[Source]) -> list | None:
     """Source statistics to share across a metadata attempt and its execution fallback.
 
@@ -229,8 +268,14 @@ def _shared_source_stats(plan: LogicalPlan, sources: list[Source]) -> list | Non
         return None
     from batcher import core
     from batcher.api.orchestration import collect_source_stats
+    from batcher.api.source_stats import column_bounds_needed
 
-    return collect_source_stats(sources, core.default_hub())
+    # `count()`/`is_empty()` answer from the row count and, when filtered, from the
+    # predicate columns' bounds (comparison-empty detection). So only those columns need
+    # a bounds scan — a `count()` over a wide unfiltered relation stays a cheap row count.
+    return collect_source_stats(
+        sources, core.default_hub(), need_columns=column_bounds_needed(plan)
+    )
 
 
 def _count(plan: LogicalPlan, sources: list[Source], _columns: list[str]) -> int:

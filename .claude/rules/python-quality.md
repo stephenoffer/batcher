@@ -68,6 +68,25 @@ expression API). Hold it to a higher bar:
   the docstring. Examples are runnable and wrapped in a `.. doctest::` directive under
   an `Examples:` heading.
 
+  This is a **gate, not a preference**: `just lint-docstrings`
+  (`tools/lint_docstrings.py`) introspects the live public surface — defined once in
+  `tools/public_surface.py` — and fails on a missing docstring, a multi-line first
+  sentence, a missing/typed `Args:`, a missing `Returns:`, or an `Examples:` block
+  that isn't a `.. doctest::`. `tests/docs/test_api_coverage.py` runs the same check
+  in CI, alongside four others: every public name is *mentioned* in `docs/**/*.md`;
+  every public name is *rendered* by Sphinx (an `autosummary` entry, an
+  `autoclass`/`autofunction`, or the `:members:` of an autodoc'd class — a prose
+  mention alone publishes no docstring); every public name is *taught* outside the
+  generated reference (a user guide, tutorial, ML/configuration page, or a runnable
+  script under `examples/`), because a name only an `autosummary` table knows about is
+  a name nobody discovers; and the expression reference page (`docs/api/expressions.md`)
+  *enumerates every `Expr` method* — the fluent builder and every accessor namespace
+  (`.str`/`.dt`/`.list`/`.struct`/`.json`/`.map`/`.image`/`.audio`/`.video`) — so the
+  curated reference can't fall behind the surface. The `.. doctest::` examples are then
+  **executed for real** by `just docs`, so an example that lies fails the build. For an
+  example that needs an external resource (a cloud store, a GPU, a real model), append
+  `# doctest: +SKIP` to its `>>>` lines rather than dropping the example.
+
   ```python
   def ray_canonical_doc_style(param1: int, param2: str) -> bool:
       """First sentence MUST be inline with the quotes and fit on one line.
@@ -115,6 +134,7 @@ expression API). Hold it to a higher bar:
 
 ## Gate before "done"
 
-`just lint-py` (ruff check + format) clean, `just lint-layers` green, full type
+`just lint-py` (ruff check + format) clean, `just lint-layers` green, and — if you
+touched the public API — `just lint-docstrings` clean and `just docs` green. Full type
 hints on touched public code, no new duplication or dead code. Then the test gate
 in `.claude/rules/testing.md`.

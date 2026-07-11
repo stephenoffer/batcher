@@ -12,11 +12,14 @@ Run (single-node default lineup: batcher, duckdb, polars, pyarrow):
     python3 benchmarks/run.py --benchmark clickbench           # ClickBench (hits)
     python3 benchmarks/run.py --benchmark tpcds --scale 1      # TPC-DS subset
     python3 benchmarks/run.py --benchmark operators            # operator-mix
-    python3 benchmarks/run.py --benchmark all                  # every dataset
+    python3 benchmarks/run.py --benchmark scan                 # parquet file-layout scan
+    python3 benchmarks/run.py --benchmark images               # multimodal image ingest
+    python3 benchmarks/run.py --benchmark all                  # every dataset except scan/images
 
     python3 benchmarks/run.py --engines batcher,duckdb,spark   # opt in to PySpark
     python3 benchmarks/run.py --tier multi                     # batcher, ray, daft
     python3 benchmarks/run.py --benchmark tpch --family tpch --only q1
+    python3 benchmarks/run.py --benchmark scan --family scan-many_small
     python3 benchmarks/run.py --list                           # list, do not run
 
 This is the single entrypoint: besides the engine-comparison datasets, it also
@@ -33,7 +36,7 @@ import batcher as bt
 import engines as engines_mod
 import suites  # noqa: F401  (import registers every benchmark)
 from batcher.config import active_config, set_config
-from context import Context
+from context import CORPUS_BENCHMARKS, Context
 from harness import compare, print_table
 from registry import REGISTRY
 
@@ -49,13 +52,24 @@ def _parse_size(text: str) -> int:
 
 
 # Engine-comparison datasets (run through the correctness-gated compare()).
-BENCHMARKS = ("tpch", "tpcds", "clickbench", "operators")
+BENCHMARKS = ("tpch", "tpcds", "clickbench", "operators", "scan", "images")
+# What `--benchmark all` sweeps. `scan` and `images` are deliberately excluded: each
+# re-reads its corpus from object storage on every repeat, so a full run is tens of
+# minutes. They are opt-in (`--benchmark scan` / `images`) for the same reason Spark is.
+ALL_DATASETS = ("tpch", "tpcds", "clickbench", "operators")
 # Standalone benchmarks with their own reporting, dispatched by this single runner.
 AUX = ("distributed", "optimizer", "shuffle")
 
 
-def _runs_for(scale: float) -> int:
-    """Best-of-N: more repeats when the data is small enough to make them cheap."""
+def _runs_for(scale: float, benchmark: str) -> int:
+    """Best-of-N: more repeats when the data is small enough to make them cheap.
+
+    The corpus benchmarks (scan, images) re-read from object storage on every repeat (that
+    is the point — the read is the measurement), so they stay at the floor rather than
+    paying five full passes over a many-small-files corpus per case.
+    """
+    if benchmark in CORPUS_BENCHMARKS:
+        return 2 if scale <= 10 else 1
     if scale <= 1:
         return 5
     return 3 if scale <= 10 else 2
@@ -67,7 +81,9 @@ def _parse_args() -> argparse.Namespace:
         "--benchmark",
         choices=(*BENCHMARKS, "all", *AUX),
         default="tpch",
-        help="dataset (tpch/tpcds/clickbench/operators/all) or aux (distributed/optimizer/shuffle)",
+        help="dataset (tpch/tpcds/clickbench/operators/scan/images) or aux "
+        "(distributed/optimizer/shuffle); 'all' sweeps every dataset but scan/images, "
+        "which are opt-in because they re-read their corpus from object storage",
     )
     p.add_argument(
         "--engines",
@@ -80,7 +96,14 @@ def _parse_args() -> argparse.Namespace:
         default="single",
         help="default lineup: single (batcher,duckdb,polars,pyarrow) or multi (batcher,ray,daft)",
     )
-    p.add_argument("--scale", type=float, default=1.0, help="TPC-H / TPC-DS scale factor")
+    p.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="TPC-H / TPC-DS scale factor; for --benchmark scan, the corpus size "
+        "(1=1GiB, 10=10GiB, ...); for --benchmark images, the image count "
+        "(1=10, 10=100, 100=1000, ...)",
+    )
     p.add_argument("--partitions", type=int, default=8, help="shuffle partitions (distributed aux)")
     p.add_argument("--source", default=None, help="override the dataset's parquet base URI")
     p.add_argument("--family", default=None, help="run only this family (exact match)")
@@ -131,13 +154,15 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
         return []
     names = [e.name for e in engines]
     t0 = time.perf_counter()
-    if args.scan:
+    if benchmark in CORPUS_BENCHMARKS:
+        ctx = Context.build_corpus(benchmark, args.scale, engines, args.source)
+    elif args.scan:
         ctx = Context.build_scan(benchmark, args.scale, engines, args.source)
     else:
         ctx = Context.build(benchmark, args.scale, engines, args.source)
-    runs = _runs_for(args.scale)
+    runs = _runs_for(args.scale, benchmark)
     elapsed = time.perf_counter() - t0
-    mode = "scan" if args.scan else "loaded"
+    mode = "corpus" if benchmark in CORPUS_BENCHMARKS else ("scan" if args.scan else "loaded")
     print(f"{mode} {benchmark} (scale {args.scale}) in {elapsed:.2f}s, best-of-{runs}\n")
     results = []
     for case in cases:
@@ -225,7 +250,7 @@ def main() -> int:
     print(f"engines: {', '.join(e.name for e in engines)}\n")
     _warn_if_debug_build()
 
-    datasets = BENCHMARKS if args.benchmark == "all" else (args.benchmark,)
+    datasets = ALL_DATASETS if args.benchmark == "all" else (args.benchmark,)
     all_results = []
     for ds in datasets:
         all_results += _run_dataset(ds, args, engines)

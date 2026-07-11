@@ -40,7 +40,9 @@ pub(crate) fn morselize(
     batches: &[RecordBatch],
     target: bc_arrow::MorselTarget,
 ) -> Vec<RecordBatch> {
-    let mut out = Vec::new();
+    // At least one morsel per input batch (splitting only ever adds more) — pre-size to
+    // that floor so the common already-small-enough case allocates the backing store once.
+    let mut out = Vec::with_capacity(batches.len());
     for b in batches {
         split_batch(&mut out, b, target);
     }

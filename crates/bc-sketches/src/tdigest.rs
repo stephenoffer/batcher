@@ -284,7 +284,8 @@ impl TDigest {
         // Flush a clone so `&self` stays immutable and the on-wire form is canonical.
         let mut canon = self.clone();
         canon.flush();
-        let mut out = Vec::new();
+        // Exact wire size: 5×8 header + centroids×(mean f64 + weight f64) — one allocation.
+        let mut out = Vec::with_capacity(40 + canon.centroids.len() * 16);
         out.extend_from_slice(&canon.compression.to_le_bytes());
         out.extend_from_slice(&canon.n.to_le_bytes());
         out.extend_from_slice(&canon.min.to_le_bytes());

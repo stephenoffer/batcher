@@ -19,8 +19,13 @@ from batcher.dist.executors.partition_io import (
     _partition_source,
     source_pushdown,
 )
-from batcher.dist.executors.plan_analysis import _relabel_single_source
-from batcher.dist.executors.ray_runtime import _ensure_ray, _rmtree, engine_config_json
+from batcher.dist.executors.plan_analysis import _relabel_single_source, empty_result_table
+from batcher.dist.executors.ray_runtime import (
+    _ensure_ray,
+    _rmtree,
+    engine_config_json,
+    record_worker_metrics,
+)
 from batcher.io.source import Source
 from batcher.plan.logical import Aggregate, Join, LogicalPlan
 
@@ -113,14 +118,15 @@ def _distributed_join(
     workers: int,
     *,
     materialize: bool = True,
+    hub=None,
 ):
     """Run a distributed join: the broadcast path when the planner marked it broadcast
     on a broadcast-safe join type, else the co-partition shuffle. `materialize=False`
     lets the co-partition path keep its result partitioned (a `MaterializedSource`) for
     the next adaptive stage; the broadcast path always collects (caller handles both)."""
     if join.strategy == "broadcast" and join.join_type in _BROADCAST_SAFE:
-        return _broadcast_join(above, join, sources, workers)
-    return _shuffle_join(above, join, sources, workers, materialize=materialize)
+        return _broadcast_join(above, join, sources, workers, hub=hub)
+    return _shuffle_join(above, join, sources, workers, materialize=materialize, hub=hub)
 
 
 def _shuffle_join(
@@ -132,6 +138,7 @@ def _shuffle_join(
     reducer_ir: str | None = None,
     output_names: list[str] | None = None,
     materialize: bool = True,
+    hub=None,
 ):
     """Co-partition both sides by join key and join each bucket in parallel.
 
@@ -309,16 +316,22 @@ def _shuffle_join(
             r_inputs = [paths[r] for paths in right_paths if paths]
             return _join_reduce_task.remote(join_ir, l_inputs, r_inputs, work_dir, r, cfg_json)
 
-        result_paths = gather_with_backups(
+        reduce_results = gather_with_backups(
             [_reduce_for(r) for r in range(workers)], _reduce_for, pol
-        )  # [(path, rows)]
+        )  # [(path, rows, metrics)]
+        result_paths = [(path, rows) for path, rows, _m in reduce_results]
+        # The reducer *is* the hash-join breaker: its `rows_build` and `peak_bytes` are the
+        # only measurement of what a distributed join's hash table costs. Without them the
+        # learned memory model — the one that decides whether the next join spills — is fit
+        # entirely from single-node runs.
+        record_worker_metrics(hub, (m for _p, _r, m in reduce_results))
 
         # Keep the join result partitioned on disk for the next adaptive stage.
         if not materialize and not above:
             from batcher.dist.executors.partition_io import materialize_reduce_output
 
             names = output_names if output_names is not None else [o.alias for o in join.output]
-            fallback = pa.schema([pa.field(n, pa.null()) for n in names])
+            fallback = empty_result_table(join, names).schema
             keep_dir = True
             return materialize_reduce_output(result_paths, work_dir, fallback)
 
@@ -334,7 +347,7 @@ def _shuffle_join(
 
     if not batches:
         names = output_names if output_names is not None else [o.alias for o in join.output]
-        result = pa.table({n: pa.array([], pa.null()) for n in names})
+        result = empty_result_table(join, names)
     else:
         result = pa.Table.from_batches(batches)
 
@@ -347,6 +360,7 @@ def _distributed_join_aggregate(
     join: Join,
     sources: list[Source],
     workers: int,
+    hub=None,
 ) -> pa.Table:
     """Distribute an aggregate over an inner join by reusing the join's co-partitioning.
 
@@ -368,12 +382,22 @@ def _distributed_join_aggregate(
         }
     )
     return _shuffle_join(
-        above, join, sources, workers, reducer_ir=reducer_ir, output_names=agg.available_columns()
+        above,
+        join,
+        sources,
+        workers,
+        reducer_ir=reducer_ir,
+        output_names=agg.available_columns(),
+        hub=hub,
     )
 
 
 def _broadcast_join(
-    above: list[LogicalPlan], join: Join, sources: list[Source], workers: int
+    above: list[LogicalPlan],
+    join: Join,
+    sources: list[Source],
+    workers: int,
+    hub=None,
 ) -> pa.Table:
     """Broadcast the small (right/build) side to every worker and range-split the
     big (left/probe) side — no shuffle of either side's keys.
@@ -412,7 +436,7 @@ def _broadcast_join(
         or sum(b.num_rows for b in right_full) == 0
         or sum(b.nbytes for b in right_full) > active_config().optimizer.broadcast_max_bytes
     ):
-        return _shuffle_join(above, join, sources, workers)
+        return _shuffle_join(above, join, sources, workers, hub=hub)
 
     from batcher.dist.shuffle_io import distributed_work_dir
 
@@ -445,17 +469,17 @@ def _broadcast_join(
             )
 
         refs = [_probe_task(i) for i in range(len(left_parts))]
-        result_paths = gather_with_backups(refs, _probe_task, speculation_policy())
+        probe_results = gather_with_backups(refs, _probe_task, speculation_policy())
+        record_worker_metrics(hub, (m for _path, ms in probe_results for m in ms))
         batches: list[pa.RecordBatch] = []
-        for p in result_paths:
+        for p, _metrics in probe_results:
             if p is not None:
                 batches.extend(read_ipc(p))
     finally:
         _rmtree(work_dir)
 
     if not batches:
-        names = [o.alias for o in join.output]
-        result = pa.table({n: pa.array([], pa.null()) for n in names})
+        result = empty_result_table(join, [o.alias for o in join.output])
     else:
         result = pa.Table.from_batches(batches)
     return result if not above else _apply_above(above, result)
@@ -477,7 +501,11 @@ def _broadcast_join_task(
     # the (large) left partition past it one chunk at a time (`_stream_broadcast_join`),
     # so the left partition never has to fit in memory at once.
     path = os.path.join(work_dir, f"bcast_join_{task_id}.arrow")
-    return _stream_broadcast_join(
+    # One `ExecMetrics` document per probe chunk: each chunk is a real join of that chunk
+    # against the full build side, so each is a legitimate observation for the cost and
+    # memory models (peak = broadcast side + one chunk + its output).
+    metrics: list[str] = []
+    out_path = _stream_broadcast_join(
         left_ir,
         iter_partition(left_part_path),
         join_ir,
@@ -485,15 +513,29 @@ def _broadcast_join_task(
         path,
         engine_config,
         _BROADCAST_PROBE_CHUNK_BYTES,
+        metrics_sink=metrics,
     )
+    return out_path, metrics
 
 
 def _stream_broadcast_join(
-    left_ir, left_batches, join_ir, right_full, out_path, engine_config, chunk_bytes
+    left_ir,
+    left_batches,
+    join_ir,
+    right_full,
+    out_path,
+    engine_config,
+    chunk_bytes,
+    metrics_sink: list[str] | None = None,
 ):
     """Join a streamed left side against a resident broadcast `right_full`, writing the
     output incrementally — peak memory is one probe chunk + the broadcast side + that
     chunk's output. Returns `out_path` if any rows were written, else None.
+
+    When `metrics_sink` is given, each chunk's join `ExecMetrics` document is appended to
+    it, so the broadcast path feeds the cost/memory models the shuffle path already feeds.
+    The left sub-plan stays unmetered: it is the map prefix, already measured wherever it
+    runs, and metering it here would double-count the same scan against every chunk.
 
     A plain helper (not a Ray task), so the chunked-probe logic is unit-testable in
     process; `_broadcast_join_task` wires it to partition IO on the worker.
@@ -501,13 +543,17 @@ def _stream_broadcast_join(
     import pyarrow as pa
 
     import batcher._native as nat
+    from batcher.dist.executors.ray_runtime import execute_metered
 
     sink = writer = None
     rows = 0
     try:
         for chunk in _byte_chunks(left_batches, chunk_bytes):
             left_rows = nat.execute_plan(left_ir, [chunk], engine_config)
-            for b in nat.execute_plan(join_ir, [left_rows, right_full], engine_config):
+            joined, metrics_json = execute_metered(join_ir, [left_rows, right_full], engine_config)
+            if metrics_sink is not None and metrics_json:
+                metrics_sink.append(metrics_json)
+            for b in joined:
                 if not b.num_rows:
                     continue
                 if writer is None:
@@ -633,7 +679,7 @@ def _join_reduce_task(join_ir, left_paths, right_paths, work_dir, reducer_id, en
     import json as _json
     import os as _os
 
-    import batcher._native as nat
+    from batcher.dist.executors.ray_runtime import execute_metered
     from batcher.dist.shuffle_io import read_ipc, write_ipc
 
     # When the two co-partitioned buckets together exceed the spill budget, reduce them
@@ -657,6 +703,8 @@ def _join_reduce_task(join_ir, left_paths, right_paths, work_dir, reducer_id, en
             n_sub,
             engine_config,
         )
+        # The out-of-core branch joins sub-bucket pairs internally; it reports no metrics.
+        metrics_json = ""
     else:
         left: list = []
         for p in left_paths:
@@ -679,15 +727,15 @@ def _join_reduce_task(join_ir, left_paths, right_paths, work_dir, reducer_id, en
             and join_node.get("join_type", "inner") == "inner"
             and (not any(b.num_rows for b in left) or not any(b.num_rows for b in right))
         ):
-            return (None, 0)
-        result = nat.execute_plan(join_ir, [left, right], engine_config)
+            return (None, 0, "")
+        result, metrics_json = execute_metered(join_ir, [left, right], engine_config)
 
     rows = sum(b.num_rows for b in result) if result else 0
     if rows == 0:
-        return (None, 0)
+        return (None, 0, metrics_json)
     path = _os.path.join(work_dir, f"join_reduce_{reducer_id}.arrow")
     write_ipc(result, path)
-    return (path, rows)
+    return (path, rows, metrics_json)
 
 
 def _safe_file_size(path: str) -> int:

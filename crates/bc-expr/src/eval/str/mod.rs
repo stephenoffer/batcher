@@ -9,6 +9,7 @@ use arrow::datatypes::DataType;
 use crate::{ExprError, StrFunc};
 
 mod chunk;
+mod html;
 mod minhash;
 
 /// Evaluate a string function over a Utf8 array (preserving nulls).
@@ -341,9 +342,14 @@ pub(crate) fn eval_str(
             }))
         }
         StrFunc::Split => {
-            use arrow::array::{ListBuilder, StringBuilder};
+            use arrow::array::{Array, ListBuilder, StringBuilder};
             let delim = require_pattern(pattern, func)?;
-            let mut builder = ListBuilder::new(StringBuilder::new());
+            // One list per row; the parts together hold ~the input bytes (minus delimiters),
+            // so pre-size both the offset buffer and the value bytes to skip builder regrowth.
+            let mut builder = ListBuilder::with_capacity(
+                StringBuilder::with_capacity(s.len(), s.value_data().len()),
+                s.len(),
+            );
             for o in s.iter() {
                 match o {
                     Some(v) => {
@@ -359,6 +365,7 @@ pub(crate) fn eval_str(
         }
         StrFunc::Chunk => chunk::eval_chunk(s, start, length)?,
         StrFunc::MinHash => minhash::eval_minhash(s, start, length)?,
+        StrFunc::StripHtml => Arc::new(map_str(s, html::strip_html_text)),
         StrFunc::SubstringIndex => {
             let delim = require_pattern(pattern, func)?;
             let count = start.unwrap_or(0);
@@ -373,9 +380,11 @@ pub(crate) fn eval_str(
             Arc::new(map_str(s, |v| overlay(v, rep, pos, length)))
         }
         StrFunc::RegexpExtractAll => {
-            use arrow::array::{ListBuilder, StringBuilder};
+            use arrow::array::{Array, ListBuilder, StringBuilder};
             let re = compile_regex(pattern, func)?;
-            let mut builder = ListBuilder::new(StringBuilder::new());
+            // One list per row; match volume per row is unknown, so pre-size only the
+            // outer offset buffer and let the inner value builder grow as matches land.
+            let mut builder = ListBuilder::with_capacity(StringBuilder::new(), s.len());
             for o in s.iter() {
                 match o {
                     Some(v) => {

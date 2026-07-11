@@ -26,9 +26,16 @@ from batcher.plan.expr_ir.nodes import Greatest, Least
 
 
 def sum_horizontal(*exprs: IntoExpr) -> Expr:
-    """Row-wise sum across the given columns, treating nulls as 0 (Polars
-    ``sum_horizontal``). Complements `greatest`/`least` (row-wise max/min). An
-    all-null row sums to 0. ``sum_horizontal(col("a"), col("b"), col("c"))``.
+    """Row-wise sum across the given columns, treating nulls as 0 (Polars ``sum_horizontal``).
+
+    Complements `greatest`/`least` (row-wise max/min). An all-null row sums to 0, as in
+    ``sum_horizontal(col("a"), col("b"), col("c"))``.
+
+    Args:
+        exprs: The columns to add together element-wise.
+
+    Returns:
+        A column holding the per-row sum across the given columns.
 
     Examples:
         .. doctest::
@@ -45,9 +52,16 @@ def sum_horizontal(*exprs: IntoExpr) -> Expr:
 
 
 def mean_horizontal(*exprs: IntoExpr) -> Expr:
-    """Row-wise mean across the given columns, ignoring nulls (Polars
-    ``mean_horizontal``): the sum of the non-null values divided by how many were
-    non-null. An all-null row yields null (no division by zero).
+    """Row-wise mean across the given columns, ignoring nulls (Polars ``mean_horizontal``).
+
+    The sum of the non-null values divided by how many were non-null. An all-null row
+    yields null (no division by zero).
+
+    Args:
+        exprs: The columns to average element-wise.
+
+    Returns:
+        A column holding the per-row mean across the non-null values.
 
     Examples:
         .. doctest::
@@ -67,10 +81,16 @@ def mean_horizontal(*exprs: IntoExpr) -> Expr:
 
 
 def min_horizontal(*exprs: IntoExpr) -> Least:
-    """Row-wise minimum across the given columns, ignoring nulls (Polars
-    ``min_horizontal``). The Polars-named spelling of `least`, completing the
-    horizontal family alongside `sum_horizontal`/`mean_horizontal`; an all-null row
-    yields null.
+    """Row-wise minimum across the given columns, ignoring nulls (Polars ``min_horizontal``).
+
+    The Polars-named spelling of `least`, completing the horizontal family alongside
+    `sum_horizontal`/`mean_horizontal`; an all-null row yields null.
+
+    Args:
+        exprs: The columns to take the row-wise minimum of.
+
+    Returns:
+        A column holding the per-row minimum across the given columns.
 
     Examples:
         .. doctest::
@@ -84,9 +104,15 @@ def min_horizontal(*exprs: IntoExpr) -> Least:
 
 
 def max_horizontal(*exprs: IntoExpr) -> Greatest:
-    """Row-wise maximum across the given columns, ignoring nulls (Polars
-    ``max_horizontal``). The Polars-named spelling of `greatest`; an all-null row
-    yields null.
+    """Row-wise maximum across the given columns, ignoring nulls (Polars ``max_horizontal``).
+
+    The Polars-named spelling of `greatest`; an all-null row yields null.
+
+    Args:
+        exprs: The columns to take the row-wise maximum of.
+
+    Returns:
+        A column holding the per-row maximum across the given columns.
 
     Examples:
         .. doctest::
@@ -105,6 +131,12 @@ def all_horizontal(*exprs: IntoExpr) -> Expr:
     The horizontal counterpart to a chain of ``&`` — true only where every column is
     true. Follows SQL three-valued logic (a null makes the row null unless another
     column is false). The idiomatic way to combine many validation flags into one.
+
+    Args:
+        exprs: The boolean columns to AND together element-wise.
+
+    Returns:
+        A boolean column true only where every argument is true.
 
     Examples:
         .. doctest::
@@ -125,6 +157,12 @@ def any_horizontal(*exprs: IntoExpr) -> Expr:
     The horizontal counterpart to a chain of ``|`` — true where any column is true.
     Follows SQL three-valued logic. The idiomatic way to test whether any of several
     flags is set.
+
+    Args:
+        exprs: The boolean columns to OR together element-wise.
+
+    Returns:
+        A boolean column true where any argument is true.
 
     Examples:
         .. doctest::

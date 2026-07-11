@@ -70,6 +70,17 @@ class SecurityCatalog:
 
         The first grant on a table makes it deny-by-default for every role.
 
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> cat = bt.SecurityCatalog()
+                >>> cat.grant("analyst", on="/data/customers.parquet", select=["id"]) is cat
+                True
+                >>> analyst = bt.Principal("ana", roles=["analyst"])
+                >>> cat.visible_columns("/data/customers.parquet", ["id", "ssn"], analyst)
+                ['id']
+
         Args:
             role: The role receiving the privilege.
             on: The table name (the path it is read from).
@@ -88,6 +99,17 @@ class SecurityCatalog:
     ) -> SecurityCatalog:
         """Read `table`.`column` through `mask`, except for principals holding `exempt`.
 
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> cat = bt.SecurityCatalog()
+                >>> cat.mask_column("/data/t.parquet", "email", lambda c: bt.mask(c)) is cat
+                True
+                >>> analyst = bt.Principal("ana", roles=["analyst"])
+                >>> cat.mask_for("/data/t.parquet", "email", analyst) is None
+                False
+
         Args:
             table: The table name.
             column: The column to mask.
@@ -105,6 +127,19 @@ class SecurityCatalog:
 
         Tags carry no policy on their own; `mask_tag` attaches one.
 
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> cat = bt.SecurityCatalog()
+                >>> cat.tag("/data/t.parquet", "email", "pii") is cat
+                True
+                >>> cat.mask_tag("pii", lambda c: bt.mask(c)) is cat
+                True
+                >>> analyst = bt.Principal("ana", roles=["analyst"])
+                >>> cat.mask_for("/data/t.parquet", "email", analyst) is None
+                False
+
         Args:
             table: The table name.
             column: The column being classified.
@@ -118,6 +153,17 @@ class SecurityCatalog:
 
     def mask_tag(self, tag: str, mask: MaskFn, *, exempt: Iterable[str] = ()) -> SecurityCatalog:
         """Mask every column tagged `tag`, in every table, except for `exempt` roles.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> cat = bt.SecurityCatalog().tag("/data/t.parquet", "email", "pii")
+                >>> cat.mask_tag("pii", lambda c: bt.mask(c), exempt=["admin"]) is cat
+                True
+                >>> admin = bt.Principal("root", roles=["admin"])
+                >>> cat.mask_for("/data/t.parquet", "email", admin) is None
+                True
 
         Args:
             tag: The tag to govern.
@@ -140,6 +186,21 @@ class SecurityCatalog:
     ) -> SecurityCatalog:
         """Restrict `table` to rows satisfying ``predicate(principal)``, except for `exempt`.
 
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> cat = bt.SecurityCatalog()
+                >>> cat.filter_rows(
+                ...     "/data/t.parquet",
+                ...     lambda p: bt.col("region") == p.attrs["region"],
+                ...     name="region_scope",
+                ... ) is cat
+                True
+                >>> analyst = bt.Principal("ana", roles=["analyst"], attrs={"region": "EU"})
+                >>> [f.name for f in cat.row_filters_for("/data/t.parquet", analyst)]
+                ['region_scope']
+
         Args:
             table: The table name.
             predicate: Given the principal, the predicate rows must satisfy.
@@ -159,6 +220,16 @@ class SecurityCatalog:
         A table nobody has written a policy about is left exactly as it was — the check
         that keeps installing a catalog from perturbing unrelated queries.
 
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> cat = bt.SecurityCatalog().grant("analyst", on="/data/sales.parquet")
+                >>> cat.governs("/data/sales.parquet")
+                True
+                >>> cat.governs("/data/other.parquet")
+                False
+
         Args:
             table: The table name.
 
@@ -176,6 +247,17 @@ class SecurityCatalog:
         self, table: str, columns: Sequence[str], principal: Principal
     ) -> list[str]:
         """The subset of `columns` that `principal` may `SELECT` from `table`, in order.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> cat = bt.SecurityCatalog().grant(
+                ...     "analyst", on="/data/t.parquet", select=["id", "email"]
+                ... )
+                >>> analyst = bt.Principal("ana", roles=["analyst"])
+                >>> cat.visible_columns("/data/t.parquet", ["id", "email", "ssn"], analyst)
+                ['id', 'email']
 
         Args:
             table: The table name.
@@ -205,6 +287,19 @@ class SecurityCatalog:
         matching tag in sorted order wins, so resolution is deterministic regardless of
         the order tags were declared in.
 
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> cat = bt.SecurityCatalog().mask_column(
+                ...     "/data/t.parquet", "ssn", lambda c: bt.mask(c)
+                ... )
+                >>> analyst = bt.Principal("ana", roles=["analyst"])
+                >>> cat.mask_for("/data/t.parquet", "ssn", analyst) is None
+                False
+                >>> cat.mask_for("/data/t.parquet", "id", analyst) is None
+                True
+
         Args:
             table: The table name.
             column: The column being read.
@@ -225,6 +320,22 @@ class SecurityCatalog:
 
     def row_filters_for(self, table: str, principal: Principal) -> list[RowFilter]:
         """Every row filter on `table` that `principal` is not exempt from.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> cat = bt.SecurityCatalog().filter_rows(
+                ...     "/data/t.parquet",
+                ...     lambda p: bt.col("region") == "EU",
+                ...     name="eu_only",
+                ...     exempt=["admin"],
+                ... )
+                >>> analyst = bt.Principal("ana", roles=["analyst"])
+                >>> [f.name for f in cat.row_filters_for("/data/t.parquet", analyst)]
+                ['eu_only']
+                >>> cat.row_filters_for("/data/t.parquet", bt.Principal("root", roles=["admin"]))
+                []
 
         Args:
             table: The table name.

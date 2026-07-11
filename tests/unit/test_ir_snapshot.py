@@ -55,6 +55,7 @@ from batcher.plan.expr_ir.func_nodes import (
     ListGet,
     ListPosition,
     ListSet,
+    ListSimhash,
     ListSlice,
     ListTransform,
     MapFunc,
@@ -127,6 +128,8 @@ def _representatives() -> dict[str, Any]:
         "sequence": Sequence(Lit(1), Lit(10), Lit(2)),
         "make_struct": MakeStruct([("a", _X), ("b", Lit(1))]),
         "list_join": ListJoin(Col("a"), ","),
+        "list_simhash": ListSimhash(Col("v"), 64),
+        "list_simhash_seeded": ListSimhash(Col("v"), 64, 3),
         # --- string functions ---------------------------------------------------
         "str_simple": StrFunc("upper", Col("s")),
         "str_contains": StrFunc("contains", Col("s"), pattern="x"),

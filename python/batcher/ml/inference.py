@@ -183,12 +183,15 @@ class InferencePool:
     retuned online toward that per-batch latency.
 
     Example:
-        >>> def make_worker():
-        ...     model = load_model()            # once per worker
-        ...     return lambda batch: model(batch)
-        >>> pool = InferencePool(make_worker, num_workers=4, target_batch_rows=2048)
-        >>> for out in pool.run(ds.iter_batches(batch_format="arrow")):
-        ...     ...
+        .. code-block:: python
+
+            def make_worker():
+                model = load_model()            # once per worker
+                return lambda batch: model(batch)
+
+            pool = InferencePool(make_worker, num_workers=4, target_batch_rows=2048)
+            for out in pool.run(ds.iter_batches(batch_format="arrow")):
+                ...
 
     Args:
         worker_factory: zero-arg callable returning a `Worker`; invoked exactly
@@ -316,12 +319,55 @@ def _pipeline_accel_kwargs() -> dict[str, Any]:
         if backend != "cpu":
             dev = torch_device(backend)
             kwargs["device"] = 0 if dev == "cuda" else dev
+        else:
+            # First-class CPU inference: cap torch's MKL/oneDNN/BLIS/OpenBLAS thread pool to the
+            # cores this actor may use, so co-located CPU actors don't each grab every host core.
+            _configure_cpu_inference_threads()
         dtype = recommend_inference_dtype(backend)
         if dtype is not None:
             kwargs["torch_dtype"] = getattr(torch, dtype)
     except Exception:
         return {}
     return kwargs
+
+
+def _cpu_inference_thread_target() -> int:
+    """The intra-op thread count a CPU-inference process should use.
+
+    An explicit `OMP_NUM_THREADS` (Ray sets it to the actor's `num_cpus`, and a user may pin it)
+    wins, so the per-actor allocation is honored; otherwise the container's usable core count
+    (cgroup/affinity-aware, via `available_cpu_count`), never the host count.
+    """
+    import os
+
+    from batcher._internal.hardware import available_cpu_count
+
+    omp = os.environ.get("OMP_NUM_THREADS", "").strip()
+    if omp.isdigit() and int(omp) > 0:
+        return int(omp)
+    return available_cpu_count()
+
+
+def _configure_cpu_inference_threads() -> int | None:
+    """Cap torch's CPU math-library thread pool to the cores this process may actually use.
+
+    torch — and the Intel MKL / oneDNN, AMD BLIS/AOCL, or OpenBLAS backend it dispatches to —
+    sizes its intra-op pool to the *host* core count, so a CPU-inference actor over-subscribes
+    under a cgroup quota and thrashes *catastrophically* when co-located actors each grab every
+    core. Sets the pool to `_cpu_inference_thread_target()`, only ever *lowering* it (never raising
+    above torch's or a caller's explicit choice). Returns the applied count, or `None` when torch
+    is absent. Best-effort and idempotent; result-invariant (a thread count, not a result)."""
+    try:
+        import torch
+    except Exception:
+        return None
+    target = _cpu_inference_thread_target()
+    try:
+        if torch.get_num_threads() > target:
+            torch.set_num_threads(target)
+    except Exception:
+        return None
+    return target
 
 
 def _maybe_compile_pipeline(pipe: Any) -> None:

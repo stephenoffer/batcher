@@ -13,7 +13,7 @@
 mod assign;
 mod combine;
 
-pub(crate) use assign::assign_groups;
+pub(crate) use assign::{assign_groups, dense_budget};
 pub(super) use combine::{combine_radix, merge_state};
 
 // Same seed both halves use — bucketing is independent of the seed, but sharing it keeps

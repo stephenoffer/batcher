@@ -177,8 +177,8 @@ impl HyperLogLog {
         }
         let raw = alpha(self.m()) * m * m / sum;
 
-        // Small-range correction: linear counting when many registers are empty.
-        if raw <= 2.5 * m && zeros > 0 {
+        // Small-range correction: linear counting while enough registers are empty.
+        if raw <= LINEAR_COUNTING_MAX_LOAD * m && zeros > 0 {
             m * (m / zeros as f64).ln()
         } else {
             raw
@@ -236,6 +236,34 @@ fn pow2_neg(r: u8) -> f64 {
 }
 
 /// HyperLogLog bias constant α_m.
+/// Load factor `n/m` at which linear counting hands over to the raw HLL estimator.
+///
+/// Flajolet's original constant here is `2.5`. It is wrong for a 64-bit hash: the raw
+/// estimator carries a large positive bias for `m < n < 5m`, so switching to it at `2.5m`
+/// steps straight onto the worst of that bias. Measured over 20–40 independent trials per
+/// point (`examples/hll_bias.rs`), the discontinuity at `2.5` was a **+2.4% systematic
+/// overestimate at 26–42 standard errors** — bias, not noise — decaying to zero by `n ≈ 4m`.
+///
+/// HLL++ removes it with empirical per-precision bias tables. Those are ~15×200 measured
+/// constants; rather than carry them, we move the handover to where the two estimators'
+/// *total* error is balanced. Linear counting's relative standard error is closed-form,
+/// `sqrt(e^t − t − 1) / (t·sqrt(m))` for `t = n/m`, and grows with `t`; the raw estimator's
+/// is a flat `1.04/sqrt(m)` plus that bias. Sweeping the handover point and scoring RMSE
+/// over `n/m ∈ [0.5, 8]`:
+///
+/// | threshold | RMSE (p=14) | worst per-point bias |
+/// |-----------|-------------|----------------------|
+/// | 2.5       | 0.915%      | 2.56%                |
+/// | 3.0       | 0.751%      | 1.01%                |
+/// | **3.5**   | **0.746%**  | **0.38%**            |
+/// | 4.5       | 0.832%      | 0.30%                |
+///
+/// `3.5` sits within 1% of the RMSE minimum at every precision tested (12, 14, 16) while
+/// cutting the worst-case bias by ~6x. Both error terms depend on `t` alone (scaled by
+/// `1/sqrt(m)`), which is why one constant serves every precision — as the measurements
+/// across p=12/14/16 confirm.
+const LINEAR_COUNTING_MAX_LOAD: f64 = 3.5;
+
 fn alpha(m: usize) -> f64 {
     match m {
         16 => 0.673,
@@ -251,6 +279,51 @@ mod tests {
     use crate::merge_all;
     use arrow::array::Int64Array;
     use std::sync::Arc;
+
+    /// Averaging independent trials cancels HLL's sampling variance (which is
+    /// `1.04/sqrt(m)` per trial) and leaves only the estimator's systematic bias.
+    fn mean_relative_error(precision: u8, n: u64, trials: u64) -> f64 {
+        let mut total = 0.0;
+        for t in 0..trials {
+            let mut hll = HyperLogLog::new(precision);
+            // A distinct, well-separated key space per trial.
+            let salt = (t + 1).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+            for i in 0..n {
+                hll.add(&(i ^ salt));
+            }
+            total += (hll.estimate() - n as f64) / n as f64;
+        }
+        total / trials as f64
+    }
+
+    #[test]
+    fn no_bias_spike_at_the_linear_counting_handover() {
+        // The raw estimator is biased high for `m < n < 5m`. Handing over to it at the
+        // classic `2.5m` stepped onto a +2.4% overestimate at ~26 standard errors. Averaged
+        // over 24 trials the sampling error is ~0.17%, so a 1% bound cannot pass by luck.
+        let m = 1u64 << 14;
+        for mult in [2.4_f64, 2.5, 2.6, 3.0] {
+            let n = (mult * m as f64) as u64;
+            let bias = mean_relative_error(14, n, 24);
+            assert!(
+                bias.abs() < 0.01,
+                "n/m = {mult}: mean relative error {:.3}% exceeds 1% — the estimator is biased",
+                bias * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn linear_counting_stays_accurate_up_to_the_handover() {
+        // Below the handover the estimate is pure linear counting, which is unbiased.
+        let m = 1u64 << 14;
+        let bias = mean_relative_error(14, m, 16);
+        assert!(
+            bias.abs() < 0.005,
+            "linear counting biased by {:.3}%",
+            bias * 100.0
+        );
+    }
 
     #[test]
     fn relative_error_within_bounds() {

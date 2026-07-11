@@ -304,6 +304,7 @@ pub(crate) fn analyze(
             Ok(ScalarTy::F64)
         }
         Expr::ListGet { .. } => Err(CodegenError::Unsupported("list index".into())),
+        Expr::ListSimhash { .. } => Err(CodegenError::Unsupported("list simhash".into())),
         Expr::StructField { .. } => Err(CodegenError::Unsupported("struct field".into())),
         Expr::ListContains { .. } => Err(CodegenError::Unsupported("list contains".into())),
         Expr::ListPosition { .. } => Err(CodegenError::Unsupported("list position".into())),

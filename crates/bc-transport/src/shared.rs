@@ -150,7 +150,7 @@ fn read_mmap_zero_copy(mmap: Mmap) -> Result<Vec<RecordBatch>, arrow::error::Arr
         let data = buffer.slice_with_length(block.offset() as usize, block_len);
         decoder.read_dictionary(block, &data)?;
     }
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(footer.recordBatches().map_or(0, |r| r.len()));
     if let Some(rbs) = footer.recordBatches() {
         for i in 0..rbs.len() {
             let block = rbs.get(i);

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import math
 import weakref
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Any
 
 from batcher.config import active_config
@@ -24,6 +26,9 @@ __all__ = [
     "MCV_KEY",
     "NDV_KEY",
     "QUANTILES_KEY",
+    "bump_generation",
+    "generation",
+    "is_material_change",
     "load_learned_stats",
     "record_column_stats",
     "record_execution",
@@ -52,14 +57,93 @@ _CORRECTION_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, tuple, dict
     weakref.WeakKeyDictionary()
 )
 
+# Cap on the distinct plan signatures whose q-error window is tracked. Each window holds
+# at most `cardinality_correction_window` floats, so this bounds the fold's memory for a
+# session that issues endlessly many distinct shapes.
+_MAX_TRACKED_SIGNATURES = 4096
+
+
+@dataclass(slots=True)
+class _QErrorState:
+    """The incremental q-error fold for one hub: how far it has read, and what it holds."""
+
+    consumed: int  # `MetadataHub.signed_appends` as of the last fold
+    window: int  # the configured per-signature sample window this state was built for
+    samples: dict[str, deque[float]] = field(default_factory=dict)
+
+
+# Per-hub incremental q-error windows, keyed weakly so a dropped hub evicts its state.
+_QERROR_CACHE: weakref.WeakKeyDictionary[MetadataHub, _QErrorState] = weakref.WeakKeyDictionary()
+
+
+# Bumped whenever something is learned that could change a *plan*, never for the routine
+# drift of an already-converged estimate. `plan_cache` keys on it: a memoized plan stays
+# valid until the feedback loop learns something worth re-planning for. This is the same
+# judgement the adaptive executor makes — re-optimize when reality disagreed with the
+# estimate, not merely because a smoothed average moved in its fourth decimal.
+_GENERATION = 0
+
+# A measured cardinality this far from the prior is a *material* correction: the estimate
+# the last plan was chosen under was wrong by more than a factor of `1 + this`, which is
+# enough to flip a build side or a join order. Smaller moves are the exponential average
+# settling and must not invalidate a plan, or nothing would ever be reused.
+_MATERIAL_CHANGE = 0.10
+
+
+def generation() -> int:
+    """A counter that advances only when the loop learns something plan-relevant."""
+    return _GENERATION
+
+
+def bump_generation() -> None:
+    """Declare that something plan-relevant was learned, invalidating memoized plans.
+
+    Called by every writer whose value the optimizer reads — the join-strategy bandit, the
+    adaptive gate, partition sizing, and the column sketches. Only the *converged drift* of
+    an already-known cardinality is exempt (`_is_material`), because that write happens on
+    every single execution and gating on it is what makes memoizing a plan possible at all.
+    Bumping too often only costs a re-plan; bumping too rarely leaves a stale plan in place,
+    so anything uncertain should bump."""
+    global _GENERATION
+    _GENERATION += 1
+
+
+def _bump_generation() -> None:
+    bump_generation()
+
+
+def is_material_change(prior: float | None, observed: float) -> bool:
+    """Whether `observed` corrects `prior` by enough to be worth re-planning for.
+
+    The threshold exists because every learned value is rewritten on every execution: an
+    exponential average settles, a counter ticks. Treating that drift as news would make a
+    memoized plan worthless. A correction past `_MATERIAL_CHANGE` is large enough to flip a
+    build side or a join order; smaller ones are the estimate converging.
+    """
+    if prior is None:
+        return True  # nothing was known; the next plan can only be better informed
+    if prior <= 0:
+        return observed > 0
+    return abs(observed - prior) / prior > _MATERIAL_CHANGE
+
+
+def _is_material(prior: float | None, observed: float) -> bool:
+    return is_material_change(prior, observed)
+
 
 def _smooth(prior: float, observed: float, n_obs: int) -> float:
-    """Exponentially smooth `prior` toward `observed`, with an observation-count
-    floor on the step. Early observations (small `n_obs`) move fast — the effective
-    weight is `max(alpha, 1/(n_obs+1))`, i.e. a running mean until enough evidence
-    accrues, then the configured `alpha` — so a settled estimate is stable while a
-    single anomalous early run can't anchor it."""
-    alpha = max(active_config().optimizer.learning_smoothing_alpha, 1.0 / (n_obs + 1))
+    """Exponentially smooth `prior` toward `observed`, with an observation-count floor.
+
+    The step is `max(floor, 1/(n_obs+1))`: a **running mean** while evidence is thin (so a
+    single anomalous early run cannot anchor the estimate), decaying into an EWMA with a
+    ~`1/floor`-observation memory once enough runs have accrued.
+
+    The floor is `learned_scalar_alpha_floor`, not `learning_smoothing_alpha`. The latter is
+    a *static blend weight* used elsewhere; at its value of 0.5 the newest run would always
+    carry half the weight, so `1/(n_obs+1)` would be dominated from the second observation
+    onward and the estimate would never converge.
+    """
+    alpha = max(active_config().optimizer.learned_scalar_alpha_floor, 1.0 / (n_obs + 1))
     return alpha * observed + (1.0 - alpha) * prior
 
 
@@ -137,26 +221,56 @@ def _cardinality_corrections(hub: MetadataHub) -> dict[str, float]:
     return out
 
 
-def _q_error_samples(hub: MetadataHub, window: int) -> dict[str, list[float]]:
+def _q_error_samples(hub: MetadataHub, window: int) -> dict[str, deque[float]]:
     """Per-signature `log(actual / estimated)` for the most recent `window` samples.
 
     Logs, not ratios, because the caller takes a geometric mean. Rows the estimator
     cannot learn from — no signature, no structural estimate (`n_estimated == 0`, which
     Kyber writes for a measured, exact, or unknown-size operator), or an empty output —
     are skipped rather than recorded as a q-error of zero.
+
+    The fold is **incremental**: the per-signature windows persist across calls and only
+    the feedback rows recorded since the last call are absorbed (`MetadataHub.
+    signed_appends` says how many that is). Re-folding the retained history on every call
+    would instead put a cost proportional to the session's cumulative query count on the
+    critical path of *every* optimize — the same trap the Hub's own views avoid.
     """
-    samples: dict[str, list[float]] = {}
-    for row in hub.op_stats_with_signature():  # oldest first
-        sig = row.get("signature") or ""
-        est = float(row.get("n_estimated") or 0.0)
-        actual = float(row.get("n_actual") or 0.0)
-        if not sig or est <= 0.0 or actual <= 0.0:
-            continue
-        bucket = samples.setdefault(sig, [])
-        bucket.append(math.log(actual / est))
-        if len(bucket) > window:
-            bucket.pop(0)  # keep only the newest `window` observations
-    return samples
+    state = _QERROR_CACHE.get(hub)
+    # Read the view *before* the cursor: the first read is what materializes the Hub's
+    # view from the backend, and that load is what gives `signed_appends` its initial
+    # value. Reading the cursor first would see 0 and absorb nothing.
+    rows = hub.op_stats_with_signature()  # oldest first
+    appends = hub.signed_appends
+    if state is None or state.window != window or state.consumed > appends:
+        # First fold for this hub, a reconfigured window, or a hub whose counter moved
+        # backwards (a fresh backend behind it): rebuild from the retained history.
+        state = _QErrorState(consumed=0, window=window, samples={})
+        _QERROR_CACHE[hub] = state
+    fresh = appends - state.consumed
+    if fresh > 0:
+        # The Hub's view is bounded, so a cursor left far enough behind can name more
+        # rows than remain; absorb whatever is still retained.
+        for row in rows[-fresh:] if fresh < len(rows) else rows:
+            _absorb_q_error(state, row)
+        state.consumed = appends
+    return state.samples
+
+
+def _absorb_q_error(state: _QErrorState, row: dict[str, Any]) -> None:
+    """Fold one feedback row into its signature's bounded q-error window."""
+    sig = row.get("signature") or ""
+    est = float(row.get("n_estimated") or 0.0)
+    actual = float(row.get("n_actual") or 0.0)
+    if not sig or est <= 0.0 or actual <= 0.0:
+        return
+    bucket = state.samples.get(sig)
+    if bucket is None:
+        if len(state.samples) >= _MAX_TRACKED_SIGNATURES:
+            # Oldest-inserted eviction (dicts preserve insertion order), so a session
+            # issuing unboundedly many distinct plan shapes cannot grow this map forever.
+            del state.samples[next(iter(state.samples))]
+        bucket = state.samples[sig] = deque(maxlen=state.window)
+    bucket.append(math.log(actual / est))
 
 
 def record_execution(hub: MetadataHub | None, plan: LogicalPlan, output_rows: int) -> None:
@@ -171,6 +285,8 @@ def record_execution(hub: MetadataHub | None, plan: LogicalPlan, output_rows: in
         sig = plan_signature(plan)
         entry = dict(hub.get_keyed_param(_NAMESPACE, sig) or {})  # preserve sibling keys
         prior = entry.get("rows")
+        if _is_material(prior, float(output_rows)):
+            _bump_generation()
         entry["rows"] = (
             float(output_rows)
             if prior is None
@@ -256,6 +372,10 @@ def record_column_stats(
         # clobber it.
         if ndv:
             col_ndv = dict(hub.get_keyed_param(_NAMESPACE, NDV_KEY) or {})
+            # A column measured for the first time can change every join and group-by
+            # estimate that reads it — the one column-stat event worth re-planning for.
+            if any(name not in col_ndv for name in ndv):
+                _bump_generation()
             col_ndv.update(ndv)
             hub.put_keyed_param(_NAMESPACE, NDV_KEY, col_ndv)
         if quantiles:

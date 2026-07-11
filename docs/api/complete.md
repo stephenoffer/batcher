@@ -34,6 +34,7 @@ register SQL functions or sessions.
    read_memory
    sql
    streams
+   await_any_termination
    register_function
    udf
    compact
@@ -61,6 +62,42 @@ Reference and derive columns, build literals, and branch.
    array
 ```
 
+## Column selectors
+
+Stand for *every column matching a predicate* — pass one anywhere a column is
+expected (`ds.select(bt.numeric())`, `ds.with_columns(bt.floating().round(2))`) and it
+expands against the input schema. See the
+[transformations guide](../user-guide/transformations.md) for how they compose.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   all
+   numeric
+   integer
+   floating
+   string
+   boolean
+   temporal
+   by_dtype
+   matches
+   starts_with
+   ends_with
+   contains
+   exclude
+```
+
+```{eval-rst}
+.. autoclass:: batcher.plan.expr_ir.selectors.Selector
+   :members:
+
+.. autoclass:: batcher.plan.expr_ir.selectors.core._SelectorNameNamespace
+   :members:
+   :member-order: bysource
+```
+
 ## Scalar functions
 
 Row-wise math, string, and date/time helpers usable anywhere an expression is.
@@ -79,8 +116,6 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    log
    nanvl
    width_bucket
-   mean_horizontal
-   sum_horizontal
    concat
    concat_ws
    format_string
@@ -96,11 +131,31 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    range
    date_range
    sequence
+   hash_rows
+```
+
+## Horizontal (row-wise across columns) functions
+
+These reduce *across* the listed expressions within one row, rather than down a
+column. The vertical counterparts are the aggregates below.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   min_horizontal
+   max_horizontal
+   sum_horizontal
+   mean_horizontal
+   all_horizontal
+   any_horizontal
 ```
 
 ## Aggregate and window functions
 
-Use these in `group_by(...).agg(...)` or `.over(...)` window frames.
+Use these in `group_by(...).agg(...)` or `.over(...)` window frames. The ranking and
+value functions are window-only: bind them with `.over(partition_by=…, order_by=…)`.
 
 ```{eval-rst}
 .. autosummary::
@@ -108,6 +163,14 @@ Use these in `group_by(...).agg(...)` or `.over(...)` window frames.
    :nosignatures:
 
    count
+   sum
+   mean
+   min
+   max
+   median
+   std
+   var
+   n_unique
    count_if
    corr
    covar_pop
@@ -118,23 +181,22 @@ Use these in `group_by(...).agg(...)` or `.over(...)` window frames.
    percent_rank
    cume_dist
    ntile
-   range
-   date_range
-   read
-   sql
-   compact
-   engine_version
-   from_arrow
-   from_batches
-   from_pydict
-   from_numpy
-   from_pandas
-   from_polars
-   from_spark
-   from_dask
-   from_huggingface
-   from_torch
-   from_tf
+   lag
+   lead
+   first_value
+   last_value
+   nth_value
+```
+
+## Configuration functions
+
+Read and override the engine tunables. See the [configuration guide](configuration.md).
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
    set_config
    config_context
 ```
@@ -145,7 +207,7 @@ Use these in `group_by(...).agg(...)` or `.over(...)` window frames.
 .. autoclass:: batcher.Dataset
    :members:
    :member-order: groupwise
-   :special-members: __getitem__, __len__, __iter__, __contains__, __add__, __or__, __and__, __sub__
+   :special-members: __getitem__, __len__, __iter__, __contains__, __add__, __or__, __and__, __sub__, __arrow_c_stream__
 ```
 
 ## GroupBy
@@ -190,7 +252,7 @@ Column-level lineage is reached from the dataset itself: :meth:`batcher.Dataset.
 ### Expression accessors
 
 The typed namespaces reached as `col("x").str`, `.dt`, `.list`, `.struct`,
-`.json`, and `.map`.
+`.json`, `.map`, and — for multimodal columns — `.image`, `.audio`, and `.video`.
 
 ```{eval-rst}
 .. autoclass:: batcher.plan.expr_ir.namespaces.strings._StrNamespace
@@ -214,6 +276,18 @@ The typed namespaces reached as `col("x").str`, `.dt`, `.list`, `.struct`,
    :member-order: bysource
 
 .. autoclass:: batcher.plan.expr_ir.namespaces.collections._MapNamespace
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.plan.expr_ir.image._ImageNamespace
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.plan.expr_ir.audio._AudioNamespace
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.plan.expr_ir.video._VideoNamespace
    :members:
    :member-order: bysource
 ```

@@ -51,11 +51,18 @@ print(sorted(back.to_pydict()["amount"]))
 | Task | pandas | Polars | PySpark | Batcher |
 |------|--------|--------|---------|---------|
 | Read Parquet | `pd.read_parquet(p)` | `pl.read_parquet(p)` | `spark.read.parquet(p)` | `bt.read.parquet(p)` |
+| Scan Parquet (lazy) | — | `pl.scan_parquet(p)` | — | `bt.read.parquet(p)` |
 | Read CSV | `pd.read_csv(p)` | `pl.read_csv(p)` | `spark.read.csv(p)` | `bt.read.csv(p)` |
 | Read Delta | — | `pl.read_delta(p)` | `spark.read.format("delta").load(p)` | `bt.read.delta(p)` |
 | Autodetect | — | — | `spark.read.load(p)` | `bt.read(p)` |
 | Write Parquet | `df.to_parquet(p)` | `df.write_parquet(p)` | `df.write.parquet(p)` | `ds.write.parquet(p)` |
 | Write Delta | — | `df.write_delta(p)` | `df.write.format("delta").save(p)` | `ds.write.delta(p)` |
+
+Polars splits reading into eager `read_*` and lazy `scan_*`; Batcher does not need
+the split, because **every `bt.read.*` is already lazy** — it returns a `Dataset`
+plan and does no I/O until a terminal op, with projection and predicate pushdown
+applied just as `scan_*` gives you. There is one spelling per format, and it is the
+lazy one.
 
 ## Transforming
 
@@ -79,7 +86,8 @@ print(out.to_pydict())
 | Select / project | `df[["a", "b"]]` | `df.select("a", "b")` | `df.select("a", "b")` | `ds.select("a", "b")` |
 | Derive column | `df.assign(c=...)` | `df.with_columns(c=...)` | `df.withColumn("c", ...)` | `ds.with_columns(c=...)` |
 | Filter rows | `df[df.a > 1]` | `df.filter(pl.col("a") > 1)` | `df.filter(df.a > 1)` | `ds.filter(col("a") > 1)` |
-| Group + aggregate | `df.groupby("k").sum()` | `df.group_by("k").agg(...)` | `df.groupBy("k").agg(...)` | `ds.group_by("k").agg(...)` |
+| Group + aggregate | `df.groupby("k").agg(...)` | `df.group_by("k").agg(...)` | `df.groupBy("k").agg(...)` | `ds.group_by("k").agg(...)` |
+| Group + sum all | `df.groupby("k").sum()` | `df.group_by("k").sum()` | — | `ds.group_by("k").sum()` |
 | Mean aggregate | `df.a.mean()` | `pl.col("a").mean()` | `F.avg("a")` | `col("a").mean()` |
 | Sort | `df.sort_values("a")` | `df.sort("a")` | `df.orderBy("a")` | `ds.sort("a")` |
 | Join | `df.merge(o, on="k")` | `df.join(o, on="k")` | `df.join(o, "k")` | `ds.join(o, on="k")` |

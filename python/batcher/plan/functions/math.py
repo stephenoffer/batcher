@@ -20,6 +20,9 @@ def log(base: IntoExpr, value: IntoExpr) -> Expr:
         base: The logarithm base (column or literal).
         value: The value to take the logarithm of (column or literal).
 
+    Returns:
+        The logarithm of ``value`` in the given base.
+
     Examples:
         .. doctest::
 
@@ -41,6 +44,9 @@ def gcd(a: IntoExpr, b: IntoExpr) -> Math2Expr:
         a: First integer operand (column or literal).
         b: Second integer operand (column or literal).
 
+    Returns:
+        The greatest common divisor of the two operands.
+
     Examples:
         .. doctest::
 
@@ -60,6 +66,9 @@ def lcm(a: IntoExpr, b: IntoExpr) -> Math2Expr:
     Args:
         a: First integer operand (column or literal).
         b: Second integer operand (column or literal).
+
+    Returns:
+        The least common multiple of the two operands.
 
     Examples:
         .. doctest::
@@ -81,6 +90,9 @@ def hypot(a: IntoExpr, b: IntoExpr) -> Math2Expr:
         a: First leg (column or literal).
         b: Second leg (column or literal).
 
+    Returns:
+        The Euclidean norm ``sqrt(a² + b²)`` of the two legs.
+
     Examples:
         .. doctest::
 
@@ -93,18 +105,21 @@ def hypot(a: IntoExpr, b: IntoExpr) -> Math2Expr:
 
 
 def width_bucket(value: IntoExpr, low: IntoExpr, high: IntoExpr, count: int) -> Expr:
-    """Histogram bucket index (1..`count`) for `value` over the equal-width range
-    ``[low, high]`` (SQL ``width_bucket``).
+    """Histogram bucket index (1..``count``) for a value over an equal-width range.
 
-    Values below `low` fall in bucket 0 and values at or above `high` in bucket
-    ``count + 1`` (the SQL out-of-range convention). Desugars to arithmetic +
-    `clip`, so it needs no engine support.
+    Backs SQL ``width_bucket`` over the range ``[low, high]``: values below `low` fall
+    in bucket 0 and values at or above `high` in bucket ``count + 1`` (the SQL
+    out-of-range convention). Desugars to arithmetic + `clip`, so it needs no engine
+    support.
 
     Args:
         value: The value to bucket (column or literal).
         low: Inclusive lower bound of the bucketed range.
         high: Exclusive upper bound of the bucketed range.
         count: Number of equal-width buckets between ``low`` and ``high``.
+
+    Returns:
+        The 1-based bucket index of ``value`` (0 or ``count + 1`` when out of range).
 
     Examples:
         .. doctest::

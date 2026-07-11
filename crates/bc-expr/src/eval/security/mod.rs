@@ -15,6 +15,7 @@
 //! * **Key material never reaches an error string** — see `crypto::decode_key`.
 
 mod crypto;
+mod keyref;
 mod mask;
 
 use std::sync::Arc;
@@ -38,7 +39,10 @@ pub(crate) fn eval_security(
 ) -> Result<ArrayRef, ExprError> {
     match func {
         StrFunc::HmacSha256 => {
-            let key = require_key(pattern, "hmac_sha256")?;
+            // The `pattern` slot carries a key *reference* (`env:`/`file:`) or an inline
+            // literal; `resolve_key` reads the secret on this node so the plan IR only
+            // ever held the reference. Resolved once here, not per row.
+            let key = keyref::resolve_key("hmac_sha256", require_key(pattern, "hmac_sha256")?)?;
             Ok(Arc::new(
                 s.iter()
                     .map(|o| o.map(|v| crypto::hmac_sha256_hex(key.as_bytes(), v.as_bytes())))
@@ -46,8 +50,8 @@ pub(crate) fn eval_security(
             ))
         }
         StrFunc::AesEncrypt => {
-            let cipher =
-                crypto::cipher_from_key("aes_encrypt", require_key(pattern, "aes_encrypt")?)?;
+            let key = keyref::resolve_key("aes_encrypt", require_key(pattern, "aes_encrypt")?)?;
+            let cipher = crypto::cipher_from_key("aes_encrypt", &key)?;
             Ok(Arc::new(
                 s.iter()
                     .map(|o| o.map(|v| crypto::encrypt(&cipher, v)))
@@ -55,8 +59,8 @@ pub(crate) fn eval_security(
             ))
         }
         StrFunc::AesDecrypt => {
-            let cipher =
-                crypto::cipher_from_key("aes_decrypt", require_key(pattern, "aes_decrypt")?)?;
+            let key = keyref::resolve_key("aes_decrypt", require_key(pattern, "aes_decrypt")?)?;
+            let cipher = crypto::cipher_from_key("aes_decrypt", &key)?;
             // Double `and_then`: a null stays null, and an undecryptable value becomes
             // one (wrong key / tampered ciphertext) rather than aborting the scan.
             Ok(Arc::new(

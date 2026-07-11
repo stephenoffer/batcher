@@ -53,34 +53,54 @@ TPC-H `lineitem` (6M rows at scale 1, 60M at scale 10), read once into Arrow and
 byte-identically across engines; a 9-node / 128-CPU cluster; 8×T4 GPUs for the ML runs. Full
 per-scale tables: [`benchmarks/BENCHMARK_RESULTS.md`](benchmarks/BENCHMARK_RESULTS.md).
 
-**Analytical SQL, single-node (vs DuckDB / Polars).** Each cell is `batcher / fastest-competitor`
-wall time — **below 1.0 means Batcher is faster** (`0.40×` = 2.5× faster). The margin *holds or
-grows* from 6M to 60M rows, so it scales rather than just starting fast:
+**Single-node, head-to-head on the same in-memory Arrow (TPC-H sf1).** Each engine runs the
+*identical* zero-copy Arrow input Batcher runs on, so this is a like-for-like **execution**
+comparison. Cells are **how many times faster Batcher is** (higher = Batcher faster; a `<1`
+value means the competitor is faster, shown as e.g. `0.5× (2× slower)`). Every row is
+correctness-gated against DuckDB:
 
-| operator | sf1 (6M) | sf10 (60M) |
-|--------------------------------|:-------:|:--------:|
-| group-by sum, one key          | 0.45×   | 0.64×    |
-| filter → count                 | 0.32×   | **0.12×** |
-| sort → top-N (`LIMIT`)         | 0.69×   | 0.76×    |
-| window `rank()`                | 0.56×   | **0.40×** |
-| window running `sum()`         | 0.36×   | **0.32×** |
+| operator | vs DuckDB | vs Polars | vs PyArrow | vs Ray Data | vs Spark |
+|-------------------------|:--------:|:--------:|:----------:|:-----------:|:--------:|
+| group-by sum (1 key)    | **2.1×** | **2.6×** | 0.7× (1.5× slower) | **306×** | **28×** |
+| group-by sum (2 keys)   | **1.5×** | **1.9×** | 0.7× (1.5× slower) | **191×** | **21×** |
+| global sum              | **8×**   | **2.2×** | **7×**    | **2700×**   | **197×** |
+| filter → count          | **37×**  | **17×**  | **320×**  | **430×**    | **125×** |
+| join → group-by         | **2.6×** | **1.4×** | **7×**    | **135×**    | **25×** |
+| sort → top-N (`LIMIT`)  | **1.2×** | **29×**  | **345×**  | **477×**    | **24×** |
+| filter → project        | **3.1×** | **1.3×** | **23×**   | **22×**     | **20×** |
+| window `rank()`         | **2.7×** | **16×**  | n/a¹      | n/a¹        | **19×** |
+| window running `sum()`  | **3.2×** | **12×**  | n/a¹      | n/a¹        | **17×** |
+| window `lag()`          | **2.1×** | **27×**  | n/a¹      | n/a¹        | **13×** |
 
-At 60M rows `rank() OVER (…)` is **~2.5× faster than DuckDB** and **~13× faster than Polars**.
-Under a tight budget where *both* engines spill, Batcher stays alive and competitive — a
-high-cardinality `DISTINCT` even flips to a **1.4× win** out-of-core.
+¹ PyArrow (Acero) and Ray Data have no window functions. On TPC-H sf1, Batcher likewise beats
+DuckDB-on-Arrow on **all 21 runnable queries** (1.3×–4.3× faster) and Spark on every query
+(5×–33×).
+
+**How it scales, kept honest.** Against Polars, PyArrow, Spark, and Ray Data, Batcher leads at
+every scale we measured. Against DuckDB the story is scale-dependent, and we report it straight:
+
+| scale (single node) | Batcher vs DuckDB (same-input execution) |
+|---------------------|-------------------------------------------|
+| **sf1** — 6M rows, in memory   | wins **all 21** TPC-H queries (1.3–4.3×) |
+| **sf10** — 60M rows, in memory | wins 15 of 21; trails on 6 aggregate/join-heavy queries (1.2–3×) |
+| **sf100** — 600M rows, scanned | DuckDB leads 2–11×; Batcher OOMs on the deepest join trees (q3/q4/q5) |
+
+The gap grows with scale for three structural reasons, none of them a tuning knob: DuckDB
+**decompresses its native store on the fly** (fewer bytes off memory — Batcher's Arrow-only
+contract has no compressed form to read), its **vector-at-a-time engine with selection vectors**
+edges Batcher's batch-at-a-time kernels as rows grow, and it **streams** where Batcher's model
+materializes each operator's output — which is what OOMs the largest single-node sf100 joins.
+Batcher's answer at that scale is **distribution**: the same mergeable operators shard across a
+cluster (one partition per node, bounded per-node memory), which is the regime it is built for and
+where it beats Ray Data 50–450× (below). Closing the single-node scale gap to DuckDB is honest,
+open work — vectorized kernels, dictionary-aware grouping, and streaming between operators.
 
 **Distributed data plane (vs Ray Data).** In-process and native, Batcher pays none of Ray Data's
-per-operation task-scheduling + block/pandas-bridge cost (~300–4500 ms fixed, even on a cluster):
-
-| operation | batcher | Ray Data | speedup |
-|-----------------------------|--------:|---------:|:-------:|
-| group-by sum | 14 ms | 1,824 ms | **127×** |
-| global sum | 4 ms | 1,804 ms | **440×** |
-| sort → top-20 (`LIMIT`) | 15 ms | 4,569 ms | **306×** |
-
-Even on Ray Data's *own* streaming `map_batches` home turf, Batcher leads: `map_batches` transform
-**2.3×**, row-exploding `flat_map` **3.5×**, chained multi-stage map **3.2×**, Parquet read **21×**,
-`iter_torch_batches` training-data ingest **3.0×**.
+per-operation task-scheduling + block/pandas-bridge cost (~300–8000 ms fixed, even on a cluster) —
+**22×–2700× faster** across the operator mix above. Even on Ray Data's *own* streaming
+`map_batches` home turf it leads: `map_batches` transform **2.3×**, row-exploding `flat_map`
+**3.5×**, chained multi-stage map **3.2×**, Parquet read **21×**, `iter_torch_batches`
+training-data ingest **3.0×**.
 
 **GPU batch inference (8×T4, vs Ray Data)** — stage-overlap streaming keeps the device fed and
 session-warm pools load the model once per session, not once per job:

@@ -9,10 +9,10 @@ constructed in their place.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from batcher._internal.hardware import available_cpu_count
 from batcher.carbonite.memory.estimator import peak_operator_bytes
 from batcher.carbonite.memory.pressure import total_memory_bytes
 from batcher.config import Config, active_config
@@ -142,19 +142,44 @@ def _binding_op_is_a_guess(ops: Sequence[PhysicalOp]) -> bool:
     return binding.properties.provenance is Provenance.DEFAULT
 
 
-def credit_ceiling(config: Config) -> int:
+def credit_ceiling(config: Config, effective_morsel_bytes: int | None = None) -> int:
     """The upper bound on a shuffle channel's credit window (count *and* bytes).
 
     The count ceiling (`default_credits x credit_ceiling_factor`) is further capped
     so the window's *bytes* (`credits x morsel_bytes`) never exceed
     `credit_byte_budget` — bounding a channel's buffered memory regardless of row
     width (C53). Always >= 1.
+
+    `effective_morsel_bytes` overrides the config `morsel_bytes` when a channel's real
+    per-batch size is known to be wider than the configured target — the learned-row-width
+    case (embeddings/blobs), where the assumed `morsel_bytes` under-counts the buffered
+    bytes and a fast producer would run the window well past `credit_byte_budget`.
     """
     fc = config.flow_control
     count_ceiling = fc.default_credits * fc.credit_ceiling_factor
-    morsel_bytes = max(1, config.execution.morsel_bytes)
+    morsel_bytes = max(1, effective_morsel_bytes or config.execution.morsel_bytes)
     byte_ceiling = max(1, fc.credit_byte_budget // morsel_bytes)
     return max(1, min(count_ceiling, byte_ceiling))
+
+
+def _learned_channel_morsel_bytes(ctx: ResourceContext) -> int | None:
+    """A channel's effective per-batch bytes from the learned row width, or `None`.
+
+    The credit→bytes conversion assumes a `morsel_bytes`-sized batch; a workload whose
+    rows proved *wide* anywhere (the learned `max_bytes_per_row`) fills a `morsel_rows`
+    batch to far more than that, so its real buffered footprint per credit is larger.
+    Returning `max(morsel_bytes, width x morsel_rows)` lets `credit_ceiling` hand out
+    fewer credits for wide-row shuffles, keeping buffered memory within budget. `None`
+    (cold model / narrow rows) leaves the conversion at the configured `morsel_bytes`.
+    """
+    model = ctx.memory_model
+    if model is None:
+        return None
+    width = model.max_bytes_per_row()
+    if width is None or width <= 0:
+        return None
+    ex = ctx.config.execution
+    return max(ex.morsel_bytes, int(width * max(1, ex.morsel_rows)))
 
 
 class StaticCreditFlowControl:
@@ -172,7 +197,7 @@ class StaticCreditFlowControl:
 
     def grant(self, requested: int, ctx: ResourceContext) -> int:
         fc = ctx.config.flow_control
-        ceiling = credit_ceiling(ctx.config)
+        ceiling = credit_ceiling(ctx.config, _learned_channel_morsel_bytes(ctx))
         if requested <= 0:
             return min(fc.default_credits, ceiling)
         return min(max(requested, 1), ceiling)
@@ -307,7 +332,7 @@ class DefaultSchedulingPolicy:
         # distributed path, where the *cluster*-aware `clamp_workers` owns the real
         # cap. Clamping the desired fan-out to the driver's core count here would
         # cap a 100-node job at the driver's cores (the bug N11 fixes).
-        cpu_budget = max(1, cfg.execution.parallelism or os.cpu_count() or 4)
+        cpu_budget = max(1, cfg.execution.parallelism or available_cpu_count())
 
         # Desired parallelism: the widest breaker request (≈ rows / target-rows). An
         # explicit user `requested_workers` always wins; an unsized/streaming plan

@@ -44,11 +44,10 @@ _SPLIT_TARGET_BYTES = max(1 << 20, int(os.environ.get("BATCHER_SPLIT_TARGET_BYTE
 # Object-store read concurrency for the dataset scan. The scan is S3-LATENCY-bound, so
 # throughput tracks the number of in-flight range requests, which pyarrow caps at the
 # global IO thread pool — whose default of 8 throttles a 16-core worker to ~120 MB/s.
-# Raising it to 32 (with matching fragment/batch readahead) measured ~6x on a TPC-H sf100
-# worker (121 → 716 MB/s); it plateaus past ~32 threads. Set once per process (idempotent,
-# global); `fragment_readahead` is how many files a worker reads at once, `batch_readahead`
-# how far it reads into each. All env-overridable.
-_IO_THREADS = max(8, int(os.environ.get("BATCHER_IO_THREADS", "32")))
+# Raising it to 32 measured ~6x on a TPC-H sf100 worker (121 → 716 MB/s); it plateaus past
+# ~32 threads. The pool itself is lifted by `io.filesystem.ensure_io_threads` (shared with
+# the single-node read path); `fragment_readahead` is how many files a worker reads at once,
+# `batch_readahead` how far it reads into each. All env-overridable.
 _FRAGMENT_READAHEAD = max(2, int(os.environ.get("BATCHER_FRAGMENT_READAHEAD", "32")))
 _BATCH_READAHEAD = max(2, int(os.environ.get("BATCHER_BATCH_READAHEAD", "64")))
 
@@ -139,13 +138,36 @@ def _scan_cache_key(splits, projection, predicate) -> tuple:
     return (ids, proj, repr(predicate))
 
 
+_SCAN_CACHE_HITS = 0
+_SCAN_CACHE_MISSES = 0
+
+
 def _scan_cache_get(key):
+    global _SCAN_CACHE_HITS, _SCAN_CACHE_MISSES
     with _SCAN_CACHE_LOCK:
         hit = _SCAN_CACHE.get(key)
         if hit is None:
+            _SCAN_CACHE_MISSES += 1
             return None
         _SCAN_CACHE.move_to_end(key)  # LRU: mark most-recently-used
+        _SCAN_CACHE_HITS += 1
         return hit[1]
+
+
+def scan_cache_stats() -> dict[str, int | float]:
+    """This worker's decoded-batch scan-cache effectiveness (hits, misses, hit-rate, bytes).
+
+    A high hit-rate on a persistent fleet worker means repeated reads of the same
+    split+projection are served at compute speed (no S3, no decode) — the warm-path win that
+    is invisible without these counters. Hit-rate is `0.0` before any lookup."""
+    with _SCAN_CACHE_LOCK:
+        total = _SCAN_CACHE_HITS + _SCAN_CACHE_MISSES
+        return {
+            "hits": _SCAN_CACHE_HITS,
+            "misses": _SCAN_CACHE_MISSES,
+            "hit_rate": (_SCAN_CACHE_HITS / total) if total else 0.0,
+            "used_bytes": _SCAN_CACHE_BYTES,
+        }
 
 
 def _scan_cache_put(key, batches, nbytes) -> None:
@@ -323,12 +345,11 @@ def _dataset_scan_batches(splits, projection, predicate):
     if not splits or not all(isinstance(s, RowGroupSplit) for s in splits):
         return None
     try:
-        import pyarrow as pa
         import pyarrow.dataset as pads
 
-        from batcher.io.filesystem import resolve_filesystem
+        from batcher.io.filesystem import ensure_io_threads, resolve_filesystem
 
-        pa.set_io_thread_count(_IO_THREADS)  # idempotent; lifts the 8-thread S3 read cap
+        ensure_io_threads()  # lift the 8-thread S3 read cap (shared with the single-node path)
         fsw = resolve_filesystem(splits[0].path)
         pafs = getattr(fsw, "_fs", None)
         if pafs is None:

@@ -346,186 +346,6 @@ fn minmax_acc(values: &ArrayRef, num_groups: usize, is_min: bool) -> Option<Fuse
 /// the proven per-call path (no `group_ids`-reuse win to gain).
 const FUSE_THRESHOLD: usize = 2;
 
-/// Slots per group past which a group's state no longer fits one 64-byte cache line,
-/// which is the entire point of the interleaved layout.
-const AOS_MAX_SLOTS: usize = 8;
-
-/// One interleaved accumulator slot: the operation to apply and the (null-free) values
-/// slice it reads. Every state is exactly 8 bytes, held as a `u64` and bit-punned for the
-/// float cases, so a group's whole state is one contiguous run of `u64`s.
-enum SlotOp<'a> {
-    SumF64(&'a [f64]),
-    SumI64(&'a [i64]),
-    /// `count(*)` and `count(col)` over a null-free column are the same increment.
-    Count,
-    MinI64(&'a [i64]),
-    MaxI64(&'a [i64]),
-    MinF64(&'a [f64]),
-    MaxF64(&'a [f64]),
-}
-
-/// Interleave every call's state into one `num_groups × stride` array, or `None` if any
-/// call falls outside the supported subset (a nullable or non-`Int64`/`Float64` column, a
-/// complex aggregate, or more than [`AOS_MAX_SLOTS`] slots).
-///
-/// Returns the slot ops and, per call, how many slots it owns (`mean` owns `[sum, count]`,
-/// matching `classify`/`accumulate`'s column order).
-fn classify_aos<'a>(calls: &'a [AggCall]) -> Option<(Vec<SlotOp<'a>>, Vec<(usize, usize)>)> {
-    fn null_free_slice<'b>(v: &'b ArrayRef) -> Option<&'b ArrayRef> {
-        (v.null_count() == 0).then_some(v)
-    }
-    fn sum_slot(v: &ArrayRef) -> Option<SlotOp<'_>> {
-        match null_free_slice(v)?.data_type() {
-            DataType::Float64 => Some(SlotOp::SumF64(v.as_primitive::<Float64Type>().values())),
-            DataType::Int64 => Some(SlotOp::SumI64(v.as_primitive::<Int64Type>().values())),
-            _ => None,
-        }
-    }
-    fn minmax_slot(v: &ArrayRef, is_min: bool) -> Option<SlotOp<'_>> {
-        match (null_free_slice(v)?.data_type(), is_min) {
-            (DataType::Int64, true) => Some(SlotOp::MinI64(v.as_primitive::<Int64Type>().values())),
-            (DataType::Int64, false) => Some(SlotOp::MaxI64(v.as_primitive::<Int64Type>().values())),
-            (DataType::Float64, true) => {
-                Some(SlotOp::MinF64(v.as_primitive::<Float64Type>().values()))
-            }
-            (DataType::Float64, false) => {
-                Some(SlotOp::MaxF64(v.as_primitive::<Float64Type>().values()))
-            }
-            _ => None,
-        }
-    }
-
-    let mut slots: Vec<SlotOp<'a>> = Vec::new();
-    let mut layout: Vec<(usize, usize)> = Vec::new();
-    for (idx, call) in calls.iter().enumerate() {
-        if call.key.is_some() {
-            return None;
-        }
-        let start = slots.len();
-        match call.func {
-            AggFunc::CountStar => slots.push(SlotOp::Count),
-            AggFunc::Count => {
-                null_free_slice(call.values.as_ref()?)?;
-                slots.push(SlotOp::Count);
-            }
-            AggFunc::Sum => slots.push(sum_slot(call.values.as_ref()?)?),
-            AggFunc::Min => slots.push(minmax_slot(call.values.as_ref()?, true)?),
-            AggFunc::Max => slots.push(minmax_slot(call.values.as_ref()?, false)?),
-            AggFunc::Mean => {
-                let v = call.values.as_ref()?;
-                slots.push(sum_slot(v)?);
-                slots.push(SlotOp::Count);
-            }
-            _ => return None,
-        }
-        layout.push((idx, slots.len() - start));
-    }
-    (slots.len() >= FUSE_THRESHOLD && slots.len() <= AOS_MAX_SLOTS).then_some((slots, layout))
-}
-
-/// Fused scan over an **interleaved (array-of-structs)** state array.
-///
-/// The struct-of-arrays layout `run_fused` uses gives each accumulator its own `Vec`, so a
-/// row with N aggregates makes N random accesses into N different arrays — N cache misses
-/// once the group count outgrows L1. Interleaving puts group `g`'s state for *every*
-/// aggregate in one contiguous `stride`-slot run, so a row touches one cache line.
-/// Measured (single-threaded, 2 M rows, 10 k groups): five aggregates went from 98.5 to
-/// ~40 ns/row, while one aggregate is unchanged.
-///
-/// Bit-identical to `run_fused`: the same values are combined into the same groups in the
-/// same row order, only the memory they live in changes. `min`/`max` still take the first
-/// row of a group verbatim (never a sentinel), so a leading `NaN` survives exactly as it
-/// does in the per-call kernel — one shared `seen` bitmap suffices because every column
-/// here is null-free, so every `min`/`max` accumulator's `valid[g]` flips on the same row.
-///
-/// Returns `false` when the call set is outside the supported subset; the caller then runs
-/// the struct-of-arrays path.
-fn try_run_aos(
-    calls: &[AggCall],
-    group_ids: &[u32],
-    num_groups: usize,
-    out: &mut [Option<Vec<ArrayRef>>],
-) -> Result<bool, RuntimeError> {
-    let Some((slots, layout)) = classify_aos(calls) else {
-        return Ok(false);
-    };
-    let stride = slots.len();
-    let mut state: Vec<u64> = vec![0; num_groups * stride];
-    // One bit per group, not per accumulator: tiny and L1-resident.
-    let mut seen: Vec<bool> = vec![false; num_groups];
-
-    for (i, &gid) in group_ids.iter().enumerate() {
-        let g = gid as usize;
-        let first = !seen[g];
-        seen[g] = true;
-        let cell = &mut state[g * stride..(g + 1) * stride];
-        for (slot, s) in slots.iter().zip(cell.iter_mut()) {
-            match slot {
-                SlotOp::SumF64(v) => *s = (f64::from_bits(*s) + v[i]).to_bits(),
-                SlotOp::SumI64(v) => {
-                    *s = (*s as i64)
-                        .checked_add(v[i])
-                        .ok_or(RuntimeError::SumOverflow)? as u64
-                }
-                SlotOp::Count => *s += 1,
-                SlotOp::MinI64(v) => {
-                    if first || v[i] < *s as i64 {
-                        *s = v[i] as u64;
-                    }
-                }
-                SlotOp::MaxI64(v) => {
-                    if first || v[i] > *s as i64 {
-                        *s = v[i] as u64;
-                    }
-                }
-                SlotOp::MinF64(v) => {
-                    if first || v[i] < f64::from_bits(*s) {
-                        *s = v[i].to_bits();
-                    }
-                }
-                SlotOp::MaxF64(v) => {
-                    if first || v[i] > f64::from_bits(*s) {
-                        *s = v[i].to_bits();
-                    }
-                }
-            }
-        }
-    }
-
-    let gather_i64 = |k: usize| -> Vec<i64> {
-        (0..num_groups).map(|g| state[g * stride + k] as i64).collect()
-    };
-    let gather_f64 = |k: usize| -> Vec<f64> {
-        (0..num_groups)
-            .map(|g| f64::from_bits(state[g * stride + k]))
-            .collect()
-    };
-    let mut k = 0usize;
-    for (idx, n_cols) in layout {
-        let mut cols = Vec::with_capacity(n_cols);
-        for _ in 0..n_cols {
-            // Validity mirrors the struct-of-arrays `finish`: a float sum is always valid
-            // (it starts at 0.0), a count needs no mask, everything else is valid exactly
-            // where the group saw a row.
-            let col: ArrayRef = match slots[k] {
-                SlotOp::SumF64(_) => Arc::new(masked_f64(gather_f64(k), vec![true; num_groups])),
-                SlotOp::SumI64(_) => Arc::new(masked_i64(gather_i64(k), seen.clone())),
-                SlotOp::Count => Arc::new(Int64Array::from(gather_i64(k))),
-                SlotOp::MinI64(_) | SlotOp::MaxI64(_) => {
-                    Arc::new(masked_i64(gather_i64(k), seen.clone()))
-                }
-                SlotOp::MinF64(_) | SlotOp::MaxF64(_) => {
-                    Arc::new(masked_f64(gather_f64(k), seen.clone()))
-                }
-            };
-            cols.push(col);
-            k += 1;
-        }
-        out[idx] = Some(cols);
-    }
-    Ok(true)
-}
-
 /// Run one scatter-add pass over `group_ids` for every fusable call, writing each
 /// fused call's state column(s) into `out[idx]` (positions match `calls`); leaves
 /// non-fusable calls' slots `None` for the per-call path. A no-op (out untouched)
@@ -540,11 +360,13 @@ pub(super) fn run_fused(
     if calls.iter().filter(|c| is_fusable_func(c.func)).count() < FUSE_THRESHOLD {
         return Ok(());
     }
-    // Interleaved layout when every call is a null-free numeric scalar aggregate: one
-    // cache line per row instead of one per aggregate. Falls through otherwise.
-    if num_groups > 0 && try_run_aos(calls, group_ids, num_groups, out)? {
-        return Ok(());
-    }
+    // NB: an interleaved (array-of-structs) state array — group `g`'s state for every
+    // aggregate in one contiguous cache line, instead of one `Vec` per accumulator — was
+    // implemented and A/B'd inside one binary. It does NOT pay off: `partial` runs per
+    // *morsel*, so `num_groups` never exceeds the 16,384-row morsel and all the
+    // accumulator arrays stay L2-resident whatever the layout. Measured at 2 M rows, five
+    // aggregates: +2% at 10k groups, **-5%** at 1.5M groups. The per-aggregate cost is the
+    // scatter's dependent load-modify-store, not a cache miss per accumulator.
     // Classify; an unsupported dtype drops a call back to per-call (None slot).
     let mut accs: Vec<FusedAcc> = Vec::new();
     let mut layout: Vec<(usize, usize)> = Vec::new(); // (call idx, n state cols)
@@ -648,10 +470,10 @@ mod tests {
         }
     }
 
-    /// The interleaved (AoS) path must equal the per-call kernel for the whole
-    /// null-free numeric set — this is the shape that actually engages it.
+    /// The whole null-free numeric set must equal the per-call kernel — the common
+    /// `sum, mean, min, max, count` shape.
     #[test]
-    fn aos_equals_per_call_on_null_free_numeric() {
+    fn fused_equals_per_call_on_null_free_numeric() {
         let f: ArrayRef = Arc::new(Float64Array::from(vec![1.5, -2.0, 3.25, 0.0, 9.75, -1.0]));
         let i: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, -5, 7, 0, 3]));
         let group_ids = [0u32, 1, 0, 2, 1, 2];
@@ -662,7 +484,6 @@ mod tests {
             AggCall::new(AggFunc::Max, Some(f.clone())),
             AggCall::new(AggFunc::CountStar, None),
         ];
-        assert!(classify_aos(&calls).is_some(), "AoS should engage");
         for (w, g) in per_call(&calls, &group_ids, 3)
             .iter()
             .zip(&fused(&calls, &group_ids, 3))
@@ -671,17 +492,16 @@ mod tests {
         }
     }
 
-    /// A leading `NaN` must survive `min`/`max` exactly as the per-call kernel leaves it —
-    /// the reason the AoS path takes the first row verbatim instead of seeding a sentinel.
+    /// A leading `NaN` must survive `min`/`max` exactly as the per-call kernel leaves it:
+    /// the first row of a group is taken verbatim, never compared against a sentinel.
     #[test]
-    fn aos_minmax_nan_matches_per_call() {
+    fn fused_minmax_nan_matches_per_call() {
         let f: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN, 1.0, 2.0, f64::NAN]));
         let group_ids = [0u32, 0, 1, 1];
         let calls = vec![
             AggCall::new(AggFunc::Min, Some(f.clone())),
             AggCall::new(AggFunc::Max, Some(f.clone())),
         ];
-        assert!(classify_aos(&calls).is_some());
         for (w, g) in per_call(&calls, &group_ids, 2)
             .iter()
             .zip(&fused(&calls, &group_ids, 2))
@@ -690,9 +510,9 @@ mod tests {
         }
     }
 
-    /// `-0.0` / `+0.0` compare equal, so the first row wins — same as per-call.
+    /// `-0.0` and `+0.0` compare equal, so the first row of the group wins — same as per-call.
     #[test]
-    fn aos_signed_zero_matches_per_call() {
+    fn fused_signed_zero_matches_per_call() {
         let f: ArrayRef = Arc::new(Float64Array::from(vec![-0.0f64, 0.0, 0.0, -0.0]));
         let group_ids = [0u32, 0, 1, 1];
         let calls = vec![
@@ -705,69 +525,6 @@ mod tests {
         {
             assert_cols_eq(w, g);
         }
-    }
-
-    /// An `i64` sum that overflows must raise, not wrap.
-    #[test]
-    fn aos_i64_sum_overflow_errors() {
-        let i: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, 1]));
-        let group_ids = [0u32, 0];
-        let calls = vec![
-            AggCall::new(AggFunc::Sum, Some(i.clone())),
-            AggCall::new(AggFunc::CountStar, None),
-        ];
-        assert!(classify_aos(&calls).is_some());
-        let mut out: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
-        assert!(run_fused(&calls, &group_ids, 1, &mut out).is_err());
-    }
-
-    /// A nullable column is outside the AoS subset: it must decline, and the
-    /// struct-of-arrays path still matches per-call.
-    #[test]
-    fn aos_declines_nullable_and_soa_still_correct() {
-        let f: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.0), None, Some(3.0)]));
-        let calls = vec![
-            AggCall::new(AggFunc::Sum, Some(f.clone())),
-            AggCall::new(AggFunc::Max, Some(f.clone())),
-        ];
-        assert!(classify_aos(&calls).is_none(), "nullable must decline AoS");
-        let group_ids = [0u32, 0, 1];
-        for (w, g) in per_call(&calls, &group_ids, 2)
-            .iter()
-            .zip(&fused(&calls, &group_ids, 2))
-        {
-            assert_cols_eq(w, g);
-        }
-    }
-
-    /// More than `AOS_MAX_SLOTS` slots would spill the cache line: decline.
-    #[test]
-    fn aos_declines_when_state_exceeds_a_cache_line() {
-        let f: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
-        // 5 means = 10 slots > AOS_MAX_SLOTS.
-        let calls: Vec<AggCall> = (0..5)
-            .map(|_| AggCall::new(AggFunc::Mean, Some(f.clone())))
-            .collect();
-        assert!(classify_aos(&calls).is_none());
-        // ... and the SoA path still agrees with per-call.
-        let group_ids = [0u32, 0];
-        for (w, g) in per_call(&calls, &group_ids, 1)
-            .iter()
-            .zip(&fused(&calls, &group_ids, 1))
-        {
-            assert_cols_eq(w, g);
-        }
-    }
-
-    /// A non-fusable call in the set (e.g. `var`) keeps the whole thing off AoS.
-    #[test]
-    fn aos_declines_when_a_call_is_not_fusable() {
-        let f: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
-        let calls = vec![
-            AggCall::new(AggFunc::Sum, Some(f.clone())),
-            AggCall::new(AggFunc::Var, Some(f.clone())),
-        ];
-        assert!(classify_aos(&calls).is_none());
     }
 
     #[test]

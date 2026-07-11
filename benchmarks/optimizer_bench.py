@@ -87,6 +87,29 @@ def main() -> None:
         ms = _best_ms(Optimizer(sources=ds._sources, rules=rules), plan)
         print(f"  +{extra:>4} inapplicable rules ({len(rules):>4} total): {ms:.3f} ms")
 
+    _bench_repeated_planning()
+
+
+def _bench_repeated_planning() -> None:
+    """The memoized `optimize_full` path — what a re-issued query (BI dashboard, benchmark
+    harness, adaptive stage re-optimization) actually pays. The lookup key is now built from
+    the plan's memoized `content_key()` instead of re-serializing the whole IR on every call.
+    """
+    from batcher.kyber.optimizer import optimize_full
+
+    print("\nRepeated planning (memoized optimize_full, cache hit):")
+    ds = join_star(6)
+    plan = ds._plan
+    for _ in range(50):  # warm the plan memo + content_key
+        optimize_full(plan, sources=ds._sources)
+    best = float("inf")
+    for _ in range(6):
+        t0 = time.perf_counter()
+        for _ in range(2000):
+            optimize_full(plan, sources=ds._sources)
+        best = min(best, (time.perf_counter() - t0) / 2000 * 1e6)
+    print(f"  cache-hit planning: {best:.2f} us/call")
+
 
 if __name__ == "__main__":
     main()

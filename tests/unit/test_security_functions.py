@@ -98,3 +98,46 @@ def test_mask_lowers_reveal_counts_into_the_start_and_length_slots():
         2,
         4,
     )
+
+
+# --- Key references (env: / file:) --------------------------------------------
+import warnings  # noqa: E402
+
+from batcher._internal.errors import SecurityWarning  # noqa: E402
+
+
+@pytest.mark.parametrize("ref", ["env:MY_KEY", "file:/run/secrets/aes.key"])
+def test_a_key_reference_is_stored_verbatim_and_not_validated(ref):
+    """A reference is resolved on the executing node, so it is not decoded here — a
+    32-byte check would wrongly reject `env:MY_KEY`."""
+    assert bt.aes_encrypt(bt.col("x"), ref).to_ir()["pattern"] == ref
+    assert bt.aes_decrypt(bt.col("x"), ref).to_ir()["pattern"] == ref
+    assert bt.hmac_sha256(bt.col("x"), ref).to_ir()["pattern"] == ref
+
+
+def test_a_reference_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", SecurityWarning)
+        bt.aes_encrypt(bt.col("x"), "env:MY_KEY")
+        bt.hmac_sha256(bt.col("x"), "file:/k")
+
+
+def test_an_inline_literal_warns_that_it_is_embedded():
+    for build in (
+        lambda: bt.aes_encrypt(bt.col("x"), HEX_KEY),
+        lambda: bt.aes_decrypt(bt.col("x"), HEX_KEY),
+        lambda: bt.hmac_sha256(bt.col("x"), "secret"),
+    ):
+        with pytest.warns(SecurityWarning, match="embedded in the query plan"):
+            build()
+
+
+def test_repr_shows_a_reference_but_hides_a_literal():
+    assert "env:MY_KEY" in repr(bt.aes_encrypt(bt.col("x"), "env:MY_KEY"))
+    r = repr(bt.aes_encrypt(bt.col("x"), HEX_KEY))
+    assert "***" in r and HEX_KEY not in r
+
+
+def test_a_bad_inline_key_is_still_rejected_at_plan_build():
+    with pytest.raises(PlanError):
+        bt.aes_encrypt(bt.col("x"), "too-short")

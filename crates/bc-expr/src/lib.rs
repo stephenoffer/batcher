@@ -232,6 +232,12 @@ pub enum Expr {
     /// (null where the row is null or the index is out of range). Type-preserving.
     ListGet { input: Box<Expr>, index: i64 },
 
+    /// A random-hyperplane (SimHash) signature of an embedding → `List<Int64>` of
+    /// `num_bits` bits: the blocking key a vector similarity join needs, as
+    /// `.str.minhash` is for Jaccard. See `eval::list_ops::simhash`.
+    #[rustfmt::skip]
+    ListSimhash { input: Box<Expr>, num_bits: i64, #[serde(default)] seed: i64 },
+
     /// `struct.field` — extract a named field from a `Struct` column
     /// (type-preserving; null where the struct row is null).
     StructField { input: Box<Expr>, field: String },
@@ -671,6 +677,10 @@ pub enum StrFunc {
     /// single character in `pattern` (default `X`). Character-length preserving; when
     /// the revealed windows overlap the value is returned unmasked. Null → null. → Utf8.
     Mask,
+    /// Readable text of an HTML document: drops tags *and* `<script>`/`<style>` bodies
+    /// and comments, decodes entities, collapses whitespace, and separates elements with
+    /// a space. Lenient on malformed markup. Null → null. → Utf8. See `eval::str::html`.
+    StripHtml,
 }
 
 /// Date/time field extractions (→ Int64). Wire tags are snake_case (the contract

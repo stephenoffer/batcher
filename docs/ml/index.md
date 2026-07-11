@@ -59,7 +59,7 @@ Place work on GPUs and actors.
 ::::
 
 ```{toctree}
-:maxdepth: 1
+:hidden:
 
 inference
 preprocessors

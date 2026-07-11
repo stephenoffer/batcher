@@ -15,6 +15,7 @@ from batcher.api.functions import *  # noqa: F403  (governed by functions.__all_
 from batcher.api.io_namespace import read
 from batcher.api.security import security
 from batcher.api.session import (
+    await_any_termination,
     compact,
     date_range,
     engine_version,
@@ -53,6 +54,7 @@ __all__ = [
     "SecurityCatalog",
     "Session",
     "Trigger",
+    "await_any_termination",
     "compact",
     "date_range",
     "engine_version",

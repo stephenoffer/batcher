@@ -13,7 +13,7 @@ of OOMing. An alternate policy plugs in by being passed to the constructor.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 
 from batcher.carbonite.base import (
@@ -41,7 +41,7 @@ from batcher.carbonite.policies import (
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
 from batcher.plan.physical import PhysicalPlan
-from batcher.plan.resource import FeasibilityVerdict, ResourceBounds, SchedulingEnvelope
+from batcher.plan.resource import FeasibilityVerdict, SchedulingEnvelope
 
 __all__ = ["ResourceManager"]
 
@@ -185,7 +185,9 @@ class ResourceManager:
         initial = load_shuffle_window(self._hub, signature) if signature is not None else None
         return AIMDFlowControl(self._config, initial_window=initial)
 
-    def recommend_morsel_target(self) -> tuple[int, int] | None:
+    def recommend_morsel_target(
+        self, families: Iterable[str] | None = None
+    ) -> tuple[int, int] | None:
         """Scale the per-morsel ``(rows, bytes)`` target down under memory pressure.
 
         Returns the recommended target, or ``None`` to keep the configured one (the
@@ -205,10 +207,12 @@ class ResourceManager:
         nothing and leaves the count at the pressure-only value (``None`` when unpressured).
         """
         cfg = self._config.execution
-        factor = _MORSEL_PRESSURE_FACTORS.get(self._pressure.level(), 1.0)
+        # A pure read: the AIMD round is the one component that *samples* the monitor
+        # (advancing its de-escalation average). Sizing a morsel must not.
+        factor = _MORSEL_PRESSURE_FACTORS.get(self._pressure.classify(), 1.0)
         rows = int(cfg.morsel_rows * factor)
         nbytes = int(cfg.morsel_bytes * factor)
-        learned_rows = self._learned_morsel_rows()
+        learned_rows = self._learned_morsel_rows(families)
         if learned_rows is not None:
             rows = min(rows, learned_rows)
         # Keep the configured target (fast path) only when neither lever moved anything.
@@ -216,14 +220,16 @@ class ResourceManager:
             return None
         return max(_MIN_MORSEL_ROWS, rows), max(_MIN_MORSEL_BYTES, nbytes)
 
-    def _learned_morsel_rows(self) -> int | None:
+    def _learned_morsel_rows(self, families: Iterable[str] | None = None) -> int | None:
         """Row cap that keeps a morsel's *measured* byte working set within the budget.
 
-        Uses the widest learned per-row footprint across all families the hub has
-        measured: ``rows = morsel_bytes / max_bytes_per_row``. `None` when nothing is
-        learned yet or the learned width is no wider than the configured target already
-        implies (so the common case adds no overhead and no change)."""
-        widths = self._mem_model.max_bytes_per_row()
+        Uses the widest learned per-row footprint (``rows = morsel_bytes /
+        max_bytes_per_row``), restricted to `families` — *this plan's* operator kinds — when
+        given, so a narrow plan is sized by its own data rather than throttled by an
+        unrelated wide family measured in an earlier query. `None` when nothing is learned
+        yet or the learned width is no wider than the configured target already implies (so
+        the common case adds no overhead and no change)."""
+        widths = self._mem_model.max_bytes_per_row(families)
         if widths is None or widths <= 0:
             return None
         cap = int(self._config.execution.morsel_bytes / widths)
@@ -231,11 +237,12 @@ class ResourceManager:
             return None  # learned width is no wider than assumed — nothing to tighten
         return max(_MIN_MORSEL_ROWS, cap)
 
-    def recommended_config(self) -> Config | None:
+    def recommended_config(self, families: Iterable[str] | None = None) -> Config | None:
         """A `Config` with the pressure-scaled morsel target, or ``None`` to keep the
         current one. The conductor activates it for the execution scope so the adapted
-        morsel reaches both the in-process engine and the shipped worker config."""
-        target = self.recommend_morsel_target()
+        morsel reaches both the in-process engine and the shipped worker config. `families`
+        (the plan's operator kinds) narrows the learned width to this plan's own data."""
+        target = self.recommend_morsel_target(families)
         if target is None:
             return None
         rows, nbytes = target
@@ -297,7 +304,13 @@ class ResourceManager:
         peak = self._peak_bytes(plan)
         if peak <= 0:
             return None
-        parts = max(_MIN_SPILL_PARTITIONS, -(-peak // _SPILL_BYTES_PER_PARTITION))  # ceil-div
+        # Prefer the *measured* spill volume when a family has a spill history: buckets shard
+        # only the bytes that actually go to disk, which is smaller than the total working-set
+        # peak (which includes the in-memory budget that never spills). Fall back to peak when
+        # nothing has spilled yet. Result-invariant either way — this only sets bucket count.
+        volume = self._mem_model.predicted_spill_bytes(plan.ops)
+        basis = volume if volume > 0 else peak
+        parts = max(_MIN_SPILL_PARTITIONS, -(-basis // _SPILL_BYTES_PER_PARTITION))  # ceil-div
         return min(_MAX_SPILL_PARTITIONS, int(parts))
 
     def recommend_spill_compression(self, plan: PhysicalPlan) -> bool | None:
@@ -337,28 +350,32 @@ class ResourceManager:
         The pool is sized to Carbonite's hard memory envelope — the same figure
         `should_spill` compares against, so the two decisions stay consistent.
 
-        Storage yields to execution: when the pool is tighter than the request, the
-        result cache drops *exactly* the deficit (lowest-value entries first) so its
-        RAM goes back to the running query rather than squeezing it — the
-        execution-evicts-storage half of Spark's unified memory model. Total process
-        RSS stays bounded by the envelope plus only the cache the query doesn't need.
+        Storage yields to execution, in two steps — the two halves of Spark's unified
+        memory model, which the cache implements but nothing used to invoke:
+
+        1. **The pressure ladder.** `CacheStore.on_pressure` trims the cache as RSS
+           climbs (three-quarters at `ELEVATED`, half at `SPILL`, everything at
+           `CRITICAL`). The cache's own bytes are *not* accounted against the buffer
+           pool, so without this the two budgets are disjoint and
+           `result_cache_max_bytes + memory envelope` can exceed physical RAM — the
+           cache silently shrinks the headroom every other Carbonite decision assumes.
+           `classify()` (not `level()`) reads the level, so this does not consume the
+           AIMD round's sample.
+        2. **The exact deficit.** When the pool is still tighter than the request, the
+           cache drops *precisely* the shortfall (lowest-value entries first) so its RAM
+           goes back to the running query rather than squeezing it.
+
+        Evicting a cache is result-invariant — it only costs a recompute — so this can
+        never change an answer, only the memory the query gets to run in.
         """
         from batcher.carbonite.cache import current_result_cache
 
         pool = process_pool(self._hard_budget())
         cache = current_result_cache()
         if cache is not None:
+            cache.on_pressure(self._pressure.classify())
             deficit = m_bytes - pool.available
             if deficit > 0:
                 cache.evict_to_free(deficit)
         with pool.reserve(m_bytes) as granted:
             yield granted
-
-    def default_bounds(self) -> ResourceBounds:
-        """Permissive bounds used until Kyber emits per-operator bounds."""
-        fc = self._config.flow_control
-        return ResourceBounds(
-            m_max_bytes=1 << 62,
-            c_max_credits=fc.default_credits,
-            n_max_parallelism=self._config.execution.parallelism or 0,
-        )

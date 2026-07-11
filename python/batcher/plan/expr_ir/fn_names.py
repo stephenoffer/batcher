@@ -99,8 +99,8 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "regexp_count", "regexp_extract", "regexp_extract_all", "regexp_matches",
         "regexp_replace", "regexp_replace_all", "repeat", "replace", "reverse",
         "right", "rpad", "sha1", "sha256", "soundex", "split", "split_part",
-        "starts_with", "substr", "substring_index", "translate", "trim", "unhex",
-        "upper", "xxhash64",
+        "starts_with", "strip_html", "substr", "substring_index", "translate", "trim",
+        "unhex", "upper", "xxhash64",
     }
 )  # fmt: skip
 

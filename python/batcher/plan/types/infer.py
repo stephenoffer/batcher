@@ -57,6 +57,7 @@ _STR_INT = frozenset(
 _STR_FLOAT = frozenset({"json_extract_float"})
 _STR_STR = frozenset(
     {
+        "strip_html",
         "upper",
         "lower",
         "trim",
@@ -113,7 +114,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         MathExpr,
         Not,
     )
-    from batcher.plan.expr_ir.namespaces import StrFunc
+    from batcher.plan.expr_ir.namespaces import ListSimhash, StrFunc
     from batcher.plan.expr_ir.nodes import Case, Col, Greatest, HashRows, Least
 
     if isinstance(expr, Col):
@@ -141,6 +142,8 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
     if isinstance(expr, Case):
         branch_thens = (infer_type(then, schema) for _cond, then in expr.branches)
         return _fold_promote([*branch_thens, infer_type(expr.otherwise, schema)])
+    if isinstance(expr, ListSimhash):
+        return pa.list_(pa.int64())  # one Int64 bit per hyperplane
     if isinstance(expr, StrFunc):
         return _strfunc_type(expr.fn)
     return None

@@ -5,7 +5,7 @@ handing the lowered IR to the native engine, then transcribes the native
 engine's per-operator `ExecMetrics` into `OperatorFeedback` for the MetadataHub.
 Core *measures* — it does not optimize: it faithfully reports what the data plane
 observed (rows in/out, time, peak bytes, spill, backend), keyed by the same
-pre-order operator id Kyber assigns in `_annotate_ops`. The morsel scheduler, JIT
+pre-order operator id Kyber assigns in `annotate_ops`. The morsel scheduler, JIT
 tier-up, and the `bc-adapt` re-optimization loop replace the single
 `execute_plan_metered` call without changing this interface.
 """
@@ -107,10 +107,15 @@ def _record_op_feedback(
                 batch_size=batch_size,
                 backend=op.get("backend", "interp"),
                 algorithm="spill" if op.get("spilled") else "",
+                spill_bytes=int(op.get("spill_bytes", 0) or 0),
+                peak_rss_bytes=int(op.get("peak_rss_bytes", 0) or 0),
                 cpu_utilization=cpu_utilization(
                     op.get("cpu_ns", 0), op.get("elapsed_ns", 0), op.get("threads", 1)
                 ),
+                threads=int(op.get("threads", 0) or 0),
                 n_input=int(rows_in),
+                n_build=int(op.get("rows_build", 0) or 0),
+                result_bytes=int(op.get("result_bytes", op.get("peak_bytes", 0)) or 0),
                 signature=_signature_of(annotated),
                 n_estimated=_raw_estimate_of(annotated),
                 expr_factor=annotated.properties.expr_factor if annotated else 1.0,

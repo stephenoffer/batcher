@@ -20,6 +20,12 @@ def concat(*exprs: IntoExpr) -> Expr:
     semantics), so ``concat("a", lit(None), "b")`` is ``"ab"`` — unlike the raw
     ``a || b`` operator, which propagates NULL. Requires at least one argument.
 
+    Args:
+        exprs: The values to concatenate, cast to text (nulls treated as empty).
+
+    Returns:
+        A string expression joining every argument.
+
     Examples:
         .. doctest::
 
@@ -45,6 +51,13 @@ def concat_ws(separator: str, *exprs: IntoExpr) -> Expr:
     ``concat_ws(",", "a", lit(None), "b")`` is ``"a,b"``. Each argument is cast to
     text. Requires at least one value argument.
 
+    Args:
+        separator: The text inserted between adjacent non-null values.
+        exprs: The values to concatenate, cast to text (nulls skipped).
+
+    Returns:
+        A string expression joining the arguments with ``separator``.
+
     Examples:
         .. doctest::
 
@@ -67,6 +80,16 @@ def format_string(format: str, *exprs: IntoExpr) -> Expr:
     number of ``{}`` placeholders must equal the number of arguments. Values are cast
     to text with the same NULL-as-empty rule as :func:`concat`. The placeholder is the
     literal two-character ``{}`` (no printf width/precision — keep formatting in SQL).
+
+    Args:
+        format: The template string with one ``{}`` per value argument.
+        exprs: The values to interpolate, cast to text (nulls treated as empty).
+
+    Returns:
+        A string expression with each ``{}`` replaced by its argument.
+
+    Raises:
+        PlanError: If the number of ``{}`` placeholders differs from the argument count.
 
     Examples:
         .. doctest::

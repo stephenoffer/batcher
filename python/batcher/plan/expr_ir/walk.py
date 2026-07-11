@@ -37,6 +37,7 @@ from batcher.plan.expr_ir.namespaces import (
     ListGet,
     ListPosition,
     ListSet,
+    ListSimhash,
     ListSlice,
     ListTransform,
     MapFunc,
@@ -104,6 +105,7 @@ def _referenced_columns_impl(expr: Expr) -> set[str]:
             MathExpr,
             ListFunc,
             ListGet,
+            ListSimhash,
             ListContains,
             ListPosition,
             ListTransform,
@@ -218,6 +220,8 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         return ListFunc(expr.fn, remap_columns(expr.input, mapping))
     if isinstance(expr, ListGet):
         return ListGet(remap_columns(expr.input, mapping), expr.index)
+    if isinstance(expr, ListSimhash):
+        return ListSimhash(remap_columns(expr.input, mapping), expr.num_bits, expr.seed)
     if isinstance(expr, ListContains):
         return ListContains(remap_columns(expr.input, mapping), expr.value)
     if isinstance(expr, ListPosition):

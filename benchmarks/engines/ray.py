@@ -12,6 +12,7 @@ import importlib.util
 import logging
 
 import pyarrow as pa
+import pyarrow.fs as pafs
 
 from .base import Engine
 
@@ -101,3 +102,11 @@ class RayEngine(Engine):
 
         _ensure_ray()
         return ray.data.read_parquet(uri)
+
+    def scan_handle(self, filesystem: pafs.FileSystem, paths: list[str]):
+        import ray.data
+
+        _ensure_ray()
+        # Ray Data takes an explicit path list (no glob), and reuses the filesystem the
+        # scan suite already resolved rather than re-inferring one per path.
+        return ray.data.read_parquet(paths, filesystem=filesystem)

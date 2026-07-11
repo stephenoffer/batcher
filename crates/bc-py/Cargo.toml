@@ -21,6 +21,7 @@ bc-io.workspace = true
 bc-resource.workspace = true
 arrow.workspace = true
 arrow-pyarrow.workspace = true
+mimalloc.workspace = true
 pyo3.workspace = true
 rayon.workspace = true
 serde_json.workspace = true

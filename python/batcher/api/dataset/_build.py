@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 from batcher._internal.errors import PlanError
 from batcher.api._join_helpers import _as_key_expr
 from batcher.plan.expr_ir import Col, nullif, when
+from batcher.plan.expr_ir.selectors import Selector, expand_selectors
 from batcher.plan.ir_tags import WINDOW_AGGREGATES
 from batcher.plan.logical import (
     Sample,
@@ -30,6 +31,20 @@ from batcher.plan.logical import (
 if TYPE_CHECKING:
     from batcher.api.dataset.frame import Dataset
     from batcher.plan.expr_ir import Expr
+
+
+def expand_selector_expr(ds: Dataset, expr: Expr) -> list[tuple[str, Expr]]:
+    """Expand a selector-bearing expression against `ds`'s columns and schema.
+
+    The one place the relational layer resolves a `Selector` into concrete columns,
+    so `select`, `with_columns`, and `drop` all agree on what a selector means.
+    """
+    return expand_selectors(expr, ds._plan.available_columns(), ds._plan.available_schema())
+
+
+def selector_columns(ds: Dataset, selector: Selector) -> list[str]:
+    """The columns of `ds` a bare `Selector` matches, in the dataset's column order."""
+    return selector.matched_columns(ds._plan.available_columns(), ds._plan.available_schema())
 
 
 def build_window(
@@ -200,65 +215,6 @@ def build_train_test_split(
         raise PlanError(f"train_test_split(): test_size must be in (0, 1), got {test_size}")
     train, test = build_random_split(ds, [1.0 - test_size, test_size], seed=seed, key=key)
     return train, test
-
-
-def build_fill_null(ds: Dataset, value: Any | dict[str, Any]) -> Dataset:
-    """Replace nulls — one fill `value` for every column, or per-column via a dict."""
-    cols = ds.columns
-    if isinstance(value, dict):
-        unknown = set(value) - set(cols)
-        if unknown:
-            raise PlanError(f"fill_null(): unknown column(s) {sorted(unknown)}")
-        return ds.with_columns(**{c: Col(c).fill_null(value[c]) for c in value})
-    return ds.with_columns(**{c: Col(c).fill_null(value) for c in cols})
-
-
-# Strategies that lower to a whole-relation window aggregate broadcast into a coalesce.
-_FILL_AGG_STRATEGIES = {"mean": "avg", "min": "min", "max": "max"}
-
-
-def build_fill_null_strategy(
-    ds: Dataset, strategy: str, subset: list[str] | None = None
-) -> Dataset:
-    """Replace nulls using a `strategy` rather than a constant.
-
-    ``"zero"`` fills with 0; ``"mean"``/``"min"``/``"max"`` fill with the column's
-    whole-relation aggregate (a single window-aggregate pass, distributed-safe).
-    ``"forward"``/``"backward"``/``"median"`` are not supported — forward/backward
-    fill require a defined row order (which a distributed relation does not carry),
-    and median is not a window aggregate; raise an actionable error.
-    """
-    cols = subset if subset is not None else ds.columns
-    unknown = set(cols) - set(ds.columns)
-    if unknown:
-        raise PlanError(f"fill_null(): unknown column(s) {sorted(unknown)}")
-    if strategy == "zero":
-        return ds.with_columns(**{c: Col(c).fill_null(0) for c in cols})
-    if strategy not in _FILL_AGG_STRATEGIES:
-        raise PlanError(
-            f"fill_null(strategy={strategy!r}) is not supported; use one of "
-            "'mean'/'min'/'max'/'zero', a constant value, or fill from another column. "
-            "(forward/backward fill need a defined row order; median is not a window aggregate.)"
-        )
-    agg = _FILL_AGG_STRATEGIES[strategy]
-    helpers = {f"__fill_{c}": (agg, c) for c in cols}
-    filled = ds.window(partition_by=[], order_by=[], functions=helpers)
-    filled = filled.with_columns(**{c: Col(c).fill_null(Col(f"__fill_{c}")) for c in cols})
-    return filled.drop(*helpers.keys())
-
-
-def build_drop_nulls(ds: Dataset, subset: list[str] | None) -> Dataset:
-    """Drop rows that are null in any of `subset` (or any column when `subset` is None)."""
-    cols = subset if subset is not None else ds.columns
-    unknown = set(cols) - set(ds.columns)
-    if unknown:
-        raise PlanError(f"drop_nulls(): unknown column(s) {sorted(unknown)}")
-    if not cols:
-        return ds
-    predicate = Col(cols[0]).is_not_null()
-    for c in cols[1:]:
-        predicate = predicate & Col(c).is_not_null()
-    return ds.filter(predicate)
 
 
 def build_cast(ds: Dataset, dtypes: str | dict[str, str], *, strict: bool = True) -> Dataset:

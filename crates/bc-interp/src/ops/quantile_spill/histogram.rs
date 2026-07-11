@@ -48,7 +48,7 @@ pub(crate) fn bounded_group_histogram(
         return Ok((Vec::new(), empty));
     };
     let sort_keys = native_value_sort_keys(n_keys);
-    let Some(mut store) = external_sort_to_final_store(
+    let Some((mut store, _)) = external_sort_to_final_store(
         flat,
         &sort_keys,
         dir,
@@ -97,7 +97,7 @@ pub(crate) fn bounded_group_histogram(
             } else {
                 None
             };
-            let mut firsts: Vec<u32> = Vec::new();
+            let mut firsts: Vec<u32> = Vec::with_capacity(batch.num_rows());
             for i in 0..batch.num_rows() {
                 let group = grows.as_ref().map(|g| g.row(i).owned());
                 if !started || (n_keys > 0 && prev_group != group) {

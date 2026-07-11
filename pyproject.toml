@@ -51,6 +51,9 @@ duckdb = ["duckdb>=1.0"]
 # Pluggable MetadataHub backends.
 redis = ["redis>=5"]
 cloud = ["fsspec", "s3fs", "gcsfs"]
+# OpenTelemetry span export (observability.otel_traces). Only the API is needed to emit;
+# the host app owns the SDK + OTLP exporter that ships spans to its collector.
+otel = ["opentelemetry-api>=1.20"]
 # ML / GPU data plane.
 torch = ["torch>=2.2"]
 tensorflow = ["tensorflow>=2.15"]
@@ -190,6 +193,10 @@ ignore_imports = [
     "batcher.core.udf.execute -> batcher",
     "batcher.core.stats -> batcher",
     "batcher.core.streaming -> batcher",
+    # The native Parquet reader (`bc_io`) is called from the neutral IO layer via
+    # `batcher._native`; grimp mis-attributes that submodule import to the root `batcher`
+    # package (as with core above), so this is the engine dependency, not a layer edge.
+    "batcher.io.formats.structured._parquet_native -> batcher",
 ]
 
 [[tool.importlinter.contracts]]

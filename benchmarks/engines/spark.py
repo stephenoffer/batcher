@@ -36,6 +36,37 @@ from .base import Engine, SqlRunner
 # `PYSPARK_SUBMIT_ARGS` rather than a `SparkConf` entry (which the driver reads too late).
 _DRIVER_MEMORY = os.environ.get("BENCH_SPARK_DRIVER_MEMORY", "32g")
 
+# S3 region for the S3A connector (mirrors the DuckDB loader's BENCH_S3_REGION).
+_S3_REGION = os.environ.get("BENCH_S3_REGION") or os.environ.get("AWS_DEFAULT_REGION", "us-west-2")
+
+
+@lru_cache(maxsize=1)
+def _hadoop_aws_version() -> str:
+    """The `hadoop-aws` version matching Spark's bundled Hadoop client (they must agree).
+
+    Stock PySpark ships the Hadoop client but not the S3A connector, so reading `s3://`
+    fails with `No FileSystem for scheme`. The connector JAR's version must match the
+    bundled `hadoop-client-*` exactly or class-loading breaks, so it is read off that JAR
+    rather than hard-coded. Falls back to a recent version if the JAR name is unexpected.
+    """
+    import glob
+
+    import pyspark
+
+    jars = glob.glob(os.path.join(os.path.dirname(pyspark.__file__), "jars", "hadoop-client-*.jar"))
+    for jar in jars:
+        # hadoop-client-api-3.4.2.jar -> 3.4.2
+        stem = os.path.basename(jar).removesuffix(".jar")
+        version = stem.rsplit("-", 1)[-1]
+        if version and version[0].isdigit():
+            return version
+    return "3.4.2"
+
+
+def _s3a(uri: str) -> str:
+    """Rewrite an ``s3://`` URI to the ``s3a://`` scheme Spark's Hadoop connector uses."""
+    return "s3a://" + uri[len("s3://") :] if uri.startswith("s3://") else uri
+
 
 def _java_home() -> str | None:
     """A usable ``JAVA_HOME``: the environment's, or a JRE installed under ``~/.jre``."""
@@ -66,7 +97,14 @@ def _session():
     home = _java_home()
     if home:
         os.environ.setdefault("JAVA_HOME", home)
-    os.environ.setdefault("PYSPARK_SUBMIT_ARGS", f"--driver-memory {_DRIVER_MEMORY} pyspark-shell")
+    # Pull the S3A connector (matching Spark's Hadoop version) from Maven at launch, so
+    # Spark can read the `s3://` benchmark data directly — without it, `s3a://` reads fail
+    # with `No FileSystem for scheme`. The download happens once (cached under ~/.ivy2).
+    packages = f"org.apache.hadoop:hadoop-aws:{_hadoop_aws_version()}"
+    os.environ.setdefault(
+        "PYSPARK_SUBMIT_ARGS",
+        f"--driver-memory {_DRIVER_MEMORY} --packages {packages} pyspark-shell",
+    )
     from pyspark.sql import SparkSession
 
     return (
@@ -75,6 +113,13 @@ def _session():
         .config("spark.sql.execution.arrow.pyspark.enabled", "true")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", "8")
+        # S3A: pin the region and let the connector's *default* credential chain resolve
+        # creds (env vars + instance profile), same as the AWS CLI / DuckDB loader. The
+        # provider is deliberately left unset: hadoop-aws 3.4 uses AWS SDK v2, whose
+        # default chain is correct here — naming the old v1 `com.amazonaws...` provider
+        # raises `ClassNotFoundException` against the v2 bundle.
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config("spark.hadoop.fs.s3a.endpoint.region", _S3_REGION)
         .getOrCreate()
     )
 
@@ -108,7 +153,7 @@ class SparkEngine(Engine):
         return _session().read.parquet(path)
 
     def read_parquet(self, uri: str):
-        return _session().read.parquet(uri)
+        return _session().read.parquet(_s3a(uri))
 
     def sql_runner(self, tables: dict[str, pa.Table]) -> SqlRunner:
         spark = _session()
@@ -119,5 +164,15 @@ class SparkEngine(Engine):
     def sql_runner_scan(self, uris: dict[str, str]) -> SqlRunner:
         spark = _session()
         for name, uri in uris.items():
-            spark.read.parquet(uri).createOrReplaceTempView(name)
+            spark.read.parquet(_s3a(uri)).createOrReplaceTempView(name)
         return lambda query: _to_arrow(spark.sql(query))
+
+    def scan_sql_runner(self, glob: str) -> SqlRunner:
+        spark = _session()
+        path = _s3a(glob)
+
+        def run(query: str) -> pa.Table:
+            spark.read.parquet(path).createOrReplaceTempView("t")
+            return _to_arrow(spark.sql(query))
+
+        return run

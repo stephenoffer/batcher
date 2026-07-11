@@ -61,6 +61,18 @@ class _FakeActor:
 # --- recommend_inflight_depth ------------------------------------------------------------
 
 
+def test_out_of_box_depth_is_double_buffered():
+    # >90%-GPU-out-of-the-box lever: the shipped default submits 2 partitions ahead so the
+    # device stays fed across the dispatch/gather round-trip on the FIRST run (no measurement
+    # yet). One-at-a-time (1) would idle the GPU between partitions.
+    from batcher.config.config import DistributedConfig
+
+    assert DistributedConfig().map_inflight_depth == 2
+    # With no utilization measurement, the out-of-box depth is kept as-is (the double buffer),
+    # and the adaptive loop only ever deepens it further from a measured low-utilization run.
+    assert recommend_inflight_depth(None, 2) == 2
+
+
 def test_recommend_depth_none_keeps_default():
     assert recommend_inflight_depth(None, 1) == 1
     assert recommend_inflight_depth(None, 4) == 4
@@ -120,7 +132,7 @@ def test_drive_pool_depth_gt1_ordering(monkeypatch):
 
     monkeypatch.setattr(mapmod, "_MapActor", _FakeMapActor)
     parts = [f"p{i}" for i in range(8)]
-    results, _ = mapmod._drive_actor_pool(
+    results, _, _ = mapmod._drive_actor_pool(
         None, parts, {}, min_size=2, max_size=2, policy=RecoveryPolicy(max_attempts=3)
     )
     assert results == [[f"out-p{i}"] for i in range(8)]
@@ -161,7 +173,7 @@ def test_drive_pool_reclaims_all_refs_of_a_dead_actor(monkeypatch):
     monkeypatch.setattr(mapmod, "_MapActor", _FakeMapActor)
     # One actor, depth 2 -> actor 0 holds both partitions in flight when it dies.
     parts = ["p0", "p1"]
-    results, _ = mapmod._drive_actor_pool(
+    results, _, _ = mapmod._drive_actor_pool(
         None, parts, {}, min_size=1, max_size=1, policy=RecoveryPolicy(max_attempts=3)
     )
     assert results == [["out-p0"], ["out-p1"]]  # both delivered, in order
@@ -225,3 +237,13 @@ def test_actor_inflight_depth_clamped(monkeypatch):
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_inflight_depth_caps_on_tight_vram():
+    # A starved GPU submits deeper; but a VRAM-tight pipeline keeps the shallow default so
+    # deep submission (several partitions' activations in flight) can't OOM the device.
+    from batcher.ml.gpu import recommend_inflight_depth
+
+    assert recommend_inflight_depth(0.2, 2) > 2  # starved, ample VRAM → deepen
+    assert recommend_inflight_depth(0.2, 2, peak_vram_fraction=0.9) == 2  # tight VRAM → shallow
+    assert recommend_inflight_depth(0.2, 2, peak_vram_fraction=0.3) > 2  # roomy → deepen stands

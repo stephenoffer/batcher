@@ -29,14 +29,46 @@ class VideoFunc(IRNode):
 
 
 class _VideoNamespace:
-    """Lazy video decode: ``col("bytes").video.decode()``."""
+    """Lazy video decode: ``col("bytes").video.decode()``.
+
+    Decoding runs in the Rust data plane over a binary column (FFmpeg-backed), so a
+    video pipeline never materializes frames in Python. Evaluating a `.video` op needs
+    the engine built with the ``video`` cargo feature; building the expression does not.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.col("clip").video.decode().to_ir()["fn"]
+            'decode'
+    """
 
     __slots__ = ("_e",)
 
     def __init__(self, e: Expr) -> None:
+        """Wrap the parent :class:`Expr` so its `.video` methods can build on it."""
         self._e = e
 
+    def __repr__(self) -> str:
+        """Show the accessor and its parent, e.g. ``<.video accessor of col('c')>``."""
+        return f"<.video accessor of {self._e!r}>"
+
     def decode(self) -> VideoFunc:
-        """Decode video bytes → struct ``{width, height, num_frames, duration_secs,
-        fps}`` (requires the ``video`` engine feature; null/undecodable → null)."""
+        """Read each clip's metadata without materializing its frames.
+
+        Requires the engine built with the ``video`` cargo feature (system FFmpeg);
+        without it, evaluating this op raises a clear error rather than returning null.
+
+        Returns:
+            An expression evaluating to a struct ``{width, height, num_frames,
+            duration_secs, fps}``; null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.video("s3://bucket/clips/")  # doctest: +SKIP
+                >>> ds.select(m=bt.col("bytes").video.decode()).to_pydict()  # doctest: +SKIP
+                {'m': [{'width': 1920, 'height': 1080, ...}]}
+        """
         return VideoFunc("decode", self._e)

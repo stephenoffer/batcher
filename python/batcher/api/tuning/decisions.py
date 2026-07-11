@@ -271,7 +271,11 @@ def record_join_outcomes(
         sig = plan_signature(join)
         strategy = join.strategy or "hash"
         record_join_sides(hub, sig, float(dec.left_rows), float(dec.right_rows))
-        record_join_strategy(hub, sig, strategy, wall_ms)
+        # The bandit's reward must not depend on how much data this particular run saw: the
+        # same signature runs over 1M rows today and 50M tomorrow, and a raw wall-time reward
+        # would permanently condemn whichever arm drew the large input. Hand it the join's
+        # total input size so it can price the arms per row.
+        record_join_strategy(hub, sig, strategy, wall_ms, float(dec.left_rows + dec.right_rows))
         if strategy in ("hash", "sort_merge"):
             # `BuildSideDecision` records the *pre-swap* orientation, so a swap moves the
             # left side into the build position. This is the x-axis of the hash-vs-sort_merge
