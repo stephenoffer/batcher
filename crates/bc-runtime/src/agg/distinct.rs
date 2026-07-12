@@ -171,20 +171,27 @@ pub(crate) fn merge_distinct(
     let list = state.as_list::<i32>();
     let offsets = list.value_offsets();
     let child = list.values();
-    // The loop emits exactly one entry per child element, so its size is known up front —
-    // reserve it and skip the reallocation churn of growing from empty.
-    let mut elem_idx: Vec<u32> = Vec::with_capacity(child.len());
+    // The concatenated child holds every partial list's values in list-row order with contiguous
+    // offsets, so flattening in row order visits child element `e` at output position `e` — the
+    // index would be `0..child.len()` and take-ing through it just copies every value (~tens of
+    // millions on a big COUNT(DISTINCT)) without reordering. Expand only the per-element group id
+    // and hand the child straight to the deduping bucketer.
+    let contiguous = offsets.first().copied().unwrap_or(0) == 0
+        && offsets.last().map(|&o| o as usize) == Some(child.len());
     let mut elem_groups: Vec<i64> = Vec::with_capacity(child.len());
     for row in 0..list.len() {
-        let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+        let n = (offsets[row + 1] - offsets[row]) as usize;
         let g = group_ids[row] as i64;
-        for e in start..end {
-            elem_idx.push(e as u32);
-            elem_groups.push(g);
-        }
+        elem_groups.extend(std::iter::repeat_n(g, n));
     }
-    let values = take(child.as_ref(), &UInt32Array::from(elem_idx), None)?;
     let group_col: ArrayRef = Arc::new(Int64Array::from(elem_groups));
+    if contiguous {
+        return distinct_pairs_to_list(group_col, child.clone(), num_groups);
+    }
+    let elem_idx: Vec<u32> = (0..list.len())
+        .flat_map(|row| offsets[row] as u32..offsets[row + 1] as u32)
+        .collect();
+    let values = take(child.as_ref(), &UInt32Array::from(elem_idx), None)?;
     distinct_pairs_to_list(group_col, values, num_groups)
 }
 
