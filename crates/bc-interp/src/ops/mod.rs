@@ -24,7 +24,6 @@ use bc_runtime::window_frame;
 use crate::error::InterpError;
 
 mod external_sort;
-mod join_top_n;
 mod joins;
 mod materialize;
 mod mixed_spill;
@@ -37,10 +36,9 @@ mod reshape;
 mod sample_sort;
 mod str_sort;
 pub(crate) use external_sort::{external_merge_sort, external_sort_to_final_store};
-pub(crate) use join_top_n::join_top_n;
 pub(crate) use joins::{
     asof_join_batches, columns_by_name, gather_join_output, gather_join_output_with, join_batches,
-    join_batches_with, join_output_schema, key_indices, map_join_type,
+    join_batches_with, join_output_schema, join_top_n, key_indices, map_join_type,
 };
 pub(crate) use materialize::materialize;
 pub(crate) use mixed_spill::try_bounded_mixed_spill;
