@@ -793,12 +793,16 @@ fn exec(
                     (merged.group_columns, agg_cols)
                 }
             };
-            let out = vec![ops::build_agg_batch(
-                group_keys,
-                aggregates,
-                &group_columns,
-                &agg_cols,
-            )?];
+            // Re-morselize the grouped output (zero-copy slices) so a downstream breaker — a
+            // post-aggregate projection, a sort, or a join on the grouped rows — fans back out
+            // across cores rather than running on the single combined batch. A high-cardinality
+            // GROUP BY (tens/hundreds of thousands of groups) otherwise emits one big batch whose
+            // consumers run single-threaded. Low-cardinality output is one small batch, so this
+            // is a no-op there. (The partitioned path already emits per-partition batches.)
+            let out = ops::remorselize(
+                vec![ops::build_agg_batch(group_keys, aggregates, &group_columns, &agg_cols)?],
+                opts.morsel_target(),
+            );
             push_breaker_spilled(
                 m,
                 op_id,
