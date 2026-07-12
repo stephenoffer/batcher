@@ -221,7 +221,10 @@ pub(crate) fn remorselize(
     if !target.byte_bounded() {
         return batches;
     }
-    morselize(&batches, target)
+    // Same parallel split as the scan: a wide join/aggregate output (14 GB of TPC-H
+    // `lineitem` for a `SELECT *` join) is re-split here, and the per-row byte walk over its
+    // string columns is the same single-threaded O(rows) cost `morselize_par` fans across cores.
+    morselize_par(&batches, target)
 }
 
 /// Emit the morsels for one batch into `out`.
