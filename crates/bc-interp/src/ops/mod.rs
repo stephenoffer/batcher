@@ -24,10 +24,12 @@ use bc_runtime::window_frame;
 use crate::error::InterpError;
 
 mod external_sort;
+mod join_top_n;
 mod joins;
 mod materialize;
 mod mixed_spill;
 mod morsel;
+mod project_field;
 mod quantile_spill;
 mod radix_sort;
 mod repartition;
@@ -35,13 +37,14 @@ mod reshape;
 mod sample_sort;
 mod str_sort;
 pub(crate) use external_sort::{external_merge_sort, external_sort_to_final_store};
+pub(crate) use join_top_n::join_top_n;
 pub(crate) use joins::{
     asof_join_batches, columns_by_name, gather_join_output, gather_join_output_with, join_batches,
     join_batches_with, join_output_schema, key_indices, map_join_type,
 };
 pub(crate) use materialize::materialize;
 pub(crate) use mixed_spill::try_bounded_mixed_spill;
-pub(crate) use morsel::{morselize_par, remorselize};
+pub(crate) use morsel::{morselize_par, remorselize, sliced_batch_bytes};
 pub(crate) use quantile_spill::{
     try_bounded_distinct_spill, try_bounded_histogram_spill, try_bounded_mode_spill,
     try_bounded_quantile_spill,
@@ -125,23 +128,7 @@ pub(crate) fn project_batch_jit(
     let mut columns = Vec::with_capacity(exprs.len());
     for (item, jit) in exprs.iter().zip(jits) {
         let array = eval_jit(jit, &item.expr, batch)?;
-        // A bare-column passthrough carries the *source field* through (renamed),
-        // preserving its metadata — notably the Arrow extension type (e.g.
-        // FixedShapeTensor for embeddings/decoded media). Rebuilding from
-        // `array.data_type()` would drop that metadata, downgrading a tensor column
-        // to its plain storage type. Computed expressions get a fresh field.
-        let field = match &item.expr {
-            bc_expr::Expr::Col { name } => match batch.schema().index_of(name) {
-                Ok(idx) => batch
-                    .schema()
-                    .field(idx)
-                    .clone()
-                    .with_name(item.alias.clone()),
-                Err(_) => Field::new(&item.alias, array.data_type().clone(), true),
-            },
-            _ => Field::new(&item.alias, array.data_type().clone(), true),
-        };
-        fields.push(field);
+        fields.push(project_field::output_field(item, &array, batch));
         columns.push(array);
     }
     Ok(RecordBatch::try_new(
@@ -506,7 +493,10 @@ pub(crate) fn parallel_top_n(
     // `sort_indices`' limit path over the eager-merged batch), keeping the global top-k.
     let mut sort_columns: Vec<SortColumn> = Vec::with_capacity(keys.len() + 1);
     for (j, key) in keys.iter().enumerate() {
-        let col_j = per.iter().map(|(_, _, kc)| kc[j].as_ref()).collect::<Vec<_>>();
+        let col_j = per
+            .iter()
+            .map(|(_, _, kc)| kc[j].as_ref())
+            .collect::<Vec<_>>();
         let values = if col_j.is_empty() {
             key.expr.eval(&parts[0])? // empty: unreachable shape, keeps types
         } else {
@@ -1028,8 +1018,10 @@ mod sort_tests {
                 }];
                 for k in [5usize, 100, 20_000, 50_000] {
                     // Eager reference: per-morsel full-row top-k, merged, re-topped.
-                    let locals: Vec<RecordBatch> =
-                        parts.iter().map(|b| sort_batch(b, &keys, Some(k)).unwrap()).collect();
+                    let locals: Vec<RecordBatch> = parts
+                        .iter()
+                        .map(|b| sort_batch(b, &keys, Some(k)).unwrap())
+                        .collect();
                     let merged = materialize(&locals).unwrap();
                     let eager = sort_batch(&merged, &keys, Some(k)).unwrap();
 
@@ -1044,7 +1036,11 @@ mod sort_tests {
                         for r in 0..ea.len() {
                             assert_eq!(le.is_null(r), ea.is_null(r), "null@{r} col={name} k={k}");
                             if !ea.is_null(r) {
-                                assert_eq!(le.value(r), ea.value(r), "{name}@{r} k={k} desc={descending} nf={nulls_first}");
+                                assert_eq!(
+                                    le.value(r),
+                                    ea.value(r),
+                                    "{name}@{r} k={k} desc={descending} nf={nulls_first}"
+                                );
                             }
                         }
                     }

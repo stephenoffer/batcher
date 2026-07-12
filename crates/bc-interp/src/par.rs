@@ -301,7 +301,7 @@ pub fn execute_parallel_with_metrics(
     // `parallelism == 0` ("all cores") therefore resolves to `available_parallelism`, which
     // reads the now-applied affinity; a positive value pins the requested width. On a
     // single node this is the same width as the global pool, so the result is unchanged.
-    let width = auto_width(opts, sources);
+    let width = auto_width(opts, sources, plan);
     let out = pool_for(width)?.install(|| exec(plan, sources, opts, &mut m, &mut ids))?;
     Ok((out, m))
 }
@@ -318,26 +318,59 @@ pub fn execute_parallel_with_metrics(
 /// stated goal of low fixed overhead on sub-second queries is exactly this case. The cap
 /// is an upper bound on useful parallelism at the leaves, so it can never remove
 /// parallelism a plan could have used, and it never changes a result (scheduling only).
-fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>]) -> usize {
+///
+/// **Exception — media decode.** The morsel cap assumes per-morsel work is O(morsel)
+/// cheap columnar work, so one morsel needs at most one core. A `.image`/`.audio`/`.video`
+/// decode breaks that assumption: it does heavy, embarrassingly-parallel per-row work
+/// *inside* the morsel (its own rayon fan-out — see `bc_expr::eval::media`), and its input
+/// is tiny *encoded* bytes (a 5 KB JPEG) that the byte-aware count still sees as one
+/// morsel. A whole corpus of images would then decode on a single core. When the plan
+/// carries a media decode we lift the cap to all cores; the intra-kernel fan-out shares
+/// this same pool (rayon work-stealing, no oversubscription), so it is right whether the
+/// input is one morsel or many. Still scheduling only — the result is unchanged.
+fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>], plan: &RelOp) -> usize {
     if opts.parallelism > 0 {
         return opts.parallelism;
     }
     let cores = std::thread::available_parallelism()
         .map(|v| v.get())
         .unwrap_or(1);
+    if plan.contains_media_decode() {
+        return cores.max(1);
+    }
     cores.min(max_useful_workers(opts, sources)).max(1)
 }
 
 /// An upper bound on workers that could have a morsel to process: the largest number of
 /// morsels any single source yields. Operators fan out over one input's morsels at a
 /// time, so the widest leaf bounds the widest `par_iter`.
+///
+/// The count is **byte-aware**, matching how the scan actually splits: `morselize` bounds a
+/// morsel by rows *and* by the byte budget, so a byte-heavy source (few rows, large blobs —
+/// decoded audio/video/images, embeddings, wide strings) yields far more morsels than
+/// `rows / target_rows` suggests. Counting by rows alone capped those workloads to a single
+/// worker — a 176 MB audio batch of 2,000 rows morselizes into ~176 pieces but was scheduled
+/// on one core. Taking the max of the row- and byte-derived counts restores the parallelism
+/// the plan can genuinely use, while still collapsing to 1 for a truly tiny query.
 fn max_useful_workers(opts: &ExecOptions, sources: &[Vec<RecordBatch>]) -> usize {
-    let target_rows = opts.morsel_target().rows.max(1);
+    let target = opts.morsel_target();
+    let target_rows = target.rows.max(1);
+    let target_bytes = target.bytes.max(1);
     sources
         .iter()
         .map(|batches| {
             let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            rows.div_ceil(target_rows)
+            let by_rows = rows.div_ceil(target_rows);
+            if target.byte_bounded() {
+                let bytes: usize = batches.iter().map(ops::sliced_batch_bytes).sum();
+                // A source cannot yield more morsels than it has rows: `morselize` keeps a
+                // single over-budget row as its own one-row morsel, never splits within a
+                // row. Capping the byte estimate by the row count keeps a few-row/huge-blob
+                // source from over-provisioning workers that would have no morsel to take.
+                by_rows.max(bytes.div_ceil(target_bytes).min(rows))
+            } else {
+                by_rows
+            }
         })
         .max()
         .unwrap_or(1)
@@ -783,6 +816,50 @@ fn exec(
         }
 
         RelOp::Sort { input, keys, limit } => {
+            // Fused late-materialized join + top-N: when a `LIMIT k` top-N sits directly on an
+            // inner hash join, gather only the sort-key columns + a `(bucket, row, row)` locator,
+            // top-k that narrow relation, then gather the wide payload for just the `k` survivors
+            // — never materializing the (up to multi-GB) full join output. Declines (falls through
+            // to the ordinary join-then-top-N) for a spilling build or non-bare sort keys.
+            if let Some(k) = limit {
+                if let RelOp::HashJoin {
+                    left,
+                    right,
+                    left_keys,
+                    right_keys,
+                    join_type: bc_ir::JoinType::Inner,
+                    output,
+                    strategy: bc_ir::JoinStrategy::Hash,
+                } = input.as_ref()
+                {
+                    let jt0 = Stopwatch::start();
+                    let lbs = exec(left, sources, opts, m, ids)?;
+                    let rbs = exec(right, sources, opts, m, ids)?;
+                    let build_rows = count_rows(&rbs) as usize;
+                    let build_bytes = batch_bytes(&rbs) as usize
+                        + bc_runtime::join::estimate_build_bytes(build_rows);
+                    if let Admit::InMemory(_reservation) = admit(opts, op_id, build_bytes) {
+                        let p = rayon::current_num_threads().max(1);
+                        if let Some(out) = ops::join_top_n(
+                            &lbs,
+                            &rbs,
+                            left_keys,
+                            right_keys,
+                            output,
+                            keys,
+                            *k,
+                            p,
+                            &opts.tuning,
+                        )? {
+                            let rows_in = count_rows(&lbs) + count_rows(&rbs);
+                            push_metric(m, op_id, "sort", rows_in, &out, jt0, false, "interp-jointopn");
+                            return Ok(out);
+                        }
+                    }
+                    // Declined: fall through. The ordinary path below re-executes `input`
+                    // (join included) — rare (spill / computed sort key), so acceptable.
+                }
+            }
             let parts = exec(input, sources, opts, m, ids)?;
             let rows_in = count_rows(&parts);
             // Captured before the input vector is consumed below.
@@ -1980,6 +2057,36 @@ mod tests {
         .unwrap()
     }
 
+    /// A plan with no media decode — the common case for the `auto_width` cap tests.
+    fn no_media_plan() -> RelOp {
+        RelOp::Scan { source_id: 0 }
+    }
+
+    /// A byte-heavy source (few rows, large blobs) must lift the worker cap: counting
+    /// morsels by rows alone would collapse it to one worker even though the scan splits
+    /// it into many byte-bounded morsels. Regression for the media/embedding throttle.
+    #[test]
+    fn byte_heavy_source_lifts_worker_cap() {
+        use arrow::array::BinaryArray;
+
+        // 100 rows × 64 KiB ≈ 6.4 MiB of binary — far under the 16,384-row target but well
+        // over the 1 MiB byte budget, so the scan yields several morsels, not one.
+        let blob = vec![0u8; 64 * 1024];
+        let arr = BinaryArray::from_iter_values((0..100).map(|_| blob.as_slice()));
+        let rb = RecordBatch::try_from_iter(vec![("b", Arc::new(arr) as ArrayRef)]).unwrap();
+        let sources = vec![vec![rb]];
+        let opts = ExecOptions::default();
+
+        // Row-only counting would have been 100 / 16,384 = 1 worker.
+        assert_eq!(100usize.div_ceil(opts.morsel_target().rows), 1);
+        // Byte-aware counting sees the ~6 morsels the byte budget produces.
+        let workers = max_useful_workers(&opts, &sources);
+        assert!(
+            workers >= 6,
+            "byte-heavy source should allow >=6 workers, got {workers}"
+        );
+    }
+
     /// Peak working-set measurement contract for the *parallel* breakers (the metrics
     /// contract integration test covers only the sequential oracle). These guard the
     /// under-counts Carbonite's per-family memory model would otherwise learn.
@@ -2258,7 +2365,10 @@ mod tests {
             ..ExecOptions::default()
         };
         // One tiny source: the morsel cap would say 1, but the explicit width wins.
-        assert_eq!(auto_width(&opts, &[vec![batch(&[1], &[1])]]), 7);
+        assert_eq!(
+            auto_width(&opts, &[vec![batch(&[1], &[1])]], &no_media_plan()),
+            7
+        );
     }
 
     /// A worker with no morsel to take still costs a wake-up and queue contention, so the
@@ -2272,11 +2382,14 @@ mod tests {
             ..ExecOptions::default()
         };
         // 1 row → 1 morsel → 1 worker.
-        assert_eq!(auto_width(&opts, &[vec![batch(&[1], &[1])]]), 1);
+        assert_eq!(
+            auto_width(&opts, &[vec![batch(&[1], &[1])]], &no_media_plan()),
+            1
+        );
         // 5 rows at 2 rows/morsel → 3 morsels; capped further by the machine's cores.
         let cores = std::thread::available_parallelism().map_or(1, |v| v.get());
         let five = vec![batch(&[1, 2, 3, 4, 5], &[1, 2, 3, 4, 5])];
-        assert_eq!(auto_width(&opts, &[five]), 3.min(cores));
+        assert_eq!(auto_width(&opts, &[five], &no_media_plan()), 3.min(cores));
     }
 
     /// The bound is the *widest* source, not their sum: an operator fans out over one
@@ -2292,7 +2405,10 @@ mod tests {
         let small = vec![batch(&[1], &[1])];
         let large = vec![batch(&[1, 2, 3, 4], &[1, 2, 3, 4])];
         let cores = std::thread::available_parallelism().map_or(1, |v| v.get());
-        assert_eq!(auto_width(&opts, &[small, large]), 4.min(cores));
+        assert_eq!(
+            auto_width(&opts, &[small, large], &no_media_plan()),
+            4.min(cores)
+        );
     }
 
     /// No sources (a literal-only plan) still needs one worker, never zero.
@@ -2302,8 +2418,47 @@ mod tests {
             parallelism: 0,
             ..ExecOptions::default()
         };
-        assert_eq!(auto_width(&opts, &[]), 1);
-        assert_eq!(auto_width(&opts, &[vec![]]), 1);
+        assert_eq!(auto_width(&opts, &[], &no_media_plan()), 1);
+        assert_eq!(auto_width(&opts, &[vec![]], &no_media_plan()), 1);
+    }
+
+    /// A media-decode plan lifts the morsel-count cap: its per-row decode is heavy and
+    /// parallelizes *inside* the morsel, so a corpus that is a single (tiny-encoded-bytes)
+    /// morsel must still get every core — not one. Without this, `read.images(decode=True)`
+    /// over a sub-morsel corpus decodes single-threaded.
+    #[test]
+    fn media_decode_plan_uses_all_cores_despite_single_morsel() {
+        use bc_expr::{Expr, ImageFunc};
+
+        let opts = ExecOptions {
+            parallelism: 0,
+            ..ExecOptions::default()
+        };
+        // One tiny source → one morsel → the cap would say 1 worker.
+        let one_morsel = &[vec![batch(&[1], &[1])]][..];
+        assert_eq!(auto_width(&opts, one_morsel, &no_media_plan()), 1);
+
+        // The same input under an image-decode projection: width jumps to all cores.
+        let decode = RelOp::Project {
+            input: Box::new(RelOp::Scan { source_id: 0 }),
+            exprs: vec![ProjectionItem {
+                expr: Expr::Image {
+                    func: ImageFunc::ToTensor,
+                    input: Box::new(Expr::Col { name: "k".into() }),
+                    width: Some(224),
+                    height: Some(224),
+                },
+                alias: "img".into(),
+            }],
+        };
+        let cores = std::thread::available_parallelism().map_or(1, |v| v.get());
+        assert_eq!(auto_width(&opts, one_morsel, &decode), cores.max(1));
+        // An explicit parallelism still wins over the media lift (control-plane decision).
+        let pinned = ExecOptions {
+            parallelism: 3,
+            ..ExecOptions::default()
+        };
+        assert_eq!(auto_width(&pinned, one_morsel, &decode), 3);
     }
 
     fn str_batch(vals: &[&str]) -> RecordBatch {
