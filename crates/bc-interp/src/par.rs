@@ -1381,7 +1381,12 @@ fn exec(
             let in_bytes = batch_bytes(&parts);
             let t0 = Stopwatch::start();
             let (batch, spilled, spill_vol) = distinct(&parts, opts, op_id)?;
-            let out = vec![batch];
+            // `distinct` returns one materialized batch; re-morselize it (zero-copy slices) so a
+            // downstream breaker (a COUNT(DISTINCT)'s outer GROUP BY, or a join) fans back out
+            // across cores instead of processing the whole relation on one thread. A single
+            // large distinct batch feeding an aggregate ran that aggregate at ~1% CPU
+            // (TPC-H Q16: the outer group-by over the deduped rows was 62% of the query, serial).
+            let out = ops::remorselize(vec![batch], opts.morsel_target());
             push_breaker_spilled(
                 m, op_id, "distinct", rows_in, 0, in_bytes, &out, t0, spilled, spill_vol, "interp",
             );
