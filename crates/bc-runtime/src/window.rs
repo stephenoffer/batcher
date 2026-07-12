@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Float64Array, Int64Array, StringArray, UInt32Array};
-use arrow::compute::{lexsort_to_indices, take, SortColumn, SortOptions};
+use arrow::compute::{take, SortOptions};
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use arrow::row::{RowConverter, Rows, SortField};
 
@@ -397,26 +397,33 @@ fn ordered_partitions_by_global_sort(
     // (a) is a stable, deterministic choice for `row_number`'s otherwise-unspecified order
     // among peers, and (b) is identical whether this runs over the whole input or over one
     // hash bucket of it, so the parallel per-bucket path matches the serial kernel exactly.
-    let mut sort_columns: Vec<SortColumn> = partition_keys
+    // Encode all sort keys into arrow's row format once (a serial O(n) pass) and then sort the
+    // row indices **in parallel** by comparing those encoded bytes. arrow's `lexsort_to_indices`
+    // is single-threaded, and on a large window (a 60M-row `RANK() OVER (PARTITION BY flag ORDER
+    // BY price)`, whose leading key is a string) that serial O(n log n) sort was the whole
+    // operator — ~118s at ~1% CPU. The Row encoding is designed so a byte-lexicographic compare
+    // equals the multi-column ordering (partition keys ascending, order keys with their own
+    // ASC/DESC + nulls placement, then the original row index ascending as a unique tie-break),
+    // so `par_sort_unstable_by` over it yields the identical total order — just across all cores.
+    use rayon::slice::ParallelSliceMut;
+    let mut enc_fields: Vec<SortField> = partition_keys
         .iter()
-        .map(|a| SortColumn {
-            values: a.clone(),
-            options: None,
-        })
+        .map(|a| SortField::new(a.data_type().clone()))
         .collect();
+    let mut enc_arrays: Vec<ArrayRef> = partition_keys.to_vec();
     for (arr, opts) in order_keys {
-        sort_columns.push(SortColumn {
-            values: arr.clone(),
-            options: Some(*opts),
-        });
+        enc_fields.push(SortField::new_with_options(arr.data_type().clone(), *opts));
+        enc_arrays.push(arr.clone());
     }
     let row_index: ArrayRef = Arc::new(Int64Array::from_iter_values(0..num_rows as i64));
-    sort_columns.push(SortColumn {
-        values: row_index,
-        options: None,
-    });
-    let sorted = lexsort_to_indices(&sort_columns, None)?;
-    let sorted = sorted.values();
+    enc_fields.push(SortField::new(row_index.data_type().clone()));
+    enc_arrays.push(row_index);
+    let converter = RowConverter::new(enc_fields)?;
+    let rows = converter.convert_columns(&enc_arrays)?;
+    let mut sorted: Vec<u32> = (0..num_rows as u32).collect();
+    // The row-index tie-break makes the key a total order, so an unstable sort is deterministic.
+    sorted.par_sort_unstable_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
+    let sorted = &sorted[..];
 
     // No PARTITION BY: every row is one partition, already globally ordered by the sort.
     if partition_keys.is_empty() {
