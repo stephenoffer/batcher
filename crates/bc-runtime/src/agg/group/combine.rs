@@ -150,6 +150,9 @@ fn hash_keys(group_keys: &[ArrayRef], num_rows: usize) -> Result<Vec<u64>, Runti
             DataType::LargeUtf8 => return Ok(hash_bytes::<LargeUtf8Type>(arr, num_rows)),
             DataType::Binary => return Ok(hash_bytes::<BinaryType>(arr, num_rows)),
             DataType::LargeBinary => return Ok(hash_bytes::<LargeBinaryType>(arr, num_rows)),
+            // Float bucketing MUST use the same canonical bits `assign` groups by, or a `-0.0`
+            // and a `0.0` (one group) would land in different radix partitions and never merge.
+            DataType::Float64 => return Ok(hash_f64_canon(arr, num_rows)),
             _ => {}
         }
     }
@@ -210,6 +213,7 @@ fn is_hashable_mixed(dt: &DataType) -> bool {
     matches!(
         dt,
         DataType::Int64
+            | DataType::Float64
             | DataType::Utf8
             | DataType::LargeUtf8
             | DataType::Binary
@@ -217,9 +221,24 @@ fn is_hashable_mixed(dt: &DataType) -> bool {
     )
 }
 
+/// Canonical bits for an `f64` bucketing key so a float key buckets consistently with how
+/// `assign_groups` groups it (the two zeros are one group, all NaNs one group). Must match
+/// `agg::group::assign::canon_f64`.
+#[inline]
+fn canon_f64(v: f64) -> u64 {
+    if v.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else if v == 0.0 {
+        0
+    } else {
+        v.to_bits()
+    }
+}
+
 /// One key column, downcast once, feeding its per-row raw value to a hasher.
 enum MixedCol<'a> {
     Int(&'a [i64]),
+    Float(&'a [f64]),
     Str32(&'a arrow::array::GenericStringArray<i32>),
     Str64(&'a arrow::array::GenericStringArray<i64>),
     Bin32(&'a arrow::array::GenericBinaryArray<i32>),
@@ -231,6 +250,7 @@ impl MixedCol<'_> {
     fn write<H: std::hash::Hasher>(&self, h: &mut H, i: usize) {
         match self {
             MixedCol::Int(v) => h.write_i64(v[i]),
+            MixedCol::Float(v) => h.write_u64(canon_f64(v[i])),
             MixedCol::Str32(a) => h.write(a.value(i).as_bytes()),
             MixedCol::Str64(a) => h.write(a.value(i).as_bytes()),
             MixedCol::Bin32(a) => h.write(a.value(i)),
@@ -248,6 +268,9 @@ fn hash_mixed(group_keys: &[ArrayRef], num_rows: usize) -> Vec<u64> {
         .iter()
         .map(|k| match k.data_type() {
             DataType::Int64 => MixedCol::Int(k.as_primitive::<Int64Type>().values()),
+            DataType::Float64 => {
+                MixedCol::Float(k.as_primitive::<arrow::datatypes::Float64Type>().values())
+            }
             DataType::Utf8 => MixedCol::Str32(k.as_string::<i32>()),
             DataType::LargeUtf8 => MixedCol::Str64(k.as_string::<i64>()),
             DataType::Binary => MixedCol::Bin32(k.as_binary::<i32>()),
@@ -263,6 +286,24 @@ fn hash_mixed(group_keys: &[ArrayRef], num_rows: usize) -> Vec<u64> {
                 c.write(&mut h, i);
             }
             h.finish()
+        })
+        .collect()
+}
+
+/// Per-row hash of a single `Float64` key over its canonical bits (nulls → `NULL_HASH`), so a
+/// float key buckets exactly as `assign` groups it. See [`canon_f64`].
+fn hash_f64_canon(arr: &ArrayRef, num_rows: usize) -> Vec<u64> {
+    let a = arr.as_primitive::<arrow::datatypes::Float64Type>();
+    let nulls = a.nulls();
+    let values = a.values();
+    (0..num_rows)
+        .into_par_iter()
+        .map(|i| {
+            if nulls.map(|n| n.is_null(i)).unwrap_or(false) {
+                NULL_HASH
+            } else {
+                SEED.hash_one(canon_f64(values[i]))
+            }
         })
         .collect()
 }

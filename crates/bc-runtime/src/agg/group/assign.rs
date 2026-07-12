@@ -10,8 +10,9 @@ use arrow::array::{
     UInt32Array,
 };
 use arrow::datatypes::{
-    ArrowNativeType, ArrowPrimitiveType, BinaryType, Int16Type, Int32Type, Int64Type, Int8Type,
-    LargeBinaryType, LargeUtf8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
+    ArrowNativeType, ArrowPrimitiveType, BinaryType, Float64Type, Int16Type, Int32Type, Int64Type,
+    Int8Type, LargeBinaryType, LargeUtf8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    Utf8Type,
 };
 use arrow::row::{RowConverter, SortField};
 use hashbrown::hash_table::Entry;
@@ -52,6 +53,13 @@ pub(crate) fn assign_groups(
             DataType::LargeUtf8 => return assign_groups_bytes::<LargeUtf8Type>(arr, num_rows),
             DataType::Binary => return assign_groups_bytes::<BinaryType>(arr, num_rows),
             DataType::LargeBinary => return assign_groups_bytes::<LargeBinaryType>(arr, num_rows),
+            // Float keys group on their canonical bits (all NaNs one group, -0.0 == 0.0),
+            // matching SQL/DuckDB — and hash those bits directly instead of paying the
+            // RowConverter's per-row float encode. Nullable falls through to the RowConverter
+            // (which coalesces nulls into one group); the fast path is null-free only.
+            DataType::Float64 if arr.null_count() == 0 => {
+                return assign_groups_f64(arr, num_rows)
+            }
             // A dictionary-encoded key groups on its integer *codes*, not its (repeated)
             // values — the whole point of the encoding. Without this it falls through to the
             // RowConverter path and is ~7x SLOWER than the same column decoded, so a dictionary
@@ -230,6 +238,26 @@ where
     T::Native: std::hash::Hash + Eq + PartialOrd,
 {
     let (group_ids, reps) = int_group_ids::<T>(arr.as_primitive::<T>(), num_rows);
+    let num_groups = reps.len();
+    let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
+    Ok((group_ids, num_groups, group_columns))
+}
+
+/// Single `Float64` key `assign_groups`, grouping on each value's canonical `u64` bits.
+///
+/// [`canon_f64`] folds negative zero into positive zero and every NaN into one value, giving the
+/// SQL/DuckDB grouping semantics; those integers then group through [`int_group_ids`] (reusing
+/// its dense-map and hash fast paths). The representative group column is `take`n from the
+/// original float array so its type and exact first-seen value carry through. Caller gates on a
+/// null-free column.
+fn assign_groups_f64(
+    arr: &ArrayRef,
+    num_rows: usize,
+) -> Result<(Vec<u32>, usize, Vec<ArrayRef>), RuntimeError> {
+    let a = arr.as_primitive::<Float64Type>();
+    let keys: Vec<u64> = a.values().iter().map(|&v| canon_f64(v)).collect();
+    let key_arr = arrow::array::UInt64Array::from(keys);
+    let (group_ids, reps) = int_group_ids::<UInt64Type>(&key_arr, num_rows);
     let num_groups = reps.len();
     let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
     Ok((group_ids, num_groups, group_columns))
@@ -742,20 +770,38 @@ fn assign_groups_int64_multi(
 }
 
 /// A key column the mixed raw multi-key grouper can hash/compare directly: a null-free
-/// `Int64`, `Utf8`/`LargeUtf8`, or `Binary`/`LargeBinary` column.
+/// `Int64`, `Float64`, `Utf8`/`LargeUtf8`, or `Binary`/`LargeBinary` column.
 fn is_raw_multikey_col(a: &ArrayRef) -> bool {
-    use arrow::datatypes::DataType::{Binary, Int64, LargeBinary, LargeUtf8, Utf8};
+    use arrow::datatypes::DataType::{Binary, Float64, Int64, LargeBinary, LargeUtf8, Utf8};
     a.null_count() == 0
         && matches!(
             a.data_type(),
-            Int64 | Utf8 | LargeUtf8 | Binary | LargeBinary
+            Int64 | Float64 | Utf8 | LargeUtf8 | Binary | LargeBinary
         )
+}
+
+/// Canonical `u64` grouping key for an `f64`.
+///
+/// Every NaN bit-pattern maps to one value and negative zero maps to positive zero, so raw-bit
+/// hashing and equality agree with SQL GROUP BY semantics: all NaNs form one group and the two
+/// zeros form one group (matching DuckDB; batcher's old `RowConverter` path wrongly split the
+/// zeros). Every other value keeps its exact bits, so distinct finite values stay distinct.
+#[inline]
+fn canon_f64(v: f64) -> u64 {
+    if v.is_nan() {
+        0x7ff8_0000_0000_0000 // one canonical quiet NaN
+    } else if v == 0.0 {
+        0 // +0.0 bits (folds -0.0 into 0.0)
+    } else {
+        v.to_bits()
+    }
 }
 
 /// One key column of the mixed raw multi-key grouper, borrowed as its concrete array so
 /// the hot loop hashes/compares raw values (no `RowConverter`, no per-row allocation).
 enum RawKeyCol<'a> {
     Int(&'a Int64Array),
+    Float(&'a arrow::array::Float64Array),
     Str32(&'a GenericStringArray<i32>),
     Str64(&'a GenericStringArray<i64>),
     Bin32(&'a GenericBinaryArray<i32>),
@@ -767,6 +813,7 @@ impl RawKeyCol<'_> {
         use std::hash::Hash;
         match self {
             RawKeyCol::Int(a) => a.value(i).hash(h),
+            RawKeyCol::Float(a) => canon_f64(a.value(i)).hash(h),
             RawKeyCol::Str32(a) => a.value(i).as_bytes().hash(h),
             RawKeyCol::Str64(a) => a.value(i).as_bytes().hash(h),
             RawKeyCol::Bin32(a) => a.value(i).hash(h),
@@ -776,6 +823,7 @@ impl RawKeyCol<'_> {
     fn eq_at(&self, x: usize, y: usize) -> bool {
         match self {
             RawKeyCol::Int(a) => a.value(x) == a.value(y),
+            RawKeyCol::Float(a) => canon_f64(a.value(x)) == canon_f64(a.value(y)),
             RawKeyCol::Str32(a) => a.value(x) == a.value(y),
             RawKeyCol::Str64(a) => a.value(x) == a.value(y),
             RawKeyCol::Bin32(a) => a.value(x) == a.value(y),
@@ -797,9 +845,10 @@ fn assign_groups_multi_raw(
     let cols: Vec<RawKeyCol> = group_keys
         .iter()
         .map(|a| {
-            use arrow::datatypes::DataType::{Binary, Int64, LargeBinary, LargeUtf8, Utf8};
+            use arrow::datatypes::DataType::{Binary, Float64, Int64, LargeBinary, LargeUtf8, Utf8};
             match a.data_type() {
                 Int64 => RawKeyCol::Int(a.as_primitive::<Int64Type>()),
+                Float64 => RawKeyCol::Float(a.as_primitive::<Float64Type>()),
                 Utf8 => RawKeyCol::Str32(a.as_string::<i32>()),
                 LargeUtf8 => RawKeyCol::Str64(a.as_string::<i64>()),
                 Binary => RawKeyCol::Bin32(a.as_binary::<i32>()),
@@ -937,6 +986,9 @@ fn assign_groups_packed(
         for (c, &o) in cols.iter().zip(&offs) {
             match c {
                 RawKeyCol::Int(a) => buf[o..o + 8].copy_from_slice(&a.value(i).to_le_bytes()),
+                // `packed_layout` only sizes Int64 / string / binary columns, so a float key
+                // never reaches the packed path (it takes `assign_groups_multi_raw` instead).
+                RawKeyCol::Float(_) => unreachable!("packed_layout excludes Float64"),
                 RawKeyCol::Str32(a) => write_bytes(&mut buf, o, a.value(i).as_bytes()),
                 RawKeyCol::Str64(a) => write_bytes(&mut buf, o, a.value(i).as_bytes()),
                 RawKeyCol::Bin32(a) => write_bytes(&mut buf, o, a.value(i)),
@@ -1338,6 +1390,36 @@ mod tests {
             .map(|(f, s)| (f.to_string(), s.to_string()))
             .collect();
         assert_eq!(got, want);
+    }
+
+    /// A single `Float64` key groups on canonical bits: `-0.0` and `0.0` are one group, all NaNs
+    /// are one group (SQL/DuckDB semantics), and distinct finite values stay distinct.
+    #[test]
+    fn float_key_canonicalizes_zero_and_nan() {
+        use arrow::array::Float64Array;
+        let vals = vec![0.0, -0.0, f64::NAN, f64::NAN, 1.5, 0.0];
+        let arr: ArrayRef = Arc::new(Float64Array::from(vals));
+        let (ids, n, cols) = assign_groups(&[arr], 6).unwrap();
+        // Expected first-seen groups: 0.0(g0), -0.0→g0, NaN(g1), NaN→g1, 1.5(g2), 0.0→g0.
+        assert_eq!(ids, vec![0, 0, 1, 1, 2, 0]);
+        assert_eq!(n, 3);
+        let reps = cols[0].as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(reps.value(0), 0.0);
+        assert!(reps.value(1).is_nan());
+        assert_eq!(reps.value(2), 1.5);
+    }
+
+    /// A composite key mixing an int and a float takes the raw multi-key path (float included)
+    /// and groups `(int, float)` tuples canonically — `(1, -0.0)` and `(1, 0.0)` are one group.
+    #[test]
+    fn int_plus_float_key_groups_canonically() {
+        use arrow::array::Float64Array;
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![1, 1, 2, 1, 2]));
+        let floats: ArrayRef = Arc::new(Float64Array::from(vec![-0.0, 0.0, 3.0, 0.0, 3.0]));
+        let (ids, n, _) = assign_groups(&[ints, floats], 5).unwrap();
+        // (1,-0.0)=g0, (1,0.0)→g0, (2,3.0)=g1, (1,0.0)→g0, (2,3.0)→g1.
+        assert_eq!(ids, vec![0, 0, 1, 0, 1]);
+        assert_eq!(n, 2);
     }
 
     /// A single-byte key mixed with a longer key falls back to the packed/raw path (the tight
