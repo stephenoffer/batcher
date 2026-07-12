@@ -197,6 +197,78 @@ pub(crate) fn merge_distinct(
 
 /// Dedup `(group, value)` pairs and bucket the distinct values into a per-group
 /// `List` column — the shared core of the distinct partial and merge steps.
+/// Dedup `(group, value)` `i64` pairs across cores by hash-partitioning them, then deduping
+/// each partition independently. Equal pairs share a partition, so the union of the partitions'
+/// distinct pairs is the global distinct set (order within a group is not preserved — only the
+/// COUNT(DISTINCT) caller uses this, and it counts, not orders). Returns the distinct groups and
+/// values as parallel vecs.
+fn par_dedup_pairs(
+    grp: &Int64Array,
+    vals: &Int64Array,
+    n: usize,
+) -> (Vec<i64>, Vec<i64>) {
+    use rayon::prelude::*;
+
+    let parts = rayon::current_num_threads().clamp(2, 256);
+    let state = ahash::RandomState::with_seed(0);
+    let g = grp.values();
+    let v = vals.values();
+    // Bucket the row indices by pair hash, in parallel: per-chunk CSR (histogram → prefix-sum →
+    // scatter), then each partition's list is the chunks' slices concatenated (same shape as the
+    // combine's radix bucketing). Cheap flat allocations, no per-(chunk,bucket) growing vectors.
+    let nthreads = rayon::current_num_threads().max(1);
+    let chunk = n.div_ceil(nthreads).max(1);
+    let bucket_of = |i: usize| (state.hash_one((g[i], v[i])) % parts as u64) as usize;
+    let per_chunk: Vec<(Vec<u32>, Vec<u32>)> = (0..n)
+        .into_par_iter()
+        .step_by(chunk)
+        .map(|start| {
+            let end = (start + chunk).min(n);
+            let mut off = vec![0u32; parts + 1];
+            for i in start..end {
+                off[bucket_of(i) + 1] += 1;
+            }
+            for b in 0..parts {
+                off[b + 1] += off[b];
+            }
+            let mut cursor = off[..parts].to_vec();
+            let mut rows = vec![0u32; end - start];
+            for i in start..end {
+                let b = bucket_of(i);
+                rows[cursor[b] as usize] = i as u32;
+                cursor[b] += 1;
+            }
+            (rows, off)
+        })
+        .collect();
+    // Dedup each partition independently, in parallel.
+    let per: Vec<(Vec<i64>, Vec<i64>)> = (0..parts)
+        .into_par_iter()
+        .map(|b| {
+            let mut seen: hashbrown::HashSet<(i64, i64), ahash::RandomState> =
+                hashbrown::HashSet::with_hasher(ahash::RandomState::with_seed(1));
+            let (mut dg, mut dv) = (Vec::new(), Vec::new());
+            for (rows, off) in &per_chunk {
+                for &i in &rows[off[b] as usize..off[b + 1] as usize] {
+                    let pair = (g[i as usize], v[i as usize]);
+                    if seen.insert(pair) {
+                        dg.push(pair.0);
+                        dv.push(pair.1);
+                    }
+                }
+            }
+            (dg, dv)
+        })
+        .collect();
+    let total: usize = per.iter().map(|(dg, _)| dg.len()).sum();
+    let (mut dgroups, mut dvalues) = (Vec::with_capacity(total), Vec::with_capacity(total));
+    for (dg, dv) in per {
+        dgroups.extend_from_slice(&dg);
+        dvalues.extend_from_slice(&dv);
+    }
+    (dgroups, dvalues)
+}
+
 fn distinct_pairs_to_list(
     groups: ArrayRef,
     values: ArrayRef,
@@ -210,6 +282,23 @@ fn distinct_pairs_to_list(
     // bucketed lists are identical.
     if let Some(vals) = values.as_any().downcast_ref::<Int64Array>() {
         let grp = groups.as_primitive::<Int64Type>();
+        // Large input: dedup in parallel by hash-partitioning the `(group, value)` pairs across
+        // cores. Equal pairs hash equally so they co-locate in one partition; deduping each
+        // partition independently and unioning the survivors yields the same distinct SET as the
+        // serial pass. COUNT(DISTINCT) only counts each group's list length, so the (now
+        // per-partition-first-seen) order within a group is irrelevant to the result — this path
+        // feeds only CountDistinct. Turns the serial hash-set scan (the whole cost of a big
+        // COUNT(DISTINCT id) combine) into a parallel one.
+        const PAR_DEDUP_MIN: usize = 1 << 18;
+        if n >= PAR_DEDUP_MIN {
+            let (dgroups, dvalues) = par_dedup_pairs(grp, vals, n);
+            let distinct_values: ArrayRef = Arc::new(Int64Array::from(dvalues));
+            return bucket_values_into_list(
+                &Int64Array::from(dgroups),
+                &distinct_values,
+                num_groups,
+            );
+        }
         // Dedup through hashbrown + a fixed-seed ahash hasher, not `std::HashSet`'s
         // cryptographic SipHash — ~5-10× faster on these small `(i64, i64)` integer keys,
         // and the result is hasher-independent (first-seen order is preserved by the
@@ -379,5 +468,29 @@ mod dense_tests {
         want.sort_unstable();
         assert_eq!(n, want.len());
         assert_eq!(values(&dense), want);
+    }
+
+    /// The parallel `(group, value)` dedup path (n ≥ 2^18) yields the exact same distinct SET
+    /// per group as a serial reference — the invariant COUNT(DISTINCT) rests on. Order within a
+    /// group is unspecified (parallel first-seen), so both sides compare sorted.
+    #[test]
+    fn par_dedup_pairs_matches_serial() {
+        use std::collections::HashSet;
+        let n = (1usize << 18) + 12_345; // over the parallel threshold
+        let mut s: u64 = 99;
+        let mut gv: Vec<i64> = Vec::with_capacity(n);
+        let mut vv: Vec<i64> = Vec::with_capacity(n);
+        for _ in 0..n {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            gv.push(((s >> 40) % 4) as i64); // 4 groups
+            vv.push(((s >> 20) % 50_000) as i64); // ~50k distinct values → lots of dupes
+        }
+        let (dg, dv) = super::par_dedup_pairs(&Int64Array::from(gv.clone()), &Int64Array::from(vv.clone()), n);
+        // Parallel result as a set of pairs.
+        let got: HashSet<(i64, i64)> = dg.iter().copied().zip(dv.iter().copied()).collect();
+        // Serial reference set.
+        let want: HashSet<(i64, i64)> = gv.iter().copied().zip(vv.iter().copied()).collect();
+        assert_eq!(got.len(), dg.len(), "parallel path emitted a duplicate pair");
+        assert_eq!(got, want, "parallel distinct set differs from serial");
     }
 }
