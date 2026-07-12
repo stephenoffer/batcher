@@ -8,6 +8,7 @@ nested subqueries via `tr.statement`. They hold no state of their own.
 from __future__ import annotations
 
 from batcher._sql.parser.core_utils import _columns_selector
+from batcher._sql.parser.json import json_extract
 from batcher._sql.parser.literals import (
     _BINOPS,
     _DATE_PART,
@@ -131,8 +132,17 @@ def _scalar(tr, node) -> Expr:
         if method is None:
             raise NotImplementedError(f"EXTRACT field {part!r} is not supported")
         return getattr(tr._scalar(node.expression).dt, method)()
+    if isinstance(node, (exp.DateTrunc, exp.TimestampTrunc)):
+        # DATE_TRUNC('unit', ts) → floor the timestamp to `unit`. sqlglot puts the timestamp
+        # in `this` and the unit literal in `args['unit']` (e.g. Literal 'MINUTE').
+        unit = node.args.get("unit")
+        if unit is None:
+            raise NotImplementedError("date_trunc requires an explicit unit")
+        return tr._scalar(node.this).dt.truncate(unit.name.lower())
     if isinstance(node, exp.RegexpReplace):
         return _regexp_replace(tr, node)
+    if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
+        return json_extract(tr, node)
 
     # Date ± INTERVAL, date_add/date_sub, date_diff (DATE operands).
     if isinstance(node, (exp.Add, exp.Sub)) and isinstance(node.expression, exp.Interval):

@@ -60,6 +60,37 @@ def test_date_functions(duck, t, q):
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
+@pytest.fixture
+def ts(duck):
+    tbl = pa.table(
+        {
+            "id": [1, 2, 3],
+            "ev": pa.array(
+                [
+                    dt.datetime(2013, 7, 15, 12, 40, 37),
+                    dt.datetime(2013, 7, 15, 12, 41, 5),
+                    dt.datetime(2020, 12, 25, 23, 59, 59),
+                ],
+                pa.timestamp("us"),
+            ),
+        }
+    )
+    duck.register("ts", tbl)
+    return tbl
+
+
+@pytest.mark.parametrize(
+    "unit",
+    ["minute", "hour", "day", "month", "year", "second"],
+)
+def test_date_trunc(duck, ts, unit):
+    """DATE_TRUNC('<unit>', ts) — the ClickBench Q42 shape — matches DuckDB."""
+    from conftest import assert_same
+
+    q = f"SELECT id, DATE_TRUNC('{unit}', ev) m FROM ts ORDER BY id"
+    assert_same(bt.sql(q, ts=ts).collect(), duck.sql(q))
+
+
 @pytest.mark.parametrize(
     "q",
     [

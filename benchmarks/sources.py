@@ -426,10 +426,30 @@ def _reconstruct_clickbench_temporals(table: pa.Table) -> pa.Table:
     return table
 
 
+def _binary_to_utf8(table: pa.Table) -> pa.Table:
+    """Cast ClickBench's string columns from their parquet ``binary`` storage to ``utf8``.
+
+    The ``hits_compatible`` parquet stores every text column (URL, Title, SearchPhrase,
+    Referer, ...) as ``binary``, but every published ClickBench loader — including DuckDB's —
+    treats them as ``VARCHAR``. Without the cast, string queries run on ``binary``: ``LIKE``
+    and ``MIN``/``MAX`` are undefined for a blob (DuckDB errors, so the query becomes an
+    un-timeable ``n/a``), and the benchmark measures the wrong thing. Casting here makes every
+    engine see the same ``utf8`` columns the standard benchmark specifies.
+    """
+    arrays, names = [], []
+    for field in table.schema:
+        arr = table.column(field.name)
+        if pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type):
+            arr = pc.cast(arr, pa.string())
+        arrays.append(arr)
+        names.append(field.name)
+    return pa.table(arrays, names=names)
+
+
 def _clickbench_tables(base: str, parts: int) -> dict[str, pa.Table]:
     uris = [f"{base}/hits_{i}.parquet" for i in range(parts)]
     hits = pa.concat_tables([_read(u) for u in uris]) if len(uris) > 1 else _read(uris[0])
-    return {"hits": _reconstruct_clickbench_temporals(_normalize_types(hits))}
+    return {"hits": _binary_to_utf8(_reconstruct_clickbench_temporals(_normalize_types(hits)))}
 
 
 def _tpcds_tables(scale: float, base: str) -> dict[str, pa.Table]:
@@ -489,4 +509,11 @@ def load_tables(benchmark: str, scale: float, source: str | None = None) -> dict
         return _clickbench_tables(source or CLICKBENCH_BASE, CLICKBENCH_PARTS)
     if benchmark == "tpcds":
         return _tpcds_tables(scale, source or TPCDS_BASE)
+    if benchmark == "json":
+        # The one generated dataset: no public nested-JSON parquet corpus exists, so a
+        # fixed-seed generator builds byte-identical documents shared across every engine
+        # (the same parity the parquet loaders provide). See ``json_source``.
+        from datagen import build_events
+
+        return build_events(scale)
     raise ValueError(f"unknown benchmark dataset: {benchmark!r}")
