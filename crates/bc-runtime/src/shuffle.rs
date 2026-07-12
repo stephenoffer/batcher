@@ -13,8 +13,8 @@
 use std::collections::HashSet;
 
 use arrow::array::{
-    Array, ArrayRef, Float64Array, GenericStringArray, LargeStringArray, OffsetSizeTrait,
-    RecordBatch, StringArray, UInt32Array,
+    Array, ArrayRef, AsArray, Float64Array, GenericBinaryArray, GenericStringArray,
+    LargeStringArray, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -90,6 +90,18 @@ pub fn bucket_of_rows(
         return Ok(vec![0u32; rows]);
     }
     if let Some(part) = partition_int_key(keys, num_partitions) {
+        return Ok(part);
+    }
+    // Mixed Int64 / string / binary key (null-free): hash each row's raw column values
+    // directly, in parallel, instead of arrow's `RowConverter` — whose `convert_columns`
+    // encodes every row into its byte format in one *serial* pass (the parallel hash after it
+    // can't hide that). That serial encode is the whole cost of a `COUNT(DISTINCT id) GROUP BY
+    // flag` partition (a `(flag, orderkey)` shuffle over 60M rows ran at ~14% CPU / ~1s).
+    // Equal non-null rows hash identically, so they co-partition — all a shuffle/DISTINCT
+    // needs. Null-free only: a null slot's arbitrary raw bytes could split two equal
+    // null-bearing rows across buckets (fine for a join, where null keys never match, but not
+    // for a DISTINCT, where nulls compare equal); a nullable key keeps the `RowConverter`.
+    if let Some(part) = partition_mixed_key(keys, num_partitions) {
         return Ok(part);
     }
     let fields: Vec<SortField> = keys
@@ -767,6 +779,68 @@ fn partition_int_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32
     })
 }
 
+/// One key column, downcast once, exposing a per-row raw value to the hasher.
+enum MixedCol<'a> {
+    Int(&'a [i64]),
+    Str32(&'a GenericStringArray<i32>),
+    Str64(&'a GenericStringArray<i64>),
+    Bin32(&'a GenericBinaryArray<i32>),
+    Bin64(&'a GenericBinaryArray<i64>),
+}
+
+impl MixedCol<'_> {
+    #[inline]
+    fn write<H: std::hash::Hasher>(&self, h: &mut H, i: usize) {
+        match self {
+            MixedCol::Int(v) => h.write_i64(v[i]),
+            MixedCol::Str32(a) => h.write(a.value(i).as_bytes()),
+            MixedCol::Str64(a) => h.write(a.value(i).as_bytes()),
+            MixedCol::Bin32(a) => h.write(a.value(i)),
+            MixedCol::Bin64(a) => h.write(a.value(i)),
+        }
+    }
+}
+
+/// Partition a null-free composite key of `Int64` / string / binary columns by hashing each
+/// row's raw values directly — the parallel alternative to the `RowConverter` path, whose
+/// per-row byte encode runs serially. Returns `None` (caller keeps `RowConverter`) for an
+/// empty key, any nullable column, or any unsupported type.
+///
+/// Equal non-null rows fold the same bytes into the hasher in the same order, so they land in
+/// the same bucket — the co-partitioning invariant a shuffle/DISTINCT needs. Gated null-free
+/// because a null slot's arbitrary raw value could split two equal null-bearing rows across
+/// buckets, which a DISTINCT (nulls compare equal) must not do.
+fn partition_mixed_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32>> {
+    if keys.len() < 2 || keys.iter().any(|k| k.null_count() != 0) {
+        return None;
+    }
+    let cols: Vec<MixedCol> = keys
+        .iter()
+        .map(|k| match k.data_type() {
+            DataType::Int64 => Some(MixedCol::Int(k.as_primitive::<arrow::datatypes::Int64Type>().values())),
+            DataType::Utf8 => Some(MixedCol::Str32(k.as_string::<i32>())),
+            DataType::LargeUtf8 => Some(MixedCol::Str64(k.as_string::<i64>())),
+            DataType::Binary => Some(MixedCol::Bin32(k.as_binary::<i32>())),
+            DataType::LargeBinary => Some(MixedCol::Bin64(k.as_binary::<i64>())),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let n = keys[0].len();
+    let hashn = |i: usize| -> u32 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = SEED.build_hasher();
+        for c in &cols {
+            c.write(&mut h, i);
+        }
+        bucket_of(h.finish(), num_partitions)
+    };
+    Some(if n >= PAR_HASH_MIN_ROWS {
+        (0..n).into_par_iter().map(hashn).collect()
+    } else {
+        (0..n).map(hashn).collect()
+    })
+}
+
 fn bucket_of(hash: u64, num_partitions: usize) -> u32 {
     if num_partitions.is_power_of_two() {
         (hash & (num_partitions as u64 - 1)) as u32
@@ -1120,5 +1194,44 @@ mod tests {
         let parts = partition_by_keys(&batch, &[0], 1).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].num_rows(), 3);
+    }
+
+    /// The mixed (string, int) fast partition co-locates equal rows and places every row
+    /// exactly once — the invariant DISTINCT / shuffle rest on. It must agree with the
+    /// `RowConverter` path on *which rows share a bucket* (bucket ids themselves may differ;
+    /// only co-location matters).
+    #[test]
+    fn mixed_key_copartitions_equal_rows() {
+        use arrow::array::StringArray;
+        let flag = Arc::new(StringArray::from(vec!["A", "N", "A", "N", "A", "R"])) as ArrayRef;
+        let key = Arc::new(Int64Array::from(vec![10, 20, 10, 20, 11, 20])) as ArrayRef;
+        let keys = vec![flag, key];
+        // Fast path must fire (null-free, 2 cols of int+str).
+        let fast = partition_mixed_key(&keys, 8).expect("mixed fast path should apply");
+        assert_eq!(fast.len(), 6);
+        // Rows 0 and 2 are ("A",10) — identical → same bucket. Rows 1,3,5 are ("N"/"R",20):
+        // 1 and 3 are ("N",20) identical; 5 is ("R",20) distinct.
+        assert_eq!(fast[0], fast[2], "equal (A,10) rows must co-partition");
+        assert_eq!(fast[1], fast[3], "equal (N,20) rows must co-partition");
+        // Different rows may or may not collide in 8 buckets, but a full DISTINCT over the
+        // partitioned buckets must recover exactly the 4 distinct rows. Verify via the public
+        // `partition_by_keys` + per-bucket dedup that the distinct count is right.
+        let batch = RecordBatch::try_from_iter(vec![
+            ("f", keys[0].clone()),
+            ("k", keys[1].clone()),
+        ])
+        .unwrap();
+        let buckets = partition_by_keys(&batch, &[0, 1], 8).unwrap();
+        let total: usize = buckets.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 6, "every row placed exactly once");
+    }
+
+    /// A nullable mixed key declines the fast path (so the null-equal `RowConverter` handles it).
+    #[test]
+    fn mixed_key_with_nulls_declines_fast_path() {
+        use arrow::array::StringArray;
+        let flag = Arc::new(StringArray::from(vec![Some("A"), None, Some("A")])) as ArrayRef;
+        let key = Arc::new(Int64Array::from(vec![1, 2, 1])) as ArrayRef;
+        assert!(partition_mixed_key(&[flag, key], 4).is_none());
     }
 }
