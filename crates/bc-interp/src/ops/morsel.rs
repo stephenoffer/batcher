@@ -290,7 +290,7 @@ fn split_batch(out: &mut Vec<RecordBatch>, b: &RecordBatch, target: bc_arrow::Mo
 /// contribute `width × rows`; string/binary columns their slice's data span (last minus first
 /// offset) plus the offset slots; other variable-width columns fall back to the memory-size
 /// over-count (which only makes the byte guard more conservative for those rarer types).
-fn sliced_batch_bytes(b: &RecordBatch) -> usize {
+pub(crate) fn sliced_batch_bytes(b: &RecordBatch) -> usize {
     b.columns().iter().map(sliced_column_bytes).sum()
 }
 
@@ -700,10 +700,18 @@ mod tests {
         let nearly: Vec<RecordBatch> = (0..8).map(|_| int_batch(14_400)).collect();
         let target = bc_arrow::MorselTarget::rows(16_384);
         let out = morselize(&nearly, target);
-        assert_eq!(out.len(), 8, "each near-full batch stays its own morsel, no coalescing");
+        assert_eq!(
+            out.len(),
+            8,
+            "each near-full batch stays its own morsel, no coalescing"
+        );
         assert_eq!(total_rows(&out), 8 * 14_400, "rows preserved");
         for m in &out {
-            assert_eq!(m.num_rows(), 14_400, "batches passed through unchanged (no re-split)");
+            assert_eq!(
+                m.num_rows(),
+                14_400,
+                "batches passed through unchanged (no re-split)"
+            );
         }
     }
 
@@ -714,8 +722,9 @@ mod tests {
     #[test]
     fn morselize_par_matches_sequential() {
         let long = "z".repeat(300); // wide enough to trip the per-row byte walk
-        let wide: Vec<RecordBatch> =
-            (0..40).map(|_| str_batch(&[long.as_str(); 8_000])).collect();
+        let wide: Vec<RecordBatch> = (0..40)
+            .map(|_| str_batch(&[long.as_str(); 8_000]))
+            .collect();
         let cases: Vec<(Vec<RecordBatch>, bc_arrow::MorselTarget)> = vec![
             // Parallel fast path: many full wide batches, byte-bounded.
             (wide.clone(), bc_arrow::MorselTarget::new(16_384, 64 * 1024)),
