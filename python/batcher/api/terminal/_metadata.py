@@ -19,6 +19,7 @@ from batcher.config import active_config
 from batcher.io.source import Source, iter_source
 from batcher.plan.expr_ir import Binary, Col, Expr, InList, Not
 from batcher.plan.logical import Aggregate, Filter, Join, LogicalPlan
+from batcher.plan.source_stats import source_stats_key
 from batcher.plan.visitor import walk
 
 __all__ = ["collect_source_metadata", "learn_column_stats", "ndv_columns", "seed_column_ndv"]
@@ -112,12 +113,19 @@ def collect_source_metadata(hub, sources: list[Source]) -> None:
     from batcher import kyber
 
     try:
-        known = set(kyber.load_learned_stats(hub).get(kyber.NDV_KEY, {}))
-        resolved = [
-            _stats_sample(src) for src in sources if any(c not in known for c in src.schema().names)
-        ]
-        if resolved:
-            learn_column_stats(hub, resolved)
+        learned = kyber.load_learned_stats(hub)
+        sampled: list[list[pa.RecordBatch]] = []
+        keep: list[Source] = []
+        for src in sources:
+            source_key = source_stats_key(src)
+            if source_key is None:
+                continue
+            known = set(kyber.columns_for(learned, kyber.NDV_KEY, source_key))
+            if any(c not in known for c in src.schema().names):
+                sampled.append(_stats_sample(src))
+                keep.append(src)
+        if sampled:
+            learn_column_stats(hub, sampled, keep)
     except Exception:  # pragma: no cover - learning must never break execution
         pass
 
@@ -203,33 +211,44 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
 
     try:
         wanted = ndv_columns(plan) if plan is not None else None
-        known = set(kyber.load_learned_stats(hub).get(kyber.NDV_KEY, {}))
+        learned = kyber.load_learned_stats(hub)
         max_cells = active_config().optimizer.ndv_sketch_max_cells
-        ndv_all: dict[str, float] = {}
         for src in sources:
             if not getattr(src, "resident", False):
                 continue
+            source_key = source_stats_key(src)
+            if source_key is None:
+                continue  # an unkeyable source: its stats cannot be told apart from another's
+            # "Already measured" is a question about *this* source, not about any column
+            # anywhere: a column named `id` measured on another table says nothing here.
+            known = set(kyber.columns_for(learned, kyber.NDV_KEY, source_key))
             cols = [
-                c
-                for c in src.schema().names
-                if c not in known and c not in ndv_all and (wanted is None or c in wanted)
+                c for c in src.schema().names if c not in known and (wanted is None or c in wanted)
             ]
             rows = src.row_count() or 0
             if not cols or rows * len(cols) > max_cells:
                 continue
-            ndv_all.update(core.column_ndv(src.read(projection=cols), cols))
-        if ndv_all:
-            kyber.record_column_stats(hub, ndv_all, {})
+            ndv = core.column_ndv(src.read(projection=cols), cols)
+            if ndv:
+                kyber.record_column_stats(hub, ndv, {}, source_key=source_key)
     except Exception:  # pragma: no cover - learning must never break execution
         pass
 
 
-def learn_column_stats(hub, resolved: list[list[pa.RecordBatch]]) -> None:
+def learn_column_stats(
+    hub, resolved: list[list[pa.RecordBatch]], sources: list[Source] | None = None
+) -> None:
     """Measure per-column ndv/quantiles from the just-scanned input and record them.
 
-    Gated to columns not already known, so the O(rows) sketch build happens at most
-    once per column — a bounded, one-time cost that sharpens every later plan. Core
-    measures (`core.column_statistics`); Kyber persists/consumes. Best-effort: a
+    `resolved[i]` are the batches scanned from `sources[i]`, and each source's statistics
+    are recorded **under that source's identity** — because a column name alone does not
+    identify a column, and an unqualified `{name: stat}` map lets one table's `id` answer
+    for another's on every join and group-by estimate in the process. A source that cannot
+    key itself is skipped rather than merged into the global namespace.
+
+    Gated to columns not already known *for that source*, so the O(rows) sketch build
+    happens at most once per column — a bounded, one-time cost that sharpens every later
+    plan. Core measures (`core.column_statistics`); Kyber persists/consumes. Best-effort: a
     failure here never affects the query result.
 
     The "already measured" marker is the *average byte width*, not the distinct count:
@@ -243,30 +262,29 @@ def learn_column_stats(hub, resolved: list[list[pa.RecordBatch]]) -> None:
     from batcher import core, kyber
 
     try:
-        known = set(kyber.load_learned_stats(hub).get(kyber.AVG_BYTES_KEY, {}))
+        learned = kyber.load_learned_stats(hub)
         min_frac = active_config().optimizer.cardinality.mcv_min_fraction
-        ndv_all: dict[str, float] = {}
-        quant_all: dict[str, dict[str, list[float]]] = {}
-        bytes_all: dict[str, float] = {}
-        mcv_all: dict[str, dict[str, float]] = {}
-        for batches in resolved:
+        for i, batches in enumerate(resolved):
             if not batches:
                 continue
+            source = sources[i] if sources is not None and i < len(sources) else None
+            source_key = source_stats_key(source) if source is not None else None
+            if source_key is None:
+                continue  # unkeyable: cannot be told apart from another source's columns
+            known = set(kyber.columns_for(learned, kyber.AVG_BYTES_KEY, source_key))
             cols = [c for c in batches[0].schema.names if c not in known]
             if not cols:
                 continue
             ndv, quants, avg_bytes = core.column_statistics(batches, cols)
-            ndv_all.update(ndv)
-            quant_all.update(quants)
-            bytes_all.update(avg_bytes)
             total = sum(b.num_rows for b in batches)
+            mcv: dict[str, dict[str, float]] = {}
             # MCV clears `min_frac` only on low-cardinality columns (ndv ≲ 1/min_frac);
             # skip the per-row Misra-Gries scan on keys/high-ndv columns (always empty).
             mcv_cols = [c for c in cols if ndv.get(c, 1e18) <= 1.0 / min_frac]
             for col_name, hits in core.heavy_hitters(batches, mcv_cols, min_frac).items():
                 if total > 0 and hits:
-                    mcv_all[col_name] = {str(v): n / total for v, n in hits}
-        if ndv_all or quant_all or bytes_all or mcv_all:
-            kyber.record_column_stats(hub, ndv_all, quant_all, bytes_all, mcv_all)
+                    mcv[col_name] = {str(v): n / total for v, n in hits}
+            if ndv or quants or avg_bytes or mcv:
+                kyber.record_column_stats(hub, ndv, quants, avg_bytes, mcv, source_key=source_key)
     except Exception:  # pragma: no cover - learning must never break execution
         pass

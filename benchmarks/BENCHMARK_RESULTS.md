@@ -1,5 +1,114 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## Session 2026-07-13 — projection/JIT + byte-true costing; two harness bugs; two open bugs
+
+**Landed (measured, gated).**
+
+1. **`Project` JIT-compiled bare column references.** A pure column-pruning projection
+   compiled each `Col` through Cranelift, which allocates a fresh buffer and copies the
+   column — where the interpreter returns a zero-copy `Arc` clone. `try_compile_computed`
+   already encoded exactly this rule and Aggregate already used it; Project did not.
+   TPC-H q5's 6M-row projection feeding its big join: **19.2 ms → 0.7 ms**.
+2. **The cost model costed every unmeasured row at a flat 64 B/row.** A column's width is
+   a property of its Arrow type; `row_width` only used *learned* widths and fell back to a
+   flat constant on every cold query, so a two-`int64` join key (16 B/row) and a 20-column
+   payload were both 64 B/row. That over-sized narrow build sides ~4x and forfeited the
+   broadcast join they should have had (q5's 3.6 MB build was estimated at 22 MB, over the
+   budget, so *both* sides were shuffled). New `plan/types/widths.py` derives the width from
+   the type; `broadcast_max_bytes` is recalibrated 10 → 4 MiB (it bounds a *cache*-resident
+   hash table, and was being read against the inflated widths).
+
+   TPC-H sf1 vs DuckDB, quiet 16-core box: **mean b/duckdb 1.48 → 1.33**, queries beating
+   DuckDB **4 → 8**. q5 3.12→2.49, q8 2.20→1.36, q17 2.29→1.70, q7 2.14→1.92; q2/q9/q11/q22
+   flip to wins. All correctness gates pass.
+3. **The distributed shuffle gathered every row twice** (`materialize` + `partition_by_keys`);
+   it now buckets from the morsels, gathering once. sf10 distributed join **635 → 590 ms**.
+
+**Two benchmark-harness bugs — both were manufacturing false results.**
+
+* **Daft was not installed on any worker node.** Its Ray runner (flotilla) could not start a
+  single worker, so every Daft cell read `ERR`. Installed on all 8 workers.
+* **`vs_ray_daft.py` timed the engines interleaved**, so one engine's cluster residue landed
+  on another's clock: Daft's flotilla actors are resident for the process's lifetime, and
+  `_with_timeout` *abandons* a timed-out engine's thread, which keeps consuming the cluster.
+  Batcher's sf10 join reads **3.2–3.7 s** interleaved and **0.59 s** with the cluster to
+  itself. Now engine-major (each engine sweeps alone). This is also why `filter_count` was
+  recorded as a loss to Daft (0.93x) — run fairly it is a **2.4x win**.
+
+**Distributed sf10, fair harness (9 nodes / 128 CPU), `vs_daft` >1 ⇒ batcher faster:**
+
+| pipeline | batcher_ms | daft_ms | vs_daft |
+|----------|-----------:|--------:|--------:|
+| `scan_count`   |     1 |  129 | **118x** |
+| `filter_count` |   220 |  523 | **2.38x** |
+| `groupby`      |   213 |  497 | **2.34x** |
+| `join` (isolated) | 590 | 1749 | **2.96x** |
+
+(Ray Data times out (>600 s) on filter_count/groupby/join at sf10 on this cluster; it
+completes `scan_count` in 4.6 s, where batcher is ~4500x faster.)
+
+**Two real bugs found, NOT fixed — both reproduce, both need a follow-up.**
+
+* **A prior query on the same source makes a later distributed join 5.5x slower.**
+  `filter_count` then `join` (sf10): the join goes **590 ms → 3.25 s** (stable across 3
+  runs). A preceding *groupby* does not do this (616 ms). Not the fleet, not the learned
+  shuffle fan-out, not `learned_partition_rows` — all measured unchanged. Mechanism still
+  unknown; this is the single largest distributed regression on the board.
+* **Sampled NDV is recorded as the column's NDV.** `collect_source_metadata` samples the
+  *leading* 262 k rows (`_stats_sample`) and `learn_column_stats` records that sample's
+  distinct count. A sample of *n* rows can never observe more than *n* distinct values, so
+  a high-cardinality key is recorded wildly low: sf10 `l_orderkey` (true ndv 15,000,000) is
+  learned as **91,387**. The join estimator divides by it (`|L||R| / max(ndv)`), so the
+  `lineitem ⋈ orders` output estimate jumps from the correct 59,986,052 to
+  **9,845,938,932** — 164x, and *worse than not learning at all* (with no ndv the estimator
+  falls back to `max(|L|,|R|)`, which is exact here).
+
+  A guard that refuses an ndv the sample cannot support was written and measured: it fixes
+  the *estimate* (back to 59,986,052) but **does not change wall time** (3.76 s vs 3.25 s,
+  i.e. within noise), so it was **not shipped** — the estimate is not the mechanism of the
+  bug above, and shipping an unvalidated cost-model change on a theory is how the shuffle
+  change below nearly went in wrong. The real fix is to stop sampling: sketch the full
+  column with a mergeable HLL on the workers already reading it (`bc-sketches`).
+
+**Methodology, the hard way.** The shuffle change (3) was first measured as a *5.8x
+regression* and reverted — because an isolated run was compared against an in-sweep one.
+It is a 7% win. Never compare across those two modes; and a co-tenant process on the
+benchmark box inflates batcher's single-node times far more than DuckDB's (batcher takes
+all 16 cores), so a loaded box does not merely add noise, it changes the ratio.
+
+---
+
+> **Single-node baseline vs DuckDB / Polars (2026-07-13, 16-core / 30 GB node).** The
+> numbers published in `docs/benchmarks/analytics.md` come from this run. It is a smaller
+> box than the 96-core node and 9-node cluster the sections below use, so do not compare
+> its absolute times against theirs — only the ratios within it.
+>
+> `python benchmarks/run.py --benchmark operators --tier single` (all correctness checks passed):
+>
+> | op | batcher_ms | duckdb_ms | polars_ms | b/duckdb | b/polars |
+> |----|-----------:|----------:|----------:|---------:|---------:|
+> | global-sum            |   0.5 |   2.7 |    1.8 | **0.19×** | **0.27×** |
+> | filter-count          |   0.6 |   2.7 |    8.4 | **0.20×** | **0.07×** |
+> | groupby-2key          |  11.6 |  16.9 |   28.8 | **0.68×** | **0.40×** |
+> | window-runsum         | 171.0 | 240.1 |  786.4 | **0.71×** | **0.22×** |
+> | groupby-sum           |   7.6 |  10.0 |   17.1 | **0.76×** | **0.44×** |
+> | window-sum-partition  |  92.7 |  99.9 |   73.8 | **0.93×** |     1.26× |
+> | sort-limit            |  14.1 |  13.3 |  600.7 |     1.06× | **0.02×** |
+> | filter-project        |  13.9 |  12.9 |    9.2 |     1.08× |     1.51× |
+> | join-agg              |  98.3 |  85.6 |   86.9 |     1.15× |     1.13× |
+> | window-lag            | 179.7 | 151.4 | 3216.9 |     1.19× | **0.06×** |
+> | window-rank           | 220.7 | 132.7 |  988.8 |     1.66× | **0.22×** |
+>
+> `python benchmarks/run.py --benchmark tpch --tier single --scale 1`: **batcher matches
+> DuckDB's result on all 22 queries**, but DuckDB is faster on 16 of the 21 comparable
+> ones — **geomean b/duckdb = 1.36×** (batcher slower). Batcher wins q1 (0.80×), q6
+> (0.82×), q12 (0.86×), q14 (0.71×), q16 (0.99×); it trails on the multi-join shapes q5
+> (2.99×), q8 (2.30×), q17 (2.46×), q7 (2.15×). q21 raises `NotImplementedError`
+> (correlated subqueries are not supported yet) rather than returning a wrong answer.
+> Polars errors on most of the suite through its SQL frontend, and computes q6 wrong.
+> This is consistent with the "trails on multi-joins" finding in the vs-Daft section
+> below, and with single-node parallelism reaching only ~1.7–3.8× on 16 cores.
+
 Measured on a distributed Ray cluster (9 nodes, 128 CPUs).
 **Batcher** runs single-node in-process (its low-overhead strength); **Ray Data**
 attaches to the live cluster (`ray.init(address="auto")` — its distributed home
@@ -18,6 +127,89 @@ python benchmarks/run.py --benchmark tpch --engines batcher,daft # SQL (Ray Data
 python benchmarks/scenarios/strength_bench.py                    # representative strength workloads
 python benchmarks/scenarios/dist_bench.py --workers 4            # distributed batcher on the cluster
 ```
+
+## MERGE: an upsert costs the change set, not the table (2026-07-13)
+
+`python benchmarks/scenarios/merge_bench.py --scaling` — a 1,000-row CDC batch merged into a
+Parquet table of growing size (250k rows/file). Every point runs in **its own process** (Batcher
+learns from execution, so an in-process A/B measures the learning, not the change) and every
+configuration is correctness-gated against DuckDB's own `MERGE INTO` before it is timed.
+
+A copy-on-write merge used to rewrite every data file, so an upsert cost the whole table no
+matter how little it changed. It now rewrites only the files whose key statistics prove they
+could contain one of the source's keys (`io/stats/key_pruning.py`).
+
+| table rows | files rewritten | pruned | full rewrite | speedup |
+|---|---|---|---|---|
+| 1M  | 1 / 4  | 180 ms | 185 ms  | 1.0x |
+| 5M  | 1 / 20 | 148 ms | 506 ms  | 3.4x |
+| 20M | 1 / 80 | 161 ms | 2,409 ms | **14.9x** |
+
+The speedup **grows with the table**, which is the whole point: the pruned cost is ~one file and
+stays flat, while the full rewrite is O(table). At 1M rows (4 files) there is nothing to win; by
+20M it is 15x, and it keeps going. The old single-file merge of a 5M-row target took 1,290 ms —
+the same upsert is now 148 ms.
+
+Selectivity sweep at 5M rows (`merge_bench.py 5000000`): a 1k *scattered* key set genuinely
+touches all 20 files and is correctly not pruned (1.0x, no regression); a 100% restatement is
+1.1x (it runs the identical plan). **There is no shape where pruning costs more than it saves.**
+
+Two estimator bugs found by this work and fixed, both of which had been silently taxing every
+query:
+- a learned row count was applied to **every** node kind, and `plan_signature` structures every
+  scan as the bare token `["scan"]` — so one table's measured size became every other table's
+  estimate. A 1,000-row change set inherited a 5M-row table's cardinality, its join was sized at
+  2.4 TB, and Carbonite spilled a 100k-row build side to disk (a 15x slowdown, on its own).
+- a **rank-limited** window (the fused form of `distinct(subset=…, keep=…)`) was estimated as
+  row-preserving and carried EXACT provenance, so `count()` answered it *from metadata without
+  executing* and returned the number of rows going **in** to the deduplication. `count()` and
+  `collect()` disagreed; only the cheap one lied.
+
+## Lakehouse: transaction-log file skipping + metadata-only commits (2026-07-13)
+
+`python benchmarks/scenarios/lakehouse_bench.py` — 10M rows across 200 Delta data files, one `day` per
+file. Correctness verified against DuckDB's `delta_scan` before anything is timed.
+
+**Read — a selective predicate should open one file, not two hundred.** The log records
+each file's column bounds; consulting it at plan time is the whole game. Before, the
+predicate never reached the reader in the `count(*)` shape at all (see below), so the
+query opened every file:
+
+| `count(*) WHERE day = 42` | ms | files opened |
+|---|---:|---:|
+| batcher (before) | 98.8 | 200 |
+| **batcher (now)** | **13.4** | **1** |
+| duckdb `delta_scan` | 19.0 | — |
+
+**7.4× against our own baseline, and 1.42× faster than DuckDB** (we were 2.7× *slower*).
+The provably-empty case (`day = 9999`, no file can match) went 214 ms → 9 ms.
+
+Two bugs were behind the old numbers, and neither was in the connector:
+
+1. **The `count(*)` fusion ate the predicate.** Kyber rewrites `COUNT(*)` over `Filter(p)`
+   into one `count_if(CASE WHEN p …)` pass — faster, but it *deletes* the `Filter`, and
+   source-predicate extraction reads predicates off the optimized plan by looking for a
+   `Filter` above a `Scan`. So the most ordinary lakehouse query there is pushed nothing
+   and scanned the whole table. Predicates are now recovered from the user's plan, where
+   a `Filter` on a `Scan` always constrains that scan whatever the optimizer does above it.
+2. **A proven-empty plan still read everything.** When the zone-map rules *prove* a filter
+   empty they rewrite the root to `Limit(x, 0)` — which drops the `Filter`, and with it the
+   pushdown, so the engine read all 200 files to feed a limit that discarded them. The
+   proof now short-circuits to a typed empty result with no source read at all.
+
+**Write — the driver should register the files its workers wrote, not re-encode them.**
+Commit phase, 16 worker shards / 240 MB:
+
+| driver commit | ms | bytes through the driver |
+|---|---:|---:|
+| old (stream every shard back through `write_deltalake`) | 634 | ~240 MB |
+| **new (commit `AddAction`s only)** | **4.9** | **0** |
+
+**130×** — and the shapes differ, not just the constants: the old commit is `O(rows)` and
+the new one `O(files)`, so the gap grows with the data. That was the real ceiling on a
+distributed write: however many workers wrote in parallel, 100% of the bytes still went
+through one process to be rewritten. The commit also records each file's statistics, which
+is what makes the *next* read skippable — the read and write halves are one mechanism.
 
 ## Headline: vs Ray Data, batcher is 50–450× faster (>> the 10× bar)
 
@@ -43,6 +235,59 @@ none of it.
 
 Batcher beats Ray Data **50× even on Ray Data's own `map_batches` pattern**. This is
 the structural, reliable 10×+ win.
+
+## Multimodal & physical-AI ingest — beats BOTH Ray Data and Daft (2026-07-11)
+
+The robotics / physical-AI hot path: turn a corpus of media files (camera frames, LiDAR
+point clouds, audio clips) into model-ready tensors. Measured on one 96-core node,
+best-of-3 warm, **correctness-gated** (frame/point count + output shape identical across
+engines), reproducible from `benchmarks/scenarios/`.
+
+**Image decode + resize** — 2,000 JPEG frames, `640×480 → 224×224`
+(`scenarios/image_decode.py`):
+
+| engine | ms | img/s | batcher advantage |
+|--------|---:|------:|:-----------------:|
+| **batcher** | 351 | 5,693 | — |
+| Daft | 838 | 2,388 | **2.4×** |
+| Ray Data | 2,136 | 936 | **6.1×** |
+
+**Point-cloud / LiDAR load → torch** — 20,000 frames of `4096×3` points via
+`iter_torch_batches` (`scenarios/point_cloud_load.py`):
+
+| engine | ms | frames/s | batcher advantage |
+|--------|---:|---------:|:-----------------:|
+| **batcher** | 932 | 21,467 | — |
+| Ray Data | 2,198 | 9,099 | **2.4×** |
+
+**Audio decode** — native symphonia decode vs a per-clip `soundfile` GIL loop
+(`scenarios/audio_decode.py`): native + per-row fan-out uses the whole machine on a
+sub-morsel corpus.
+
+### Why (the fix chain, this session)
+
+Image ingest started this session at ~350 img/s — **losing to both** Ray Data and Daft.
+Five fixes took it to 5,700 img/s (≈16×), clearing 2× over Daft and 6× over Ray Data:
+
+1. **Media-decode single-core throttle.** The per-row decode kernels ran serially *and*
+   the parallel executor capped its rayon pool to the morsel count — a small-JPEG corpus
+   is one morsel, so the whole decode ran on one core. Fixed with a rayon per-row
+   `map_rows` in the media kernels + `Expr/RelOp::contains_media_decode()` so `auto_width`
+   lifts the pool to all cores for a media plan. (Decode alone: 17–22×.)
+2. **SIMD resize** (`fast_image_resize`, replacing `image`'s scalar Triangle).
+3. **DCT-scaled JPEG decode** (`jpeg-decoder.scale()` at 1/2·1/4·1/8) for large-frame →
+   small-input, used only when the source is ≥2× the target.
+4. **Native tensor type — no re-type UDF.** `read.images(decode=True)` used to append a
+   Python `map_batches` just to re-type the flat list as a shaped tensor; *any* downstream
+   `map_batches` roughly halves throughput and core use (even an identity one). The engine
+   now emits the canonical `arrow.fixed_shape_tensor` field metadata directly, so pyarrow
+   reconstructs the shaped column across the FFI and the decode stays on the fully-parallel
+   native path. (2,000 → 4,600 img/s.)
+5. **Bulk concurrent read** — `MediaSource.read()` read 64-file chunks serially with a
+   fresh thread pool each; now one wide concurrent wave over all files (368 → 250 ms).
+
+Point-cloud loading already inherits #4 (`.npy` → `fixed_shape_tensor`) and the concurrent
+`FileSource` read, so it wins 2.4× over Ray Data with no modality-specific work.
 
 ## Ray Data's data-plane home turf (map ETL, inference, training ingest)
 
@@ -262,6 +507,76 @@ caches):**
 This is the straight picture: the read-path work landed here is real and verified, but
 closing the remaining ~10× to Daft at scale is a deeper distributed-throughput effort, not
 a tuning knob.
+
+> **SUPERSEDED (2026-07-12).** The section above is kept for the record; its diagnosis was
+> right about *where* the problem was and wrong about how deep it went. The fan-out
+> follow-up it names ("distributed batcher under-fans-out by default") was the dominant
+> cause, and it was a control-plane bug, not a throughput ceiling. See the next section:
+> with it fixed, batcher now **beats Daft on 4 of 5 distributed pipelines** at sf1/sf10/sf100.
+
+## Distributed vs Ray Data vs Daft, all three on the cluster (2026-07-12)
+
+Everything below is **distributed-vs-distributed**, correctness-gated (per-pipeline result
+signature compared across engines; a mismatch is printed, not hidden). All three engines
+attach to the *same* live Ray cluster — 16 × 8-CPU worker nodes (128 CPUs) + a 0-CPU head.
+Daft runs its **Ray runner** (flotilla), not its local engine; it needed installing on every
+worker node before its workers could start at all. Data is TPC-H parquet read **directly from
+S3** by each engine (the distributed read is part of the measured work).
+
+    python benchmarks/cluster/vs_ray_daft.py 10        # sf1 / sf10 / sf100
+
+`b/x` below is `engine_ms / batcher_ms` — **>1 means batcher is faster**.
+
+| pipeline | sf1 vs Ray / Daft | sf10 vs Ray / Daft | sf100 vs Ray / Daft |
+|----------|------------------:|-------------------:|--------------------:|
+| `scan_count`   | **4944×** / **162×** | **5526×** / **208×** | **7831×** / **250×** |
+| `filter_count` | **16.6×** / 1.18×    | **7.7×** / 0.92×     | **2.9×** / 0.84×     |
+| `groupby`      | **33.9×** / 1.03×    | **21.3×** / 1.18×    | **6.6×** / 1.30×     |
+| `join`         | **33.0×** / **2.23×**| **16.6×** / **1.73×**| (Ray OOM/err) / **1.72×** |
+| `udf` (map_batches) | **5.6×** / n/a  | **1.7×** / n/a       | **2.2×** / n/a       |
+
+Batcher beats **Ray Data on every pipeline at every scale**. Against **Daft** it wins the
+join (1.7–2.2×), the group-by, and the metadata-only count, and **loses only `filter_count`
+at sf10/sf100 (0.84–0.92×)** — the most purely S3-bound shape there is (scan one column,
+filter, count), where both engines are reading the same bytes from the same store and the
+gap is object-store read throughput, not execution.
+
+**Honest note on the "10× over everything" bar:** it is met against Ray Data, and it is *not*
+attainable against Daft on these shapes. Daft is also a native (Rust) engine reading the same
+S3 parquet; on an IO-bound scan, no execution engine can be 10× faster than another that is
+already at a similar fraction of the network's line rate. The wins that *are* available at
+scale are the ones taken below (don't move the bytes, don't move them twice, and use every
+node), plus scan throughput — which is the one remaining measured gap.
+
+### What was actually wrong (all control-plane / data-movement bugs, all fixed)
+
+1. **The cluster-fill fan-out was dead.** `distributed_grant` handed `execute_distributed` a
+   *derived* `num_workers`, which that function reads as an **explicit user override** and
+   therefore skips `_cluster_fill_workers()` (its one-worker-per-node fill). Any query that
+   ran with Ray already initialized fanned out to **2 of 16 workers**. The derived count now
+   travels in `envelope.n_tasks`; only a real user request suppresses the fill.
+2. **The fan-out was sized from the plan's OUTPUT rows.** `learned_num_workers` sized from
+   what the query *emits*: the sf10 join emits 5 rows (a `GROUP BY`), so it asked for ~2
+   workers to chew through 7.5M input rows. It now sizes from the volume actually processed.
+3. **Every distributed `map_batches` pipeline ran single-node on the driver.** The adaptive
+   loop's `_run_stage` sent any stage containing a UDF to the *single-node* orchestrator,
+   ignoring `distributed=True` — and adaptive is on by default, so the whole batch-inference
+   path (Ray Data's home turf) used **1 of 17 nodes**.
+4. **The distributed map never pushed a projection into its scan**, so a UDF over one column
+   of `lineitem` read all 17 from S3, on every task. (The shuffle operators always had; the
+   map path did not.)
+5. **`source_pushdown` was keyed on the pre-relabel source id.** The scan is relabeled to
+   source 0, so the lookup silently missed whenever the original id wasn't 0 — which is
+   *always* true for a join's build side. The join's right side read every column of its table.
+6. **The shuffle's flat gather was throttled by the combiner tree's fan-in.** One constant
+   (`8`) governed both, so a 16-mapper shuffle fetched in two half-idle waves. Split into
+   `flow_control.shuffle_fetch_fan_in` (a flat gather holds all its data anyway, so capping
+   its *concurrency* buys no memory — it only idles the network). The join reducer also
+   fetched its left side, *then* its right; they now stream together.
+7. **The join reducer round-tripped its whole output through Python.** `execute_plan` →
+   3.75M rows / ~106 MB of Python `RecordBatch` objects → straight back into Rust for
+   `partial_aggregate`. The new `execute_plan_aggregated` FFI entry runs the join and folds
+   the aggregate **inside the engine**, so the intermediate never crosses the boundary.
 
 ## Open levers (next, highest-leverage first)
 
