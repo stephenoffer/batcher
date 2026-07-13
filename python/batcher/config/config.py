@@ -233,6 +233,11 @@ class MemoryConfig:
     # LZ4 for strings/mixed; "lz4"/"zstd"/None force one codec. Spilled data is
     # transient, so this only trades CPU for disk I/O and footprint at scale
     # (result-invariant — IPC self-describes its compression).
+    #
+    # `spill_local_budget_bytes` is `None` (auto: derived from measured free disk),
+    # a positive byte cap, or `0` — no local scratch, so every bucket overflows
+    # straight to `spill_remote_uri` (the "local disk already full" tier, e.g. a
+    # node with no usable NVMe). `0` without a remote URI keeps everything local.
     spill_dir: str | None = None
     spill_remote_uri: str | None = None
     spill_local_budget_bytes: int | None = None
@@ -304,15 +309,25 @@ class FlowControlConfig:
 
             >>> from batcher.config import FlowControlConfig
             >>> FlowControlConfig().default_credits
-            4
+            16
     """
 
-    # Credit window (in-flight RecordBatch slots) when the operator has no estimate.
-    # One credit = one buffered batch, so this bounds a shuffle channel's memory.
-    # Carbonite is the authority that supplies it, and clamps any per-operator
-    # request to `default_credits x ceiling`. Shipped to Rust as `EngineConfig`.
-    default_credits: int = 4
-    credit_ceiling_factor: int = 16  # max window = default_credits x this
+    # Credit window (in-flight RecordBatch slots) a shuffle channel *starts* at when the
+    # operator has no learned estimate. One credit = one buffered batch, so this bounds a
+    # channel's memory; the AIMD controller then slow-starts it up to the bandwidth-delay
+    # product and holds it there. A cross-node fetch's throughput is `window x batch / RTT`,
+    # so the start matters most for the first/short fetches AIMD can't yet have ramped:
+    # measured on a 50 ms-RTT link, a single 18 MiB partition transfers at 2.4 MiB/s at 4
+    # credits vs 7.7 MiB/s at 16 (3.2x) — the old default of 4 throttled every cross-node
+    # shuffle's opening rounds. 16 credits is ~16 MiB/channel of narrow-row buffering (the
+    # byte ceiling below re-shrinks it for wide rows), well within the per-channel budget.
+    # Carbonite is the authority that supplies it, and clamps any per-operator request to
+    # `default_credits x ceiling`. Shipped to Rust as `EngineConfig`.
+    default_credits: int = 16
+    # Max window = default_credits x this. Kept so the ceiling (16 x 4 = 64 credits ≈ 64
+    # MiB/channel of narrow rows) is unchanged from the historical `4 x 16`; only the
+    # *starting* window rose, not the memory ceiling.
+    credit_ceiling_factor: int = 4
     # Byte ceiling for one shuffle channel's credit window (C53). A credit ≈ one
     # `morsel_bytes` batch, so a count-only ceiling can buffer GBs for wide rows
     # (embeddings, blobs). The granted window is also clamped to
@@ -324,6 +339,17 @@ class FlowControlConfig:
     # reduce becomes a tree of combiner stages (depth log_fan_in(workers)), so
     # per-node fan-in stays bounded as the cluster grows to many thousands.
     shuffle_fan_in: int = 8
+    # Max mapper buckets a *flat* gather (join / sort / window reduce) streams at once.
+    # Distinct from `shuffle_fan_in` above, which bounds the aggregate's combiner-TREE
+    # depth so a node never *folds* more than that many partials. A flat gather has no
+    # tree: the reducer concatenates every mapper's bucket and therefore holds all of it
+    # regardless, so throttling the fetch to the tree's fan-in buys no memory — it only
+    # serializes the network. At the old shared value of 8, a 16-worker cluster pulled its
+    # buckets in two half-idle waves and a reducer's fetch ran at ~39 MB/s. In-flight
+    # memory stays bounded by the per-channel credit window (`credit_byte_budget`), which
+    # is the actual buffering governor; this only caps how many peers are dialed at once,
+    # so a thousand-mapper shuffle still can't open a thousand sockets.
+    shuffle_fetch_fan_in: int = 32
     aimd_alpha: int = 1  # additive increase: +1 credit / RTT
     aimd_beta: float = 0.5  # multiplicative decrease on congestion
     backpressure_high: float = 0.70
@@ -436,7 +462,10 @@ class OptimizerConfig:
     # take the max of the row- and byte-derived fan-out, so a few wide rows (GB
     # videos, embeddings) still shard finely enough to fit memory. ~target_rows × 64.
     target_bytes_per_task: int = 256 * 1024 * 1024  # 256 MiB
-    fixpoint_iterations: int = 8  # max rewrite-phase iterations before bailing
+    # Floor on rewrite-phase iterations. The effective bound is `max(this, plan_depth + 4)`:
+    # pushdown descends one level per iteration, so the distance to a fixpoint scales with plan
+    # depth (`kyber.optimizer._fixpoint_bound`). A convergent phase still exits early.
+    fixpoint_iterations: int = 8
     row_bytes: int = 64  # per-row footprint for the memory-budgeting estimate
     # `split_expensive_filter`: the engine's `and` evaluates BOTH operands over every
     # row (no short-circuit, no selection vector), so a conjunction pairing a cheap
@@ -685,6 +714,25 @@ class DistributedConfig:
     # cluster with a higher background failure rate may want more attempts.
     recovery_max_attempts: int = 3
     recovery_backoff_base_s: float = 0.5
+    # Shuffle-output replication factor: how many workers hold each mapper's published
+    # buckets. 1 (default) = today's single copy, so a lost worker's output must be
+    # *recomputed* — re-reading its source partition from object storage and re-running
+    # the map, which is usually the longest part of the query. 2+ replicates each bucket
+    # onto peers on *other nodes*, so a reducer whose mapper is gone transparently fetches
+    # a byte-identical copy from a survivor: worker loss costs one re-fetch instead of a
+    # full recompute round, and the recompute loop stays as the backstop for when every
+    # copy is gone.
+    #
+    # This is affordable precisely because of the mergeable algebra: what a mapper
+    # publishes is *pre-aggregated partial state*, typically far smaller than the source
+    # that produced it, so copying it is much cheaper than regenerating it. (Spark cannot
+    # make the same trade — its shuffle carries raw rows, so it recomputes the map stage
+    # when a node takes its shuffle files with it.)
+    #
+    # The cost is one extra network copy of the shuffle output per additional replica, so
+    # it stays at 1 for a stable on-demand cluster and rises to 2 under the `spot`
+    # resilience profile, where preemption is expected rather than exceptional.
+    shuffle_replication: int = 1
     # Broken-record tolerance for the distributed scan. A single corrupt file /
     # unreadable row-group otherwise raises out of a worker's read and — because the
     # error is *deterministic* (a rerun fails identically) — the recompute loop retries

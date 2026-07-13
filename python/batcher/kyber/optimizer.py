@@ -45,10 +45,41 @@ from batcher.plan.visitor import children, transform_up, walk
 
 __all__ = ["Optimizer", "optimize", "optimize_traced"]
 
-# Confluent rewrite phases iterate to a fixpoint (bounded by
-# `OptimizerConfig.fixpoint_iterations`, which caps pathological non-convergence);
-# every other phase makes a single decision and runs once.
+# Confluent rewrite phases iterate to a fixpoint (bounded by `_fixpoint_bound`, which caps
+# pathological non-convergence); every other phase makes a single decision and runs once.
 _FIXPOINT_PHASES = frozenset({Phase.NORMALIZE, Phase.REWRITE, Phase.PUSHDOWN, Phase.FUSION})
+
+# Headroom above the plan's depth for rules whose convergence isn't purely depth-linear
+# (a rewrite that deepens the plan, then pushes through the new level).
+_FIXPOINT_DEPTH_SLACK = 4
+
+
+def _depth(plan: LogicalPlan) -> int:
+    """Longest root-to-leaf path in `plan`."""
+    stack: list[tuple[LogicalPlan, int]] = [(plan, 1)]
+    deepest = 1
+    while stack:
+        node, d = stack.pop()
+        deepest = max(deepest, d)
+        stack.extend((c, d + 1) for c in children(node))
+    return deepest
+
+
+def _fixpoint_bound(plan: LogicalPlan, configured: int) -> int:
+    """How many iterations a fixpoint phase may take, given the plan it is rewriting.
+
+    The pushdown rules are node-local over a bottom-up traversal, so a predicate descends
+    exactly **one level per iteration** — the distance to a fixpoint is the plan's depth, not a
+    constant. A fixed cap therefore doesn't bound pathological non-convergence (its purpose);
+    it silently truncates *healthy, linear* convergence on any plan deeper than the cap, leaving
+    predicates un-pushed and the engine scanning rows it should never have read. TPC-H q8 needs
+    9 iterations and the shipped cap is 8, so this fires on the benchmark's own plans.
+
+    Scaling the bound with depth makes the cap do its actual job: a plan that converges early
+    still exits early (the loop breaks on structural identity), so this costs nothing for the
+    plans that were already fine, while deep plans get the fixpoint they were promised.
+    """
+    return max(configured, _depth(plan) + _FIXPOINT_DEPTH_SLACK)
 
 
 def _applicable(rules: list[Rule], present: frozenset[type]) -> list[Rule]:
@@ -240,7 +271,7 @@ class Optimizer:
         """
         plan = logical
         last_ir: dict | None = None
-        fixpoint = self._config.optimizer.fixpoint_iterations
+        fixpoint = _fixpoint_bound(plan, self._config.optimizer.fixpoint_iterations)
         # The node-type set drives each phase's rule pattern-index. It only changes when
         # a phase rewrites the plan, so compute it once and refresh after a real change
         # rather than re-walking the whole tree at the start of every phase (7 walks → ~1
