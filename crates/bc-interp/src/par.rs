@@ -159,6 +159,46 @@ impl ExecOptions {
         bc_arrow::MorselTarget::new(self.morsel_rows, self.morsel_bytes)
     }
 
+    /// The morsel target for a relation known to hold `rows` rows.
+    ///
+    /// The configured 16,384-row morsel is a **cache** decision — sized so one morsel's working
+    /// set stays resident while an operator sweeps it. It is not a **scheduling** decision, and
+    /// on a mid-sized relation the two disagree badly: an operator fans out over its input's
+    /// morsels, so a 57k-row relation offers only 3 of them and a 16-thread pool runs on 3
+    /// threads. That is not a hypothetical — it is where TPC-H's serial operators come from:
+    ///
+    ///   - q10's 57k-row join  (3 morsels) measured 0.23 CPU utilization
+    ///   - q10's 114k-row aggregate       measured 0.09
+    ///   - q16's 18k-row sort  (1 morsel) measured 0.10 — i.e. fully serial
+    ///
+    /// Each is a *cheap* relation being processed on one core while fifteen sit idle. So size
+    /// the morsel to the pool when the relation is too small to fill it: aim for a few morsels
+    /// per worker (enough for rayon to steal past an uneven one), floored so per-morsel fixed
+    /// cost stays amortized, and **never coarser than the configured target** — a big relation
+    /// keeps the cache-friendly 16k morsel it already had.
+    ///
+    /// Scheduling only: morsel boundaries do not change what any operator computes.
+    pub(crate) fn morsel_target_for(&self, rows: usize) -> bc_arrow::MorselTarget {
+        /// Morsels per worker. >1 so an uneven morsel is stealable rather than a straggler.
+        const MORSELS_PER_WORKER: usize = 4;
+        /// Below this, per-morsel overhead (slicing, schema, a partial agg state) stops being
+        /// amortized and finer splitting costs more than the parallelism it buys.
+        const MIN_MORSEL_ROWS: usize = 1024;
+
+        let base = self.morsel_target();
+        let workers = rayon::current_num_threads();
+        if workers <= 1 || rows == 0 {
+            return base;
+        }
+        let ceiling = base.rows.max(1);
+        // The floor can never exceed the configured target: a caller that deliberately asks for
+        // a tiny morsel (the tests, a memory-pressure-shrunk target from Carbonite) must get it,
+        // not have it silently widened back out to the amortization floor.
+        let floor = MIN_MORSEL_ROWS.min(ceiling);
+        let per_morsel = rows / (workers * MORSELS_PER_WORKER).max(1);
+        bc_arrow::MorselTarget::new(per_morsel.clamp(floor, ceiling), self.morsel_bytes)
+    }
+
     /// The spill budget for one operator: its Kyber-assigned per-operator bound
     /// (`op_budgets`) when present and positive, else the global
     /// `agg_spill.memory_budget_bytes`. `None` means there is no spill envelope at
@@ -341,6 +381,49 @@ fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>], plan: &RelOp) ->
     cores.min(max_useful_workers(opts, sources)).max(1)
 }
 
+/// Re-morselize an operator's output, sizing the morsel to the relation it actually produced.
+///
+/// The point of re-morselizing is to hand the *next* operator enough pieces to fan out over.
+/// Using the fixed target does that only for big relations; a mid-sized one (a filtered fact
+/// table, a joined dimension) comes back as a handful of morsels and pins the rest of the
+/// pipeline to a handful of cores. See [`ExecOptions::morsel_target_for`].
+fn remorselize_for(out: Vec<RecordBatch>, opts: &ExecOptions) -> Vec<RecordBatch> {
+    let rows = count_rows(&out) as usize;
+    ops::remorselize(out, opts.morsel_target_for(rows))
+}
+
+/// How many hash buckets the shuffle join should partition into, given the worker count and
+/// the size of the larger input.
+///
+/// **Not** one bucket per thread. A per-bucket join is an indivisible rayon task, so with
+/// `threads` buckets the operator's wall time is set by the *largest* bucket while every other
+/// core sits idle — real key distributions are never uniform, and rayon has nothing left to
+/// steal. That is the mechanism behind the hash join's measured 0.59 CPU utilization (the worst
+/// of any major TPC-H operator, and it is also the most expensive one).
+///
+/// Cutting finer than the worker count turns bucket-size imbalance back into stealable work:
+/// a core that draws a small bucket picks up another instead of waiting. The floor keeps that
+/// from backfiring on small inputs, where more buckets would only multiply the per-bucket join's
+/// fixed cost (hash table setup, schema plumbing) over ever-tinier relations.
+///
+/// Partitioning is by `hash(key) % buckets`, so equal keys still share a bucket at any count —
+/// the union of the per-bucket joins is the same relation. Only *scheduling* changes.
+fn shuffle_buckets(threads: usize, rows: usize) -> usize {
+    /// Buckets per worker. 4 is the usual radix-partitioning sweet spot: enough slack for
+    /// stealing to hide a 2–3x bucket imbalance, few enough that per-bucket fixed cost stays
+    /// amortized.
+    const OVERPARTITION: usize = 4;
+    /// Below this many rows a bucket's fixed cost stops being amortized, so stop subdividing.
+    const MIN_ROWS_PER_BUCKET: usize = 8 * 1024;
+    if threads <= 1 {
+        return 1;
+    }
+    // Never fewer than `threads` (that is the parallelism floor), never so many that buckets
+    // fall under the amortization threshold.
+    let by_rows = rows / MIN_ROWS_PER_BUCKET;
+    (threads * OVERPARTITION).min(by_rows.max(threads)).max(1)
+}
+
 /// An upper bound on workers that could have a morsel to process: the largest number of
 /// morsels any single source yields. Operators fan out over one input's morsels at a
 /// time, so the widest leaf bounds the widest `par_iter`.
@@ -490,7 +573,10 @@ fn exec(
                 source_id: *source_id,
                 available: sources.len(),
             })?;
-            let out = ops::morselize_par(batches, opts.morsel_target());
+            let out = ops::morselize_par(
+                batches,
+                opts.morsel_target_for(count_rows(batches) as usize),
+            );
             let rows = count_rows(&out);
             push_metric(m, op_id, "scan", rows, &out, t0, false, "interp");
             Ok(out)
@@ -530,7 +616,7 @@ fn exec(
                 .collect::<Result<_, InterpError>>()?;
             // A projection can add a wide column (a large string, an embedding, a
             // decoded image), so re-bound the output to the byte budget.
-            let out = ops::remorselize(out, opts.morsel_target());
+            let out = remorselize_for(out, opts);
             push_metric(m, op_id, "project", rows_in, &out, t0, false, backend);
             Ok(out)
         }
@@ -549,7 +635,7 @@ fn exec(
                 .collect::<Result<_, InterpError>>()?;
             // Unnest multiplies rows (a list of N explodes one row into N), so a
             // within-budget input morsel can produce an over-budget output morsel.
-            let out = ops::remorselize(out, opts.morsel_target());
+            let out = remorselize_for(out, opts);
             push_metric(m, op_id, "unnest", rows_in, &out, t0, false, "interp");
             Ok(out)
         }
@@ -586,7 +672,7 @@ fn exec(
                 .collect::<Result<_, InterpError>>()?;
             // Unpivot stacks `on` columns into rows, multiplying row count, so
             // re-bound the output to the byte budget.
-            let out = ops::remorselize(out, opts.morsel_target());
+            let out = remorselize_for(out, opts);
             push_metric(m, op_id, "unpivot", rows_in, &out, t0, false, "interp");
             Ok(out)
         }
@@ -799,9 +885,14 @@ fn exec(
             // GROUP BY (tens/hundreds of thousands of groups) otherwise emits one big batch whose
             // consumers run single-threaded. Low-cardinality output is one small batch, so this
             // is a no-op there. (The partitioned path already emits per-partition batches.)
-            let out = ops::remorselize(
-                vec![ops::build_agg_batch(group_keys, aggregates, &group_columns, &agg_cols)?],
-                opts.morsel_target(),
+            let out = remorselize_for(
+                vec![ops::build_agg_batch(
+                    group_keys,
+                    aggregates,
+                    &group_columns,
+                    &agg_cols,
+                )?],
+                opts,
             );
             push_breaker_spilled(
                 m,
@@ -856,7 +947,16 @@ fn exec(
                             &opts.tuning,
                         )? {
                             let rows_in = count_rows(&lbs) + count_rows(&rbs);
-                            push_metric(m, op_id, "sort", rows_in, &out, jt0, false, "interp-jointopn");
+                            push_metric(
+                                m,
+                                op_id,
+                                "sort",
+                                rows_in,
+                                &out,
+                                jt0,
+                                false,
+                                "interp-jointopn",
+                            );
                             return Ok(out);
                         }
                     }
@@ -904,7 +1004,7 @@ fn exec(
                             // never re-morselized) would otherwise become a single run
                             // larger than the working-set budget. The merge phase is
                             // already fan-in bounded, so this caps peak sort memory.
-                            let parts = ops::remorselize(parts, opts.morsel_target());
+                            let parts = remorselize_for(parts, opts);
                             let (sorted, vol) = ops::external_merge_sort(
                                 parts,
                                 keys,
@@ -1026,7 +1126,7 @@ fn exec(
             // single core (a col-ref Project over a 6M-row window output measured ~50 ms
             // single-threaded). Re-morselize so the pipeline below the breaker fans back
             // out across cores; the split is zero-copy Arrow slices. Same rows, same order.
-            let out = ops::remorselize(out, opts.morsel_target());
+            let out = remorselize_for(out, opts);
             push_breaker_spilled(
                 m, op_id, "window", rows_in, 0, in_bytes, &out, t0, spill, spill_vol, "interp",
             );
@@ -1264,7 +1364,7 @@ fn exec(
                 // a handful when the build side is large), which would run every downstream
                 // operator on those few big batches single-threaded. Re-morselize (zero-copy
                 // slices) so the pipeline below fans back out across cores.
-                let out = ops::remorselize(out, opts.morsel_target());
+                let out = remorselize_for(out, opts);
                 push_breaker(
                     m,
                     op_id,
@@ -1280,7 +1380,15 @@ fn exec(
                 return Ok(out);
             }
 
-            let p = rayon::current_num_threads().max(1);
+            // More buckets than threads, so rayon can *steal* join work. With exactly one
+            // bucket per thread the per-bucket joins are indivisible tasks of unequal size, so
+            // the slowest bucket sets the operator's wall time and every other core idles
+            // waiting for it — measured at 0.59 CPU utilization across TPC-H, the worst of any
+            // big operator. Over-partitioning turns that imbalance into stealable work.
+            let p = shuffle_buckets(
+                rayon::current_num_threads().max(1),
+                count_rows(&left_batches).max(rows_build) as usize,
+            );
 
             // Bucket both sides straight from their morsels, gathering each row **once**.
             // `materialize(&batches)` here used to concatenate a relation only for
@@ -1357,7 +1465,7 @@ fn exec(
                 .collect();
             // Even out the per-bucket output batches (a hot key makes one bucket far larger
             // than the rest) so the downstream operators see balanced, core-sized morsels.
-            let out = ops::remorselize(out, opts.morsel_target());
+            let out = remorselize_for(out, opts);
             let backend = match (skewed_any, *strategy == bc_ir::JoinStrategy::SortMerge) {
                 (true, _) => "interp-skew",
                 (false, true) => "interp-smj",
@@ -1390,7 +1498,7 @@ fn exec(
             // across cores instead of processing the whole relation on one thread. A single
             // large distinct batch feeding an aggregate ran that aggregate at ~1% CPU
             // (TPC-H Q16: the outer group-by over the deduped rows was 62% of the query, serial).
-            let out = ops::remorselize(vec![batch], opts.morsel_target());
+            let out = remorselize_for(vec![batch], opts);
             push_breaker_spilled(
                 m, op_id, "distinct", rows_in, 0, in_bytes, &out, t0, spilled, spill_vol, "interp",
             );
@@ -1597,7 +1705,7 @@ fn exec_fused(
     }
     // A projection can widen a column, so re-bound the fused output to the byte budget
     // (matches the unfused Project path; relation-preserving — rows and order unchanged).
-    let out = ops::remorselize(out, opts.morsel_target());
+    let out = remorselize_for(out, opts);
 
     // Emit one metric per fused op in apply order (children before parents, as the
     // recursion does). Rows exact; wall-time split evenly; peak bytes to the outermost
@@ -2418,6 +2526,86 @@ mod tests {
             auto_width(&opts, &[small, large], &no_media_plan()),
             4.min(cores)
         );
+    }
+
+    /// A relation too small to fill the pool gets a finer morsel, so every core still gets work.
+    /// This is the fix for the serial mid-sized operators (a 57k-row join ran on 3 of 16 threads).
+    #[test]
+    fn morsel_target_for_splits_a_midsized_relation_finely() {
+        let opts = ExecOptions::default();
+        let workers = rayon::current_num_threads();
+        if workers <= 1 {
+            return; // a single-threaded pool has nothing to spread over
+        }
+        // 57k rows at the fixed 16,384 target is only 3 morsels — fewer than the workers.
+        let coarse = opts.morsel_target().rows;
+        let fine = opts.morsel_target_for(57_000).rows;
+        assert!(
+            fine < coarse,
+            "a mid-sized relation must be cut finer than the fixed target"
+        );
+        let morsels = 57_000usize.div_ceil(fine);
+        assert!(
+            morsels >= workers,
+            "{morsels} morsels for {workers} workers — still cannot fill the pool"
+        );
+    }
+
+    /// A big relation keeps the configured, cache-friendly morsel: it already has plenty.
+    #[test]
+    fn morsel_target_for_never_coarsens_or_over_splits_a_large_relation() {
+        let opts = ExecOptions::default();
+        let base = opts.morsel_target().rows;
+        assert_eq!(opts.morsel_target_for(100_000_000).rows, base);
+        // and never *coarser* than the configured target, for any size
+        for rows in [0usize, 1, 5_000, 57_000, 1_000_000, 100_000_000] {
+            assert!(opts.morsel_target_for(rows).rows <= base);
+        }
+    }
+
+    /// The floor holds: a tiny relation is not shredded into per-row morsels.
+    #[test]
+    fn morsel_target_for_floors_tiny_relations() {
+        let opts = ExecOptions::default();
+        assert!(opts.morsel_target_for(100).rows >= 1024);
+        assert!(opts.morsel_target_for(1).rows >= 1024);
+        // rows == 0 is the "unknown" case and must fall back to the fixed target, not to 0.
+        assert_eq!(opts.morsel_target_for(0).rows, opts.morsel_target().rows);
+    }
+
+    /// A big join over-partitions past the worker count, so an uneven bucket becomes work
+    /// another core can steal rather than a straggler everyone waits on.
+    #[test]
+    fn shuffle_buckets_oversubscribes_a_large_join() {
+        assert_eq!(shuffle_buckets(16, 6_000_000), 64); // 16 x 4
+        assert_eq!(shuffle_buckets(8, 6_000_000), 32);
+    }
+
+    /// A small relation must not be shredded: below the amortization floor, extra buckets only
+    /// multiply the per-bucket join's fixed cost over ever-tinier inputs.
+    #[test]
+    fn shuffle_buckets_does_not_shred_a_small_join() {
+        // 100k rows / 8k = 12 buckets' worth, which is under the 16-thread floor -> stay at 16.
+        assert_eq!(shuffle_buckets(16, 100_000), 16);
+        // A tiny relation still gets the parallelism floor, never zero buckets.
+        assert_eq!(shuffle_buckets(16, 10), 16);
+        assert_eq!(shuffle_buckets(16, 0), 16);
+    }
+
+    /// It never drops below the worker count (that would *lose* parallelism) and is never 0.
+    #[test]
+    fn shuffle_buckets_respects_the_parallelism_floor() {
+        for threads in [2usize, 4, 8, 16, 32] {
+            for rows in [0usize, 1, 10_000, 1_000_000, 100_000_000] {
+                let b = shuffle_buckets(threads, rows);
+                assert!(
+                    b >= threads,
+                    "{threads} threads, {rows} rows -> {b} buckets"
+                );
+                assert!(b <= threads * 4);
+            }
+        }
+        assert_eq!(shuffle_buckets(1, 1_000_000), 1); // single-threaded: one bucket, no shuffle
     }
 
     /// No sources (a literal-only plan) still needs one worker, never zero.
