@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
     from batcher.api.dataset import Dataset
+    from batcher.api.merge import MergeBuilder
     from batcher.api.streaming import StreamingQuery
     from batcher.io.manifest import WriteManifest
     from batcher.plan.streaming import Trigger
@@ -24,14 +25,18 @@ if TYPE_CHECKING:
 __all__ = ["Writer"]
 
 
-# Save modes (Spark `SaveMode` parity). `append` is only meaningful for the
-# transactional lakehouse sinks, which consume `mode` as a constructor option; the
-# file sinks always overwrite, so for them `mode` only drives the existence gate.
+# Save modes (Spark `SaveMode` parity). `append` is only meaningful for the sinks that
+# can add to an existing target — the transactional lakehouse tables and the warehouse
+# tables — which consume `mode` as a constructor option; the file sinks always overwrite,
+# so for them `mode` only drives the existence gate.
+#
+# A sink that honors `mode` MUST be listed here. `snowflake` was not, and the result was
+# the worst of both: `mode="append"` was rejected even though `SnowflakeSink` implements
+# it, and `mode="overwrite"` passed the gate but never reached the sink, so the write
+# quietly appended instead. A save mode that silently does the opposite of what it says is
+# a data-corruption bug, not a missing feature.
 _SAVE_MODES = ("overwrite", "error", "ignore", "append")
-_MODE_AWARE_SINKS = frozenset({"delta", "iceberg", "hudi"})
-# Sinks with a native transactional MERGE; others fall back to a copy-on-write
-# file merge (`api.merge.compose_file_merge`).
-_MERGE_NATIVE_SINKS = frozenset({"delta"})
+_MODE_AWARE_SINKS = frozenset({"delta", "iceberg", "hudi", "snowflake"})
 
 
 class Writer:
@@ -65,7 +70,7 @@ class Writer:
         *,
         mode: str = "overwrite",
         partition_by: list[str] | None = None,
-        distributed: bool = False,
+        distributed: bool | str = "auto",
         num_workers: int | None = None,
         resume: bool = False,
         max_rows_per_file: int | None = None,
@@ -75,6 +80,7 @@ class Writer:
         output_mode: str = "append",
         checkpoint: str | None = None,
         query_name: str | None = None,
+        auto_compact: bool = False,
         **opts: Any,
     ) -> WriteManifest | StreamingQuery:
         """Execute and write the result, inferring `format` from the path when omitted.
@@ -170,8 +176,20 @@ class Writer:
 
         # Unified surface: a trigger or an unbounded source means this is a streaming
         # write — append micro-batches to `path` and return a StreamingQuery.
+        #
+        # The distributed *stream* drain stays EXPLICIT opt-in (`distributed=True`), not
+        # `"auto"`: it supports only a stateless `available_now()` backfill and raises for
+        # a checkpointed / continuous / stateful stream. Letting `"auto"` resolve it True
+        # on a cluster would turn those into errors for users who never asked to
+        # distribute. The batch path below resolves `"auto"` normally.
         if trigger is not None or any(not is_bounded(s) for s in self._ds._sources):
-            sink = self._stream_sink_for(path, fmt, opts)
+            if distributed is True:
+                drain = self._maybe_distributed_stream(
+                    path, fmt, opts, trigger, checkpoint, num_workers, query_name
+                )
+                if drain is not None:
+                    return drain
+            sink = self._stream_sink_for(path, fmt, opts, query_name)
             return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
 
         # Resume is exactly-once only on a deterministic plan: the same input must
@@ -194,14 +212,30 @@ class Writer:
                     "materialize a stable keyed intermediate first."
                 )
 
-        # `replace_where` = dynamic partition/range overwrite (Delta `replaceWhere` /
-        # the backfill pattern): atomically replace only the rows matching the
-        # predicate, preserving the rest. Copy-on-write: keep the existing rows
-        # *outside* the range, union the new data, overwrite. Single-writer only.
+        # `replace_where` = dynamic partition/range overwrite (Delta `replaceWhere` / the
+        # backfill pattern): atomically replace only the rows matching the predicate and
+        # keep the rest.
+        #
+        # On a **Delta** table this is a scoped commit: the workers write the new
+        # partition's files and the driver retires exactly the matching partitions from the
+        # log. Nothing else is read and nothing else is rewritten, so backfilling one day of
+        # a 100 TB table costs one day. The copy-on-write path below cannot do that — it
+        # reads the *whole* table, filters out the replaced range, unions, and overwrites
+        # everything, which turns a one-day backfill into a full-table rewrite. That is what
+        # every lakehouse target used to do.
         if replace_where is not None:
             from batcher.io.filesystem import resolve_filesystem
 
-            if resolve_filesystem(path).exists(path):
+            if fmt in ("delta", "iceberg"):
+                # A lakehouse target scopes the overwrite to the predicate, inside its own
+                # transaction. Iceberg used to fall through the `exists(path)` check below —
+                # an Iceberg "path" is a catalog identifier, not a file, so the check was
+                # always False, `replace_where` was silently dropped, and the write ran as a
+                # plain overwrite that DELETED THE REST OF THE TABLE.
+                opts = dict(opts)
+                opts["replace_where"] = replace_where.to_ir()
+                mode = "overwrite"
+            elif resolve_filesystem(path).exists(path):
                 kept = _read(path, format=fmt).filter(~replace_where)
                 combined = kept.union(self._ds)
                 return combined.write(
@@ -252,6 +286,7 @@ class Writer:
             self._ds.columns,
             path,
             fmt,
+            auto_compact=auto_compact,
             partition_by=partition_by,
             distributed=distributed,
             num_workers=num_workers,
@@ -284,12 +319,80 @@ class Writer:
             checkpoint=checkpoint,
         )
 
-    def _stream_sink_for(self, path: str, fmt: str, opts: dict[str, Any]) -> Any:
-        """Build the per-micro-batch `StreamSink` for a path/format streaming write."""
+    def _maybe_distributed_stream(
+        self,
+        path: str,
+        fmt: str,
+        opts: dict[str, Any],
+        trigger: Trigger | None,
+        checkpoint: str | None,
+        num_workers: int | None,
+        query_name: str | None,
+    ) -> StreamingQuery | None:
+        """Run a `distributed=True` streaming write as a parallel cluster drain, if eligible.
+
+        The supported distributed streaming shape today is a *backfill*: an
+        `available_now`/`once` trigger draining a splittable single source through a
+        stateless pipeline, which fans read+transform+write across workers (Spark's
+        `Trigger.AvailableNow`). Returns a `StreamingQuery` for that case. A benign
+        mismatch (a non-splittable source) returns ``None`` so the caller falls back to
+        the single-node engine; an unsupported *request* (a continuous trigger, a
+        checkpoint, or a stateful plan with `distributed=True`) raises `PlanError` rather
+        than silently ignoring the flag.
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.api.streaming import _DRAIN_TRIGGER_KINDS, _is_stateless
+        from batcher.dist.executor import _is_splittable_source
+
+        if trigger is None or trigger.kind not in _DRAIN_TRIGGER_KINDS:
+            raise PlanError(
+                "distributed=True streaming currently supports Trigger.available_now() / "
+                "once() (a parallel backfill/drain of the currently-available data). "
+                "Continuous and processing-time distributed streaming are not yet "
+                "available — omit distributed for those (single-node), or use a drain "
+                "trigger to fan the backfill across the cluster."
+            )
+        if checkpoint is not None:
+            raise PlanError(
+                "distributed=True streaming does not yet checkpoint (per-partition offset "
+                "coordination is not implemented). Omit checkpoint for the distributed "
+                "drain, or run single-node (distributed=False) for exactly-once recovery."
+            )
+        if not _is_stateless(self._ds._plan):
+            raise PlanError(
+                "distributed=True streaming supports only stateless pipelines "
+                "(filter / select / map_batches). A streaming aggregation must run "
+                "single-node today — omit distributed."
+            )
+        srcs = self._ds._sources
+        if len(srcs) != 1 or not _is_splittable_source(srcs[0]):
+            return None  # not worth (or not able to) fan out — fall back to single-node
+        from batcher.api.streaming import start_distributed_stream_drain
+
+        return start_distributed_stream_drain(
+            self._ds._plan,
+            srcs,
+            path,
+            fmt,
+            opts,
+            self._ds.columns,
+            num_workers=num_workers,
+            name=query_name,
+        )
+
+    def _stream_sink_for(
+        self, path: str, fmt: str, opts: dict[str, Any], query_name: str | None = None
+    ) -> Any:
+        """Build the per-micro-batch `StreamSink` for a path/format streaming write.
+
+        `query_name` becomes the transactional sink's Delta ``txn`` application id, which
+        is what makes a restarted query's replayed micro-batch idempotent — so it has to
+        reach the sink, not just the query engine.
+        """
         from batcher.io.formats.streaming.sinks import DeltaStreamSink, FileStreamSink
 
         if fmt in _MODE_AWARE_SINKS:
-            return DeltaStreamSink(path, **opts)
+            return DeltaStreamSink(path, query_name=query_name, **opts)
         return FileStreamSink(path, fmt, **opts)
 
     def console(
@@ -672,9 +775,69 @@ class Writer:
             when_matched=when_matched,
             when_not_matched=when_not_matched,
             format=format,
-            native_sinks=_MERGE_NATIVE_SINKS,
             opts=opts,
         )
+
+    def merge_into(
+        self,
+        target: str,
+        *,
+        on: str | list[str],
+        prune: bool = True,
+        format: str | None = None,
+        **opts: Any,
+    ) -> MergeBuilder:
+        """Open a full ``MERGE INTO`` against `target`, keyed on `on` — the general form.
+
+        `merge` is the two-clause shorthand (update the matched, insert the rest). This is
+        the whole statement: any number of ordered ``WHEN`` clauses, each with its own
+        condition, each writing whichever columns it likes — including ``WHEN NOT MATCHED
+        BY SOURCE``, which acts on the target rows the change set never mentioned (how a
+        snapshot load expires departed rows, and how SCD-2 closes a version). Clauses are
+        tried in the order added; the first whose condition holds wins.
+
+        The merge rewrites only the data files whose key statistics prove they could hold
+        one of the source's keys — so an upsert costs the change set, not the table. (A
+        ``when_not_matched_by_source`` clause is *about* the untouched rows, so it forces a
+        full rewrite; see `when_not_matched_by_source`.)
+
+        Args:
+            target: Path/URI of the table to merge into.
+            on: Key column(s) matching a source row to a target row.
+            prune: Skip target files the source's keys provably cannot reach. Correctness
+                does not depend on it — turning it off only rewrites everything.
+            format: Sink format override; inferred from `target` when omitted.
+            opts: Additional write options forwarded to the sink.
+
+        Returns:
+            A `MergeBuilder`; add clauses, then call `execute`.
+
+        Examples:
+            .. doctest::
+
+                >>> import tempfile, os
+                >>> import batcher as bt
+                >>> from batcher import lit, source_col
+                >>> path = os.path.join(tempfile.mkdtemp(), "orders.parquet")
+                >>> _ = bt.from_pydict({"id": [1, 2], "amount": [10, 20]}).write.parquet(path)
+                >>> changes = bt.from_pydict({"id": [2, 3], "amount": [99, 30]})
+                >>> _ = (
+                ...     changes.write.merge_into(path, on="id")
+                ...     .when_matched(source_col("amount") > lit(50))
+                ...     .delete()
+                ...     .when_matched()
+                ...     .update_all()
+                ...     .when_not_matched()
+                ...     .insert_all()
+                ...     .execute()
+                ... )
+                >>> sorted(bt.read.parquet(path).collect().to_pydict()["id"])
+                [1, 3]
+        """
+        from batcher.api.merge import MergeBuilder
+
+        keys = [on] if isinstance(on, str) else list(on)
+        return MergeBuilder(self._ds, target, keys, prune=prune, format=format, opts=opts)
 
     # --- Lakehouse / catalog ----------------------------------------------
     def delta(
@@ -683,6 +846,8 @@ class Writer:
         *,
         mode: str = "append",
         merge_on: str | list[str] | None = None,
+        auto_compact: bool = False,
+        merge_schema: bool = False,
         **opts: Any,
     ) -> WriteManifest:
         """Write to a Delta Lake table (one transactional commit).
@@ -692,10 +857,22 @@ class Writer:
         keys build the match predicate; pass `merge_predicate=` instead for a custom
         one. Otherwise `mode` is ``"append"`` (default) or ``"overwrite"``.
 
+        ``auto_compact=True`` bin-packs the table after the commit if it has accumulated
+        enough small files. An incremental writer leaves one small file per commit and the
+        next write cannot fix that — it only adds another — so a table nobody compacts
+        eventually costs more to *plan* than to read. The check counts the table's standing
+        small files (from the log, not by opening anything), and the compaction is the same
+        transaction `bt.compact` runs, so it never deletes a file an older version still
+        references. It runs *after* the commit, so a failed compaction cannot fail the write.
+
         Args:
             uri: Path/URI of the Delta table root.
             mode: ``"append"`` (default) or ``"overwrite"`` when not merging.
             merge_on: Key column(s) to upsert on; triggers a ``MERGE INTO``.
+            auto_compact: Bin-pack the table after the commit if small files have piled up.
+            merge_schema: Evolve the table to accept columns this write has and the table
+                does not. Off by default — an unexpected column is refused rather than
+                silently written into the files where the table cannot see it.
             opts: Additional write options (e.g. ``merge_predicate=``) forwarded to the sink.
 
         Returns:
@@ -712,7 +889,8 @@ class Writer:
             from batcher.api.merge import merge_predicate_for
 
             opts["merge_predicate"] = merge_predicate_for(merge_on)
-        return self(uri, "delta", mode=mode, **opts)
+        opts["merge_schema"] = merge_schema
+        return self(uri, "delta", mode=mode, auto_compact=auto_compact, **opts)
 
     def iceberg(self, identifier: str, *, mode: str = "append", **opts: Any) -> WriteManifest:
         """Write to an Iceberg table (``mode="append"|"overwrite"``).

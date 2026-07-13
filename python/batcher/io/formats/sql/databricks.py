@@ -201,7 +201,14 @@ class DatabricksSource:
             return f"databricks:{self.table}"
         return f"databricks-wh:{self.http_path}:{self.query}"
 
-    def splits(self, target_size: int | None = None) -> list[Split]:
+    def splits(self, target_size: int | None = None, predicate: dict | None = None) -> list[Split]:
+        """Splits for the table, with transaction-log file skipping on the lakehouse path.
+
+        A Unity Catalog table *is* a Delta table, so threading the pushed predicate down
+        to the Delta source is what gives a Databricks-catalog read the same file
+        skipping a path-addressed Delta read gets. Without it, resolving a table by name
+        silently cost every data file in the table.
+        """
         if self._is_lakehouse():
-            return self._delta_source().splits(target_size)
+            return self._delta_source().splits(target_size, predicate)
         return [self._warehouse_split()]

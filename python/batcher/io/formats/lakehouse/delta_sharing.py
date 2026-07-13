@@ -70,6 +70,60 @@ def _list_files(url: str) -> list[Any]:
     return list(response.add_files)
 
 
+def _surviving_urls(files: list[Any], predicate: dict | None) -> list[str]:
+    """The pre-signed URLs of the shared files that can contain a row matching `predicate`.
+
+    Each `AddFile` carries a Delta ``stats`` JSON string. Normalizing those into the
+    add-action manifest layout lets the shared table reuse the same pruning the local
+    Delta reader uses (`io.stats.file_skipping`) instead of fetching every file. Any file
+    whose statistics are missing or unparseable is kept — an unknown must never prune.
+    """
+    if predicate is None or not files:
+        return [f.url for f in files]
+    manifest = _stats_manifest(files)
+    if manifest is None:
+        return [f.url for f in files]
+    from batcher.io.stats.file_skipping import surviving_files
+
+    keep = surviving_files(predicate, manifest)
+    if keep is None:
+        return [f.url for f in files]
+    surviving = set(keep)
+    return [f.url for f in files if f.url in surviving]
+
+
+def _stats_manifest(files: list[Any]) -> pa.Table | None:
+    """The shared files' Delta ``stats`` as an add-action manifest, or None if unusable.
+
+    A file with no recorded statistics contributes a row of nulls rather than being
+    dropped from the manifest, so it survives pruning (a missing stat is an unknown).
+    """
+    import json
+
+    rows: list[dict[str, Any]] = []
+    for f in files:
+        row: dict[str, Any] = {"path": f.url, "num_records": None}
+        raw = getattr(f, "stats", None)
+        if raw:
+            try:
+                stats = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            except (ValueError, TypeError):
+                stats = {}
+            row["num_records"] = stats.get("numRecords")
+            for key, prefix in (
+                ("minValues", "min."),
+                ("maxValues", "max."),
+                ("nullCount", "null_count."),
+            ):
+                for column, value in (stats.get(key) or {}).items():
+                    row[f"{prefix}{column}"] = value
+        rows.append(row)
+    try:
+        return pa.Table.from_pylist(rows)
+    except (pa.ArrowInvalid, pa.ArrowTypeError):
+        return None  # heterogeneous stat types across files → prune nothing
+
+
 def _read_presigned(
     file_url: str, projection: list[str] | None, predicate: dict | None = None
 ) -> pa.Table:
@@ -124,19 +178,21 @@ class DeltaSharingSource:
     ) -> list[pa.RecordBatch]:
         from batcher.io._concurrent import read_each_file
 
-        files = self._files()
+        # Skip the files the shared statistics rule out *before* fetching: each one the
+        # predicate eliminates is an object-storage round trip that never happens.
+        urls = _surviving_urls(self._files(), predicate)
         # Each shared file is a separate presigned-URL parquet fetch that releases the GIL;
         # read them concurrently so a many-file shared table isn't fetched one at a time.
         tables = read_each_file(
-            None, files, lambda _fs, f: _read_presigned(f.url, projection, predicate)
+            None, urls, lambda _fs, url: _read_presigned(url, projection, predicate)
         )
         return [b for table in tables for b in table.to_batches()]
 
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        for f in self._files():
-            yield from _read_presigned(f.url, projection, predicate).to_batches()
+        for url in _surviving_urls(self._files(), predicate):
+            yield from _read_presigned(url, projection, predicate).to_batches()
 
     def row_count(self) -> int | None:
         return None  # pre-signed URLs carry no guaranteed cheap count.
@@ -144,9 +200,23 @@ class DeltaSharingSource:
     def identity(self) -> str:
         return f"delta_sharing:{self._url}"
 
-    def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
-        """One Split per pre-signed Parquet file in the shared table."""
-        return [DeltaSharingFileSplit(file_url=f.url) for f in self._files()]
+    def splits(
+        self,
+        target_size: int | None = None,  # noqa: ARG002 - shared files are not coalescable
+        predicate: dict | None = None,
+    ) -> list[Split]:
+        """One Split per pre-signed Parquet file that can match `predicate`.
+
+        The sharing protocol already sends each file's Delta statistics alongside its
+        pre-signed URL — the same ``numRecords``/``minValues``/``maxValues``/``nullCount``
+        a local `_delta_log` carries — and they were being thrown away. Reading them lets
+        a shared table be pruned exactly like a local one, which matters *more* here than
+        locally: a skipped file is an object-storage GET over the wire that never happens.
+        Files whose statistics are absent or undecidable are kept (see `file_skipping`).
+        """
+        files = self._files()
+        surviving = _surviving_urls(files, predicate)
+        return [DeltaSharingFileSplit(file_url=url) for url in surviving]
 
 
 class DeltaSharingFileSplit:

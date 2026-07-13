@@ -195,6 +195,23 @@ def run_relational(
         return _run_relational(plan, sources, ctx, distributed=distributed, materialize=materialize)
 
 
+def _proven_empty_table(logical_opt: LogicalPlan, plan: LogicalPlan) -> pa.Table | None:
+    """A typed, zero-row result when the optimizer proved the plan yields no rows.
+
+    Kyber signals that proof by rewriting the root to a `Limit(input, 0)` — the only way
+    the plan algebra can say "provably empty". The result is then fully determined by
+    the output schema, so no source is read and the engine never runs. Returns None
+    (execute normally) when the root is not that shape or the schema cannot be inferred
+    without executing.
+    """
+    from batcher.plan.logical import Limit
+
+    if not (isinstance(logical_opt, Limit) and logical_opt.n == 0):
+        return None
+    inferred = plan.available_schema()
+    return None if inferred is None else inferred.arrow.empty_table()
+
+
 def _run_relational(
     plan: LogicalPlan,
     sources: list[Source],
@@ -248,6 +265,19 @@ def _run_relational(
         from batcher.api.terminal.profile import record_plan
 
         record_plan(prof, opt, plan, distributed, decisions)
+
+    # Kyber's zone-map rules can *prove* a plan empty — a predicate its per-source
+    # bounds rule out entirely — and record that by rewriting the root to `Limit(x, 0)`.
+    # Executing that reads every source in full and throws every row away: the maximum
+    # possible I/O for an answer already known, and worse than not having proved it at
+    # all (the proof drops the `Filter`, and with it the predicate the source would have
+    # used to skip its files). The proof only exists *after* optimization, which is why
+    # the raw-plan pre-gate in `metadata_answer` cannot see it. Answer it here instead.
+    if materialize:
+        empty = _proven_empty_table(logical_opt, plan)
+        if empty is not None:
+            kyber.record_execution(ctx.hub, plan, 0)
+            return empty, decisions
 
     # Hub-backed so admission/spill/reservation size from the learned per-family peak
     # memory (measured `m_peak_bytes`), not the plan estimate alone — closing the "peak
@@ -407,17 +437,29 @@ def _run_relational(
             if spilled is not None:
                 kyber.record_execution(ctx.hub, plan, spilled.num_rows)
                 return spilled, decisions
-        # When profiling, take the metered path (still feeding the hub) so the per-operator
-        # `ExecMetrics` reach the conductor's `QueryProfile`; otherwise the plain path,
-        # which skips even the tiny metrics serialization — keeping an ordinary run intact.
-        if prof is not None:
-            batches, metric_ops = core.execute_local_metered(opt, resolved, feedback=ctx.hub)
-            prof.metric_ops = metric_ops
-        else:
-            batches = core.execute_local(opt, resolved, feedback=ctx.hub)
-    table = pa.Table.from_batches(
-        batches, schema=batches[0].schema if batches else _empty_result_schema(plan, ctx.columns)
-    )
+        # A bare `Scan` is already done: the reader decoded the files and applied the pushed
+        # projection, so its batches *are* the result. Handing them back to the engine only to
+        # pass them through a no-op operator costs a full round trip of the data across the FFI
+        # boundary — ~25% of the wall clock of `read_parquet(...).collect()`, the most common
+        # query there is. Recognize the shape and skip it (`core.scan_only_result`).
+        table = (
+            None
+            if prof is not None  # profiling wants the per-operator metrics; take the real path
+            else core.scan_only_result(logical_opt, resolved, opt.source_predicates)
+        )
+        if table is None:
+            # When profiling, take the metered path (still feeding the hub) so the per-operator
+            # `ExecMetrics` reach the conductor's `QueryProfile`; otherwise the plain path,
+            # which skips even the tiny metrics serialization — keeping an ordinary run intact.
+            if prof is not None:
+                batches, metric_ops = core.execute_local_metered(opt, resolved, feedback=ctx.hub)
+                prof.metric_ops = metric_ops
+            else:
+                batches = core.execute_local(opt, resolved, feedback=ctx.hub)
+            table = pa.Table.from_batches(
+                batches,
+                schema=batches[0].schema if batches else _empty_result_schema(plan, ctx.columns),
+            )
     # Feed the measured output size back to the learner for next time, learn
     # per-column distinct counts / quantiles from the scanned input, and record the
     # filter's measured selectivity (a ratio that generalizes across input sizes) —
@@ -425,7 +467,7 @@ def _run_relational(
     kyber.record_execution(ctx.hub, plan, table.num_rows)
     from batcher.api.terminal._metadata import learn_column_stats
 
-    learn_column_stats(ctx.hub, resolved)
+    learn_column_stats(ctx.hub, resolved, sources, plan)
     kyber.record_selectivity(ctx.hub, plan, sources, table.num_rows)
     # Close the conductor's tuning loops from this run's measured outcomes (breaker volume →
     # partition count, group reduction → pre-aggregation, join wall time → the bandit). Each

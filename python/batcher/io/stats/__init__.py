@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from batcher.io.stats.columnar_footer import orc_statistics, parquet_statistics
 from batcher.io.stats.free_counts import numpy_statistics
-from batcher.io.stats.lakehouse_manifest import delta_statistics
+from batcher.io.stats.lakehouse_manifest import manifest_statistics
 from batcher.io.stats.pruning import (
     RowGroupBounds,
     parquet_row_group_bounds,
@@ -29,7 +29,7 @@ from batcher.io.stats.sql_catalog import catalog_row_count
 __all__ = [
     "RowGroupBounds",
     "catalog_row_count",
-    "delta_statistics",
+    "manifest_statistics",
     "numpy_statistics",
     "orc_statistics",
     "parquet_row_group_bounds",

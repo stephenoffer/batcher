@@ -51,12 +51,6 @@ DIR_ALLOW: dict[str, str] = {
         "dataset/terminal/tuning subpackages, and source_stats can't move under terminal/ (an "
         "import cycle back to orchestration), so a further subpackage split is a follow-up refactor"
     ),
-    "python/batcher/io": (
-        "the neutral IO layer's distinct top-level concerns (base/filesystem/splits/sink/"
-        "manifest/credentials/detect/catalog/predicate/interop) plus two extracted helpers "
-        "(_file_cache keeps filesystem.py under the 500-line cap; _concurrent is the shared "
-        "per-file fan-out) sit at 13 by one; a subpackage split is a follow-up refactor"
-    ),
 }
 INIT_MAX = 120  # __init__.py is a re-export shim, not a code dump
 FUNC_SOFT = 60  # function length soft guideline (warn)
@@ -121,12 +115,6 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # `kyber/rules/` is already at the 12-file directory cap, so the DP builders can't
     # move to a sibling module without breaching it — the dir-size invariant wins.
     "python/batcher/kyber/rules/join_order.py": "join-reorder rule + cost-DP variants; rules/ at the 12-file dir cap",
-    # The Delta connector is one cohesive lakehouse source+sink: read (incl.
-    # deletion-vector / merge-on-read masking), partitioned/atomic write, MERGE,
-    # change-data-feed, time-travel, and add-action statistics, all sharing the same
-    # `_table()` / add-action scaffolding. Splitting it into a subpackage is the proper
-    # fix but a separate refactor; the cohesive connector wins over the line cap here.
-    "python/batcher/io/formats/lakehouse/delta.py": "complete Delta source+sink connector (read/DV/write/MERGE/CDF/time-travel/stats)",
     # The expression accessor namespaces: each is one bound family (`.str` / `.list`)
     # whose every public method carries a Google-style docstring with a runnable
     # `.. doctest::` example (python-quality.md). The examples — not the code — push

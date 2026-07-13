@@ -38,6 +38,7 @@ from batcher.api.session import (
     register_function,
     sql,
     streams,
+    vacuum,
 )
 from batcher.api.sql_session import Session
 from batcher.governance import GovernanceEvent, Principal, SecurityCatalog
@@ -80,4 +81,5 @@ __all__ = [
     "sql",
     "streams",
     *_functions.__all__,
+    "vacuum",
 ]

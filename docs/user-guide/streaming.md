@@ -1,14 +1,10 @@
 # Streaming
 
-Batcher treats **batch as the bounded special case of streaming**. The same
-`Dataset` API — the same `group_by`, `window`, `join`, `with_columns`, `write` —
-runs over a finite table or an unbounded stream. You do not learn a second API or
-rewrite a pipeline to move it from a one-off job to a continuous one: you change the
-*source* (or add a `trigger`), and the same code keeps working.
-
-This page covers consuming and producing streams: sources, the unified `ds.write`,
-triggers and output modes, event-time windows and watermarks, deduplication,
-stream–stream joins, and exactly-once checkpointing.
+Batcher treats **batch as the bounded special case of streaming**. One `Dataset`
+API (`group_by`, `window`, `join`, `with_columns`, `write`) runs over a finite table
+or an unbounded stream. Moving a pipeline from a one-off job to a continuous one
+means changing the *source*, or adding a `trigger`. There is no second API to learn
+and nothing in the pipeline to rewrite.
 
 ## One API, batch or streaming
 
@@ -27,8 +23,8 @@ totals = events.group_by("user").agg(total=col("amount").sum())
 print(totals.to_pydict())
 ```
 
-Point the *same* transformation at an unbounded source and consume it incrementally
-— nothing about the pipeline changes:
+Point that same transformation at an unbounded source and consume it incrementally.
+Nothing about the pipeline changes.
 
 ```python
 import pyarrow as pa
@@ -45,9 +41,9 @@ seen = [b.num_rows for b in stream.filter(col("amount") > 4).iter_batches()]
 print(sum(seen))
 ```
 
-A bounded source can additionally `collect()`; an unbounded one cannot (it would
-never finish) and raises a clear `PlanError` if a terminal tries to materialize it.
-Use `ds.is_streaming` to check which you have.
+A bounded source can also `collect()`. An unbounded one cannot, since it would never
+finish, and it raises a clear `PlanError` if a terminal tries to materialize it. Use
+`ds.is_streaming` to check which you have.
 
 ## Reading streams
 
@@ -89,9 +85,9 @@ for batch in recent.iter_batches():
 ## Writing streams: the unified `ds.write`
 
 `ds.write(...)` is the one write surface. With a bounded source and no trigger it is
-a single batch write returning a `WriteManifest` (unchanged from a normal job). Add a
-`trigger=` — or point it at an unbounded source — and it runs as a streaming query,
-appending each micro-batch and returning a `StreamingQuery` handle:
+a single batch write returning a `WriteManifest`, unchanged from a normal job. Add a
+`trigger=`, or point it at an unbounded source, and it runs as a streaming query:
+each micro-batch is appended, and you get back a `StreamingQuery` handle.
 
 ```python
 import pyarrow as pa
@@ -111,43 +107,43 @@ print(bt.read_memory("totals_demo").count())  # 3 rows accumulated
 
 Sinks available on the write namespace:
 
-- `ds.write(path, format=..., trigger=...)` — files (Parquet/CSV/JSON/…), one
+- `ds.write(path, format=..., trigger=...)` writes files (Parquet/CSV/JSON/…), one
   `part-batch*` file per micro-batch, idempotent on restart.
-- `ds.write.delta(uri, trigger=...)` — a transactional Delta append per micro-batch.
-- `ds.write.console(trigger=...)` — print each micro-batch (development).
-- `ds.write.memory(name, trigger=...)` — an in-memory table read back with
+- `ds.write.delta(uri, trigger=...)` makes a transactional Delta append per micro-batch.
+- `ds.write.console(trigger=...)` prints each micro-batch. Development only.
+- `ds.write.memory(name, trigger=...)` builds an in-memory table you read back with
   `bt.read_memory(name)`.
-- `ds.write.for_each_batch(fn, trigger=...)` — call `fn(table, batch_id)` on each
-  micro-batch. The whole Arrow table is passed (never a row), so this is the hook for
+- `ds.write.for_each_batch(fn, trigger=...)` calls `fn(table, batch_id)` on each
+  micro-batch. The whole Arrow table is passed, never a row, so this is the hook for
   custom upserts (`MERGE`/SCD), multi-sink fan-out, or any per-batch commit logic.
-- `ds.write.for_each(fn, trigger=...)` — call `fn(row)` per row.
+- `ds.write.for_each(fn, trigger=...)` calls `fn(row)` per row.
 
 ### Triggers
 
 A `Trigger` sets the cadence (Spark parity):
 
-- `bt.Trigger.processing_time("5 seconds")` — fire a micro-batch on a wall-clock
-  interval (the default streaming cadence).
-- `bt.Trigger.once()` — process one micro-batch of available data, then stop.
-- `bt.Trigger.available_now()` — drain all currently-available data, then stop (the
-  incremental-batch / backfill trigger).
-- `bt.Trigger.continuous("1 second")` — lowest latency: micro-batches run
+- `bt.Trigger.processing_time("5 seconds")` fires a micro-batch on a wall-clock
+  interval. This is the default streaming cadence.
+- `bt.Trigger.once()` processes one micro-batch of available data, then stops.
+- `bt.Trigger.available_now()` drains all currently-available data, then stops. It is
+  the incremental-batch / backfill trigger.
+- `bt.Trigger.continuous("1 second")` is the lowest-latency option: micro-batches run
   back-to-back with no inter-batch delay, committing a checkpoint epoch on the
-  interval (stateless pipelines only).
+  interval. Stateless pipelines only.
 
 ### Output modes
 
 `output_mode=` controls what each micro-batch emits:
 
-- `"append"` (default) — only rows that are final and will not change again. For a
+- `"append"` (default): only rows that are final and will not change again. For a
   plain pipeline that is every row; for a windowed aggregation it is a window's row
   once the watermark closes it.
-- `"complete"` — the full result table after every micro-batch (aggregations only).
-- `"update"` — only the result rows whose value changed this micro-batch.
+- `"complete"`: the full result table after every micro-batch. Aggregations only.
+- `"update"`: only the result rows whose value changed this micro-batch.
 
 Those literals are the values of the {py:class}`OutputMode <batcher.OutputMode>`
-constants — `bt.OutputMode.APPEND`, `bt.OutputMode.COMPLETE`, `bt.OutputMode.UPDATE`
-— which you can pass in place of the raw strings for an explicit, typo-proof spelling:
+constants, `bt.OutputMode.APPEND`, `bt.OutputMode.COMPLETE`, `bt.OutputMode.UPDATE`.
+Pass a constant in place of the raw string for a typo-proof spelling.
 
 ```python
 print(bt.OutputMode.COMPLETE)
@@ -183,8 +179,8 @@ bt.streams()           # all active streaming queries
 ```
 
 With several queries running, `bt.await_any_termination(timeout=None)` blocks until
-the first of them stops (re-raising its exception if it failed) — the Spark
-`awaitAnyTermination` pattern for a driver that supervises multiple streams.
+the first of them stops, re-raising its exception if it failed. This is the Spark
+`awaitAnyTermination` pattern, for a driver that supervises multiple streams.
 
 ## Event-time windows and watermarks
 
@@ -265,10 +261,25 @@ print(attributed.to_pydict()["ad"])  # ['a'] — clicked within 5 minutes of sho
 ## Exactly-once and checkpointing
 
 Pass `checkpoint=<dir>` to a streaming write to record source offsets and sink
-commits per micro-batch. On restart the query resumes from the last committed offset
-— a replayable source (Kafka offsets, Kinesis sequence numbers, a Delta version,
-the Auto-Loader seen-file set) seeks forward and an idempotent sink dedups, so the
-combined output is exactly-once with no row lost or duplicated:
+commits per micro-batch. On restart the query resumes from the last committed offset.
+A replayable source (Kafka offsets, Kinesis sequence numbers, a Delta version, the
+Auto-Loader seen-file set) seeks forward and an idempotent sink dedups, so the
+combined output is exactly-once, with no row lost or duplicated.
+
+The sink's half of that is worth being concrete about, because replay is not optional:
+the engine records a micro-batch's source offset *before* it processes the batch, so a
+crash in between leaves a batch the next run **will** re-emit. A plain append would then
+write those rows twice. Writing to Delta, each micro-batch instead commits with a
+transaction id — the query name plus the batch number — and the sink checks the log for
+it first. A replayed batch finds its own transaction already recorded, writes no file and
+commits nothing. That is what turns the engine's at-least-once replay into end-to-end
+exactly-once, and it is why the log holds exactly one transaction per micro-batch however
+many times one was retried.
+
+Give the query a stable `query_name` if you rely on this: the name is the transaction's
+application id, so it has to be the same across restarts for the check to find the
+previous run's commits. Without one it is derived from the destination table, which is
+stable but shared — so two different unnamed queries writing the same table would collide.
 
 ```python
 # docs: skip
@@ -283,9 +294,9 @@ q = bt.read.kafka(topic="orders").write(
 
 ## The medallion pattern
 
-Because each layer reads the previous one as a stream, the three medallion layers
-chain with the same primitives — incremental file or Delta reads in, transform,
-checkpointed write out:
+Each layer reads the previous one as a stream, so the three medallion layers chain
+with the primitives above: an incremental file or Delta read in, a transform, a
+checkpointed write out.
 
 ```python
 # docs: skip
@@ -311,9 +322,9 @@ bt.read.kafka(topic="events").write(
 
 ## See also
 
-- {doc}`writing-data` — the batch write surface `ds.write` extends.
-- {doc}`aggregations` and {doc}`window-functions` — the grouping and SQL-window APIs.
-- {doc}`../architecture/execution` — the pipelines-and-breakers execution model that
+- {doc}`writing-data`: the batch write surface `ds.write` extends.
+- {doc}`aggregations` and {doc}`window-functions`: the grouping and SQL-window APIs.
+- {doc}`../architecture/execution`: the pipelines-and-breakers execution model that
   makes batch and streaming one engine.
-- {doc}`../ml/streaming` — streaming a query as bounded-memory training data.
+- {doc}`../ml/streaming`: streaming a query as bounded-memory training data.
 ```

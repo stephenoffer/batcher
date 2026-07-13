@@ -6,7 +6,7 @@ results in BigQuery, write Parquet to GCS and load it, or use `bq load`.
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.table("bigquery", project=..., table=...)` |
+| **Read** | `bt.read.bigquery(query, project=...)` or `bt.read.bigquery(table=..., project=...)` |
 | **Write** | Not supported |
 | **Extra** | `pip install 'batcher-engine[bigquery]'` |
 | **Parallelism** | One split per Storage Read API stream; `max_streams` defaults to 8 |
@@ -74,12 +74,11 @@ job, then read its result in parallel.
 
 ::::
 
-:::{warning}
-`bt.read.bigquery("acme-billing", table="acme-data.analytics.events")` reaches the same source,
-but note what happened there: the positional argument binds to the source's first field, which
-is `project`, not the query. A `bt.read.bigquery("SELECT ...")` that reads like a query read is
-not one. The keyword form through `bt.read.table` avoids the ambiguity, and it is the one to
-use.
+:::{note}
+The positional argument to `bt.read.bigquery(...)` is the **query**, so
+`bt.read.bigquery("SELECT ...", project="acme-billing")` reads what it looks like it reads.
+To read a whole table instead, pass `table=` and leave the positional slot empty:
+`bt.read.bigquery(table="acme-data.analytics.events", project="acme-billing")`.
 :::
 
 :::{important}

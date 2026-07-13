@@ -180,26 +180,6 @@ def _scalar(tr, node) -> Expr:
     raise NotImplementedError(f"unsupported SQL expression: {type(node).__name__}")
 
 
-def _int_literal(node) -> int | None:
-    """The integer a literal node denotes, or `None` if it isn't an integer literal.
-
-    A negative number is not a literal in the parse tree: sqlglot renders `-2` as a `Neg`
-    wrapping the literal `2`. Matching only `Literal` would therefore reject every negative
-    argument, which for `ROUND(x, -2)` is a legal query.
-    """
-    from sqlglot import expressions as exp
-
-    if isinstance(node, exp.Neg):
-        inner = _int_literal(node.this)
-        return None if inner is None else -inner
-    if isinstance(node, exp.Literal) and not node.is_string:
-        try:
-            return int(node.this)
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
 def _scalar_function(tr, node):
     """Map a SQL scalar function call to its `Expr` builder, or None."""
     from sqlglot import expressions as exp

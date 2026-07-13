@@ -10,19 +10,32 @@ lazily inside methods, so this import is cheap and never fails on a missing extr
 
 from __future__ import annotations
 
-from batcher.io.formats.lakehouse.delta import DeltaSink, DeltaSource, DeltaStreamSource
+from batcher.io.formats.lakehouse.delta import (
+    DeltaMaintenance,
+    DeltaSink,
+    DeltaSource,
+    DeltaStreamSource,
+)
 from batcher.io.formats.lakehouse.delta_sharing import (
     DeltaSharingFileSplit,
     DeltaSharingSource,
 )
 from batcher.io.formats.lakehouse.hudi import HudiSink, HudiSource
 from batcher.io.formats.lakehouse.iceberg import (
+    IcebergMaintenance,
     IcebergSink,
     IcebergSource,
     IcebergTableSplit,
 )
+from batcher.io.formats.lakehouse.maintenance import (
+    MAINTENANCE,
+    TableMaintenance,
+    table_maintenance,
+)
 
 __all__ = [
+    "MAINTENANCE",
+    "DeltaMaintenance",
     "DeltaSharingFileSplit",
     "DeltaSharingSource",
     "DeltaSink",
@@ -30,7 +43,10 @@ __all__ = [
     "DeltaStreamSource",
     "HudiSink",
     "HudiSource",
+    "IcebergMaintenance",
     "IcebergSink",
     "IcebergSource",
     "IcebergTableSplit",
+    "TableMaintenance",
+    "table_maintenance",
 ]

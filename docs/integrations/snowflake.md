@@ -7,7 +7,7 @@ dataset into a table.
 | | |
 | --- | --- |
 | **Read** | `bt.read.snowflake(query, connection_kwargs=...)` |
-| **Write** | `ds.write.snowflake(table, connection_kwargs=...)`. Append only. |
+| **Write** | `ds.write.snowflake(table, connection_kwargs=...)`, `mode="overwrite"` (default) or `"append"` |
 | **Extra** | `pip install 'batcher-engine[snowflake]'` |
 | **Parallelism** | One split per result chunk from `get_result_batches()` |
 | **Pushdown** | Predicates, as a `WHERE` around your query. Projection is not pushed. |
@@ -145,10 +145,12 @@ lowercase Arrow column names and you get a table whose columns can only ever be 
 :::
 
 :::{important}
-The write appends, and only appends. `mode="append"` is rejected outright by the save-mode gate
-(which knows only the lakehouse sinks) and raises `PlanError`; `mode="overwrite"` is accepted
-but never reaches the sink. What lands in Snowflake is an append either way. If you need replace
-semantics, `TRUNCATE` or swap the table yourself before the write.
+`mode` is honored, and the default is `mode="overwrite"` — which replaces the destination
+table. Pass `mode="append"` explicitly to add to it.
+
+This is worth reading twice, because the default is the destructive one. It is consistent
+with `ds.write.delta` and the rest of `write()`, but a Snowflake table is not a file, and
+"overwrite" means the rows that were there are gone.
 :::
 
 And it goes through pandas. The Arrow table is converted with `to_pandas()` and staged by

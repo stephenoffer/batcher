@@ -38,6 +38,7 @@ from batcher.kyber.rules.projections import (
 )
 from batcher.kyber.rules.selection import BuildSideDecision
 from batcher.metadata import MetadataHub
+from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.logical import LogicalPlan
 from batcher.plan.physical import PhysicalPlan
 from batcher.plan.stats import RelStats
@@ -126,11 +127,16 @@ def _run_phase(
     # rewrite the fused pass skipped (a rule that built a new subtree) is picked up on the
     # next iteration. A once-run phase has no next iteration, so it must not fuse.
     fuse = max_iterations > 1
+    # Survives across this phase's fixpoint iterations: a rule that was a no-op on a node
+    # object stays a no-op on it, and structural sharing keeps untouched nodes identical.
+    # See `_apply_node_rules` — this is what stops the fixpoint from re-deriving "nothing to
+    # do" for every rule on every unchanged node, on every iteration.
+    noop: dict[tuple[str, int], LogicalPlan] = {}
     current_ir = None  # lazily computed, only on the identity-says-changed path
     changed = False
     converged = False
     for _ in range(max_iterations):
-        updated = _apply_rules(plan, _applicable(rules, present), ctx, fuse=fuse)
+        updated = _apply_rules(plan, _applicable(rules, present), ctx, fuse=fuse, noop=noop)
         if updated is plan:  # structural sharing → confirmed fixpoint, O(1)
             converged = True
             break
@@ -163,7 +169,12 @@ def _present(plan: LogicalPlan) -> frozenset[type]:
 
 
 def _apply_rules(
-    plan: LogicalPlan, rules: list[Rule], ctx: OptimizerContext, *, fuse: bool
+    plan: LogicalPlan,
+    rules: list[Rule],
+    ctx: OptimizerContext,
+    *,
+    fuse: bool,
+    noop: dict[tuple[str, int], LogicalPlan] | None = None,
 ) -> LogicalPlan:
     """Apply a phase's rules in registered order.
 
@@ -195,28 +206,94 @@ def _apply_rules(
             j += 1
         run = rules[i:j]
         if fuse:
-            out = _apply_node_rules(out, run, ctx)
+            out = _apply_node_rules(out, run, ctx, noop, fuse_exprs=True)
         else:
             for r in run:
-                out = _apply_node_rules(out, [r], ctx)
+                out = _apply_node_rules(out, [r], ctx, noop)
         i = j
     return out
 
 
 def _apply_node_rules(
-    plan: LogicalPlan, node_rules: list[Rule], ctx: OptimizerContext
+    plan: LogicalPlan,
+    node_rules: list[Rule],
+    ctx: OptimizerContext,
+    noop: dict[tuple[str, int], LogicalPlan] | None = None,
+    fuse_exprs: bool = False,
 ) -> LogicalPlan:
-    """One bottom-up pass applying every node-local rule at each node, in order."""
+    """One bottom-up pass applying every node-local rule at each node, in order.
+
+    **A rule that did nothing to a node will do nothing to it again.** A rule is a pure
+    function of `(node, ctx)`; `ctx` is fixed for the run and plan nodes are immutable, so a
+    node's *identity* determines its content. `noop` therefore records "rule `i` was a no-op
+    on this exact node object" and skips it on the next fixpoint iteration.
+
+    That is where the cost was. A fixpoint phase re-runs every applicable rule over every
+    node until the plan stops changing, and a rewrite typically touches one node — so on each
+    later iteration the other ~140 expression rules re-walked the whole expression tree of
+    every untouched node to re-derive "nothing to do" (profiled: `transform_expr_up` was 66%
+    of planning, 180k calls for one query). Structural sharing means an untouched node comes
+    back as the *same object*, so the memo hits, and only the subtree that actually changed —
+    whose nodes are new objects — is re-examined.
+
+    The memo holds a strong reference to the node it keyed on, so a freed node's recycled
+    `id()` can never produce a stale hit."""
 
     def visit(node: LogicalPlan) -> LogicalPlan:
+        # Every rule whose body is a leaf `Expr -> Expr` rewrite shares ONE traversal of the
+        # node's expressions, instead of each walking the whole tree to find its own shape.
+        # Fusing is only sound where the driver already fuses node rules — a fixpoint phase,
+        # which recovers on its next iteration anything a fused pass stepped over.
+        if fuse_exprs:
+            node_type = type(node)
+            leaves = [
+                r.expr_fn
+                for r in node_rules
+                if r.expr_fn is not None and (r.matches is None or node_type in r.matches)
+            ]
+            if leaves:
+                node = _apply_expr_leaves(node, leaves)
         for r in node_rules:
-            if r.matches is None or type(node) in r.matches:
-                rewritten = r.node_fn(node, ctx)
-                if rewritten is not None:
-                    node = rewritten
+            if fuse_exprs and r.expr_fn is not None:
+                continue  # already applied, in the shared traversal above
+            # Re-check the type against the *current* node, not the one this visit started
+            # with: an earlier rule may have replaced it with a node of a different type
+            # (`eliminate_identity_project` returns its input), and a rule chosen for the old
+            # type would then be handed a node it never matched.
+            if r.matches is not None and type(node) not in r.matches:
+                continue
+            key = (r.name, id(node))  # a rule's *name* is its unique, position-independent id
+            if noop is not None:
+                seen = noop.get(key)
+                if seen is not None and seen is node:
+                    continue  # this rule already proved itself a no-op on this exact node
+            rewritten = r.node_fn(node, ctx)
+            if rewritten is None:
+                if noop is not None:
+                    noop[key] = node  # strong ref: pins the id against reuse
+                continue
+            node = rewritten
         return node
 
     return transform_up(plan, visit)
+
+
+def _apply_expr_leaves(node: LogicalPlan, leaves: list) -> LogicalPlan:
+    """Apply every leaf `Expr -> Expr` rewrite to `node`'s expressions in ONE traversal.
+
+    Each leaf is offered every expression node, bottom-up, in registered order; a leaf that
+    rewrites an expression hands the rewritten form to the next leaf at that same node. That
+    is the expression-level analogue of the node-rule fusion the driver already does, and it
+    is what turns "one full expression walk per rule" — the two-thirds of planning time the
+    profiler found — into one walk for all of them.
+    """
+
+    def combined(expr):
+        for leaf in leaves:
+            expr = leaf(expr)
+        return expr
+
+    return map_node_expressions(node, lambda e: transform_expr_up(e, combined))
 
 
 class Optimizer:
@@ -322,7 +399,7 @@ class Optimizer:
                 load_cpu_utilization(self._hub, self._config),
             ),
             source_projections=required_columns_per_source(plan),
-            source_predicates=required_predicates_per_source(plan),
+            source_predicates=_source_predicates(logical, plan),
         )
         return phys, plan, ctx.notes.get("build_side_decisions", [])
 
@@ -372,6 +449,32 @@ def _format_plan(node: LogicalPlan, est: CardinalityEstimator, depth: int = 0) -
     for child in children(node):
         out += _format_plan(child, est, depth + 1)
     return out
+
+
+def _source_predicates(logical: LogicalPlan, optimized: LogicalPlan) -> dict[int, dict]:
+    """The predicate to push to each scan, recovered even when a rule consumed the `Filter`.
+
+    Predicates are normally read off the *optimized* plan, where pushdown has parked a
+    residual `Filter` just above each `Scan`. But a rule may legitimately absorb that
+    `Filter` into the operator above it — the aggregate fusion rewrites
+    ``COUNT(*)`` over ``Filter(p)`` into a single ``count_if(CASE WHEN p ...)`` pass over
+    the `Scan`, which is strictly faster *and* deletes the only node this extraction knows
+    how to read. The predicate then reached the source nowhere, so
+    ``SELECT count(*) WHERE day = 42`` — the most ordinary lakehouse query there is —
+    silently scanned every data file in the table instead of the one the log says can
+    match.
+
+    So a scan the optimized plan has no predicate for falls back to the one the *user's*
+    plan put directly above it. That is always sound: a `Filter` sitting on a `Scan`
+    constrains every row that scan can contribute to the query, so pre-filtering the
+    source removes only rows the plan above was going to discard — whatever
+    semantics-preserving shape the optimizer later rewrote it into. Where the optimized
+    plan does carry a predicate it wins, since pushdown may have made it tighter.
+    """
+    predicates = required_predicates_per_source(optimized)
+    for source_id, predicate in required_predicates_per_source(logical).items():
+        predicates.setdefault(source_id, predicate)
+    return predicates
 
 
 def optimize(

@@ -27,28 +27,38 @@ from __future__ import annotations
 from typing import Any
 
 from batcher.io.stats.columnar_footer import is_exact_minmax_type
+from batcher.io.stats.file_skipping import (
+    MAX_PREFIX as _MAX_PREFIX,
+)
+from batcher.io.stats.file_skipping import (
+    MIN_PREFIX as _MIN_PREFIX,
+)
+from batcher.io.stats.file_skipping import (
+    NULL_PREFIX as _NULL_PREFIX,
+)
+from batcher.io.stats.file_skipping import (
+    PARTITION_PREFIX as _PARTITION_PREFIX,
+)
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
 
-__all__ = ["delta_statistics"]
-
-_PARTITION_PREFIX = "partition."
-_MIN_PREFIX = "min."
-_MAX_PREFIX = "max."
-_NULL_PREFIX = "null_count."
+__all__ = ["manifest_statistics"]
 
 
-def delta_statistics(add_actions: Any) -> SourceStatistics | None:
-    """Aggregate a Delta table's flattened add-actions into `SourceStatistics`.
+def manifest_statistics(add_actions: Any) -> SourceStatistics | None:
+    """Aggregate a lakehouse table's per-file manifest into `SourceStatistics`.
 
-    `add_actions` is the Arrow table returned by
-    `DeltaTable.get_add_actions(flatten=True)` — one row per data file with a
-    `num_records` column, optional `partition.<col>` partition values, and, when
-    the table collects stats, `min.<col>` / `max.<col>` / `null_count.<col>`
-    columns. Returns the exact total row count always, exact bounds for partition
-    and numeric columns where every file recorded them, and pruning-grade bounds
-    otherwise. Best-effort: any failure yields None so the caller falls back to a
-    plain row count.
+    `add_actions` is the manifest in the add-action layout — one row per data file with a
+    `num_records` column, optional `partition.<col>` partition values, and, when the table
+    collects stats, `min.<col>` / `max.<col>` / `null_count.<col>` columns. Delta produces
+    it directly (`get_add_actions(flatten=True)`); Iceberg's connector normalizes its
+    `readable_metrics` into the same shape. Nothing here is format-specific, which is the
+    point — the aggregation, the provenance rules, and the file skipping that consumes it
+    are one implementation for both.
+
+    Returns the exact total row count always, exact bounds for partition and numeric
+    columns where every file recorded them, and pruning-grade bounds otherwise.
+    Best-effort: any failure yields None so the caller falls back to a plain row count.
     """
     try:
         import pyarrow as pa

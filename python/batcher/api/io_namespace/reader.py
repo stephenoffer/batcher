@@ -856,10 +856,16 @@ class Reader:
 
                 >>> import batcher as bt
                 >>> ds = bt.read.bigquery(  # doctest: +SKIP
-                ...     "SELECT * FROM `project.dataset.events`"
+                ...     "SELECT * FROM `project.dataset.events`", project="my-project"
                 ... )
         """
-        return _read_table("bigquery", query, **opts)
+        # Bind `query` by name. `BigQuerySource`'s first field is `project`, so passing it
+        # positionally sent the SQL text into `project` — and a caller who also passed
+        # `project=` (as they must) got "multiple values for argument 'project'" instead of
+        # a query.
+        if query is not None:
+            opts["query"] = query
+        return _read_table("bigquery", **opts)
 
     def clickhouse(self, query: str, **opts: Any) -> Dataset:
         """Read the result of a ClickHouse SQL query over the Arrow-native interface.
