@@ -53,6 +53,7 @@ from batcher.plan.logical import (
 )
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import Provenance, RelStats, weakest
+from batcher.plan.types import column_bytes
 
 __all__ = ["StatsEstimator", "combine_ndv"]
 
@@ -640,19 +641,33 @@ class StatsEstimator:
     def row_width(self, node: LogicalPlan, default: float) -> float:
         """Estimated average bytes per output row of `node`.
 
-        Sums the node's output columns' *learned* average byte widths; columns
-        with no measured width contribute the mean of the measured ones (a neutral
-        per-column estimate). When **no** output column has a learned width yet,
-        falls back to `default` — the cost model's flat per-row constant — so a
-        cold-start plan costs exactly as it did before byte-awareness.
+        A column's width is taken from the first source that knows it: a *learned*
+        average byte width (measured, authoritative), else the width implied by its
+        Arrow **type** (exact for fixed-width types, a documented prior for
+        variable-length ones — see `plan.types.widths`), else the mean of this
+        node's measured columns. Only a node with no schema at all falls back to
+        `default`, the cost model's flat per-row constant.
+
+        The schema floor matters because the byte axes gate broadcast eligibility.
+        Costing every unmeasured relation at a flat per-row constant sized a
+        two-`int64` join key (16 B/row) exactly like a 20-column payload, which
+        over-sized narrow build sides by ~4x and forfeited their broadcast join.
         """
         widths = self._avg_bytes
         cols = node.available_columns()
-        measured = [widths[c] for c in cols if c in widths]
-        if not measured:
+        if not cols:
             return default
-        avg_known = sum(measured) / len(measured)
-        return sum(widths.get(c, avg_known) for c in cols)
+        schema = node.available_schema()
+        typed: dict[str, float] = {}
+        if schema is not None:
+            typed = {f.name: column_bytes(f.type) for f in schema.arrow}
+        measured = [widths[c] for c in cols if c in widths]
+        if not measured and not typed:
+            return default
+        # Neutral per-column filler for a column neither measured nor typed.
+        known = measured or list(typed.values())
+        avg_known = sum(known) / len(known)
+        return sum(widths.get(c) or typed.get(c, avg_known) for c in cols)
 
     def _side_ndv(self, keys: tuple[str, ...], rows: float) -> float | None:
         """Distinct count of one join side's key *set*, capped at its row count.

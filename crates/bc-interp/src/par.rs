@@ -519,7 +519,7 @@ fn exec(
             let jits: Vec<ops::Jit> = match parts.first() {
                 Some(sample) => exprs
                     .iter()
-                    .map(|e| ops::try_compile(&e.expr, sample))
+                    .map(|e| ops::try_compile_computed(&e.expr, sample))
                     .collect(),
                 None => exprs.iter().map(|_| None).collect(),
             };
@@ -800,7 +800,12 @@ fn exec(
             // consumers run single-threaded. Low-cardinality output is one small batch, so this
             // is a no-op there. (The partitioned path already emits per-partition batches.)
             let out = ops::remorselize(
-                vec![ops::build_agg_batch(group_keys, aggregates, &group_columns, &agg_cols)?],
+                vec![ops::build_agg_batch(
+                    group_keys,
+                    aggregates,
+                    &group_columns,
+                    &agg_cols,
+                )?],
                 opts.morsel_target(),
             );
             push_breaker_spilled(
@@ -856,7 +861,16 @@ fn exec(
                             &opts.tuning,
                         )? {
                             let rows_in = count_rows(&lbs) + count_rows(&rbs);
-                            push_metric(m, op_id, "sort", rows_in, &out, jt0, false, "interp-jointopn");
+                            push_metric(
+                                m,
+                                op_id,
+                                "sort",
+                                rows_in,
+                                &out,
+                                jt0,
+                                false,
+                                "interp-jointopn",
+                            );
                             return Ok(out);
                         }
                     }
@@ -1507,7 +1521,10 @@ fn compile_stage<'a>(op_id: u32, op: &'a RelOp, sample: Option<&RecordBatch>) ->
         }
         RelOp::Project { exprs, .. } => {
             let jits: Vec<ops::Jit> = match sample {
-                Some(s) => exprs.iter().map(|e| ops::try_compile(&e.expr, s)).collect(),
+                Some(s) => exprs
+                    .iter()
+                    .map(|e| ops::try_compile_computed(&e.expr, s))
+                    .collect(),
                 None => exprs.iter().map(|_| None).collect(),
             };
             let backend = backend_tag(&jits.iter().map(|j| j.is_some()).collect::<Vec<_>>());

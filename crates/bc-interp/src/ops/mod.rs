@@ -149,7 +149,7 @@ pub(crate) fn agg_funcs(aggregates: &[AggregateItem]) -> Vec<agg::AggFunc> {
 /// a compiled column would pay a compile cost and materialize a fresh buffer — a
 /// loss. Returns `None` (interpreter) for bare columns and anything outside the
 /// JIT subset; `Some` for compiled arithmetic/comparison/etc.
-fn try_compile_computed(expr: &bc_expr::Expr, sample: &RecordBatch) -> Jit {
+pub(crate) fn try_compile_computed(expr: &bc_expr::Expr, sample: &RecordBatch) -> Jit {
     match expr {
         bc_expr::Expr::Col { .. } => None,
         _ => try_compile(expr, sample),

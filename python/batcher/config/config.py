@@ -358,8 +358,10 @@ class FlowControlConfig:
 
 @dataclass(frozen=True, slots=True)
 class CardinalityConfig:
-    """Selinger-style defaults the cardinality estimator falls back to before
-    anything is learned. Superseded by learned/sketch values when present.
+    """Selinger-style defaults the cardinality estimator falls back to.
+
+    Cold-start values only: superseded by learned/sketch statistics once a query has run
+    and the measured selectivities are available.
 
     Examples:
         .. doctest::
@@ -396,7 +398,16 @@ class CardinalityConfig:
 @dataclass(frozen=True, slots=True)
 class CostWeights:
     """Relative importance of each axis when collapsing `Cost` to a scalar.
-    WS9 swaps these per query to honor latency/cost/throughput targets."""
+
+    Swapped per query to honor a latency / cost / throughput target.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import CostWeights
+            >>> CostWeights().net  # a shuffled byte costs twice a local one
+            2.0
+    """
 
     cpu: float = 1.0
     io: float = 1.0
@@ -405,8 +416,17 @@ class CostWeights:
 
 @dataclass(frozen=True, slots=True)
 class CostCoefficients:
-    """Per-unit costs. Constants today; calibrated from measured `op_stats` later.
-    All values are in abstract, mutually-comparable "work units" per row/byte."""
+    """Per-unit costs, in abstract, mutually-comparable "work units" per row or byte.
+
+    Constants today; calibrated from measured `op_stats` later.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import CostCoefficients
+            >>> CostCoefficients().hash_build_row  # inserting costs twice a probe
+            2.0
+    """
 
     scan_row: float = 1.0
     filter_row: float = 0.5
@@ -483,7 +503,21 @@ class OptimizerConfig:
     # distributed executor's *runtime* guard read this one value: if the materialized
     # build side actually exceeds it (the estimate was wrong), the executor falls back
     # to a shuffle join instead of OOMing the driver by replicating an over-large side.
-    broadcast_max_bytes: int = 10 * 1024 * 1024  # 10 MiB
+    #
+    # Sized to *cache*, not to memory. A broadcast join builds ONE hash table and probes
+    # it from every core, so each probe row is a random access into it: the strategy wins
+    # only while that table stays cache-resident. Past it, the partitioned (shuffle) join
+    # wins, because each of its buckets probes a small, L2-resident table instead. TPC-H
+    # sf1 measures the crossover between 4 and 10 MiB (q3's 4.4 MB build over a 3.2M-row
+    # probe: 52 ms partitioned vs 83 ms broadcast), so the table — not the machine's RAM —
+    # is what this bounds.
+    #
+    # NOTE: this is a *true* byte size. It was previously read against a flat 64 B/row
+    # width estimate that over-sized narrow relations ~4x (a two-`int64` key costed as
+    # 64 B/row, not 16), so the effective threshold was ~4x smaller than its nominal
+    # 10 MiB. `plan.types.widths` now makes the width type-exact; this value is the
+    # recalibrated equivalent.
+    broadcast_max_bytes: int = 4 * 1024 * 1024  # 4 MiB
     # Static blend weight, NOT an EWMA rate: how far a *single* decision moves from its
     # plan estimate toward a measured value (`LearnedMemoryModel.blend_peak`, the pressure
     # EWMA, GPU/stream autobatch). Per-signature scalars that accumulate observations use
@@ -624,6 +658,22 @@ class ShuffleTlsConfig:
     `ca_cert_path` is the trust root for both directions; set `require_client_auth` to
     turn on mTLS (a connecting peer must present a certificate that CA signed).
     Overridable via ``BATCHER_DISTRIBUTED_TLS_<FIELD>`` env vars.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import ShuffleTlsConfig
+            >>> ShuffleTlsConfig().enabled  # plaintext shuffle by default
+            False
+            >>> tls = ShuffleTlsConfig(
+            ...     enabled=True,
+            ...     ca_cert_path="/etc/batcher/ca.pem",
+            ...     server_cert_path="/etc/batcher/server.pem",
+            ...     server_key_path="/etc/batcher/server.key",
+            ...     require_client_auth=True,
+            ... )
+            >>> tls.server_name  # the SAN a peer's certificate must carry
+            'batcher-shuffle'
     """
 
     enabled: bool = False
@@ -650,6 +700,15 @@ class DistributedConfig:
 
     Ray is scheduling only; the data plane shuffles via Carbonite/Arrow Flight or
     (single-node / shared filesystem) Arrow-IPC files. These knobs decide which.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import DistributedConfig
+            >>> DistributedConfig().ray_address is None  # attach locally, or $RAY_ADDRESS
+            True
+            >>> DistributedConfig().namespace  # the shuffle actors are isolated here
+            'batcher'
     """
 
     # Ray cluster address. None → attach to an existing cluster when ``RAY_ADDRESS``
@@ -1073,6 +1132,15 @@ class ObservabilityConfig:
     Kyber/Carbonite decisions, and the measured per-operator profile). Env overrides use
     the ``BATCHER_OBSERVABILITY_*`` prefix (e.g. ``BATCHER_OBSERVABILITY_LOG_LEVEL=DEBUG``,
     ``BATCHER_OBSERVABILITY_EVENT_LOG=0`` to disable the event log).
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import ObservabilityConfig
+            >>> ObservabilityConfig().log_level  # quiet unless asked
+            'WARNING'
+            >>> ObservabilityConfig(log_format="json", log_file="/var/log/batcher.log").console
+            True
     """
 
     # Threshold for the `batcher.*` loggers and the Rust data-plane tracing bridge:
@@ -1431,7 +1499,22 @@ _active: contextvars.ContextVar[Config] = contextvars.ContextVar(
 
 
 def active_config() -> Config:
-    """The Config in effect for the current context."""
+    """The Config in effect for the current context.
+
+    Resolves to the innermost of: an enclosing `config_context` block, the process-wide
+    `set_config`, then the static defaults layered with the config file and env vars.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import active_config
+            >>> active_config().execution.morsel_rows
+            16384
+
+    Returns:
+        The active Config. It is frozen — derive a new one with `Config.replace` rather
+        than mutating it.
+    """
     return _active.get()
 
 

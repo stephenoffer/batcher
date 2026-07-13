@@ -55,13 +55,15 @@ def test_record_and_load_avg_byte_width():
     learned = load_learned_stats(hub)
     assert learned["__column_avg_bytes__"]["a"] == 4096.0
 
-    # row_width sums learned widths over the node's output columns; with no
-    # measured width it returns the supplied flat default (cold-start parity).
+    # row_width sums learned widths over the node's output columns — a measured
+    # width is authoritative and overrides the width implied by the column's type.
     ds = bt.from_pydict({"a": list(range(10))})
     est = CardinalityEstimator(ds._sources, learned)
     assert est.row_width(ds._plan, default=64.0) == 4096.0
+    # Cold, the column's Arrow type supplies the width (int64 → 8 B), not the flat
+    # default — which now only applies to a node with no schema at all.
     cold = CardinalityEstimator(ds._sources, {})
-    assert cold.row_width(ds._plan, default=64.0) == 64.0
+    assert cold.row_width(ds._plan, default=64.0) == 8.0
 
 
 def test_record_column_stats_best_effort_on_none_hub():

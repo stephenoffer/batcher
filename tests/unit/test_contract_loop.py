@@ -246,7 +246,10 @@ def test_broadcast_crossover_learns_from_measured_timings():
         record_broadcast_timing(hub, "broadcast", mb * mib, 5.0 + 1.2 * mb)
         record_broadcast_timing(hub, "shuffle", mb * mib, 50.0 + 0.3 * mb)
 
-    learned = learned_broadcast_max_bytes(hub)
+    # The solved crossover is clamped to a band around the *default*, so pass the
+    # default explicitly: this asserts the value is learned from the timings, not
+    # that it happens to sit inside the band of whatever the config default is today.
+    learned = learned_broadcast_max_bytes(hub, default=10 * mib)
     assert learned is not None
     assert learned / mib == pytest.approx(50.0, abs=1.0)
 

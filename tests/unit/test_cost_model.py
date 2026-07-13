@@ -34,11 +34,23 @@ def test_learned_width_makes_io_byte_true():
     assert warm.op_cost(ds._plan).io > cold.op_cost(ds._plan).io
 
 
-def test_row_width_falls_back_to_flat_default_when_unmeasured():
-    ds = bt.from_pydict({"x": list(range(10))})
+def test_row_width_uses_the_column_type_when_unmeasured():
+    # No learned widths → the width implied by the column's Arrow *type*, which is
+    # exact for a fixed-width type. The flat `bytes_per_row` coefficient is only the
+    # last resort (a node with no schema at all): costing one int64 at 64 B/row
+    # over-sized narrow relations ~8x and forfeited their broadcast join.
+    ds = bt.from_pydict({"x": list(range(10))})  # a single int64 column
     model, plan = _model(ds)
-    # No learned widths → the flat bytes_per_row coefficient (cold-start parity).
-    assert model.row_bytes(plan) == model._c.bytes_per_row
+    assert model.row_bytes(plan) == 8.0
+    assert model.row_bytes(plan) < model._c.bytes_per_row
+
+
+def test_row_width_prefers_a_learned_width_over_the_type():
+    # A measured width is authoritative — a `string` column's true average width is
+    # only knowable by measuring it, and it overrides the type's prior.
+    ds = bt.from_pydict({"x": list(range(10))})
+    warm = CostModel(CardinalityEstimator(ds._sources, {"__column_avg_bytes__": {"x": 512.0}}))
+    assert warm.row_bytes(ds._plan) == 512.0
 
 
 def test_scan_cost_scales_with_rows():
