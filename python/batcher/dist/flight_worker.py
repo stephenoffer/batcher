@@ -18,8 +18,10 @@ and its lineage-recovery contract without a circular import.
 
 from __future__ import annotations
 
+from concurrent import futures
 from typing import TYPE_CHECKING
 
+from batcher._internal.native import engine
 from batcher.carbonite.transfer import ShuffleTicket
 
 if TYPE_CHECKING:
@@ -88,8 +90,7 @@ def _combine_sources(session, gk, aj, sources):
     surfaces as a `RetryableShuffleError` (the tree node's task fails → driver
     recompute), preserving the propagate-on-fault contract of the serial path.
     """
-    import batcher._native as nat
-
+    nat = engine()
     running, unreachable = session.gather_combine(gk, aj, list(sources), finalize=False)
     if unreachable:
         raise nat.RetryableShuffleError(f"combiner lost sources {unreachable}")
@@ -125,7 +126,7 @@ try:
             preemption: bool = False,
             tls_config: ShuffleTlsConfig | None = None,
         ) -> None:
-            import batcher._native as nat
+            nat = engine()
             from batcher.carbonite.transfer import ShuffleSession
 
             # Fence this worker's tickets to the query it was spawned for, so a
@@ -210,6 +211,26 @@ try:
         def addr(self) -> str:
             return self.session.addr
 
+        def set_grant(self, credits: int, engine_config: str) -> None:
+            """Re-grant this worker for the query about to borrow it.
+
+            A worker is built from the grant of whichever query *spawned* it: its credit
+            window (1 credit = 1 in-flight batch) and the `EngineConfig` every local
+            `execute_plan` runs under (memory budget, morsel size, parallelism). A reused
+            session fleet therefore ran every later query under the first query's grant —
+            so a global `COUNT(*)` (granted 1 credit and a 1 MB budget, which is all it
+            needs) left the 8-node join after it shuffling one batch at a time against a
+            1 MB budget: measured 0.6 s -> 3.2 s on TPC-H sf10, same plan, same data.
+
+            Re-granting in place is what makes the warm fleet *correct* to reuse. It is two
+            attribute writes on the worker — no respawn, so it costs neither the placement
+            group nor the Flight server bind, and it cannot fail to place (a fleet asks for
+            the cluster's whole CPU capacity, so a respawn is exactly what one cannot do
+            reliably while the fleet it replaces is still being reaped).
+            """
+            self.session.set_credits(credits)
+            self._engine_config = engine_config
+
         def is_draining(self) -> bool:
             """Whether this worker has seen a spot-preemption notice (reclamation
             imminent). The driver consults this at a stage boundary to migrate the
@@ -234,7 +255,7 @@ try:
         def map_publish(
             self, map_ir, gk, aj, partition, n_keys, n_reducers, src=None, epoch=0
         ) -> str:
-            import batcher._native as nat
+            nat = engine()
             from batcher.dist.executors.partition_io import (
                 iter_partition_descriptor,
                 streaming_partial_aggregate,
@@ -268,7 +289,29 @@ try:
                 self._bucket_bytes[r] = sum(b.nbytes for b in bucket)
             return self.session.addr
 
-        def reduce_fetch(self, gk, aj, mapper_addrs, reducer_id, epochs=None):
+        def replicate_buckets(self, primary_addr, src, n_buckets, stage=0, epoch=0) -> str:
+            """Pull every bucket source `src` published on `primary_addr` and re-publish it
+            here, under the *same* ticket — a second copy of that mapper's shuffle output.
+
+            This is the core of recompute-free recovery. A reducer whose mapper is gone
+            fetches the byte-identical copy from this worker instead of forcing the driver
+            to re-read the source partition and re-run the map. It is also the spot-drain
+            hand-off: a survivor pulls a doomed-but-still-alive worker's buckets, so a
+            preemption notice costs one copy of (small, pre-aggregated) partial state
+            rather than a full recompute of it.
+
+            Returns this worker's address once **every** bucket is registered, and raises if
+            any fetch failed. That all-or-nothing ack is load-bearing: an unregistered ticket
+            reads back as an *empty* bucket rather than an error, so a reducer allowed to
+            fall back to a half-filled replica would silently drop that mapper's rows. The
+            driver therefore only advertises a replica whose ack it has in hand.
+            """
+            for r in range(n_buckets):
+                ticket = _ticket(stage, src, r, epoch)
+                self.session.publish(ticket, self.session.fetch(primary_addr, ticket))
+            return self.session.addr
+
+        def reduce_fetch(self, gk, aj, mapper_addrs, reducer_id, epochs=None, replicas=None):
             # Fetch every mapper's partial *concurrently* and fold them into one running
             # merged state in Rust (bounded by the session's fan-in), instead of one
             # blocking round-trip per mapper. The reducer holds one merged partial (sized
@@ -276,21 +319,27 @@ try:
             # independent of the mapper count, so the shuffle scales to a wide cluster.
             # `combine` is associative, so the concurrent fold equals a serial one.
             # `epochs` maps a recomputed source to its current epoch (default 0) so the
-            # fetch resolves the fresh partition, never a lost worker's stale one. A
-            # retryable fault (unreachable/idle peer == worker loss, since every bucket
-            # is published) is reported so the driver recomputes + retries; a fatal fault
-            # propagates and fails the query fast.
+            # fetch resolves the fresh partition, never a lost worker's stale one.
+            # `replicas[src]` are the peers holding a copy of that mapper's bucket: the
+            # gather falls over to one when the primary is unreachable, so a lost worker
+            # costs a re-fetch and no recovery round at all. Only when *every* copy is gone
+            # is the source reported retryable, and the driver recomputes + retries; a fatal
+            # fault propagates and fails the query fast.
             epochs = epochs or {}
             sources = [
                 (addr, _ticket(0, src, reducer_id, epochs.get(src, 0)))
                 for src, addr in enumerate(mapper_addrs)
             ]
-            payload, unreachable = self.session.gather_combine(gk, aj, sources, finalize=True)
+            payload, unreachable = self.session.gather_combine(
+                gk, aj, sources, finalize=True, replicas=replicas
+            )
             if unreachable:
                 return ("retry", unreachable)
             return ("ok", payload)
 
-        def reduce_fetch_publish(self, gk, aj, mapper_addrs, reducer_id, epochs=None):
+        def reduce_fetch_publish(
+            self, gk, aj, mapper_addrs, reducer_id, epochs=None, replicas=None
+        ):
             """Like `reduce_fetch`, but PUBLISH the finalized result on this worker's own
             Flight server and return only a `(addr, ticket, rows, schema)` handle.
 
@@ -299,7 +348,7 @@ try:
             reducer's result back to the driver. The status protocol is unchanged
             (`"retry"` on a lost mapper), so it composes with the recovery loop.
             """
-            status, payload = self.reduce_fetch(gk, aj, mapper_addrs, reducer_id, epochs)
+            status, payload = self.reduce_fetch(gk, aj, mapper_addrs, reducer_id, epochs, replicas)
             if status != "ok" or payload is None:
                 return (status, payload)  # retry, or an empty bucket (no handle)
             ticket = _ticket(_RESULT_STAGE, self.id, reducer_id)
@@ -316,18 +365,22 @@ try:
         def combine_finalize_fetch(self, gk, aj, sources):
             # The tree root for one bucket: merge the last <= fan_in partials and
             # finalize to output rows.
-            import batcher._native as nat
-
+            nat = engine()
             running = _combine_sources(self.session, gk, aj, sources)
             return None if running is None else nat.combine_finalize(gk, aj, [running])
 
-        def map_publish_raw(self, sub_ir, key_names, partition, n_buckets, stage, src=None) -> str:
-            import batcher._native as nat
+        def map_publish_raw(
+            self, sub_ir, key_names, partition, n_buckets, stage, src=None, epoch=0
+        ) -> str:
+            nat = engine()
             from batcher.dist.executors.partition_io import read_partition_descriptor
 
             # `src` overrides the mapper id on recompute (a survivor regenerates a
-            # lost worker's side). Publish EVERY bucket, empty included, so a
-            # reducer's failed fetch means a lost worker, not an empty bucket.
+            # lost worker's side). `epoch` rises on each recompute so the fresh partition
+            # is published under a new ticket and a zombie worker's stale one can never be
+            # read — the same fence the aggregate's `map_publish` carries. Publish EVERY
+            # bucket, empty included, so a reducer's failed fetch means a lost worker, not
+            # an empty bucket.
             src = self.id if src is None else src
             rows = nat.execute_plan(
                 sub_ir, [read_partition_descriptor(partition)], self._engine_config
@@ -340,18 +393,41 @@ try:
                     [rows] if n_buckets == 1 else nat.partition_batches(rows, key_idx, n_buckets)
                 )
             for r in range(n_buckets):
-                self.session.publish(_ticket(stage, src, r), buckets[r] if r < len(buckets) else [])
+                self.session.publish(
+                    _ticket(stage, src, r, epoch), buckets[r] if r < len(buckets) else []
+                )
             return self.session.addr
 
-        def reduce_window(self, win_ir, addrs, reducer_id):
-            import batcher._native as nat
+        def map_publish_join(self, left, right, n_buckets, src=None, epoch=0) -> str:
+            """Publish BOTH sides of one join source partition in a single actor call.
 
+            `left`/`right` are each `(sub_ir, key_names, partition)`.
+
+            A join mapper must land its left (stage 0) *and* right (stage 1) buckets before
+            any reducer fetches them. Issuing the two `map_publish_raw` calls separately and
+            awaiting only the second one silently swallowed a left-side failure: the barrier
+            saw the right side's address come back, declared the mapper healthy, and then every
+            reducer failed to fetch its stage-0 ticket — so a deterministic application error
+            surfaced, three retries later, as a phantom "unreachable worker". One call means
+            one `ObjectRef`, so either side's exception propagates to the barrier as the error
+            it actually is.
+            """
+            self.map_publish_raw(left[0], left[1], left[2], n_buckets, 0, src, epoch)
+            return self.map_publish_raw(right[0], right[1], right[2], n_buckets, 1, src, epoch)
+
+        def reduce_window(self, win_ir, addrs, reducer_id, epochs=None, replicas=None):
+            nat = engine()
             # A window partition is computed whole, so this reducer holds all of its
             # bucket's raw rows (memory = the bucket, which shrinks as workers grow).
-            # Fetch every mapper concurrently, tracking lost workers so the driver
+            # Fetch every mapper concurrently, falling over to a replica of any mapper that
+            # is gone, and tracking the sources whose every copy is lost so the driver
             # recomputes + retries.
-            sources = [(addr, _ticket(0, src, reducer_id)) for src, addr in enumerate(addrs)]
-            rows, unreachable = self.session.gather_concat(sources)
+            epochs = epochs or {}
+            sources = [
+                (addr, _ticket(0, src, reducer_id, epochs.get(src, 0)))
+                for src, addr in enumerate(addrs)
+            ]
+            rows, unreachable = self.session.gather_concat(sources, replicas=replicas)
             if unreachable:
                 return ("retry", unreachable)
             if not rows:
@@ -368,39 +444,117 @@ try:
             gk=None,
             aj=None,
             finalize=True,
+            epochs=None,
+            replicas=None,
         ):
-            import batcher._native as nat
+            import functools
 
+            nat = engine()
             # A join needs its bucket's whole left and right side, so it holds them
             # both (memory = the bucket's data, which shrinks as workers grow). Fetch
-            # every mapper's left (stage 0) and right (stage 1) side concurrently,
-            # tracking lost workers so the driver can recompute and retry.
-            left_sources = [(addr, _ticket(0, src, reducer_id)) for src, addr in enumerate(addrs)]
-            right_sources = [(addr, _ticket(1, src, reducer_id)) for src, addr in enumerate(addrs)]
-            left, lost_left = self.session.gather_concat(left_sources)
-            right, lost_right = self.session.gather_concat(right_sources)
+            # every mapper's left (stage 0) and right (stage 1) side concurrently, falling
+            # over to a replica of any mapper that is gone and tracking the sources whose
+            # every copy is lost, so the driver can recompute and retry. Both sides of a
+            # source live on the same worker, so one `replicas` list covers them both.
+            epochs = epochs or {}
+            left_sources = [
+                (addr, _ticket(0, src, reducer_id, epochs.get(src, 0)))
+                for src, addr in enumerate(addrs)
+            ]
+            right_sources = [
+                (addr, _ticket(1, src, reducer_id, epochs.get(src, 0)))
+                for src, addr in enumerate(addrs)
+            ]
+            # The two sides are independent streams from the same peers, so fetch them at
+            # the same time rather than draining the left before dialing the right. Each
+            # `gather_concat` drops the GIL and blocks on the shared Rust runtime, so two
+            # Python threads genuinely overlap the transfers; serially, the right side's
+            # round-trips were dead time on a link the left side had already finished with.
+            gather = functools.partial(self.session.gather_concat, replicas=replicas)
+            with futures.ThreadPoolExecutor(max_workers=2) as pool:
+                l_fut = pool.submit(gather, left_sources)
+                r_fut = pool.submit(gather, right_sources)
+                left, lost_left = l_fut.result()
+                right, lost_right = r_fut.result()
             unreachable = sorted(set(lost_left) | set(lost_right))
             if unreachable:
                 return ("retry", unreachable)
             if not left and not right:
                 return ("ok", None)
             # Schema-bearing empties so an outer join can null-extend the missing side.
-            joined = nat.execute_plan(
-                join_ir, [left or [left_schema], right or [right_schema]], self._engine_config
-            )
+            relations = [left or [left_schema], right or [right_schema]]
             if gk is not None:
                 # Fused post-join aggregate (only a small bucket leaves the worker — the
                 # full join never reaches the driver). `finalize=True` when group keys ⊇
                 # join key (each group is whole in this bucket, so finalize here; driver
                 # concatenates disjoint groups); `finalize=False` otherwise (a group spans
                 # buckets, so emit PARTIAL state and let the driver `combine_finalize`).
-                partial = nat.partial_aggregate(gk, aj, joined)
-                if finalize:
-                    out = nat.combine_finalize(gk, aj, [partial])
-                    joined = [out] if out is not None else []
-                else:
-                    joined = [partial] if partial is not None else []
+                #
+                # Run the join and the fold in ONE native call: the join's output is the
+                # reducer's largest object by far (TPC-H sf10: 3.75M rows / ~106 MB) and is
+                # consumed immediately by the aggregate, so handing it back to Python only
+                # to pass it straight into the next FFI call built a Python mirror of it for
+                # nothing. Same plan, same fold — a bit-identical partial.
+                out = nat.execute_plan_aggregated(
+                    join_ir, relations, gk, aj, self._engine_config, finalize
+                )
+                return ("ok", [out] if out is not None else [])
+            joined = nat.execute_plan(join_ir, relations, self._engine_config)
             return ("ok", joined)
+
+        def reduce_join_publish(
+            self,
+            join_ir,
+            addrs,
+            reducer_id,
+            left_schema,
+            right_schema,
+            epochs=None,
+            replicas=None,
+        ):
+            """Like `reduce_join`, but PUBLISH this bucket's joined rows on the worker's own
+            Flight server and hand back only an `(addr, ticket, rows, schema)` handle.
+
+            The join analogue of `reduce_fetch_publish`, and what lets a *multi-join* query
+            run without a driver round-trip per join. Previously every intermediate join
+            collected its whole output to the driver, which then re-partitioned it back out
+            to the workers for the next join — so a 6-table query moved every intermediate
+            twice through one process (TPC-H q5 sf1 pushed 12M then 18M rows through the
+            driver for a 5-row answer, and at sf10 it OOM-killed the node). Keeping the
+            bucket where it was computed means the next stage's mappers fetch it
+            shared-nothing, straight from the holding actor.
+
+            The status protocol is `reduce_join`'s, so it composes with the same recovery
+            loop: `("retry", unreachable)` on a lost mapper, `("ok", None)` for an empty
+            bucket (nothing to publish).
+            """
+            status, batches = self.reduce_join(
+                join_ir,
+                addrs,
+                reducer_id,
+                left_schema,
+                right_schema,
+                None,
+                None,
+                True,
+                epochs,
+                replicas,
+            )
+            if status != "ok":
+                return (status, batches)  # retry: `batches` carries the unreachable mappers
+            # An EMPTY bucket publishes nothing and yields no handle. It contributes no rows
+            # to the relation, and a zero-row partition is not merely pointless to serve: the
+            # Flight encoder emits no data message for it, so a reader blocks until the fetch
+            # idle timeout (60s) and then reports the perfectly healthy worker holding it as
+            # unreachable. (`reduce_fetch_publish` returns `None` for an empty bucket for the
+            # same reason.) The join's probe schema — not an empty bucket — carries the schema.
+            batches = [b for b in (batches or []) if b.num_rows > 0]
+            if not batches:
+                return ("ok", None)
+            ticket = _ticket(_RESULT_STAGE, self.id, reducer_id)
+            self.session.publish(ticket, batches)
+            rows = sum(b.num_rows for b in batches)
+            return ("ok", (self.session.addr, ticket, rows, batches[0].schema))
 
         def local_topn(self, plan_ir, partition):
             """Run `plan_ir` (the map prefix + sort + limit) on this worker's own split and
@@ -408,7 +562,7 @@ try:
             the global answer is the top-N of the union of per-worker top-Ns, so each
             worker reads its split, applies the single-node top-N heap, and ships only k
             rows; the driver merges. Reads the split directly (never on the driver)."""
-            import batcher._native as nat
+            nat = engine()
             from batcher.dist.executors.partition_io import read_partition_descriptor
 
             return nat.execute_plan(
@@ -422,7 +576,7 @@ try:
             driver. The grid (a few floats) plus the row count go back; the driver
             merges them into range boundaries. Stateless w.r.t. the shuffle session.
             """
-            import batcher._native as nat
+            nat = engine()
             from batcher.dist.executors.partition_io import read_partition_descriptor
 
             rows = nat.execute_plan(
@@ -435,7 +589,16 @@ try:
             return (grid, n)
 
         def range_publish(
-            self, map_ir, key_name, boundaries, n_buckets, nulls_first, desc, partition, src=None
+            self,
+            map_ir,
+            key_name,
+            boundaries,
+            n_buckets,
+            nulls_first,
+            desc,
+            partition,
+            src=None,
+            epoch=0,
         ) -> str:
             """Range-partition this split's rows by `boundaries` and publish each bucket.
 
@@ -445,8 +608,11 @@ try:
             the per-bucket sorts concatenate to a globally sorted result. Nulls go to
             the bucket that lands at the correct end of the *final* (post-`desc`)
             concatenation, so they sort first/last exactly as single-node would.
+
+            `epoch` rises on each recompute, so a regenerated bucket is published under a
+            fresh ticket and a zombie worker's stale one can never be read.
             """
-            import batcher._native as nat
+            nat = engine()
             from batcher.dist.executors.partition_io import bucketize, read_partition_descriptor
 
             src = self.id if src is None else src
@@ -457,17 +623,22 @@ try:
             # Publish EVERY bucket (empty included) so a reducer's failed fetch means
             # a lost worker, not an empty bucket — the recompute loop's clean signal.
             for r in range(n_buckets):
-                self.session.publish(_ticket(0, src, r), buckets[r])
+                self.session.publish(_ticket(0, src, r, epoch), buckets[r])
             return self.session.addr
 
-        def sort_reduce(self, sort_ir, addrs, reducer_id):
-            import batcher._native as nat
-
+        def sort_reduce(self, sort_ir, addrs, reducer_id, epochs=None, replicas=None):
+            nat = engine()
             # This reducer owns one contiguous key range; fetch its bucket from every
             # mapper concurrently, concatenate, and sort by all keys — the bucket is
             # globally ordered relative to the others, so a final concat needs no merge.
-            sources = [(addr, _ticket(0, src, reducer_id)) for src, addr in enumerate(addrs)]
-            rows, unreachable = self.session.gather_concat(sources)
+            # A mapper that is gone is served from a replica; only a source whose every
+            # copy is lost is reported retryable for the driver to recompute.
+            epochs = epochs or {}
+            sources = [
+                (addr, _ticket(0, src, reducer_id, epochs.get(src, 0)))
+                for src, addr in enumerate(addrs)
+            ]
+            rows, unreachable = self.session.gather_concat(sources, replicas=replicas)
             if unreachable:
                 return ("retry", unreachable)
             if not rows:
@@ -519,8 +690,7 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     # Same-node shared-memory transfer, decided on the driver and shipped to every
     # worker (which can't see the driver's config_context). Gated on the native probe so
     # it is never enabled where no shared directory exists (it would just churn fallbacks).
-    import batcher._native as nat
-
+    nat = engine()
     shm = bool(dc.shared_memory_transfer) and nat.shm_available()
     # Each worker watches for a preemption notice so the driver can migrate its output
     # before reclamation (proactive, not reactive). Engaged under the spot profile —

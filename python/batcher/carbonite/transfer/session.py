@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import threading
 import weakref
 from typing import TYPE_CHECKING
 
@@ -124,6 +125,9 @@ class ShuffleSession:
         # would grow without bound (C13). off_network / total reconstruct the ratio.
         self._off_network = 0
         self._fetches = 0
+        # Guards the read-modify-write bookkeeping (locality counters + the AIMD window)
+        # against the concurrent gathers a join reducer issues for its two sides.
+        self._stats_lock = threading.Lock()
         # Opt-in adaptive flow control: when a controller is supplied, the credit
         # window grows/shrinks per remote fetch from observed memory backpressure
         # (the AIMD law) instead of staying at the static grant. Off by default, so
@@ -139,6 +143,24 @@ class ShuffleSession:
 
             self._pressure = PressureMonitor()
         _register_session(self)
+
+    def set_credits(self, credits: int | None) -> None:
+        """Re-grant this session's static credit window.
+
+        The window is read per fetch (`_window`), never baked into the Flight server, so a
+        session outliving one query can be re-granted for the next instead of being torn
+        down. That is what lets a *reused* shuffle fleet serve a query other than the one
+        that spawned it: without it, a fleet spawned by a global `COUNT(*)` (granted 1
+        credit — one in-flight batch) keeps that window for every later query on it, and
+        the next join's exchange serializes behind it.
+
+        A no-op under adaptive flow control, which owns the window itself (`_flow_control`).
+
+        Args:
+            credits: The new static credit window (1 credit = 1 in-flight batch).
+        """
+        if self._flow_control is None:
+            self._credits = credits
 
     def _window(self) -> int | None:
         """The credit window for the next fetch — adaptive when a controller is set."""
@@ -250,6 +272,7 @@ class ShuffleSession:
         *,
         finalize: bool,
         fan_in: int = _DEFAULT_FAN_IN,
+        replicas: list[list[str]] | None = None,
     ) -> tuple[pa.RecordBatch | None, list[int]]:
         """Concurrently fetch + `combine` aggregate partials from every mapper.
 
@@ -261,6 +284,10 @@ class ShuffleSession:
         signal. When same-node shared memory is enabled, same-node sources are read
         zero-copy from shared memory *inside* the concurrent gather (Flight fallback on a
         miss), so cross-node fetches still fan out in parallel.
+
+        `replicas[i]` are the peers holding a copy of mapper `i`'s bucket: a lost mapper is
+        then served from a survivor rather than reported unreachable, so the driver pays no
+        recompute at all. A source is `unreachable` only once every copy of it is gone.
         """
         payload, unreachable = self._server.gather_combine(
             _process_client(),
@@ -272,6 +299,7 @@ class ShuffleSession:
             credits=self._window(),
             token=self._token,
             shm=self._shm,
+            replicas=replicas,
         )
         self._fetches += len(sources)
         self._observe_backpressure()
@@ -281,7 +309,8 @@ class ShuffleSession:
         self,
         sources: list[tuple[str, ShuffleTicket]],
         *,
-        fan_in: int = _DEFAULT_FAN_IN,
+        fan_in: int | None = None,
+        replicas: list[list[str]] | None = None,
     ) -> tuple[list[pa.RecordBatch], list[int]]:
         """Concurrently fetch every mapper's raw bucket into one list (window/sort/join).
 
@@ -289,7 +318,22 @@ class ShuffleSession:
         lost-source indices instead of raising, so the reducer can report `("retry",
         srcs)`. When shared memory is enabled, same-node sources are read zero-copy from
         shared memory within the concurrent gather (Flight fallback on a miss).
+
+        `fan_in` defaults to `flow_control.shuffle_fetch_fan_in` — the *flat*-gather bound,
+        not the combiner tree's `shuffle_fan_in`. This gather concatenates every source, so
+        the reducer holds all of it no matter how few peers stream at once: throttling to
+        the tree's fan-in only idled the network. In-flight memory is still bounded by the
+        per-channel credit window.
+
+        `replicas[i]` are the peers holding a copy of mapper `i`'s bucket: a lost mapper is
+        served from a survivor rather than reported unreachable, so the driver pays no
+        recompute. A source is `unreachable` only once every copy of it is gone.
         """
+        if fan_in is None:
+            from batcher.config import active_config
+
+            fan_in = max(1, active_config().flow_control.shuffle_fetch_fan_in)
+        fan_in = min(fan_in, max(1, len(sources)))  # never dial more peers than exist
         rows, unreachable = self._server.gather_concat(
             _process_client(),
             sources,
@@ -297,9 +341,15 @@ class ShuffleSession:
             credits=self._window(),
             token=self._token,
             shm=self._shm,
+            replicas=replicas,
         )
-        self._fetches += len(sources)
-        self._observe_backpressure()
+        # A join reducer gathers its left and right sides on two threads at once (they are
+        # independent streams, so serializing them idled the link), and both land here. The
+        # fetch itself is outside the lock — it is the part that must overlap — but the AIMD
+        # window and the locality counter are read-modify-write, so guard just the bookkeeping.
+        with self._stats_lock:
+            self._fetches += len(sources)
+            self._observe_backpressure()
         return rows, unreachable
 
     @property
