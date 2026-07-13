@@ -47,13 +47,57 @@
 (Ray Data times out (>600 s) on filter_count/groupby/join at sf10 on this cluster; it
 completes `scan_count` in 4.6 s, where batcher is ~4500x faster.)
 
-**Two real bugs found, NOT fixed — both reproduce, both need a follow-up.**
+**The big one: a reused shuffle fleet ran every query under the *first* query's grant.**
+(Found by chasing "a prior query makes the next join 5.5x slower"; fixed.)
 
-* **A prior query on the same source makes a later distributed join 5.5x slower.**
-  `filter_count` then `join` (sf10): the join goes **590 ms → 3.25 s** (stable across 3
-  runs). A preceding *groupby* does not do this (616 ms). Not the fleet, not the learned
-  shuffle fan-out, not `learned_partition_rows` — all measured unchanged. Mechanism still
-  unknown; this is the single largest distributed regression on the board.
+A `_FlightWorker` is built from the grant of whichever query **spawned** it — its credit
+window (1 credit = 1 in-flight batch) and the `EngineConfig` its every `execute_plan` runs
+under (memory budget, morsel size, parallelism). The session fleet outlives one query (that
+reuse is what makes a warm distributed query ~1 s instead of ~3 s), but nothing re-granted
+it. So a **cheap query poisoned every expensive query after it**:
+
+    fleet spawned by the join   (credits=64, memory_budget=372 MB):    0.6 s
+    fleet spawned by a COUNT(*) (credits=1,  memory_budget=1 MB)  :    3.2 s
+
+Same plan, same data, same 8 live actors. Carbonite is right to grant a global count one
+reducer and a megabyte; the bug is that the join then inherited it and shuffled one batch
+at a time. When the inherited fleet was *also* too narrow the join ran on 2 workers: 16-125 s.
+
+Fixed by re-granting the fleet in place on acquire (`_FlightWorker.set_grant`), not
+respawning it — a fleet asks for one worker per node holding that node's cores, i.e. the
+cluster's entire CPU capacity, so a respawn issued while the old fleet is still being reaped
+cannot be placed and silently degrades to the 1-2 workers it *can* place. (Trying it the
+respawn way first is exactly how the 16 s number was produced.)
+
+    join after a distributed filter_count:  3,244 / 16,556 / 16,774 ms  ->  588 / 616 / 655 ms
+    join in isolation (control):                              613 ms
+
+In the benchmark sweep the sf10 join goes **3,257 ms -> 612 ms**, i.e. `vs_daft` **0.52x
+(loss) -> 2.73x (win)**.
+
+**Distributed sf10, final (fair harness, 9 nodes / 128 CPU). Batcher wins every pipeline:**
+
+| pipeline | batcher_ms | daft_ms | vs_daft | ray_ms |
+|----------|-----------:|--------:|--------:|-------:|
+| `scan_count`   |   1 |  132 | **88.6x** | timeout |
+| `filter_count` | 307 |  494 | **1.61x** | timeout |
+| `groupby`      | 304 |  389 | **1.28x** | timeout |
+| `join`         | 612 | 1672 | **2.73x** | timeout |
+
+Ray Data times out (>120 s) on every pipeline but `scan_count` at this scale.
+
+**Why `filter_count`/`groupby` do not reach 2x, and will not.** They are object-store-bound,
+and both engines read the same ~500 MB from the same S3 over the same 8 nodes. Decomposed
+(sf1 vs sf10, same query): **~73 ms fixed + ~223 ms data-proportional**. The driver control
+plane is already ~0 ms on a warm query (`BATCHER_SORT_PROFILE`: source-stats, Kyber,
+Carbonite all 0.0 s — the whole 309 ms is inside `execute_distributed`), and read
+concurrency is saturated (32 / 64 / 128 IO threads all measure 295-307 ms — the default is
+already at the ceiling). Even zeroing *all* fixed overhead leaves groupby at ~1.7x. This is
+the same physics the section below states for the 10x bar: on an IO-bound scan no engine can
+outrun another that is already at a similar fraction of the network's line rate.
+
+**One real bug found, NOT fixed — reproduces, needs a follow-up.**
+
 * **Sampled NDV is recorded as the column's NDV.** `collect_source_metadata` samples the
   *leading* 262 k rows (`_stats_sample`) and `learn_column_stats` records that sample's
   distinct count. A sample of *n* rows can never observe more than *n* distinct values, so
@@ -64,11 +108,13 @@ completes `scan_count` in 4.6 s, where batcher is ~4500x faster.)
   falls back to `max(|L|,|R|)`, which is exact here).
 
   A guard that refuses an ndv the sample cannot support was written and measured: it fixes
-  the *estimate* (back to 59,986,052) but **does not change wall time** (3.76 s vs 3.25 s,
-  i.e. within noise), so it was **not shipped** — the estimate is not the mechanism of the
-  bug above, and shipping an unvalidated cost-model change on a theory is how the shuffle
-  change below nearly went in wrong. The real fix is to stop sampling: sketch the full
-  column with a mergeable HLL on the workers already reading it (`bc-sketches`).
+  the *estimate* (back to 59,986,052) but **does not change wall time** — which is how we
+  learned the estimate was never the mechanism of the fleet bug above, and why it was not
+  shipped. It remains a real cost-model defect (a 164x error will hurt *somewhere* — memory
+  admission, spill, at other scales), just not the one that was costing 5.5x. The right fix
+  is to stop sampling: sketch the full column with a mergeable HLL on the workers already
+  reading it (`bc-sketches`), rather than record a 262k-row prefix's distinct count as a
+  60M-row column's.
 
 **Methodology, the hard way.** The shuffle change (3) was first measured as a *5.8x
 regression* and reverted — because an isolated run was compared against an in-sweep one.
@@ -164,6 +210,51 @@ query:
   row-preserving and carried EXACT provenance, so `count()` answered it *from metadata without
   executing* and returned the number of rows going **in** to the deduplication. `count()` and
   `collect()` disagreed; only the cheap one lied.
+
+## Scan: `read_parquet(...).collect()` — the fixed overhead with nowhere to hide (2026-07-13)
+
+`python benchmarks/scenarios/scan_read_bench.py --ray` — one 20M-row x 16-int64 table, three
+physical layouts, each measurement in its own process. A plain read is where an engine's fixed
+overhead is fully exposed: no join to dominate it, no aggregation to amortize it.
+
+| layout | files | batcher | pyarrow | Ray Data (128 CPU / 9 nodes) | vs Ray |
+|---|---|---|---|---|---|
+| one big file | 1 | ~1.0 s | 1.08 s | 9.4 s | **9.4x** |
+| mid | 10 | ~1.0 s | 0.90 s | 3.2 s | **3.2x** |
+| many small | 200 | ~1.4 s | 1.05 s | 2.5 s | **1.8x** |
+
+Batcher is single-node on 16 cores here; Ray Data has 128 CPUs across 9 nodes. The 10x bar is
+met on the single-large-file layout (where Ray Data cannot parallelize *inside* a file) and not
+on the many-files layouts, where Ray Data's whole cluster is the point. **Batcher's parquet
+decode is already faster than pyarrow's** (695-834 ms vs 779-937 ms on the 1.6 GB file), so
+there is no Python-side overhead left to reclaim: going further means a decode 2.5x faster than
+Arrow's, which is an arrow-rs/SIMD project, not a tuning knob.
+
+Two things were costing the read path far more than the read:
+
+**A 22.9-second column-stat sketch on a 0.73-second read.** The post-run learner
+(`learn_column_stats`) builds HLL + KLL + Misra-Gries sketches over every value of every
+column it is handed. It was being handed *every column of the source*, after *every query* —
+including a plain scan, which has no join, no group-by and no filter, and therefore cannot
+consult a single one of those statistics. The query paid thirty times its own cost to learn
+things nothing would ever ask for. It is now restricted to `learnable_columns` (the join keys,
+group keys and filter columns an estimator actually reads) and capped by `ndv_sketch_max_cells`
+— exactly the two bounds the *pre*-optimize pass (`seed_column_ndv`) has always honored. Local
+read of the 10-file layout: **23,000 ms → ~1,000 ms.**
+
+(Worth knowing: at `HEAD` this learner was *dead* — `learn_column_stats(hub, resolved)` was
+called without `sources`, so it bailed on the first line and never learned anything. Enabling
+it is what exposed the missing bound. It now both works and stays bounded.)
+
+**A no-op round trip of the whole table across the FFI boundary.** `read_parquet(p).collect()`
+optimizes to a plan that is a single `Scan`: the reader has already decoded the files and
+applied the pushed projection, so its batches *are* the result. They were nonetheless exported
+to Python, imported back into Rust, passed through a pass-through operator, and exported again
+— zero-copy per array, but ~10,000 arrays for a 20M-row/16-column read. Measured at **189 ms
+on a 709 ms read: a quarter of the wall clock to accomplish nothing.** `core.scan_only_result`
+recognizes the shape and skips the engine, with tests holding the two paths against each other
+on the shapes where they could drift (narrow-numeric widening, projection ordering, nulls,
+empties).
 
 ## Lakehouse: transaction-log file skipping + metadata-only commits (2026-07-13)
 
