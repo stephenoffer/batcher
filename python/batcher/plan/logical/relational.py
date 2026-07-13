@@ -419,6 +419,15 @@ class MapBatches(LogicalPlan):
     compiled relational operators and black-box ML compose in one pipeline. The
     optional `output_columns` declares the result schema for downstream
     validation; if omitted, the input columns are assumed to pass through.
+
+    `input_columns` is the other half of that contract, and it is what lets the optimizer
+    see *into* the black box far enough to be useful. Without it the plan must assume the
+    `fn` may read any column of its input, so projection pushdown gives up and the scan
+    reads the whole table: an embedding stage over one column of a 41-column Parquet file
+    read all 41. Declaring the columns the `fn` actually reads turns that into a one-column
+    scan, and lets column lineage narrow to the truth instead of "everything derives from
+    everything". It is opt-in precisely because getting it wrong is a wrong answer, not a
+    slow one — an undeclared column the `fn` secretly reads would be pruned away beneath it.
     """
 
     input: LogicalPlan
@@ -428,6 +437,12 @@ class MapBatches(LogicalPlan):
     fn: object
     batch_size: int | None = None
     output_columns: tuple[str, ...] | None = None
+    # The columns `fn` reads. None = unknown, so the optimizer must keep every column alive
+    # (the safe default). When declared, projection pushdown prunes the scan to these columns
+    # (plus whatever the operators *above* still need), and lineage attributes the outputs to
+    # these inputs only. Declaring a column the `fn` does not read is merely wasteful;
+    # OMITTING one it does read is a correctness bug — the column gets pruned out from under it.
+    input_columns: tuple[str, ...] | None = None
     # Concurrent workers for the per-batch call (>1 overlaps GIL-releasing model
     # inference across cores; the GIL serializes pure-Python `fn`s).
     num_workers: int = 1

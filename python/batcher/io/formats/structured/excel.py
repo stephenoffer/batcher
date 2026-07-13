@@ -75,6 +75,11 @@ class ExcelSource(FileSource):
         super().__init__(path)
         self._sheet = sheet
 
+    def _reader_kwargs(self) -> dict[str, object]:
+        # Without the `sheet`, a worker rebuilding the reader falls back to sheet 0 and silently
+        # reads a different worksheet than single-node requested. Carry it to the worker.
+        return {"sheet": self._sheet}
+
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
         header, columns = _to_columns(_rows(fh, self._sheet))
         return self._batches(header, columns)[0].schema if header else pa.schema([])

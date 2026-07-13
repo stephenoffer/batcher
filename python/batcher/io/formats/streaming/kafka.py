@@ -95,6 +95,21 @@ class KafkaSource(BrokerSource):
             self._consumer.assign([TopicPartition(self.topic, p) for p in self._partitions])
         return self._consumer
 
+    def _apply_seek(self, partition: int, token: Any) -> None:
+        """Resume a checkpointed partition strictly after its committed offset.
+
+        Only meaningful when partitions are explicitly assigned (the distributed
+        split path): the consumer is repositioned to ``offset + 1``. In subscribe
+        mode assignment is decided by a group rebalance, so the consumer group's
+        own committed offset resumes the stream and this is a no-op.
+        """
+        if self._partitions is None:
+            return
+        from confluent_kafka import TopicPartition
+
+        consumer = self._client()
+        consumer.seek(TopicPartition(self.topic, partition, int(token) + 1))
+
     def _discover_partitions(self) -> list[int]:
         if self._partitions is not None:
             return list(self._partitions)

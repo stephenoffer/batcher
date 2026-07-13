@@ -82,9 +82,7 @@ def test_exception_is_none_on_clean_stop():
 
 @pytest.mark.integration
 def test_query_is_a_context_manager():
-    with _slow_stream(n=1000).write.memory(
-        "life_cm", trigger=bt.Trigger.processing_time(0)
-    ) as q:
+    with _slow_stream(n=1000).write.memory("life_cm", trigger=bt.Trigger.processing_time(0)) as q:
         assert q.is_active is True
         assert "active" in repr(q)
     # Leaving the `with` block stops the query.

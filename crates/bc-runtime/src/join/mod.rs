@@ -217,6 +217,24 @@ pub(crate) fn hash_join_indices_impl(
     use_bloom: bool,
     bloom_fp_rate: f64,
 ) -> Result<JoinIndices, RuntimeError> {
+    // Canonicalize float keys before ANY key handling below.
+    //
+    // `crate::keys` is documented as the one canonical form every hash path derives key
+    // identity from "so they cannot disagree" — and the shuffle, the window, and all three
+    // aggregate paths already do. The join did not, so it encoded its keys through
+    // `RowConverter` raw: `-0.0` and `0.0` produce different row bytes and never match,
+    // even though `=`, `GROUP BY`, and the shuffle all treat them as one value. A join on a
+    // float key therefore silently DROPPED matching rows (`0.0 ⋈ -0.0` returned nothing),
+    // and NaN keys — which the aggregate path folds to one canonical quiet NaN — likewise
+    // failed to match themselves. Canonicalizing here, at the entry, puts the join on the
+    // same key identity as every other operator, which is the invariant `keys.rs` exists to
+    // hold. A key set with no float column is returned unchanged (`None`), so the integer
+    // fast paths below are untouched.
+    let l_canon = crate::keys::canonicalize_float_keys(left_keys);
+    let r_canon = crate::keys::canonicalize_float_keys(right_keys);
+    let left_keys: &[ArrayRef] = l_canon.as_deref().unwrap_or(left_keys);
+    let right_keys: &[ArrayRef] = r_canon.as_deref().unwrap_or(right_keys);
+
     let left_rows = left_keys.first().map_or(0, |a| a.len());
     let right_rows = right_keys.first().map_or(0, |a| a.len());
     let left_null = null_mask(left_keys, left_rows);
@@ -900,6 +918,24 @@ pub fn broadcast_hash_join_indices(
         ),
         "broadcast probe is left-driven only; Right/Full run single-pass"
     );
+    // Canonicalize float keys before ANY key handling below.
+    //
+    // `crate::keys` is documented as the one canonical form every hash path derives key
+    // identity from "so they cannot disagree" — and the shuffle, the window, and all three
+    // aggregate paths already do. The join did not, so it encoded its keys through
+    // `RowConverter` raw: `-0.0` and `0.0` produce different row bytes and never match,
+    // even though `=`, `GROUP BY`, and the shuffle all treat them as one value. A join on a
+    // float key therefore silently DROPPED matching rows (`0.0 ⋈ -0.0` returned nothing),
+    // and NaN keys — which the aggregate path folds to one canonical quiet NaN — likewise
+    // failed to match themselves. Canonicalizing here, at the entry, puts the join on the
+    // same key identity as every other operator, which is the invariant `keys.rs` exists to
+    // hold. A key set with no float column is returned unchanged (`None`), so the integer
+    // fast paths below are untouched.
+    let l_canon = crate::keys::canonicalize_float_keys(left_keys);
+    let r_canon = crate::keys::canonicalize_float_keys(right_keys);
+    let left_keys: &[ArrayRef] = l_canon.as_deref().unwrap_or(left_keys);
+    let right_keys: &[ArrayRef] = r_canon.as_deref().unwrap_or(right_keys);
+
     let left_rows = left_keys.first().map_or(0, |a| a.len());
     let right_rows = right_keys.first().map_or(0, |a| a.len());
     let left_null = null_mask(left_keys, left_rows);

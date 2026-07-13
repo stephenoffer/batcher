@@ -33,6 +33,14 @@ def serve_deployment(
 ) -> Any:
     """A Ray Serve deployment wrapping a load-once, request-batched predictor.
 
+    Examples:
+        .. doctest::
+
+            >>> from ray import serve  # doctest: +SKIP
+            >>> from batcher.ml import serve_deployment  # doctest: +SKIP
+            >>> deployment = serve_deployment(build_predictor, num_replicas=2)  # doctest: +SKIP
+            >>> serve.run(deployment.bind())  # doctest: +SKIP
+
     Args:
         build: a zero-arg factory (or class) returning a batched predictor — a
             ``list[input] -> list[output]`` callable. Run once per replica, so the

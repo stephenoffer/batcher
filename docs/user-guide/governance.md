@@ -7,15 +7,14 @@ that scope is governed.
 
 Policy is applied when a table is **read**, not when a query is executed. That is what
 makes it unbypassable: a `Dataset` never holds an ungoverned plan, so there is no
-`count()`, `write()`, or streaming path that could skip the check. It is also what a
-database does — a masking policy resolves against the role in effect when the column is
-read.
+`count()`, `write()`, or streaming path that could skip the check. A database works the
+same way. A masking policy resolves against the role in effect when the column is read.
 
 ## Setup
 
-Governance keys on the path a table is read from, because that is the only name a
-file-backed table has *before* anyone reads it — and a policy has to be declarable
-before the first read.
+Governance keys on the path a table is read from. That is the only name a file-backed
+table has *before* anyone reads it, and a policy has to be declarable before the first
+read.
 
 ```python
 import os
@@ -53,7 +52,7 @@ only authorizes.
 ## Column access
 
 `grant` gives a role `SELECT` on some columns. The **first grant on a table switches
-that table to deny-by-default** — so installing a catalog never silently locks out
+that table to deny-by-default**, so installing a catalog never silently locks out
 queries against tables nobody wrote a policy about.
 
 ```python
@@ -69,9 +68,13 @@ with bt.security(catalog, analyst):
 print(ds.columns)
 ```
 
+Each call records a `Grant`: a role, a table, and the columns that role may read
+(`select=None` means all of them). A catalog is a list of those. That is what keeps it a
+value you can print and diff and review, rather than a service you have to interrogate.
+
 A column the principal may not select simply does not exist for it. Referencing
-`salary` raises the ordinary unknown-column error rather than "access denied" — an
-error that said "you may not read `salary`" would itself confirm that `salary` exists.
+`salary` raises the ordinary unknown-column error, not "access denied". An error that
+said "you may not read `salary`" would itself confirm that `salary` exists.
 
 ## Masking PII
 
@@ -110,6 +113,14 @@ print(ds.filter(bt.col("email") == "a@x.com").count())  # 0 — the filter sees 
 An explicit `mask_column` overrides the tag-derived mask for that one column, and a
 principal holding an `exempt` role reads the raw value.
 
+The two spellings record two different policy objects, and the difference is the whole
+reason to classify a column at all. `mask_column` records a `ColumnMask`, bound to one
+`table`.`column`: precise, and one entry per column per table. `mask_tag` records a
+`TagMask`, bound to a *tag*, so it governs every column carrying that tag in every table,
+including the table someone adds next quarter that nobody will remember to come back and
+mask. Per-column bindings are what you reach for to override a case; tags are what make
+the catalog survive the tenth table.
+
 ## Row-level security
 
 `filter_rows` restricts a table to the rows a principal may see. The predicate is a
@@ -134,6 +145,43 @@ authority, not the caller's.
 Multiple row filters on one table are conjoined, so adding one can never widen what a
 principal sees.
 
+Each call records a `RowFilter`. Note the shape of the predicate: it takes the
+*principal*, not a row. It is called once, while the plan is being built, and returns an
+ordinary `Expr`, here `col("region") == "EU"`. The engine then treats that expression
+like any predicate you wrote yourself: Kyber pushes it down toward the scan and fuses it
+with neighboring filters. Row-level security therefore costs one filter, not a policy
+callback per row.
+
+## Enforcement is a plan rewrite
+
+`enforce` rewrites the plan when a governed table is read. Every governed scan becomes:
+
+```text
+Project(visible columns, read through their masks)
+  Filter(row-access predicate)
+    Scan(table)
+```
+
+You can see it:
+
+```python
+with bt.security(catalog, analyst):
+    print(bt.read.parquet(customers).explain())
+# project    <- the columns the analyst may select, masked
+#   filter   <- the row filter, below the projection
+#     scan
+```
+
+The order matters in both directions. The filter sits *below* the projection, so a row
+policy may reference `region` even though the analyst has no `SELECT` on it; a row-access
+policy runs with the catalog's authority, not the caller's. The masked projection sits at
+the leaf, below everything the user wrote, so no operator above it can ever see a raw
+value.
+
+Because it is a rewrite and not a check, there is no enforcement code on the hot path to
+bypass and no execution mode that skips it. `collect`, `count`, `iter_batches`, `write`,
+and the distributed path all run the same governed plan.
+
 ## Choosing a protection
 
 | Function        | Reversible?       | Joinable? | Use it for                   |
@@ -143,14 +191,14 @@ principal sees.
 | `aes_encrypt`   | yes, with the key | yes       | data that must be read back  |
 
 "Joinable" means equal inputs produce equal outputs, so the protected column still
-groups and equi-joins. Every expression in Batcher must be deterministic — the
-sequential interpreter is the correctness oracle the parallel executor and the JIT are
-checked against — so `aes_encrypt` uses AES-256-GCM-SIV, the AEAD whose security does
-not collapse under the fixed nonce that determinism forces.
+groups and equi-joins. Every expression in Batcher must be deterministic (the sequential
+interpreter is the correctness oracle that the parallel executor and the JIT are checked
+against), so `aes_encrypt` uses AES-256-GCM-SIV, the AEAD whose security does not
+collapse under the fixed nonce that determinism forces.
 
 The price of that determinism is that equality is observable: an encrypted column
-reveals which rows share a value. Where that is unacceptable, do not protect the
-column — leave it out of the projection.
+reveals which rows share a value. Where that is unacceptable, do not protect the column.
+Leave it out of the projection.
 
 ```python
 key = "00" * 32  # 32 bytes as hex; use a secret manager in production
@@ -159,9 +207,9 @@ enc = bt.from_pydict({"ssn": ["123-45-6789"]}).select(c=bt.aes_encrypt(bt.col("s
 print(enc.select(s=bt.aes_decrypt(bt.col("c"), key)).to_pydict())
 ```
 
-`aes_decrypt` under the wrong key yields NULL rather than failing the query — one
-unreadable row must not abort a scan of a billion. An all-NULL result is the
-unambiguous signal that the key is wrong.
+`aes_decrypt` under the wrong key yields NULL rather than failing the query. One
+unreadable row must not abort a scan of a billion. An all-NULL result is the unambiguous
+signal that the key is wrong.
 
 For pseudonymized analytics, prefer `hmac_sha256` over a bare `sha256`: a plain digest
 of a low-entropy value like an email address is recovered by trying every email
@@ -185,24 +233,24 @@ enc = ds.select(c=bt.aes_encrypt(bt.col("ssn"), "file:/run/secrets/aes"))  # fro
 ```
 
 `env:NAME` reads an environment variable and `file:PATH` reads a mounted secret file. Only
-the reference travels in the plan IR — plan logs, the profile, `explain()`, and the FFI
-boundary never see the secret — and the data plane resolves it on the machine that runs
-the query, so a distributed query reads the key on each worker instead of shipping it over
-the wire. An inline literal key still works for local development but emits a
+the reference travels in the plan IR; plan logs, the profile, `explain()`, and the FFI
+boundary never see the secret. The data plane resolves it on the machine that runs the
+query, so a distributed query reads the key on each worker instead of shipping it over the
+wire. An inline literal key still works for local development but emits a
 `SecurityWarning`, because it embeds the secret in the query and its serialized plan. A
 missing reference (`env:` var unset, `file:` path absent) fails loudly, naming the
-*reference* — never the key.
+*reference*, never the key.
 
 ## Fingerprints and change detection
 
-Governance is not only about hiding a value — it is also about proving what a value
-*was*, without keeping the plaintext around. A hash reduces a row (or a column) to a
-fixed digest you can compare, deduplicate, or diff across snapshots.
+Hiding a value is half of governance. The other half is proving what a value *was*,
+without keeping the plaintext around. A hash reduces a row (or a column) to a fixed
+digest you can compare, deduplicate, or diff across snapshots.
 
-`hash_rows(*exprs, seed=0)` is a deterministic 64-bit digest of several columns at
-once, stable across partitions, runs, and machines. It is the change-detection and
-dedup-key primitive: fingerprint each row, and any later row whose fingerprint
-differs is one that changed.
+`hash_rows(*exprs, seed=0)` is a deterministic 64-bit digest of several columns at once,
+stable across partitions and runs and machines. It is the change-detection and dedup-key
+primitive: fingerprint each row, and any later row whose fingerprint differs is one that
+changed.
 
 ```python
 cols = [bt.col("id"), bt.col("email"), bt.col("region")]
@@ -219,8 +267,8 @@ print([i for i, (a, b) in enumerate(zip(fp_before, fp_after)) if a != b])  # [1]
 ```
 
 For a single column, the `.str` digests produce a per-value fingerprint.
-`.str.xxhash64()` and `.str.hash64()` are fast non-cryptographic 64-bit hashes — the
-ones to reach for when sharding or bucketing:
+`.str.xxhash64()` and `.str.hash64()` are fast non-cryptographic 64-bit hashes, the ones
+to reach for when sharding or bucketing.
 
 ```python
 accounts = bt.from_pydict({"email": ["a@x.com", "b@x.com", "c@x.com", "d@x.com"]})
@@ -239,12 +287,12 @@ print(sample.select(m=bt.col("s").str.md5(), c=bt.col("s").str.crc32()).to_pydic
 ```
 
 The same caution the table draws for a bare `sha256` applies to these: a `md5` or
-`sha1` digest is **not** a safe pseudonym. Both are cryptographic hashes, but a
-digest of a low-entropy value like an email address is recovered by hashing every
-candidate — it leaks exactly what a pseudonym must hide. For pseudonymized-but-
-joinable analytics use `hmac_sha256` (above), whose key the attacker lacks; reserve
-`hash_rows`, `md5`, `sha1`, `crc32`, and the `xxhash64`/`hash64` pair for
-fingerprinting, bucketing, and integrity checks, not for de-identification.
+`sha1` digest is **not** a safe pseudonym. Both are cryptographic hashes, but a digest of
+a low-entropy value like an email address is recovered by hashing every candidate. It
+leaks exactly what a pseudonym must hide. For pseudonymized-but-joinable analytics use
+`hmac_sha256` (above), whose key the attacker lacks. Reserve `hash_rows`, `md5`, `sha1`,
+`crc32`, and the `xxhash64`/`hash64` pair for fingerprinting, bucketing, and integrity
+checks, never for de-identification.
 
 ## Scoping
 
@@ -260,15 +308,15 @@ print(ds.count())  # still 2 — the plan was governed when the table was read
 ```
 
 Nested blocks restore the outer policy on exit. A table read outside any block is
-ungoverned, and an in-memory dataset (`from_pydict`, `from_arrow`) is never governed —
+ungoverned, and an in-memory dataset (`from_pydict`, `from_arrow`) is never governed:
 there is no durable name to write a policy about a dict you are already holding.
 
 ## Auditing
 
-Every governed read emits a `GovernanceEvent` — who asked, what they were allowed to
-see, what was withheld, what was masked, and which row filters applied. Denials are
-audited too, before the error is raised: the access a compliance review most wants to
-find is the one that was refused.
+Every governed read emits a `GovernanceEvent`: who asked, what they were allowed to see,
+what was withheld, what was masked, which row filters applied. Denials are audited too,
+before the error is raised. The access a compliance review most wants to find is the one
+that was refused.
 
 ```python
 seen = []
@@ -288,8 +336,8 @@ pass a sink.
 ## Column-level lineage
 
 Tagging `email` as PII only helps if you can answer where it went. `ds.lineage()` reads
-the plan — nothing executes — and reports, per output column, the source columns its
-*values* are derived from.
+the plan, executing nothing, and reports the source columns each output column's *values*
+are derived from.
 
 ```python
 derived = bt.read.parquet(customers).select(
@@ -302,10 +350,35 @@ carrying = [col for col, origins in derived.lineage().items() if pii in origins]
 print(carrying)
 ```
 
+Lineage is what makes a tag durable. A masked value that has been renamed, cast,
+concatenated, or aggregated is no longer called `email` and no longer lives in
+`customers`. It still carries what `customers.email` held, and lineage is how you find
+it. Tag the source column once; ask lineage which output columns descend from it.
+
+`ds.lineage()` renders origins as `"table.column"` strings. Underneath it is
+`column_lineage(plan, tables)`, which works on a `LogicalPlan` and returns each column's
+origins as a set of `Origin`, the `(table, column)` pair. Reach for it when you are
+building policy tooling of your own and want the pair rather than the rendered string.
+
+```python
+import pyarrow as pa
+
+from batcher.governance import column_lineage
+from batcher.plan.expr_ir import Col
+from batcher.plan.logical import Project, Projection, Scan
+from batcher.plan.schema import SchemaRef
+
+schema = SchemaRef.from_arrow(pa.schema([("first", pa.string()), ("last", pa.string())]))
+plan = Project(Scan(0, schema), (Projection(alias="name", expr=Col("first") + Col("last")),))
+
+print(sorted(column_lineage(plan, ["people.parquet"])["name"]))
+# [('people.parquet', 'first'), ('people.parquet', 'last')]
+```
+
 Two properties make the answer trustworthy:
 
 * **Data flow, not control flow.** Filtering on `email` does not put it in the lineage of
-  the surviving columns — its values never reach the output. That matches how Unity
+  the surviving columns; its values never reach the output. That matches how Unity
   Catalog and Snowflake report lineage.
 * **Over-approximate, never under-approximate.** An opaque `map_batches` stage is treated
   as though every output column derives from every input column. A false "this might carry
@@ -315,10 +388,10 @@ A column built only from literals, or generated by `with_row_index`, has no orig
 
 ## Persisting a policy
 
-The masks and row filters above are Python callables, which is maximally flexible in
-process but cannot be stored. For a policy your platform keeps in an external store and
-reconstructs each session, build the catalog from the **declarative** factories — they are
-picklable, so a catalog built from them survives a round-trip and enforces identically:
+The masks and row filters above are Python callables. Flexible in process, impossible to
+store. For a policy your platform keeps in an external store and reconstructs each
+session, build the catalog from the **declarative** factories instead. They are picklable,
+so a catalog built from them survives a round-trip and enforces identically.
 
 ```python
 from batcher.governance import Pseudonymize, Nullify, MatchesAttribute
@@ -334,16 +407,16 @@ catalog = (
 
 `Redact`, `Pseudonymize`, `Encrypt`, and `Nullify` cover the masking shapes an enterprise
 policy uses (and lower to the data-plane functions above); `MatchesAttribute` and
-`AttributeIn` cover attribute-based row access. Batcher persists nothing itself — it hands
-you picklable policy objects and enforces the catalog you give it; where that policy lives
+`AttributeIn` cover attribute-based row access. Batcher persists nothing itself. It hands
+you picklable policy objects and enforces the catalog you give it. Where that policy lives
 is your platform's decision.
 
 ## What this does not do
 
 Batcher authorizes; it does not authenticate, and it does not encrypt data at rest or
-in transit for you. It has no persistent policy store — a `SecurityCatalog` is built in
-Python, which means it is a serializable, diffable, reviewable artifact you can load
-from your own store and check into review.
+in transit for you. It has no persistent policy store either. A `SecurityCatalog` is
+built in Python, which makes it a serializable, diffable artifact you can load from your
+own store and check into review.
 
 ## See also
 

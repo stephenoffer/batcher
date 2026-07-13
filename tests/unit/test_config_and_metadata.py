@@ -115,7 +115,9 @@ def test_op_stats_by_kind_matches_a_cold_reload():
     for i in range(6):
         hub.record(_fb(i, i * 2))
     warm = {k: [r["n_actual"] for r in v] for k, v in hub.op_stats_by_kind().items()}
-    cold = {k: [r["n_actual"] for r in v] for k, v in MetadataHub(backend).op_stats_by_kind().items()}
+    cold = {
+        k: [r["n_actual"] for r in v] for k, v in MetadataHub(backend).op_stats_by_kind().items()
+    }
     assert warm == cold
 
 

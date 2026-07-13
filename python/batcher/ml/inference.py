@@ -31,10 +31,11 @@ if TYPE_CHECKING:
 
 __all__ = ["InferencePool", "Worker", "WorkerFactory", "transformers_pipeline_encoder"]
 
-# A worker transforms one whole batch (e.g. runs a model forward pass on its columns).
 Worker = Callable[["pa.RecordBatch"], "pa.RecordBatch"]
-# Builds a worker; called exactly once per pool slot so the model loads once.
+"""Transforms one whole batch (e.g. runs a model forward pass over its columns)."""
+
 WorkerFactory = Callable[[], Worker]
+"""Builds a `Worker`, called exactly once per pool slot so the model loads once."""
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
@@ -182,16 +183,16 @@ class InferencePool:
     yielded in input order. When `target_latency_ms` is set, the batch size is
     retuned online toward that per-batch latency.
 
-    Example:
-        .. code-block:: python
+    Examples:
+        .. doctest::
 
-            def make_worker():
-                model = load_model()            # once per worker
-                return lambda batch: model(batch)
-
-            pool = InferencePool(make_worker, num_workers=4, target_batch_rows=2048)
-            for out in pool.run(ds.iter_batches(batch_format="arrow")):
-                ...
+            >>> from batcher.ml import InferencePool  # doctest: +SKIP
+            >>> def make_worker():  # doctest: +SKIP
+            ...     model = load_model()  # once per worker
+            ...     return lambda batch: model(batch)
+            >>> pool = InferencePool(make_worker, num_workers=4)  # doctest: +SKIP
+            >>> for out in pool.run(ds.iter_batches()):  # doctest: +SKIP
+            ...     ...
 
     Args:
         worker_factory: zero-arg callable returning a `Worker`; invoked exactly
@@ -263,7 +264,20 @@ class InferencePool:
         return None
 
     def run(self, batches: Iterable[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-        """Stream `batches` through the pool, yielding result batches in order."""
+        """Stream `batches` through the pool, yielding result batches in order.
+
+        Examples:
+            .. doctest::
+
+                >>> pool = InferencePool(make_worker, num_workers=4)  # doctest: +SKIP
+                >>> outputs = list(pool.run(ds.iter_batches()))  # doctest: +SKIP
+
+        Args:
+            batches: an iterable of `pyarrow.RecordBatch` to run through the workers.
+
+        Returns:
+            An iterator of the workers' output batches, in input order.
+        """
         workers: Queue[Worker] = Queue()
         for _ in range(self._num_workers):
             workers.put(self._factory())

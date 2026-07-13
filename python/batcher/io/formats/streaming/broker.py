@@ -57,6 +57,11 @@ class BrokerMessage:
 
     ``key`` may be ``None`` (an unkeyed message); all other fields are required.
     ``timestamp`` is milliseconds since the Unix epoch.
+
+    ``resume_token`` is the *native* position a client seeks strictly after to
+    replay from this message on recovery (a Kinesis sequence number, a Pulsar
+    message id, …). It is checkpoint bookkeeping only — never a schema column —
+    and defaults to ``None``, in which case the int64 ``offset`` is the token.
     """
 
     value: bytes
@@ -65,6 +70,7 @@ class BrokerMessage:
     timestamp: int
     topic: str
     key: bytes | None = None
+    resume_token: Any = None
 
 
 class BrokerSource(ABC):
@@ -78,7 +84,7 @@ class BrokerSource(ABC):
     format_name: str = "broker"
     bounded = False  # an infinite poll loop — collect() must not materialize it
 
-    __slots__ = ("_options", "poll_size", "topic")
+    __slots__ = ("_options", "_positions", "_resume_from", "poll_size", "topic")
 
     def __init__(self, topic: str, *, poll_size: int = 16_384, **options: Any) -> None:
         """Create a broker source for ``topic`` polling ``poll_size`` per batch.
@@ -89,6 +95,13 @@ class BrokerSource(ABC):
         self.topic = topic
         self.poll_size = poll_size
         self._options = options
+        # The latest position delivered per partition this run (offset or native
+        # `resume_token`). A streaming checkpoint write-aheads this via
+        # `snapshot_position`, so recovery resumes strictly after it.
+        self._positions: dict[int, Any] = {}
+        # Per-partition position to resume strictly after, set by `seek` on recovery
+        # and applied to the live client by `_apply_seek`.
+        self._resume_from: dict[int, Any] = {}
 
     # ---- shared, do-not-override ------------------------------------------
     def schema(self) -> pa.Schema:
@@ -121,8 +134,51 @@ class BrokerSource(ABC):
                 return
             if not messages:
                 continue
+            self._track_positions(messages)
             batch = self._make_batch(messages)
             yield batch.select(projection) if projection is not None else batch
+
+    # ---- exactly-once checkpoint/resume (Checkpointable protocol) ----------
+    def _track_positions(self, messages: list[BrokerMessage]) -> None:
+        """Record the latest resume position per partition from a poll.
+
+        Messages arrive in delivery order, so the last message of each partition
+        carries the position to resume strictly after — a native ``resume_token``
+        when the client supplies one, otherwise the int64 ``offset``.
+        """
+        for m in messages:
+            self._positions[m.partition] = m.offset if m.resume_token is None else m.resume_token
+
+    def snapshot_position(self) -> dict:
+        """The latest position delivered per partition (for checkpoint/resume).
+
+        Returns a JSON-serializable ``{"offsets": {partition: position}}`` the
+        offset log write-aheads before a micro-batch is processed, so recovery
+        resumes strictly after the last *committed* batch (exactly-once for a
+        replayable broker + idempotent sink).
+        """
+        return {"offsets": {str(p): tok for p, tok in self._positions.items()}}
+
+    def seek(self, position: dict) -> None:
+        """Resume each partition strictly after its checkpointed position.
+
+        Restores the in-memory positions and repositions the live client per
+        partition via ``_apply_seek`` (a native seek in a concrete broker).
+        """
+        for p_str, tok in position.get("offsets", {}).items():
+            p = int(p_str)
+            self._positions[p] = tok
+            self._resume_from[p] = tok
+            self._apply_seek(p, tok)
+
+    def _apply_seek(self, partition: int, token: Any) -> None:  # noqa: B027
+        """Reposition the live client to resume strictly after ``token``.
+
+        The base default records the target in ``_resume_from`` for a ``_poll``
+        that consults it; a broker with a native seek (Kafka ``seek``, Kinesis
+        ``AFTER_SEQUENCE_NUMBER``) overrides this to drive the client directly.
+        Intentionally a no-op beyond the ``_resume_from`` already set by ``seek``.
+        """
 
     def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
         """One :class:`BrokerSplit` per partition/shard (offset-locator only)."""

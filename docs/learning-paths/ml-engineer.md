@@ -1,8 +1,8 @@
 # ML engineer learning path
 
-For running models over data at scale: batch inference, embeddings, and GPU
-execution through the `.ml` accessor. Functions operate on whole Arrow batches, so
-the data path stays vectorized and a model loads once per worker rather than once per
+This path covers running models over large data: batch inference, embeddings, and GPUs,
+all through the `.ml` accessor. Your function sees a whole Arrow batch rather than a
+row, so the data path stays vectorized. The model loads once per worker, not once per
 batch.
 
 ## Reading order
@@ -41,9 +41,9 @@ print(ds.ml.map_batches(score).to_pydict())
 
 ## Example: a model loaded once per worker (sketch)
 
-A class function constructs once per worker and is reused across batches, with GPUs
-and concurrency declared on the call. This needs a real model, so it is shown but
-not run.
+A class function is constructed once per worker and reused across batches. GPUs and
+concurrency are declared on the call itself. This one needs a real model, so it is
+shown rather than run.
 
 ```python
 # docs: skip
@@ -69,10 +69,54 @@ class Embedder:
 
 ## Runnable examples
 
-- `ml_inference.py` — a batch-inference pipeline with `ds.ml.map_batches` (runs as written).
-- `feature_engineering.py` — prepare model-ready features.
-- `preprocessors.py` — the same features with fit/transform preprocessor objects and `Chain`.
-- `streaming_pipeline.py` — a streaming inference pipeline shape (needs a broker to run).
+- `ml_inference.py` is a batch-inference pipeline built on `ds.ml.map_batches`, and it
+  runs as written.
+- `feature_engineering.py` prepares model-ready features.
+- `preprocessors.py` builds the same features from fit/transform preprocessor objects
+  and `Chain`.
+- `streaming_pipeline.py` sketches the shape of a streaming inference pipeline. It
+  needs a broker to run.
 
 See also the [performance guide](../user-guide/performance.md) for caching feature
-tables and the [GPU guide](../ml/gpu.md) for accelerator placement.
+tables, and the [GPU guide](../ml/gpu.md) for accelerator placement.
+
+
+## Recipes and deeper reading
+
+The [ML cookbook](../examples/ml/index.md) covers the applied path: embeddings, batch
+scoring, RAG indexes, feature pipelines, and the train/test leak you get for free from a
+naive random split.
+
+::::{grid} 1 2 2 2
+:gutter: 3
+
+:::{grid-item-card} {octicon}`search;1.1em` Text embeddings
+:link: ../examples/ml/text-embeddings
+:link-type: doc
+Encode a corpus, then retrieve from it.
+:::
+
+:::{grid-item-card} {octicon}`beaker;1.1em` LLM batch scoring
+:link: ../examples/ml/llm-batch-scoring
+:link-type: doc
+Structured output, and why the engine you pick barely matters.
+:::
+
+:::{grid-item-card} {octicon}`graph;1.1em` Train/test split
+:link: ../examples/ml/train-test-split
+:link-type: doc
+The leak a naive random split hands you.
+:::
+
+:::{grid-item-card} {octicon}`zap;1.1em` GPU execution
+:link: ../deep-dives/gpu-execution
+:link-type: doc
+Why the device idles, and what stage-overlap does about it.
+:::
+::::
+
+:::{seealso}
+- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md) — ten workload families, measured.
+- [PyTorch](../integrations/pytorch.md) and [Hugging Face](../integrations/huggingface.md).
+- [Tensor columns](../deep-dives/tensor-columns.md) — how an image becomes a column.
+:::

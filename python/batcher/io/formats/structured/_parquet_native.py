@@ -10,9 +10,13 @@ is byte-identical either way.
 
 from __future__ import annotations
 
+import json
+
 import pyarrow as pa
 
-__all__ = ["NATIVE_READ_BATCH", "read_many", "read_one"]
+from batcher._internal.native import engine
+
+__all__ = ["NATIVE_READ_BATCH", "read_many", "read_one", "read_row_groups_filtered"]
 
 # Read batch size handed to the native reader; the engine re-morselizes downstream, so a
 # larger read batch just trades a few big Arrow batches for better decode throughput.
@@ -22,9 +26,37 @@ NATIVE_READ_BATCH = 65536
 def read_one(uri: str, projection: list[str] | None) -> list[pa.RecordBatch] | None:
     """One whole Parquet file's batches via the native reader, or ``None`` to fall back."""
     try:
-        import batcher._native as _native
-
+        _native = engine()
         return _native.read_parquet(uri, [], projection, NATIVE_READ_BATCH)
+    except Exception:
+        return None
+
+
+def read_row_groups_filtered(
+    uri: str,
+    row_groups: list[int],
+    projection: list[str] | None,
+    predicate: dict | None,
+    batch_size: int = NATIVE_READ_BATCH,
+) -> list[pa.RecordBatch] | None:
+    """Read `row_groups` with a pushed `predicate` applied as native row-group pruning.
+
+    `predicate` is the IR dict; its pushable subset is translated (`to_native_predicate`)
+    to the reader's compact form and used to skip row-groups whose footer statistics prove
+    no row can match — the reader never fetches or decodes those column chunks. Pruning is
+    superset-safe (the engine keeps the `Filter`), so a non-pushable predicate reads every
+    requested row-group. Returns ``None`` on any failure (caller falls back to PyArrow).
+    """
+    try:
+        _native = engine()
+        from batcher.io.predicate import to_native_predicate
+
+        native_pred = to_native_predicate(predicate) if predicate is not None else None
+        if native_pred is None:
+            return _native.read_parquet(uri, row_groups, projection, batch_size)
+        return _native.read_parquet_filtered(
+            uri, row_groups, projection, batch_size, json.dumps(native_pred)
+        )
     except Exception:
         return None
 
@@ -36,8 +68,7 @@ def read_many(uris: list[str], projection: list[str] | None) -> list[list[pa.Rec
     file's footer + column-chunk GETs, instead of a per-file call (and FFI round trip) each.
     """
     try:
-        import batcher._native as _native
-
+        _native = engine()
         return _native.read_parquet_many(uris, projection, NATIVE_READ_BATCH)
     except Exception:
         return None

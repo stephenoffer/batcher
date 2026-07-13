@@ -108,6 +108,7 @@ def column_bounds(build: ColumnBuilder, dtype: pa.DataType, name: str):
     A single vectorized ``min_max`` pass. Returns `None` for a non-ordered type
     (string/nested), an all-null column (its SQL ``MIN``/``MAX`` is NULL — let a run
     return it), or an unsupported kernel — the same skips [`statistics`] makes per column.
+    Float columns take [`_float_bounds`], whose NaN handling `pc.min_max` does not give us.
     """
     if not (
         pa.types.is_integer(dtype) or pa.types.is_floating(dtype) or pa.types.is_temporal(dtype)
@@ -117,6 +118,8 @@ def column_bounds(build: ColumnBuilder, dtype: pa.DataType, name: str):
 
     try:
         col = build(name)
+        if pa.types.is_floating(dtype):
+            return _float_bounds(col)
         mm = pc.min_max(col, skip_nulls=True)
         lo, hi = mm["min"].as_py(), mm["max"].as_py()
     except _ARROW_ERRORS:
@@ -124,6 +127,44 @@ def column_bounds(build: ColumnBuilder, dtype: pa.DataType, name: str):
     if lo is None:  # all-null column
         return None
     return ColumnStat(min=lo, max=hi, null_count=col.null_count, provenance=Provenance.EXACT)
+
+
+def _float_bounds(col: pa.Array):
+    """Truthful float bounds under SQL's total order, where NaN is the **greatest** value.
+
+    `pc.min_max` has no NaN policy we can rely on: over an all-NaN column it hands back the
+    kernel's identity element (`+inf`/`-inf`), which is not a value in the column at all —
+    so `min(f)` was answered from metadata as `inf` while executing the same query returned
+    `nan`. A bound that is not a fact about the data is worse than no bound.
+
+    So: NaN is excluded when computing the *minimum* (it can never be the smallest under a
+    total order that makes it the largest), and the *maximum* is reported as NaN whenever any
+    NaN is present, which is what it actually is. A column with no non-NaN value has no usable
+    bound at all — return `None` and let a real run produce the answer.
+
+    Args:
+        col: The column to bound.
+
+    Returns:
+        An EXACT `ColumnStat`, or `None` when no sound bound exists.
+    """
+    from batcher.plan.stats import ColumnStat, Provenance
+
+    non_null = col.drop_null()
+    if len(non_null) == 0:  # all-null column — SQL MIN/MAX is NULL; let a run return it
+        return None
+    nan_mask = pc.is_nan(non_null)
+    has_nan = bool(pc.any(nan_mask).as_py())
+    finite = pc.filter(non_null, pc.invert(nan_mask))
+    if len(finite) == 0:  # every value is NaN — no usable bound
+        return None
+    mm = pc.min_max(finite)
+    return ColumnStat(
+        min=mm["min"].as_py(),
+        max=float("nan") if has_nan else mm["max"].as_py(),
+        null_count=col.null_count,
+        provenance=Provenance.EXACT,
+    )
 
 
 def statistics(build: ColumnBuilder, schema: pa.Schema, rows: int) -> SourceStatistics:

@@ -840,6 +840,7 @@ class Dataset:
         fn: Callable | type,
         *,
         batch_size: int | None = None,
+        input_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
         num_workers: int | str = "auto",
         num_gpus: float = 0.0,
@@ -861,6 +862,9 @@ class Dataset:
         Args:
             fn: A callable (or stateful class) applied to each batch.
             batch_size: Rows per batch handed to `fn`; ``None`` uses the engine default.
+            input_columns: The columns `fn` reads, letting projection pushdown prune the
+                scan to just those; ``None`` keeps every column alive. Omitting one `fn`
+                does read is a correctness bug — it gets pruned out from under it.
             output_columns: The output column names, when `fn` reshapes the schema.
             num_workers: Worker fan-out; ``"auto"`` spreads across local cores.
             num_gpus: GPUs reserved per worker.
@@ -886,6 +890,7 @@ class Dataset:
         return self.ml.map_batches(
             fn,
             batch_size=batch_size,
+            input_columns=input_columns,
             output_columns=output_columns,
             num_workers=num_workers,
             num_gpus=num_gpus,
@@ -1379,8 +1384,10 @@ class Dataset:
                 >>> import batcher as bt
                 >>> left = bt.from_pydict({"a": [1, 2]})
                 >>> right = bt.from_pydict({"b": ["x"]})
-                >>> left.cross_join(right).to_pydict()
+                >>> left.cross_join(right).sort("a").to_pydict()
                 {'a': [1, 2], 'b': ['x', 'x']}
+
+            The join emits rows in no particular order, so sort when you need one.
         """
         from batcher.plan.expr_ir import lit
 
@@ -1819,18 +1826,20 @@ class Dataset:
             sources.extend(other._sources)
         return Dataset(Union(tuple(plans), distinct), sources)
 
-    def intersect(self, other: Dataset) -> Dataset:
-        """Distinct rows present in BOTH datasets (SQL INTERSECT).
+    def intersect(self, other: Dataset, *, distinct: bool = True) -> Dataset:
+        """Rows present in BOTH datasets (SQL INTERSECT, or INTERSECT ALL if not `distinct`).
 
         NULLs compare equal, matching SQL set semantics: a row that is identical —
-        nulls included — in both inputs is in the result. Returns distinct rows
-        (INTERSECT ALL multiplicity is not supported).
+        nulls included — in both inputs is in the result. `distinct` (the default)
+        returns each such row once; ``distinct=False`` is INTERSECT ALL, keeping a row
+        ``min(left_count, right_count)`` times.
 
         Args:
             other: The dataset to intersect with; must share this one's columns.
+            distinct: Deduplicate the result (INTERSECT) instead of keeping multiplicity.
 
         Returns:
-            A new `Dataset` of the distinct rows in both inputs.
+            A new `Dataset` of the rows present in both inputs.
 
         Examples:
             .. doctest::
@@ -1840,21 +1849,29 @@ class Dataset:
                 >>> b = bt.from_pydict({"x": [2, 3, 4]})
                 >>> a.intersect(b).sort("x").to_pydict()
                 {'x': [2, 3]}
+
+                >>> a = bt.from_pydict({"x": [1, 1, 2]})
+                >>> b = bt.from_pydict({"x": [1, 1, 3]})
+                >>> a.intersect(b, distinct=False).sort("x").to_pydict()
+                {'x': [1, 1]}
         """
         cols = self._same_columns(other, "intersect")
-        return self._set_membership(other, cols, both=True)
+        return self._set_membership(other, cols, both=True, distinct=distinct)
 
-    def except_(self, other: Dataset) -> Dataset:
-        """Distinct rows in this dataset but NOT in `other` (SQL EXCEPT).
+    def except_(self, other: Dataset, *, distinct: bool = True) -> Dataset:
+        """Rows in this dataset but NOT in `other` (SQL EXCEPT, or EXCEPT ALL if not `distinct`).
 
         NULLs compare equal (a wholly-null row in both inputs is excluded), matching
-        SQL set semantics. Returns distinct rows (EXCEPT ALL is not supported).
+        SQL set semantics. `distinct` (the default) returns each surviving row once;
+        ``distinct=False`` is EXCEPT ALL, keeping a row
+        ``max(left_count - right_count, 0)`` times.
 
         Args:
             other: The dataset whose rows to subtract; must share this one's columns.
+            distinct: Deduplicate the result (EXCEPT) instead of keeping multiplicity.
 
         Returns:
-            A new `Dataset` of the distinct rows in this but not `other`.
+            A new `Dataset` of the rows in this but not `other`.
 
         Examples:
             .. doctest::
@@ -1864,11 +1881,18 @@ class Dataset:
                 >>> b = bt.from_pydict({"x": [2]})
                 >>> a.except_(b).sort("x").to_pydict()
                 {'x': [1, 3]}
+
+                >>> a = bt.from_pydict({"x": [1, 1, 2]})
+                >>> b = bt.from_pydict({"x": [1]})
+                >>> a.except_(b, distinct=False).sort("x").to_pydict()
+                {'x': [1, 2]}
         """
         cols = self._same_columns(other, "except")
-        return self._set_membership(other, cols, both=False)
+        return self._set_membership(other, cols, both=False, distinct=distinct)
 
-    def _set_membership(self, other: Dataset, cols: list[str], *, both: bool) -> Dataset:
+    def _set_membership(
+        self, other: Dataset, cols: list[str], *, both: bool, distinct: bool
+    ) -> Dataset:
         """INTERSECT/EXCEPT via group-by membership flags.
 
         Tag each side, union, then group by *all* columns. Grouping treats NULL as a
@@ -1877,14 +1901,31 @@ class Dataset:
         per group; keep groups in both (INTERSECT) or only the left (EXCEPT). One row
         per distinct combination, so the result is DISTINCT by construction, and the
         whole thing is mergeable aggregation, so it distributes.
+
+        The ALL forms (`distinct=False`) need multiplicity, which a membership flag
+        cannot carry. Number each row within its run of identical rows first, and the
+        k-th copy on the left then meets the k-th copy on the right under the very same
+        membership group-by, now keyed on (columns, ordinal). Keeping the groups in both
+        sides leaves ordinals 1..min(cl, cr) — INTERSECT ALL; keeping the left-only ones
+        leaves cr+1..cl — EXCEPT ALL. The ordinal's ORDER BY is the partition columns
+        themselves: every row in a partition is identical, so the order is a pure
+        tie-break and any assignment yields the same multiset.
         """
         from batcher.plan.expr_ir import col, lit
+        from batcher.plan.expr_ir.nodes import row_number
 
-        left = self.select(*cols).with_columns(__bc_l__=lit(True), __bc_r__=lit(False))
-        right = other.select(*cols).with_columns(__bc_l__=lit(False), __bc_r__=lit(True))
+        keys = list(cols)
+        left, right = self.select(*cols), other.select(*cols)
+        if not distinct:
+            ordinal = row_number().over(partition_by=cols, order_by=cols)
+            left = left.with_columns(__bc_n__=ordinal)
+            right = right.with_columns(__bc_n__=ordinal)
+            keys = [*cols, "__bc_n__"]
+        left = left.with_columns(__bc_l__=lit(True), __bc_r__=lit(False))
+        right = right.with_columns(__bc_l__=lit(False), __bc_r__=lit(True))
         grouped = (
             left.union(right)
-            .group_by(*cols)
+            .group_by(*keys)
             .agg(__bc_in_l__=col("__bc_l__").bool_or(), __bc_in_r__=col("__bc_r__").bool_or())
         )
         in_l, in_r = col("__bc_in_l__"), col("__bc_in_r__")

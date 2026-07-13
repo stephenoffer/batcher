@@ -547,7 +547,13 @@ pub fn combine_with(
     // dominates a many-group combine. Below it, and for global aggregates (no keys), the
     // serial path wins (the radix machinery is pure overhead on a small/single group).
     if total_rows > radix_parallel_threshold && !group_concat.is_empty() {
-        let partitions = rayon::current_num_threads().clamp(2, 64);
+        // One radix partition per core so the independent group-and-merge tasks fill the
+        // pool. The old `64` ceiling left a >64-core box merging a high-cardinality combine
+        // (DISTINCT / many-group) on at most 64 cores while the extra cores idled — the
+        // combine plateaued, then regressed, past ~16 cores. Partitioning is now flat-CSR
+        // (see `combine_radix`), so more partitions cost bounded allocation, not a growing-
+        // vector storm. The 512 ceiling caps per-partition setup overhead on huge boxes.
+        let partitions = rayon::current_num_threads().clamp(2, 512);
         let (group_columns, states) =
             group::combine_radix(&group_concat, &state_concats, funcs, total_rows, partitions)?;
         return Ok(Partial {

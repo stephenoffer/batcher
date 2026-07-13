@@ -4,6 +4,18 @@ Build test datasets in memory with plain Python and {py:obj}`bt.from_pydict <bat
 simplest way to produce inputs for trying out a pipeline at a chosen size and shape.
 Everything here runs as written.
 
+:::{note}
+**What you'll build.** Four generated datasets: a fixed one, a seeded random one, a numpy
+one, and a pair of joinable tables. `pip install batcher-engine` covers all but the numpy
+section, which needs `numpy`.
+:::
+
+:::{tip}
+Seed the generator. `random.seed(0)` or `np.random.default_rng(0)` is the difference between
+a test that fails reproducibly and a test that fails on Tuesdays. Every example below is
+seeded for exactly that reason.
+:::
+
 ## A small fixed dataset
 
 {py:obj}`bt.from_pydict <batcher.from_pydict>` takes a column-oriented dict, so generate each column as a list.
@@ -101,7 +113,50 @@ print(sorted(set(joined.to_pydict()["label"])))
 # ['E', 'W']
 ```
 
-## Next steps
+## Which generator to reach for
 
-- [Your first pipeline](first-pipeline.md): the full transform-aggregate-sort flow.
-- [Batch inference](batch-inference.md): run a model over the data you generate.
+| You want | Use |
+|---|---|
+| A handful of rows with exact values | A literal dict, as in the first section |
+| Arbitrary size, no dependency beyond the standard library | `random`, seeded |
+| Arbitrary size, fast, and numeric | `numpy`, with `default_rng(seed)` |
+| To exercise a join | Two tables sharing a key, as above |
+| A file on disk instead of memory | Generate, then `ds.write.parquet(path)` |
+
+:::{warning}
+Generated data is uniform, and real data is not. A pipeline that is fast on
+`random.choice(["north", "south", "east", "west"])` may be slow on a production key with one
+value in ten million rows and a million values with one row each. Skew is the thing your
+synthetic corpus will not reproduce unless you build it in on purpose.
+:::
+
+## What you learned
+
+::::{grid} 1 3 3 3
+:gutter: 3
+
+:::{grid-item-card} {octicon}`rocket;1.1em` Your first pipeline
+:link: first-pipeline
+:link-type: doc
+The full transform, aggregate, sort flow over what you just built.
+:::
+
+:::{grid-item-card} {octicon}`zap;1.1em` Batch inference
+:link: batch-inference
+:link-type: doc
+Run a model over the data you generate.
+:::
+
+:::{grid-item-card} {octicon}`meter;1.1em` Optimizing a slow query
+:link: optimizing-a-slow-query
+:link-type: doc
+Now make a 200,000-row query tell you why it is slow.
+:::
+::::
+
+## See also
+
+- [Joins](../user-guide/joins.md): the operator the last section sets up.
+- [Writing data](../user-guide/writing-data.md): turning a generated dataset into files.
+- [Data quality](../user-guide/data-quality.md): validating a corpus, synthetic or not.
+- [Dataset API](../api/dataset.md): `from_pydict`, `join`, and the rest.

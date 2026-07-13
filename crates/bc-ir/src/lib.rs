@@ -440,6 +440,67 @@ pub struct ProjectionItem {
 }
 
 impl RelOp {
+    /// True if any expression anywhere in this plan is a library-backed media decode
+    /// (`.image`/`.audio`/`.video`).
+    ///
+    /// A *scheduling* signal, not a semantic one: a media-decode kernel parallelizes
+    /// *within* a single morsel (heavy per-row JPEG/audio/video decode — see
+    /// [`Expr::contains_media_decode`]), so a plan carrying one can saturate every core
+    /// even when its input is a single morsel. The parallel executor uses this to lift
+    /// its morsel-count cap on pool width for such plans. Exhaustive by construction: a
+    /// new `RelOp` variant is a compile error here until it is classified.
+    pub fn contains_media_decode(&self) -> bool {
+        match self {
+            RelOp::Scan { .. } => false,
+            RelOp::Filter { input, predicate } => {
+                predicate.contains_media_decode() || input.contains_media_decode()
+            }
+            RelOp::Project { input, exprs } => {
+                exprs.iter().any(|p| p.expr.contains_media_decode())
+                    || input.contains_media_decode()
+            }
+            RelOp::Aggregate {
+                input,
+                group_keys,
+                aggregates,
+            } => {
+                group_keys.iter().any(|p| p.expr.contains_media_decode())
+                    || aggregates.iter().any(|a| {
+                        a.input.as_ref().is_some_and(Expr::contains_media_decode)
+                            || a.input2.as_ref().is_some_and(Expr::contains_media_decode)
+                    })
+                    || input.contains_media_decode()
+            }
+            RelOp::Sort { input, keys, .. } => {
+                keys.iter().any(|k| k.expr.contains_media_decode()) || input.contains_media_decode()
+            }
+            RelOp::Limit { input, .. }
+            | RelOp::Distinct { input }
+            | RelOp::Unnest { input, .. }
+            | RelOp::RowId { input, .. }
+            | RelOp::Unpivot { input, .. }
+            | RelOp::Sample { input, .. } => input.contains_media_decode(),
+            RelOp::HashJoin { left, right, .. } | RelOp::AsofJoin { left, right, .. } => {
+                left.contains_media_decode() || right.contains_media_decode()
+            }
+            RelOp::Window {
+                input,
+                partition_keys,
+                order_keys,
+                functions,
+                ..
+            } => {
+                partition_keys.iter().any(Expr::contains_media_decode)
+                    || order_keys.iter().any(|k| k.expr.contains_media_decode())
+                    || functions
+                        .iter()
+                        .any(|f| f.input.as_ref().is_some_and(Expr::contains_media_decode))
+                    || input.contains_media_decode()
+            }
+            RelOp::Union { inputs, .. } => inputs.iter().any(RelOp::contains_media_decode),
+        }
+    }
+
     /// Parse a plan from the JSON IR document emitted by the Python control plane.
     ///
     /// serde_json guards against stack overflow with a default 128-deep recursion limit,

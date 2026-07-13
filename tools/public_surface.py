@@ -14,6 +14,15 @@ the ML preprocessor exports. Private helpers (``_``-prefixed) are excluded — w
 the exception of the accessor-namespace *classes*, which are private by name
 (``_StrNamespace``) but public by reach, since ``col("x").str.upper()`` is the
 documented spelling.
+
+The root ``__all__`` is not the whole surface, and assuming it was is how 73 public
+names went undocumented while every gate stayed green: a user also reaches
+``batcher.ml`` (engines, loaders, serving), ``batcher.governance`` (row filters,
+column masks, lineage), ``batcher.config`` (the tunable dataclasses), and
+``batcher.io`` (the ``Source``/``Sink`` protocols and formats a custom connector
+implements). Those four packages curate their own ``__all__``, so they are part of
+the surface too — enumerated in ``_SUBPACKAGES`` below. A gate that derives the
+surface from one ``__all__`` only proves that one ``__all__`` is documented.
 """
 
 from __future__ import annotations
@@ -31,6 +40,29 @@ PUBLIC_DUNDERS = frozenset(
         "__contains__",
     }
 )
+
+
+# The subpackages that curate their own public ``__all__``. A user imports from these
+# directly (``from batcher.governance import RowFilter``), so every name they export is
+# public and owes the same documentation as a root export.
+_SUBPACKAGES = (
+    "batcher.ml",
+    "batcher.io",
+    "batcher.config",
+    "batcher.governance",
+)
+
+
+def _subpackage_exports() -> list[tuple[str, Any]]:
+    """Every name the public subpackages export, as ``(qualified_name, obj)`` pairs."""
+    import importlib
+
+    out: list[tuple[str, Any]] = []
+    for mod_name in _SUBPACKAGES:
+        module = importlib.import_module(mod_name)
+        for name in getattr(module, "__all__", ()):
+            out.append((f"{mod_name}.{name}", getattr(module, name)))
+    return out
 
 
 def _accessor_namespaces() -> list[type]:
@@ -97,6 +129,10 @@ def public_classes() -> list[tuple[str, type]]:
         obj = getattr(preprocessors, name)
         if inspect.isclass(obj):
             out.append((f"batcher.ml.preprocessors.{name}", obj))
+
+    for qual, obj in _subpackage_exports():
+        if inspect.isclass(obj):
+            out.append((qual, obj))
     return out
 
 
@@ -116,6 +152,10 @@ def public_functions() -> list[tuple[str, Any]]:
         obj = getattr(preprocessors, name)
         if inspect.isfunction(obj):
             out.append((f"batcher.ml.preprocessors.{name}", obj))
+
+    for qual, obj in _subpackage_exports():
+        if inspect.isfunction(obj):
+            out.append((qual, obj))
     return out
 
 
@@ -173,6 +213,7 @@ def public_names() -> set[str]:
     from batcher.ml import preprocessors
 
     names |= set(preprocessors.__all__)
+    names |= {qual.rsplit(".", 1)[-1] for qual, _ in _subpackage_exports()}
     return names
 
 

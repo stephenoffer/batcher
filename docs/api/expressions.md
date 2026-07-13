@@ -262,7 +262,7 @@ Breadth lives on accessor namespaces rather than on the expression itself.
 | `.json` | `extract_string(path)` |
 | `.map` | `get(key)`, `keys()`, `values()` — read a `Map`-typed column |
 | `.image` | `decode()`, `to_tensor(width, height)`, `resize(width, height)` (re-encode to PNG bytes) |
-| `.audio` | `decode()`, `to_waveform()` (decode to a mono PCM `List<Float>` signal) |
+| `.audio` | `decode()`, `to_waveform()` (decode to a mono PCM `List<Float>` signal), `resample(rate)` (decode + band-limited resample to `rate` Hz — the 16 kHz audio-ML preprocessing step) |
 | `.video` | `decode()` |
 
 ### More `.str` methods

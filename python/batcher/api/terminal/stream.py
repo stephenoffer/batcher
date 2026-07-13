@@ -201,7 +201,11 @@ def _iter_batches(
         from batcher.plan.logical import Join, Window
 
         gen = None
-        if isinstance(plan, Sort) and supports_spilling_sort(plan) and is_streamable(plan.input):
+        if (
+            isinstance(plan, Sort)
+            and supports_spilling_sort(plan, sources)
+            and is_streamable(plan.input)
+        ):
             gen = stream_spilling_sort(plan, sources)
         elif isinstance(plan, Join) and is_streamable(plan.left) and is_streamable(plan.right):
             gen = stream_spilling_join(plan, sources)

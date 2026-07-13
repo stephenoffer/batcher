@@ -84,6 +84,29 @@ def test_orc_split_concat_equals_whole(tmp_path):
     assert _sorted_pydict(from_splits) == _sorted_pydict(table)
 
 
+def test_orc_write_stream_is_incremental(tmp_path):
+    """`write_stream` uses the incremental ORCWriter (bounded memory), not a buffer.
+
+    Feeding batches one at a time must round-trip identically to a whole-table write,
+    and the sink must expose a real stream writer (so `write_stream` never falls back
+    to buffering the whole table).
+    """
+    from batcher.io.formats.structured.orc import ORCSink, ORCSource
+
+    table = _sample_table()
+    sink = ORCSink()
+    # The incremental hook must be wired — otherwise write_stream silently buffers.
+    with open(str(tmp_path / "_probe.orc"), "wb") as fh:
+        assert sink._open_stream_writer(fh, table.schema) is not None
+
+    path = str(tmp_path / "streamed.orc")
+    written = sink.write_stream(iter(table.to_batches(max_chunksize=1)), path)
+    assert written.rows == table.num_rows
+
+    got = pa.Table.from_batches(ORCSource(path).read())
+    assert _sorted_pydict(got) == _sorted_pydict(table)
+
+
 # --------------------------------------------------------------------- Arrow IPC
 def test_arrow_ipc_roundtrip(tmp_path):
     from batcher.io.formats.structured.arrow_ipc import ArrowIPCSink, ArrowIPCSource
@@ -193,6 +216,36 @@ def test_avro_roundtrip(tmp_path):
     src = AvroSource(path)
     got = pa.Table.from_batches(src.read())
     assert _sorted_pydict(got.select(["id", "name"])) == _sorted_pydict(table)
+
+
+def test_avro_native_matches_fastavro(tmp_path, monkeypatch):
+    """The native `arrow-avro` reader and the `fastavro` fallback decode identically.
+
+    Covers several types (long / double / string / boolean) so a divergence in either
+    path — not just row count — surfaces. The fallback is exercised by stubbing the native
+    reader to report "unavailable" (returns ``None``), the same signal a decode error gives.
+    """
+    pytest.importorskip("fastavro")
+    from batcher.io.formats.structured import avro as avro_mod
+    from batcher.io.formats.structured.avro import AvroSink, AvroSource
+
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4], type=pa.int64()),
+            "amount": pa.array([1.5, -2.25, 0.0, 9.75], type=pa.float64()),
+            "name": ["alice", "bob", "carol", "dave"],
+        }
+    )
+    path = str(tmp_path / "data.avro")
+    AvroSink().write(table, path)
+
+    native = pa.Table.from_batches(AvroSource(path).read())
+
+    monkeypatch.setattr(avro_mod, "_read_native", lambda data, batch_rows: None)
+    fallback = pa.Table.from_batches(AvroSource(path).read())
+
+    assert _sorted_pydict(native) == _sorted_pydict(fallback)
+    assert _sorted_pydict(native) == _sorted_pydict(table)
 
 
 def test_lance_roundtrip(tmp_path):

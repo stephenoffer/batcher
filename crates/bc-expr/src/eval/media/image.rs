@@ -16,6 +16,7 @@ use arrow::array::{
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field};
 
+use super::map_rows;
 use crate::{ExprError, ImageFunc};
 
 /// Evaluate an image function over a Binary array of encoded image bytes.
@@ -53,42 +54,46 @@ fn resize(
         func: "resize".into(),
         arg: "height",
     })? as u32;
-    let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(bytes.len());
-    for i in 0..bytes.len() {
+    let out: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
         if bytes.is_null(i) {
-            out.push(None);
+            None
         } else {
-            out.push(resize_png(bytes.value(i), w, h));
+            resize_png(bytes.value(i), w, h)
         }
-    }
+    });
     Ok(Arc::new(BinaryArray::from_iter(out)))
 }
 
 /// Decode, resize to `(w, h)`, and re-encode as PNG; `None` on any failure.
 fn resize_png(data: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
-    let img = image::load_from_memory(data).ok()?;
-    let resized = img.resize_exact(w, h, image::imageops::FilterType::Triangle);
+    let raw = decode_rgb_resized(data, w, h)?;
+    let img = image::RgbImage::from_raw(w, h, raw)?;
     let mut buf = Cursor::new(Vec::new());
-    resized.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .ok()?;
     Some(buf.into_inner())
 }
 
 /// `decode` → struct `{width: Int32, height: Int32}` (header read only).
 fn decode_dims(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
+    // Read each header in parallel (an undecodable/null row → `None`), then unzip into
+    // the three column buffers. The header read is the cost; the unzip is a cheap memcpy.
+    let dims: Vec<Option<(i32, i32)>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            None
+        } else {
+            image_dimensions(bytes.value(i)).map(|(w, h)| (w as i32, h as i32))
+        }
+    });
     let mut widths: Vec<i32> = Vec::with_capacity(bytes.len());
     let mut heights: Vec<i32> = Vec::with_capacity(bytes.len());
     let mut valid: Vec<bool> = Vec::with_capacity(bytes.len());
-    for i in 0..bytes.len() {
-        if bytes.is_null(i) {
-            widths.push(0);
-            heights.push(0);
-            valid.push(false);
-            continue;
-        }
-        match image_dimensions(bytes.value(i)) {
+    for dim in dims {
+        match dim {
             Some((w, h)) => {
-                widths.push(w as i32);
-                heights.push(h as i32);
+                widths.push(w);
+                heights.push(h);
                 valid.push(true);
             }
             None => {
@@ -126,23 +131,26 @@ fn to_tensor(
         arg: "height",
     })? as u32;
     let per_row = (w as usize) * (h as usize) * 3;
-    let mut values: Vec<u8> = Vec::with_capacity(bytes.len() * per_row);
+    // Decode + resize every row in parallel (this is the training-data hot path:
+    // `read.images(decode=True)` lowers to exactly this kernel). Each row yields its
+    // own `per_row`-byte RGB8 buffer, or `None` on null/undecodable/wrong-size input.
+    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        decode_rgb_resized(bytes.value(i), w, h).filter(|buf| buf.len() == per_row)
+    });
+    // Assemble the contiguous FixedSizeList child buffer serially — a straight memcpy
+    // per row (undecodable rows leave their slot zeroed), cheap next to the decode.
+    let mut values: Vec<u8> = vec![0u8; bytes.len() * per_row];
     let mut valid: Vec<bool> = Vec::with_capacity(bytes.len());
-    for i in 0..bytes.len() {
-        let pixels: Option<Vec<u8>> = if bytes.is_null(i) {
-            None
-        } else {
-            decode_rgb_resized(bytes.value(i), w, h)
-        };
-        match pixels {
-            Some(buf) if buf.len() == per_row => {
-                values.extend_from_slice(&buf);
+    for (i, row) in rows.into_iter().enumerate() {
+        match row {
+            Some(buf) => {
+                values[i * per_row..(i + 1) * per_row].copy_from_slice(&buf);
                 valid.push(true);
             }
-            _ => {
-                values.resize(values.len() + per_row, 0);
-                valid.push(false);
-            }
+            None => valid.push(false),
         }
     }
     let field = Arc::new(Field::new("item", DataType::UInt8, false));
@@ -165,10 +173,72 @@ fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// Decode, resize to `(w, h)`, and flatten to RGB8; `None` on any failure.
+///
+/// Two SIMD-accelerated stages, each the fast option for its job:
+///   1. **Decode.** For a JPEG whose source is ≥2× the target, decode at a 1/2·1/4·1/8
+///      **DCT scale** ([`decode_jpeg_scaled`]) — the physical-AI case (large camera frame
+///      → small model input), where full-res decode wastes most of the pixels and memory
+///      bandwidth. Everything else (small JPEGs, PNG/WebP/…) decodes via zune-jpeg / the
+///      `image` crate, already SIMD.
+///   2. **Resize** to the exact `(w, h)` with `fast_image_resize` (SIMD bilinear — the same
+///      tent/linear filter the previous scalar `resize_exact(Triangle)` used).
+///
+/// Pixels are not bit-identical across decoder/resizer implementations; the multimodal
+/// benchmark accounts for this by comparing counts/dims, not raw pixels.
 fn decode_rgb_resized(data: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
-    let img = image::load_from_memory(data).ok()?;
-    let resized = img.resize_exact(w, h, image::imageops::FilterType::Triangle);
-    Some(resized.to_rgb8().into_raw())
+    use fast_image_resize as fir;
+
+    // Stage 1: decode to an RGB8 buffer at some `(sw, sh)` ≥ the target.
+    let (rgb, sw, sh) = match decode_jpeg_scaled(data, w, h) {
+        Some(scaled) => scaled,
+        None => {
+            let img = image::load_from_memory(data).ok()?;
+            let (sw, sh) = (img.width(), img.height());
+            (img.into_rgb8().into_raw(), sw, sh)
+        }
+    };
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    // Stage 2: exact resize (skip when the scaled decode already hit the target size).
+    if sw == w && sh == h {
+        return Some(rgb);
+    }
+    let src = fir::images::Image::from_vec_u8(sw, sh, rgb, fir::PixelType::U8x3).ok()?;
+    let mut dst = fir::images::Image::new(w, h, fir::PixelType::U8x3);
+    let opts = fir::ResizeOptions::new()
+        .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Bilinear));
+    fir::Resizer::new().resize(&src, &mut dst, &opts).ok()?;
+    Some(dst.into_vec())
+}
+
+/// DCT-scaled JPEG decode: decode at the smallest 1/1·1/2·1/4·1/8 scale whose output is
+/// still ≥ `(w, h)`, returning `(rgb8, out_w, out_h)`. `None` (→ caller uses the full
+/// decoder) unless the source is a baseline RGB JPEG at least 2× the target in both dims —
+/// below that, `jpeg-decoder`'s slower per-pixel decode would lose to zune-jpeg's full one.
+fn decode_jpeg_scaled(data: &[u8], w: u32, h: u32) -> Option<(Vec<u8>, u32, u32)> {
+    use jpeg_decoder::{Decoder, PixelFormat};
+
+    let mut dec = Decoder::new(Cursor::new(data));
+    dec.read_info().ok()?;
+    let info = dec.info()?;
+    // Only a win when at least one DCT octave can be dropped, and only for RGB (the common
+    // 3-channel photo case); grayscale/CMYK fall back so the pixel semantics stay simple.
+    if info.pixel_format != PixelFormat::RGB24
+        || u32::from(info.width) < w.saturating_mul(2)
+        || u32::from(info.height) < h.saturating_mul(2)
+    {
+        return None;
+    }
+    // Request the target size; the decoder snaps up to the nearest DCT scale that still
+    // covers it, so the subsequent resize only ever downsamples.
+    let (out_w, out_h) = dec.scale(w as u16, h as u16).ok()?;
+    let pixels = dec.decode().ok()?;
+    let (out_w, out_h) = (u32::from(out_w), u32::from(out_h));
+    if pixels.len() != (out_w as usize) * (out_h as usize) * 3 {
+        return None; // unexpected layout — let the full decoder handle it
+    }
+    Some((pixels, out_w, out_h))
 }
 
 #[cfg(test)]
@@ -183,6 +253,45 @@ mod tests {
             .write_to(&mut out, image::ImageFormat::Png)
             .unwrap();
         out.into_inner()
+    }
+
+    /// Manual throughput check (ignored). Run:
+    ///   RAYON_NUM_THREADS=1 cargo test -p bc-expr to_tensor_bench -- --ignored --nocapture
+    ///   cargo test -p bc-expr to_tensor_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn to_tensor_bench() {
+        use std::time::Instant;
+        let n = 4000usize;
+        let blobs: Vec<Vec<u8>> = (0..n)
+            .map(|i| {
+                // A noisy image so JPEG decode does real work (not a trivial solid fill).
+                let mut img = image::RgbImage::new(256, 256);
+                for (x, y, p) in img.enumerate_pixels_mut() {
+                    let v = ((x * 7 + y * 13 + (i as u32) * 31) % 256) as u8;
+                    *p = image::Rgb([v, v.wrapping_add(80), v.wrapping_add(160)]);
+                }
+                let mut out = Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(img)
+                    .write_to(&mut out, image::ImageFormat::Jpeg)
+                    .unwrap();
+                out.into_inner()
+            })
+            .collect();
+        let arr: ArrayRef = Arc::new(BinaryArray::from_iter(
+            blobs.iter().map(|b| Some(b.as_slice())),
+        ));
+        let _ = eval_image(ImageFunc::ToTensor, &arr, Some(224), Some(224)).unwrap(); // warm
+        let t = Instant::now();
+        let out = eval_image(ImageFunc::ToTensor, &arr, Some(224), Some(224)).unwrap();
+        let dt = t.elapsed().as_secs_f64();
+        assert_eq!(out.len(), n);
+        println!(
+            "rayon_threads={}  to_tensor {n} imgs: {:.1} ms ({:.0} img/s)",
+            rayon::current_num_threads(),
+            dt * 1000.0,
+            n as f64 / dt
+        );
     }
 
     #[test]
@@ -218,6 +327,103 @@ mod tests {
         assert_eq!(px.value(0), 255);
         assert_eq!(px.value(1), 0);
         assert_eq!(px.value(2), 0);
+    }
+
+    #[test]
+    fn to_tensor_parallel_batch_preserves_order_and_nulls() {
+        // A batch above `PAR_ROW_THRESHOLD` so the parallel row map runs. Every third
+        // row is null and every fifth is corrupt; the rest are solid-color images whose
+        // color encodes their index, so we can prove order is preserved across the fan-out.
+        let n = 40usize;
+        let mut rows: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if i % 3 == 0 {
+                rows.push(None);
+            } else if i % 5 == 0 {
+                rows.push(Some(b"not an image".to_vec()));
+            } else {
+                let c = (i % 256) as u8;
+                let img = image::RgbImage::from_pixel(6, 6, image::Rgb([c, 0, 0]));
+                let mut out = Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(img)
+                    .write_to(&mut out, image::ImageFormat::Png)
+                    .unwrap();
+                rows.push(Some(out.into_inner()));
+            }
+        }
+        let arr: ArrayRef = Arc::new(BinaryArray::from_iter(rows));
+        let out = eval_image(ImageFunc::ToTensor, &arr, Some(4), Some(4)).unwrap();
+        let fsl = out.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        assert_eq!(fsl.len(), n);
+        for i in 0..n {
+            if i % 3 == 0 || i % 5 == 0 {
+                assert!(fsl.is_null(i), "row {i} should be null");
+            } else {
+                assert!(fsl.is_valid(i), "row {i} should be valid");
+                let row = fsl.value(i);
+                let px = row.as_any().downcast_ref::<UInt8Array>().unwrap();
+                // The solid color survives resize, proving this slot got row `i`'s pixels.
+                assert_eq!(px.value(0), (i % 256) as u8, "row {i} decoded out of order");
+                assert_eq!(px.value(1), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_decode_downscales_large_jpeg_correctly() {
+        // A large solid-color JPEG (source 512×512 ≥ 2× target 128 → the DCT-scaled path
+        // runs). The color must survive decode+resize, proving the scaled path is wired
+        // correctly and produces the right shape.
+        let src = image::RgbImage::from_pixel(512, 512, image::Rgb([40, 160, 200]));
+        let mut jpg = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(src)
+            .write_to(&mut jpg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let jpg = jpg.into_inner();
+
+        // The scaled path is taken and returns the right shape.
+        let scaled = decode_jpeg_scaled(&jpg, 128, 128);
+        assert!(scaled.is_some(), "512→128 JPEG should use the scaled path");
+        let (_, sw, sh) = scaled.unwrap();
+        assert!(
+            sw >= 128 && sh >= 128,
+            "scaled output must still cover the target"
+        );
+
+        // End to end: the tensor is 128×128×3 and stays the source color (± JPEG noise).
+        let arr: ArrayRef = Arc::new(BinaryArray::from_iter(vec![Some(jpg.as_slice())]));
+        let out = eval_image(ImageFunc::ToTensor, &arr, Some(128), Some(128)).unwrap();
+        let fsl = out.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        assert_eq!(fsl.value_length(), 128 * 128 * 3);
+        assert!(fsl.is_valid(0));
+        let row = fsl.value(0);
+        let px = row.as_any().downcast_ref::<UInt8Array>().unwrap();
+        assert!(
+            (px.value(0) as i32 - 40).abs() < 20,
+            "R ~40, got {}",
+            px.value(0)
+        );
+        assert!(
+            (px.value(1) as i32 - 160).abs() < 20,
+            "G ~160, got {}",
+            px.value(1)
+        );
+        assert!(
+            (px.value(2) as i32 - 200).abs() < 20,
+            "B ~200, got {}",
+            px.value(2)
+        );
+
+        // A small JPEG (≤2× target) must NOT take the scaled path — full decode is faster.
+        let small = image::RgbImage::from_pixel(130, 130, image::Rgb([10, 20, 30]));
+        let mut sbuf = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(small)
+            .write_to(&mut sbuf, image::ImageFormat::Jpeg)
+            .unwrap();
+        assert!(
+            decode_jpeg_scaled(&sbuf.into_inner(), 128, 128).is_none(),
+            "130→128 is not a ≥2× downscale; the scaled path should decline it"
+        );
     }
 
     #[test]

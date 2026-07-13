@@ -1,21 +1,20 @@
 # Inference
 
-Batch inference applies a model to every row of a dataset. In Batcher this runs
-through the `.ml` accessor: `ds.ml.infer(model, ...)` for predictions and
-`ds.ml.embed(model, ...)` for vectors. Both are lazy, return a new `Dataset`, and
-operate on whole Arrow batches, so the model sees a batch of inputs at a time and
-the engine handles parallelism, batching, and GPU placement.
+Batch inference applies a model to every row of a dataset. Two calls on the `.ml`
+accessor do it: `ds.ml.infer(model, ...)` for predictions, `ds.ml.embed(model, ...)`
+for vectors. Both are lazy and hand back a new `Dataset`. Both give the model whole
+Arrow batches, so parallelism, batch sizing, and GPU placement stay in the engine.
 
 ## The model is a callable over batches
 
-`model` is a callable applied to each `pyarrow.RecordBatch`. The recommended form
-is a class: the constructor loads the weights once per worker, and `__call__` runs
-the forward pass on each batch and returns a batch with the results appended. This
-amortizes model loading across every batch the worker handles.
+`model` is a callable applied to each `pyarrow.RecordBatch`. Write it as a class: the
+constructor loads the weights once per worker, and `__call__` runs the forward pass on
+each batch and returns a batch with the results appended. Loading in the constructor
+amortizes that cost across every batch the worker handles.
 
-A model needs a GPU and weights, so the inference call itself is shown but not
-run. The mechanics, a class that sets up once and is called per batch, are the
-same as the runnable `map_batches` example below.
+The call below needs a GPU and real weights, so it is shown but not executed. The
+mechanics (set up once, get called per batch) are the same as the runnable
+`map_batches` example further down.
 
 ```python
 # docs: skip
@@ -91,13 +90,13 @@ shortcut for embedding models, appending a vector column; it needs the `st` extr
 
 By default the callable receives and returns a `pyarrow.RecordBatch` (zero-copy,
 no conversion). `batch_format` switches that to whatever the model code is written
-against, converting only around the call — the engine boundary stays Arrow:
+against, converting only around the call. The engine boundary stays Arrow:
 
-- `"numpy"` — a `{column: ndarray}` dict, the most natural shape for a NumPy or
+- `"numpy"` gives a `{column: ndarray}` dict, the natural shape for a NumPy or
   pure-array model.
-- `"pandas"` — a `DataFrame`.
-- `"torch"` — a `{column: tensor}` dict over the numeric columns, ready to move to
-  a device.
+- `"pandas"` gives a `DataFrame`.
+- `"torch"` gives a `{column: tensor}` dict over the numeric columns, ready to move
+  to a device.
 
 A tensor column (every row a same-shape N-d array, e.g. decoded images) arrives as
 a stacked `ndarray` under `"numpy"`/`"torch"`, so a `(batch, H, W, 3)` block feeds
@@ -126,11 +125,10 @@ print(out.to_pydict()["score"])
 
 ## GPU placement
 
-Inference does not have to run on a GPU, but when it does the placement is declared
-on the same call: `num_gpus` reserves a device per actor and `concurrency` sizes the
-pool. Preprocessing stays on CPU workers while the model runs on GPU actors — the
-heterogeneous pipeline. The full mechanics, fractional packing, and how to keep the
-devices fed live in [GPU scheduling](gpu.md).
+Inference does not have to run on a GPU. When it does, the placement is declared on
+the same call: `num_gpus` reserves a device per actor, `concurrency` sizes the pool.
+Preprocessing stays on CPU workers while the model runs on GPU actors.
+[GPU scheduling](gpu.md) covers fractional packing and how to keep the devices fed.
 
 ## Embeddings
 
@@ -155,6 +153,90 @@ class Embedder:
 docs = bt.read.parquet("data/docs.parquet")
 embedded = docs.ml.embed(Embedder(), batch_size=256, num_gpus=1, concurrency=2)
 ```
+
+## Driving the pool yourself
+
+`ds.ml.infer` runs on a `Dataset`. When what you hold is a bare stream of Arrow batches
+(the output of `iter_batches()`, a reader, a previous stage), `InferencePool` gives you
+that same worker pool with no plan around it.
+
+Two callables define it. A `Worker` maps one `pyarrow.RecordBatch` to one
+`RecordBatch`: the forward pass, the tokenizer, whatever the batch has to go through. A
+`WorkerFactory` is a zero-argument callable that builds a `Worker`. The pool calls the
+factory exactly `num_workers` times, once per slot, so the weights load once and every
+batch that slot handles reuses them. Build the model inside the `Worker` and it reloads
+on every batch; the factory exists to stop that.
+
+```python
+import pyarrow as pa
+import pyarrow.compute as pc
+from batcher.ml import InferencePool
+
+
+def make_worker():  # a WorkerFactory — called once per pool slot
+    scale = pa.scalar(2.0)  # stands in for the weights you would load here
+
+    def worker(batch):  # a Worker — called once per batch
+        return batch.append_column("scaled", pc.multiply(batch.column("x"), scale))
+
+    return worker
+
+
+batches = [pa.record_batch({"x": [1.0, 2.0]}), pa.record_batch({"x": [3.0]})]
+pool = InferencePool(make_worker, num_workers=2, target_batch_rows=2)
+print([b.column("scaled").to_pylist() for b in pool.run(batches)])
+# [[2.0, 4.0], [6.0]]
+```
+
+`run` re-chunks the input to `target_batch_rows` (coalescing small batches, splitting
+large ones), dispatches across the workers concurrently, and yields results **in input
+order**. Concurrency never reorders your rows. Set `target_latency_ms` to retune the
+batch size online toward a per-batch latency, bounded by `min_batch_rows` /
+`max_batch_rows`; leave it unset for a fixed size. `objective="throughput"` hill-climbs
+the batch size for rows/sec under a VRAM cap instead, which is what offline batch work
+wants.
+
+A batch that OOMs the accelerator is halved and retried rather than failing the job: the
+pool frees the cache, runs the two halves, and concatenates them. Only a single row that
+still OOMs raises.
+
+## Overlapping stages with `run_pipeline`
+
+A real inference job is a chain: read, decode, forward pass. Run them in lockstep and
+the GPU idles while the CPU decodes the next batch. `run_pipeline` runs each `Stage` on
+its own thread with a bounded queue between them, so the GPU stage works on batch *k*
+while the CPU stage prepares *k+1*.
+
+Each `Stage` carries a factory (built once, on that stage's thread, the same load-once
+contract as `WorkerFactory`), a `credits` count, and a `num_gpus` placement hint.
+Credits are the backpressure. They cap how many finished batches may sit between one
+stage and the next, so a slow consumer blocks its producer instead of letting the queue
+grow without bound. Peak memory is the sum of the stages' credits, counted in batches,
+not in the length of the stream.
+
+```python
+import pyarrow as pa
+import pyarrow.compute as pc
+from batcher.ml import Stage, run_pipeline
+
+
+def decode():  # a CPU stage
+    return lambda b: b.append_column("x2", pc.multiply(b.column("x"), pa.scalar(2)))
+
+
+def forward():  # the stage that would hold the model
+    return lambda b: b.append_column("y", pc.add(b.column("x2"), pa.scalar(1)))
+
+
+batches = [pa.record_batch({"x": [1, 2]}), pa.record_batch({"x": [3]})]
+stages = [Stage(decode, credits=2, name="decode"), Stage(forward, num_gpus=1, name="model")]
+print([b.column("y").to_pylist() for b in run_pipeline(batches, stages)])
+# [[3, 5], [7]]
+```
+
+The result is exactly what applying the stages in sequence would produce, in the same
+order. Overlapping them changes the schedule, never the answer. An exception in any
+stage stops the others and is re-raised to the consumer.
 
 ## A runnable batch transform
 

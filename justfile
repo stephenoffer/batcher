@@ -70,16 +70,29 @@ lint-layers:
 lint-structure:
     python tools/lint_structure.py
 
+# Copy-paste detector. The subsystems cannot import each other, so copy-paste is the only
+# *wrong* way to share between them — this is what catches it.
+lint-duplication:
+    python tools/lint_duplication.py
+
+# The agent-facing docs (CLAUDE.md, .claude/rules, .claude/skills) must stay TRUE: every path
+# and `just` recipe they name has to exist. Guidance pointing at a file that is not there is
+# worse than none — the agent invents a new home for the code instead.
+lint-guardrails:
+    python tools/lint_guardrails.py
+
 # Public-API docstring style: one-line summary, `.. doctest::` examples, typeless
 # Args/Returns. Needs the engine built (it introspects the live objects). The
 # examples it insists on are actually executed by `just docs`.
 lint-docstrings:
     python tools/lint_docstrings.py
 
-# Install the git pre-commit hook that runs the structure + ruff + layer gates.
+# Install the git pre-commit hook. RUN THIS FIRST, before you write any code: it is the only
+# thing that stops a commit which breaks a hard invariant. A branch once shipped with the layer
+# contract broken six ways because the hook existed and was never installed.
 install-hooks:
     ln -sf ../../tools/git-hooks/pre-commit .git/hooks/pre-commit
-    @echo "pre-commit hook installed (runs: lint-structure, ruff check, lint-layers)"
+    @echo "pre-commit hook installed (lint-structure, lint-duplication, lint-guardrails, ruff, lint-layers)"
 
 # Build the documentation site. Warnings are errors, so an orphan page or a
 # broken cross-reference fails the build. The doctest builder runs first, so a

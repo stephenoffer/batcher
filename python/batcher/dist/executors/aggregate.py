@@ -12,6 +12,7 @@ import json
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     _apply_above,
     _partition_source,
@@ -153,7 +154,7 @@ def _map_task(
 ):
     import os as _os
 
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.executors.partition_io import read_partition
     from batcher.dist.executors.ray_runtime import execute_metered
     from batcher.dist.shuffle_io import write_ipc
@@ -191,7 +192,7 @@ def _reduce_task(group_keys_json, aggregates_json, input_paths, work_dir, reduce
     one call — the mergeable-algebra invariant."""
     import os as _os
 
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.shuffle_io import read_ipc, write_ipc
 
     running = None

@@ -44,9 +44,7 @@ def t_nulls(duck):
 
 @pytest.fixture
 def t_empty(duck):
-    tbl = pa.table(
-        {"dept": pa.array([], pa.string()), "salary": pa.array([], pa.int64())}
-    )
+    tbl = pa.table({"dept": pa.array([], pa.string()), "salary": pa.array([], pa.int64())})
     duck.register("te", tbl)
     return tbl
 

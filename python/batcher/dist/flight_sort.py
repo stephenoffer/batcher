@@ -22,6 +22,7 @@ import json
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.dist.executor import _apply_above, _ensure_ray, _relabel_single_source
 from batcher.dist.executors.partition_io import (
     merge_boundaries,
@@ -31,10 +32,9 @@ from batcher.dist.executors.partition_io import (
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
     map_barrier,
-    release_placement,
     shuffle_partitions,
 )
-from batcher.dist.fleet import acquire_fleet
+from batcher.dist.fleet import acquire_fleet, release_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Sort
@@ -77,8 +77,7 @@ def execute_topn_flight(
     """
     import ray
 
-    import batcher._native as nat
-
+    nat = engine()
     _ensure_ray(workers)
     cfg_json = engine_config_json()
     map_plan, sid = _relabel_single_source(sort.input)
@@ -95,17 +94,16 @@ def execute_topn_flight(
         # otherwise parts and actors mismatch: a larger fleet indexes past `parts`, a smaller
         # one silently drops the tail partitions' rows (a wrong result). `execute_sort_flight`
         # already orders it this way.
-        projection, predicate = source_pushdown(map_plan, sid)
+        # `map_plan`'s scan was relabeled to source 0, so key the analysis on 0, not on the
+        # source's original index: a staged plan whose input is an intermediate (source id >
+        # 0) missed the lookup and silently read every column.
+        projection, predicate = source_pushdown(map_plan, 0)
         parts = partition_descriptors(
             sources[sid], workers, projection=projection, predicate=predicate
         )
         results = ray.get([actors[i].local_topn.remote(local_ir, parts[i]) for i in range(workers)])
     finally:
-        if owns:
-            for a in actors:
-                with contextlib.suppress(Exception):
-                    ray.kill(a)
-            release_placement(pg)
+        release_fleet(actors, pg, owns)
 
     gathered = [b for r in results for b in r if b.num_rows > 0]
     merged = nat.execute_plan(merge_ir, [gathered], cfg_json) if gathered else []
@@ -178,7 +176,10 @@ def execute_sort_flight(
         # fetches only the columns/rows it needs (the sort keys + carried output), not
         # the whole wide source — the projection the `map_ir` would otherwise discard
         # after paying to read it (see flight_aggregate).
-        projection, predicate = source_pushdown(map_plan, sid)
+        # `map_plan`'s scan was relabeled to source 0, so key the analysis on 0, not on the
+        # source's original index: a staged plan whose input is an intermediate (source id >
+        # 0) missed the lookup and silently read every column.
+        projection, predicate = source_pushdown(map_plan, 0)
         parts = partition_descriptors(
             sources[sid], workers, projection=projection, predicate=predicate
         )
@@ -247,11 +248,7 @@ def execute_sort_flight(
         if _prof:
             print(f"[sort] REDUCE(gather+sort) {_t.perf_counter() - _s:.1f}s", flush=True)
     finally:
-        if owns:
-            for a in actors:
-                with contextlib.suppress(Exception):
-                    ray.kill(a)
-            release_placement(pg)
+        release_fleet(actors, pg, owns)
 
     # Concatenate the ranges in leading-key order (reversed for a descending sort) —
     # each bucket is globally ordered relative to the others, so no final merge.

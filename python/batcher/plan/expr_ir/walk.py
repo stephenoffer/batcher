@@ -61,6 +61,37 @@ from batcher.plan.expr_ir.nodes import (
 from batcher.plan.expr_ir.video import VideoFunc
 
 
+def column_occurrence_counts(exprs: list[Expr]) -> dict[str, int]:
+    """How many times each column name *occurs* across `exprs` — occurrences, not distinct.
+
+    The counting sibling of `referenced_columns`: the projection rules need to know whether
+    merging two projections would evaluate a column twice, which a set cannot tell them. It
+    lives here because two Kyber rules had each written it out (`_col_ref_counts` and
+    `_occurrence_counts` — same body, different names), and a shared walk belongs with the
+    other shared walks.
+
+    Args:
+        exprs: The expressions to count column references across.
+
+    Returns:
+        Column name to the number of times it is referenced.
+    """
+    # Deferred: `expr_rewrite` imports this package, so a module-level import would close an
+    # `expr_ir -> expr_rewrite -> expr_ir` cycle.
+    from batcher.plan.expr_rewrite import transform_expr_up
+
+    counts: dict[str, int] = {}
+
+    def tally(expr: Expr) -> Expr:
+        if isinstance(expr, Col):
+            counts[expr.name] = counts.get(expr.name, 0) + 1
+        return expr
+
+    for expr in exprs:
+        transform_expr_up(expr, tally)
+    return counts
+
+
 def referenced_columns(expr: Expr) -> set[str]:
     """The set of input column names an expression reads.
 

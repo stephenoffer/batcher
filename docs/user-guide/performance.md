@@ -1,11 +1,14 @@
 # Performance and memory
 
-Batcher is built to stay fast on a laptop and survive on a cluster. This page
-covers the levers a user actually reaches for: caching a result you reuse, the
-morsel-driven execution model and its adaptive sizing, out-of-core spilling under a
-bounded memory budget, and how to read what a query did. Every knob lives on one
-frozen `Config`, applied process-wide with `set_config` or scoped to a block with
-`config_context`.
+Batcher is built to stay fast on a laptop and survive on a cluster. The levers a
+user actually reaches for are few: cache a result you reuse, size the morsels, give
+the engine a memory budget so it spills instead of dying, and read back what the
+query did. Every knob lives on one frozen `Config`, applied process-wide with
+`set_config` or scoped to a block with `config_context`.
+
+This page is about making *your* query faster. For how Batcher compares against DuckDB,
+Polars, Ray Data, and Daft, see the [benchmarks](../benchmarks/index.md), which include
+the workloads where Batcher still loses.
 
 ## Setup
 
@@ -25,8 +28,8 @@ events = bt.from_pydict(
 
 `cache()` marks a dataset's result to be stored in memory the first time it is
 computed. A later terminal on the *same* cached dataset returns the stored result
-instead of re-running the plan — the Spark/Polars `cache` pattern. Use it when an
-expensive upstream (a filter, a join, an aggregation) feeds several downstream
+instead of re-running the plan. It is the Spark/Polars `cache` pattern. Use it when
+an expensive upstream (a filter, a join, an aggregation) feeds several downstream
 queries.
 
 ```python
@@ -41,9 +44,9 @@ print(sorted(first["region"]))
 ```
 
 The cache is process-wide and memory-bounded by `memory.result_cache_max_bytes`
-(256 MiB by default), holding results LRU and yielding their memory back to running
-queries under pressure — so caching never grows the process without bound. It marks
-*this* result: a further transform on a cached dataset is a new, uncached result.
+(256 MiB by default). It holds results LRU and yields their memory back to running
+queries under pressure, so caching never grows the process without bound. And it
+marks *this* result: a further transform on a cached dataset is a new, uncached one.
 
 ## Reusing a cached dataset
 
@@ -59,13 +62,13 @@ print(hot.group_by("region").agg(total=bt.col("amount").sum()).sort("region").to
 
 ## Morsel-driven execution
 
-The engine's unit of work is a *morsel* — a small Arrow `RecordBatch`, 16,384 rows
-by default — sized to fit cache so scheduling stays granular and parallelism stays
-even across cores. You rarely change it, but `execution.morsel_rows` and
-`execution.morsel_bytes` are the levers: a morsel splits at whichever bound trips
+The engine's unit of work is a *morsel*: a small Arrow `RecordBatch`, 16,384 rows by
+default, sized to fit cache so scheduling stays granular and parallelism stays even
+across cores. You rarely change it. When you do, `execution.morsel_rows` and
+`execution.morsel_bytes` are the levers, and a morsel splits at whichever bound trips
 first, so wide rows (large strings, embeddings, blobs) stay memory-bounded even at a
-fixed row count. The setting is result-invariant — a morsel only batches data, it
-never changes the output.
+fixed row count. The setting is result-invariant. A morsel batches data; it never
+changes the output.
 
 ```python
 from batcher.config import Config, ExecutionConfig, config_context
@@ -85,10 +88,10 @@ the batch toward a target latency.
 
 ## Adaptive re-optimization
 
-Every cost estimate is a guess until the query runs. At a pipeline breaker — a sort,
-an aggregate, a join build — the engine has *measured* the real size of what it just
-processed, and when an estimate was off by more than `optimizer.reoptimize_error`
-(2x by default), it re-plans the rest of the query on the measured numbers before
+Every cost estimate is a guess until the query runs. At a pipeline breaker (a sort,
+an aggregate, a join build) the engine has *measured* the real size of what it just
+processed. When an estimate was off by more than `optimizer.reoptimize_error` (2x by
+default), it re-plans the rest of the query on the measured numbers before
 continuing. This is the part static optimizers cannot match. `collect(adaptive=...)`
 controls it: `"auto"` (the default) turns it on only when a join's input size is a
 pure estimate, and `True`/`False` force it. The result is identical whichever way it
@@ -108,17 +111,17 @@ print(joined.collect(adaptive=True).to_pydict())
 
 ## Out-of-core spilling
 
-Stateful operators — aggregation, distinct, sort, join build, windowed-by-partition
-— spill to disk when they would exceed the memory envelope, so a query that does not
+Stateful operators (aggregation, distinct, sort, join build, windowed-by-partition)
+spill to disk when they would exceed the memory envelope, so a query that does not
 fit in memory slows down rather than dying. Spilling is a property of the runtime
 primitive, not a separate plan: the result is bit-identical to the in-memory run.
 
 You do not ask an operator to spill; you set a memory budget and the engine decides.
-Setting `memory.max_memory_bytes` is what opts the in-memory engine into spilling —
-the data plane receives a per-operator budget of `max_memory_bytes x hard_limit`.
+Setting `memory.max_memory_bytes` is what opts the in-memory engine into spilling,
+and the data plane receives a per-operator budget of `max_memory_bytes x hard_limit`.
 A deliberately tiny budget forces the out-of-core path here so the example runs
-anywhere; in production you set it to the real ceiling (honoring a container/cgroup
-limit).
+anywhere. In production you set it to the real ceiling, honoring a container or cgroup
+limit.
 
 ```python
 from batcher.config import MemoryConfig
@@ -142,15 +145,15 @@ print(len(spilled["k"]))
 # 50
 ```
 
-At scale the local (NVMe) spill tier overflows to `memory.spill_remote_uri` (any
-fsspec URL) when local disk fills, and a skewed aggregate bucket that overflows
-`memory.spill_bucket_max_bytes` is re-partitioned and reduced one piece at a time —
-so a large or skewed query degrades gracefully instead of running out of memory.
+On a big job the local (NVMe) spill tier overflows to `memory.spill_remote_uri` (any
+fsspec URL) once local disk fills. A skewed aggregate bucket that overflows
+`memory.spill_bucket_max_bytes` is re-partitioned and reduced one piece at a time, so
+a large or skewed query degrades gracefully instead of running out of memory.
 
 ## Competitive benchmarks
 
 Every benchmark below is **correctness-gated**: the engines must return the identical
-result (a sorted row multiset within float tolerance) before any timing is trusted — a
+result (a sorted row multiset within float tolerance) before any timing is trusted. A
 fast wrong answer is a bug, not a win. Reproduce with:
 
 ```bash
@@ -160,8 +163,8 @@ python benchmarks/run.py --benchmark operators --scale 10    # at 60M rows (sf10
 
 ### Single-node operator mix (TPC-H `lineitem`, vs DuckDB and Polars)
 
-Batcher wins the analytical core — grouped aggregation, filters, ordering, and the
-whole window family — at both 6M (sf1) and 60M (sf10) rows. Each cell is
+Batcher wins the analytical core (grouped aggregation, filters, ordering, the whole
+window family) at both 6M (sf1) and 60M (sf10) rows. Each cell is
 `batcher / fastest-competitor` wall time, so **below 1.0 means batcher is faster**
 (e.g. `0.40×` = 2.5× faster than the next engine).
 
@@ -179,13 +182,13 @@ whole window family — at both 6M (sf1) and 60M (sf10) rows. Each cell is
 
 The window family is the widest margin: at 60M rows, `rank() OVER (PARTITION BY …)`
 runs ~2.5× faster than DuckDB and ~13× faster than Polars, and the whole family
-scales — the win holds or grows from 6M to 60M rows. (Daft is 30–100× slower on
+scales: the win holds or grows from 6M to 60M rows. (Daft is 30–100× slower on
 windows.) Two-key aggregation and DISTINCT hash their composite keys directly rather
 than through a row encoder, so they keep winning as row counts grow.
 
 ### Out-of-core resilience (the memory-bound regime)
 
-The harder test is a tight memory budget where **both** engines must spill to disk —
+The harder test is a tight memory budget where **both** engines must spill to disk:
 the PB-scale regime in miniature. Batcher stays alive and competitive, and
 high-cardinality dedup that loses in memory can flip to a win once the comparison is
 out-of-core (batcher's hash-partitioned distinct spill vs DuckDB's):
@@ -196,10 +199,10 @@ out-of-core (batcher's hash-partitioned distinct spill vs DuckDB's):
 | group-by, two keys                         | ~1.0× (tie/win)   |
 | `COUNT(DISTINCT)`                           | 1.6× (completes)  |
 
-The guarantee that matters at scale is *completion*: aggregation, distinct, sort
+The guarantee that matters on a big job is *completion*. Aggregation, distinct, sort
 (single- or multi-key), join build, and partitioned windows all spill, and a skewed
 partition is recursively re-partitioned so peak memory stays bounded regardless of the
-key distribution — the query finishes rather than OOMing.
+key distribution. The query finishes rather than OOMing.
 
 ### vs Ray Data
 
@@ -208,7 +211,7 @@ On Ray Data's own distributed home turf, batcher's in-process native engine is
 cost (task scheduling plus the block/pandas bridge, ~300–4500 ms) that batcher, native
 and in-process, does not pay.
 
-But the fairer test is Ray Data's *bread-and-butter data plane* — streaming
+But the fairer test is Ray Data's *bread-and-butter data plane*: streaming
 `map_batches` ETL / batch inference, multimodal-style file I/O, and the last-mile
 training-data loader. The results below are measured on a single 96-core node (188 GB),
 each **correctness-gated** (row count + checksum identical across engines). Every cell
@@ -230,13 +233,13 @@ is Ray Data's wall time ÷ batcher's, so **`>1` means batcher is faster**.
 
 Batcher wins these because a CPU-bound `map_batches` runs across a **warm, shared process
 pool** (Ray Data's actor-pool role) that reads its input from RAM-backed shared memory
-zero-copy — no per-worker pickling of the batch — while a GIL-releasing NumPy/torch `fn`
+zero-copy, with no per-worker pickling of the batch, while a GIL-releasing NumPy/torch `fn`
 fans across threads with no IPC at all. Reads and multi-file writes are parallelized
 (Parquet decode/encode releases the GIL), and a `read → map → write` overlaps compute
 with I/O on a background thread the way Ray Data's streaming executor pipelines stages.
 
 **Distributed-training data ingest** (`iter_torch_batches`, 10 M rows × 32 features,
-`batch_size=1024`) — Ray Data's own docs note it is ~20 % slower than a native PyTorch
+`batch_size=1024`). Ray Data's own docs note it is ~20 % slower than a native PyTorch
 `DataLoader` here; batcher is faster still:
 
 | ingest configuration | batcher vs Ray Data |
@@ -248,8 +251,8 @@ with I/O on a background thread the way Ray Data's streaming executor pipelines 
 
 The loader (`iter_torch_batches`, `streaming_split` for data-parallel sharding, plus
 `stream_loader` / `shard_stream_loader` for exact-shuffle and out-of-core-from-shards)
-streams Arrow → tensor in bounded memory with background prefetch, and — unlike a global
-`random_shuffle` that Ray Data must materialize — keeps the shuffle streaming.
+streams Arrow → tensor in bounded memory with background prefetch, and keeps the shuffle
+streaming, where a global `random_shuffle` forces Ray Data to materialize.
 
 **Lazy / metadata control plane.** Ray Data pays a fixed scheduling + execution cost on
 even trivial queries; batcher answers them from Parquet metadata and a lazy plan. Same
@@ -264,13 +267,13 @@ even trivial queries; batcher answers them from Parquet metadata and a lazy plan
 | `filter(pred).count()` | 47 ms | 695 ms | **15×** |
 
 `count()` is answered from footer row counts and cached; `head(10)` streams and stops
-after ten rows (Ray Data's `limit` does not short-circuit — it schedules a task). And a
+after ten rows (Ray Data's `limit` does not short-circuit, it schedules a task). And a
 `filter(...).count()` is compiled to a `COUNT(*)` aggregate, so **projection pushdown
 reads only the predicate's column** and the count fuses into a single `count_if` pass
-rather than materializing every matching row — the difference between reading one column
-and all of them.
+rather than materializing every matching row. That is the difference between reading one
+column and all of them.
 
-**Data connectors — reads and directory writes** (20 M rows / 64 files; both engines
+**Data connectors: reads and directory writes** (20 M rows / 64 files; both engines
 write a *directory* of shards, Ray Data's default output, for a fair comparison):
 
 | connector | read | directory write |
@@ -281,12 +284,12 @@ write a *directory* of shards, Ray Data's default output, for a fair comparison)
 
 Reads win because batcher decodes files concurrently in-process (Parquet/CSV/JSON decode
 releases the GIL) with no task-scheduling or object-store hop. Directory writes shard the
-encode across cores — and where the encoder is GIL-bound (JSON via pandas), across
-*processes* (each worker encodes and writes one part, no result copy), which took the JSON
-directory write from **12.9 s → 1.0 s**. The same holds per-worker in the distributed
-path, so multi-node writes shard the same way.
+encode across cores, and where the encoder is GIL-bound (JSON via pandas), across
+*processes*: each worker encodes and writes one part, no result copy. That took the JSON
+directory write from **12.9 s → 1.0 s**. It holds per-worker in the distributed path too,
+so multi-node writes shard the same way.
 
-**Broad operation sweep** (20 M rows, each result fingerprinted in Arrow — no Python
+**Broad operation sweep** (20 M rows, each result fingerprinted in Arrow, with no Python
 materialization on either side):
 
 | operation | batcher vs Ray Data |
@@ -311,45 +314,92 @@ it never sorts the whole relation.
 
 **Lazy schema/metadata after a transform chain.** Because a `Dataset` is a lazy plan,
 `schema`, `columns`, `dtypes`, and a derivable `count()` are answered by *inferring over
-the plan* — never by executing it. After `select → filter → with_columns → rename → drop`
-(and even after a `join → group_by`), batcher returns the schema in **under 1 ms**; Ray
+the plan*, never by executing it. After `select → filter → with_columns → rename → drop`
+(and even after a `join → group_by`), batcher returns the schema in **under 1 ms**. Ray
 Data must run the pipeline (or a block of it) whenever an opaque `add_column`/`map` is in
-the chain — **~200 ms vs ~1 ms, a 100×+ gap** — which is exactly the inner loop of
-interactive, exploratory work.
+the chain: **~200 ms vs ~1 ms, a 100×+ gap**, in exactly the inner loop of interactive,
+exploratory work.
 
 **Scale and mode.** Single-node `collect()` materializes, so it is fastest up to memory
 limits and wins these workloads through ~60 M rows. Past that, the same mergeable
 operators run **distributed** (`collect(distributed=True)`) or **streaming**
-(`iter_batches()` / `iter_torch_batches()`), which keep per-node memory bounded — a
+(`iter_batches()` / `iter_torch_batches()`), which keep per-node memory bounded. A
 row-exploding `flat_map → agg` that materializes 480 M rows on one node instead runs
 ~**5.8× faster** distributed, where each partition reduces before anything leaves it.
-Full numbers and the reproduction harness are in `benchmarks/BENCHMARK_RESULTS.md`.
+Full numbers and the reproduction scripts are in `benchmarks/BENCHMARK_RESULTS.md`.
+
+### Multimodal & physical-AI ingest (images, point clouds, audio)
+
+Robotics and physical-AI training start by turning a corpus of media files (camera
+frames, LiDAR point clouds, audio clips) into model-ready tensors. This is the ingest hot
+path, where batcher competes with Ray Data and Daft directly. Every number below is a
+single 96-core node, best-of-3 warm, **correctness-gated** (frame/point count and output
+shape identical across engines), reproducible from `benchmarks/scenarios/`.
+
+**Image decode + resize** (2 000 JPEG frames, `640×480 → 224×224`, the vision-model
+preprocessing step; `benchmarks/scenarios/image_decode.py`):
+
+| engine | img/s | batcher advantage |
+|-----------|------:|:-----------------:|
+| **batcher** | ~5 700 | — |
+| Daft | ~2 400 | **2.4× faster** |
+| Ray Data | ~940 | **6.1× faster** |
+
+**Point-cloud / LiDAR loading** (20 000 frames of `4096×3` points streamed to torch via
+`iter_torch_batches`; `benchmarks/scenarios/point_cloud_load.py`):
+
+| engine | frames/s | batcher advantage |
+|-----------|---------:|:-----------------:|
+| **batcher** | ~21 000 | — |
+| Ray Data | ~9 000 | **2.4× faster** |
+
+**Audio decode** (encoded clips → PCM waveforms, the Whisper/wav2vec/CLAP first step;
+`benchmarks/scenarios/audio_decode.py`) decodes natively (`col(bytes).audio.decode()`,
+symphonia) fanned across every core, versus a per-clip `soundfile` loop under the GIL.
+
+batcher wins the whole class for the same reasons.
+
+Decode is native and parallel. Image, audio and video decode run in the Rust data plane
+over Arrow, and each media kernel fans out *per row* across the cores, so a corpus smaller
+than one 16 384-row morsel still uses the whole machine instead of a single core. Image
+decode adds SIMD JPEG (zune, with a 1/2·1/4·1/8 DCT-scaled path for large frames → small
+model inputs) and SIMD resize (`fast_image_resize`).
+
+Tensors then cross the boundary already shaped, with no re-type UDF. A decoded image or a
+loaded `.npy` frame becomes a canonical `fixed_shape_tensor` column whose shape rides in
+Arrow field metadata: zero-copy across the FFI and straight into a `(N, …)` torch tensor.
+Because the reader emits the type directly, the decode stays a pure native `with_columns`
+on the fully-parallel path, rather than being forced through a slower per-batch
+`map_batches` re-type, which alone roughly halved image-ingest throughput.
+
+Files are read concurrently in one wide wave (media decode releases the GIL), and the
+loader streams Arrow → tensor in bounded memory with background prefetch.
 
 ### Distributed shuffle & data movement (automatic)
 
 A distributed `group_by` / `join` / `sort` moves its data over Carbonite's Arrow Flight
-transport — never the Ray object store — and picks the cheapest path for each fetch
-**with no configuration**. Same-process buckets are read in place; same-node,
-cross-process buckets (the common case when a node runs several worker actors) are read
-**zero-copy from shared memory** — a memory-mapped Arrow IPC file — which measured
-**≈23× faster than a loopback Flight hop** (1.2 → 27 GB/s point-to-point on a real
-cluster), and **7.5×** through a full concurrent gather. It is on by default and
-self-limiting: a mapper skips the shared-memory copy under memory pressure (falling back
-to Flight), so it never risks OOM on a tight or churning spot node, and a miss is always
-bit-identical to the network path.
+transport, never the Ray object store, and picks the cheapest path for each fetch **with
+no configuration**. Same-process buckets are read in place. Same-node, cross-process
+buckets (the common case when a node runs several worker actors) are read **zero-copy
+from shared memory**, a memory-mapped Arrow IPC file, which measured **≈23× faster than a
+loopback Flight hop** (1.2 → 27 GB/s point-to-point on a real cluster), and **7.5×**
+through a full concurrent gather. It is on by default and self-limiting: a mapper skips
+the shared-memory copy under memory pressure (falling back to Flight), so it never risks
+OOM on a tight or churning spot node, and a miss is always bit-identical to the network
+path.
 
 Cross-node, a single reducer saturates its NIC (~22 Gbps on a T4 node), so throughput
 scales with the **whole cluster**: measured aggregate all-to-all shuffle of **2.0 → 6.9 →
 15.2 GB/s at 2 → 4 → 8 nodes**. The mergeable `partial → combine → finalize` algebra and
 credit-based flow control keep per-node memory bounded as the cluster grows, so the same
 path holds from a few nodes to thousands, including autoscaling spot fleets. None of this
-is a knob you set — it adapts to the cluster shape on its own.
+is a knob you set; it adapts to the cluster shape on its own.
 
 ### GPU data-plane backend (vs Ray Data + cuDF)
 
 A supported relational query can run on the GPU (cuDF) instead of the CPU engine by
-passing `backend=` to `collect()`. It is the same query, the same result — only *where*
-it runs changes:
+passing `backend=` to `collect()`. It is the same query and the same result; only *where*
+it runs changes.
 
 ```python
 # docs: skip
@@ -361,18 +411,18 @@ q.collect(backend="gpu")   # force the cuDF GPU backend for any supported shape
 q.collect(backend="auto")  # let Kyber decide GPU vs CPU by estimated size
 ```
 
-`backend="auto"` is the adaptive choice: Kyber's cost policy sends a query to the GPU
+`backend="auto"` is the adaptive choice. Kyber's cost policy sends a query to the GPU
 only when the estimated input is large enough to amortize the device overhead
-(host↔device transfer, cuDF import, task dispatch) *and* fits the cluster's GPU memory —
-sharding a working set that exceeds one GPU across many, or staying on the spillable CPU
-engine when it exceeds them all. Below the crossover a small query stays on the (already
-fast, morsel-parallel) CPU engine; anything unsupported or a GPU-less cluster transparently
-falls back. The GPU worker reads its shard straight from storage — the source is never
+(host↔device transfer, cuDF import, task dispatch) *and* fits the cluster's GPU memory. A
+working set that exceeds one GPU is sharded across many; one that exceeds them all stays
+on the spillable CPU engine. Below the crossover a small query stays on the (already fast,
+morsel-parallel) CPU engine, and anything unsupported or a GPU-less cluster transparently
+falls back. The GPU worker reads its shard straight from storage; the source is never
 funnelled through the driver.
 
 The crossover itself is **learned**, not fixed. Each GPU or CPU group-by run records its
 (estimated rows, wall time) to the MetadataHub; Kyber fits a cost line per backend and
-solves for their intersection, so the threshold self-corrects to the hardware — a faster
+solves for their intersection, so the threshold self-corrects to the hardware. A faster
 GPU or a wider table moves it on its own (Core measures, Kyber consumes). Until enough runs
 are seen it uses the measured default (`distributed.gpu_min_rows`, ~10 M rows on an 8×T4).
 
@@ -385,7 +435,7 @@ result correctness-gated against the CPU engine:
 | batcher `backend="gpu"` (cold) | ~7.1 s | first query pays one-time cuDF import |
 | Ray Data + cuDF (`map_batches`, `num_gpus=1`) | ~42.6 s | per-block cuDF + object-store + combine |
 
-That is **6× faster cold and ~18× warm than the hand-written Ray Data + cuDF path** — Ray
+That is **6× faster cold and ~18× warm than the hand-written Ray Data + cuDF path**. Ray
 Data has no GPU aggregate, so a user rebuilds one from `map_batches` and pays its per-block
 bridge on top. At small sizes the picture inverts (at 4 M rows the GPU loses ~5× to the CPU
 engine), which is exactly why `auto` gates on size. See
@@ -393,7 +443,7 @@ engine), which is exactly why `auto` gates on size. See
 
 ### GPU batch inference & ML workloads (vs Ray Data)
 
-The relational GPU path above is one use of the device; the larger one is ML — batch
+The relational GPU path above is one use of the device. The larger one is ML: batch
 inference, embeddings, LLM generation, and training-data ingest through `map_batches`.
 Batcher runs these as **stage-overlapped streaming** (a CPU decode/prep stage keeps the GPU
 forward fed instead of idling it) with **session-warm model pools** (the model loads once per
@@ -411,28 +461,29 @@ session, not once per job). Measured distributed over **8×T4**, each result cor
 
 The wins are the general `map_batches`-inference mechanism, not one model:
 
-- **Stage-overlap streaming** lifted a two-stage decode → ResNet-50 pipeline from **942 → 2504
-  img/s** and GPU utilization from **~30% → 81%** — the device stays fed instead of idling
+- Stage-overlap streaming lifted a two-stage decode → ResNet-50 pipeline from **942 → 2504
+  img/s**, and GPU utilization from **~30% → 81%**. The device stays fed instead of idling
   through the CPU decode. Result-identical to the materializing path; single-node == distributed.
-- **Session-warm pools** (`distributed.warm_inference_pools`, on by default) load the model once
-  per session; Ray Data respawns its actor pool and reloads the model on every `collect()`. That
-  is where the 2×–11× shows up — the realistic notebook / batch-inference-service / many-datasets
-  pattern — and it grows with model size (the LLM's multi-GB load is paid once, not per run).
-- **Zero-config**: `map_batches(Model, num_gpus=1)` with no `batch_size` is where out-of-the-box
-  utilization is won or lost. Ray Data hard-errors (`must provide batch_size`); Batcher picks a
-  VRAM-safe default, streams it with stage overlap, and self-corrects on a CUDA OOM by halving the
-  batch — **82% util at 2451 img/s** with zero knobs.
+- Session-warm pools (`distributed.warm_inference_pools`, on by default) load the model once
+  per session. Ray Data respawns its actor pool and reloads the model on every `collect()`. That
+  is where the 2×–11× shows up, in the realistic notebook / batch-inference-service /
+  many-datasets pattern, and it grows with model size: the LLM's multi-GB load is paid once,
+  not per run.
+- Zero config is where out-of-the-box utilization is won or lost. `map_batches(Model,
+  num_gpus=1)` with no `batch_size` hard-errors on Ray Data (`must provide batch_size`).
+  Batcher picks a VRAM-safe default, streams it with stage overlap, and self-corrects on a CUDA
+  OOM by halving the batch, reaching **82% util at 2451 img/s** with zero knobs.
 
 On a *single maximally-large* compute-bound job both engines saturate the same GPUs at the same
-FLOPs (131k images: batcher 2504 vs Ray 2383 img/s ≈ parity, both ≥78% util) — the honest ceiling;
-2× there needs fewer FLOPs (FP16 / quantization), not a faster data plane. Full methodology and
-per-scale numbers: `benchmarks/BENCHMARK_RESULTS.md`.
+FLOPs (131k images: batcher 2504 vs Ray 2383 img/s ≈ parity, both ≥78% util). That is the honest
+ceiling; 2× there needs fewer FLOPs (FP16 / quantization), not a faster data plane. Full
+methodology and per-scale numbers: `benchmarks/BENCHMARK_RESULTS.md`.
 
 ## Reading a query plan
 
 `explain()` runs the optimizer and renders the optimized plan with per-operator
-cardinality estimates, without executing — the way to confirm a predicate landed at
-the scan or a join was reordered the way you expected.
+cardinality estimates, without executing. It is how you confirm a predicate landed at
+the scan, or that a join was reordered the way you expected.
 
 ```python
 print(events.filter(bt.col("status") == "active").select("region", "amount").explain())
@@ -440,7 +491,7 @@ print(events.filter(bt.col("status") == "active").select("region", "amount").exp
 ```
 
 Where `explain()` shows the *planned* shape, `stats()` runs the query and reports
-what the engine *measured* — rows in/out, wall time, peak bytes, spill, and the
+what the engine *measured*: rows in/out, wall time, peak bytes, spill, and the
 operator that dominated wall time.
 
 ```python
@@ -463,15 +514,15 @@ print(events.profile().columns)
 
 Reach for these in order; most workloads need none of them.
 
-- **A result reused across queries** — `cache()` the shared upstream.
-- **Bounded or container memory** — set `memory.max_memory_bytes` to the real
-  ceiling so stateful operators spill instead of OOMing.
-- **Wide rows (blobs, embeddings)** — lower `execution.morsel_bytes` to keep the
-  working set bounded; leave `morsel_rows` alone.
-- **A query slower than expected** — `explain()` to check the plan, then `stats()`
-  to find the operator that dominated wall time.
-- **A cluster shuffle under memory pressure** — the credit-based backpressure in
-  `flow_control` and `distributed`; see [Fault tolerance](../architecture/fault-tolerance.md).
+- A result reused across queries: `cache()` the shared upstream.
+- Bounded or container memory: set `memory.max_memory_bytes` to the real ceiling, so
+  stateful operators spill instead of OOMing.
+- Wide rows (blobs, embeddings): lower `execution.morsel_bytes` to keep the working set
+  bounded, and leave `morsel_rows` alone.
+- A query slower than expected: `explain()` to check the plan, then `stats()` to find the
+  operator that dominated wall time.
+- A cluster shuffle under memory pressure: the credit-based backpressure in `flow_control`
+  and `distributed`. See [Fault tolerance](../architecture/fault-tolerance.md).
 
 Every field, with its default and meaning, is in
 [Configuration options](../configuration/options.md).

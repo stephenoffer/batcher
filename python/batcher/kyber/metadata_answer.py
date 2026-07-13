@@ -25,7 +25,7 @@ from batcher.kyber.learning import QUANTILES_KEY, load_learned_stats
 from batcher.kyber.optimizer import Optimizer
 from batcher.kyber.stats import StatsEstimator
 from batcher.metadata.hub import MetadataHub
-from batcher.plan.logical import Aggregate, LogicalPlan
+from batcher.plan.logical import Aggregate, LogicalPlan, Project
 from batcher.plan.stats import ColumnStat, Provenance, RelStats
 
 __all__ = [
@@ -98,22 +98,37 @@ def answer_aggregate(
 ) -> dict[str, Any] | None:
     """The one-row result of a *global* aggregate, from metadata, or None.
 
-    Returns `{alias: value}` only when the plan's root is a keyless `Aggregate`
-    and **every** output aggregate is exactly derivable from the child's EXACT
-    column stats (e.g. `count(*)`, `min`/`max` over footer bounds,
-    `count_distinct` over an exact distinct count). If any output is not
-    derivable, returns None so the caller executes — a partial answer is never
-    returned.
+    Returns `{alias: value}` only when `plan` is a keyless `Aggregate` and **every** output
+    is exactly derivable from the child's EXACT column stats (e.g. `count(*)`, `min`/`max`
+    over footer bounds, `count_distinct` over an exact distinct count). If any output is not
+    derivable, returns None so the caller executes — a partial answer is never returned.
+
+    The *rewritten* root may be either the `Aggregate` itself or a `Project` of constants a
+    rule already folded it into; both are read the same way (see below).
     """
+    if not isinstance(plan, Aggregate) or plan.group_keys:
+        return None  # this answers a *global* aggregate; the caller's plan must be one
     rewritten, stats = _root_stats(plan, sources, source_stats, hub, config)
-    if not isinstance(rewritten, Aggregate) or rewritten.group_keys:
+
+    # The rewrite may have already answered the question. A rule that folds a keyless
+    # aggregate to constants reads the *same* EXACT statistics this path does, and leaves a
+    # `Project` of literals where the `Aggregate` was — so insisting the root still be an
+    # `Aggregate` would refuse to answer precisely the plans the optimizer understood best,
+    # and send them to the engine to re-derive a constant. Either shape is accepted; the
+    # answer is read from the root's column statistics in exactly the same way.
+    if isinstance(rewritten, Aggregate) and not rewritten.group_keys:
+        aliases = [spec.alias for spec in rewritten.aggregates]
+    elif isinstance(rewritten, Project):
+        aliases = [item.alias for item in rewritten.items]
+    else:
         return None
+
     answer: dict[str, Any] = {}
-    for spec in rewritten.aggregates:
-        col = stats.columns.get(spec.alias)
+    for alias in aliases:
+        col = stats.columns.get(alias)
         if col is None or col.provenance is not Provenance.EXACT:
             return None  # at least one output isn't exactly derivable → execute
-        answer[spec.alias] = col.min  # constant column: min == max == the value
+        answer[alias] = col.min  # constant column: min == max == the value
     return answer
 
 
@@ -149,6 +164,52 @@ def _exact_col(stats: RelStats, column: str) -> ColumnStat | None:
     return stat
 
 
+def _has_float_column(columns: set[str], sources: list) -> bool:
+    """Whether any of `columns` is a floating-point column in some source's schema."""
+    import pyarrow as pa
+
+    for src in sources:
+        try:
+            schema = src.schema()
+        except Exception:  # pragma: no cover - a source that cannot describe itself
+            continue
+        for name in columns:
+            idx = schema.get_field_index(name)
+            if idx >= 0 and pa.types.is_floating(schema.field(idx).type):
+                return True
+    return False
+
+
+def _bound_cannot_answer(column_or_expr: Any, sources: list) -> bool:
+    """Whether a **`max`** over this column may NOT be answered from a stored bound.
+
+    A float bound is not a sound answer for `max`, even when its provenance is `EXACT` —
+    because **both** producers of the bound deliberately exclude NaN:
+
+    * the KLL quantile sketch drops NaN on `add` ("it has no place in an ordered sketch"),
+      which is right for quantiles and fatal for a bound; and
+    * the Parquet spec omits NaN from a column's min/max statistics.
+
+    But SQL's total order — the one our own `ORDER BY` uses — makes NaN the *greatest*
+    value, so `max(f)` over a column containing a NaN **is** NaN. Answering from the bound
+    returns the largest non-NaN value instead, and the query silently disagrees with what
+    executing it would produce. The bound cannot represent the answer, and nothing in the
+    stats says whether a NaN was dropped, so the only sound move is to execute.
+
+    `min` is deliberately **not** gated: because NaN is the greatest value, a dropped NaN can
+    never have been the minimum, so a float `min` bound is sound. (An all-NaN column has no
+    bound at all, so it falls through to execution rather than answering wrongly.) Integers,
+    strings, and temporals have no NaN and answer from metadata for both.
+    """
+    from batcher.plan.expr_ir.walk import referenced_columns
+
+    if isinstance(column_or_expr, str):
+        columns = {column_or_expr}
+    else:
+        columns = referenced_columns(column_or_expr)
+    return _has_float_column(columns, sources)
+
+
 def answer_min(
     column: str,
     plan: LogicalPlan,
@@ -181,6 +242,8 @@ def answer_max(
 
     Mirror of `answer_min`; None (execute) unless the upper bound is provably exact.
     """
+    if _bound_cannot_answer(column, sources):
+        return None
     _, stats = _root_stats(plan, sources, source_stats, hub, config)
     stat = _exact_col(stats, column)
     return None if stat is None else stat.max

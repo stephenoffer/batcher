@@ -103,6 +103,15 @@ def llm_generate(
 ) -> Iterator[pa.RecordBatch]:
     """Append an LLM-generated `output_column` to each batch.
 
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> from batcher.ml import llm_generate, vllm_engine  # doctest: +SKIP
+            >>> engine = vllm_engine("meta-llama/Llama-3-8B")  # doctest: +SKIP
+            >>> batches = ds.iter_batches()  # doctest: +SKIP
+            >>> out = list(llm_generate(batches, engine, prompt_column="q"))  # doctest: +SKIP
+
     Args:
         batches: an iterable of `pyarrow.RecordBatch`.
         engine_factory: zero-arg callable returning an engine (``list[str]`` →
@@ -124,8 +133,9 @@ def llm_generate(
             (the per-row token counts the engine reported — `vllm_engine` and
             `http_engine` do). Aggregate them to track cost (tokens * price) or
             throughput. Null for an engine that does not report usage.
-        num_workers / target_batch_rows: forwarded to `InferencePool` (no latency
-            controller — the engine owns its own batching).
+        num_workers: pool size — engines built, and batches generated, in parallel.
+        target_batch_rows: rows per batch handed to an engine (no latency controller —
+            the engine owns its own batching).
 
     Yields:
         Each input batch with `output_column` appended, in order.
@@ -201,6 +211,14 @@ def llm_udf(
     `ds.ml.generate` reuse the whole `num_gpus`/`concurrency`/`accelerator_type`
     machinery instead of owning a second scheduler. A plain function would rebuild the
     engine (reloading the model) on every batch.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml import llm_udf, vllm_engine  # doctest: +SKIP
+            >>> engine = vllm_engine("meta-llama/Llama-3-8B")  # doctest: +SKIP
+            >>> udf = llm_udf(engine, prompt_column="question")  # doctest: +SKIP
+            >>> ds.ml.map_batches(udf, num_gpus=1).collect()  # doctest: +SKIP
 
     Args:
         engine_factory: zero-arg callable returning an `Engine`; called once per worker.

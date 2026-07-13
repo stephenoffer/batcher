@@ -202,11 +202,7 @@ pub(crate) fn merge_distinct(
 /// distinct pairs is the global distinct set (order within a group is not preserved — only the
 /// COUNT(DISTINCT) caller uses this, and it counts, not orders). Returns the distinct groups and
 /// values as parallel vecs.
-fn par_dedup_pairs(
-    grp: &Int64Array,
-    vals: &Int64Array,
-    n: usize,
-) -> (Vec<i64>, Vec<i64>) {
+fn par_dedup_pairs(grp: &Int64Array, vals: &Int64Array, n: usize) -> (Vec<i64>, Vec<i64>) {
     use rayon::prelude::*;
 
     let parts = rayon::current_num_threads().clamp(2, 256);
@@ -485,12 +481,20 @@ mod dense_tests {
             gv.push(((s >> 40) % 4) as i64); // 4 groups
             vv.push(((s >> 20) % 50_000) as i64); // ~50k distinct values → lots of dupes
         }
-        let (dg, dv) = super::par_dedup_pairs(&Int64Array::from(gv.clone()), &Int64Array::from(vv.clone()), n);
+        let (dg, dv) = super::par_dedup_pairs(
+            &Int64Array::from(gv.clone()),
+            &Int64Array::from(vv.clone()),
+            n,
+        );
         // Parallel result as a set of pairs.
         let got: HashSet<(i64, i64)> = dg.iter().copied().zip(dv.iter().copied()).collect();
         // Serial reference set.
         let want: HashSet<(i64, i64)> = gv.iter().copied().zip(vv.iter().copied()).collect();
-        assert_eq!(got.len(), dg.len(), "parallel path emitted a duplicate pair");
+        assert_eq!(
+            got.len(),
+            dg.len(),
+            "parallel path emitted a duplicate pair"
+        );
         assert_eq!(got, want, "parallel distinct set differs from serial");
     }
 }

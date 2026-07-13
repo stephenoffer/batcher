@@ -24,10 +24,41 @@ __all__ = ["ServingClient", "serving_udf"]
 
 @runtime_checkable
 class ServingClient(Protocol):
-    """A connected inference backend: a batch of named arrays in, named arrays out."""
+    """A connected inference backend: a batch of named arrays in, named arrays out.
+
+    Implement it to teach `serving_udf` a backend the built-in clients
+    (`http_client`, `triton_client`, `torchserve_client`) do not cover.
+
+    Examples:
+        .. doctest::
+
+            >>> import numpy as np
+            >>> from batcher.ml import ServingClient
+            >>> class Doubler:
+            ...     def predict(self, inputs):
+            ...         return {"y": inputs["x"] * 2}
+            >>> isinstance(Doubler(), ServingClient)  # a structural, runtime-checked match
+            True
+            >>> Doubler().predict({"x": np.array([1, 2])})
+            {'y': array([2, 4])}
+    """
 
     def predict(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """Run inference on one batch of input arrays, returning output arrays."""
+        """Run inference on one batch of input arrays, returning output arrays.
+
+        Examples:
+            .. doctest::
+
+                >>> client.predict({"image": images})  # doctest: +SKIP
+                {'logits': array([[0.1, 0.9]])}
+
+        Args:
+            inputs: the input columns as NumPy arrays, keyed by the backend's input
+                names (a tensor column keeps its ``(N, *shape)`` form).
+
+        Returns:
+            The backend's output arrays, keyed by its output names.
+        """
         ...
 
 
@@ -58,6 +89,13 @@ def serving_udf(
     output_columns: Sequence[str] | None = None,
 ) -> type:
     """Build a load-once class UDF that runs `input_columns` through a serving backend.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml import serving_udf  # doctest: +SKIP
+            >>> udf = serving_udf(connect, input_columns=["image"])  # doctest: +SKIP
+            >>> ds.ml.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
 
     Args:
         connect: a zero-arg callable returning a connected `ServingClient`; run once

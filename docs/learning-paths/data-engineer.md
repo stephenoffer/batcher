@@ -1,8 +1,8 @@
 # Data engineer learning path
 
-For building and operating data pipelines: read sources, transform and aggregate,
-join, and write results. The pipeline stays lazy until a terminal operation, and all
-per-row work runs in Rust.
+This path is for building and running data pipelines: read a source, reshape it, join it
+against another, aggregate, write the result. The pipeline stays lazy until a terminal
+operation, and all per-row work runs in Rust.
 
 ## Reading order
 
@@ -18,8 +18,8 @@ per-row work runs in Rust.
    aggregates.
 9. [Writing data](../user-guide/writing-data.md): output formats and partitioning.
 10. [Lakehouse tables](../user-guide/lakehouse.md): Delta read/write/merge and SCD.
-11. [Data quality](../user-guide/data-quality.md): validate, quarantine, and enforce
-    a contract.
+11. [Data quality](../user-guide/data-quality.md): validate against a contract and
+    quarantine what fails it.
 12. [Cloud storage](../user-guide/cloud-storage.md): object-store paths.
 13. [Performance and memory](../user-guide/performance.md): caching and spill.
 14. [Best practices](../user-guide/best-practices.md) and
@@ -64,8 +64,48 @@ print(joined.to_pydict())
 
 These scripts build their own data and run directly with `python examples/<name>.py`:
 
-- `quickstart.py`, `transformations_aggregations_joins.py` — the pipeline core.
-- `data_quality.py` — validate and quarantine against a contract.
-- `lakehouse_scd.py` — a Delta round-trip and SCD type-2 history.
-- `timeseries.py`, `window_functions.py` — time buckets and rolling aggregates.
-- `spill.py` — out-of-core execution under a bounded budget.
+- `quickstart.py` and `transformations_aggregations_joins.py` cover the pipeline core.
+- `data_quality.py` validates rows against a contract and quarantines the failures.
+- `lakehouse_scd.py` does a Delta round-trip, then SCD type-2 history.
+- `timeseries.py` and `window_functions.py` show time buckets and rolling aggregates.
+- `spill.py` runs out-of-core under a bounded budget.
+
+
+## Recipes for the problems you will actually hit
+
+The [data-engineering cookbook](../examples/data-engineering/index.md) is the applied half
+of this path. Each recipe opens on the failure and shows the code that avoids it.
+
+::::{grid} 1 2 2 2
+:gutter: 3
+
+:::{grid-item-card} {octicon}`download;1.1em` Incremental ingest
+:link: ../examples/data-engineering/incremental-ingest
+:link-type: doc
+Read only what is new.
+:::
+
+:::{grid-item-card} {octicon}`git-merge;1.1em` CDC pipeline
+:link: ../examples/data-engineering/cdc-pipeline
+:link-type: doc
+Apply a change feed in the order the changes happened.
+:::
+
+:::{grid-item-card} {octicon}`filter;1.1em` Deduplication
+:link: ../examples/data-engineering/deduplication
+:link-type: doc
+Exactly-once is a property you build.
+:::
+
+:::{grid-item-card} {octicon}`stack;1.1em` Schema evolution
+:link: ../examples/data-engineering/schema-evolution
+:link-type: doc
+The column that changed type under you.
+:::
+::::
+
+:::{seealso}
+- [Integrations](../integrations/index.md) — connecting to Kafka, Snowflake, Delta, and the rest.
+- [Building a lakehouse](../tutorials/building-a-lakehouse.md) — the same pieces, end to end.
+- [Custom connectors](../user-guide/custom-connectors.md) — when the format you need isn't built in.
+:::

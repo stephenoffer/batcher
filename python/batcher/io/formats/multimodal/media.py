@@ -142,7 +142,27 @@ class MediaSource:
         return pa.schema(fields)
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        return list(self.iter_batches(projection))
+        """Read every file-batch (the bounded-source / `collect()` path).
+
+        `read()` returns all batches, so every payload is resident regardless — which
+        lets it fetch *all* files in one wide concurrent wave (a single thread pool) and
+        then slice them into `batch_files`-sized batches, rather than spinning a fresh
+        pool and blocking on a serial read per file-batch. That removes the per-chunk pool
+        churn + cross-chunk serialization that held image/clip ingest well under the raw
+        parallel-read rate. `iter_batches` keeps its per-chunk streaming for the
+        bounded-memory (larger-than-RAM) consumer, where reading everything up front would
+        defeat the point.
+        """
+        files = self._files()
+        if len(files) <= self._batch_files:
+            return list(self.iter_batches(projection))
+        reads = self._read_chunk(files)  # one concurrent wave over every file
+        out: list[pa.RecordBatch] = []
+        for start in range(0, len(files), self._batch_files):
+            sl = slice(start, start + self._batch_files)
+            batch = self._assemble(files[sl], reads[sl])
+            out.append(batch.select(projection) if projection is not None else batch)
+        return out
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
         files = self._files()
@@ -179,13 +199,25 @@ class MediaSource:
         and only the header + size are touched per file — so a chunk of GB videos
         costs kilobytes, not gigabytes.
         """
+        return self._assemble(chunk, self._read_chunk(chunk))
+
+    def _assemble(
+        self, chunk: list[str], reads: list[tuple[bytes, bytes | None, int]]
+    ) -> pa.RecordBatch:
+        """Build one `RecordBatch` from files and their already-read payloads.
+
+        Split from the read so `read()` can bulk-fetch every file in one wide concurrent
+        wave and then assemble the batches, instead of a fresh thread pool + a serial
+        read per file-batch (which left a many-file scan far under the raw parallel-read
+        throughput — the ingest floor for a directory of many small images/clips).
+        """
         uris: list[str] = []
         blobs: list[bytes | None] = []
         sizes: list[int] = []
         mimes: list[str] = []
         meta_rows: list[dict[str, Any]] = []
         meta_fields = self._meta_fields() if self._with_meta else []
-        for path, (header, payload, size) in zip(chunk, self._read_chunk(chunk), strict=True):
+        for path, (header, payload, size) in zip(chunk, reads, strict=True):
             uris.append(path)
             blobs.append(payload)  # None in reference mode
             sizes.append(size)
@@ -319,17 +351,32 @@ def read_blob_bytes(
 ) -> pa.RecordBatch:
     """Materialize file payloads for a batch of reference handles.
 
-    Reads each row's ``uri_col`` file and writes its bytes into the ``into``
-    column (replacing it if present, else appending). Intended to run inside
-    `map_batches` *after* filtering/sampling reference-mode handles, so only the
-    surviving rows' payloads are ever read — and with a small `batch_size`, only a
-    few payloads are resident at once::
+    Reads each row's `uri_col` file and writes its bytes into the `into` column
+    (replacing it if present, else appending). Intended to run inside `map_batches`
+    *after* filtering/sampling reference-mode handles, so only the surviving rows'
+    payloads are ever read — and with a small ``batch_size``, only a few payloads
+    are resident at once. The bytes land in a `large_binary` column, so a batch of
+    GB-scale payloads cannot overflow 32-bit offsets.
 
-        ds = bt.read.video("s3://clips/", materialize_bytes=False)
-        big = ds.filter(col("size") < 500_000_000)        # prune on metadata first
-        decoded = big.map_batches(read_blob_bytes, batch_size=4)
+    Examples:
+        .. doctest::
 
-    Bounds memory by `batch_size`; the GB payloads never all co-reside.
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> from batcher import col  # doctest: +SKIP
+            >>> from batcher.io import read_blob_bytes  # doctest: +SKIP
+            >>> ds = bt.read.video("s3://clips/", materialize_bytes=False)  # doctest: +SKIP
+            >>> big = ds.filter(col("size") < 500_000_000)  # doctest: +SKIP
+            >>> # ... metadata pruned first, so only surviving payloads are read.
+            >>> decoded = big.map_batches(read_blob_bytes, batch_size=4)  # doctest: +SKIP
+
+    Args:
+        batch: A batch of reference handles, one row per file.
+        uri_col: Column holding each row's file URI.
+        into: Column the payload bytes are written to.
+
+    Returns:
+        `batch` with `into` holding each row's file contents (null where the URI
+        is null).
     """
     uris = batch.column(uri_col).to_pylist()
     blobs: list[bytes | None] = []

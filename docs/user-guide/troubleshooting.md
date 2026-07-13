@@ -1,9 +1,9 @@
 # Troubleshooting
 
-This page collects the errors you are most likely to hit and how to fix them
-against the current API. Most stem from one of three things: referencing a column
-that does not exist, passing a string where an expression is expected, or calling a
-method that lives in a different place than you remembered.
+The errors below are the ones you are most likely to hit. Nearly all of them come
+from the same few causes: a column that does not exist, a string passed where an
+expression belongs, or a method that lives somewhere other than where you remembered
+it.
 
 ```python
 import batcher as bt
@@ -117,9 +117,9 @@ print(type(table).__module__, type(table).__name__)
 ## A large query runs out of memory
 
 Stateful operators hold state in memory by default. Pass `spill=True` to let
-aggregation, join, and sort spill to disk under pressure, and `distributed=True`
-with `num_workers=` to spread the work across machines. Both are off by default
-because they add overhead that only pays off at scale.
+aggregation, join and sort spill to disk under pressure, and `distributed=True` with
+`num_workers=` to spread the work across machines. Both are off by default. They add
+overhead that only pays for itself on a big job.
 
 ```python
 # docs: skip
@@ -128,9 +128,8 @@ out = ds.group_by("x").agg(total=bt.col("y").sum()).collect(spill=True)
 
 ## See also
 
-- [Performance and memory](performance.md): caching, spill tuning, and reading a
-  query plan.
-- [Distributed fault tolerance](../architecture/fault-tolerance.md): diagnosing
-  task, shuffle, and node failures.
-- [Configuration options](../configuration/options.md): every tunable and its
-  default.
+- [Performance and memory](performance.md): caching, spill tuning, reading a query
+  plan.
+- [Distributed fault tolerance](../architecture/fault-tolerance.md): diagnosing a
+  failed task, shuffle, or node.
+- [Configuration options](../configuration/options.md): every tunable and its default.

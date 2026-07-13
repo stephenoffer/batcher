@@ -134,7 +134,10 @@ def execute_aggregate_flight(
         # has 16 columns but this agg needs 3, so the un-pushed read moved ~5x the bytes
         # and dominated the scan (sf10 map barrier 18s → ~4s). Mirrors single-node
         # projection/predicate pushdown; the `map_ir` filter re-checks, so pushdown is safe.
-        projection, predicate = source_pushdown(map_plan, sid)
+        # `map_plan`'s scan was relabeled to source 0, so key the analysis on 0, not on the
+        # source's original index: a staged plan whose input is an intermediate (source id >
+        # 0) missed the lookup and silently read every column.
+        projection, predicate = source_pushdown(map_plan, 0)
         partitions = partition_descriptors(
             sources[sid], workers, projection=projection, predicate=predicate
         )

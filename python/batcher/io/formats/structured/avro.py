@@ -18,6 +18,7 @@ from typing import IO, Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.io.base import FileSink, FileSource
 from batcher.io.formats.base import SINKS, SOURCES
@@ -35,6 +36,20 @@ _AVRO_TO_ARROW: dict[str, pa.DataType] = {
     "bytes": pa.binary(),
     "string": pa.string(),
 }
+
+
+def _read_native(data: bytes, batch_rows: int) -> list[pa.RecordBatch] | None:
+    """Decode Avro bytes with the native `arrow-avro` reader (via `bc_io`), or ``None``.
+
+    Returns ``None`` — signalling the caller to fall back to the row-by-row `fastavro`
+    path — if the native engine is unavailable or the decode errors (an Avro feature
+    ``arrow-avro`` does not yet cover), so the result is identical either way.
+    """
+    try:
+        _native = engine()
+        return _native.read_avro(data, batch_rows)
+    except Exception:
+        return None
 
 
 def _require_fastavro() -> Any:
@@ -80,10 +95,22 @@ class AvroSource(FileSource):
         return _avro_schema_to_arrow(reader.writer_schema)
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
-        fastavro = _require_fastavro()
-        reader = fastavro.reader(fh)
-        schema = _avro_schema_to_arrow(reader.writer_schema)
         batch_rows = active_config().execution.morsel_rows
+        data = fh.read()
+        native = _read_native(data, batch_rows)
+        if native is not None:
+            return [b.select(projection) for b in native] if projection is not None else native
+        return self._read_fastavro(data, batch_rows, projection)
+
+    def _read_fastavro(
+        self, data: bytes, batch_rows: int, projection: list[str] | None
+    ) -> list[pa.RecordBatch]:
+        """Row-by-row fallback for anything the native reader cannot decode."""
+        import io
+
+        fastavro = _require_fastavro()
+        reader = fastavro.reader(io.BytesIO(data))
+        schema = _avro_schema_to_arrow(reader.writer_schema)
         out: list[pa.RecordBatch] = []
         rows: list[dict[str, Any]] = []
         for record in reader:

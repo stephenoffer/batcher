@@ -78,18 +78,27 @@ def learned_num_workers(
 ) -> int | None:
     """Worker fan-out sized from the learned/estimated data volume, or `None` cold.
 
-    Targets ``target_rows_per_task`` rows per worker from the measured size this shape produced
-    (falling back to the sources' row counts), clamped to ``[1, cluster_nodes]`` so it never
-    over-asks the cluster. Returns ``None`` when nothing is known, so the caller keeps its own
-    default. Worker count only shards the work — the mergeable algebra makes the result identical
-    for any count.
+    Targets ``target_rows_per_task`` rows per worker over the volume the workers actually
+    **process**, clamped to ``[1, cluster_nodes]`` so it never over-asks the cluster. Returns
+    ``None`` when nothing is known, so the caller keeps its own default. Worker count only shards
+    the work — the mergeable algebra makes the result identical for any count.
+
+    The sizing volume is ``max(input rows, learned output rows)``, not the output rows alone. A
+    worker's cost is dominated by the rows it *scans and shuffles*, not by the rows the query
+    emits: sizing a 7.5M-row TPC-H join from the 5 rows its ``GROUP BY`` returns asked for one
+    worker and stranded the scan on a single node. The learned output count still participates via
+    the ``max`` so a row-*expanding* plan (a fan-out join, an ``unnest``) — which does more work
+    than its input implies — is sized up rather than down.
     """
     if hub is None or cluster_nodes <= 0:
         return None
     try:
-        rows = learned_output_rows(hub, plan)
-        if rows is None:
-            rows = total_source_rows(sources)
+        # The scan/shuffle volume the workers must chew through...
+        rows = total_source_rows(sources)
+        # ...but never less than what this shape is known to *emit* (a row-expanding plan).
+        emitted = learned_output_rows(hub, plan)
+        if emitted is not None and (rows is None or emitted > rows):
+            rows = emitted
         if rows is None or rows <= 0:
             return None
         target = active_config().optimizer.target_rows_per_task
@@ -180,22 +189,32 @@ def distributed_grant(
 ) -> tuple[int | None, SchedulingEnvelope]:
     """Resolve the distributed run's worker fan-out and shuffle-credit envelope from learning.
 
-    Sizes ``num_workers`` from the measured data volume (when the user gave none) and warm-starts
-    the shuffle credit window from the window this signature converged on last time. Both are pure
-    scheduling levers — AIMD still governs the window actually used and the mergeable algebra keeps
-    the result identical for any worker count — so a cold hub reproduces the default grant exactly.
+    Sizes the envelope's ``n_tasks`` from the measured data volume (when the user gave none) and
+    warm-starts the shuffle credit window from the window this signature converged on last time.
+    Both are pure scheduling levers — AIMD still governs the window actually used and the mergeable
+    algebra keeps the result identical for any worker count — so a cold hub reproduces the default
+    grant exactly.
+
+    The returned worker count is the user's **explicit** ``num_workers`` (or ``None``), never the
+    derived one: ``execute_distributed`` reads a non-``None`` value as a user override and skips its
+    cluster-filling fan-out (one worker per node). Handing it a *derived* count therefore stranded
+    every non-explicit query on however many workers the data-volume heuristic guessed — a 7.5M-row
+    join sized from its 5-row GROUP BY output ran on 2 of 16 nodes. The derived count still travels
+    in ``envelope.n_tasks``, which is exactly where ``execute_distributed`` looks for it before
+    applying the cluster fill.
     """
     from batcher import dist
     from batcher.kyber.signature import plan_signature
 
     workers = ctx.num_workers
-    if workers is None:
+    derived = workers
+    if derived is None:
         try:
             nodes = int(dist.cluster_topology().get("nodes", 0))
         except Exception:  # pragma: no cover - topology probe must never break a query
             nodes = 0
-        workers = learned_num_workers(ctx.hub, plan, sources, nodes)
-    envelope = rm.scheduling_envelope(opt, workers)
+        derived = learned_num_workers(ctx.hub, plan, sources, nodes)
+    envelope = rm.scheduling_envelope(opt, derived)
     max_credits = max((op.bounds.c_max_credits for op in opt.ops), default=0)
     if max_credits > 0:
         window = rm.grant_credits(max_credits, signature=plan_signature(plan))
@@ -268,7 +287,13 @@ def record_join_outcomes(
         if len(joins) != 1 or len(decisions) != 1:
             return
         join, dec = joins[0], decisions[0]
-        sig = plan_signature(join)
+        # Key the reward on the signature SELECTION actually looked the arm up under. The
+        # ENFORCE phase runs after SELECTION and may rewrite the join's inputs (a runtime
+        # filter lands on them), so `plan_signature` of the *finished* plan is a different
+        # key than the one the bandit read — recording under it would teach an arm that is
+        # never consulted. `BuildSideDecision.signature` carries the right one; the fallback
+        # keeps a decision from an older shape working.
+        sig = dec.signature or plan_signature(join)
         strategy = join.strategy or "hash"
         record_join_sides(hub, sig, float(dec.left_rows), float(dec.right_rows))
         # The bandit's reward must not depend on how much data this particular run saw: the

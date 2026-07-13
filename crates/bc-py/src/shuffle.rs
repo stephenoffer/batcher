@@ -201,7 +201,8 @@ async fn drive(
         // Every address carrying this bucket: the primary, then its replicas. They hold
         // byte-identical batches under the same ticket, so which one answers is invisible
         // to the result — only to how long it takes.
-        let mut candidates: Vec<&str> = Vec::with_capacity(1 + replicas.get(idx).map_or(0, Vec::len));
+        let mut candidates: Vec<&str> =
+            Vec::with_capacity(1 + replicas.get(idx).map_or(0, Vec::len));
         candidates.push(addr.as_str());
         candidates.extend(replicas.get(idx).into_iter().flatten().map(String::as_str));
 
@@ -244,7 +245,8 @@ async fn drive(
                     let (a, t) = (addr.clone(), ticket.to_string());
                     // shm read is blocking file I/O + decode → off the async reactor.
                     if let Ok(Ok(Some(batches))) =
-                        tokio::task::spawn_blocking(move || bc_transport::fetch_shared(&a, &t)).await
+                        tokio::task::spawn_blocking(move || bc_transport::fetch_shared(&a, &t))
+                            .await
                     {
                         return (idx, Ok(batches));
                     }

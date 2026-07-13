@@ -24,8 +24,8 @@ answers = (
 )
 ```
 
-Because an *engine* is just a zero-arg callable returning a `list[str] -> list[str]`
-function, a deterministic stub stands in for a model — so a generation pipeline is
+An *engine* is only a zero-arg callable returning a `list[str] -> list[str]` function,
+so a deterministic stub can stand in for a model, which makes a generation pipeline
 testable with no GPU:
 
 ```python
@@ -42,7 +42,7 @@ print(bt.from_pydict({"q": ["hi"]}).ml.generate(shout, prompt_column="q").to_pyd
 applies the model's own chat template. **Set this for any instruction-tuned or chat
 model.** The default (`chat=False`) is the completion path, right for a base model: it
 skips the template, and a tuned model then answers a prompt in a format it was never
-trained on — degraded output with nothing to signal it. `system=` adds a system turn to
+trained on. The output degrades, and nothing signals it. `system=` adds a system turn to
 every conversation.
 
 ```python
@@ -63,7 +63,7 @@ Vision models take their image through the completion path, so `image_column` re
 A pretraining batch is `seq_len` tokens wide; documents are not. Padding each document to
 the context length wastes the padding, and the GPU computes attention over it.
 `pack_sequences` lays the tokenized documents end to end, separated by an EOS token, and
-cuts the stream every `seq_len` tokens — so every position is a real token.
+cuts the stream every `seq_len` tokens, so every position holds a real token.
 
 ```python
 import pyarrow as pa
@@ -78,11 +78,12 @@ On a corpus of 5,000 documents averaging ~325 tokens against a 4,096-token conte
 padding each document fills only **7.9%** of each sequence with real tokens; packing
 fills 100% and emits **92% fewer sequences** for the same data.
 
-Packing is sequential and stateful — a document that does not fit is carried into the
-next sequence rather than padded — so it transforms a *batch stream*, not a `map_batches`
-(a parallel per-batch map would cut the stream in a nondeterministic place). Shuffle
-before packing, not after. The output is a `FixedSizeList<Int64>[seq_len]` column, which
-`iter_torch_batches` turns into an `(n, seq_len)` tensor with no reshape at the edge.
+Packing is sequential and stateful: a document that does not fit is carried into the
+next sequence rather than padded. So it transforms a *batch stream* instead of running as
+a `map_batches`, because a parallel per-batch map would cut the stream in a
+nondeterministic place. Shuffle before packing, not after. The output is a
+`FixedSizeList<Int64>[seq_len]` column, which `iter_torch_batches` turns into an
+`(n, seq_len)` tensor with no reshape at the edge.
 
 The trailing partial sequence is dropped by default (`drop_remainder=False` pads it with
 `pad_token`, so every emitted batch keeps one schema).
@@ -106,12 +107,12 @@ so the model is loaded once and reused. Throughput comes from two layers: `num_w
 engine copies run in parallel, and inside each, the engine batches the requests it is
 handed. Batcher reshapes the incoming morsels into request lists of about
 `target_batch_rows` and lets the engine's own continuous batching schedule them across
-its accelerators — there is no outer latency controller, because the engine owns its
+its accelerators. There is no outer latency controller, because the engine owns its
 batching. The prompt comes from `prompt_column` directly, or from a `template` that
 formats any of the row's columns into a prompt.
 
 Because the result is an iterator of Arrow batches, it composes with the rest of the
-engine — write it straight back out, or feed it into another stage:
+engine: write it straight back out, or feed it into another stage:
 
 ```python
 # docs: skip
@@ -122,9 +123,39 @@ table = pa.Table.from_batches(batches)
 bt.from_arrow(table).write.parquet("s3://bucket/answers.parquet")
 ```
 
+## The class-UDF form
+
+`llm_udf(engine_factory, prompt_column=...)` returns a **class** that appends the
+generated column to each batch. Same columnar work as `llm_generate`, packaged so
+`map_batches` can own the scheduling. `ds.ml.generate` is exactly this: it builds the UDF
+and hands it to `map_batches`, which is how generation inherits `num_gpus`,
+`concurrency`, and `accelerator_type` instead of carrying a second scheduler.
+
+Reach for it directly when you want the GPU-actor machinery around a generation step you
+are composing yourself. Pass the class, never an instance: `map_batches` constructs it
+once per worker, and that constructor is where the engine is built. A plain function
+would rebuild the engine, reloading the model, on every batch.
+
+```python
+# docs: skip
+from batcher.ml import llm_udf, vllm_engine
+
+udf = llm_udf(
+    vllm_engine("meta-llama/Llama-3-8B"),
+    prompt_column="question",
+    output_column="answer",
+    usage=True,  # also append prompt_tokens / completion_tokens
+)
+answered = ds.ml.map_batches(udf, num_gpus=1, concurrency=4)
+```
+
+It takes the same options as `llm_generate` (`template`, `image_column`,
+`adapter_column`, `parse_json`, `usage`) minus the pool knobs, which `map_batches`
+supplies.
+
 ## Building prompts from columns
 
-When the prompt is more than a single column, pass a `template` — a `str.format`
+When the prompt is more than a single column, pass a `template`: a `str.format`
 string over the row's columns. `prompt_column` is then ignored, and each row's prompt
 is `template.format(**row)`, so any combination of columns assembles the request
 without a per-row Python loop in your code.
@@ -143,18 +174,39 @@ summaries = llm_generate(
 ```
 
 A shared instruction prefix (a system prompt baked into the template, or the same
-leading text on every row) is encoded once by the engine when prefix caching is on —
-which `vllm_engine` enables by default — so a long fixed preamble costs little across
+leading text on every row) is encoded once by the engine when prefix caching is on,
+which `vllm_engine` enables by default, so a long fixed preamble costs little across
 millions of rows.
 
 ## Engines
+
+An **`Engine`** is a callable that maps `list[str]` prompts to a list of completions,
+one per prompt, in input order. That is the whole contract. An **`EngineFactory`** is a
+zero-argument callable returning an `Engine`, called once per worker so the model loads
+a single time.
+
+Keeping the contract that small is what makes the backends interchangeable: a local vLLM
+engine holding weights on a GPU and a remote OpenAI-compatible HTTP endpoint both
+satisfy it, so `ds.ml.generate`, `llm_generate`, and `llm_udf` take either without
+knowing which they got. It is also why the stub above works. A lambda returning a lambda
+is a legal `EngineFactory`, which is how you test a generation pipeline with no GPU.
+
+```python
+engine_factory = lambda: (lambda prompts: [p.upper() for p in prompts])
+print(engine_factory()(["a", "b"]))
+# ['A', 'B']
+```
+
+An engine may also set `last_usage`, one `(prompt_tokens, completion_tokens)` pair per
+request, which is what `usage=True` reads to append the token-count columns.
+`vllm_engine` and `http_engine` both do.
 
 | Engine | Use |
 | --- | --- |
 | `vllm_engine(model, *, sampling, guided_json, guided_regex, lora_path, **engine_kwargs)` | Local vLLM on a GPU. `sampling` (max tokens, temperature, etc.), `guided_json` / `guided_regex` for structured output, `lora_path` for an adapter, and `engine_kwargs` for tensor parallelism, quantization, and the rest of vLLM's engine options. Needs `batcher-engine[vllm]`. |
 | `http_engine(base_url, model, *, api_key, system, chat=True, max_tokens=512, temperature=0.0, timeout=60.0)` | An OpenAI-compatible HTTP endpoint (vLLM server, llama.cpp, a hosted API). Applies the chat template server-side; retries on rate limits. |
 
-`vllm_engine` is the high-throughput path — the GPU stays saturated because vLLM
+`vllm_engine` is the high-throughput path: the GPU stays saturated because vLLM
 batches continuously across in-flight requests. It enables **prefix caching** and
 **chunked prefill** by default (both throughput/TTFT wins for offline batch); any value
 you pass in `engine_kwargs` overrides the default. Use `sampling` for decoding
@@ -179,7 +231,7 @@ engine = vllm_engine(
 `http_engine` offloads the model entirely; throughput is then bounded by the endpoint,
 and `num_workers` controls how many concurrent request streams you open against it.
 With `chat=True` (the default) the server applies the model's chat template, so a plain
-prompt is wrapped as a user message — pass `system=...` to prepend a system message.
+prompt is wrapped as a user message. Pass `system=...` to prepend a system message.
 
 ```python
 # docs: skip
@@ -198,10 +250,10 @@ labeled = llm_generate(ds.iter_batches(), engine, prompt_column="text", num_work
 ## Batching and throughput
 
 Two knobs control the request flow. `num_workers` sets how many engine copies run in
-parallel — each loads the model once, so for `vllm_engine` size it to the GPUs you have
+parallel. Each loads the model once, so for `vllm_engine` size it to the GPUs you have
 (or the model replicas that fit). `target_batch_rows` sets how many requests Batcher
 hands the engine at a time; the engine's continuous batching then schedules them across
-its accelerator. Do **not** try to micro-manage an outer batch size for vLLM — its
+its accelerator. Do **not** try to micro-manage an outer batch size for vLLM. Its
 scheduler already interleaves prefill and decode, and a fixed outer batch would fight
 it.
 
@@ -216,14 +268,14 @@ answers = llm_generate(
 )
 ```
 
-## AI-powered ETL: typed columns, not strings
+## AI-powered ETL: turning strings into typed columns
 
-Generation gives you a *string*. A string is not a column an analyst can filter, join, or
-aggregate — turning it into one is the actual ETL step, and it is where these pipelines
-break. Two Dataset methods do it.
+Generation gives you a *string*. No analyst can filter, join, or aggregate a string;
+turning it into a column is the actual ETL step, and it is where these pipelines break.
+Two Dataset methods do it.
 
 `ds.ml.extract(engine, schema=...)` appends one **typed** column per declared field. The
-declaration — not what the model happened to emit — decides the Arrow type:
+declaration decides the Arrow type, not whatever the model happened to emit:
 
 ```python
 import batcher as bt
@@ -236,12 +288,13 @@ print(notes.ml.extract(stub, schema={"vendor": "string", "total": "float64"}, pr
 
 This is why `extract` exists rather than `generate(parse_json=True)`: `parse_json` infers
 the struct type from whatever came back **in that batch**. Ask for `{label, score}`, have
-the model omit `score` on one batch, and the two batches carry incompatible struct types —
-the scan dies at concat time with the GPU work already paid for. A declared schema pins
-every batch to the same types and makes the missing value a null. Note also that `"42"`
-came back as a *string* and landed in a `float64` column: values are coerced per row.
+the model omit `score` on one batch, and the two batches carry incompatible struct types.
+The scan then dies at concat time with the GPU work already paid for. A declared schema
+pins every batch to the same types and makes the missing value a null. Note also that
+`"42"` came back as a *string* and landed in a `float64` column: values are coerced per
+row.
 
-Failures degrade one row, never the batch — an unparseable response, a missing key, or a
+Failures degrade one row, never the batch. An unparseable response, a missing key, or a
 value that will not coerce becomes null, and the damage is countable:
 
 ```python
@@ -264,7 +317,7 @@ print(reviews.ml.classify(stub, labels=["positive", "negative"], prompt_column="
 # {'review': ['loved it', 'awful'], 'label': ['positive', 'negative']}
 ```
 
-Pair `extract` with guided decoding so that every row parses in the first place —
+Pair `extract` with guided decoding so that every row parses in the first place.
 `json_schema(schema)` builds the JSON Schema for you:
 
 ```python
@@ -287,9 +340,9 @@ Constrain generation to a JSON schema so every row is parseable, then parse it i
 struct column. `guided_json` on the engine forces the model's decoding to the schema,
 and `parse_json=True` on `llm_generate` parses each output into a struct; a row that
 fails to parse gets a null rather than failing the batch. Prefer `ds.ml.extract` above
-when the fields are known — it pins the Arrow types. Pair the two — guided
-decoding makes the output well-formed, and `parse_json` turns it into typed columns
-you can query downstream.
+when the fields are known; it pins the Arrow types. Pair the two: guided decoding makes
+the output well-formed, and `parse_json` turns it into typed columns you can query
+downstream.
 
 ```python
 # docs: skip
@@ -319,7 +372,7 @@ a regular expression (e.g. `r"\d{4}-\d{2}-\d{2}"` for a date).
 ## Vision-language models
 
 Pass an `image_column` (raw bytes or a decoded `(H, W, 3)` tensor) for a multimodal
-model. Each request becomes prompt plus image, and the engine must be vision-capable —
+model. Each request becomes prompt plus image, and the engine must be vision-capable;
 `vllm_engine` on a multimodal model handles it. A null image row falls back to a
 text-only request.
 
@@ -342,12 +395,12 @@ captions = llm_generate(
 ## Text embeddings
 
 `ds.ml.embed` with a sentence-transformers model id embeds a text `column`, loading
-the model once per worker and scheduling it across GPU actors — the retrieval-pipeline
-companion to [vector search](multimodal.md). It appends one fixed-width vector column
-(named by `output_column`) and keeps the dataset lazy. `num_gpus` reserves accelerator
-fraction per worker, `concurrency` sets the worker count (or an autoscaling
-`(min, max)` range), and `batch_size` controls how many texts go through the model at
-once. Needs `batcher-engine[st]`.
+the model once per worker and scheduling it across GPU actors. It is the
+retrieval-pipeline companion to [vector search](multimodal.md). It appends one
+fixed-width vector column (named by `output_column`) and keeps the dataset lazy.
+`num_gpus` reserves an accelerator fraction per worker, `concurrency` sets the worker
+count (or an autoscaling `(min, max)` range), and `batch_size` controls how many texts
+go through the model at once. Needs `batcher-engine[st]`.
 
 ```python
 # docs: skip
@@ -360,7 +413,7 @@ vectors.write.lance("s3://bucket/vectors.lance")
 
 For a model Batcher does not wrap directly, `ds.ml.embed` also takes any load-once
 callable or class that maps a batch to vectors, and `ds.ml.infer` does the same for
-general model scoring — both accept `concurrency`, `num_gpus`, and `batch_size` the
+general model scoring. Both accept `concurrency`, `num_gpus`, and `batch_size` the
 same way.
 
 ## Next steps

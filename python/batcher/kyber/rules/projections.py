@@ -24,8 +24,8 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.plan.expr_ir import AggExpr, Col, Expr, referenced_columns
+from batcher.plan.expr_ir.walk import column_occurrence_counts
 from batcher.plan.expr_rewrite import substitute_columns as _substitute_cols
-from batcher.plan.expr_rewrite import transform_expr_up
 from batcher.plan.logical import (
     Aggregate,
     AsofJoin,
@@ -34,6 +34,7 @@ from batcher.plan.logical import (
     Join,
     Limit,
     LogicalPlan,
+    MapBatches,
     Project,
     Projection,
     RowId,
@@ -55,6 +56,36 @@ __all__ = [
     "required_predicates_per_source",
     "rewrite_projection",
 ]
+
+
+def _map_batches_need(node: MapBatches, need: set[str]) -> set[str]:
+    """The columns a `map_batches` requires from its input — the one place that decides.
+
+    A `map_batches` is a black box: the control plane cannot read the Python `fn`. So unless
+    the `fn`'s inputs are *declared*, every column of the input must be kept alive — pruning to
+    `need` (what the operators *above* the UDF consume) would starve an `fn` that reads a column
+    it does not re-emit, silently changing its result. That is the safe default, and it is
+    expensive: an embedding stage over one column of a 41-column Parquet table read all 41.
+
+    When `input_columns` **is** declared, the UDF's true inputs are known, and the answer is
+    exactly those plus whatever the plan above still needs (the UDF may pass columns through,
+    and a consumer above may want them). Everything else is prunable, and the scan shrinks.
+
+    Both pushdown walks — the plan rewrite and the per-source projection — call this, so the
+    "what does a UDF need" rule exists once and the two cannot drift into disagreeing.
+
+    Args:
+        node: The `MapBatches` node.
+        need: Columns the operators above this node consume.
+
+    Returns:
+        The set of input columns that must be preserved beneath `node`.
+    """
+    if node.input_columns is None:
+        return set(node.input.available_columns())  # opaque: keep everything
+    available = set(node.input.available_columns())
+    # Intersect with what the input actually has: `need` may name columns the UDF *creates*.
+    return (set(node.input_columns) | need) & available
 
 
 @rule(name="projection_inlining_into_agg", phase=Phase.REWRITE, matches=(Aggregate,))
@@ -94,21 +125,6 @@ def projection_inlining_into_agg(node: Aggregate, _ctx: OptimizerContext) -> Log
     return Aggregate(proj.input, new_keys, tuple(new_aggs))
 
 
-def _col_ref_counts(exprs: list[Expr]) -> dict[str, int]:
-    """How many times each column name is referenced across `exprs` (occurrences,
-    not distinct), so we can refuse a merge that would duplicate a computation."""
-    counts: dict[str, int] = {}
-
-    def tally(e: Expr) -> Expr:
-        if isinstance(e, Col):
-            counts[e.name] = counts.get(e.name, 0) + 1
-        return e
-
-    for ex in exprs:
-        transform_expr_up(ex, tally)
-    return counts
-
-
 @rule(name="eliminate_identity_project", phase=Phase.NORMALIZE, matches=(Project,))
 def eliminate_identity_project(node: Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`Project(x)` → `x` when the projection outputs exactly `x`'s columns, in
@@ -142,7 +158,7 @@ def merge_projections(node: Project, _ctx: OptimizerContext) -> LogicalPlan | No
     inner = node.input
     if not isinstance(inner, Project):
         return None
-    counts = _col_ref_counts([it.expr for it in node.items])
+    counts = column_occurrence_counts([it.expr for it in node.items])
     if any(counts.get(it.alias, 0) > 1 for it in inner.items):
         return None
     inner_map = {it.alias: it.expr for it in inner.items}
@@ -382,6 +398,9 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
             node.direction,
             node.output,
         )
+    if isinstance(node, MapBatches):
+        child = _rewrite(node.input, _map_batches_need(node, need))
+        return node if child is node.input else dataclasses.replace(node, input=child)
     raise TypeError(f"projection rewrite: unhandled node {type(node).__name__}")
 
 
@@ -529,6 +548,9 @@ def _visit(node: LogicalPlan, need: set[str], acc: dict[int, list[str]]) -> None
         # The sample hash reads every column of its input (see `_rewrite`), so the scan below
         # must supply them all; pruning to `need` would change which rows are sampled.
         _visit(node.input, set(node.input.available_columns()), acc)
+
+    elif isinstance(node, MapBatches):
+        _visit(node.input, _map_batches_need(node, need), acc)
 
     else:  # pragma: no cover - defensive
         raise TypeError(f"projection pushdown: unhandled node {type(node).__name__}")

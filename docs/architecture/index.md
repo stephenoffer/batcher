@@ -7,6 +7,12 @@ is identical on one core or a hundred.
 
 ![Batcher's two planes: a Python control plane hands a JSON IR plus zero-copy Arrow batches to the Rust data plane.](../_static/diagrams/two_planes.png)
 
+:::{seealso}
+This section is the shape of the system. For one mechanism at a time — how the JIT falls
+back, how a morsel is scheduled, how the shuffle blocks a producer at zero credits — see
+the [deep dives](../deep-dives/index.md).
+:::
+
 ::::{grid} 1 3 3 3
 :gutter: 3
 

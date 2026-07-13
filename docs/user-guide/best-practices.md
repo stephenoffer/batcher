@@ -90,13 +90,13 @@ print(plan)
 `collect` runs single-node and in-memory by default, which is the fastest path for
 data that fits. Reach for the flags when the workload calls for them:
 
-- `distributed=True` (with `num_workers=`) spreads execution across Ray workers.
-  Use it when one machine cannot hold or process the data in reasonable time. The
-  result is identical to single-node execution because the same mergeable operators
-  run in both modes.
-- `spill=True` lets stateful operators (aggregation, join, sort) spill to disk
-  under memory pressure instead of failing. Use it when an in-memory run risks
-  running out of memory.
+- `distributed=True` (with `num_workers=`) spreads execution across Ray workers. Use
+  it when one machine cannot hold the data, or cannot process it in reasonable time.
+  The result is identical to single-node execution, because the same mergeable
+  operators run in both modes.
+- `spill=True` lets stateful operators (aggregation, join, sort) spill to disk under
+  memory pressure instead of failing. Reach for it when an in-memory run risks running
+  out of memory.
 
 ```python
 # docs: skip
@@ -109,7 +109,7 @@ out = (
 
 Do not turn these on by default. Distribution adds scheduling and shuffle overhead
 that hurts small queries, and spill trades memory for disk I/O. Both earn their cost
-only at scale.
+only on a big job.
 
 ## See also
 

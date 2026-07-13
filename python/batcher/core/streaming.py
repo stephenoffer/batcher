@@ -19,6 +19,7 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
@@ -49,7 +50,7 @@ class _AggFold:
     __slots__ = ("_aggregates_json", "_group_keys_json", "_input_ir", "_nat", "_running")
 
     def __init__(self, agg: Aggregate) -> None:
-        import batcher._native as nat
+        nat = engine()
 
         self._nat = nat
         self._group_keys_json = json.dumps(
@@ -110,8 +111,23 @@ def stream_aggregate(
     for batch in source.iter_batches(None):
         fold.push(batch)
     result = fold.finalize()
+    if result is None and not agg.group_keys:
+        # A *global* aggregate over an empty input still yields exactly one row — `SUM` is
+        # NULL, `COUNT` is 0 — which is what SQL, DuckDB, and `collect()` all produce. The
+        # fold has no partial to finalize (it skips empty batches), so it would yield nothing
+        # and silently disagree with the oracle. Ask the engine for the empty-input result
+        # through the ordinary plan path, so the answer comes from the same operator.
+        result = _empty_global_aggregate(agg, source)
     if result is not None:
         yield from _rebatch(result, batch_size)
+
+
+def _empty_global_aggregate(agg: Aggregate, source: Source) -> pa.RecordBatch | None:
+    """The one-row result of a keyless aggregate over an empty input, via the engine."""
+    nat = engine()
+    empty = pa.RecordBatch.from_pylist([], schema=source.schema())
+    out = nat.execute_plan(json.dumps(agg.to_ir()), [[empty]], active_config().engine_config_json())
+    return next((b for b in out if b.num_rows), None)
 
 
 _EPOCH = datetime.datetime(1970, 1, 1)
@@ -166,7 +182,7 @@ class _WindowedAggFold:
     )
 
     def __init__(self, agg: Aggregate, w_alias: str, width: int) -> None:
-        import batcher._native as nat
+        nat = engine()
 
         self._nat = nat
         self._gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys])
@@ -319,7 +335,7 @@ def stream_limit(
     partition-independent, so taking the first `n` rows across source batches in
     iteration order equals applying the `Limit` to the whole pipeline.
     """
-    import batcher._native as nat
+    nat = engine()
 
     input_ir = json.dumps(limit.input.to_ir())
     cfg = active_config().engine_config_json()
@@ -362,7 +378,7 @@ def stream_topn(
     running set is the global top-N, identical to sorting the whole input then
     taking the first `limit` rows.
     """
-    import batcher._native as nat
+    nat = engine()
 
     sort_ir = json.dumps(
         {

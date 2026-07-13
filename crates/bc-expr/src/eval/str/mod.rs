@@ -10,6 +10,7 @@ use crate::{ExprError, StrFunc};
 
 mod chunk;
 mod html;
+mod json;
 mod minhash;
 
 /// Evaluate a string function over a Utf8 array (preserving nulls).
@@ -191,49 +192,36 @@ pub(crate) fn eval_str(
             }))
         }
         StrFunc::JsonExtractString => {
-            let path = require_pattern(pattern, func)?;
-            let keys = json_path_keys(path);
+            let path = json::parse_path(require_pattern(pattern, func)?);
             // Nullable result: null where input is not valid JSON or path is absent.
             Arc::new(
                 s.iter()
-                    .map(|o| o.and_then(|v| json_extract_string(v, &keys)))
+                    .map(|o| o.and_then(|v| json::extract_string(v, &path)))
                     .collect::<StringArray>(),
             )
         }
         StrFunc::JsonExtractInt => {
-            let path = require_pattern(pattern, func)?;
-            let keys = json_path_keys(path);
+            let path = json::parse_path(require_pattern(pattern, func)?);
             Arc::new(
                 s.iter()
-                    .map(|o| {
-                        o.and_then(|v| json_navigate(v, &keys))
-                            .and_then(|j| j.as_i64())
-                    })
+                    .map(|o| o.and_then(|v| json::extract_int(v, &path)))
                     .collect::<Int64Array>(),
             )
         }
         StrFunc::JsonExtractFloat => {
             use arrow::array::Float64Array;
-            let path = require_pattern(pattern, func)?;
-            let keys = json_path_keys(path);
+            let path = json::parse_path(require_pattern(pattern, func)?);
             Arc::new(
                 s.iter()
-                    .map(|o| {
-                        o.and_then(|v| json_navigate(v, &keys))
-                            .and_then(|j| j.as_f64())
-                    })
+                    .map(|o| o.and_then(|v| json::extract_float(v, &path)))
                     .collect::<Float64Array>(),
             )
         }
         StrFunc::JsonExtractBool => {
-            let path = require_pattern(pattern, func)?;
-            let keys = json_path_keys(path);
+            let path = json::parse_path(require_pattern(pattern, func)?);
             Arc::new(
                 s.iter()
-                    .map(|o| {
-                        o.and_then(|v| json_navigate(v, &keys))
-                            .and_then(|j| j.as_bool())
-                    })
+                    .map(|o| o.and_then(|v| json::extract_bool(v, &path)))
                     .collect::<BooleanArray>(),
             )
         }
@@ -659,18 +647,6 @@ fn substr_slice(v: &str, start: i64, length: Option<i64>) -> &str {
     &v[byte_at(lo - 1)..byte_at(hi)]
 }
 
-/// Split a JSON path like `$.a.b` or `a.b` into its keys.
-fn json_path_keys(path: &str) -> Vec<String> {
-    path.trim_start_matches('$')
-        .split('.')
-        .filter(|k| !k.is_empty())
-        .map(|k| k.to_string())
-        .collect()
-}
-
-/// Navigate `keys` into the JSON document `text`, returning the leaf as a string
-/// (string leaves verbatim; numbers/bools as their text). `None` if invalid JSON
-/// or the path is missing.
 /// FNV-1a 64-bit hash of `bytes` — a tiny, deterministic, dependency-free hash whose
 /// digest is stable across partitions, runs, and machines (unlike `ahash`). Used by
 /// `StrFunc::Hash64` for surrogate keys and SCD change detection.
@@ -692,25 +668,6 @@ fn xxhash64(bytes: &[u8]) -> u64 {
     let mut h = twox_hash::XxHash64::with_seed(0);
     h.write(bytes);
     h.finish()
-}
-
-/// Navigate `text` (parsed as JSON) down the `$.a.b` path `keys`, returning the
-/// `Value` at that location (or `None` if the text isn't valid JSON or the path is
-/// absent). Shared by the typed `json_extract_*` extractors.
-fn json_navigate(text: &str, keys: &[String]) -> Option<serde_json::Value> {
-    let mut cur: serde_json::Value = serde_json::from_str(text).ok()?;
-    for k in keys {
-        cur = cur.get(k)?.clone();
-    }
-    Some(cur)
-}
-
-fn json_extract_string(text: &str, keys: &[String]) -> Option<String> {
-    match json_navigate(text, keys)? {
-        serde_json::Value::String(s) => Some(s),
-        serde_json::Value::Null => None,
-        other => Some(other.to_string()),
-    }
 }
 
 /// Translate a SQL `LIKE`/`ILIKE` pattern into an anchored `regex::Regex`.

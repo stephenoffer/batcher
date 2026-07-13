@@ -19,7 +19,7 @@ import pytest
 
 import batcher as bt
 from batcher.config import active_config, config_context
-from batcher.io.source._impl import InMemorySource
+from batcher.io.source import InMemorySource
 from batcher.kyber import learning, plan_cache
 
 pytestmark = pytest.mark.unit

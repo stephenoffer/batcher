@@ -31,6 +31,14 @@ class MatchesAttribute:
     ``MatchesAttribute("region", "region")`` restricts a table to rows whose ``region``
     matches the reading principal's ``region`` attribute — one policy for every regional
     analyst. A principal missing the attribute is a policy error, surfaced clearly.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.governance import MatchesAttribute, Principal
+            >>> analyst = Principal("ana", roles={"analyst"}, attrs={"region": "EU"})
+            >>> MatchesAttribute("region", "region")(analyst)
+            (col('region') == lit('EU'))
     """
 
     column: str
@@ -46,6 +54,14 @@ class AttributeIn:
 
     The attribute value is split on `sep` (default ``,``) into the allowed set — e.g. a
     principal with ``regions="EU,US"`` sees rows in either. Empty attribute → no rows.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.governance import AttributeIn, Principal
+            >>> analyst = Principal("ana", roles={"analyst"}, attrs={"regions": "EU,US"})
+            >>> AttributeIn("region", "regions")(analyst)
+            ((col('region') == lit('EU')) | (col('region') == lit('US')))
     """
 
     column: str

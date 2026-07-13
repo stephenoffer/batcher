@@ -89,6 +89,12 @@ pub fn bucket_of_rows(
     if keys.is_empty() {
         return Ok(vec![0u32; rows]);
     }
+    // Canonicalize float keys FIRST, so every path below (raw hash or `RowConverter`) sees the
+    // same bits `assign_groups` groups by. Without this a `-0.0` and a `0.0` — one group to the
+    // assigner — encode differently, land on different reducers, and the query returns two
+    // groups where the single-node oracle returns one (invariant #7). See `crate::keys`.
+    let canon = crate::keys::canonicalize_float_keys(keys);
+    let keys: &[ArrayRef] = canon.as_deref().unwrap_or(keys);
     if let Some(part) = partition_int_key(keys, num_partitions) {
         return Ok(part);
     }
@@ -725,50 +731,67 @@ fn salted_hash(key_hash: u64, salt: u32) -> u64 {
 /// hash's high-entropy bits. Deterministic, so equal keys (and both join sides)
 /// always agree within a run.
 #[inline]
-/// Per-row bucket ids for a single `Int64` key, hashing native values directly (no
-/// row encoding). `None` unless every key column is `Int64` (narrow ints are normalized
-/// to `Int64` upstream, so this covers the common single- and composite-integer shuffle
-/// shapes). Null slots hash their (arbitrary) raw value; that is harmless — a null key
-/// still lands in *some* bucket consistently, and join matching rejects it separately.
+/// Per-row bucket ids for an all-`Int64` key, hashing native values directly (no row encoding).
+/// `None` unless every key column is `Int64` (narrow ints are normalized to `Int64` upstream, so
+/// this covers the common single- and composite-integer shuffle shapes).
+///
+/// Nulls are handled in-path, not bailed on. Arrow leaves the value under a null slot undefined
+/// (parquet's `pad_nulls` leaves whatever was in the buffer), so a null row must NOT be hashed by
+/// its raw value: it would scatter otherwise-identical NULL keys across every bucket (wrong for an
+/// aggregate/DISTINCT shuffle, where SQL says all NULLs are one group). Instead every null row
+/// hashes to the fixed `keys::NULL_HASH` bucket. Crucially, this keeps a *nullable* key on the raw
+/// path rather than falling back to the `RowConverter`: if it fell back while a null-free key of
+/// the same type hashed raw, the two hashes would disagree on equal *non-null* keys and split them
+/// across buckets — silently dropping inner-join matches (both join sides must take one path).
 fn partition_int_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32>> {
     use arrow::array::Int64Array;
     if keys.is_empty() || !keys.iter().all(|k| k.data_type() == &DataType::Int64) {
         return None;
     }
-    // Single Int64 key — hash the raw value directly (null slots hash their arbitrary raw
-    // value, harmless for a shuffle join since null keys never match).
+    // Nulls are handled here, NOT bailed on: a null row hashes to the fixed `keys::NULL_HASH`
+    // bucket (co-locating every null, so a DISTINCT/aggregate sees one NULL group), and a
+    // non-null row hashes its raw value. This is what keeps BOTH sides of a join on the raw
+    // path: if a nullable key fell back to the `RowConverter` while the other (null-free) side
+    // took this raw hash, the two hashes would disagree on equal *non-null* keys, splitting them
+    // across buckets and silently dropping inner-join matches. Same-typed keys therefore always
+    // take one identical path regardless of null presence.
+    let null_bucket = bucket_of(crate::keys::NULL_HASH, num_partitions);
+    // Single Int64 key — hash the raw value directly.
     if keys.len() == 1 {
-        let vals = keys[0].as_any().downcast_ref::<Int64Array>()?.values();
-        let hash1 = |v: &i64| bucket_of(SEED.hash_one(*v), num_partitions);
-        return Some(if vals.len() >= PAR_HASH_MIN_ROWS {
-            vals.par_iter().map(hash1).collect()
+        let arr = keys[0].as_any().downcast_ref::<Int64Array>()?;
+        let vals = arr.values();
+        let hash1 = |i: usize| -> u32 {
+            if arr.is_null(i) {
+                null_bucket
+            } else {
+                bucket_of(SEED.hash_one(vals[i]), num_partitions)
+            }
+        };
+        let n = vals.len();
+        return Some(if n >= PAR_HASH_MIN_ROWS {
+            (0..n).into_par_iter().map(hash1).collect()
         } else {
-            vals.iter().map(hash1).collect()
+            (0..n).map(hash1).collect()
         });
     }
     // Composite Int64 key (e.g. a `(part, supplier)` join / group shuffle). Fold each
     // column's raw value into one hasher per row — skips the `RowConverter` encode the
-    // general path runs. Like the single-key path, a null slot hashes its arbitrary raw
-    // value: BOTH shuffle sides are the same key type and so take this same path, so equal
-    // non-null keys still co-partition (the only invariant a join needs — null keys never
-    // match). This path is therefore used for join/group shuffles, not a null-sensitive
-    // DISTINCT (which dedups via the row-encoded `assign_groups`, where nulls compare equal).
-    let cols: Vec<&[i64]> = keys
+    // general path runs. A row with a null in ANY key column routes to the null bucket (equal
+    // null-bearing rows still co-locate; they are compared within the bucket by the assigner),
+    // so co-partitioning holds for null-free and nullable keys alike.
+    let cols: Vec<&Int64Array> = keys
         .iter()
-        .map(|k| {
-            k.as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values()
-                .as_ref()
-        })
+        .map(|k| k.as_any().downcast_ref::<Int64Array>().unwrap())
         .collect();
     let n = cols[0].len();
     let hashn = |i: usize| -> u32 {
         use std::hash::{BuildHasher, Hasher};
+        if cols.iter().any(|c| c.is_null(i)) {
+            return null_bucket;
+        }
         let mut h = SEED.build_hasher();
         for c in &cols {
-            h.write_i64(c[i]);
+            h.write_i64(c.values()[i]);
         }
         bucket_of(h.finish(), num_partitions)
     };
@@ -811,13 +834,15 @@ impl MixedCol<'_> {
 /// because a null slot's arbitrary raw value could split two equal null-bearing rows across
 /// buckets, which a DISTINCT (nulls compare equal) must not do.
 fn partition_mixed_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u32>> {
-    if keys.len() < 2 || keys.iter().any(|k| k.null_count() != 0) {
+    if keys.len() < 2 {
         return None;
     }
     let cols: Vec<MixedCol> = keys
         .iter()
         .map(|k| match k.data_type() {
-            DataType::Int64 => Some(MixedCol::Int(k.as_primitive::<arrow::datatypes::Int64Type>().values())),
+            DataType::Int64 => Some(MixedCol::Int(
+                k.as_primitive::<arrow::datatypes::Int64Type>().values(),
+            )),
             DataType::Utf8 => Some(MixedCol::Str32(k.as_string::<i32>())),
             DataType::LargeUtf8 => Some(MixedCol::Str64(k.as_string::<i64>())),
             DataType::Binary => Some(MixedCol::Bin32(k.as_binary::<i32>())),
@@ -826,8 +851,17 @@ fn partition_mixed_key(keys: &[ArrayRef], num_partitions: usize) -> Option<Vec<u
         })
         .collect::<Option<_>>()?;
     let n = keys[0].len();
+    // Nulls route to the fixed null bucket (co-locating equal null-bearing rows) and non-null
+    // rows hash raw — the same null-awareness `partition_int_key` has, so a nullable key never
+    // falls back to the `RowConverter` while a null-free key of the same shape hashes raw, which
+    // would split equal non-null keys across buckets and drop inner-join matches.
+    let null_bucket = bucket_of(crate::keys::NULL_HASH, num_partitions);
+    let any_null = keys.iter().any(|k| k.null_count() != 0);
     let hashn = |i: usize| -> u32 {
         use std::hash::{BuildHasher, Hasher};
+        if any_null && keys.iter().any(|k| k.is_null(i)) {
+            return null_bucket;
+        }
         let mut h = SEED.build_hasher();
         for c in &cols {
             c.write(&mut h, i);
@@ -1216,22 +1250,59 @@ mod tests {
         // Different rows may or may not collide in 8 buckets, but a full DISTINCT over the
         // partitioned buckets must recover exactly the 4 distinct rows. Verify via the public
         // `partition_by_keys` + per-bucket dedup that the distinct count is right.
-        let batch = RecordBatch::try_from_iter(vec![
-            ("f", keys[0].clone()),
-            ("k", keys[1].clone()),
-        ])
-        .unwrap();
+        let batch =
+            RecordBatch::try_from_iter(vec![("f", keys[0].clone()), ("k", keys[1].clone())])
+                .unwrap();
         let buckets = partition_by_keys(&batch, &[0, 1], 8).unwrap();
         let total: usize = buckets.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 6, "every row placed exactly once");
     }
 
-    /// A nullable mixed key declines the fast path (so the null-equal `RowConverter` handles it).
+    /// A nullable mixed key stays on the raw fast path (it no longer declines): null rows route
+    /// to the fixed null bucket and equal non-null rows co-partition. Declining here was the
+    /// bug — a nullable key fell back to the `RowConverter` while a null-free key of the same
+    /// type hashed raw, so equal non-null keys split across buckets and inner-join matches were
+    /// silently dropped. The raw path must fire and co-locate both the null rows and the equal
+    /// non-null rows.
     #[test]
-    fn mixed_key_with_nulls_declines_fast_path() {
+    fn mixed_key_with_nulls_uses_null_aware_fast_path() {
         use arrow::array::StringArray;
-        let flag = Arc::new(StringArray::from(vec![Some("A"), None, Some("A")])) as ArrayRef;
-        let key = Arc::new(Int64Array::from(vec![1, 2, 1])) as ArrayRef;
-        assert!(partition_mixed_key(&[flag, key], 4).is_none());
+        let flag = Arc::new(StringArray::from(vec![Some("A"), None, Some("A"), None])) as ArrayRef;
+        let key = Arc::new(Int64Array::from(vec![Some(1), None, Some(1), None])) as ArrayRef;
+        let part = partition_mixed_key(&[flag, key], 8).expect("null-aware fast path applies");
+        assert_eq!(part.len(), 4);
+        // Rows 0 and 2 are ("A",1) → same bucket. Rows 1 and 3 are (null,null) → the null bucket.
+        assert_eq!(part[0], part[2], "equal (A,1) rows co-partition");
+        assert_eq!(
+            part[1], part[3],
+            "null-bearing rows co-locate in the null bucket"
+        );
+        assert_eq!(
+            part[1],
+            bucket_of(crate::keys::NULL_HASH, 8),
+            "null rows route to the fixed null bucket"
+        );
+    }
+
+    /// Regression for the dropped-match bug: a null-BEARING key column and a null-FREE key column
+    /// of the same type must send equal non-null values to the SAME bucket. Before the fix the
+    /// null-bearing side fell back to the `RowConverter` while the null-free side hashed raw, so
+    /// equal keys split across buckets and an inner join silently lost rows.
+    #[test]
+    fn nullable_and_nullfree_int_keys_copartition() {
+        let with_null = Arc::new(Int64Array::from(vec![Some(7), None, Some(42)])) as ArrayRef;
+        let no_null = Arc::new(Int64Array::from(vec![7, 42, 99])) as ArrayRef;
+        let p_null = bucket_of_rows(&[with_null], 3, 16).unwrap();
+        let p_free = bucket_of_rows(&[no_null], 3, 16).unwrap();
+        // key 7: row 0 on the nullable side, row 0 on the null-free side.
+        assert_eq!(
+            p_null[0], p_free[0],
+            "key 7 must co-partition across both sides"
+        );
+        // key 42: row 2 on the nullable side, row 1 on the null-free side.
+        assert_eq!(
+            p_null[2], p_free[1],
+            "key 42 must co-partition across both sides"
+        );
     }
 }

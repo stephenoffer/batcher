@@ -30,7 +30,7 @@ This tag is now law for both sides. Don't proceed until the name is final.
 
 ## 2. Implement in the interpreter — the correctness oracle
 
-- Add the operator logic to `crates/bc-interp/src/ops.rs` (the shared operator
+- Add the operator logic to `crates/bc-interp/src/ops/` (the shared operator
   module both executors call) and wire it into the sequential walk in
   `crates/bc-interp/src/lib.rs` (`execute`).
 - For an expression, implement `Expr::eval` in `bc-expr` using arrow compute
@@ -73,7 +73,7 @@ Stateful operators (aggregation, join, distinct, window, top-N) MUST be mergeabl
 
 ## 6. Surface it in Python (`plan` + `api`)
 
-- Add the `LogicalPlan` node in `python/batcher/plan/logical.py` with a `to_ir()`
+- Add the `LogicalPlan` node in `python/batcher/plan/logical/` with a `to_ir()`
   returning `{"op": "<tag>", ...}` whose tag and field names **exactly match** the
   Rust `serde` definition from step 1. (For a scalar **expression** node, extend
   `plan/expr_ir/`: subclass the declarative `IRNode` (`node_base.py`) — set `tag`
@@ -81,7 +81,7 @@ Stateful operators (aggregation, join, distinct, window, top-N) MUST be mergeabl
   `to_ir` is generated. Add its tag to `plan/ir_tags.py::ExprTag`, its `fn` name to
   the family vocabulary in `plan/expr_ir/fn_names.py`, and a representative to
   `tests/unit/test_ir_snapshot.py`. See the `add-expression-or-function` skill.)
-- Add the fluent, lazy, immutable method to `python/batcher/api/dataset.py`
+- Add the fluent, lazy, immutable method to `python/batcher/api/dataset/`
   (returns a new `Dataset`; expression-first; one obvious way to do it). Curate
   `__all__`, type hints, a docstring, and typed errors (`PlanError`) for bad input.
 - Keep lowering in the neutral `plan` layer; don't leak it into kyber/carbonite/core.

@@ -26,8 +26,13 @@ from collections import deque
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher._internal.hardware import available_cpu_count
-from batcher.dist.executors.partition_io import descriptor_rows, partition_descriptors
+from batcher.dist.executors.partition_io import (
+    descriptor_rows,
+    partition_descriptors,
+    source_pushdown,
+)
 from batcher.dist.executors.plan_analysis import _relabel_single_source
 from batcher.dist.executors.ray_runtime import _ensure_ray
 from batcher.io.source import Source
@@ -344,7 +349,8 @@ def _distributed_map(
     # arriving as one large batch fans out evenly (one balanced slice per GPU actor) instead
     # of landing whole on worker 0.
     n_parts = workers if wants_pool else _adaptive_partition_count(sources[sid], plan, workers, hub)
-    partitions = partition_descriptors(sources[sid], n_parts)
+    proj, pred = _scan_pushdown(plan0)
+    partitions = partition_descriptors(sources[sid], n_parts, projection=proj, predicate=pred)
 
     opts = _gpu_options(num_gpus, accelerator_type)
     if wants_pool:
@@ -594,6 +600,22 @@ def _source_total_rows(source) -> int | None:
     return total if splits else None
 
 
+def _scan_pushdown(plan0: LogicalPlan) -> tuple[list[str] | None, dict | None]:
+    """The projection + predicate a relabeled map plan's scan can read straight from storage.
+
+    `_relabel_single_source` rewrites the sub-plan's scan to source 0, so the analysis is
+    keyed on 0. The shuffle operators (join, aggregate, sort) have always pushed this down;
+    the map/UDF path did not, so every task read **every column** of its partition and let the
+    plan's `Project` throw the rest away. For the pipeline the ML/inference path is built on —
+    a UDF over one or two columns of a wide table — that is the whole table pulled from object
+    storage, per task: on TPC-H sf10 `lineitem`, 16 columns fetched to use 1.
+
+    `(None, None)` (the analysis can't run) keeps the read-everything behavior, which is
+    always correct — this only ever narrows what is read, never what is computed.
+    """
+    return source_pushdown(plan0, 0)
+
+
 def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
     """How many tasks to split a map/scan source into — data- and compute-driven.
 
@@ -680,7 +702,8 @@ def stream_distributed_map(plan: LogicalPlan, sources: list[Source], workers: in
     if env is not None and env.accelerator_type is not None:
         accelerator_type = env.accelerator_type
 
-    partitions = partition_descriptors(sources[sid], workers)
+    proj, pred = _scan_pushdown(plan0)
+    partitions = partition_descriptors(sources[sid], workers, projection=proj, predicate=pred)
     opts = _gpu_options(num_gpus, accelerator_type)
     task = _map_udf_task.options(**opts) if opts else _map_udf_task
     pending = [task.remote(plan0, p) for p in partitions]
@@ -1053,7 +1076,7 @@ def _map_agg_task(plan0, partition, group_keys_json, aggregates_json, workers: i
     small partial-aggregate state leaves the worker — the driver does the cross-partition
     `combine_finalize`. This distributes a `map_batches → aggregate` pipeline (Ray Data's
     bread and butter) instead of running the whole UDF single-node on the driver."""
-    import batcher._native as nat
+    nat = engine()
     from batcher import core
     from batcher.dist.executors.partition_io import read_partition_descriptor
     from batcher.io.source import InMemorySource
@@ -1078,7 +1101,7 @@ def _distributed_map_aggregate(above, agg, sources, workers):
 
     import pyarrow as pa
 
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.executors.partition_io import _apply_above
     from batcher.dist.executors.plan_analysis import _empty_agg_table
     from batcher.dist.executors.ray_runtime import current_envelope, gather_map_results
@@ -1088,7 +1111,8 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys])
     aj = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
     n_parts = _adaptive_partition_count(sources[sid], agg.input, workers)
-    partitions = partition_descriptors(sources[sid], n_parts)
+    proj, pred = _scan_pushdown(map_plan)
+    partitions = partition_descriptors(sources[sid], n_parts, projection=proj, predicate=pred)
     # Skew-aware adaptive CPU per task (sized to the partition that runs the UDF here);
     # placement resolves SPREAD vs locality-aware DEFAULT against the live cluster.
     shares = _adaptive_task_cpus(partitions, agg.input)

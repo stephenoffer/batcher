@@ -16,7 +16,11 @@ estimators, and join ordering land on top of this seam.
 from __future__ import annotations
 
 from batcher.kyber.learning import (
+    AVG_BYTES_KEY,
+    MCV_KEY,
     NDV_KEY,
+    QUANTILES_KEY,
+    columns_for,
     load_learned_stats,
     record_column_stats,
     record_execution,
@@ -41,9 +45,14 @@ from batcher.kyber.optimizer import (
     optimize_logical,
     optimize_traced,
 )
+from batcher.kyber.rules.projections import required_columns_per_source
+from batcher.kyber.stats import hot_join_values
 
 __all__ = [
+    "AVG_BYTES_KEY",
+    "MCV_KEY",
     "NDV_KEY",
+    "QUANTILES_KEY",
     "Optimizer",
     "answer_aggregate",
     "answer_column_summary",
@@ -53,6 +62,8 @@ __all__ = [
     "answer_filter_is_empty",
     "answer_is_empty",
     "approx_count_distinct",
+    "columns_for",
+    "hot_join_values",
     "load_learned_stats",
     "optimize",
     "optimize_full",
@@ -61,4 +72,5 @@ __all__ = [
     "record_column_stats",
     "record_execution",
     "record_selectivity",
+    "required_columns_per_source",
 ]

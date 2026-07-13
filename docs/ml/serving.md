@@ -22,19 +22,21 @@ scored = bt.read.images("s3://bucket/imgs/", decode=True, size=(224, 224)).ml.ma
 
 An adapter returns a *class*, not a function. `map_batches` instantiates it once per
 worker; the constructor opens the connection (or builds the client), and that client
-is reused for every batch the worker sees. The expensive setup — the HTTP session, the
-gRPC channel, the tensor metadata handshake — happens once, not per batch. If you write
-your own adapter, do the connecting in `__init__` and nothing per-call but the request.
+is reused for every batch the worker sees. The expensive setup (the HTTP session, the
+gRPC channel, the tensor metadata handshake) happens once, not per batch. If you write
+your own adapter, do the connecting in `__init__` and leave nothing per call but the
+request itself.
 
 The class implements the `ServingClient` protocol: one `predict` method that takes a
 dict of named NumPy arrays and returns a dict of named arrays. Batcher handles the
 columnar plumbing on both sides. Input columns are pulled from the Arrow batch and
 converted to NumPy in the order given by `input_columns`; output arrays come back keyed
 by name and are appended as new columns. The input batch passes through unchanged, so
-inference adds columns rather than replacing the row. A tensor input column (every row
-a same-shape N-d array, like decoded images) keeps its `(N, *shape)` form across the
-boundary; a 1-D output array becomes a scalar column and a higher-rank output becomes a
-tensor column.
+inference adds columns rather than replacing the row.
+
+Shapes survive the round trip. A tensor input column (every row a same-shape N-d array,
+like decoded images) keeps its `(N, *shape)` form across the boundary; a 1-D output
+array becomes a scalar column, and a higher-rank output becomes a tensor column.
 
 ## Adapters
 
@@ -45,21 +47,21 @@ tensor column.
 | `http_client(url, *, input_columns, output_columns, headers=None, timeout=30.0, retries=3)` | Any columnar-JSON REST endpoint (KServe-style). |
 | `serving_udf(connect, *, input_columns, output_columns=None)` | Build your own adapter from a zero-arg `connect()` returning a `ServingClient`. |
 
-Use `triton_client` for tensor inputs (decoded images, embeddings) — it sends binary
-tensors, and maps NumPy dtypes (including `bf16` and the `fp8` variants modern
-transformers serve in) to Triton's KServe-v2 dtype vocabulary. `http_client` is for
-scalar/text features; JSON-encoding a tensor is slow and bloated, so it warns once if
-asked to. `torchserve_client` is `http_client` pointed at `/predictions/{model}`, so a
-TorchServe handler that accepts and returns `{column: [values...]}` works with no extra
-glue.
+Use `triton_client` for tensor inputs (decoded images, embeddings): it sends binary
+tensors, and maps NumPy dtypes, including `bf16` and the `fp8` variants modern
+transformers serve in, to Triton's KServe-v2 dtype vocabulary. `http_client` is for
+scalar and text features. JSON-encoding a tensor is slow and bloated, so it warns once
+if asked to. `torchserve_client` is `http_client` pointed at `/predictions/{model}`, so
+a TorchServe handler that accepts and returns `{column: [values...]}` works with no
+extra glue.
 
 ## Writing your own adapter
 
 `serving_udf` builds an adapter from a `connect()` callable that returns anything
-implementing `ServingClient` — a `predict({col: ndarray}) -> {col: ndarray}` method.
-`connect()` runs once per worker, so do the client setup there and keep `predict` to
-the request itself. When `output_columns` is omitted, the keys of the returned dict
-become the output column names.
+implementing `ServingClient`, meaning a `predict({col: ndarray}) -> {col: ndarray}`
+method. `connect()` runs once per worker, so do the client setup there and keep
+`predict` to the request itself. When `output_columns` is omitted, the keys of the
+returned dict become the output column names.
 
 ```python
 # docs: skip
@@ -86,30 +88,30 @@ scored = ds.ml.map_batches(udf, concurrency=(2, 8))
 ## Batching
 
 The batch the server sees is the morsel the pipeline hands the UDF. Set `batch_size`
-on `map_batches` to control how many rows go in one `predict` call — large enough to
+on `map_batches` to control how many rows go in one `predict` call: large enough to
 keep the model's accelerator busy, small enough to fit the request and the server's own
 queue. `concurrency` (an int or a `(min, max)` range) sets how many worker copies of
-the adapter run in parallel; with a `(min, max)` range the stage autoscales between
-those bounds under load. More concurrency means more open connections to the server, so
-size it against what the server can absorb.
+the adapter run in parallel; with a range, the stage autoscales between those bounds
+under load. More concurrency means more open connections, so size it against what the
+server can absorb.
 
 ## Errors and retries
 
-`http_client` retries with exponential backoff on transient failures — connection
+`http_client` retries with exponential backoff on transient failures: connection
 errors, timeouts, and the retryable status codes (408, 425, 429, 500, 502, 503, 504).
 Other 4xx responses fail immediately, since a malformed request will not improve on a
-retry. After `retries` attempts are exhausted the adapter raises `BackendError` with
-the endpoint and the last error. Triton and TorchServe adapters surface backend errors
-the same way. A failure propagates up through the stage; it is not silently dropped.
+retry. Once `retries` attempts are exhausted the adapter raises `BackendError` with the
+endpoint and the last error. Triton and TorchServe surface backend errors the same way.
+Nothing is dropped silently; a failure propagates up through the stage.
 
 ## From batch to online serving
 
 The same load-once factory that backs a batch stage can stand up an online endpoint.
 `serve_deployment` wraps it as a Ray Serve deployment that answers per-request calls,
-coalescing concurrent requests with Serve's native batching — so a model proven in a
-batch pipeline serves online unchanged, with no second execution engine to maintain.
-The offline `map_batches` adapter and this online deployment share one `build` factory,
-so what you validate in batch is what runs at the endpoint. Needs `batcher-engine[serve]`.
+coalescing concurrent requests with Serve's native batching. A model proven in a batch
+pipeline then serves online unchanged, with no second execution engine to maintain. The
+offline `map_batches` adapter and this online deployment share one `build` factory, so
+what you validate in batch is what runs at the endpoint. Needs `batcher-engine[serve]`.
 
 | Argument | Meaning |
 | --- | --- |
@@ -123,7 +125,7 @@ The `build` factory returns a *batched* predictor: it is handed the list of requ
 Serve coalesced (up to `max_batch_size`, or whatever arrived within
 `batch_wait_timeout_s`) and runs one forward pass for the whole list, so the GPU sees a
 real batch even under per-request traffic. Tune `max_batch_size` and
-`batch_wait_timeout_s` together — a larger batch and a longer wait trade a little
+`batch_wait_timeout_s` together: a bigger batch and a longer wait trade a little
 latency for throughput.
 
 ```python

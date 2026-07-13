@@ -13,6 +13,7 @@ changes, so nothing can silently over-claim.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 
 from batcher.plan.expr_ir import Cast, Col, Lit
@@ -38,37 +39,39 @@ __all__ = [
 
 def scan_columns(
     source_columns: Mapping[str, ColumnStat],
-    learned_ndv: Mapping[str, float],
+    learned: Mapping[str, ColumnStat],
 ) -> dict[str, ColumnStat]:
     """Seed a `Scan`'s column stats from the connector's declared statistics,
-    supplemented by learned (execution-measured) distinct counts.
+    supplemented by the statistics measured for **this source** in past runs.
 
-    Source-declared stats are authoritative and carry their own provenance
-    (footer min/max is `EXACT`, byte-truncated string bounds weaker). A learned
-    ndv (from an HLL sketch over a past run — never exact) fills in only where it
-    cannot mislabel an exact statistic: an `EXACT` footer column is left
-    untouched, because a single `ColumnStat` carries one provenance and tagging
-    its ndv `EXACT` would let an approximate distinct count wrongly answer
-    `count_distinct`. The learned ndv lands only on footerless or already-inexact
-    columns, where it informs `approx_count_distinct` and cost.
+    Source-declared stats are authoritative and carry their own provenance (footer min/max
+    is `EXACT`, byte-truncated string bounds weaker). The learned bundle — an HLL distinct
+    count, a KLL quantile grid, Misra-Gries top values, a measured byte width, none of them
+    exact — fills in around them.
+
+    The `ndv` merge is the delicate one. A `ColumnStat` carries **one** provenance for the
+    whole bundle, so writing an approximate ndv onto an `EXACT` footer column would tag
+    that ndv `EXACT` too and let it wrongly answer `count_distinct`. So a learned ndv lands
+    only on a footerless or already-inexact column. The purely *descriptive* statistics
+    (quantiles, mcv, avg_bytes) carry no such risk — nothing answers a query from them,
+    they only sharpen an estimate — so they attach to any column, including an EXACT one,
+    without disturbing its provenance.
     """
     cols: dict[str, ColumnStat] = dict(source_columns)
-    for name, ndv in learned_ndv.items():
-        if ndv <= 0:
-            continue
+    for name, measured in learned.items():
         existing = cols.get(name)
         if existing is None:
-            cols[name] = ColumnStat(ndv=float(ndv), provenance=Provenance.SKETCH)
-        elif existing.ndv is None and existing.provenance is not Provenance.EXACT:
-            cols[name] = ColumnStat(
-                min=existing.min,
-                max=existing.max,
-                null_count=existing.null_count,
-                ndv=float(ndv),
-                total_sum=existing.total_sum,
-                provenance=existing.provenance,
-                bloom=existing.bloom,
-            )
+            cols[name] = measured
+            continue
+        exact = existing.provenance is Provenance.EXACT
+        take_ndv = measured.ndv is not None and existing.ndv is None and not exact
+        cols[name] = dataclasses.replace(
+            existing,
+            ndv=measured.ndv if take_ndv else existing.ndv,
+            quantiles=existing.quantiles or measured.quantiles,
+            mcv=existing.mcv or measured.mcv,
+            avg_bytes=existing.avg_bytes or measured.avg_bytes,
+        )
     return cols
 
 
@@ -130,16 +133,21 @@ def _identity_cast_column(
 def filter_columns(child: RelStats) -> dict[str, ColumnStat]:
     """Filter output column stats: min/max survive as *bounds* (a filter can only
     shrink the value range), but provenance drops to `DEFAULT` because the
-    extremes may have been removed. null_count and ndv become unknown/looser."""
+    extremes may have been removed. null_count becomes unknown; ndv is an upper bound.
+
+    The measured distributional stats (quantiles, mcv, avg_bytes) and the totals
+    (total_sum, mean) carry through by `downgrade`, which weakens provenance but keeps the
+    values. They must: they describe the column's *shape*, they are read only to estimate,
+    and a relation above a filter is exactly where an estimate is still needed — dropping
+    them here would mean any predicate at all blinded every operator above it to the very
+    statistics the metadata loop measured (a `WHERE` clause would cost a wide string column
+    at the flat 64-byte default and forfeit its broadcast join).
+    """
     out: dict[str, ColumnStat] = {}
     for name, stat in child.columns.items():
-        out[name] = ColumnStat(
-            min=stat.min,
-            max=stat.max,
+        out[name] = dataclasses.replace(
+            stat.downgrade(Provenance.DEFAULT),
             null_count=None,  # filter may drop nulls; count no longer known
-            ndv=stat.ndv,  # an upper bound after filtering
-            provenance=weakest(stat.provenance, Provenance.DEFAULT),
-            bloom=stat.bloom,  # absence in the base bloom persists in any subset
         )
     return out
 
@@ -168,17 +176,22 @@ def window_columns(child: RelStats) -> dict[str, ColumnStat]:
 def distinct_columns(child: RelStats) -> dict[str, ColumnStat]:
     """Distinct output column stats: dedup preserves the exact *value set*, so
     min/max/ndv pass through at their original provenance; null_count is no
-    longer known (dedup collapses duplicate nulls to one)."""
+    longer known (dedup collapses duplicate nulls to one).
+
+    The measured width carries through (dedup drops rows, it does not change how wide a
+    value is), and so does the quantile grid as a description of the value *set*. The
+    most-common-values do not: dedup collapses every duplicate, which is precisely the
+    frequency information an MCV records — a value held by 90% of rows is one row after a
+    `DISTINCT`, so carrying its frequency forward would claim a skew that no longer exists.
+    """
     out: dict[str, ColumnStat] = {}
     for name, stat in child.columns.items():
-        out[name] = ColumnStat(
-            min=stat.min,
-            max=stat.max,
+        out[name] = dataclasses.replace(
+            stat,
             null_count=None,
-            ndv=stat.ndv,
             total_sum=None,  # sum changes under dedup
-            provenance=stat.provenance,
-            bloom=stat.bloom,  # dedup adds no value → absence proof still holds
+            mean=None,  # so does the mean
+            mcv=None,  # dedup destroys frequency; see above
         )
     return out
 
@@ -213,6 +226,7 @@ def _merge_union_column(stats: list[ColumnStat]) -> ColumnStat:
     mins = [s.min for s in stats if s.min is not None]
     maxs = [s.max for s in stats if s.max is not None]
     nulls = [s.null_count for s in stats]
+    widths = [s.avg_bytes for s in stats if s.avg_bytes is not None]
     all_min = len(mins) == len(stats)
     all_max = len(maxs) == len(stats)
     all_null = all(n is not None for n in nulls)
@@ -222,6 +236,10 @@ def _merge_union_column(stats: list[ColumnStat]) -> ColumnStat:
         null_count=sum(n for n in nulls if n is not None) if all_null else None,
         ndv=None,
         provenance=prov,
+        # A width is a per-row property, so the union's is the widest branch's — the safe
+        # direction for the memory/broadcast sizing it feeds. Quantiles and MCVs describe a
+        # *distribution* and do not merge by any sound rule here, so they are dropped.
+        avg_bytes=max(widths) if widths else None,
     )
 
 
@@ -243,12 +261,25 @@ def global_aggregate_columns(node: Aggregate, child: RelStats) -> dict[str, Colu
     """
     out: dict[str, ColumnStat] = {}
     for spec in node.aggregates:
-        value = _derive_scalar_aggregate(spec.agg.func, spec.agg.input, child)
+        value = _derive_scalar_aggregate(spec.agg.func, spec.agg.input, child, node.input)
         if value is not None:
             out[spec.alias] = ColumnStat(
                 min=value, max=value, null_count=0, ndv=1, provenance=Provenance.EXACT
             )
     return out
+
+
+def _is_float_column(col_name: str, plan) -> bool:
+    """Whether `col_name` is a floating-point column in `plan`'s leaf schema."""
+    import pyarrow as pa
+
+    from batcher.plan.logical import Scan
+    from batcher.plan.visitor import walk
+
+    for node in walk(plan):
+        if isinstance(node, Scan) and node.schema.has(col_name):
+            return pa.types.is_floating(node.schema.field(col_name).type)
+    return False
 
 
 # SQL/DataFrame spellings of the two boolean aggregates (`every`/`some` are the
@@ -257,8 +288,13 @@ _BOOL_AND_FUNCS = frozenset({"bool_and", "every"})
 _BOOL_OR_FUNCS = frozenset({"bool_or", "some"})
 
 
-def _derive_scalar_aggregate(func: str, input_expr, child: RelStats):
-    """The exact scalar value of one global aggregate, or None if not derivable."""
+def _derive_scalar_aggregate(func: str, input_expr, child: RelStats, plan=None):
+    """The exact scalar value of one global aggregate, or None if not derivable.
+
+    `plan` is the aggregate's input, used only to type-check a `min`/`max` column — see the
+    float-bound refusal below. It is optional so existing callers/tests keep working; without
+    it the float check cannot run.
+    """
     col_name = input_expr.name if isinstance(input_expr, Col) else None
     if func == "count_star":
         # count(*) = total rows, regardless of any column.
@@ -279,8 +315,25 @@ def _derive_scalar_aggregate(func: str, input_expr, child: RelStats):
     if stat is None or stat.provenance is not Provenance.EXACT:
         return None
     if func == "min":
+        # Sound for every type, floats included: NaN is the *greatest* value in the total
+        # order (see `max` below), so a dropped NaN can never have been the minimum. An
+        # all-NaN column has no bound at all (the sketch saw nothing, the footer has no
+        # min/max), so it falls through to execution rather than answering NULL.
         return stat.min
     if func == "max":
+        # A float bound cannot answer `max`. Both producers of the bound deliberately drop
+        # NaN — the KLL quantile sketch ignores it on `add` ("no place in an ordered sketch")
+        # and the Parquet spec omits it from column statistics — while SQL's total order (the
+        # one our own ORDER BY uses) makes NaN the *greatest* value. So `max(f)` over a column
+        # containing a NaN **is** NaN, which the bound cannot represent, and nothing in the
+        # stats records whether a NaN was dropped. Answering from the bound returned the
+        # largest non-NaN value and silently disagreed with executing the very same query —
+        # a wrong answer produced *by an optimization*, which is the worst kind. Execute.
+        #
+        # Only `max`, and only floats: `min` is unaffected (above), and ints / strings /
+        # temporals have no NaN, so they keep answering from metadata.
+        if plan is not None and col_name is not None and _is_float_column(col_name, plan):
+            return None
         return stat.max
     if func == "sum":
         # An exact recorded total (a catalog/format `total_sum`). SQL `sum` over a
@@ -344,6 +397,10 @@ def grouped_aggregate_columns(node: Aggregate, child: RelStats) -> dict[str, Col
                     ndv=None,
                     provenance=src.provenance,  # extremes preserved → EXACT survives
                     bloom=src.bloom,  # grouping adds no value → absence proof holds
+                    # A key's width is unchanged by grouping; its frequency distribution is
+                    # destroyed by it (every group is one row), so the mcv must not carry.
+                    avg_bytes=src.avg_bytes,
+                    quantiles=src.quantiles,
                 )
     return out
 
@@ -376,13 +433,17 @@ def join_columns(
         side = left if o.side == "left" else right
         src = side.columns.get(o.name)
         if src is not None:
-            out[o.alias] = ColumnStat(
-                min=src.min,
-                max=src.max,
+            out[o.alias] = dataclasses.replace(
+                src.downgrade(Provenance.DEFAULT),
                 null_count=None,
                 ndv=_join_ndv(src.ndv, out_rows),
-                provenance=weakest(src.provenance, Provenance.DEFAULT),
-                bloom=src.bloom,
+                total_sum=None,  # matching duplicates rows, so a recorded sum no longer holds
+                mean=None,
+                # The measured *width* survives — a join changes which rows are present, not
+                # how many bytes one holds — and it is what keeps byte-true memory and
+                # broadcast sizing alive above a join. Frequencies (mcv) do not: a join
+                # re-weights the value distribution by its match multiplicity.
+                mcv=None,
             )
     return out
 

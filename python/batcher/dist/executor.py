@@ -74,7 +74,23 @@ from batcher.plan.logical import (
 )
 from batcher.plan.resource import SchedulingEnvelope
 
-__all__ = ["execute_distributed"]
+__all__ = ["execute_distributed", "resolve_worker_fanout"]
+
+
+def resolve_worker_fanout(num_workers: int | None) -> int:
+    """The worker fan-out for a distributed stage the caller did not size explicitly.
+
+    `execute_distributed` derives its fan-out from the live cluster (`_cluster_fill_workers`
+    — enough workers to fill every node's cores). Paths that bypass it and drive Ray tasks
+    directly — notably the distributed **write** — must not invent their own constant: a
+    hard-coded fan-out uses 4 workers on a 100-node cluster, stranding 96 nodes. This is
+    that same sizing, exposed for those callers. An explicit `num_workers` always wins.
+    """
+    if num_workers is not None:
+        return max(1, num_workers)
+    _ensure_ray(available_cpu_count())
+    fill = _cluster_fill_workers()
+    return fill[0] if fill is not None else available_cpu_count()
 
 
 def execute_distributed(
@@ -801,7 +817,11 @@ def _dispatch(
             if transport == "flight":
                 from batcher.dist.flight_join import execute_join_flight
 
-                return execute_join_flight(above, join, sources, workers)
+                # `materialize=False` (an intermediate stage of a multi-join query) keeps
+                # each reducer's joined bucket on its worker and returns a
+                # `FlightMaterializedSource` the next stage reads in place — no driver
+                # round-trip per join, which is what makes a 3+-table query scale.
+                return execute_join_flight(above, join, sources, workers, materialize=materialize)
             from batcher.dist.executors.join import _distributed_join
 
             return _distributed_join(

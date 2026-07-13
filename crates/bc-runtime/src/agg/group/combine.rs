@@ -21,6 +21,7 @@ use crate::agg::{
     merge_median, AggFunc,
 };
 use crate::error::RuntimeError;
+use crate::keys::canon_f64;
 
 /// Parallel `combine` regroup via hash-radix partitioning. Returns the merged group-key
 /// columns and, per aggregate, its merged state columns — identical to the serial
@@ -219,20 +220,6 @@ fn is_hashable_mixed(dt: &DataType) -> bool {
             | DataType::Binary
             | DataType::LargeBinary
     )
-}
-
-/// Canonical bits for an `f64` bucketing key so a float key buckets consistently with how
-/// `assign_groups` groups it (the two zeros are one group, all NaNs one group). Must match
-/// `agg::group::assign::canon_f64`.
-#[inline]
-fn canon_f64(v: f64) -> u64 {
-    if v.is_nan() {
-        0x7ff8_0000_0000_0000
-    } else if v == 0.0 {
-        0
-    } else {
-        v.to_bits()
-    }
 }
 
 /// One key column, downcast once, feeding its per-row raw value to a hasher.

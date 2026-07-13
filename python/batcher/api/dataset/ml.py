@@ -94,6 +94,7 @@ class DatasetML:
         fn: Callable | type,
         *,
         batch_size: int | None = None,
+        input_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
         num_workers: int | str = "auto",
         num_gpus: float = 0.0,
@@ -163,6 +164,12 @@ class DatasetML:
         Args:
             fn: A function (or class/factory) applied to each batch.
             batch_size: Rebatch to this many rows before each call.
+            input_columns: The columns `fn` reads. Declaring them lets the optimizer prune
+                everything else out of the scan — an embedding stage over one column of a
+                41-column Parquet file otherwise reads all 41, because the engine cannot see
+                inside a Python function and must assume it reads anything. Omitting a column
+                the `fn` actually reads is a correctness bug, not a slow path: it will be
+                pruned out from under the function. Leave unset (the default) if unsure.
             output_columns: The result schema when `fn` changes the columns.
             num_workers: Concurrent per-batch calls within a worker (``"auto"``
                 sizes to the stage), or an explicit int.
@@ -208,6 +215,7 @@ class DatasetML:
                 fn,
                 batch_size,
                 cols,
+                input_columns=tuple(input_columns) if input_columns is not None else None,
                 num_workers=resolve_num_workers(num_workers, num_gpus),
                 num_gpus=num_gpus,
                 concurrency=concurrency,

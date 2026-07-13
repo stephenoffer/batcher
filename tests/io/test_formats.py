@@ -41,6 +41,63 @@ def test_json_roundtrip_via_sink_and_read_json(tmp_path):
     assert src.schema().names == table.schema.names
 
 
+def test_json_write_stream_bounded_and_matches(tmp_path):
+    """`JSONSink.write_stream` encodes one batch at a time and round-trips.
+
+    Streaming a multi-batch source must produce the same NDJSON as a whole-table
+    write, and report the correct row count — bounded memory, no full materialization.
+    """
+    table = pa.table({"id": list(range(50)), "v": [x * 0.5 for x in range(50)]})
+    path = str(tmp_path / "streamed.json")
+
+    written = JSONSink().write_stream(iter(table.to_batches(max_chunksize=7)), path)
+    assert written.rows == table.num_rows
+
+    got = pa.Table.from_batches(JSONSource(path).read())
+    assert _sorted_pydict(got) == _sorted_pydict(table)
+
+
+def test_json_write_stream_empty_writes_valid_file(tmp_path):
+    """An empty stream writes a valid (empty) file using the provided schema."""
+    schema = pa.schema([("id", pa.int64()), ("v", pa.float64())])
+    path = str(tmp_path / "empty.json")
+    written = JSONSink().write_stream(iter([]), path, schema=schema)
+    assert written.rows == 0
+    assert (
+        JSONSource(path).read() == []
+        or pa.Table.from_batches(JSONSource(path).read()).num_rows == 0
+    )
+
+
+def test_partitioned_write_parallel_matches_hive_layout(tmp_path):
+    """A partitioned write fans partition dirs concurrently and reads back correctly.
+
+    Each ``c=v`` directory holds its own rows with the partition column dropped from
+    the data; reading the dataset back recovers the partition column and all rows.
+    """
+    from batcher.io.formats.structured.parquet import ParquetDatasetSource, ParquetSink
+
+    table = pa.table(
+        {
+            "region": ["us", "eu", "us", "ap", "eu", "ap"],
+            "id": [1, 2, 3, 4, 5, 6],
+            "v": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        }
+    )
+    root = str(tmp_path / "parts")
+    written = ParquetSink().write_partitioned(table, root, partition_by=["region"])
+    # One file per distinct partition; partition column dropped from the data files.
+    assert len(written) == 3
+    assert all(w.partition_values and "region" in w.partition_values for w in written)
+
+    got = pa.Table.from_batches(ParquetDatasetSource(root).read())
+    assert set(got.column_names) == {"region", "id", "v"}
+    # Align column order (the dataset appends the recovered partition column) and cast
+    # the dictionary-encoded partition column back to plain strings for comparison.
+    got = got.select(["region", "id", "v"]).cast(table.schema)
+    assert _sorted_pydict(got) == _sorted_pydict(table)
+
+
 def test_json_source_projection(tmp_path):
     table = pa.table({"a": [1, 2], "b": [3, 4], "c": [5, 6]})
     path = str(tmp_path / "p.json")

@@ -97,14 +97,30 @@ class KinesisSource(BrokerSource):
             return shards
         return [shards[i] for i in self._partitions if i < len(shards)]
 
-    def _iterator(self, shard_id: str) -> str:
+    def _iterator(self, shard_id: str, shard_index: int) -> str:
+        """A shard iterator, resuming after a checkpointed sequence when present.
+
+        On recovery ``seek`` records the raw sequence number in ``_resume_from``
+        (keyed by shard index); the iterator is then obtained with
+        ``AFTER_SEQUENCE_NUMBER`` so no record is replayed or skipped. Otherwise
+        the configured ``iterator_type`` (``TRIM_HORIZON`` / ``LATEST``) applies.
+        """
         if shard_id not in self._iterators:
             client = self._client()
-            resp = client.get_shard_iterator(
-                StreamName=self.topic,
-                ShardId=shard_id,
-                ShardIteratorType=self._options["iterator_type"],
-            )
+            resume = self._resume_from.get(shard_index)
+            if resume is not None:
+                resp = client.get_shard_iterator(
+                    StreamName=self.topic,
+                    ShardId=shard_id,
+                    ShardIteratorType="AFTER_SEQUENCE_NUMBER",
+                    StartingSequenceNumber=str(resume),
+                )
+            else:
+                resp = client.get_shard_iterator(
+                    StreamName=self.topic,
+                    ShardId=shard_id,
+                    ShardIteratorType=self._options["iterator_type"],
+                )
             self._iterators[shard_id] = resp["ShardIterator"]
         return self._iterators[shard_id]
 
@@ -113,7 +129,7 @@ class KinesisSource(BrokerSource):
         messages: list[BrokerMessage] = []
         for shard_index, shard_id in enumerate(self._active_shards()):
             resp = client.get_records(
-                ShardIterator=self._iterator(shard_id),
+                ShardIterator=self._iterator(shard_id, shard_index),
                 Limit=self.poll_size,
             )
             next_iter = resp.get("NextShardIterator")
@@ -126,6 +142,9 @@ class KinesisSource(BrokerSource):
                         value=rec["Data"],
                         partition=shard_index,
                         offset=_seq_to_offset(rec["SequenceNumber"]),
+                        # The raw sequence is the resume token (the int64 offset is a
+                        # lossy hash); `AFTER_SEQUENCE_NUMBER` needs the exact string.
+                        resume_token=rec["SequenceNumber"],
                         timestamp=int(ts.timestamp() * 1000) if ts is not None else 0,
                         topic=self.topic,
                         key=(rec.get("PartitionKey") or "").encode("utf-8") or None,

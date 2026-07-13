@@ -182,22 +182,15 @@ modules = [
     "batcher.core",
     "batcher.governance",
 ]
-# Core imports the compiled engine as `batcher._native`; import-linter cannot see
-# into the extension module and mis-attributes it to the root `batcher` package
-# (which re-exports the api). Those edges are the engine dependency, not layer ones.
-# (Carbonite also drives `batcher._native` to govern the data plane — the
-# bc-resource pool / bc-transport shuffle — but grimp resolves that to the
-# `batcher._native` submodule, outside the independence set, so it needs no ignore.)
-ignore_imports = [
-    "batcher.core.executor -> batcher",
-    "batcher.core.udf.execute -> batcher",
-    "batcher.core.stats -> batcher",
-    "batcher.core.streaming -> batcher",
-    # The native Parquet reader (`bc_io`) is called from the neutral IO layer via
-    # `batcher._native`; grimp mis-attributes that submodule import to the root `batcher`
-    # package (as with core above), so this is the engine dependency, not a layer edge.
-    "batcher.io.formats.structured._parquet_native -> batcher",
-]
+# No `ignore_imports`, deliberately. There used to be one entry per module that wrote
+# `import batcher._native` — grimp cannot see into a compiled extension, so it attributed
+# each such import to the ROOT `batcher` package, which re-exports `api`, which imports every
+# subsystem: a phantom `core -> batcher -> api -> kyber` cycle that broke this contract. The
+# allowlist silenced the symptom, and grew by one line per new module — until a new IO format
+# added the same import, was not on the list, and broke all six independence directions at once.
+# The engine is now reached through the single accessor `batcher._internal.native`, so the
+# phantom edge does not exist and nothing needs excusing. If you find yourself adding an entry
+# here, you have almost certainly bypassed that shim — don't.
 
 [[tool.importlinter.contracts]]
 name = "plan is the neutral contract layer"
@@ -210,6 +203,34 @@ forbidden_modules = [
     "batcher.governance",
     "batcher.api",
 ]
+
+# `io` sits below every subsystem (layer 2 in the import matrix in
+# `.claude/rules/architecture.md`): sources/sinks/formats are infrastructure that `kyber`,
+# `core`, and `dist` all legitimately depend on. That only holds while `io` itself stays
+# neutral — the moment a format reaches back up into a subsystem, `io` stops being a shared
+# foundation and becomes a cycle, taking the independence contract down with it.
+[[tool.importlinter.contracts]]
+name = "io is neutral infrastructure"
+type = "forbidden"
+source_modules = ["batcher.io"]
+forbidden_modules = [
+    "batcher.kyber",
+    "batcher.carbonite",
+    "batcher.core",
+    "batcher.governance",
+    "batcher.dist",
+    "batcher.api",
+    "batcher.ml",
+]
+
+# `dist` is a *backend* of the conductor, not a peer of it: `api` decides to distribute and
+# calls `dist`. If `dist` imports `api` back, the conductor becomes a dependency of the thing
+# it conducts, and "api is the only conductor" stops meaning anything.
+[[tool.importlinter.contracts]]
+name = "dist is a backend, not a second conductor"
+type = "forbidden"
+source_modules = ["batcher.dist"]
+forbidden_modules = ["batcher.api"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

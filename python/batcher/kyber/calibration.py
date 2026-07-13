@@ -29,6 +29,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import weakref
+from statistics import median
 
 from batcher.config import Config, CostCoefficients, active_config
 from batcher.metadata import MetadataHub
@@ -110,13 +111,6 @@ def _samples(rows: list[dict]) -> list[tuple[float, float, float, float]]:
         if t > 0.0 and (rin > 0.0 or rout > 0.0) and factor > 0.0:
             out.append((rin or rout, rout or rin, t, factor))
     return out
-
-
-def _median(xs: list[float]) -> float:
-    s = sorted(xs)
-    n = len(s)
-    mid = n // 2
-    return s[mid] if n % 2 else 0.5 * (s[mid - 1] + s[mid])
 
 
 def calibrate(hub: MetadataHub | None, config: Config | None = None) -> CostCoefficients:
@@ -206,7 +200,7 @@ def _calibrate(
         ]
         if not per_row:
             continue
-        measured = _median(per_row)
+        measured = median(per_row)
         updates[coeff] = _clamp(_shrink(measured, c0, len(per_row), prior_strength), c0, clamp)
 
     speedup = _measured_jit_speedup(by_kind, defaults, cfg)
@@ -261,7 +255,7 @@ def _measured_jit_speedup(
             ]
             if len(per_row) < min_samples:
                 break
-            residuals[backend] = _median(per_row)
+            residuals[backend] = median(per_row)
         if len(residuals) != 2 or min(residuals.values()) <= 0.0:
             continue
         ratios.append(residuals["interp"] / residuals["jit"])
@@ -270,7 +264,7 @@ def _measured_jit_speedup(
     # `expr_factor` already divided the compiled bucket by the prior, so the residual
     # ratio *scales* the prior rather than replacing it. A compiled expression is never
     # slower than the same expression interpreted, hence the floor at 1.0.
-    measured = defaults.jit_speedup * _median(ratios)
+    measured = defaults.jit_speedup * median(ratios)
     return _clamp(max(1.0, measured), defaults.jit_speedup, clamp)
 
 

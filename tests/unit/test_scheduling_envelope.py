@@ -42,9 +42,9 @@ def _op(op_id: int, kind: str, mem: int, credits: int, par: int) -> PhysicalOp:
 
 def test_annotate_ops_scales_parallelism_with_rows():
     import batcher as bt
+    from batcher.kyber.annotate import annotate_ops
     from batcher.kyber.cardinality import CardinalityEstimator
     from batcher.kyber.cost import CostModel
-    from batcher.kyber.annotate import annotate_ops
 
     class _Source:
         """Source stub that reports a huge row count to the estimator."""
@@ -259,9 +259,9 @@ def test_resolve_placement_strategy_against_live_nodes(monkeypatch):
 
 def test_annotate_ops_sets_locality_for_small_shuffle_only():
     import batcher as bt
+    from batcher.kyber.annotate import annotate_ops
     from batcher.kyber.cardinality import CardinalityEstimator
     from batcher.kyber.cost import CostModel
-    from batcher.kyber.annotate import annotate_ops
 
     class _Source:
         def __init__(self, rows: int) -> None:
@@ -463,9 +463,9 @@ def test_envelope_cpu_is_dominant_operator_share():
 
 def test_kyber_annotates_cpu_light_with_fraction():
     import batcher as bt
+    from batcher.kyber.annotate import annotate_ops
     from batcher.kyber.cardinality import CardinalityEstimator
     from batcher.kyber.cost import CostModel
-    from batcher.kyber.annotate import annotate_ops
 
     cfg = active_config()
     ds = bt.from_pydict({"k": [1, 2], "v": [3, 4]}).filter(bt.col("v") > 0)
@@ -535,9 +535,9 @@ def test_load_cpu_utilization_medians_by_kind():
 
 def test_annotate_ops_overrides_static_cpu_with_learned():
     import batcher as bt
+    from batcher.kyber.annotate import annotate_ops
     from batcher.kyber.cardinality import CardinalityEstimator
     from batcher.kyber.cost import CostModel
-    from batcher.kyber.annotate import annotate_ops
 
     cfg = active_config()
     ds = bt.from_pydict({"k": [1, 2], "v": [3, 4]}).filter(bt.col("v") > 0)

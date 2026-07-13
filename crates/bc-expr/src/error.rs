@@ -51,6 +51,9 @@ pub enum ExprError {
     #[error("image function {func} requires a {arg} argument")]
     MissingImageArg { func: String, arg: &'static str },
 
+    #[error("audio.resample requires a positive target sample rate")]
+    MissingAudioRate,
+
     #[error("image decode failed: {0}")]
     ImageDecode(String),
 

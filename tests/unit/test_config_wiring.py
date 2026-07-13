@@ -254,15 +254,11 @@ def test_open_override_is_still_validated_via_env():
     from batcher._internal.errors import ConfigError
 
     # A good deep-nested override reaches the knob.
-    good = Config.from_env(
-        {"BATCHER_OPTIMIZER_CARDINALITY_EQ_SELECTIVITY": "0.3"}, base=Config()
-    )
+    good = Config.from_env({"BATCHER_OPTIMIZER_CARDINALITY_EQ_SELECTIVITY": "0.3"}, base=Config())
     assert good.optimizer.cardinality.eq_selectivity == 0.3
     # A bad one is caught at the env-load entry point (from_env → _resolved → validate).
     with pytest.raises(ConfigError):
-        Config.from_env(
-            {"BATCHER_OPTIMIZER_CARDINALITY_EQ_SELECTIVITY": "5.0"}, base=Config()
-        )
+        Config.from_env({"BATCHER_OPTIMIZER_CARDINALITY_EQ_SELECTIVITY": "5.0"}, base=Config())
 
 
 def test_set_config_validates(monkeypatch):

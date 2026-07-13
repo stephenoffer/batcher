@@ -40,9 +40,7 @@ def gpu_available() -> bool:
         return False
 
 
-def gpu_groupby_agg(
-    table: pa.Table, key: str, aggs: dict[str, tuple[str, str]]
-) -> pa.Table:
+def gpu_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]]) -> pa.Table:
     """Group `table` by `key` and compute `aggs` on the GPU, returning an Arrow table.
 
     `aggs` maps ``output_name -> (column, reduction)`` where reduction is one of
@@ -68,9 +66,7 @@ def gpu_groupby_agg(
         return _torch_groupby_agg(table, key, aggs, device="cuda")
 
 
-def _cudf_groupby_agg(
-    table: pa.Table, key: str, aggs: dict[str, tuple[str, str]]
-) -> pa.Table:
+def _cudf_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]]) -> pa.Table:
     """The cuDF (RAPIDS) group-by kernel — a mature GPU dataframe, ~3x the torch kernel and
     the engine behind Polars-GPU. Arrow in, Arrow out; result-identical to the CPU engine."""
     import cudf

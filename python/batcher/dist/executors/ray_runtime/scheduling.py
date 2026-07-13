@@ -112,13 +112,11 @@ def worker_runtime_env() -> dict | None:
         return None
     if _WORKER_RT_ENV_DONE:
         return _WORKER_RT_ENV
-    import os
-
     from ray._private.runtime_env.py_modules import upload_py_modules_if_needed
 
-    import batcher
+    from batcher._internal.paths import package_dir
 
-    pkg = os.path.dirname(os.path.abspath(batcher.__file__))
+    pkg = package_dir()
     # include_gitignore=False → upload the dir verbatim (the maturin-built native
     # `.so` may be gitignored; it must reach the worker for `import batcher` to work).
     rt = upload_py_modules_if_needed({"py_modules": [pkg]}, include_gitignore=False)

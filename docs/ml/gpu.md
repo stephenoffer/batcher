@@ -8,15 +8,14 @@ describe a pool of GPU actors:
 - `concurrency`: how many actors run in parallel.
 
 The engine places those actors on available GPUs, hands each one a stream of Arrow
-batches, and collects the results. Your code never manages device placement
-directly; it requests GPUs and processes batches.
+batches, and collects the results. Your code requests GPUs and processes batches; it
+never touches device placement.
 
 ## How the pool works
 
-Each actor is a worker that holds `num_gpus` of a GPU for its lifetime. A
-class-based function loads its model once when the actor starts, then processes
-many batches on that reserved device. With `concurrency` actors, that many batches
-are in flight at once.
+Each actor is a worker that holds `num_gpus` of a GPU for its lifetime. A class-based
+function loads its model once when the actor starts, then processes many batches on that
+reserved device. With `concurrency` actors, that many batches are in flight at once.
 
 - `num_gpus=1, concurrency=4`: four actors, each owning a whole GPU. Use this when
   one model fills a device.
@@ -24,17 +23,17 @@ are in flight at once.
   devices. Use this for small models so a single GPU is not underused.
 - `num_gpus=0.0` (the default): CPU only, no GPU reserved.
 
-The fractional packing is how you keep expensive GPUs busy: size `num_gpus` to the
-model's memory footprint and raise `concurrency` until the devices are saturated.
+Fractional packing is how you keep expensive GPUs busy: size `num_gpus` to the model's
+memory footprint, then raise `concurrency` until the devices are saturated.
 
-`concurrency` defaults to `"auto"` — one actor per GPU the cluster reports — so a
+`concurrency` defaults to `"auto"`, meaning one actor per GPU the cluster reports, so a
 multi-GPU cluster is never left idling a single engine (a common scale-out foot-gun).
 
 ## Autoscaling the pool
 
 Pass `concurrency` as a `(min, max)` tuple to let the pool grow and shrink with the
 backlog instead of holding a fixed actor count. The engine adds actors (up to `max`)
-while batches queue and releases them (down to `min`) when the stage drains — so a
+while batches queue and releases them (down to `min`) once the stage drains, so a
 bursty workload does not pin every GPU for its whole duration.
 
 ```python
@@ -62,13 +61,13 @@ ds.ml.infer(Model, num_gpus=1, concurrency=4, accelerator_type="NVIDIA_A100")
 ## Letting the engine pack by memory
 
 `model_memory_gb` declares the model's footprint in gigabytes. State the size once and
-Kyber sizes the stage for you: when you leave `num_gpus` and `batch_size` unset, it
-picks the GPU fraction from the model's size versus one GPU's memory — packing several
-copies of a light model onto one device, or reserving whole GPUs for a model larger
-than one — and seeds the initial `batch_size` from the VRAM left after the model. The
-online throughput controller then refines that batch size from measured VRAM and
-throughput. The resource layer additionally uses `model_memory_gb` to budget host RAM
-per worker (OOM protection), and Kyber to cost an inference stage by size.
+Kyber sizes the stage for you. With `num_gpus` and `batch_size` left unset, it picks the
+GPU fraction from the model's size against one GPU's memory (packing several copies of a
+light model onto one device, or reserving whole GPUs for a model larger than one) and
+seeds the initial `batch_size` from the VRAM left over. The online throughput controller
+then refines that batch size from measured VRAM and throughput. Two other consumers read
+the same number: the resource layer, to budget host RAM per worker (OOM protection), and
+Kyber, to cost an inference stage by size.
 
 Any value you set yourself is always honored; Kyber only fills what you leave unset.
 
@@ -85,11 +84,11 @@ ds.ml.infer(Model, num_gpus=0.25, concurrency=8, batch_size=256, model_memory_gb
 
 GPU placement is also part of Batcher's adaptive loop. Each actor measures how busy
 the device actually was; that utilization is recorded to the MetadataHub keyed by the
-pipeline, and the next run's effective `num_gpus` adapts — packing more tasks onto a
-fraction of a device that sat idle, or asking for a whole GPU when one saturated. The
-declared `num_gpus` is the starting point; the measured load refines it. On a host
-with no measurable utilization (Apple MPS, CPU, or no driver) the loop is a no-op and
-your request stands unchanged.
+pipeline, and the next run's effective `num_gpus` adapts. It packs more tasks onto a
+fraction of a device that sat idle, or asks for a whole GPU when one saturated. Your
+declared `num_gpus` is the starting point; the measured load refines it. On a host with
+no measurable utilization (Apple MPS, CPU, or no driver) the loop is a no-op and your
+request stands unchanged.
 
 ## Requesting GPUs
 

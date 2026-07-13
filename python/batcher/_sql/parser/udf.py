@@ -172,7 +172,14 @@ def _hoist_one(tr, ds, call):
     out_col = f"__bc_udf_{tr._udf_n}"
     tr._udf_n += 1
     adapter = _make_adapter(rf, arg_cols, const_args, out_col)
-    ds = ds.ml.map_batches(adapter, output_columns=[*ds.columns, out_col])
+    # The parser already resolved exactly which columns the UDF reads (`arg_cols`), so hand
+    # them to the plan instead of throwing them away — otherwise `SELECT a FROM t WHERE
+    # my_udf(b) > 0` scans every column of `t` because the UDF looks opaque.
+    ds = ds.ml.map_batches(
+        adapter,
+        input_columns=[name for _, name in arg_cols],
+        output_columns=[*ds.columns, out_col],
+    )
     replacement = exp.column(out_col)
     if call.parent is not None:
         call.replace(replacement)

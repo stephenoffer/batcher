@@ -8,7 +8,7 @@ API hygiene) live in `.claude/rules/python-quality.md`.
 
 ## The user-facing API: lazy, immutable, expression-first
 
-The surface (`api/dataset.py`, `plan/expr_ir.py`, `python/batcher/__init__.py`) is
+The surface (`api/dataset/`, `plan/expr_ir/`, `python/batcher/__init__.py`) is
 deliberately small. Keep it that way.
 
 - **Lazy + immutable.** A `Dataset` is a handle to a `LogicalPlan` plus bound

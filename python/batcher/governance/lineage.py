@@ -56,6 +56,27 @@ LineageMap = dict[str, frozenset[Origin]]
 def column_lineage(plan: LogicalPlan, tables: Sequence[str]) -> LineageMap:
     """Return, for each of `plan`'s output columns, the source columns it derives from.
 
+    Operates on a `LogicalPlan`; `Dataset.lineage` is the sugar over it that names the
+    tables for you and renders the origins as ``"table.column"``.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.governance import column_lineage
+            >>> from batcher.plan.expr_ir import Col
+            >>> from batcher.plan.logical import Project, Projection, Scan
+            >>> from batcher.plan.schema import SchemaRef
+            >>> schema = SchemaRef.from_arrow(
+            ...     pa.schema([("first", pa.string()), ("last", pa.string())])
+            ... )
+            >>> plan = Project(
+            ...     Scan(0, schema),
+            ...     (Projection(alias="name", expr=Col("first") + Col("last")),),
+            ... )
+            >>> sorted(column_lineage(plan, ["people.parquet"])["name"])
+            [('people.parquet', 'first'), ('people.parquet', 'last')]
+
     Args:
         plan: The plan to analyze. It is not executed.
         tables: The table name of each source, indexed by a `Scan`'s ``source_id``.

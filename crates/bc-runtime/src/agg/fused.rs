@@ -156,7 +156,16 @@ impl FusedAcc<'_> {
             } => {
                 if v.is_valid(i) {
                     let val = v.value(i);
-                    if !valid[g] || (*is_min && val < cur[g]) || (!*is_min && val > cur[g]) {
+                    // Same total order the per-call `minmax_acc` uses (`crate::keys`), not raw
+                    // IEEE `<`/`>` — otherwise NaN never wins here and the fused path disagrees
+                    // with the per-call path, which `fused_minmax_nan_matches_per_call` pins.
+                    let ord = crate::keys::float_total_cmp(val, cur[g]);
+                    let wins = if *is_min {
+                        ord == std::cmp::Ordering::Less
+                    } else {
+                        ord == std::cmp::Ordering::Greater
+                    };
+                    if !valid[g] || wins {
                         cur[g] = val;
                         valid[g] = true;
                     }

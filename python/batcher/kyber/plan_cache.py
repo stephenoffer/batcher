@@ -50,6 +50,7 @@ from typing import Any
 
 from batcher.config import Config
 from batcher.kyber import learning
+from batcher.plan.source_stats import source_stats_key
 
 __all__ = ["cache_key", "clear", "lookup", "record_write", "store"]
 
@@ -142,18 +143,21 @@ def _config_key(config: Config) -> str:
 
 
 def _source_keys(sources: list | None) -> list[str] | None:
-    """One data-stable key per source, or `None` if any source cannot be keyed safely."""
+    """One data-stable key per source, or `None` if any source cannot be keyed safely.
+
+    `plan.source_stats.source_stats_key` is the single definition of that key — a
+    data-stable identity where one exists, object identity for shape-keyed in-memory data
+    (whose `identity()` collides across different relations), `None` when a source cannot
+    key itself. The learned column statistics are filed under exactly the same key, so a
+    plan and the statistics it was chosen under can never disagree about which source is
+    which.
+    """
     keys: list[str] = []
     for source in sources or ():
-        identity_fn = getattr(source, "identity", None)
-        if not callable(identity_fn):
+        key = source_stats_key(source)
+        if key is None:
             return None  # an unkeyable source: never cache a plan built over it
-        # A shape-based identity (in-memory data) collides across different relations, and
-        # zone-map pruning reads a source's actual bounds — so key those by object identity.
-        if getattr(source, "stable_stats_identity", True):
-            keys.append(f"id:{identity_fn()}")
-        else:
-            keys.append(f"obj:{id(source)}")
+        keys.append(key)
     return keys
 
 

@@ -50,6 +50,7 @@ class RuleRegistry:
         matches: tuple[type, ...],
         category: RuleCategory = RuleCategory.REWRITE,
         idempotent: bool = True,
+        expr: Callable | None = None,
     ) -> Callable[
         [Callable[[LogicalPlan, OptimizerContext], LogicalPlan | None]],
         Callable[[LogicalPlan, OptimizerContext], LogicalPlan | None],
@@ -68,6 +69,7 @@ class RuleRegistry:
                     matches=matches,
                     category=category,
                     idempotent=idempotent,
+                    expr_fn=expr,
                 )
             )
             return fn
@@ -89,10 +91,19 @@ def rule(
     matches: tuple[type, ...],
     category: RuleCategory = RuleCategory.REWRITE,
     idempotent: bool = True,
+    expr: Callable | None = None,
 ):
-    """Register a node-local rule into the default registry (see `RuleRegistry.rule`)."""
+    """Register a node-local rule into the default registry (see `RuleRegistry.rule`).
+
+    `expr` declares the rule's body as a leaf `Expr -> Expr` rewrite, letting the driver run
+    it in one shared expression traversal with every other expression rule in the phase."""
     return DEFAULT_REGISTRY.rule(
-        name=name, phase=phase, matches=matches, category=category, idempotent=idempotent
+        name=name,
+        phase=phase,
+        matches=matches,
+        category=category,
+        idempotent=idempotent,
+        expr=expr,
     )
 
 

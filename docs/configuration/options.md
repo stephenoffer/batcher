@@ -83,8 +83,8 @@ Credit-based backpressure for the shuffle, the Carbonite flow-control model.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `default_credits` | `4` | In-flight batch slots when an operator has no estimate. One credit is one buffered batch. |
-| `credit_ceiling_factor` | `16` | Maximum credit window is `default_credits * credit_ceiling_factor`. |
+| `default_credits` | `16` | In-flight batch slots when an operator has no estimate. One credit is one buffered batch. |
+| `credit_ceiling_factor` | `4` | Maximum credit window is `default_credits * credit_ceiling_factor`. |
 | `credit_byte_budget` | `268435456` (256 MiB) | Byte ceiling for one shuffle channel's credit window, so wide rows can't buffer GBs even within the count ceiling. |
 | `shuffle_fan_in` | `8` | Maximum inbound streams a shuffle node fans in before the reduce becomes a tree of combiner stages. |
 | `aimd_alpha` | `1` | Additive increase: credits added per round trip. |
@@ -243,12 +243,26 @@ cluster** profile in [profiles](profiles.md).
 | `transport` | `"auto"` | Shuffle transport. `"auto"` picks Flight on a multi-node cluster, disk on a single node / shared filesystem; `"flight"`/`"disk"` force it. |
 | `shared_filesystem` | `False` | True when every worker shares a filesystem at the same path, so the disk shuffle is safe cluster-wide. |
 | `dashboard` | `False` | Show the Ray dashboard. |
-| `adaptive_credits` | `False` | Opt-in AIMD shuffle credits: the window adapts to observed memory backpressure instead of the static grant. |
-| `runtime_bloom_join` | `False` | Build a bloom from the join build side and push it to the probe side to drop non-matching rows before they shuffle — cutting network volume for selective fact ⋈ dimension joins. Opt-in; inner / semi single-key joins only. |
-| `shared_memory_transfer` | `False` | Same-node shared-memory shuffle: a mapper mirrors each bucket to a memory-mapped Arrow-IPC file (Linux `/dev/shm` when available) that a same-node reducer reads via mmap — no gRPC. Best-effort; a miss falls back to Flight. |
+| `tls` | `ShuffleTlsConfig()` (off) | TLS/mTLS for the inter-node Arrow Flight shuffle. Sub-section below. |
+| `adaptive_credits` | `True` | AIMD shuffle credits: the window grows and shrinks per remote fetch from observed memory backpressure instead of holding the static grant. Flow control only, so the merged output is unchanged. `False` pins the static `default_credits` window. |
+| `runtime_bloom_join` | `"auto"` | Build a bloom from the join build side and push it to the probe side to drop non-matching rows before they shuffle — cutting network volume for selective fact ⋈ dimension joins. `"auto"` engages only when Kyber estimates the probe is much larger than the build; `True` always, `False` never. Inner / semi joins only. |
+| `shared_memory_transfer` | `True` | Same-node shared-memory shuffle: a mapper mirrors each bucket to a memory-mapped Arrow-IPC file (Linux `/dev/shm` when available) that a same-node reducer reads via mmap — no gRPC. Pressure-gated (skipped when the node is tight on memory) and best-effort; a miss falls back to Flight, which is bit-identical. |
 | `locality_aware_scheduling` | `False` | Host a reducer whose bucket concentrates on one node on that node, turning the bulk of its fetches into same-node hits. Result-preserving; pays off on a multi-node cluster with a skewed / co-partitioned shuffle. |
 | `persistent_fleet` | `False` | Reserve one placement group and worker fleet for a whole adaptive multi-stage query, keeping each stage's intermediate partitioned on the workers instead of collecting to the driver. Removes per-stage placement churn and the driver funnel. |
 | `resilience` | `"default"` | Named fault-tolerance profile. `"default"` keeps the conservative budgets below; `"spot"` hardens them as a bundle (more restarts / recompute, keepalive on, one speculative backup) for a churning spot-node cluster. Explicit knobs override the profile. See [fault tolerance](../architecture/fault-tolerance.md). |
+
+This section is the {py:class}`DistributedConfig <batcher.config.config.DistributedConfig>`
+dataclass (the API reference lists every field). Construct one and swap it onto `Config`
+— e.g. to isolate a job's shuffle actors in their own Ray namespace:
+
+```python
+from batcher import Config
+from batcher.config import DistributedConfig
+
+cfg = Config().replace(distributed=DistributedConfig(namespace="nightly-etl"))
+print(cfg.distributed.namespace)
+# nightly-etl
+```
 
 ### Fault tolerance
 
@@ -300,12 +314,127 @@ The `BATCHER_AUTOSCALE` env var is authoritative in both directions — `1` forc
 on, `0` forces it off even on a managed cluster. The wait is pure scheduling: the result is
 identical whether it waits or not.
 
+### distributed.tls
+
+The shuffle carries query data — including columns a governance policy has already
+decrypted or masked — straight between worker processes. On a network you do not fully
+control, encrypt it. `config.distributed.tls` is a
+{py:class}`ShuffleTlsConfig <batcher.config.config.ShuffleTlsConfig>`: the fields are **paths**
+to PEM material your platform already mounts on every worker (a Kubernetes secret volume,
+cert-manager, a cloud private CA). Batcher reads them at worker start and issues no
+certificates itself.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `enabled` | `False` | Turn on TLS for the Flight shuffle. Off means a plaintext shuffle, which is the right default only on a trusted network. |
+| `ca_cert_path` | `""` | The CA a peer's certificate must chain to — the trust root in both directions, since one cluster CA usually signs both server and client certificates. |
+| `server_cert_path` | `""` | This node's server certificate, presented on its Flight port. |
+| `server_key_path` | `""` | The private key for `server_cert_path`. |
+| `client_cert_path` | `""` | This node's client certificate, presented under mTLS when fetching from a peer. Empty means outbound connections are server-auth only. |
+| `client_key_path` | `""` | The private key for `client_cert_path`. Set together with the certificate or not at all. |
+| `require_client_auth` | `False` | mTLS: verify a client certificate on every incoming fetch, so a process that can merely reach the port cannot pull shuffle data. |
+| `server_name` | `"batcher-shuffle"` | The name checked against a peer certificate's SAN. Peers are dialed by address, so the certificate rarely matches the literal host — set this to the name your certificates actually carry. |
+
+A half-configured TLS setup fails at config time, not at the first fetch: enabling TLS
+without `ca_cert_path`, without the server certificate/key pair, or with only one half of
+the client pair raises `ConfigError`. Each field also has a
+`BATCHER_DISTRIBUTED_TLS_<FIELD>` env override, which is how a deployment injects paths
+without shipping a config file.
+
+```python
+# docs: skip
+from batcher import Config, set_config
+from batcher.config import DistributedConfig, ShuffleTlsConfig
+
+set_config(
+    Config().replace(
+        distributed=DistributedConfig(
+            transport="flight",
+            tls=ShuffleTlsConfig(
+                enabled=True,
+                ca_cert_path="/etc/batcher/ca.pem",
+                server_cert_path="/etc/batcher/server.pem",
+                server_key_path="/etc/batcher/server.key",
+                client_cert_path="/etc/batcher/client.pem",
+                client_key_path="/etc/batcher/client.key",
+                require_client_auth=True,
+            ),
+        )
+    )
+)
+```
+
+Pair it with `shuffle_token` above: TLS proves *who* the peer is, the token proves it is
+allowed to fetch this partition.
+
+## observability
+
+What the engine tells you about what it did: the `batcher.*` logger hierarchy and the
+structured per-query event log (one JSON document per query — the plan, the Kyber and
+Carbonite decisions, and the measured per-operator profile).
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `log_level` | `"WARNING"` | Threshold for the `batcher.*` loggers and the Rust data plane's tracing bridge: `CRITICAL`/`ERROR`/`WARNING`/`INFO`/`DEBUG`. `INFO` is where the governance decisions and adaptive re-optimizations show up. |
+| `console` | `True` | Emit records to stderr. `False` for a file-only setup. |
+| `log_file` | `None` | Path to a rotating log file, or `None` for no file handler. |
+| `log_file_max_bytes` | `10000000` (10 MB) | Bytes per log file before it rotates. |
+| `log_file_backups` | `3` | How many rotated files to keep. |
+| `log_format` | `"human"` | `"human"` is a readable one-line layout; `"json"` writes one JSON object per record, for a log shipper. |
+| `event_log` | `True` | Write the structured per-query event log (the Spark event-log analog). |
+| `otel_traces` | `False` | Emit an OpenTelemetry span per query, with a child span per operator, into the tracer your app already configured. Needs `opentelemetry` installed and a provider — Batcher owns no exporter. It reuses the profile the event log already measures, so turning it on adds the emit, not the measurement. |
+| `event_log_dir` | `""` | Directory for event-log documents. Empty resolves to `$BATCHER_HOME/logs` (or `~/.batcher/logs`) at write time. |
+| `event_log_max_files` | `200` | Keep at most this many event-log files; the oldest are pruned on write. `0` is unbounded. |
+
+These fields are the
+{py:class}`ObservabilityConfig <batcher.config.config.ObservabilityConfig>` dataclass. Construct
+one and swap it onto `Config` — e.g. to ship JSON logs and see every decision the engine
+makes:
+
+```python
+from batcher import Config
+from batcher.config import ObservabilityConfig
+
+cfg = Config().replace(
+    observability=ObservabilityConfig(log_level="INFO", log_format="json")
+)
+print((cfg.observability.log_level, cfg.observability.event_log))
+# ('INFO', True)
+```
+
+Every field takes a `BATCHER_OBSERVABILITY_*` env override, so a deployment can raise the
+log level or turn the event log off (`BATCHER_OBSERVABILITY_EVENT_LOG=0`) without touching
+code.
+
 Invalid values (a negative retry count, `soft_limit` above `hard_limit`, a
 non-positive timeout) raise `ConfigError` at the config entry point
 (`set_config`, `config_context`, `from_env`, `from_file`) rather than failing
 confusingly at runtime.
 
 ## Inspecting and editing
+
+`Config()` is the defaults. To read the config a query would actually run under — after
+the config file, the `BATCHER_*` env vars, `set_config`, and any enclosing
+`config_context` block have all been layered — call `active_config()`. It resolves to the
+innermost of those, so it is what you check when a tunable does not seem to be taking
+effect.
+
+```python
+from batcher.config import Config, ExecutionConfig, active_config, config_context
+
+print(active_config().execution.morsel_rows)
+# 16384
+
+with config_context(Config().replace(execution=ExecutionConfig(morsel_rows=4096))):
+    print(active_config().execution.morsel_rows)
+    # 4096
+
+print(active_config().execution.morsel_rows)
+# 16384
+```
+
+The returned `Config` is frozen, like every section: derive a new one rather than trying
+to mutate it.
 
 Read any field through its section, and derive a new config to change one.
 

@@ -169,6 +169,7 @@ class FlightShuffleServer:
         credits: int | None = None,
         token: str | None = None,
         shm: bool = False,
+        replicas: list[list[str]] | None = None,
     ) -> tuple[pa.RecordBatch | None, list[int]]:
         """Concurrently fetch + `combine` the aggregate partials from every source.
 
@@ -182,6 +183,10 @@ class FlightShuffleServer:
         a serial one. When `shm` is set, same-node sources are read zero-copy from shared
         memory (with a Flight fallback) *inside* the concurrent set, so cross-node fetches
         still fan out.
+
+        `replicas[i]` are the fallback addresses holding a copy of source `i`'s bucket:
+        a retryable fault against one address falls over to the next, so a lost mapper is
+        served from a survivor instead of recomputed. `None` ⇒ no replicas.
         """
         src = [(addr, str(ticket)) for addr, ticket in sources]
         if credits is None:
@@ -194,6 +199,7 @@ class FlightShuffleServer:
                 fan_in,
                 finalize,
                 shm=shm,
+                replicas=replicas or [],
             )
         return _gather_combine(
             self._srv,
@@ -206,6 +212,7 @@ class FlightShuffleServer:
             credits,
             token,
             shm,
+            replicas or [],
         )
 
     def gather_concat(
@@ -216,6 +223,7 @@ class FlightShuffleServer:
         credits: int | None = None,
         token: str | None = None,
         shm: bool = False,
+        replicas: list[list[str]] | None = None,
     ) -> tuple[list[pa.RecordBatch], list[int]]:
         """Concurrently fetch every source's raw batches into one list (window/sort/join).
 
@@ -224,11 +232,18 @@ class FlightShuffleServer:
         `unreachable` leaves the batches partial (the driver recomputes and retries). When
         `shm` is set, same-node sources are read zero-copy from shared memory (Flight
         fallback) within the concurrent set.
+
+        `replicas[i]` are the fallback addresses holding a copy of source `i`'s bucket, so
+        a lost mapper is served from a survivor instead of recomputed. `None` ⇒ no replicas.
         """
         src = [(addr, str(ticket)) for addr, ticket in sources]
         if credits is None:
-            return _gather_concat(self._srv, client._client, src, fan_in, shm=shm)
-        return _gather_concat(self._srv, client._client, src, fan_in, credits, token, shm)
+            return _gather_concat(
+                self._srv, client._client, src, fan_in, shm=shm, replicas=replicas or []
+            )
+        return _gather_concat(
+            self._srv, client._client, src, fan_in, credits, token, shm, replicas or []
+        )
 
 
 class ShuffleClient:

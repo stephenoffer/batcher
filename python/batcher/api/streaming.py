@@ -31,7 +31,16 @@ if TYPE_CHECKING:
     from batcher.io.source import Source
     from batcher.plan.logical import LogicalPlan
 
-__all__ = ["StreamingQuery", "active_streams", "start_streaming_query"]
+__all__ = [
+    "StreamingQuery",
+    "active_streams",
+    "start_distributed_stream_drain",
+    "start_streaming_query",
+]
+
+# Triggers that drain the currently-available data and stop (Spark `AvailableNow` /
+# `Once`). These are the shapes the distributed backfill path supports today.
+_DRAIN_TRIGGER_KINDS = ("available_now", "once")
 
 
 # Process-wide registry of running queries, surfaced as `bt.streams`.
@@ -311,3 +320,112 @@ def _is_stateless(plan: LogicalPlan) -> bool:
     from batcher.plan.logical import Aggregate, Distinct, is_streamable
 
     return is_streamable(plan) and not isinstance(plan, (Aggregate, Distinct))
+
+
+class _DrainEngine:
+    """A completed distributed-drain query — a `StreamingQuery`-compatible handle.
+
+    A distributed `available_now`/`once` write runs the whole backfill to completion
+    (every worker drains its source partition in parallel) before the handle returns,
+    so the query is already stopped. This exposes the same read surface the micro-batch
+    `StreamingQueryEngine` does (`is_active`, `status`, `recent_progress`, …) reporting
+    that terminal state, so `ds.write(..., distributed=True)` returns one uniform
+    `StreamingQuery` regardless of whether it ran on one node or many.
+    """
+
+    __slots__ = ("_progress",)
+
+    is_active = False
+    exception = None
+
+    def __init__(self, progress: StreamingQueryProgress) -> None:
+        self._progress = [progress]
+
+    def stop(self) -> None:
+        """No-op — the drain already ran to completion before the handle was returned."""
+
+    def await_termination(self, timeout: float | None = None) -> bool:  # noqa: ARG002
+        """Already terminated; always returns ``True``."""
+        return True
+
+    def status(self) -> StreamingQueryStatus:
+        return StreamingQueryStatus(
+            is_active=False,
+            is_data_available=False,
+            is_trigger_active=False,
+            message="Stopped",
+            batches_processed=len(self._progress),
+        )
+
+    def recent_progress(self) -> list[StreamingQueryProgress]:
+        return list(self._progress)
+
+
+def start_distributed_stream_drain(
+    plan: LogicalPlan,
+    sources: list[Source],
+    path: str,
+    fmt: str,
+    sink_kwargs: dict,
+    columns: list[str],
+    *,
+    num_workers: int | None = None,
+    name: str | None = None,
+) -> StreamingQuery:
+    """Backfill a stream across the cluster: each worker drains one source partition.
+
+    The distributed image of an `available_now`/`once` streaming write. Rather than the
+    driver pulling the whole stream through one thread, the splittable source is
+    partitioned and each worker reads its partition, runs the (stateless) pipeline, and
+    writes its own shard files — only manifests return to the driver. The mergeable/
+    shared-nothing write means the output is identical to the single-node drain; this
+    just fans the read+transform+write across nodes. Returns a completed `StreamingQuery`.
+
+    The caller (`io_namespace.writer`) guarantees eligibility (stateless plan, splittable
+    single source, drain trigger, no checkpoint, file/lakehouse sink).
+    """
+    from time import perf_counter, time
+
+    from batcher.api.terminal import _write
+
+    t0 = perf_counter()
+    manifest = _write(
+        plan,
+        sources,
+        columns,
+        path,
+        fmt,
+        distributed=True,
+        num_workers=num_workers if num_workers is not None else _drain_workers(sources[0]),
+        sink_kwargs=sink_kwargs,
+    )
+    rows = manifest.total_rows
+    progress = StreamingQueryProgress(
+        batch_id=0,
+        num_input_rows=rows,
+        num_output_rows=rows,
+        duration_ms=(perf_counter() - t0) * 1000.0,
+        timestamp=time(),
+    )
+    query_name = name or _next_name()
+    query = StreamingQuery(query_name, _DrainEngine(progress))  # type: ignore[arg-type]
+    with _LOCK:
+        _ACTIVE[query_name] = query
+    return query
+
+
+def _drain_workers(source) -> int:
+    """A data-aware default worker count for a distributed drain (unset ``num_workers``).
+
+    Fan out to one worker per source partition, capped at the driver's CPU count — so the
+    drain scales with the backlog's real parallelism instead of a fixed handful. On a Ray
+    cluster the resulting task demand is what the autoscaler reacts to; the per-task
+    placement then clamps this to the live cluster (`dist.executors...clamp_workers`).
+    """
+    from batcher._internal.hardware import available_cpu_count
+
+    try:
+        n_splits = len(source.splits())
+    except Exception:
+        n_splits = 1
+    return max(1, min(n_splits, available_cpu_count()))

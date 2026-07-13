@@ -209,18 +209,33 @@ class StaticCreditFlowControl:
 # round, which would serialize the shuffle.
 _MIN_AIMD_BETA = 0.1
 _MAX_AIMD_BETA = 0.95
+# Slow-start multiplier: while a channel has never hit congestion, the window *doubles*
+# each headroom-to-spare round (TCP slow-start) instead of crawling up `+alpha`/RTT. A
+# cross-node shuffle's throughput ceiling is `window x batch / RTT`, so on a high-RTT link
+# a window that starts at `default_credits` (4) and grows `+1`/RTT reaches a BDP-filling
+# ~64 credits only after ~60 round trips — long after a short shuffle has finished, so it
+# runs the whole transfer memory-safe but bandwidth-starved. Doubling reaches the same
+# ceiling in ~log2 rounds (4->8->16->32->64 = 4 RTTs), then the first congestion switches
+# to additive-increase / multiplicative-decrease (congestion avoidance). Purely the
+# window's *ramp*: same ceiling, same backoff, so the memory bound and results are
+# unchanged.
+_SLOW_START_FACTOR = 2
 
 
 class AIMDFlowControl:
-    """Adaptive credit window via AIMD (additive-increase / multiplicative-decrease).
+    """Adaptive credit window via AIMD with TCP-style slow-start.
 
     The static policy fixes the window; this one *adapts* it from observed
     backpressure, the TCP-style control law the architecture specifies. It starts at
     the config default window and, per round, `observe`s whether the channel was
-    congested: a congested round cuts the window by `aimd_beta` (relieve memory
-    pressure fast), an uncongested round grows it by `aimd_alpha` (pipeline deeper
-    while memory is plentiful). The window is always clamped to the same memory-safe
-    band `[1, default_credits x credit_ceiling_factor]` the static policy uses.
+    congested. While it has never congested it is in **slow-start** — a headroom round
+    *doubles* the window (`_SLOW_START_FACTOR`) so it fills the bandwidth-delay product
+    in ~log2 rounds rather than crawling up `+alpha`/RTT. The first congestion exits
+    slow-start into classic AIMD: a congested round cuts by `aimd_beta` (relieve memory
+    pressure fast), a headroom round grows by `aimd_alpha` (pipeline deeper while memory
+    is plentiful). The window is always clamped to the same memory-safe band
+    `[1, default_credits x credit_ceiling_factor]` the static policy uses, so slow-start
+    can never exceed the byte-bounded ceiling.
 
     Stateful — hold one per adaptive channel. `grant` ignores its `requested`
     argument because the controller, not the caller, owns the evolving window.
@@ -240,9 +255,12 @@ class AIMDFlowControl:
         # A recurring shuffle warm-starts at the window its past runs converged to
         # (`initial_window`, learned per shuffle signature) instead of re-climbing from
         # `default_credits` every time — the AIMD control law still governs from there,
-        # so the window a channel actually uses is unchanged, only its starting point.
+        # so the window a channel actually uses is unchanged, only its starting point. A
+        # warm-started channel skips slow-start: its window already reflects a prior run's
+        # congestion, so exponential ramp from there would overshoot the learned value.
         start = fc.default_credits if initial_window is None else initial_window
         self._window: float = float(min(max(start, self._floor), self._ceiling))
+        self._slow_start = initial_window is None
 
     @property
     def window(self) -> int:
@@ -256,11 +274,15 @@ class AIMDFlowControl:
         """Update the window from one round's congestion signal; return the new window.
 
         `congested` is true when the round hit backpressure (e.g. the producer ran
-        the window full, or memory pressure was high): cut multiplicatively. Else the
-        consumer kept up with headroom to spare: grow additively.
+        the window full, or memory pressure was high): cut multiplicatively and leave
+        slow-start. Else the consumer kept up with headroom to spare: double the window
+        in slow-start, otherwise grow additively.
         """
         if congested:
             self._window = max(self._floor, self._window * self._beta)
+            self._slow_start = False
+        elif self._slow_start:
+            self._window = min(self._ceiling, self._window * _SLOW_START_FACTOR)
         else:
             self._window = min(self._ceiling, self._window + self._alpha)
         return self.window

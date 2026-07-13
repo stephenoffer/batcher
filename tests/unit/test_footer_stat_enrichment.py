@@ -24,7 +24,7 @@ from batcher.io.stats.columnar_footer import (
     orc_statistics,
     parquet_statistics,
 )
-from batcher.io.stats.lakehouse_manifest import delta_statistics
+from batcher.io.stats.lakehouse_manifest import manifest_statistics
 from batcher.io.stats.pruning import parquet_row_group_bounds, surviving_rows_for_range
 from batcher.plan.stats import Provenance
 
@@ -140,7 +140,7 @@ def test_delta_partition_column_is_exact():
         num_records=pa.array([10, 20], type=pa.int64()),
         **{"partition.region": pa.array(["us", "eu"])},
     )
-    stats = delta_statistics(add)
+    stats = manifest_statistics(add)
     assert stats.row_count == 30
     region = stats.columns["region"]
     assert region.provenance is Provenance.EXACT  # literal partition value, untruncated
@@ -152,7 +152,7 @@ def test_delta_single_partition_value_min_equals_max():
         num_records=pa.array([5, 5], type=pa.int64()),
         **{"partition.day": pa.array(["2020-01-01", "2020-01-01"])},
     )
-    day = delta_statistics(add).columns["day"]
+    day = manifest_statistics(add).columns["day"]
     assert day.min == day.max == "2020-01-01"
     assert day.provenance is Provenance.EXACT
 
@@ -166,7 +166,7 @@ def test_delta_numeric_column_exact_when_all_files_recorded():
             "null_count.x": pa.array([0, 1], type=pa.int64()),
         },
     )
-    x = delta_statistics(add).columns["x"]
+    x = manifest_statistics(add).columns["x"]
     assert x.min == 1 and x.max == 40
     assert x.null_count == 1.0
     assert x.provenance is Provenance.EXACT
@@ -180,7 +180,7 @@ def test_delta_numeric_column_downgraded_when_a_file_lacks_stats():
             "max.x": pa.array([9, 40], type=pa.int64()),
         },
     )
-    x = delta_statistics(add).columns["x"]
+    x = manifest_statistics(add).columns["x"]
     assert x.provenance is Provenance.DEFAULT  # aggregate min may be wrong → bound only
 
 
@@ -189,7 +189,7 @@ def test_delta_string_column_is_bound_only():
         num_records=pa.array([2], type=pa.int64()),
         **{"min.name": pa.array(["aaa"]), "max.name": pa.array(["zzz"])},
     )
-    name = delta_statistics(add).columns["name"]
+    name = manifest_statistics(add).columns["name"]
     assert name.provenance is Provenance.DEFAULT  # writer-truncated → never exact
 
 

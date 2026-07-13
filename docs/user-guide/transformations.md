@@ -1,9 +1,9 @@
 # Transformations
 
-Transformations reshape the columns of a dataset: choosing which columns survive,
-deriving new ones, and renaming or dropping them. Each returns a new `Dataset` and
-runs nothing until a terminal operation. Column work is expressed with `Expr`
-values and evaluated in the Rust data plane.
+Transformations reshape the columns of a dataset. You choose which columns survive,
+derive new ones, rename or drop what is left. Each call returns a new `Dataset` and
+runs nothing until a terminal operation. Column work is expressed with `Expr` values
+and evaluated in the Rust data plane.
 
 ## Setup
 
@@ -97,12 +97,12 @@ print(ds.rename({"qty": "quantity"}).to_pydict())
 ## Column selectors
 
 The transforms above name columns one at a time. A **selector** stands for *every*
-column that matches a rule — by name, by name pattern, or by Arrow dtype — so one
-written expression becomes as many computed columns as match. A selector is an
-`Expr` leaf (`Selector`), so the whole scalar algebra composes onto it and it works
-anywhere a projection is built: `select`, `with_columns`, and `drop`.
+column matching a rule: a name, a name pattern, an Arrow dtype. One written
+expression then becomes as many computed columns as match. Because a selector is an
+`Expr` leaf (`Selector`), the whole scalar algebra composes onto it, and it works
+anywhere a projection is built (`select`, `with_columns`, `drop`).
 
-`bt.exclude(...)` selects every column except the named ones — the mirror image of
+`bt.exclude(...)` selects every column except the named ones, the mirror image of
 listing the ones you want to keep:
 
 ```python
@@ -156,9 +156,9 @@ print(messy.select(bt.all().name.to_uppercase()).columns)
 # ['USER ID', 'SIGNUP DATE']
 ```
 
-Put `.name` *before* the scalar work — it is an accessor on the selector, not on
-the computed expression — so read `bt.numeric().name.prefix("n_").round(2)` as
-"the numeric columns, prefixed, rounded".
+Put `.name` *before* the scalar work. It is an accessor on the selector, not on the
+computed expression, so read `bt.numeric().name.prefix("n_").round(2)` as "the
+numeric columns, prefixed, rounded".
 
 Because renaming happens per matched column, `with_columns` replaces a column in
 place when the output name is unchanged, and adds a new one when it changes:
@@ -171,8 +171,8 @@ print(ds.with_columns(bt.floating().name.suffix("_x2") * 2).columns)
 # ['name', 'price', 'qty', 'price_x2'] — price kept, a new column added
 ```
 
-Selectors compose with set algebra — `|` (union), `&` (intersection), `-`
-(difference), and `~` (complement) — so you can name a group by describing it:
+Selectors compose with set algebra: `|` (union), `&` (intersection), `-`
+(difference), `~` (complement). Name a group by describing it.
 
 ```python
 print(ds.select(bt.numeric() - bt.floating()).columns)
@@ -181,10 +181,10 @@ print(ds.select(bt.numeric() - bt.floating()).columns)
 
 ## Choosing between select and with_columns
 
-There is one obvious tool for each intent. Use `select` when you want to define
-the complete set of output columns, and `with_columns` (or `with_column`) when you
-want to add to or replace columns in the existing set. Casting is an expression
-method that takes an Arrow type name, applied inside either one:
+One obvious tool per intent. `select` defines the complete set of output columns;
+`with_columns` (or `with_column`) adds to or replaces columns in the set you already
+have. Casting is an expression method taking an Arrow type name, and works inside
+either one:
 
 ```python
 print(ds.with_columns(qty=bt.col("qty").cast("float64")).to_pydict())
@@ -206,9 +206,9 @@ print(ds.pipe(with_total, tax=0.5).filter(bt.col("total") > 20).to_pydict()["tot
 # [60.0, 135.0]
 ```
 
-Without `pipe` the same pipeline reads backwards — `with_total(ds).filter(...)`
-puts the first step in the middle. Reach for it whenever a chain grows a step that
-does not have a built-in method.
+Without `pipe` the same pipeline reads backwards; `with_total(ds).filter(...)` puts
+the first step in the middle. Reach for it whenever a chain grows a step that has no
+built-in method.
 
 ## Flattening nested data
 
@@ -246,6 +246,6 @@ flat table.
 
 ## Next steps
 
-- [Filtering](filtering.md): row selection, deduplication, and limits.
+- [Filtering](filtering.md): row selection, deduplication, limits.
 - [Aggregations](aggregations.md): grouped and global summaries.
 - [Dataset API](../api/dataset.md): the full method reference for every transformation.

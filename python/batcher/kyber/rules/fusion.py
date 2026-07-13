@@ -36,7 +36,6 @@ from batcher.plan.logical import (
     Limit,
     LogicalPlan,
     Project,
-    Sample,
     Scan,
     Sort,
     Union,
@@ -276,11 +275,20 @@ def _push_to_producer(
 ) -> LogicalPlan | None:
     """Relocate ``cast(col(col_name), dtype)`` into the node that produces `col_name`.
 
-    Walks down through operators that do not read `col_name` (Filter/Sort/Limit/
-    Sample) to the producing `Project`, folding the cast into its defining expression
-    when that genuinely narrows the column. Returns the rewritten subtree, or None if
-    the column is read on the way down, the producer isn't a plain projection, or the
-    cast would not narrow.
+    Walks down through operators that do not read `col_name` (Filter/Sort/Limit) to the
+    producing `Project`, folding the cast into its defining expression when that genuinely
+    narrows the column. Returns the rewritten subtree, or None if the column is read on the
+    way down, the producer isn't a plain projection, or the cast would not narrow.
+
+    "Does not read `col_name`" is the whole soundness condition, and it is subtler than
+    "has no expression mentioning the column". A `Sample` names no column anywhere in the
+    plan, yet a *fraction* sample decides each row's fate from a hash of that row's
+    **encoded values** — so narrowing `v` from int64 to int32 underneath it changes the
+    bytes that are hashed, and therefore changes *which rows are sampled*. Measured: the
+    same query returned 99 rows with this rule and 95 without it. A `Sample` is a value
+    reader that happens to read every column implicitly, so it is not transparent and is
+    refused below. `Limit` is genuinely transparent: it takes a positional prefix, and a
+    cast reorders nothing.
     """
     if isinstance(node, Project):
         for i, item in enumerate(node.items):
@@ -302,10 +310,13 @@ def _push_to_producer(
     elif isinstance(node, Sort):
         if any(col_name in referenced_columns(k.expr) for k in node.keys):
             return None
-    elif isinstance(node, (Limit, Sample)):
-        pass  # neither reads column values
+    elif isinstance(node, Limit):
+        pass  # a positional prefix; a cast reorders nothing, so this is value-independent
     else:
-        return None  # Join/Aggregate/Union/Distinct/Unnest/… — stop, can't prove safe
+        # Join/Aggregate/Union/Distinct/Unnest/**Sample**/… — stop, can't prove safe.
+        # `Sample` belongs here, not above: it reads every column implicitly (it hashes the
+        # row's encoded values), so changing a column's encoding changes its output rows.
+        return None
 
     pushed = _push_to_producer(node.input, col_name, dtype, try_cast)
     return None if pushed is None else dataclasses.replace(node, input=pushed)

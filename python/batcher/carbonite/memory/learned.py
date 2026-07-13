@@ -28,6 +28,7 @@ from __future__ import annotations
 import weakref
 from collections.abc import Iterable
 from dataclasses import dataclass
+from statistics import median
 
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
@@ -60,13 +61,6 @@ _REFIT_AFTER = 64
 _MODEL_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, tuple, LearnedMemoryModel]] = (
     weakref.WeakKeyDictionary()
 )
-
-
-def _median(xs: list[float]) -> float:
-    s = sorted(xs)
-    n = len(s)
-    mid = n // 2
-    return s[mid] if n % 2 else 0.5 * (s[mid - 1] + s[mid])
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,9 +208,9 @@ def _fit(hub: MetadataHub, cfg: Config) -> LearnedMemoryModel:
                 spill_samples.append(spill / basis)
         canon = _canonical_kind(kind)
         if len(samples) >= min_samples:
-            bpr[canon] = _median(samples)
+            bpr[canon] = median(samples)
         if len(spill_samples) >= min_samples:
-            spr[canon] = _median(spill_samples)
+            spr[canon] = median(spill_samples)
     return LearnedMemoryModel(
         _bytes_per_row=bpr,
         _alpha=opt.learning_smoothing_alpha,

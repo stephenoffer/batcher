@@ -19,7 +19,7 @@ import pytest
 
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.streaming import IncrementalFileSource  # registers all sources
-from batcher.io.formats.streaming.broker import BrokerMessage, broker_schema
+from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource, broker_schema
 from batcher.io.formats.streaming.seen_store import SeenStore
 
 
@@ -160,6 +160,80 @@ def test_broker_make_batch_assembles_fixed_schema():
     assert batch.column("value").to_pylist() == [b"a", b"b"]
     assert batch.column("key").to_pylist() == [b"k", None]
     assert batch.column("offset").to_pylist() == [10, 11]
+
+
+class _BoundedTestBroker(BrokerSource):
+    """A finite, replayable broker for the checkpoint contract — no client needed.
+
+    Emits ``total`` messages (offsets ``0..total-1``) on partition 0 in
+    ``poll_size`` chunks and honors ``_resume_from`` so a ``seek`` resumes strictly
+    after a checkpointed offset. Used to exercise the base offset-tracking machinery
+    that Kafka/Kinesis/… inherit.
+    """
+
+    format_name = "test_broker"
+    __slots__ = ("_cursor", "_started", "_total")
+
+    def __init__(self, topic: str = "t", *, total: int = 20, poll_size: int = 5, **opts):
+        super().__init__(topic, poll_size=poll_size, **opts)
+        self._total = total
+        self._cursor = 0
+        self._started = False
+
+    def _discover_partitions(self):
+        return [0]
+
+    def _poll(self):
+        if not self._started:
+            self._started = True
+            resume = self._resume_from.get(0)
+            self._cursor = 0 if resume is None else int(resume) + 1
+        if self._cursor >= self._total:
+            return None  # bounded: signals end-of-stream
+        end = min(self._cursor + self.poll_size, self._total)
+        msgs = [
+            BrokerMessage(
+                value=str(o).encode(), partition=0, offset=o, timestamp=o, topic=self.topic
+            )
+            for o in range(self._cursor, end)
+        ]
+        self._cursor = end
+        return msgs
+
+
+def test_broker_source_is_checkpointable():
+    from batcher.io.source import is_checkpointable
+
+    assert is_checkpointable(_BoundedTestBroker())
+
+
+def test_broker_tracks_and_snapshots_offsets():
+    broker = _BoundedTestBroker(total=12, poll_size=5)
+    batches = list(broker.iter_batches())
+    # 12 rows in chunks of 5 -> offsets 0..11; the snapshot is the last offset seen.
+    assert sum(b.num_rows for b in batches) == 12
+    assert broker.snapshot_position() == {"offsets": {"0": 11}}
+
+
+def test_broker_seek_resumes_strictly_after_offset():
+    broker = _BoundedTestBroker(total=12, poll_size=5)
+    broker.seek({"offsets": {"0": 6}})  # resume strictly after offset 6
+    offsets = [o for b in broker.iter_batches() for o in b.column("offset").to_pylist()]
+    assert offsets == list(range(7, 12))  # 7..11, none replayed or skipped
+
+
+def test_broker_resume_token_overrides_offset_in_snapshot():
+    # A native resume token (e.g. a Kinesis sequence) is snapshotted in place of the
+    # lossy int64 offset, so a client can seek to the exact position.
+    broker = _BoundedTestBroker()
+    broker._track_positions(
+        [
+            BrokerMessage(
+                value=b"x", partition=0, offset=99, timestamp=0, topic="t", resume_token="seq-abc"
+            )
+        ]
+    )
+    assert broker.snapshot_position() == {"offsets": {"0": "seq-abc"}}
 
 
 def test_broker_split_is_picklable():

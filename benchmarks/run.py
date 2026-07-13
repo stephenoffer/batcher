@@ -52,11 +52,11 @@ def _parse_size(text: str) -> int:
 
 
 # Engine-comparison datasets (run through the correctness-gated compare()).
-BENCHMARKS = ("tpch", "tpcds", "clickbench", "operators", "scan", "images")
+BENCHMARKS = ("tpch", "tpcds", "clickbench", "operators", "json", "scan", "images")
 # What `--benchmark all` sweeps. `scan` and `images` are deliberately excluded: each
 # re-reads its corpus from object storage on every repeat, so a full run is tens of
 # minutes. They are opt-in (`--benchmark scan` / `images`) for the same reason Spark is.
-ALL_DATASETS = ("tpch", "tpcds", "clickbench", "operators")
+ALL_DATASETS = ("tpch", "tpcds", "clickbench", "operators", "json")
 # Standalone benchmarks with their own reporting, dispatched by this single runner.
 AUX = ("distributed", "optimizer", "shuffle")
 

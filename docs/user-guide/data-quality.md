@@ -2,8 +2,8 @@
 
 Data-quality checks live on the `ds.dq` accessor: a chain of expectations over a
 dataset, then a terminal action. A constraint is just a boolean expression that is
-TRUE for a valid row, so checks compose like any other operation and lower to the
-same relational operators — no separate validation engine.
+TRUE for a valid row. Checks therefore compose like any other operation and lower to
+the same relational operators. There is no separate validation engine.
 
 ## Setup
 
@@ -25,7 +25,7 @@ people = bt.from_pydict(
 Constraint methods accumulate on `ds.dq` and return a new accessor, so they chain.
 `not_null` forbids nulls, `in_range` bounds a numeric column, and
 `accepted_values` restricts a column to a fixed set. The value constraints treat a
-NULL as valid so they compose independently — add `not_null` to forbid nulls
+NULL as valid so they compose independently; add `not_null` to forbid nulls
 explicitly. A terminal method then applies the accumulated checks.
 
 ```python
@@ -65,8 +65,8 @@ print(report.ok, report.total_violations)
 
 ## Drop invalid rows
 
-`drop` returns only the rows that satisfy every constraint — the cleansing path
-when bad rows should simply be removed.
+`drop` returns only the rows that satisfy every constraint. It is the cleansing
+path, for when bad rows should simply go away.
 
 ```python
 clean = people.dq.in_range("age", 0, 120).not_null("email").drop()
@@ -114,7 +114,7 @@ print(ok.dq.in_range("age", 0, 120).fail().to_pydict())
 
 `unique` requires a key (or key combination) to occur at most once; the report
 counts the duplicated keys. `foreign_key` returns the orphan rows whose key has no
-match in a reference dataset — an empty result means every key resolves.
+match in a reference dataset, so an empty result means every key resolves.
 
 ```python
 dupes = bt.from_pydict({"id": [1, 1, 2, 3, 3]})
@@ -132,7 +132,7 @@ print(orphans.to_pydict())
 
 `distinct` removes duplicate rows. With no argument it deduplicates over all
 columns; with a `subset` it keeps one row per key combination. Pass
-`keep="first"`/`"last"` with `order_by` to pick which row survives — the standard
+`keep="first"`/`"last"` with `order_by` to pick which row survives. That is the
 "latest record per key" pattern.
 
 ```python
@@ -151,10 +151,10 @@ print(latest.sort("user").to_pydict())
 ## Evolving schemas
 
 When a directory of files was written over time, later files may add columns or
-widen a type. Pass `schema_mode="union"` to a read so the files reconcile into one
-schema — the union of columns, each promoted to a common type, with missing columns
-filled as null. Use `"latest"` to let the newest file's schema win, or `"strict"`
-(the default) to require every file to match.
+widen a type. Pass `schema_mode="union"` to a read and the files reconcile into one
+schema: the union of columns, each promoted to a common type, missing columns filled
+as null. Use `"latest"` to let the newest file's schema win. `"strict"`, the default,
+requires every file to match.
 
 ```python
 import os
@@ -176,7 +176,8 @@ print(evolved.to_pydict())
 
 ## Next steps
 
-- [Reading data](reading-data.md): ingest files and reconcile evolving schemas.
-- [Transformations](transformations.md): cleanse and reshape the validated data.
-- [Aggregations](aggregations.md): summarize the validated data.
+- [Reading data](reading-data.md): ingest files, and reconcile the schemas that
+  drifted between them.
+- [Transformations](transformations.md): cleanse and reshape what survived the checks.
+- [Aggregations](aggregations.md): summarize it.
 - [Dataset API](../api/dataset.md): the full reference for `ds.dq` and `distinct`.

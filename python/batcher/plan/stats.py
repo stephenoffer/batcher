@@ -98,13 +98,31 @@ class ColumnStat:
     # the bloom" still proves absence in any subset — independent of `provenance`
     # (the bloom is consulted only to prove *absence*, never to answer a value).
     bloom: bytes | None = None
+    # The three *measured* distributional statistics, carried here rather than in a
+    # side map keyed by bare column name. That distinction is the whole point: a
+    # relation's statistics must travel **with the relation**, because a column name
+    # alone does not identify a column — two tables both have an `id`, and a global
+    # `{name: stat}` map silently lets one table's measurement answer for the other's.
+    #
+    #   `quantiles`  — an ascending quantile grid `{"probs": [...], "values": [...]}`
+    #                  (a KLL sketch), for interpolating range selectivity.
+    #   `mcv`        — most-common-values `{str(value): frequency}` (Misra-Gries), which
+    #                  sharpens equality selectivity on a skewed column far past `1/ndv`.
+    #   `avg_bytes`  — measured average width, which makes memory/broadcast sizing
+    #                  byte-true for wide columns (strings, embeddings, blobs).
+    quantiles: Mapping[str, list[float]] | None = None
+    mcv: Mapping[str, float] | None = None
+    avg_bytes: float | None = None
 
     def downgrade(self, floor: Provenance) -> ColumnStat:
         """Return a copy whose provenance is weakened to at least `floor`.
 
         Used by row-shrinking operators (filter, limit, join) that preserve the
         *values* as bounds but can no longer vouch for them as exact extremes. The
-        bloom is preserved — it stays a sound absence proof over any subset.
+        bloom is preserved — it stays a sound absence proof over any subset. So are
+        the measured distributional stats: dropping rows can only *shrink* a column's
+        support, so its quantile grid and top values remain the best description of it
+        we have — and they are only ever read to *estimate*, never to answer.
         """
         return ColumnStat(
             min=self.min,
@@ -112,8 +130,12 @@ class ColumnStat:
             null_count=self.null_count,
             ndv=self.ndv,
             total_sum=self.total_sum,
+            mean=self.mean,
             provenance=weakest(self.provenance, floor),
             bloom=self.bloom,
+            quantiles=self.quantiles,
+            mcv=self.mcv,
+            avg_bytes=self.avg_bytes,
         )
 
 

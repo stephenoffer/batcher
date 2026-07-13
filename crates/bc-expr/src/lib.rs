@@ -21,6 +21,7 @@ use arrow::array::{
 };
 use serde::Deserialize;
 
+mod analyze;
 mod error;
 pub use error::ExprError;
 
@@ -126,10 +127,13 @@ pub enum Expr {
 
     /// An audio decode op over a binary (audio-bytes) sub-expression. Library-backed
     /// (symphonia), so the JIT falls back to this interpreter path (like `Image`).
+    /// `rate` is the target sample rate for `AudioFunc::Resample` (ignored otherwise).
     Audio {
         #[serde(rename = "fn")]
         func: AudioFunc,
         input: Box<Expr>,
+        #[serde(default)]
+        rate: Option<i64>,
     },
 
     /// A video decode op over a binary (video-bytes) sub-expression. Backed by the
@@ -402,12 +406,15 @@ pub enum ListSetOp {
 }
 
 /// Audio-decode operations for the `.audio` namespace. `Decode` reads each clip's
-/// metadata into a struct; `ToWaveform` decodes to a mono `List<Float32>` signal.
+/// metadata into a struct; `ToWaveform` decodes to a mono `List<Float32>` signal;
+/// `Resample` decodes then band-limited-resamples that signal to the `rate` on the
+/// [`Expr::Audio`] node (the target sample rate), also a mono `List<Float32>`.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioFunc {
     Decode,
     ToWaveform,
+    Resample,
 }
 
 /// Video-decode operations for the `.video` namespace. `Decode` reads each clip's

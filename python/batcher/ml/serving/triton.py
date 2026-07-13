@@ -32,14 +32,30 @@ def triton_client(
 ) -> type:
     """A `map_batches` class UDF running each batch through a Triton model.
 
+    Needs ``tritonclient`` (``pip install 'batcher-engine[triton]'``).
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml import triton_client  # doctest: +SKIP
+            >>> udf = triton_client(  # doctest: +SKIP
+            ...     "localhost:8000",
+            ...     "resnet50",
+            ...     input_columns=["input__0"],
+            ...     output_columns=["output__0"],
+            ... )
+            >>> ds.ml.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
+
     Args:
         url: the Triton endpoint (``host:8000`` for http, ``host:8001`` for grpc).
         model: the Triton model name.
-        input_columns / output_columns: the model's input/output tensor names.
+        input_columns: the model's input tensor names (the batch columns sent).
+        output_columns: the model's output tensor names (appended to each batch).
         protocol: ``"http"`` or ``"grpc"``.
         model_version: optional model version (default: server-chosen).
 
-    Needs ``tritonclient`` (``pip install 'batcher-engine[triton]'``).
+    Returns:
+        A class for ``ds.ml.map_batches(...)`` — the client connects once per worker.
     """
     if protocol not in ("http", "grpc"):
         raise BackendError(f"triton protocol must be 'http' or 'grpc', got {protocol!r}")

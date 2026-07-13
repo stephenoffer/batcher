@@ -12,7 +12,7 @@ import re
 
 import pyarrow as pa
 
-from .base import Engine, SqlRunner
+from .base import Engine, Rename, SqlRunner
 
 # Polars' SQL parser accepts the combined ANSI interval literal ``INTERVAL '90 days'``
 # but rejects the equally-standard split form ``INTERVAL '90' DAY`` the TPC-H text
@@ -59,12 +59,16 @@ class PolarsEngine(Engine):
             ctx.register(name, pl.from_arrow(tbl))
         return lambda query: ctx.execute(_polars_sql_dialect(query)).to_arrow()
 
-    def sql_runner_scan(self, uris: dict[str, str]) -> SqlRunner:
+    def sql_runner_scan(self, uris: dict[str, str], rename: Rename | None = None) -> SqlRunner:
         import polars as pl
 
         ctx = pl.SQLContext(eager=True)
         for name, uri in uris.items():
-            ctx.register(name, pl.scan_parquet(uri))
+            scan = pl.scan_parquet(uri)
+            cols = (rename or {}).get(name)
+            if cols:
+                scan = scan.rename(cols)
+            ctx.register(name, scan)
         return lambda query: ctx.execute(_polars_sql_dialect(query)).to_arrow()
 
     def scan_sql_runner(self, glob: str) -> SqlRunner:

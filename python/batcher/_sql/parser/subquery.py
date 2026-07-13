@@ -92,8 +92,10 @@ def _apply_in_subquery(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     # A plain column, or a row value `(a, b, …)` — a multi-column IN → multi-key semi-join.
     if _is_plain_column(target):
         left_keys = [target.name]
-    elif isinstance(target, exp.Tuple) and target.expressions and all(
-        _is_plain_column(e) for e in target.expressions
+    elif (
+        isinstance(target, exp.Tuple)
+        and target.expressions
+        and all(_is_plain_column(e) for e in target.expressions)
     ):
         left_keys = [e.name for e in target.expressions]
     else:

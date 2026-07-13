@@ -132,7 +132,7 @@ cfg = base.replace(
     flow_control=dataclasses.replace(
         base.flow_control,
         default_credits=4,        # in-flight batch slots per channel
-        credit_ceiling_factor=16, # max window = default_credits x this
+        credit_ceiling_factor=4, # max window = default_credits x this
     )
 )
 ```

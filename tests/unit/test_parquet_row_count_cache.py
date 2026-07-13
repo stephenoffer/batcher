@@ -13,7 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from batcher.io.formats.structured import parquet as pqmod
+from batcher.io.formats.structured.parquet import source as pqmod
 
 pytestmark = pytest.mark.unit
 

@@ -18,6 +18,7 @@ import json
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import _apply_above, _partition_source, merge_boundaries
 from batcher.dist.executors.plan_analysis import _relabel_single_source
 from batcher.dist.executors.ray_runtime import (
@@ -146,7 +147,7 @@ def _distributed_sort(
 
 
 def _sample_task(map_ir, key_name, probs, part_path, engine_config):
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.executors.partition_io import read_partition
 
     rows = nat.execute_plan(map_ir, [read_partition(part_path)], engine_config)

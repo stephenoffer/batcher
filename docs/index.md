@@ -17,9 +17,9 @@
 </div>
 ```
 
-Data work has splintered into a tool per job: one for SQL, another for DataFrames, a
-third for streaming, more for images and models. Each one is another system to run
-and another seam to leak. Batcher collapses that stack into a single engine.
+Data work has splintered into a tool per job. One for SQL, another for DataFrames, a
+third for streaming, more again for images and models. Every one of them is a system to
+run and a seam to leak. Batcher collapses that stack into a single engine.
 
 ![One engine: any source — Parquet, media, Kafka, lakehouse — flows into Batcher and back out to any workload: SQL and ETL, batch inference, embeddings, and training data.](_static/diagrams/hub.png)
 
@@ -42,14 +42,14 @@ hand-off between them is a place for data and effort to leak.
 :::
 
 :::{grid-item-card} {octicon}`gear;1.1em` Tuned by hand
-Batch sizes, partition counts, join order — guess wrong and the job stalls or runs out
-of memory, often only at scale.
+Batch sizes, partition counts, join order. Guess wrong and the job stalls or runs out
+of memory, often only once it's big enough to matter.
 :::
 ::::
 
-Batcher answers all three at once: the same code from a laptop to a cluster, one
-engine across SQL, DataFrames, and ML, and a plan that re-tunes itself as it runs — so
-you build the pipeline once and it keeps working as the data grows.
+Batcher answers all three at once. The same code runs from a laptop to a cluster, one
+engine covers SQL and DataFrames and ML, and the plan re-tunes itself while it runs. You
+build the pipeline once, and it keeps working as the data grows.
 
 ## Any data, any workload
 
@@ -60,8 +60,8 @@ same pipeline can clean it, query it, or feed it to a model.
 :gutter: 3
 
 :::{grid-item-card} {octicon}`table;1.1em` Structured
-Parquet, CSV, JSON, and the lakehouse formats (Delta, Iceberg, Hudi) — filtered,
-joined, and aggregated with SQL or DataFrames.
+Parquet, CSV, JSON, and the lakehouse formats (Delta, Iceberg, Hudi), filtered and
+joined and aggregated with SQL or DataFrames.
 :::
 
 :::{grid-item-card} {octicon}`file;1.1em` Unstructured
@@ -82,9 +82,9 @@ search, and RAG.
 
 ## Write it your way
 
-Express a transformation as a DataFrame, as SQL, or as composable expressions — and
-run it as a batch job or a live stream. Every form builds the same plan and runs on
-the same engine, so you mix them freely.
+Express a transformation as a DataFrame, as SQL, or as composable expressions, then run
+it as a batch job or a live stream. Every form builds the same plan and runs on the same
+engine, so you can mix them freely.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
@@ -136,9 +136,9 @@ counts.write.parquet("out/", trigger=bt.Trigger.processing_time("10s"))
 :::
 ::::
 
-Expressions carry typed accessors for every column kind — `.str`, `.dt`, `.list`,
-`.struct` — so the column language is the same whether you reach for it from a
-DataFrame, from SQL, or in a stream.
+Expressions carry typed accessors for every column kind (`.str`, `.dt`, `.list`,
+`.struct`), so the column language stays the same whether you reach for it from a
+DataFrame, from SQL, or inside a stream.
 
 ## Explore the capabilities
 
@@ -222,14 +222,38 @@ S3, GCS, Azure, and Delta / Iceberg / Hudi.
 :link-type: doc
 Translate the API you already know, side by side.
 :::
+
+:::{grid-item-card} {octicon}`meter;1.1em` Benchmarks
+:link: benchmarks/index
+:link-type: doc
+Correctness-gated numbers across every workload, including where we still lose.
+:::
+
+:::{grid-item-card} {octicon}`book;1.1em` Recipes
+:link: examples/index
+:link-type: doc
+Four cookbooks: data engineering, analytics, ML, and streaming.
+:::
+
+:::{grid-item-card} {octicon}`plug;1.1em` Integrations
+:link: integrations/index
+:link-type: doc
+Kafka, Snowflake, BigQuery, Delta, Iceberg, Ray, PyTorch, and the rest of your stack.
+:::
+
+:::{grid-item-card} {octicon}`telescope;1.1em` Deep dives
+:link: deep-dives/index
+:link-type: doc
+How the engine actually works, one mechanism at a time.
+:::
 ::::
 
 ## It tunes itself
 
-You don't size batches, pick join strategies, or guess partition counts. Batcher
-measures the data as it flows and re-plans the rest of the query on real numbers, so a
-query that starts on a bad estimate corrects itself instead of stalling — the kind of
-mid-flight adaptation a plan-once optimizer can't do. The
+You don't size batches, pick join strategies, or guess partition counts. Batcher measures
+the data as it flows and re-plans the rest of the query on real numbers, so a query that
+starts on a bad estimate corrects itself instead of stalling. A plan-once optimizer cannot
+do that, because by the time it learns it was wrong the query is already over. The
 [architecture guide](architecture/index.md) covers how, if you're curious.
 
 ## How it compares
@@ -268,84 +292,69 @@ it.
 
 ## Benchmarks
 
-Numbers, not adjectives — and every one is **correctness-gated**: the harness runs each query
-on every engine, checks they return the *identical* result (a sorted row multiset within float
-tolerance), and only *then* trusts the timing. A fast wrong answer is a bug, not a win. Setup:
-TPC-H `lineitem` (6M rows at scale 1, 60M at scale 10), read once into Arrow and shared
-byte-identically across engines; a 9-node / 128-CPU cluster; 8×T4 GPUs for the ML runs. Full
-methodology and per-scale tables: [performance guide](user-guide/performance.md).
+Numbers, not adjectives. Every one is **correctness-gated**: the harness runs each query
+on every engine, checks they return the identical result, and only then trusts the timing. A
+fast wrong answer is a bug, not a win. (The gate earns its keep: on TPC-H q6 both Daft and
+Polars compute the wrong revenue, and the harness refuses to time them.)
 
-### Analytical SQL, single-node (vs DuckDB / Polars)
+### AI and multimodal: the widest margin
 
-Each cell is `batcher / fastest-competitor` wall time — **below 1.0 means Batcher is faster**
-(`0.40×` = 2.5× faster). Batcher wins the operator core, and the margin *holds or grows* from
-6M to 60M rows — it scales, it doesn't just start fast:
+Ten GPU workload families on 8×T4, real models, every one at least 2× Ray Data:
 
-| operator | sf1 (6M) | sf10 (60M) |
-|--------------------------------|:-------:|:--------:|
-| group-by sum, one key          | 0.45×   | 0.64×    |
-| group-by, two keys             | 0.53×   | 0.89×    |
-| filter → count                 | 0.32×   | **0.12×** |
-| sort → top-N (`LIMIT`)         | 0.69×   | 0.76×    |
-| window `rank()`                | 0.56×   | **0.40×** |
-| window running `sum()`         | 0.36×   | **0.32×** |
-| window `lag()`                 | 0.54×   | 0.50×    |
+| workload | vs Ray Data |
+|---|---:|
+| text embeddings (MiniLM) | **47×** |
+| audio feature extraction | **12.5×** |
+| LLM batch inference (gpt2) | **11.1×** |
+| image generation (diffusion) | **8.6×** |
+| training ingest (`iter_torch_batches`) | **3.0×** |
+| batch inference (ResNet-50) | **2.05×** |
+| zero-config `map_batches(Model, num_gpus=1)` | Ray Data hard-errors |
 
-At 60M rows `rank() OVER (PARTITION BY …)` is **~2.5× faster than DuckDB** and **~13× faster
-than Polars**. Under a tight memory budget where *both* engines spill to disk, Batcher stays
-alive and competitive — high-cardinality `DISTINCT` even flips to a **1.4× win** out-of-core.
+Image decode → tensor beats **both** competitors: 2.4× Daft and 6.1× Ray Data. Stage-overlapped
+streaming keeps the device fed. The CPU decode of the next morsel runs while the GPU forward of
+the current one is still in flight, which took a two-stage ResNet-50 pipeline from 942 to
+**2,504 img/s** and utilization from ~30% to **81%**.
 
-### Distributed data plane (vs Ray Data)
+### Analytics and I/O
 
-In-process and native, Batcher pays none of Ray Data's per-operation task-scheduling and
-block/pandas-bridge cost (~300–4500 ms fixed, even on the cluster). Same query, same data,
-best-of-N wall time:
+Single node, 16 cores, TPC-H at scale 1. Ratios are `batcher / competitor`, so below 1.0 means
+Batcher is faster:
 
-| operation | batcher | Ray Data | speedup |
-|-----------------------------|--------:|---------:|:-------:|
-| group-by sum | 14 ms | 1,824 ms | **127×** |
-| global sum | 4 ms | 1,804 ms | **440×** |
-| filter → count | 7 ms | 310 ms | **46×** |
-| sort → top-20 (`LIMIT`) | 15 ms | 4,569 ms | **306×** |
+| operator | vs DuckDB | vs Polars |
+|---|---:|---:|
+| filter → count | **0.20×** | **0.07×** |
+| global sum | **0.19×** | **0.27×** |
+| group-by sum | **0.76×** | **0.44×** |
+| sort → top-N | 1.06× | **0.02×** |
+| window `rank()` | 1.66× | **0.22×** |
 
-And on Ray Data's *own* streaming `map_batches` home turf — CPU inference, ETL, file I/O — where
-it should be strongest, Batcher still leads (warm shared process pool, zero-copy shared-memory
-input, GIL-releasing threads for NumPy/torch): `map_batches` transform **2.3×**, row-exploding
-`flat_map` **3.5×**, chained multi-stage map **3.2×**, Parquet read **21×**, `iter_torch_batches`
-training-data ingest **3.0×**.
+Reading data is where the gap to Ray Data is structural rather than incidental: Parquet read →
+sum is **20.8×**, CSV **14.3×**, `count()` roughly **1,400×** (it comes from metadata, not a scan).
 
-### GPU batch inference & ML (8×T4, vs Ray Data)
+### Where Batcher loses
 
-Stage-overlapped streaming keeps the device fed (a CPU decode stage runs while the GPU forward
-of the previous morsel is still in flight), and session-warm pools load the model **once per
-session** instead of once per job:
+On join-heavy TPC-H, DuckDB is still ahead. It wins 16 of 21 comparable queries, a geometric
+mean of **~1.4× in its favor**, and Daft leads on per-batch Python UDFs by ~2×. The cause is understood
+(single-node parallelism reaches ~1.7–3.8× on 16 cores; more CPU work per query) and is a
+runtime-efficiency effort, not a tuning knob. Correctness is not in question: Batcher matches
+DuckDB on all 22 queries.
 
-| GPU workload | batcher | Ray Data | vs Ray |
-|--------------|--------:|---------:|:------:|
-| **LLM batch inference** (gpt2 generate, 2048 prompts) | 814 prompt/s | 73 prompt/s | **11.1×** |
-| batch inference (ResNet-50, iterative) | 2576 img/s @ 78% util | 1257 @ 41% | **2.05×** |
-| batch embeddings (2048-d vectors) | 2502 img/s @ 80% util | 1267 @ 41% | **1.98×** |
-| zero-config `map_batches(Model, num_gpus=1)` | 2451 img/s @ 82% util | *hard-errors* | Ray refuses |
-
-Stage-overlap alone lifted a two-stage decode → ResNet-50 pipeline from **942 → 2504 img/s** and
-GPU utilization from **~30% → 81%** — same result, the device just stops idling through the CPU
-decode. Batcher reaches **≥80% sustained GPU utilization out of the box** and runs the
-zero-`batch_size` call Ray Data rejects outright. On a single maximally-large compute-bound job
-both saturate the same GPUs at the same FLOPs (≈ parity) — the honest ceiling.
+**[Full benchmarks, methodology, and reproduction commands →](benchmarks/index.md)**
 
 ### Why the wins happen
 
-The speedups are structural, not tuning — each traces to a design choice you can read in the
-[architecture guide](architecture/index.md):
+None of this is tuning. Each speedup traces to a design choice you can read about in the
+[architecture guide](architecture/index.md).
 
-- **In-process, native, over Arrow.** No task-scheduler or object-store hop per operation, so the
-  fixed cost that dominates Ray Data's small/medium queries (50–450×) simply isn't paid.
-- **Composite-key hashing + specialized kernels.** Two-key aggregation and `DISTINCT` hash their
-  composite keys directly instead of through a row encoder, so the win *grows* with row count.
-- **Warm model pools + stage-overlapped streaming.** GPU inference loads the model once per
-  session and overlaps CPU prep with the GPU forward — the 2–11× on real batch-inference shapes.
-- **Adaptive re-optimization.** Plans re-tune on measured cardinalities mid-query, so a bad
-  estimate corrects itself instead of stalling or OOMing — the thing a plan-once engine can't do.
+Batcher runs in-process and native over Arrow, with no task-scheduler or object-store hop
+per operation, so the fixed cost that dominates Ray Data's small and medium queries is
+never paid at all. That alone is most of the 50–450×.
+
+On the AI side, GPU inference loads a model once per session and overlaps CPU prep with the
+GPU forward pass, which is where the 2–47× comes from. And plans re-tune on measured
+cardinalities mid-query, so a bad estimate corrects itself rather than stalling or running
+out of memory.
 
 ```{toctree}
 :hidden:
@@ -365,6 +374,27 @@ user-guide/index
 ml/index
 configuration/index
 migration/index
+```
+
+```{toctree}
+:hidden:
+:caption: Performance
+
+benchmarks/index
+```
+
+```{toctree}
+:hidden:
+:caption: Integrate
+
+integrations/index
+```
+
+```{toctree}
+:hidden:
+:caption: Understand
+
+deep-dives/index
 ```
 
 ```{toctree}

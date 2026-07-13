@@ -118,6 +118,11 @@ def validate_config(cfg: Config) -> None:
         f"distributed.speculation_max_backups must be >= 0, got {d.speculation_max_backups}",
     )
     _check(
+        d.shuffle_replication >= 1,
+        f"distributed.shuffle_replication must be >= 1 (1 = no replica), "
+        f"got {d.shuffle_replication}",
+    )
+    _check(
         d.resilience in RESILIENCE_PROFILES,
         f"distributed.resilience must be one of {sorted(RESILIENCE_PROFILES)}, "
         f"got {d.resilience!r}",
@@ -233,8 +238,8 @@ def validate_config(cfg: Config) -> None:
         f"memory.spill_bucket_max_bytes must be positive, got {m.spill_bucket_max_bytes}",
     )
     _check(
-        m.spill_local_budget_bytes is None or m.spill_local_budget_bytes > 0,
-        f"memory.spill_local_budget_bytes must be positive or None, "
+        m.spill_local_budget_bytes is None or m.spill_local_budget_bytes >= 0,
+        f"memory.spill_local_budget_bytes must be non-negative or None, "
         f"got {m.spill_local_budget_bytes}",
     )
 

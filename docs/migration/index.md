@@ -5,7 +5,7 @@ come from pandas, Polars, or PySpark, most of your vocabulary carries over. The
 tables below map the common operations, and the round-trip adapters let you move
 data in and out without copying.
 
-The one concept to internalize: a `Dataset` is **lazy**. Transformations
+One concept to absorb before anything else: a `Dataset` is **lazy**. Transformations
 (`select`, `filter`, `group_by().agg()`, `join`, …) build a plan and return a new
 `Dataset`; nothing runs until a **terminal** operation (`collect`, `to_arrow`,
 `to_pandas`, `write`, `count`, `iter_batches`). This is the Polars `LazyFrame`
@@ -27,8 +27,8 @@ and the typed accessors carry over almost verbatim.
 :::
 
 :::{grid-item-card} {octicon}`server;1.1em` PySpark
-No `SparkSession` and no cluster to start — it runs in-process. The DataFrame verbs,
-save modes, and `MERGE INTO` all carry over.
+No `SparkSession`, no cluster to start: it runs in-process. The DataFrame verbs carry
+over, and so do the save modes and `MERGE INTO`.
 :::
 ::::
 
@@ -58,11 +58,10 @@ print(sorted(back.to_pydict()["amount"]))
 | Write Parquet | `df.to_parquet(p)` | `df.write_parquet(p)` | `df.write.parquet(p)` | `ds.write.parquet(p)` |
 | Write Delta | — | `df.write_delta(p)` | `df.write.format("delta").save(p)` | `ds.write.delta(p)` |
 
-Polars splits reading into eager `read_*` and lazy `scan_*`; Batcher does not need
-the split, because **every `bt.read.*` is already lazy** — it returns a `Dataset`
-plan and does no I/O until a terminal op, with projection and predicate pushdown
-applied just as `scan_*` gives you. There is one spelling per format, and it is the
-lazy one.
+Polars splits reading into eager `read_*` and lazy `scan_*`. Batcher does not need the
+split, because **every `bt.read.*` is already lazy**. It returns a `Dataset` plan and
+does no I/O until a terminal op, with the projection and predicate pushdown `scan_*`
+gives you. One spelling per format, and it is the lazy one.
 
 ## Transforming
 
@@ -127,10 +126,10 @@ muscle-memory still works.
 | Explain plan | — | `df.explain()` | `df.explain()` | `ds.explain()` |
 | Measured per-op stats | — | — | — | `ds.stats()` |
 
-`ds.write(path, mode=...)` takes the Spark save modes — `overwrite` (default),
-`error`, `ignore`, and `append` (lakehouse sinks only). For Delta upserts,
-`ds.write.delta(uri, merge_on=["id"])` runs a transactional `MERGE INTO` (matched
-rows updated, new rows inserted) — the Spark/Delta `MERGE` in one call.
+`ds.write(path, mode=...)` takes the Spark save modes: `overwrite` (default), `error`,
+`ignore`, and `append` (lakehouse sinks only). For Delta upserts,
+`ds.write.delta(uri, merge_on=["id"])` runs a transactional `MERGE INTO`, matched rows
+updated and new rows inserted. That is the Spark/Delta `MERGE` in one call.
 
 ## Moving data in and out
 
@@ -188,13 +187,12 @@ for you instead of executed as written.
 Settings other engines make you tune by hand are measured defaults here. Batch size
 adapts toward throughput under a VRAM cap, `num_gpus` adapts to observed GPU
 utilization, and there is no object-store proportion to set, because the data plane
-bypasses it. The engine's low fixed overhead also keeps small queries fast, so the
-sub-million-row filter, group-by, and aggregate stay sub-second. `benchmarks/` holds
-the correctness-gated numbers against DuckDB and Polars (`python benchmarks/run.py`).
+bypasses it. Low fixed overhead keeps small queries fast too: a sub-million-row filter
+with a group-by and an aggregate on top stays sub-second. `benchmarks/` holds the
+correctness-gated numbers against DuckDB and Polars (`python benchmarks/run.py`).
 
-`ds.stats()` is the answer to "where is my time going" — it runs the query and
-reports each operator's measured rows, wall time, peak bytes, spill, and the
-dominant (bottleneck) operator:
+`ds.stats()` answers "where is my time going". It runs the query and reports measured
+rows, wall time, peak bytes, and spill per operator, plus which one was the bottleneck:
 
 ```python
 import batcher as bt
@@ -220,10 +218,10 @@ print(bt.read.parquet("/tmp/bt_resume_demo").count())
 ```
 
 Feeding a distributed PyTorch (DDP/FSDP) or DeepSpeed trainer uses `stream_loader`,
-which gives every rank the same number of batches in a seed-reproducible order that
-is independent of world size — so a job can resume on a differently-sized cluster
-with no repeated or skipped samples (disable the framework's own sampler; this is
-the single shard authority):
+which gives every rank the same number of batches in a seed-reproducible order that is
+independent of world size, so a job can resume on a differently-sized cluster with no
+repeated or skipped samples. Disable the framework's own sampler; `stream_loader` is the
+single shard authority.
 
 ```python
 # docs: skip  (requires torch; shown for reference)

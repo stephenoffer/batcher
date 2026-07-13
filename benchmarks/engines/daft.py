@@ -12,7 +12,7 @@ import importlib.util
 
 import pyarrow as pa
 
-from .base import Engine, SqlRunner
+from .base import Engine, Rename, SqlRunner
 
 
 class DaftEngine(Engine):
@@ -41,10 +41,20 @@ class DaftEngine(Engine):
         # Current Daft: named DataFrames are passed to daft.sql as bindings.
         return lambda query: daft.sql(query, **frames).to_arrow()
 
-    def sql_runner_scan(self, uris: dict[str, str]) -> SqlRunner | None:
+    def sql_runner_scan(
+        self, uris: dict[str, str], rename: Rename | None = None
+    ) -> SqlRunner | None:
         import daft
 
-        frames = {name: daft.read_parquet(uri) for name, uri in uris.items()}
+        frames = {}
+        for name, uri in uris.items():
+            frame = daft.read_parquet(uri)
+            cols = (rename or {}).get(name)
+            if cols:
+                frame = frame.select(
+                    *(daft.col(stored).alias(canonical) for stored, canonical in cols.items())
+                )
+            frames[name] = frame
         return lambda query: daft.sql(query, **frames).to_arrow()
 
     def scan_sql_runner(self, glob: str) -> SqlRunner:

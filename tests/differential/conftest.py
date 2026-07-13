@@ -27,12 +27,24 @@ def _normalize(table: pa.Table) -> list[tuple]:
     return sorted(rows, key=lambda t: tuple((v is None, str(type(v)), v) for v in t))
 
 
+#: Stand-in for NaN in a comparison. `nan != nan`, so a raw NaN in a result tuple makes the
+#: comparison fail even when both engines agree — which silently made every NaN case
+#: untestable, and left the float-key edges (where a real `-0.0` grouping bug lived) with no
+#: differential coverage. SQL treats all NaNs as one value for grouping/equality, so a single
+#: canonical sentinel is the right comparison semantics, not a fudge.
+_NAN = "<nan>"
+
+
 def _coerce(v):
     if isinstance(v, bool):
         return v
     if isinstance(v, int):
         return float(v)
     if isinstance(v, float):
+        if v != v:  # NaN — any payload, any sign
+            return _NAN
+        if v == 0.0:  # -0.0 == 0.0 in SQL grouping, and they must compare equal here too
+            return 0.0
         return round(v, 9)
     return v
 
@@ -57,6 +69,31 @@ def assert_same_ordered(batcher_table: pa.Table, duck_relation) -> None:
     bat = [tuple(_coerce(r[c]) for c in cols) for r in batcher_table.to_pylist()]
     duck = [tuple(_coerce(r[c]) for c in cols) for r in duck_table.to_pylist()]
     assert bat == duck, f"\nBatcher: {bat}\nDuckDB:  {duck}"
+
+
+def assert_tables_equal(actual: pa.Table, expected: pa.Table, *, ordered: bool = False) -> None:
+    """Assert two Batcher results are equal — for comparing execution *paths* to each other.
+
+    `assert_same` / `assert_same_ordered` compare against DuckDB; this compares Batcher to
+    Batcher (`collect()` vs `collect(spill=True)` vs `iter_batches()`), which is how invariant
+    #7 is checked. It goes through the same `_coerce` normalization, so a NaN compares equal to
+    a NaN — a plain `to_pydict() ==` cannot express that (`nan != nan`) and silently reports a
+    false mismatch on any float column carrying one.
+
+    Args:
+        actual: The table produced by the path under test.
+        expected: The table produced by the oracle path.
+        ordered: Whether row order is part of the contract (sorts) or not.
+    """
+    assert actual.column_names == expected.column_names, (
+        f"column mismatch: {actual.column_names} vs {expected.column_names}"
+    )
+    a = [tuple(_coerce(r[c]) for c in actual.column_names) for r in actual.to_pylist()]
+    e = [tuple(_coerce(r[c]) for c in expected.column_names) for r in expected.to_pylist()]
+    if not ordered:
+        key = lambda t: tuple((v is None, str(type(v)), str(v)) for v in t)  # noqa: E731
+        a, e = sorted(a, key=key), sorted(e, key=key)
+    assert a == e, f"\nactual:   {a}\nexpected: {e}"
 
 
 @pytest.fixture

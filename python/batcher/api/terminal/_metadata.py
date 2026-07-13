@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 
+from batcher._internal.logging import get_logger
 from batcher.config import active_config
 from batcher.io.source import Source, iter_source
 from batcher.plan.expr_ir import Binary, Col, Expr, InList, Not
@@ -22,7 +23,15 @@ from batcher.plan.logical import Aggregate, Filter, Join, LogicalPlan
 from batcher.plan.source_stats import source_stats_key
 from batcher.plan.visitor import walk
 
-__all__ = ["collect_source_metadata", "learn_column_stats", "ndv_columns", "seed_column_ndv"]
+__all__ = [
+    "collect_source_metadata",
+    "learn_column_stats",
+    "learnable_columns",
+    "ndv_columns",
+    "seed_column_ndv",
+]
+
+_log = get_logger("metadata")
 
 
 # Row cap for the driver-side column-stat sample (≈ a couple of Parquet row-groups).
@@ -235,8 +244,24 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
         pass
 
 
+def learnable_columns(plan: LogicalPlan) -> set[str]:
+    """The columns whose measured statistics a later plan of this shape could actually read.
+
+    The union of the two things the estimator consults: `ndv_columns` (join keys, group
+    keys, equality predicates — the distinct counts) and the columns any `Filter` mentions
+    (the quantile grids and most-common-values, which drive range and equality selectivity).
+    A column outside that union has no consumer; sketching it is pure loss.
+    """
+    from batcher.api.source_stats import column_bounds_needed
+
+    return ndv_columns(plan) | column_bounds_needed(plan)
+
+
 def learn_column_stats(
-    hub, resolved: list[list[pa.RecordBatch]], sources: list[Source] | None = None
+    hub,
+    resolved: list[list[pa.RecordBatch]],
+    sources: list[Source] | None = None,
+    plan: LogicalPlan | None = None,
 ) -> None:
     """Measure per-column ndv/quantiles from the just-scanned input and record them.
 
@@ -246,16 +271,38 @@ def learn_column_stats(
     for another's on every join and group-by estimate in the process. A source that cannot
     key itself is skipped rather than merged into the global namespace.
 
-    Gated to columns not already known *for that source*, so the O(rows) sketch build
-    happens at most once per column — a bounded, one-time cost that sharpens every later
-    plan. Core measures (`core.column_statistics`); Kyber persists/consumes. Best-effort: a
+    Core measures (`core.column_statistics`); Kyber persists/consumes. Best-effort: a
     failure here never affects the query result.
+
+    ## Only the columns something will read, and never unboundedly
+
+    The sketch is an **O(rows x columns)** pass — HLL, KLL and Misra-Gries over every value —
+    and it used to run over *every column of the source*, for every query, whether or not any
+    of it could ever be consulted. On a plain ``read_parquet(dir).collect()`` — 20M rows, 16
+    columns, no join, no group-by, no filter, and therefore not one statistic the estimator
+    can use — it cost **22.9 seconds on top of a 0.73-second read**. The query paid 30x its
+    own cost to learn things nothing would ever ask for.
+
+    So it is bounded exactly the way the pre-optimize `seed_column_ndv` already bounds
+    itself, and for the same stated reason: *computing a column the optimizer does not read
+    only wastes work.*
+
+    * `plan` restricts the sketch to `learnable_columns` — the join keys, group keys and
+      filter columns an estimator actually consults. A filter-free, join-free scan learns
+      nothing, because there is nothing to learn.
+    * `ndv_sketch_max_cells` caps the total work, so one enormous column cannot turn a
+      cheap query into an expensive one. The pre-pass has always honored this cap; this one
+      did not, which is why it had no ceiling at all.
+
+    Passing `plan=None` keeps the old learn-everything behavior, for the caller that hands
+    in an already-bounded *sample* (`collect_source_metadata`) rather than a whole scan.
 
     The "already measured" marker is the *average byte width*, not the distinct count:
     `column_statistics` records one for every column it touches (numeric or not), whereas
     `ndv` alone is also written by the cheaper pre-optimize `seed_column_ndv`. Gating on
     `ndv` would let that seeding suppress this pass, losing the quantile grids and
-    most-common-values it is the only source of.
+    most-common-values it is the only source of. A column left unsketched stays unmarked, so
+    the first query that *can* use it is the one that measures it.
     """
     if hub is None:
         return
@@ -264,6 +311,10 @@ def learn_column_stats(
     try:
         learned = kyber.load_learned_stats(hub)
         min_frac = active_config().optimizer.cardinality.mcv_min_fraction
+        max_cells = active_config().optimizer.ndv_sketch_max_cells
+        wanted = learnable_columns(plan) if plan is not None else None
+        if wanted is not None and not wanted:
+            return  # nothing in this plan consults a column statistic
         for i, batches in enumerate(resolved):
             if not batches:
                 continue
@@ -272,19 +323,42 @@ def learn_column_stats(
             if source_key is None:
                 continue  # unkeyable: cannot be told apart from another source's columns
             known = set(kyber.columns_for(learned, kyber.AVG_BYTES_KEY, source_key))
-            cols = [c for c in batches[0].schema.names if c not in known]
+            cols = [
+                c
+                for c in batches[0].schema.names
+                if c not in known and (wanted is None or c in wanted)
+            ]
             if not cols:
                 continue
+            rows = sum(b.num_rows for b in batches)
+            if rows * len(cols) > max_cells:
+                continue  # too big to sketch cheaply; a worse plan beats a 20x slower query
             ndv, quants, avg_bytes = core.column_statistics(batches, cols)
-            total = sum(b.num_rows for b in batches)
+            total = rows
             mcv: dict[str, dict[str, float]] = {}
-            # MCV clears `min_frac` only on low-cardinality columns (ndv ≲ 1/min_frac);
-            # skip the per-row Misra-Gries scan on keys/high-ndv columns (always empty).
-            mcv_cols = [c for c in cols if ndv.get(c, 1e18) <= 1.0 / min_frac]
-            for col_name, hits in core.heavy_hitters(batches, mcv_cols, min_frac).items():
+            # Heavy hitters are measured on **every** column being sketched, not only
+            # low-cardinality ones.
+            #
+            # This used to skip any column with `ndv > 1/min_frac` (20), reasoning that a
+            # high-cardinality column cannot hold a value above the frequency floor. That is
+            # only true under *uniformity* — which is the one assumption an MCV exists to
+            # correct. A column of a million distinct keys can still have a single value at
+            # 30% of rows (a sentinel, a default account, one whale customer), and
+            # Misra-Gries finds it in the same pass. Measured: 1,000 distinct `cust_id`s with
+            # key 7 at 47.5% of rows was excluded by the gate, so `cust_id = 7` estimated at
+            # `1/ndv` = 0.001 against a true 0.5 — a ~500x under-estimate on the most skewed
+            # key in the table, which is exactly the key a join is about to be built on. The
+            # gate suppressed skew precisely where skew matters, leaving join-key skew
+            # structurally unmeasurable (`kyber.hot_join_values` reads this).
+            for col_name, hits in core.heavy_hitters(batches, cols, min_frac).items():
                 if total > 0 and hits:
                     mcv[col_name] = {str(v): n / total for v, n in hits}
             if ndv or quants or avg_bytes or mcv:
                 kyber.record_column_stats(hub, ndv, quants, avg_bytes, mcv, source_key=source_key)
-    except Exception:  # pragma: no cover - learning must never break execution
-        pass
+    except Exception:  # learning must never break execution — but it must not vanish either
+        # This `except` is load-bearing (a measurement failure must never fail a query), but
+        # a bare `pass` also swallows a *bug*: an `AttributeError` on this function's first
+        # line silently made the entire post-run column learner a no-op, so quantiles, MCVs
+        # and byte widths were never recorded at all. A swallowed exception that is never
+        # logged is indistinguishable from a code path that works.
+        _log.debug("column-statistics learning failed; plans fall back to priors", exc_info=True)

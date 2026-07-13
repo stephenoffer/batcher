@@ -52,9 +52,7 @@ def load_source_throughput_mbps(hub: MetadataHub | None, identity: str) -> float
     return float(value) if value is not None else None
 
 
-def predicted_read_seconds(
-    hub: MetadataHub | None, identity: str, byte_count: int
-) -> float | None:
+def predicted_read_seconds(hub: MetadataHub | None, identity: str, byte_count: int) -> float | None:
     """Predicted wall time to read `byte_count` bytes of source `identity`, from its learned
     throughput — the "predict" half: turn measured MB/s + a known byte size into an expected
     read cost the optimizer/`explain` can reason about *before* running. `None` when the

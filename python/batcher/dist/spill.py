@@ -31,6 +31,7 @@ import tempfile
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.carbonite.spill import TieredSpillStore
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source
@@ -88,6 +89,81 @@ def _make_store(work_dir: str) -> TieredSpillStore:
     )
 
 
+# Byte target the out-of-core partition phase feeds the engine at once. A source's
+# batch size is not the engine's to trust: it can be far too large (`from_arrow` of a
+# whole table, a fat parquet row group) or far too small (a streaming reader, a
+# per-file scan, an exploded/filtered upstream emitting thousands of tiny batches).
+# Both hurt.
+#
+#   * Too large: the parallel partial-aggregate builds per-thread hash tables over the
+#     entire batch's cardinality, so peak memory scales with the batch, not the morsel
+#     — a high-cardinality group-by peaked ~2.6x higher on one 20M-row batch than on
+#     the same rows normalized here.
+#   * Too small: the partition phase makes one engine dispatch per batch, and a batch
+#     far under a morsel-group can't fill the cores — 256-row batches ran ~30x slower
+#     than 256K-row batches through the identical spill.
+#
+# Normalizing every source to ~this target (split the over-large, coalesce runs of the
+# under-large) caps the partition phase's working set *and* keeps each chunk wide
+# enough to fan across all cores — so out-of-core throughput no longer depends on how
+# the source happened to chunk its output.
+_SPILL_INPUT_CHUNK_BYTES = 8 << 20  # 8 MiB
+
+
+def _iter_spill_morsels(source: Source, projection: list[str] | None = None):
+    """Yield `source`'s batches normalized to ~``_SPILL_INPUT_CHUNK_BYTES``.
+
+    Over-large batches are split into zero-copy `slice` views (bounded without a
+    copy); runs of small batches are coalesced into one chunk so the partition phase
+    always processes an efficiently-sized, all-cores-wide morsel-group regardless of
+    the source's batching. This is the single input tap every out-of-core partition
+    phase (aggregate/join/sort/window) reads through; coalescing/splitting only
+    reshapes the row stream, so every spill result is byte-identical.
+    """
+    pending: list[pa.RecordBatch] = []
+    pending_bytes = 0
+
+    def _flush() -> pa.RecordBatch | None:
+        nonlocal pending_bytes
+        if not pending:
+            return None
+        # One buffered batch needs no copy; a run is compacted into a single 0-offset
+        # batch so the engine sees one contiguous chunk, not a chain of tiny ones.
+        out = (
+            pending[0]
+            if len(pending) == 1
+            else pa.Table.from_batches(pending).combine_chunks().to_batches()[0]
+        )
+        pending.clear()
+        pending_bytes = 0
+        return out
+
+    for batch in source.iter_batches(projection):
+        n = batch.num_rows
+        if n == 0:
+            continue
+        nbytes = batch.nbytes
+        if nbytes >= _SPILL_INPUT_CHUNK_BYTES:
+            # Emit any buffered small batches first (order-preserving), then split.
+            buffered = _flush()
+            if buffered is not None:
+                yield buffered
+            if n == 1:
+                yield batch
+            else:
+                rows = max(1, (_SPILL_INPUT_CHUNK_BYTES * n) // nbytes)
+                for off in range(0, n, rows):
+                    yield batch.slice(off, min(rows, n - off))
+        else:
+            pending.append(batch)
+            pending_bytes += nbytes
+            if pending_bytes >= _SPILL_INPUT_CHUNK_BYTES:
+                yield _flush()
+    tail = _flush()
+    if tail is not None:
+        yield tail
+
+
 def _peel_to_breaker(plan: LogicalPlan) -> LogicalPlan | None:
     """The spillable breaker under a chain of leading row-wise/limit ops, or `None`.
 
@@ -141,8 +217,13 @@ def spill_collect(
         from batcher.dist import spill_breakers as br
 
         if isinstance(plan, Join):
-            return br.execute_spilling_join(plan, sources, num_partitions)
-        if isinstance(plan, Sort) and br.supports_spilling_sort(plan):
+            # A join whose side spans several sources cannot be grace-partitioned (see
+            # `supports_spilling_join`); decline so the caller runs it in memory rather
+            # than asserting.
+            if br.supports_spilling_join(plan):
+                return br.execute_spilling_join(plan, sources, num_partitions)
+            return None
+        if isinstance(plan, Sort) and br.supports_spilling_sort(plan, sources):
             return br.execute_spilling_sort(plan, sources, num_partitions)
         if isinstance(plan, Window):
             # PARTITION BY window → grace-partition by those keys; a *global* window
@@ -191,8 +272,7 @@ def execute_spilling_aggregate(
     spill_dir: str | None = None,
 ) -> pa.Table:
     """Aggregate `agg` out-of-core, spilling hash-partitioned partials to disk."""
-    import batcher._native as nat
-
+    nat = engine()
     cfg_json = active_config().engine_config_json()
     group_keys_json = json.dumps(
         [{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys]
@@ -214,9 +294,7 @@ def execute_spilling_aggregate(
 
     try:
         # --- partition phase: stream source, partial-aggregate, spill by key ---
-        for batch in source.iter_batches():
-            if batch.num_rows == 0:
-                continue
+        for batch in _iter_spill_morsels(source):
             mapped = nat.execute_plan(map_ir, [[batch]], cfg_json)
             if not mapped:
                 continue

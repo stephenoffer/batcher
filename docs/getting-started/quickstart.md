@@ -1,8 +1,8 @@
 # Quickstart
 
-This page walks through a complete pipeline: build a dataset, transform it,
-aggregate it, and read the result. The examples use small in-memory data so they
-run anywhere; the same API applies at any scale.
+A complete pipeline, start to finish: build a dataset, transform it, aggregate it,
+read the result. The data here is small and in-memory so the examples run anywhere.
+The API is the same one you would point at a terabyte of Parquet.
 
 ## Import and build a dataset
 
@@ -26,8 +26,8 @@ print(ds.columns)
 # ['id', 'name', 'category', 'price', 'qty']
 ```
 
-A `Dataset` is lazy: each operation returns a new `Dataset` describing a plan, and
-no work runs until a terminal operation such as `to_pydict` or `collect`.
+A `Dataset` is lazy. Each operation returns a new `Dataset` describing a plan, and no
+work runs until a terminal operation such as `to_pydict` or `collect`.
 
 ## Filter rows
 
@@ -105,8 +105,8 @@ print(ds.filter(bt.col("price") > 25.0).explain())
 
 ## Reading and writing files
 
-File readers and writers use the same API; only the source or sink changes. These
-need real files, so they are shown but not run here.
+Readers and writers use the same API. Only the source or the sink changes. The
+snippet below needs real files, so it is shown rather than run.
 
 ```python
 # docs: skip

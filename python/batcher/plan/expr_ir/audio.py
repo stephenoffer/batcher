@@ -19,12 +19,14 @@ __all__ = ["AudioFunc", "_AudioNamespace"]
 class AudioFunc(IRNode):
     """An audio decode op over a binary (audio-bytes) sub-expression (via `.audio`).
 
-    `decode` reads each clip's metadata; `to_waveform` decodes to a mono signal.
+    `decode` reads each clip's metadata; `to_waveform` decodes to a mono signal;
+    `resample` decodes then band-limited-resamples that signal to `rate` Hz.
     """
 
     tag = ExprTag.AUDIO
     fn: str = scalar()
     input: Expr = child()
+    rate: int | None = scalar(omit_none=True, default=None)
 
 
 class _AudioNamespace:
@@ -88,3 +90,28 @@ class _AudioNamespace:
                 >>> ds.select(w=bt.col("bytes").audio.to_waveform())  # doctest: +SKIP
         """
         return AudioFunc("to_waveform", self._e)
+
+    def resample(self, rate: int) -> AudioFunc:
+        """Decode to mono and band-limited-resample to ``rate`` Hz.
+
+        The audio-ML preprocessing step (models expect a fixed rate — 16 kHz for
+        Whisper/wav2vec, 22 kHz for many audio models). Sinc resampling runs natively in
+        the data plane over the whole batch, replacing a per-file Python ``librosa`` call.
+        The output length is ``ceil(n * rate / source_rate)`` — the length ``librosa``
+        produces — so a resampled frame count is reproducible and engine-independent.
+
+        Args:
+            rate: The target sample rate in Hz (must be positive).
+
+        Returns:
+            An expression evaluating to a ``List<Float32>`` of resampled mono samples;
+            null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.audio("s3://bucket/clips/")  # doctest: +SKIP
+                >>> ds.select(w=bt.col("bytes").audio.resample(16000))  # doctest: +SKIP
+        """
+        return AudioFunc("resample", self._e, rate=rate)

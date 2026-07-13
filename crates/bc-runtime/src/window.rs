@@ -185,6 +185,17 @@ pub fn window_with(
     // row threshold and when there is no PARTITION BY (a single global partition can't be
     // split; the serial group-id fast path handles it). A frameless window that mixes a
     // non-aggregate (a value function with no order) also stays serial.
+    // Canonicalize float PARTITION BY keys once, here, before any grouping path sees them, so
+    // `PARTITION BY f` folds `-0.0`/`0.0` into one partition and all NaNs into one — the same
+    // key identity GROUP BY uses (`crate::keys`). The RowConverter-based partition groupers
+    // (`assign_partitions`, `ordered_partitions_by_global_sort`, the parallel hash bucketer) do
+    // NOT canonicalize on their own, so `distinct(subset)` — which lowers to
+    // `row_number() OVER (PARTITION BY subset ...)` — returned two rows for `[-0.0, 0.0]` where
+    // DuckDB returns one. Window function *outputs* don't include the key, so folding the key's
+    // identity never changes an emitted value. Non-float keys are returned unchanged.
+    let canon = crate::keys::canonicalize_float_keys(partition_keys);
+    let partition_keys: &[ArrayRef] = canon.as_deref().unwrap_or(partition_keys);
+
     let nthreads = rayon::current_num_threads();
     let frameless_agg = order_keys.is_empty()
         && funcs

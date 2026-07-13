@@ -2,8 +2,8 @@
 
 Filtering keeps the rows that satisfy a predicate. A predicate is an `Expr` that
 evaluates to a boolean column, built with comparisons and combined with boolean
-operators. This page also covers null tests, set membership, ranges,
-deduplication, and limiting.
+operators. Null tests, set membership, ranges, deduplication and limiting all follow
+from the same idea.
 
 ## Setup
 

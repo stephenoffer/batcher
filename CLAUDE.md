@@ -63,25 +63,41 @@ tests you wrote pass.
 
 ## Repository map
 
+Every package is listed. If you are about to add code and cannot find its home here, that is a
+signal to stop and ask — not to invent one. The **import matrix** in
+`.claude/rules/architecture.md` says what each may import; read it before adding an import.
+
 ```
 python/batcher/          Control plane — never touches a tuple in the hot path
-  api/        conductor: the only layer that imports kyber+carbonite+core
-  kyber/      optimizer: an ordered list of passes (plan → plan)
-  carbonite/  resource manager: buffer pool, spill, credit-based flow control
-  core/       executor: drives the engine, adaptive re-optimization loop
-  plan/       NEUTRAL: LogicalPlan/PhysicalPlan, expr_ir, schema, JSON IR (to_ir)
-  metadata/   learned stats (MetadataHub) — Core measures, Kyber consumes
-  config/  io/  dist/  _sql/  _internal/
+  ml/  _sql/    front-ends ON the public API: ML/inference/loaders; the SQL parser
+  api/          conductor: the ONLY layer that imports the subsystems
+  dist/         distributed *scheduling* backend (Ray tasks, Flight shuffle, spill)
+  kyber/        optimizer: an ordered list of passes (plan → plan)
+  carbonite/    resource manager: buffer pool, spill, credit-based flow control
+  core/         executor: drives the engine, adaptive re-optimization loop
+  governance/   policy: row filters / column masks as a pure plan rewrite; lineage
+  io/           NEUTRAL: sources, sinks, formats, filesystem, schema evolution
+  plan/         NEUTRAL: LogicalPlan/PhysicalPlan, expr_ir, schema, JSON IR (to_ir)
+  metadata/     learned stats (MetadataHub) — Core measures, Kyber consumes
+  config/  _internal/    config; errors, registry, and `_internal.native` —
+                         the ONE accessor for the compiled engine (never
+                         `import batcher._native` yourself; see architecture.md)
 
 crates/                  Data plane — pure Rust + Arrow (only bc-py links PyO3)
   bc-arrow      Arrow re-exports + Morsel (RecordBatch, 16,384 rows)
   bc-expr       the one scalar Expr + vectorized eval (interpreter oracle)
   bc-ir         the one relational RelOp DAG (JSON wire contract)
   bc-runtime    mergeable stateful primitives: agg, join, shuffle, window
+                — plus `keys`: the ONE canonical form for a grouping/partitioning
+                  key. Every hash path (assign / combine / shuffle / join / window)
+                  derives key identity from it, so they cannot disagree.
   bc-codegen    Cranelift JIT for Expr (Tier-1; bit-for-bit parity w/ bc-expr)
   bc-interp     Tier-0 executor: execute (seq oracle), par, dist
   bc-sketches   mergeable HLL / KLL / Count-Min for cardinality/quantiles
   bc-transport  Arrow Flight shuffle (data plane bypasses the Ray object store)
+  bc-resource   the memory/buffer pool the executor allocates from
+  bc-io         native readers (Parquet/Avro) behind the neutral io/ layer
+  bc-udf        UDF support types
   bc-py         the ONLY PyO3 crate; thin, zero-copy FFI boundary
 
 architecture.txt, docs/  Design + the mathematical foundations (source of truth)
@@ -91,30 +107,49 @@ tests/{unit,differential,integration}/   The test pyramid
 
 ## Dev workflow
 
+**Run `just install-hooks` once, first, before you write any code.** It installs the
+pre-commit hook that runs `lint-structure`, `ruff`, and `lint-layers`. It is not optional
+hygiene: it is the only thing standing between you and a commit that breaks a hard invariant.
+The gates are real and they *have* caught real bugs — but they were once left uninstalled, and
+a branch shipped with the layer-independence contract broken in all six directions and the
+structure limits blown, because nothing forced them to run.
+
 Use the `just` recipes — they encode the exact build/test invocations:
 
 ```
+just install-hooks  # ← DO THIS FIRST. pre-commit: lint-structure + ruff + lint-layers
 just build        # maturin develop — build the Rust engine into the venv
 just build-release
 just check        # cargo check --workspace --exclude bc-py  (fast, no PyO3 link)
 just test-rust    # cargo test  --workspace --exclude bc-py
 just test-py      # pytest  (requires `just build` first)
-just test         # CI: check → test-rust → build → test-py
+just test         # CI: check → test-rust → build → test-py → cov-gate (62% floor)
 just fmt          # cargo fmt + clippy -D warnings
 just lint-py      # ruff check + ruff format --check  (Python quality gate)
 just lint-docstrings  # public-API docstring style (summary/Examples/Args/Returns)
-just lint-layers  # import-linter — enforces the three-subsystem independence
+just lint-layers  # import-linter — the import matrix (independence, plan/io neutrality)
+just lint-structure   # file/dir/class size limits + the duplication gate
 just docs         # build the docs site (warnings = errors: orphans, broken refs)
-just bench        # operator-mix benchmark vs DuckDB/Polars (also bench-tpch, bench-dist)
+just bench        # TPC-H vs DuckDB/Polars   (bench-ops = operator mix; also bench-dist)
 ```
 
 **Nothing is "done" until the quality gate is green.** Before you claim a change
 works: `just check`, `just test-rust`, `just build`, `just test-py`,
-`just lint-layers`, and `clippy -D warnings`. Doc changes also run `just docs`
-(the doc code examples execute under `just test-py` via
+`just lint-py`, `just lint-layers`, `just lint-structure`, and `clippy -D warnings`.
+Doc changes also run `just docs` (the doc code examples execute under `just test-py` via
 `tests/docs/test_doc_examples.py`). For perf-relevant work, also run `just bench`
-(and `just bench-tpch` / `just bench-dist` where relevant). The
+(and `just bench-ops` / `just bench-dist` where relevant). The
 `/run-quality-gate` skill walks this and how to triage failures.
+
+**A green gate is not a green light.** Every one of these gates passed while
+`sort(descending=True)` silently returned unsorted data under spill, and while a
+distributed `GROUP BY` on a float key split one group into two. They passed because
+nothing *combined* an operator with a non-default flag on a non-default execution path.
+When you touch an operator, test it across the **cross-product** — `{collect, spill,
+iter_batches, distributed}` x `{nulls, empty, one row, duplicates, -0.0/NaN, descending}` —
+not just the shape you were thinking about. `tests/differential/test_diff_operator_matrix.py`
+is that cross-product; extend it, and never assert a sort with an order-*independent*
+comparison (it cannot see a sort bug).
 
 ## Skills (invoke when the task matches)
 

@@ -18,6 +18,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.core.udf import strategy as strat
 from batcher.io.schema.evolution import reconcile_batches
@@ -74,8 +75,16 @@ def has_map_batches(plan: LogicalPlan) -> bool:
     return False
 
 
-def execute_with_udfs(plan: LogicalPlan, sources: list) -> list[pa.RecordBatch]:
+def execute_with_udfs(
+    plan: LogicalPlan, sources: list, source_projections: dict[int, list[str]] | None = None
+) -> list[pa.RecordBatch]:
     """Execute a (possibly non-linear) pipeline that contains `map_batches`.
+
+    `source_projections` is the per-source column list Kyber decided (Core executes the plan it
+    is given; it does not compute projections — see `.claude/rules/architecture.md`). Without it
+    the scan beneath a UDF reads **every** column of the source, which is what a `map_batches`
+    over one column of a wide table used to do. `None` means "read everything", the old
+    behavior, which is what an undeclared (`input_columns=None`) UDF still requires.
 
     A linear ``Scan → map_batches → … → map_batches`` chain (the batch-inference /
     multimodal-preprocessing shape) runs through the **streaming, stage-overlapped**
@@ -88,10 +97,11 @@ def execute_with_udfs(plan: LogicalPlan, sources: list) -> list[pa.RecordBatch]:
     """
     from batcher.core.udf.stream import linear_map_chain, stream_eligible, stream_linear_chain
 
+    projections = source_projections or {}
     chain = linear_map_chain(plan)
     if chain is not None and stream_eligible(chain[1]):
-        return list(stream_linear_chain(chain[0], chain[1], sources))
-    batches, _schema = _execute_node(plan, sources)
+        return list(stream_linear_chain(chain[0], chain[1], sources, projections))
+    batches, _schema = _execute_node(plan, sources, projections)
     return batches
 
 
@@ -127,18 +137,23 @@ def _resilient_call(
         return left + _resilient_call(call, sub.slice(mid), budget, is_gpu)
 
 
-def _execute_node(node: LogicalPlan, sources: list) -> tuple[list[pa.RecordBatch], pa.Schema]:
+def _execute_node(
+    node: LogicalPlan, sources: list, projections: dict[int, list[str]] | None = None
+) -> tuple[list[pa.RecordBatch], pa.Schema]:
     """Materialize `node` to `(batches, schema)`.
 
     The schema is tracked alongside the batches so an *empty* sub-result (which
     carries no batch to read a schema from) can still be scanned by a parent
     operator — the case that makes joins/unions over filtered-to-empty inputs work.
     """
+    projections = projections or {}
     if isinstance(node, Scan):
-        batches = list(sources[node.source_id].read())
+        # Read only the columns the plan needs. Kyber computed them; a `map_batches` that
+        # declared no `input_columns` yields None here, so the whole source is read (safe).
+        batches = list(sources[node.source_id].read(projections.get(node.source_id)))
         return batches, (batches[0].schema if batches else node.schema.arrow)
     if isinstance(node, MapBatches):
-        inputs, in_schema = _execute_node(node.input, sources)
+        inputs, in_schema = _execute_node(node.input, sources, projections)
         # Reconcile a UDF whose output schema drifts across batches (e.g. LLM structured
         # outputs with varying fields) to one union schema, so the stage's batches concat
         # instead of failing — the schema-inference footgun Ray Data hits.
@@ -155,8 +170,7 @@ def _run_engine_op(
     node: LogicalPlan, child_results: list[tuple[list[pa.RecordBatch], pa.Schema]]
 ) -> tuple[list[pa.RecordBatch], pa.Schema]:
     """Run one relational operator natively over already-materialized child inputs."""
-    import batcher._native as nat
-
+    nat = engine()
     inputs = [batches for batches, _ in child_results]
     scans = [Scan(i, SchemaRef.from_arrow(schema)) for i, (_, schema) in enumerate(child_results)]
     rebuilt = with_children(node, scans)

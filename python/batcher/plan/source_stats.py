@@ -22,7 +22,42 @@ from dataclasses import dataclass, field
 
 from batcher.plan.stats import ColumnStat, Provenance, RelStats
 
-__all__ = ["SourceStatistics"]
+__all__ = ["SourceStatistics", "source_stats_key"]
+
+
+def source_stats_key(source: object) -> str | None:
+    """The key a source's *statistics* are stored under, or `None` if it has none.
+
+    A statistic must be attributed to the source it was measured from — a bare column name
+    identifies nothing, since two tables both have an `id` — so every learned column
+    statistic is qualified by this key. It is the same discipline the plan cache applies
+    (`kyber.plan_cache._source_keys`), and for the same reason:
+
+      - A source with a **data-stable** identity (a file path, a table URI) is keyed by it,
+        so what one run measures the next run reads back.
+      - A source whose identity is only *shape*-based — in-memory batches, keyed by schema
+        and row count — is keyed by **object identity** instead. Its `identity()` is
+        documented to collide across different relations of the same shape, and keying
+        statistics on it would re-create the very collision this exists to prevent. Such
+        data has no cross-run life anyway, so a process-local key loses nothing.
+      - A source that cannot key itself at all gets `None`: its statistics are simply not
+        learned, which is strictly better than filing them where another table reads them.
+
+    Args:
+        source: A bound input source.
+
+    Returns:
+        The stable key to qualify this source's statistics with, or `None`.
+    """
+    identity = getattr(source, "identity", None)
+    if not callable(identity):
+        return None
+    if not getattr(source, "stable_stats_identity", True):
+        return f"obj:{id(source)}"
+    try:
+        return f"id:{identity()}"
+    except Exception:  # pragma: no cover - a source that cannot key itself
+        return None
 
 
 @dataclass(frozen=True, slots=True)

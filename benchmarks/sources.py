@@ -496,6 +496,35 @@ def table_uris(benchmark: str, scale: float, source: str | None = None) -> dict[
     return {name: f"{root}/{name}/*.parquet" for name in tables}
 
 
+def scan_rename(benchmark: str, uris: dict[str, str]) -> dict[str, dict[str, str]]:
+    """Per-table ``{positional -> canonical}`` column renames for the *scan* path.
+
+    The public Ray TPC-H parquet names its columns positionally (``column00``...), while
+    every TPC-H query names them (``l_orderkey``...). :func:`load_tables` renames after
+    materializing into Arrow; the scan path never materializes, so instead each engine
+    binds its lazy scan with this rename applied — schema-on-read, the same pure-metadata
+    projection for every engine, and no 40 GB mirror to normalize the names.
+
+    Returns ``{}`` for a source whose columns are already canonical (a normalized mirror,
+    and TPC-DS / ClickBench, which ship real names), so those pay nothing.
+    """
+    if benchmark != "tpch":
+        return {}  # TPC-DS and ClickBench parquet already carry real column names
+    con = _reader()
+    out: dict[str, dict[str, str]] = {}
+    for name, glob in uris.items():
+        want = TPCH_COLUMNS.get(name)
+        if not want:
+            continue
+        found = tuple(
+            row[0] for row in con.sql(f"DESCRIBE SELECT * FROM read_parquet('{glob}')").fetchall()
+        )
+        if not found or found[0] == want[0]:
+            continue  # already canonically named
+        out[name] = dict(zip(found, want, strict=False))
+    return out
+
+
 def load_tables(benchmark: str, scale: float, source: str | None = None) -> dict[str, pa.Table]:
     """Load the named tables for ``benchmark`` from its public parquet source.
 

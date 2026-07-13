@@ -71,8 +71,8 @@ print(out.to_pydict())
 # {'name': ['Ann', 'bob', 'CARL'], 'tier': ['low', 'mid', 'high']}
 ```
 
-When there are exactly two branches, {py:obj}`bt.iff(cond, if_true, if_false) <batcher.iff>`
-is the terse form of a single `when/then/otherwise` — the SQL `IF`/`IFF`.
+With exactly two branches, {py:obj}`bt.iff(cond, if_true, if_false) <batcher.iff>`
+is the terse form of a single `when/then/otherwise`. It is the SQL `IF`/`IFF`.
 
 ```python
 out = ds.select(
@@ -101,8 +101,8 @@ print(out.to_pydict())
 ```
 
 A floating-point `NaN` is distinct from null. {py:obj}`bt.nanvl(value, fallback) <batcher.nanvl>`
-(Spark's `nanvl`) substitutes `fallback` only where `value` is `NaN`, leaving real
-numbers — and nulls — untouched.
+(Spark's `nanvl`) substitutes `fallback` only where `value` is `NaN`. Real numbers
+are left alone, and so are nulls.
 
 ```python
 import math
@@ -117,9 +117,9 @@ print(out.to_pydict())
 
 Aggregates fold a column *down* to one value; the `*_horizontal` functions fold
 *across* columns within each row. `sum_horizontal`/`mean_horizontal` combine numeric
-columns (nulls treated as 0 / skipped), `min_horizontal`/`max_horizontal` are the
-Polars-named row-wise `least`/`greatest`, and `all_horizontal`/`any_horizontal`
-reduce many boolean columns into one — handy for combining validation flags.
+columns (nulls treated as 0 / skipped), and `min_horizontal`/`max_horizontal` are the
+Polars-named row-wise `least`/`greatest`. `all_horizontal`/`any_horizontal` reduce
+many boolean columns into one, which is how you combine validation flags.
 
 ```python
 checks = bt.from_pydict({"a": [1, 2, 3], "b": [4, 6, 6], "c": [7, 8, 9]})
@@ -185,7 +185,7 @@ print(out.to_pydict())
 ```
 
 {py:obj}`bt.width_bucket(value, low, high, count) <batcher.width_bucket>` assigns each
-value to one of `count` equal-width histogram buckets spanning `[low, high)` — the
+value to one of `count` equal-width histogram buckets spanning `[low, high)`. The
 result is `1..count`, with `0` for values below the range and `count + 1` above it.
 Reach for it to bin a continuous column without a chain of `when`s.
 
@@ -198,7 +198,7 @@ print(out.to_pydict())
 
 ## String accessor: .str
 
-The `.str` namespace covers casing, trimming, search, slicing, padding, and
+The `.str` namespace covers casing and trimming, search, slicing, padding,
 encoding. Search methods such as `contains`, `starts_with`, and `like` are
 case-sensitive; use `ilike` for case-insensitive matching.
 
@@ -231,10 +231,10 @@ print(out.to_pydict())
 # {'is_conf': [True, False, False], 'second': ['app', 'local', ''], 'head': ['etc/app', 'usr/local', '  a   b  '], 'tidy': ['etc/app/conf', 'usr/local/bin', 'a b']}
 ```
 
-`ascii` returns the codepoint of the first character; `bit_length` and
-`octet_length` measure the encoded size in bits and UTF-8 bytes (not characters);
-`levenshtein(target)` is the edit distance to a constant string and `soundex` its
-phonetic key — both useful for fuzzy matching and deduplication.
+`ascii` returns the codepoint of the first character. `bit_length` and
+`octet_length` measure the encoded size in bits and UTF-8 bytes, not characters.
+`levenshtein(target)` gives the edit distance to a constant string and `soundex` its
+phonetic key; both earn their keep in fuzzy matching and deduplication.
 
 ```python
 words = bt.from_pydict({"w": ["Robert", "Rupert", "café"]})
@@ -419,8 +419,8 @@ print(out.to_pydict())
 ```
 
 Going the other way, {py:obj}`bt.named_struct(name, value, ...) <batcher.named_struct>`
-packs several columns into one struct from alternating name/value arguments —
-handy for nesting a group of fields before a write or a `.struct.field` lookup.
+packs several columns into one struct from alternating name/value arguments. Use it
+to nest a group of fields before a write, or before a `.struct.field` lookup.
 
 ```python
 out = ds.select(row=bt.named_struct("who", bt.col("name"), "n", bt.col("qty")))
@@ -440,10 +440,10 @@ print(out.to_pydict())
 # {'value': ['hi', 'bye']}
 ```
 
-The typed variants read a JSON value directly as a scalar instead of text:
+The typed variants read a JSON value directly as a scalar instead of text.
 `extract_bool`, `extract_int`, and `extract_float` return `Boolean`, `Int64`, and
 `Float64` columns, yielding null when the path is absent or the value has the wrong
-type — no separate cast step.
+type. No separate cast step.
 
 ```python
 records = bt.from_pydict(

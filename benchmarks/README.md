@@ -133,6 +133,43 @@ open cost over S3** (see the `cluster/` GPU suites for the in-memory multimodal 
 comparison, which is where Batcher's warm-pool / streaming moat shows). This suite measures
 the read/decode path honestly, S3 penalty included.
 
+### Physical-AI ingest scenarios (self-contained, local, no S3)
+
+For a fast offline read of the multimodal ingest story, `benchmarks/scenarios/` holds
+single-file, correctness-gated head-to-heads that synthesize their own local corpus:
+
+```bash
+python benchmarks/scenarios/image_decode.py       # JPEG decode+resize vs Ray Data + Daft
+python benchmarks/scenarios/point_cloud_load.py   # LiDAR .npy -> torch tensors vs Ray Data
+python benchmarks/scenarios/audio_decode.py       # native audio decode vs a soundfile loop
+```
+
+On a 96-core node these show batcher **2.4× faster than Daft and 6× than Ray Data** on
+image decode+resize, and **2.4× than Ray Data** on point-cloud loading — the physical-AI
+(camera / LiDAR / audio) ingest path. Findings and the fix chain are in
+`BENCHMARK_RESULTS.md`; the mechanism is documented in `docs/user-guide/performance.md`
+("Multimodal & physical-AI ingest").
+
+### Structured streaming (Batcher vs Spark Structured Streaming)
+
+Batcher and Spark are the two real *structured-streaming* engines; this head-to-head
+runs the drain trigger both support (Spark `Trigger.AvailableNow`, Batcher
+`Trigger.available_now()`) over a Parquet backlog, folding a grouped aggregation, with a
+per-key correctness gate against DuckDB/Polars (which appear as a batch floor — they have
+no streaming engine):
+
+```bash
+python benchmarks/scenarios/streaming_throughput.py            # 4M rows, grouped agg
+# the Spark comparison needs a JVM: export JAVA_HOME=<jdk17-or-21> first (else it skips)
+```
+
+At 4M rows / 1000 keys this shows batcher streaming at **~81M rows/s vs Spark Structured
+Streaming's ~6.5M rows/s — 12.5× faster**, correctness-gated (both match DuckDB). Batcher's
+micro-batch overhead is small enough that its *streaming* aggregation also edges out
+Polars' *batch* aggregation on the same data. The distributed drain (`distributed=True`,
+Spark `AvailableNow` parity) fans the same work across the cluster; see
+`tests/integration/test_distributed_streaming.py`.
+
 ## `cluster/`: GPU multimodal compute (distributed)
 
 Beyond ingest, `benchmarks/cluster/` holds the distributed **GPU** multimodal benchmarks vs

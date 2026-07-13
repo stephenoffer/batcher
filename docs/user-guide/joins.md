@@ -1,9 +1,9 @@
 # Joins
 
-A join combines rows from two datasets on matching key values. Batcher supports
-the standard relational join types plus the set operations union, intersect, and
-except. Joins are mergeable, so the same operator runs on one core or across a
-cluster with an identical result.
+A join combines rows from two datasets on matching key values. Batcher supports the
+standard relational join types, plus the set operations: union, intersect, except.
+Joins are mergeable, so the same operator runs on one core or across a cluster with an
+identical result.
 
 ## Setup
 

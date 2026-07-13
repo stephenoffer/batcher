@@ -153,6 +153,12 @@ _SPOT_DISTRIBUTED: dict[str, object] = {
     "speculation_max_backups": 1,
     "fleet_max_attempts": 6,
     "autoscale_wait_s": AUTOSCALE_WAIT_DEFAULT_S,
+    # Keep a second copy of every mapper's shuffle output on another node, so a
+    # preemption — the expected event here, not an exceptional one — is served from the
+    # replica instead of paying a full map recompute (re-reading the source from object
+    # storage). One extra copy of the (pre-aggregated, small) partial state buys the
+    # single largest reduction in recovery cost on a churning cluster.
+    "shuffle_replication": 2,
 }
 
 # Env vars naming a durable, cross-node location for learned stats, in priority order. The

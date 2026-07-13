@@ -16,9 +16,11 @@ from collections.abc import Callable, Sequence
 
 __all__ = ["Engine", "EngineFactory", "http_engine", "vllm_engine"]
 
-# Maps a list of prompts to a list of generated strings (one per prompt, in order).
 Engine = Callable[[list[str]], Sequence[str]]
+"""Maps a list of prompts to a list of generated strings (one per prompt, in order)."""
+
 EngineFactory = Callable[[], Engine]
+"""Builds an `Engine`, called once per worker so the model loads a single time."""
 
 
 def vllm_engine(
@@ -36,39 +38,8 @@ def vllm_engine(
 ) -> EngineFactory:
     """An `EngineFactory` backed by vLLM (requires ``batcher-engine[vllm]`` + a GPU).
 
-    Returns a factory that builds a vLLM engine once per worker and exposes it as a
-    ``list[str] -> list[str]`` callable, with full control over modern batch-inference
-    knobs:
-
-    * `chat` — send each prompt as a **chat conversation** (``LLM.chat``), so vLLM
-      applies the model's own chat template. Set this for any instruction-tuned or
-      chat model: the completion path (`chat=False`, the default, matching a base
-      model) skips the template, and the model then answers a prompt in a format it
-      was never tuned on — degraded output with nothing to signal it. `system` adds a
-      system turn to every conversation. Not compatible with `image_column` (an image
-      has no place in a text conversation) — use the completion path for vision.
-    * `sampling` — `SamplingParams` kwargs (``temperature``, ``top_p``, ``max_tokens``,
-      ``stop``, ``n``, ``seed``, ...). Defaults to greedy (``temperature=0``).
-    * `guided_json` / `guided_regex` — **structured output**: constrain generation to a
-      JSON schema or regex via vLLM's guided decoding (the reliable way to get parseable
-      output; pair with ``llm_generate(parse_json=True)``).
-    * `lora_path` — serve a single LoRA adapter on top of the base `model` (applied to
-      every row that does not name another adapter).
-    * `lora_paths` — a ``{name: path}`` table of adapters to **multiplex**: a request
-      tagged with that name (via ``llm_generate(adapter_column=...)``) is routed to it,
-      so one engine serves many adapters in one batch. Rows are grouped by adapter and
-      each group is generated together; output order is preserved. Set the vLLM
-      ``enable_lora``/``max_loras``/``max_cpu_loras`` engine kwargs for the adapter cache.
-    * `quantization` — ``"auto"`` (default) picks ``"fp8"`` on GPUs with native FP8
-      tensor cores (NVIDIA Ada L4/L40S, Hopper H100), where it halves weight/KV-cache
-      memory at <1% quality loss, and keeps native precision (BF16/FP16) elsewhere —
-      the zero-config win Ray Data users must select by hand per GPU. Pass an explicit
-      string (``"fp8"``, ``"awq"``, ...) to force it, or ``None`` to disable.
-    * `engine_kwargs` — pass through to ``vllm.LLM``: ``max_model_len``,
-      ``gpu_memory_utilization``, ``tensor_parallel_size`` (tensor parallelism for a
-      model larger than one GPU), ``speculative_config`` /
-      ``spec_decode_disable_by_queue_size`` (speculative decoding), ``enable_lora`` /
-      ``max_loras`` / ``max_cpu_loras`` (multi-adapter serving), ...
+    The factory builds a vLLM engine once per worker and exposes it as a
+    ``list[str] -> list[str]`` callable.
 
     Zero-config batch defaults: **prefix caching** and **chunked prefill** are enabled
     unless you set them — both are throughput/TTFT wins for offline batch (a shared
@@ -76,6 +47,50 @@ def vllm_engine(
     users must turn on by hand. Any value you pass in `engine_kwargs` wins. (`max_model_len`
     is left to vLLM's model default — auto-sizing it to the data needs the worker tokenizer
     and is a follow-on; a char-heuristic could truncate prompts and corrupt output.)
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> engine = bt.ml.vllm_engine("meta-llama/Llama-3-8B", chat=True)  # doctest: +SKIP
+            >>> ds.ml.generate(engine, prompt_column="question").collect()  # doctest: +SKIP
+
+    Args:
+        model: the model id or path handed to ``vllm.LLM``.
+        chat: send each prompt as a **chat conversation** (``LLM.chat``), so vLLM applies
+            the model's own chat template. Set this for any instruction-tuned or chat
+            model: the completion path (the default, matching a base model) skips the
+            template, and the model then answers a prompt in a format it was never tuned
+            on — degraded output with nothing to signal it. Not compatible with an image
+            column (an image has no place in a text conversation); use the completion
+            path for vision.
+        system: a system turn prepended to every conversation (with `chat`).
+        sampling: `SamplingParams` kwargs (``temperature``, ``top_p``, ``max_tokens``,
+            ``stop``, ``n``, ``seed``, ...). Defaults to greedy (``temperature=0``).
+        guided_json: constrain generation to this JSON schema via vLLM's guided decoding
+            — the reliable way to get parseable output; pair with
+            ``llm_generate(parse_json=True)``.
+        guided_regex: constrain generation to this regex, same mechanism.
+        lora_path: serve a single LoRA adapter on top of the base `model` (applied to
+            every row that does not name another adapter).
+        lora_paths: a ``{name: path}`` table of adapters to **multiplex**: a request
+            tagged with that name (via ``llm_generate(adapter_column=...)``) is routed to
+            it, so one engine serves many adapters in one batch. Rows are grouped by
+            adapter and each group generated together; output order is preserved. Set the
+            vLLM ``enable_lora``/``max_loras``/``max_cpu_loras`` kwargs for the cache.
+        quantization: ``"auto"`` (default) picks ``"fp8"`` on GPUs with native FP8 tensor
+            cores (NVIDIA Ada L4/L40S, Hopper H100), where it halves weight/KV-cache
+            memory at <1% quality loss, and keeps native precision (BF16/FP16) elsewhere
+            — the zero-config win Ray Data users must select by hand per GPU. Pass an
+            explicit string (``"fp8"``, ``"awq"``, ...) to force it, or ``None`` to disable.
+        engine_kwargs: passed to ``vllm.LLM``: ``max_model_len``,
+            ``gpu_memory_utilization``, ``tensor_parallel_size`` (for a model larger than
+            one GPU), ``speculative_config`` / ``spec_decode_disable_by_queue_size``
+            (speculative decoding), ``enable_lora`` / ``max_loras`` / ``max_cpu_loras``
+            (multi-adapter serving), ...
+
+    Returns:
+        A zero-arg factory building the vLLM-backed `Engine` once per worker.
     """
     engine_kwargs = _vllm_batch_defaults(engine_kwargs)
 
@@ -261,22 +276,41 @@ def http_engine(
     timeout: float = 60.0,
     concurrency: int = 8,
 ) -> EngineFactory:
-    """An `EngineFactory` calling an OpenAI-compatible HTTP endpoint (the Ray Data
-    ``HttpRequestProcessor`` analog) — batch inference against a *served* model.
+    """An `EngineFactory` calling an OpenAI-compatible HTTP endpoint — a *served* model.
 
-    Targets ``{base_url}/chat/completions`` (``chat=True``, the default) or
-    ``/completions``; with chat, the **server applies the model's chat template**, so a
-    plain prompt string is wrapped as a user message (with an optional `system`
-    message). Works against vLLM's OpenAI server, llama.cpp, or a hosted API. `api_key`
-    sets the bearer token; `max_tokens`/`temperature`/`top_p`/`stop` control decoding
-    (`top_p` and `stop` are omitted from the request body when unset, so a server that
-    rejects unknown or null fields still works).
+    Targets ``{base_url}/chat/completions`` (the default) or ``/completions``; with chat,
+    the **server applies the model's chat template**, so a plain prompt string is wrapped
+    as a user message. Works against vLLM's OpenAI server, llama.cpp, or a hosted API.
 
     The prompts in each batch are sent **concurrently** over up to `concurrency`
     in-flight requests (input order preserved), so a batch's latency is the slowest
     request rather than their sum — the right shape for a network-bound served endpoint
     where one request barely uses the connection. Each request still retries with
-    backoff on the 429s a hosted API returns. Set `concurrency=1` to serialize.
+    backoff on the 429s a hosted API returns.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> engine = bt.ml.http_engine("http://localhost:8000/v1", "my-model")  # doctest: +SKIP
+            >>> ds.ml.generate(engine, prompt_column="question").collect()  # doctest: +SKIP
+
+    Args:
+        base_url: the OpenAI-compatible API root (e.g. ``http://host:8000/v1``).
+        model: the model name the server expects.
+        api_key: bearer token, when the endpoint needs one.
+        system: a system message prepended to every chat request.
+        chat: call ``/chat/completions`` (default) rather than ``/completions``.
+        max_tokens: tokens to sample per request.
+        temperature: sampling temperature (0 = greedy).
+        top_p: nucleus-sampling mass; omitted from the body when unset, so a server that
+            rejects unknown or null fields still works.
+        stop: stop strings; omitted from the body when unset.
+        timeout: per-request timeout in seconds.
+        concurrency: in-flight requests per batch. Set to 1 to serialize.
+
+    Returns:
+        A zero-arg factory building the HTTP-backed `Engine` once per worker.
     """
 
     def factory() -> Engine:

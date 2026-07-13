@@ -86,9 +86,9 @@ each other; `api` wires them.
 
 - New optimizer rule → `kyber/rules/<family>.py`, registered via `@rule`.
 - New scalar/agg/window function → `plan/functions/<family>.py`, surfaced through the
-  `api/functions.py` façade; or a `.str`/`.dt`/… accessor in `plan/expr/namespaces.py`.
+  `api/functions.py` façade; or a `.str`/`.dt`/… accessor in `plan/expr_ir/namespaces/`.
 - New IO format → `io/formats/<fmt>.py`, registered as a `SourceFormat`/`SinkFormat`.
-- New relational operator → Rust `bc-runtime` (mergeable) + `plan/nodes/` + the IR tag.
+- New relational operator → Rust `bc-runtime` (mergeable) + `plan/logical/` + the IR tag.
 - New execution tier (morsel/JIT/LLVM/GPU) → a `core` `Executor` strategy, not new
   call-site branching.
 - New adaptive/resource decision → a `carbonite` policy.

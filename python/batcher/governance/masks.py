@@ -28,6 +28,14 @@ class Redact:
 
     ``Redact(show_last=4)`` masks all but the last four characters — the "card ending
     1234" pattern. Lowers to `mask`; length-preserving, irreversible.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher import col
+            >>> from batcher.governance import Redact
+            >>> Redact(show_last=4)(col("card_number"))
+            col('card_number').cast('string').str.mask('X', 0, 4)
     """
 
     show_first: int = 0
@@ -45,6 +53,14 @@ class Pseudonymize:
     Deterministic (so pseudonymized columns still join and count distinct) and
     irreversible. `key` is a key reference (``env:NAME`` / ``file:PATH``) resolved by the
     data plane, so the persisted policy carries the reference, not the secret.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher import col
+            >>> from batcher.governance import Pseudonymize
+            >>> Pseudonymize("env:HMAC_KEY")(col("email"))
+            col('email').cast('string').str.hmac_sha256('env:HMAC_KEY')
     """
 
     key: str
@@ -59,6 +75,14 @@ class Encrypt:
 
     `key` is a key reference (``env:NAME`` / ``file:PATH``). See `Pseudonymize` for why
     the reference, not the secret, is what the policy stores.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher import col
+            >>> from batcher.governance import Encrypt
+            >>> Encrypt("env:AES_KEY")(col("email"))
+            col('email').cast('string').str.aes_encrypt('env:AES_KEY')
     """
 
     key: str
@@ -72,6 +96,14 @@ class Nullify:
     """Replace the value with NULL — full redaction that keeps the column's type.
 
     The strongest mask: a principal sees the column exists but never any value.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher import col
+            >>> from batcher.governance import Nullify
+            >>> Nullify()(col("salary"))
+            NullIf(col('salary'), col('salary'))
     """
 
     def __call__(self, column: Expr) -> Expr:

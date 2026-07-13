@@ -14,6 +14,12 @@ py="$(command -v python || command -v python3)"
 echo "pre-commit: structural fitness…"
 "$py" tools/lint_structure.py
 
+echo "pre-commit: lint-duplication (copy-paste across the subsystems)…"
+"$py" tools/lint_duplication.py
+
+echo "pre-commit: lint-guardrails (the agent docs must stay true)…"
+"$py" tools/lint_guardrails.py
+
 echo "pre-commit: ruff (lint + commented-out code)…"
 ruff check python tests benchmarks
 

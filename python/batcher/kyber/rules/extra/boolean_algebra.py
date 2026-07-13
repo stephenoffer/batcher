@@ -125,8 +125,23 @@ def _is_false(expr: Expr) -> bool:
 
 def _rewrite_node(node: LogicalPlan, leaf) -> LogicalPlan | None:
     """Apply a leaf `Expr → Expr` rewrite to every expression in `node`, returning the
-    rebuilt node, or `None` when nothing changed (so the driver reaches a fixpoint)."""
+    rebuilt node, or `None` when nothing changed (so the driver reaches a fixpoint).
+
+    **Identity first.** `map_node_expressions` and `transform_expr_up` share structure: when
+    a rule touches nothing — the overwhelming case, since each of the hundred-odd expression
+    rules matches a handful of shapes and passes over the rest — the *same* node object comes
+    back. That is an O(1) "no change", and it is the answer almost every time this is called.
+
+    Falling straight through to `to_ir() != to_ir()` instead meant serializing the node's
+    whole expression tree to JSON **twice, per rule, per node, per fixpoint iteration** just
+    to conclude nothing had happened. That serialization — not the rewriting — was what made
+    the rule set expensive to plan with: it is quadratic in (rules x expression size), and it
+    is pure waste. The IR comparison is still needed on the path where the object *did*
+    change, because a rule may rebuild an equal-but-new tree (`Lit(False)` over an already
+    `Lit(False)`), and treating that as a change would spin the fixpoint forever."""
     new = map_node_expressions(node, lambda e: transform_expr_up(e, leaf))
+    if new is node:
+        return None  # structural sharing proved the rewrite was a no-op
     return new if new.to_ir() != node.to_ir() else None
 
 
@@ -142,7 +157,12 @@ def _and_false(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="and_false_annihilator", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="and_false_annihilator",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _and_false(e),
+)
 def and_false_annihilator(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND FALSE → FALSE`. Under the engine's Kleene AND, `NULL AND FALSE` and
     `TRUE AND FALSE` are both FALSE, so a `FALSE` operand forces the whole conjunction
@@ -161,7 +181,12 @@ def _or_true(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="or_true_annihilator", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="or_true_annihilator",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _or_true(e),
+)
 def or_true_annihilator(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR TRUE → TRUE`. Under the engine's Kleene OR, `NULL OR TRUE` and
     `FALSE OR TRUE` are both TRUE, so a `TRUE` operand forces the disjunction to TRUE.
@@ -183,7 +208,12 @@ def _and_idem(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="and_idempotent", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="and_idempotent",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _and_idem(e),
+)
 def and_idempotent(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND x → x`. In Kleene logic `v AND v = v` for every value (`T,F,N`), so a
     self-conjunction is redundant. Restricted to a `_safe` `x` so collapsing two
@@ -202,7 +232,12 @@ def _or_idem(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="or_idempotent", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="or_idempotent",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _or_idem(e),
+)
 def or_idempotent(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR x → x`. In Kleene logic `v OR v = v` for every value, so a
     self-disjunction is redundant. Restricted to a `_safe` `x`."""
@@ -234,7 +269,12 @@ def _and_absorb(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="and_absorption", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="and_absorption",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _and_absorb(e),
+)
 def and_absorption(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND (x OR y) → x`. The Kleene absorption law holds for all three values
     (`x=T`: `T`; `x=F`: `F`; `x=N`: `N`), so the disjunction is redundant. Both
@@ -252,7 +292,12 @@ def _or_absorb(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="or_absorption", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="or_absorption",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _or_absorb(e),
+)
 def or_absorption(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR (x AND y) → x`. The dual Kleene absorption law, valid for all three
     values. Both operands must be `_safe`."""
@@ -277,7 +322,12 @@ def _complement(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="complement_total_bool", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="complement_total_bool",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _complement(e),
+)
 def complement_total_bool(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND NOT x → FALSE` and `x OR NOT x → TRUE`, but **only** when `x` never
     yields null (`is_null`/`is_not_null`). For a nullable `x`, `x AND NOT x` is NULL
@@ -300,7 +350,12 @@ def _fold_not_comparison(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="fold_not_comparison", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="fold_not_comparison",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _fold_not_comparison(e),
+)
 def fold_not_comparison(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`NOT (a = b) → a <> b`, `NOT (a < b) → a >= b`, … — push `NOT` into a
     comparison. Exact under three-valued logic: a comparison and its complement are
@@ -333,7 +388,12 @@ def _bool_eq_literal(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="bool_eq_literal", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="bool_eq_literal",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _bool_eq_literal(e),
+)
 def bool_eq_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x = TRUE → x`, `x = FALSE → NOT x` (and the `<>` duals) for a boolean `x`.
     Comparing a boolean to a boolean literal is the identity or the negation in all
@@ -352,7 +412,12 @@ def _single_in_list(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="single_in_list", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="single_in_list",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _single_in_list(e),
+)
 def single_in_list(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x IN (v) → x = v`. A one-element membership test is exactly an equality, with
     identical null behavior (`NULL IN (v)` and `NULL = v` are both null). Turns the
@@ -369,7 +434,12 @@ def _dedup_in_list(expr: Expr) -> Expr:
     return expr
 
 
-@rule(name="dedup_in_list", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="dedup_in_list",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _dedup_in_list(e),
+)
 def dedup_in_list(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x IN (a, b, a) → x IN (a, b)`. Set membership is unchanged by duplicate values,
     so de-duplicating (first occurrence kept) shrinks the probe set with no change to
@@ -410,7 +480,12 @@ def _coalesce_simplify(expr: Expr) -> Expr:
     return Coalesce(out)
 
 
-@rule(name="coalesce_simplify", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="coalesce_simplify",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr=lambda e: _coalesce_simplify(e),
+)
 def coalesce_simplify(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Flatten and shrink a `COALESCE`: inline a nested `COALESCE`, drop a later
     duplicate of an earlier `_safe` argument, truncate everything after the first

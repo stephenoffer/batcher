@@ -270,7 +270,10 @@ def stream_eligible(stages: list[MapBatches]) -> bool:
 
 
 def stream_linear_chain(
-    scan: Scan, stages: list[MapBatches], sources: list
+    scan: Scan,
+    stages: list[MapBatches],
+    sources: list,
+    projections: dict[int, list[str]] | None = None,
 ) -> Iterator[pa.RecordBatch]:
     """Yield the chain's output morsels, each stage pipelined on its own thread.
 
@@ -298,8 +301,10 @@ def stream_linear_chain(
     # prefetch order and result are unchanged at any depth.
     src = sources[scan.source_id]
     read_depth = _learned_read_depth(src)
+    # Stream only the columns the plan needs (None = every column, for an undeclared UDF).
+    projection = (projections or {}).get(scan.source_id)
     gen: Iterator[pa.RecordBatch] = prefetch(
-        _timed_source(src, iter(src.iter_batches())), depth=read_depth
+        _timed_source(src, iter(src.iter_batches(projection))), depth=read_depth
     )
     for op in stages:
         depth = _GPU_SOLO_PIPELINE_DEPTH if solo_gpu else _GPU_PIPELINE_DEPTH

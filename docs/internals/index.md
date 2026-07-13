@@ -4,6 +4,14 @@ How Batcher works under the hood: the layered architecture and the components th
 turn your query into results. You don't need any of this to use Batcher — it's here
 for contributors and the curious.
 
+:::{seealso}
+The [deep dives](../deep-dives/index.md) cover the same engine one mechanism at a time,
+with worked examples you can run: the [query lifecycle](../deep-dives/query-lifecycle.md),
+[mergeable algebra](../deep-dives/mergeable-algebra.md),
+[spilling](../deep-dives/spilling.md), and
+[adaptive re-optimization](../deep-dives/adaptive-reoptimization.md).
+:::
+
 ## Architecture overview
 
 ![Batcher's layered architecture from the User API down through the Dataset API, Logical Plan, Kyber optimizer, Physical Plan, Execution Engine, Carbonite, and optional Ray.](../_static/diagrams/layer_stack.png)

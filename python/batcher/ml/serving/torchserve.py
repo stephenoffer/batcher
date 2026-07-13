@@ -28,11 +28,27 @@ def torchserve_client(
 ) -> type:
     """A `map_batches` class UDF posting each batch to a TorchServe model.
 
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml import torchserve_client  # doctest: +SKIP
+            >>> udf = torchserve_client(  # doctest: +SKIP
+            ...     "http://host:8080",
+            ...     "resnet50",
+            ...     input_columns=["image"],
+            ...     output_columns=["class"],
+            ... )
+            >>> ds.ml.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
+
     Args:
         base_url: the TorchServe inference base (e.g. ``http://host:8080``).
         model: the registered model name (the URL becomes ``/predictions/{model}``).
-        input_columns / output_columns: columns sent and appended.
+        input_columns: the columns sent to the handler, in order.
+        output_columns: the result columns appended to each batch.
         timeout: per-request timeout in seconds.
+
+    Returns:
+        A class for ``ds.ml.map_batches(...)`` — the client connects once per worker.
     """
     url = f"{base_url.rstrip('/')}/predictions/{model}"
     return http_client(

@@ -32,6 +32,7 @@ from sources import (
     image_corpus,
     load_tables,
     scan_corpora,
+    scan_rename,
     table_uris,
 )
 
@@ -43,6 +44,7 @@ SOURCE_FOR = {
     "tpcds": "tpcds",
     "clickbench": "clickbench",
     "operators": "tpch",
+    "json": "json",
 }
 
 # Datasets built from a file *corpus* rather than named tables: the cases construct each
@@ -59,6 +61,7 @@ class Context:
     tables: dict[str, pa.Table]
     engines: list[Engine]
     uris: dict[str, str] = field(default_factory=dict)
+    rename: dict[str, dict[str, str]] = field(default_factory=dict)
     corpora: dict[str, ScanCorpus] = field(default_factory=dict)
     images: ImageCorpus | None = None
     _runners: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
@@ -90,7 +93,8 @@ class Context:
         (operator-mix ``handle``/``table`` need in-memory Arrow and raise).
         """
         uris = table_uris(SOURCE_FOR[benchmark], scale, source)
-        return cls(benchmark=benchmark, tables={}, engines=engines, uris=uris)
+        rename = scan_rename(SOURCE_FOR[benchmark], uris)
+        return cls(benchmark=benchmark, tables={}, engines=engines, uris=uris, rename=rename)
 
     @classmethod
     def build_corpus(
@@ -141,7 +145,9 @@ class Context:
                 if not engine.supports_sql:
                     continue
                 runner = (
-                    engine.sql_runner_scan(self.uris) if scan else engine.sql_runner(self.tables)
+                    engine.sql_runner_scan(self.uris, self.rename)
+                    if scan
+                    else engine.sql_runner(self.tables)
                 )
                 if runner is not None:
                     self._runners[engine.name] = runner

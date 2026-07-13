@@ -168,6 +168,54 @@ fn partial_aggregate(
     Ok(PyArrowType(out))
 }
 
+/// Execute `plan_json` and fold its output straight into partial-aggregate state,
+/// without ever handing the intermediate rows back to Python.
+///
+/// The fused shuffle-reduce step. A distributed `GROUP BY` over a join has its reducer
+/// run the per-bucket join and then aggregate the result — and doing that as two FFI
+/// calls (`execute_plan` → Python list → `partial_aggregate`) materializes the *whole*
+/// join output as Python `RecordBatch` objects on the way through. On TPC-H sf10 that is
+/// 3.75M rows / ~106 MB per reducer, built and re-imported for no reason: the only thing
+/// the caller wants is the handful of partial-state rows at the end.
+///
+/// Folding the two inside Rust keeps the intermediate in the engine, so the reducer's
+/// peak memory is the join's own working set rather than the join's output *plus* a
+/// Python mirror of it. Semantics are unchanged — the same plan, the same
+/// `partial_aggregate`/`combine_finalize` on the same batches, so the mergeable algebra
+/// (and therefore the result) is bit-identical to the two-call path.
+///
+/// `finalize` mirrors the caller's contract: `true` when the group keys are a superset of
+/// the join key (every group is whole in this bucket, so it can be finalized here),
+/// `false` to emit partial state for a cross-bucket `combine_finalize` on the driver.
+#[pyfunction]
+#[pyo3(signature = (plan_json, sources, group_keys_json, aggregates_json, engine_config="", finalize=false))]
+fn execute_plan_aggregated(
+    py: Python<'_>,
+    plan_json: &str,
+    sources: Vec<Vec<PyArrowType<RecordBatch>>>,
+    group_keys_json: &str,
+    aggregates_json: &str,
+    engine_config: &str,
+    finalize: bool,
+) -> PyResult<PyArrowType<RecordBatch>> {
+    let (plan, sources, opts, narrow) = prepare_exec(plan_json, sources, engine_config)?;
+    let group_keys = parse_group_keys(group_keys_json)?;
+    let aggregates = parse_aggregates(aggregates_json)?;
+    let out = py.allow_threads(|| {
+        let rows = bc_interp::execute_parallel_with(&plan, &sources, &opts)?;
+        // Narrow exactly where `execute_plan` would have, so the aggregate sees the same
+        // dtypes it saw when this ran as two calls (a no-op unless `shrink_output_dtypes`).
+        let rows = narrow_output(rows, &narrow);
+        let partial = bc_interp::dist::partial_aggregate(&group_keys, &aggregates, &rows)?;
+        if finalize {
+            bc_interp::dist::combine_finalize(&group_keys, &aggregates, &[partial])
+        } else {
+            Ok(partial)
+        }
+    });
+    Ok(PyArrowType(out.map_err(to_pyerr)?))
+}
+
 /// Distributed reduce step: merge partial-state batches and finalize.
 #[pyfunction]
 fn combine_finalize(
@@ -225,6 +273,38 @@ fn read_parquet(
     Ok(batches.into_iter().map(PyArrowType).collect())
 }
 
+/// Native Parquet read with a pushed predicate applied as footer-statistics row-group
+/// pruning before decode.
+///
+/// Same as [`read_parquet`] plus `predicate`: the compact JSON `to_native_predicate`
+/// emits. Row-groups whose statistics prove no row can match are skipped (their column
+/// chunks are never fetched or decoded). Pruning is superset-safe — the engine keeps the
+/// `Filter` operator, so a non-pushable or unparseable predicate simply reads every
+/// requested row-group and the result is identical, just with more rows read.
+#[pyfunction]
+#[pyo3(signature = (uri, row_groups, columns, batch_size, predicate))]
+fn read_parquet_filtered(
+    py: Python<'_>,
+    uri: &str,
+    row_groups: Vec<usize>,
+    columns: Option<Vec<String>>,
+    batch_size: usize,
+    predicate: &str,
+) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
+    let batches = py
+        .allow_threads(|| {
+            bc_io::read_parquet_filtered(
+                uri,
+                &row_groups,
+                columns.as_deref(),
+                batch_size,
+                predicate,
+            )
+        })
+        .map_err(to_pyerr)?;
+    Ok(batches.into_iter().map(PyArrowType).collect())
+}
+
 /// Native read of MANY whole Parquet objects in one pass, returning per-file batch lists.
 ///
 /// The many-small-files throughput path: one GIL release and one runtime pass overlap every
@@ -245,6 +325,24 @@ fn read_parquet_many(
         .into_iter()
         .map(|batches| batches.into_iter().map(PyArrowType).collect())
         .collect())
+}
+
+/// Native Avro (OCF) decode to Arrow — the columnar replacement for the row-by-row
+/// `fastavro` Python path (measured ~33x faster on 3 M rows). `data` is one whole Avro
+/// file's bytes (the Python `AvroSource` already holds them from the split's handle);
+/// `batch_size` is the output `RecordBatch` row count. Errors surface to Python, where
+/// `AvroSource` falls back to `fastavro`, so the result is identical either way.
+#[pyfunction]
+#[pyo3(signature = (data, batch_size))]
+fn read_avro(
+    py: Python<'_>,
+    data: &[u8],
+    batch_size: usize,
+) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
+    let batches = py
+        .allow_threads(|| bc_io::read_avro_bytes(data, batch_size))
+        .map_err(to_pyerr)?;
+    Ok(batches.into_iter().map(PyArrowType).collect())
 }
 
 /// A process-wide memory accounting pool (Carbonite's reserve-before-allocate
@@ -639,8 +737,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(execute_plan, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_metered, m)?)?;
     m.add_function(wrap_pyfunction!(read_parquet, m)?)?;
+    m.add_function(wrap_pyfunction!(read_avro, m)?)?;
+    m.add_function(wrap_pyfunction!(read_parquet_filtered, m)?)?;
     m.add_function(wrap_pyfunction!(read_parquet_many, m)?)?;
     m.add_function(wrap_pyfunction!(partial_aggregate, m)?)?;
+    m.add_function(wrap_pyfunction!(execute_plan_aggregated, m)?)?;
     m.add_function(wrap_pyfunction!(combine, m)?)?;
     m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle::partition_batches, m)?)?;

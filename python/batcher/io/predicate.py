@@ -19,6 +19,7 @@ from typing import Any
 __all__ = [
     "to_iceberg_expression",
     "to_mongo_filter",
+    "to_native_predicate",
     "to_pyarrow_expression",
     "to_sql_where",
 ]
@@ -208,6 +209,59 @@ def to_iceberg_expression(ir: dict[str, Any]) -> Any | None:
         return None
 
     return walk(ir)
+
+
+def _native_scalar(ir: dict[str, Any]) -> tuple[Any, bool]:
+    """A literal for the native reader: ``(value, ok)``.
+
+    Only plain ``int``/``float``/``str``/``bool`` literals push to the native reader's
+    zone-map pruning. Temporal kinds (``date``/``timestamp``/``time``) are epoch offsets
+    whose parquet physical unit the reader cannot verify without risking an unsound prune,
+    so they mark the term non-pushable (``ok=False``) and the pyarrow path handles them.
+    """
+    ((kind, value),) = ir["value"].items()
+    if kind in ("int", "float", "str", "bool"):
+        return value, True
+    return None, False
+
+
+def to_native_predicate(ir: dict[str, Any]) -> dict[str, Any] | None:
+    """Translate the pushable subset of `ir` to the native reader's compact predicate.
+
+    The shape `bc_io`'s `predicate` module deserializes: ``{"node":"cmp","col":..,"op":..,
+    "lit":..}`` / ``{"node":"and"/"or","left":..,"right":..}`` / ``{"node":"null","col":..,
+    "negated":..}``. Comparisons are normalized so the column is on the left. Returns
+    ``None`` if any term is not pushable (a non-column/literal comparison, a temporal
+    literal, or an unsupported node) — the caller then reads without native pruning.
+    """
+    e = ir.get("e")
+    if e in ("is_null", "is_not_null"):
+        inner = ir["input"]
+        if inner.get("e") != "col":
+            return None
+        return {"node": "null", "col": inner["name"], "negated": e == "is_not_null"}
+    if e != "binary":
+        return None
+    op = ir["op"]
+    if op in ("and", "or"):
+        left = to_native_predicate(ir["left"])
+        right = to_native_predicate(ir["right"])
+        if left is None or right is None:
+            return None
+        return {"node": op, "left": left, "right": right}
+    if op in _CMP:
+        left, right = ir["left"], ir["right"]
+        if left.get("e") == "col" and right.get("e") == "lit":
+            col, lit_ir, flipped = left["name"], right, False
+        elif left.get("e") == "lit" and right.get("e") == "col":
+            col, lit_ir, flipped = right["name"], left, True
+        else:
+            return None
+        value, ok = _native_scalar(lit_ir)
+        if not ok:
+            return None
+        return {"node": "cmp", "col": col, "op": _FLIP[op] if flipped else op, "lit": value}
+    return None
 
 
 _MONGO_OP = {"eq": "$eq", "ne": "$ne", "lt": "$lt", "le": "$lte", "gt": "$gt", "ge": "$gte"}

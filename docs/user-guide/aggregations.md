@@ -26,8 +26,8 @@ keywords to name the output, or positionally to keep the source column's name.
 {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; the column aggregates are methods
 on an expression (`.sum()`, `.mean()`, …) or the top-level shorthands
 {py:obj}`bt.sum("x") <batcher.sum>`, `bt.mean`, `bt.min`, `bt.max`, `bt.median`,
-`bt.std`, `bt.var`, `bt.n_unique` — where `bt.sum("x")` reads as
-`col("x").sum()` (the Polars `pl.sum` convention).
+`bt.std`, `bt.var`, `bt.n_unique`. `bt.sum("x")` reads as `col("x").sum()`, the
+Polars `pl.sum` convention.
 
 ```python
 # Positional shorthands keep the column name; keywords rename.
@@ -49,10 +49,10 @@ print(out.to_pydict())
 
 ## Shortcut reductions
 
-When you reduce *every* value column the same way, the shortcut methods —
-`sum`, `mean`, `min`, `max`, `median`, `quantile(q)`, `n_unique`, `std`, `var`,
-`count` (non-null values per column), and `len` (the per-group row count) — are
-shorter than spelling out `agg`. With no arguments they reduce every non-key
+When you reduce *every* value column the same way, a shortcut method is shorter
+than spelling out `agg`. The set is `sum`, `mean`, `min`, `max`, `median`,
+`quantile(q)`, `n_unique`, `std`, `var`, `count` (non-null values per column), and
+`len` (the per-group row count). With no arguments they reduce every non-key
 column, keeping its name; pass column names or a
 [selector](transformations.md) to reduce a subset. The arithmetic reductions
 (`sum`, `mean`, `median`, `quantile`, `std`, `var`) default to numeric columns
@@ -79,9 +79,9 @@ two-column statistic.
 The aggregate methods available inside `agg` are `sum`, `min`, `max`, `mean`,
 `var`, `std`, `median`, `quantile(q)`, `count`, and `n_unique` (also spelled
 `count_distinct`). {py:obj}`bt.count() <batcher.count>` counts rows. Each of these
-builds an {py:class}`AggExpr <batcher.AggExpr>` — the aggregate type that `agg(...)`
-consumes and that `.over(...)` lifts into a [window function](window-functions.md);
-you rarely name it directly.
+builds an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that `agg(...)`
+consumes and that `.over(...)` lifts into a [window function](window-functions.md).
+You rarely name it directly.
 
 ```python
 stats = ds.group_by("category").agg(
@@ -124,7 +124,7 @@ correlation coefficient in `[-1, 1]` (SQL `CORR`); {py:obj}`bt.covar_pop(x, y)
 <batcher.covar_pop>` and {py:obj}`bt.covar_samp(x, y) <batcher.covar_samp>` are the
 population and sample covariance (SQL `COVAR_POP` / `COVAR_SAMP`, dividing by `n`
 and `n - 1` respectively). Reach for `corr` to score the strength and sign of a
-relationship — for instance whether ad spend tracks revenue per region:
+relationship: whether ad spend tracks revenue per region, say.
 
 ```python
 market = bt.from_pydict(
@@ -146,11 +146,12 @@ print(bivariate.to_pydict())
 
 ## Approximate aggregates
 
-For distinct counts and quantiles at scale, the sketch-backed aggregates trade a
-little accuracy for bounded memory and mergeability: `approx_n_unique`
-(HyperLogLog), `approx_quantile(q)` and `approx_median` (KLL). They merge exactly
-across partitions, so the estimate is identical single-node or distributed. On small
-inputs the estimate typically matches the exact count.
+Exact distinct counts and quantiles get expensive on large inputs. The
+sketch-backed aggregates trade a little accuracy for bounded memory and
+mergeability: `approx_n_unique` (HyperLogLog), `approx_quantile(q)` and
+`approx_median` (KLL). They merge exactly across partitions, so the estimate is
+identical single-node or distributed. On small inputs it typically matches the
+exact count.
 
 ```python
 approx = ds.group_by("category").agg(
@@ -219,9 +220,8 @@ print(buckets.to_pydict())
 ## Next steps
 
 - [Joins](joins.md): combine grouped results with other datasets.
-- [Window functions](window-functions.md): per-row aggregates that do not collapse
-  rows.
-- [Performance and memory](performance.md): cache a reused rollup and spill large
-  aggregations.
+- [Window functions](window-functions.md): per-row aggregates that keep the rows.
+- [Performance and memory](performance.md): cache a rollup you reuse, and spill the
+  aggregations too big for memory.
 - [Expressions API](../api/expressions.md): every aggregate and approximate-aggregate
   method in one place.

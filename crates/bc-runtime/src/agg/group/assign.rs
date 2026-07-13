@@ -19,6 +19,7 @@ use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 
 use crate::error::RuntimeError;
+use crate::keys::canon_f64;
 
 /// Assign each row a dense group id, returning the ids, the group count, and the
 /// distinct group-key columns (in first-seen order).
@@ -57,9 +58,7 @@ pub(crate) fn assign_groups(
             // matching SQL/DuckDB — and hash those bits directly instead of paying the
             // RowConverter's per-row float encode. Nullable falls through to the RowConverter
             // (which coalesces nulls into one group); the fast path is null-free only.
-            DataType::Float64 if arr.null_count() == 0 => {
-                return assign_groups_f64(arr, num_rows)
-            }
+            DataType::Float64 if arr.null_count() == 0 => return assign_groups_f64(arr, num_rows),
             // A dictionary-encoded key groups on its integer *codes*, not its (repeated)
             // values — the whole point of the encoding. Without this it falls through to the
             // RowConverter path and is ~7x SLOWER than the same column decoded, so a dictionary
@@ -131,12 +130,21 @@ pub(crate) fn assign_groups(
         }
         return assign_groups_multi_raw(group_keys, num_rows);
     }
-    let fields: Vec<SortField> = group_keys
+    // The general (row-encoded) path. Canonicalize float keys FIRST: arrow's row encoding is
+    // NOT canonical for floats — it maps `-0.0` and `0.0` to different bytes — so without this
+    // a *nullable* float key (which is exactly what falls through to here; the null-free float
+    // fast path above already canonicalizes) would split the two zeros into two groups, while
+    // SQL and DuckDB treat them as one. The encoded rows are used only for hashing/equality;
+    // the group's output value is `take`n from the ORIGINAL column below, so the canonical form
+    // decides *identity* without changing the representative the query returns.
+    let canon = crate::keys::canonicalize_float_keys(group_keys);
+    let encode_keys: &[ArrayRef] = canon.as_deref().unwrap_or(group_keys);
+    let fields: Vec<SortField> = encode_keys
         .iter()
         .map(|a| SortField::new(a.data_type().clone()))
         .collect();
     let converter = RowConverter::new(fields)?;
-    let rows = converter.convert_columns(group_keys)?;
+    let rows = converter.convert_columns(encode_keys)?;
 
     // Group via a raw hash table keyed by *row index* — we store only the
     // first-seen row of each group and compare encoded rows directly, avoiding
@@ -169,7 +177,15 @@ pub(crate) fn assign_groups(
     }
 
     let num_groups = reps.len();
-    let group_columns = converter.convert_rows(reps.iter().map(|&i| rows.row(i as usize)))?;
+    // `take` the first-seen row of each group from the ORIGINAL key columns rather than decoding
+    // the encoded rows. Decoding would hand back the *canonical* float (`0.0` for a group first
+    // seen as `-0.0`), whereas every other grouping path here returns the first-seen value — and
+    // so does DuckDB. Taking from the source keeps the paths identical and skips a decode.
+    let reps_arr = UInt32Array::from(reps);
+    let group_columns = group_keys
+        .iter()
+        .map(|a| arrow::compute::take(a, &reps_arr, None))
+        .collect::<Result<_, _>>()?;
     Ok((group_ids, num_groups, group_columns))
 }
 
@@ -780,23 +796,6 @@ fn is_raw_multikey_col(a: &ArrayRef) -> bool {
         )
 }
 
-/// Canonical `u64` grouping key for an `f64`.
-///
-/// Every NaN bit-pattern maps to one value and negative zero maps to positive zero, so raw-bit
-/// hashing and equality agree with SQL GROUP BY semantics: all NaNs form one group and the two
-/// zeros form one group (matching DuckDB; batcher's old `RowConverter` path wrongly split the
-/// zeros). Every other value keeps its exact bits, so distinct finite values stay distinct.
-#[inline]
-fn canon_f64(v: f64) -> u64 {
-    if v.is_nan() {
-        0x7ff8_0000_0000_0000 // one canonical quiet NaN
-    } else if v == 0.0 {
-        0 // +0.0 bits (folds -0.0 into 0.0)
-    } else {
-        v.to_bits()
-    }
-}
-
 /// One key column of the mixed raw multi-key grouper, borrowed as its concrete array so
 /// the hot loop hashes/compares raw values (no `RowConverter`, no per-row allocation).
 enum RawKeyCol<'a> {
@@ -845,7 +844,9 @@ fn assign_groups_multi_raw(
     let cols: Vec<RawKeyCol> = group_keys
         .iter()
         .map(|a| {
-            use arrow::datatypes::DataType::{Binary, Float64, Int64, LargeBinary, LargeUtf8, Utf8};
+            use arrow::datatypes::DataType::{
+                Binary, Float64, Int64, LargeBinary, LargeUtf8, Utf8,
+            };
             match a.data_type() {
                 Int64 => RawKeyCol::Int(a.as_primitive::<Int64Type>()),
                 Float64 => RawKeyCol::Float(a.as_primitive::<Float64Type>()),

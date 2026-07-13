@@ -66,9 +66,11 @@ def sentence_transformer_encoder(
     return _STEncoder
 
 
-# Encodes a list of strings into a sequence of equal-length numeric vectors.
 Encoder = Callable[[list[str]], Sequence[Sequence[float]]]
+"""Encodes a list of strings into a sequence of equal-length numeric vectors."""
+
 EncoderFactory = Callable[[], Encoder]
+"""Builds an `Encoder`, called once per worker so the model loads a single time."""
 
 
 def embed(
@@ -83,6 +85,15 @@ def embed(
 ) -> Iterator[pa.RecordBatch]:
     """Append an embedding column produced from `text_column`.
 
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> from batcher.ml import embed, sentence_transformer_encoder  # doctest: +SKIP
+            >>> ds = bt.from_pydict({"text": ["a cat", "a dog"]})  # doctest: +SKIP
+            >>> factory = lambda: SentenceTransformer("all-MiniLM-L6-v2").encode  # doctest: +SKIP
+            >>> list(embed(ds.iter_batches(), factory, text_column="text"))  # doctest: +SKIP
+
     Args:
         batches: an iterable of `pyarrow.RecordBatch`.
         encoder_factory: zero-arg callable returning an encoder
@@ -90,7 +101,9 @@ def embed(
             model loads once.
         text_column: the string column to embed.
         output_column: name of the appended `list<float64>` column.
-        num_workers / target_batch_rows / **pool_kwargs: forwarded to `InferencePool`.
+        num_workers: pool size — encoders built, and batches embedded, in parallel.
+        target_batch_rows: rows per batch handed to an encoder.
+        pool_kwargs: further `InferencePool` options (e.g. ``target_latency_ms``).
 
     Yields:
         Each input batch with `output_column` appended, in order.
@@ -138,8 +151,27 @@ def vector_search(
     Returns the `k` rows nearest to `query` (a 1-D embedding), with a ``_distance``
     column — the retrieval step for RAG / similarity lookup. Uses the column's ANN
     index when one exists (build it with `build_vector_index`), else a brute-force
-    scan. `nprobes`/`refine_factor` trade recall for latency; `filter` is a SQL
-    predicate applied with the search. Needs ``batcher-engine[lance]``.
+    scan. Needs ``batcher-engine[lance]``.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml import vector_search  # doctest: +SKIP
+            >>> hits = vector_search("s3://bucket/docs.lance", query_vector, k=5)  # doctest: +SKIP
+            >>> hits.collect()  # doctest: +SKIP
+
+    Args:
+        uri: the Lance dataset to search.
+        query: the query embedding (a 1-D sequence of floats).
+        column: the vector column to search.
+        k: how many nearest rows to return.
+        columns: subset of columns to return (default: all).
+        filter: optional SQL predicate applied with the search.
+        nprobes: index partitions to probe — higher is more recall, more latency.
+        refine_factor: re-rank ``k * refine_factor`` candidates with exact distances.
+
+    Returns:
+        A `Dataset` of the `k` nearest rows, with a ``_distance`` column appended.
     """
     import batcher as bt
     from batcher.io.formats.structured.lance import lance_vector_search
@@ -160,8 +192,19 @@ def vector_search(
 def build_vector_index(uri: str, column: str = "embedding", **index_kwargs: Any) -> None:
     """Build an ANN index on a Lance vector `column` so `vector_search` scales.
 
-    `index_kwargs` (e.g. ``index_type``, ``metric``, ``num_partitions``,
-    ``num_sub_vectors``) pass through to Lance. Needs ``batcher-engine[lance]``.
+    Needs ``batcher-engine[lance]``.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml import build_vector_index  # doctest: +SKIP
+            >>> build_vector_index("s3://bucket/docs.lance", "embedding")  # doctest: +SKIP
+
+    Args:
+        uri: the Lance dataset holding the vectors.
+        column: the vector column to index.
+        index_kwargs: passed to Lance (``index_type``, ``metric``, ``num_partitions``,
+            ``num_sub_vectors``, ...).
     """
     from batcher.io.formats.structured.lance import lance_create_vector_index
 

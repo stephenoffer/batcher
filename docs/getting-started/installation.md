@@ -1,18 +1,17 @@
 # Installation
 
-Batcher is distributed on PyPI as **`batcher-engine`** and imported as **`batcher`**
-(the bare `batcher` name on PyPI belongs to an unrelated project). The core engine
-(the Python control plane plus the compiled Rust data plane) is self-contained.
-Optional features such as distribution, file formats, and ML backends are pulled in
-through extras.
+On PyPI the package is `batcher-engine`; in your code it imports as `batcher`. (The bare
+`batcher` name on PyPI belongs to an unrelated project.) Everything the core engine
+needs ships in that one wheel: the Python control plane and the compiled Rust data
+plane. Distribution, file formats, and ML backends arrive through extras.
 
 ## Requirements
 
 - Python 3.10 or newer.
 - A 64-bit platform (Linux, macOS, or Windows).
 
-The compiled engine is distributed as a native extension module
-(`batcher._native`); no separate Rust toolchain is needed to install a release.
+Releases ship the compiled engine as a native extension module (`batcher._native`), so
+you do not need a Rust toolchain to install one.
 
 ## Install the core engine
 
@@ -20,7 +19,7 @@ The compiled engine is distributed as a native extension module
 pip install batcher-engine
 ```
 
-After it finishes, the import and a small query should work:
+Then check that the import and a small query work:
 
 ```python
 import batcher as bt
@@ -32,15 +31,15 @@ print(ds.select(doubled=bt.col("x") * 2).to_pydict())
 
 ## Optional extras
 
-Extras are installed with the usual `pip install "batcher-engine[extra]"` syntax.
-They add capabilities without changing the core API.
+Extras install with the usual `pip install "batcher-engine[extra]"` syntax. None of
+them change the core API.
 
-- `ray` - distributed execution and scheduling. Ray is used for task and actor
-  scheduling only; bulk data moves over Arrow Flight, not the Ray object store.
-- `cloud` - object-store filesystems (`s3://`, `gs://`, and similar) via fsspec.
-- `torch`, `tensorflow` - ML data-plane backends for the `.ml` accessor.
-- `duckdb`, `polars` - reference backends used by the benchmark and differential
-  test suites; not part of the core engine.
+- `ray`: distributed execution and scheduling. Ray schedules tasks and actors; bulk
+  data moves over Arrow Flight, never through the Ray object store.
+- `cloud`: object-store filesystems (`s3://`, `gs://`, and similar) via fsspec.
+- `torch`, `tensorflow`: ML data-plane backends for the `.ml` accessor.
+- `duckdb`, `polars`: the reference backends the benchmark and differential test
+  suites compare against. They are not part of the core engine.
 
 Install several at once:
 
@@ -48,10 +47,10 @@ Install several at once:
 pip install "batcher-engine[ray,cloud]"
 ```
 
-## Install from GitHub
+## Install an unreleased revision
 
-To install an unreleased revision straight from source (this builds the Rust engine,
-so a [Rust toolchain](https://rustup.rs) is required):
+Installing straight from the git repository builds the Rust engine, so you need a
+[Rust toolchain](https://rustup.rs):
 
 ```
 pip install "git+https://github.com/stephenoffer/batcher.git"
@@ -59,8 +58,8 @@ pip install "git+https://github.com/stephenoffer/batcher.git"
 
 ## Building from source
 
-If you are working on the engine itself, build the Rust crates into your virtual
-environment. The project uses `just` recipes that wrap the exact build commands:
+Working on the engine itself means building the Rust crates into your virtual
+environment. The `just` recipes wrap the exact build commands:
 
 ```
 just build          # maturin develop - compile the engine into the venv
@@ -77,7 +76,7 @@ Once built, `import batcher` resolves the local `batcher._native` extension.
 :::{grid-item-card} {octicon}`rocket;1.1em` Quickstart
 :link: quickstart
 :link-type: doc
-Run an end-to-end query in a couple of minutes.
+Run a query end to end in a couple of minutes.
 :::
 
 :::{grid-item-card} {octicon}`light-bulb;1.1em` Core concepts

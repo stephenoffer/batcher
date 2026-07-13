@@ -18,6 +18,7 @@ over two aggregates picks its build side from the two real sizes.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 
 import pyarrow as pa
@@ -319,9 +320,16 @@ def _execute_adaptive(
     # each operator to spawn its own fleet — bit-identical to before.
     fleet = None
     fleet_token = None
+    stack = contextlib.ExitStack()
     if distributed:
-        from batcher.dist.fleet import maybe_spawn_query_fleet, set_fleet
+        from batcher.dist.fleet import maybe_spawn_query_fleet, session_fleet_lease, set_fleet
 
+        # Hold the warm *session* fleet for the whole staged query. Each stage's operator
+        # takes its own short lease, but between stages nothing would — and an intermediate
+        # left partitioned on the workers is read in place by the next stage, so a teardown
+        # in that gap destroys it. (The per-operator lease alone also let the idle timer
+        # kill the fleet under any single stage running longer than it.)
+        stack.enter_context(session_fleet_lease())
         fleet = maybe_spawn_query_fleet(num_workers, transport)
         if fleet is not None:
             fleet_token = set_fleet(fleet)
@@ -342,9 +350,26 @@ def _execute_adaptive(
             est_rows = 0 if final else _estimate_rows(target, srcs, hub)
             # Intermediate stages may stay partitioned (materialize=False); the final
             # stage must collect a table to return.
+            import os as _os
+            import time as _t
+
+            _dbg = _os.environ.get("BATCHER_DEBUG_STAGES")
+            _t0 = _t.perf_counter()
+            if _dbg:
+                print(
+                    f"[stage {stages}] {type(target).__name__} final={final} est={est_rows:.0f}",
+                    flush=True,
+                )
             result, decs = _run_stage(
                 target, srcs, hub, distributed, num_workers, transport, materialize=final
             )
+            if _dbg:
+                _n = getattr(result, "num_rows", None)
+                _elapsed = _t.perf_counter() - _t0
+                print(
+                    f"[stage {stages}] -> {type(result).__name__} rows={_n} in {_elapsed:.1f}s",
+                    flush=True,
+                )
             decisions.extend(decs)
             stages += 1
             if final:
@@ -406,6 +431,9 @@ def _execute_adaptive(
 
             reset_fleet(fleet_token)
             fleet.cleanup()
+        # Drop the query-scoped session-fleet lease last: every intermediate that read
+        # from the warm fleet is gone, so it may now go idle (and time out) safely.
+        stack.close()
 
 
 def _run_stage(
@@ -427,13 +455,15 @@ def _run_stage(
     `row_count`, so the optimizer's estimator reads *measured* sizes for its
     build-side/broadcast/join-order choices, not guesses. With ``materialize=False``
     a distributed stage may return a `MaterializedSource` (result kept on disk).
+
+    A stage carrying `map_batches` is opaque to Kyber, so it bypasses `run_relational` — but
+    it still honours `distributed`: the `DistributedExecutor` fans the UDF/inference chain out
+    across the workers (`dist.executors.map`), exactly as the one-shot path does. Running it
+    through the single-node UDF orchestrator regardless — which is what this did — pinned every
+    distributed `map_batches` pipeline (the batch-inference hot path, and Ray Data's home turf)
+    to the **driver alone**, using one node of the cluster while the other fifteen sat idle.
     """
     from batcher import core
-    from batcher.api.orchestration import run_relational
-
-    if core.has_map_batches(node):
-        batches = core.execute_with_udfs(node, sources)
-        return _table(batches, node), []
 
     ctx = core.ExecutionContext(
         columns=node.available_columns(),
@@ -441,6 +471,17 @@ def _run_stage(
         num_workers=num_workers,
         transport=transport,
     )
+
+    if core.has_map_batches(node):
+        if distributed:
+            from batcher.api import executors
+
+            return executors.select(node, distributed=True).execute(node, sources, ctx), []
+        batches = core.execute_with_udfs(node, sources)
+        return _table(batches, node), []
+
+    from batcher.api.orchestration import run_relational
+
     return run_relational(node, sources, ctx, distributed=distributed, materialize=materialize)
 
 

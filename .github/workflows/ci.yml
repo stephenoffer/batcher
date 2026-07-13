@@ -64,6 +64,15 @@ jobs:
       - name: Structure limits
         run: just lint-structure
 
+      - name: Duplication gate
+        run: just lint-duplication
+
+      - name: Guardrail docs are true
+        run: just lint-guardrails
+
+      - name: Public-API docstrings
+        run: just lint-docstrings
+
       - name: Build engine into the environment
         run: just build
 

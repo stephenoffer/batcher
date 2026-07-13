@@ -97,11 +97,22 @@ class LogicalPlan:
         `sort_keys` is unnecessary — `to_ir()` builds its dicts in a fixed, deterministic
         order, so the serialization already canonicalizes an identical plan — which is why
         the compact, unsorted dump is a safe key (never a wrong hit; at worst a missed one).
+
+        A plan carrying an **opaque** node (`map_batches` runs in Python and deliberately has
+        no engine IR, so its `to_ir()` raises) cannot be fingerprinted by content. Such a plan
+        is keyed by *instance identity* instead: the memo still hits when the same plan object
+        is optimized twice (the adaptive loop, a `collect` loop), and two different UDFs can
+        never collide onto one key — a collision would hand one query the other's optimized
+        plan, i.e. a wrong answer. A rebuilt-from-scratch UDF plan simply misses and
+        re-optimizes, which is only ever a cost, never an error.
         """
         cache = self.__dict__
         val = cache.get("_c_content_key", _UNSET)
         if val is _UNSET:
-            payload = json.dumps(self.to_ir(), separators=(",", ":"), default=str)
+            try:
+                payload = json.dumps(self.to_ir(), separators=(",", ":"), default=str)
+            except NotImplementedError:
+                payload = f"opaque:{id(self):x}"
             val = hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
             cache["_c_content_key"] = val
         return val

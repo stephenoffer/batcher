@@ -1,10 +1,8 @@
 # Machine learning
 
-Run your models where your data already lives. The `ml` accessor hands your Python
-functions and models whole Arrow batches instead of one row at a time, and the
-scheduler places that work on GPUs and across worker actors for you. From there the
-pages cover the common jobs: batch inference and embeddings, feature preprocessing,
-decoding images and audio, serving models, LLM generation, and loading training data.
+Run your models where the data already is. The `ml` accessor hands your Python
+functions and models whole Arrow batches instead of one row at a time, and it places
+that work on GPUs and across worker actors for you.
 
 ::::{grid} 1 2 3 4
 :gutter: 3
@@ -24,7 +22,7 @@ Feature transforms over batches.
 :::{grid-item-card} {octicon}`image;1.1em` Multimodal
 :link: multimodal
 :link-type: doc
-Decode images, audio, and video.
+Decode images and audio into tensors; sample video frames.
 :::
 
 :::{grid-item-card} {octicon}`server;1.1em` Serving
@@ -56,6 +54,54 @@ Inference over live streams.
 :link-type: doc
 Place work on GPUs and actors.
 :::
+
+:::{grid-item-card} {octicon}`git-branch;1.1em` Embeddings
+:link: embeddings
+:link-type: doc
+Encode a column into vectors, at scale.
+:::
+
+:::{grid-item-card} {octicon}`search;1.1em` Vector search
+:link: vector-search
+:link-type: doc
+Brute force in-engine, or an ANN index.
+:::
+
+:::{grid-item-card} {octicon}`book;1.1em` RAG
+:link: rag
+:link-type: doc
+Chunk, embed, retrieve, generate.
+:::
+
+:::{grid-item-card} {octicon}`typography;1.1em` Tokenization
+:link: tokenization
+:link-type: doc
+Tokenize as a stage; pack sequences.
+:::
+
+:::{grid-item-card} {octicon}`workflow;1.1em` Distributed training
+:link: distributed-training
+:link-type: doc
+Balanced, resumable, elastic sharding.
+:::
+
+:::{grid-item-card} {octicon}`stack;1.1em` Data loaders
+:link: data-loaders
+:link-type: doc
+Which loader, and what it guarantees.
+:::
+
+:::{grid-item-card} {octicon}`meter;1.1em` Batch scoring
+:link: batch-scoring
+:link-type: doc
+The offline scoring job, end to end.
+:::
+
+:::{grid-item-card} {octicon}`plug;1.1em` Serving patterns
+:link: model-serving-patterns
+:link-type: doc
+In-process, or call a served model.
+:::
 ::::
 
 ```{toctree}
@@ -69,4 +115,12 @@ llm
 pytorch
 streaming
 gpu
+embeddings
+vector-search
+rag
+tokenization
+distributed-training
+data-loaders
+batch-scoring
+model-serving-patterns
 ```

@@ -1,7 +1,7 @@
 # User guide
 
-Task-oriented guides for the Dataset API, grouped by what you're doing. Each page
-covers one capability with runnable examples.
+Task-oriented guides for the Dataset API, grouped by what you're doing. One page per
+capability, every example runnable.
 
 ## Transform
 
@@ -11,19 +11,49 @@ covers one capability with runnable examples.
 :::{grid-item-card} {octicon}`pencil;1.1em` Transformations
 :link: transformations
 :link-type: doc
-Select, derive, reshape, and explode columns.
+Select and derive columns; reshape and explode them.
 :::
 
 :::{grid-item-card} {octicon}`filter;1.1em` Filtering
 :link: filtering
 :link-type: doc
-Predicates, null handling, and sampling.
+Predicates, null handling, sampling.
 :::
 
 :::{grid-item-card} {octicon}`code;1.1em` Expressions
 :link: expressions
 :link-type: doc
 The composable column language and its accessors.
+:::
+
+:::{grid-item-card} {octicon}`sort-desc;1.1em` Sorting
+:link: sorting
+:link-type: doc
+Order rows; nulls, NaN, ties, top-n.
+:::
+
+:::{grid-item-card} {octicon}`duplicate;1.1em` Distinct and dedup
+:link: distinct-and-dedup
+:link-type: doc
+Exact, keyed, and near-duplicate removal.
+:::
+
+:::{grid-item-card} {octicon}`beaker;1.1em` Sampling
+:link: sampling
+:link-type: doc
+Reproducible samples and train/test splits.
+:::
+
+:::{grid-item-card} {octicon}`code-square;1.1em` UDFs
+:link: udfs
+:link-type: doc
+Your Python over whole Arrow batches.
+:::
+
+:::{grid-item-card} {octicon}`typography;1.1em` Type system
+:link: type-system
+:link-type: doc
+Arrow types, boundary widening, casts, nulls.
 :::
 ::::
 
@@ -35,19 +65,25 @@ The composable column language and its accessors.
 :::{grid-item-card} {octicon}`graph;1.1em` Aggregations
 :link: aggregations
 :link-type: doc
-Group, summarize, pivot, and roll up.
+Group and summarize; pivot; roll up.
 :::
 
 :::{grid-item-card} {octicon}`git-merge;1.1em` Joins
 :link: joins
 :link-type: doc
-Inner, outer, semi, anti, and as-of joins.
+Inner, outer, semi, anti, as-of.
 :::
 
 :::{grid-item-card} {octicon}`versions;1.1em` Window functions
 :link: window-functions
 :link-type: doc
 Ranking, running totals, lag and lead.
+:::
+
+:::{grid-item-card} {octicon}`table;1.1em` Pivoting
+:link: pivoting
+:link-type: doc
+Long to wide and back.
 :::
 
 :::{grid-item-card} {octicon}`database;1.1em` SQL
@@ -71,13 +107,19 @@ Files, object storage, databases, streams.
 :::{grid-item-card} {octicon}`upload;1.1em` Writing data
 :link: writing-data
 :link-type: doc
-Files, lakehouse tables, and sinks.
+Files, lakehouse tables, sinks.
+:::
+
+:::{grid-item-card} {octicon}`plug;1.1em` Custom connectors
+:link: custom-connectors
+:link-type: doc
+Plug in your own source or sink format.
 :::
 
 :::{grid-item-card} {octicon}`cloud;1.1em` Cloud storage
 :link: cloud-storage
 :link-type: doc
-S3, GCS, Azure, and on-prem.
+S3, GCS, Azure, on-prem.
 :::
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Streaming
@@ -92,10 +134,22 @@ Windows, watermarks, exactly-once.
 ::::{grid} 1 2 2 2
 :gutter: 3
 
+:::{grid-item-card} {octicon}`stack;1.1em` Caching
+:link: caching
+:link-type: doc
+Reuse a result instead of recomputing it.
+:::
+
+:::{grid-item-card} {octicon}`telescope;1.1em` Explain plans
+:link: explain-plans
+:link-type: doc
+Read the plan and the measured profile.
+:::
+
 :::{grid-item-card} {octicon}`light-bulb;1.1em` Best practices
 :link: best-practices
 :link-type: doc
-Patterns for fast, reliable pipelines.
+Patterns for pipelines that stay fast.
 :::
 
 :::{grid-item-card} {octicon}`bug;1.1em` Troubleshooting
@@ -112,6 +166,11 @@ Diagnose and fix common issues.
 transformations
 filtering
 expressions
+sorting
+distinct-and-dedup
+sampling
+udfs
+type-system
 ```
 
 ```{toctree}
@@ -121,6 +180,7 @@ expressions
 aggregations
 joins
 window-functions
+pivoting
 sql
 ```
 
@@ -130,6 +190,7 @@ sql
 
 reading-data
 writing-data
+custom-connectors
 cloud-storage
 lakehouse
 streaming
@@ -148,6 +209,8 @@ governance
 :caption: Operate
 
 performance
+caching
+explain-plans
 best-practices
 troubleshooting
 ```

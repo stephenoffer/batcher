@@ -70,6 +70,15 @@ def to_numpy_batches(
 
     Numeric, non-null columns convert zero-copy; nullable/string columns copy.
 
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.ml import to_numpy_batches
+            >>> batch = pa.record_batch({"x": [1, 2], "y": [3.0, 4.0]})
+            >>> next(to_numpy_batches([batch], columns=["x"]))
+            {'x': array([1, 2])}
+
     Args:
         batches: an iterable of `pyarrow.RecordBatch`.
         columns: optional subset of column names to keep (default: all).
@@ -114,6 +123,21 @@ def to_torch_iterable(
     columns (e.g. strings) are skipped. Requires `torch`. The dataset is single-pass
     over `batches` unless `batches` is itself re-iterable.
 
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> from batcher.ml import to_torch_iterable  # doctest: +SKIP
+            >>> ds = bt.from_pydict({"x": [1, 2, 3]})  # doctest: +SKIP
+            >>> loader = to_torch_iterable(ds.iter_batches())  # doctest: +SKIP
+
+    Args:
+        batches: an iterable of `pyarrow.RecordBatch`.
+        columns: optional subset of column names to keep (default: all).
+
+    Returns:
+        A `torch.utils.data.IterableDataset` yielding one tensor dict per batch.
+
     Raises:
         ImportError: if `torch` is not installed.
     """
@@ -139,6 +163,21 @@ def to_tf_dataset(
 
     Each element is one batch's columns as TensorFlow tensors; non-numeric columns
     (e.g. strings) are skipped. Requires `tensorflow`. Re-iterable iff `batches` is.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt  # doctest: +SKIP
+            >>> from batcher.ml import to_tf_dataset  # doctest: +SKIP
+            >>> ds = bt.from_pydict({"x": [1, 2, 3]})  # doctest: +SKIP
+            >>> tf_ds = to_tf_dataset(ds.iter_batches())  # doctest: +SKIP
+
+    Args:
+        batches: an iterable of `pyarrow.RecordBatch`.
+        columns: optional subset of column names to keep (default: all).
+
+    Returns:
+        A ``tf.data.Dataset`` yielding one `{column: tensor}` dict per batch.
 
     Raises:
         ImportError: if `tensorflow` is not installed.

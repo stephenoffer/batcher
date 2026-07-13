@@ -35,9 +35,9 @@ for batch in ds.iter_batches(batch_size=2):
 # 2
 ```
 
-The yielded objects are ordinary `pyarrow.RecordBatch`es, so anything in the PyArrow
-ecosystem (compute kernels, NumPy/pandas conversion, tensor extraction) works on them
-without copying through Python lists.
+The yielded objects are ordinary `pyarrow.RecordBatch`es, so PyArrow's compute kernels,
+its NumPy and pandas conversions, and its tensor extraction all work on them without
+copying through Python lists.
 
 ## Shaping batches before the stream
 
@@ -60,9 +60,9 @@ print(first.column("x").to_pylist())
 ```
 
 For learned feature statistics (standardization, encoding, imputation), fit a
-[preprocessor](preprocessors.md) on the training split and `transform` the stream — the
-fit is one mergeable pass and the transform stays inside the engine, so neither touches
-the training hot path.
+[preprocessor](preprocessors.md) on the training split and `transform` the stream. The
+fit is one mergeable pass; the transform stays inside the engine. Neither touches the
+training hot path.
 
 ## Building a training-data pipeline
 
@@ -116,19 +116,21 @@ zero-copy options in full (and a runnable in-memory example).
 
 For data-parallel training across ranks, `ds.ml.stream_loader` gives each rank a
 `torch.utils.data.IterableDataset` over its slice of a single, seed-reproducible global
-order. It is the streaming-ingest path for PyTorch DDP/FSDP/DeepSpeed, and it holds the
-guarantees a distributed loop needs:
+order. It is the streaming-ingest path for PyTorch DDP/FSDP/DeepSpeed, and it holds four
+guarantees a distributed loop needs.
 
-- **balanced** — every rank yields the same number of batches, so no rank finishes early
-  and stalls the others at the all-reduce barrier. `drop_last=True` (the default) trims
-  the epoch's tail to a multiple of `world_size`; `drop_last=False` keeps every sample
-  and pads instead, repeating a few — never handing the ranks unequal counts;
-- **deterministic / elastic** — the same `(seed, epoch)` produces the same global order
-  *regardless of `world_size`*, so a job can resume on a differently-sized cluster;
-- **resumable** — pass `global_consumed` (the sample count already processed this epoch,
-  read from a checkpoint) to resume mid-epoch with no repeated or skipped samples;
-- **independent ranks** — each rank reads its own index slice with no central
-  coordinator, so a slow rank never blocks the others.
+The ranks stay **balanced**: every rank yields the same number of batches, so none
+finishes early and stalls the others at the all-reduce barrier. `drop_last=True` (the
+default) trims the epoch's tail to a multiple of `world_size`; `drop_last=False` keeps
+every sample and pads instead, repeating a few. Neither mode hands the ranks unequal
+counts.
+
+The order is **deterministic and elastic**: the same `(seed, epoch)` produces the same
+global order *regardless of `world_size`*, so a job can resume on a differently-sized
+cluster. It is **resumable**: pass `global_consumed` (the sample count already processed
+this epoch, read from a checkpoint) and a rank picks up mid-epoch with no repeated or
+skipped samples. And the ranks are **independent**, each reading its own index slice with
+no central coordinator, so a slow rank never blocks the others.
 
 ```python
 # docs: skip
@@ -164,7 +166,7 @@ checkpointed `global_consumed` so the rank picks up exactly where it stopped.
 
 The global order is **computed, never materialized**. A shuffled list of every sample
 index costs ~28 bytes per sample in CPython, so the index order alone would need 280 GB
-of driver RAM for a 10-billion-sample corpus — before a single row is read. Instead
+of driver RAM for a 10-billion-sample corpus, before a single row is read. Instead,
 `epoch_permutation` is a keyed pseudorandom bijection on `[0, n)`: index in, shuffled
 index out, no state.
 
@@ -180,7 +182,7 @@ sample 900,000,000,000 of a trillion-sample epoch is a modular-arithmetic step, 
 walk. Indices are generated in vectorized batches at ~11 M/s, so ordering never gates a
 training step.
 
-`shard_stream_loader` — the larger-than-RAM path — draws its indices from
+`shard_stream_loader`, the larger-than-RAM path, draws its indices from
 `rank_index_batches`, which holds one batch of indices at a time. `stream_loader`
 materializes the dataset anyway (`collect()`), so it keeps the simpler list path.
 
@@ -193,6 +195,38 @@ for indices in rank_index_batches(10**12, batch_size=8192, world_size=1024, rank
     break
 ```
 
+### The ordering, without a loader
+
+The two functions the whole contract rests on are usable on their own, which is the
+easiest way to see what a resumed run will actually read.
+
+`epoch_order(n, epoch=, seed=)` materializes the epoch's global order as a list, the
+same order the loaders stride over. It costs O(`n`) memory, so use it for a corpus that
+fits in driver RAM, for a test, or to inspect what an epoch will look like; when it does
+not fit, `rank_index_batches` above is the one to reach for. `usable_length(total,
+world_size)` reports how many sample positions the epoch spans: always a multiple of
+`world_size`, rounded down with `drop_last=True` (the remainder is dropped) or up with
+`False` (the remainder is padded by repeating a few samples).
+
+```python
+from batcher.ml import epoch_order, usable_length
+
+print(epoch_order(8, seed=42))
+# [6, 4, 7, 3, 2, 5, 0, 1]
+print(epoch_order(8, seed=42, epoch=1))  # the next epoch reshuffles
+# [4, 0, 6, 5, 7, 3, 1, 2]
+
+print(usable_length(8, 3), usable_length(8, 3, drop_last=False))
+# 6 9
+```
+
+The order is a function of `(seed, epoch)` alone: neither the world size nor the last
+run's progress enters into it. That is what makes a resume honest. A job that dies at
+step 40,000 restarts against the *same* permutation and seeks to the checkpointed
+`global_consumed` position in it, so it sees the samples it had not reached, in the
+order it would have seen them. An order re-drawn at startup would quietly re-show data
+the model already trained on, and nothing in the loss curve would tell you.
+
 ### How this compares
 
 | System | Global shuffle | Mid-epoch resume | Balanced ranks | Elastic world size |
@@ -203,15 +237,15 @@ for indices in rank_index_batches(10**12, batch_size=8192, world_size=1024, rank
 | Ray Data `streaming_split` | local buffer only | no | not guaranteed | n/a |
 | **Batcher** | **exact, O(1) memory** | **yes (`state_dict`)** | **yes (drop or pad)** | **yes** |
 
-The distinction worth being precise about: WebDataset and MosaicML shuffle *approximately*
-— a shard permutation plus a local buffer, so two samples in the same shard stay
-correlated. Batcher's is an exact permutation of the whole corpus, and it costs less
-memory than either, because it is never stored.
+One distinction is worth being precise about. WebDataset and MosaicML shuffle
+*approximately*: a shard permutation plus a local buffer, so two samples in the same
+shard stay correlated. Batcher's is an exact permutation of the whole corpus, and it
+costs less memory than either, because it is never stored.
 
 ### Checkpointing the position
 
 `ResumableSampler` owns the `(epoch, global_consumed)` pair for you, with the
-`state_dict` / `load_state_dict` protocol a checkpoint already speaks — so the training
+`state_dict` / `load_state_dict` protocol a checkpoint already speaks, so the training
 loop never computes a sample offset by hand.
 
 ```python
@@ -231,8 +265,8 @@ print(len(resumed), set(seen) & set(resumed))
 Take the `state_dict` **between steps**, where every rank has consumed the same count.
 `set_epoch(n)` reshuffles and rewinds, the `DistributedSampler` protocol. Restoring a
 state from a different corpus or seed raises rather than silently reshuffling samples
-the model has already trained on, and — because the global order does not depend on
-`world_size` — a state may be restored onto a differently sized cluster.
+the model has already trained on. And because the global order does not depend on
+`world_size`, a state may be restored onto a differently sized cluster.
 
 ## Next steps
 

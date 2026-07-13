@@ -236,8 +236,8 @@ def _read_split_batches_uncached(splits, projection, predicate, on_read_error="e
             splits, projection, predicate, _SCAN_PREFETCH, skip_errors=True
         )
         return
-    if _NATIVE_READER and predicate is None:
-        native = _native_scan_batches(splits, projection)
+    if _NATIVE_READER:
+        native = _native_scan_batches(splits, projection, predicate)
         if native is not None:
             yield from native
             return
@@ -248,20 +248,23 @@ def _read_split_batches_uncached(splits, projection, predicate, on_read_error="e
         yield from _prefetch_split_reads(splits, projection, predicate, _SCAN_PREFETCH)
 
 
-def _native_scan_batches(splits, projection):
+def _native_scan_batches(splits, projection, predicate=None):
     """Read uniform Parquet row-group splits with the native Rust reader, or `None`.
 
     Groups the splits by file and reads each file's requested row-groups in one native
-    call (which fetches them concurrently). Returns `None` (caller falls back to pyarrow)
-    when the splits aren't all `RowGroupSplit`s or the native extension/read is
+    call (which fetches them concurrently). A pushed `predicate` is applied as native
+    row-group pruning — its zone-map-provably-empty groups are never fetched or decoded;
+    the pruning is superset-safe (the engine keeps the `Filter` operator downstream, so a
+    non-pushable predicate just reads more rows). Returns `None` (caller falls back to
+    pyarrow) when the splits aren't all `RowGroupSplit`s or the native extension/read is
     unavailable — so an unsupported scheme or any read error never fails the scan.
     """
+    from batcher.io.formats.structured import _parquet_native
     from batcher.io.splits import RowGroupSplit
 
     if not splits or not all(isinstance(s, RowGroupSplit) for s in splits):
         return None
     try:
-        import batcher._native as nat
         from batcher.config import active_config
 
         batch_rows = active_config().execution.morsel_rows
@@ -281,7 +284,12 @@ def _native_scan_batches(splits, projection):
             # memory + read/compute overlap) instead of materializing its whole partition.
             for i in range(0, len(ordered), _NATIVE_RG_WINDOW):
                 window = ordered[i : i + _NATIVE_RG_WINDOW]
-                yield from nat.read_parquet(uri, window, cols, batch_rows)
+                batches = _parquet_native.read_row_groups_filtered(
+                    uri, window, cols, predicate, batch_rows
+                )
+                if batches is None:  # native unavailable/failed → fall back to pyarrow
+                    raise _NativeUnavailable
+                yield from batches
 
     # Probe the first read eagerly so a failure falls back to pyarrow instead of yielding
     # a half-stream; on success, chain the probed batches back in.
@@ -296,6 +304,11 @@ def _native_scan_batches(splits, projection):
 
 
 _SENTINEL = object()
+
+
+class _NativeUnavailable(Exception):
+    """Raised inside the native scan generator when the native read returns no result, so
+    the eager first-batch probe falls back to the pyarrow dataset scan."""
 
 
 def _chain_first(first, rest):

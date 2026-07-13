@@ -11,8 +11,8 @@ Every preprocessor is importable from `batcher.ml` as well as
 
 ## Splitting first
 
-`fit` must see the training rows only — fitting on the whole frame leaks held-out
-statistics into the features. `ds.ml.train_test_split` gives disjoint parts that
+`fit` must see the training rows only. Fit on the whole frame and held-out statistics
+leak into your features. `ds.ml.train_test_split` gives disjoint parts that
 together cover every row, assigned by a reproducible hash of each row's own content.
 Each part is a plain row-wise filter, so the split streams, distributes, and is
 *partition-independent*: a row lands in the same part however the data is laid out.
@@ -38,7 +38,7 @@ print(train.count() + test.count())
 # 1000
 ```
 
-Then re-deriving a feature column does not move rows between train and test — the split
+Then re-deriving a feature column does not move rows between train and test: the split
 follows `id` alone, so recomputing `score` leaves every row where it was:
 
 ```python
@@ -55,7 +55,7 @@ changes.
 
 Exact deduplication is `distinct()`. On a web-scale training corpus it barely helps: the
 duplicates are the same article behind a different header, or the same page with a
-changed timestamp. Removing *those* is the highest-leverage preprocessing step for an LLM
+changed timestamp. Removing *those* is the single biggest win in preprocessing an LLM
 pretraining set.
 
 `ds.ml.near_duplicates` finds the pairs; `ds.ml.drop_near_duplicates` removes them,
@@ -81,7 +81,7 @@ and LSH banding turns the similarity join into an equi-join on a band hash. Ever
 returned pair is then **verified** against the threshold, so banding only costs recall,
 never precision. `bands` is the dial: more bands, more candidates, more recall, more work.
 
-Both are ordinary relational plans — a projection, an `explode`, and joins — so they run
+Both are ordinary relational plans (a projection, an `explode`, some joins), so they run
 wherever a join runs.
 
 ## Matching on meaning: `similarity_join`
@@ -104,14 +104,14 @@ print(pairs.select("key_a", "key_b").to_pydict())
 # {'key_a': [1], 'key_b': [10]}
 ```
 
-This is entity resolution — a product catalogue against a supplier feed, a CRM against a
-billing system — and retrieval over a corpus, wherever the join key is "means the same
+This is entity resolution (a product catalog against a supplier feed, a CRM against a
+billing system) and retrieval over a corpus: any join whose key is "means the same
 thing" rather than "is the same string".
 
 `simhash` is Charikar's random-hyperplane LSH: `num_bits` hyperplanes are drawn through
 the origin and each bit records which side of one the vector falls on. Two vectors an
 angle `θ` apart agree on each bit with probability `1 - θ/π`, so the fraction of agreeing
-bits estimates the angle — the vector-space counterpart of MinHash's Jaccard estimate.
+bits estimates the angle: the vector-space counterpart of MinHash's Jaccard estimate.
 The hyperplanes are derived by hashing `(seed, bit, dimension)` rather than stored, so
 every partition and every machine draws the same ones and a signature computed on one
 node is comparable with one computed on another.
@@ -119,16 +119,16 @@ node is comparable with one computed on another.
 Exactly as in fuzzy dedup, banding governs **recall, never precision**: no pair below
 `threshold` is ever returned, but a pair above it can miss every band. `bands` is the
 dial. Rows whose vector is null or empty have no direction, cannot clear any threshold,
-and are dropped rather than banded — left in, they would all collide and blow the
+and are dropped rather than banded. Left in, they would all collide and blow the
 candidate set up quadratically.
 
 ## Chaining steps
 
 `Chain` is the sklearn `Pipeline` equivalent: it fits each step on the **previous
 step's output** and replays the fitted steps, in order, over any split. Doing this by
-hand means fitting step *i* on data that steps *0..i-1* have already transformed — easy
-to get subtly wrong, and a mistake that leaks held-out statistics into training features
-without ever failing.
+hand means fitting step *i* on data that steps *0..i-1* have already transformed. That
+is easy to get subtly wrong, and the mistake leaks held-out statistics into training
+features without ever failing.
 
 ```python
 import batcher as bt
@@ -163,8 +163,8 @@ print(train_scaled.collect().column_names)
 # ['age', 'income']
 ```
 
-Because the fitted state lives on each object, the same steps transform held-out
-data with the statistics learned on train:
+Each object keeps its fitted state, so the same steps transform held-out data with the
+statistics learned on train:
 
 ```python
 import batcher as bt
@@ -180,14 +180,12 @@ print([round(v, 3) for v in scaler.transform(test).collect().column("x").to_pyli
 
 ## The three-call contract
 
-Every preprocessor exposes the same `Preprocessor` API:
-
-- **`fit(ds)`** runs a small aggregate, stores the learned state on the object, and
-  returns `self` (so a stateless transform — `Normalizer`, `Concatenator`,
-  `Tokenizer` — also needs a `fit` or `fit_transform` before `transform`).
-- **`transform(ds)`** returns a new lazy `Dataset` with the learned rewrite applied;
-  it runs no work until a terminal op (`collect`, `write.parquet`, ...).
-- **`fit_transform(ds)`** is `fit(ds).transform(ds)` — the common single-split path.
+Every preprocessor exposes the same `Preprocessor` API. `fit(ds)` runs a small aggregate,
+stores the learned state on the object, and returns `self`; even a stateless transform
+(`Normalizer`, `Concatenator`, `Tokenizer`) needs a `fit` or `fit_transform` before
+`transform`. `transform(ds)` returns a new lazy `Dataset` with the learned rewrite
+applied, and runs no work until a terminal op (`collect`, `write.parquet`, ...).
+`fit_transform(ds)` is `fit(ds).transform(ds)`, the common single-split path.
 
 `fit` *executes* (it is the one place a preprocessor touches data); `transform` stays
 lazy, so it composes with the rest of the pipeline and runs inside the engine. Calling
@@ -238,7 +236,7 @@ print([round(v, 3) for v in scaled.column("age").to_pylist()])
 ```
 
 The fitted statistics live on the object, so the *same* scaler standardizes a
-held-out split with the training mean and standard deviation — never refit on
+held-out split with the training mean and standard deviation. Never refit on
 validation data, or the splits no longer share a scale:
 
 ```python
@@ -275,7 +273,7 @@ the scaler falls back to a scale of 1.0 (or maps to the bottom of `feature_range
 
 `Normalizer` is the row-wise scaler: it divides each row by its norm across the named
 columns, so every row becomes a unit vector. It is stateless (there is nothing to
-learn), but still follows the `fit`/`transform` contract — use `transform` directly
+learn), but still follows the `fit`/`transform` contract, so use `transform` directly
 after construction, or `fit_transform`. `norm="l2"` (default) divides by
 `sqrt(Σ xᵢ²)`, `"l1"` by `Σ|xᵢ|`, and `"max"` by `max|xᵢ|`.
 
@@ -294,8 +292,8 @@ print(normalized.column("b").to_pylist())
 ## Encoding categories
 
 Categorical encoders learn the category set in `fit` (one `distinct` over the engine)
-and lower `transform` to a `CASE` expression or a set of indicator columns — no
-per-row Python.
+and lower `transform` to a `CASE` expression or a set of indicator columns. No per-row
+Python anywhere in the path.
 
 `OrdinalEncoder` replaces each categorical column with an integer code in sorted
 category order; `LabelEncoder` is the one-column variant for a target label.
@@ -371,8 +369,8 @@ print(imputer.transform(train).collect().column("age").to_pylist())
 ```
 
 The learned fill value (`imputer.statistics_`) is reused on every split, so train and
-validation get the *same* fill — the standard impute-then-scale ordering composes by
-sequencing the objects, as the **Composing a pipeline** section below shows.
+validation get the *same* fill. The standard impute-then-scale ordering composes by
+sequencing the objects, as **Composing a pipeline** below shows.
 
 ## Binning continuous values
 
@@ -392,7 +390,7 @@ print(binned.column("x").to_pylist())
 
 ## Assembling features
 
-`Concatenator` stacks several numeric columns into one list column — the "make a
+`Concatenator` stacks several numeric columns into one list column: the "make a
 feature vector" step before training. It is stateless (`fit` is a no-op) but follows
 the contract, so use `fit_transform` or `fit` then `transform`. The source columns
 are kept unless `drop=True`.
@@ -456,7 +454,7 @@ print(prepared.collect().column_names)
 # ['age', 'income', 'city_oslo', 'city_paris', 'city_rome']
 ```
 
-Held-out data flows through the identical fitted objects — `transform`, never
+Held-out data flows through the identical fitted objects. Use `transform`, never
 `fit_transform`, so it inherits the training statistics:
 
 ```python
@@ -469,8 +467,8 @@ print(prepared_val.collect().column_names)
 ## Where they run
 
 `transform` is a lazy `Dataset`, so it composes with the rest of a pipeline and the
-result is computed by a terminal op like `collect()` or `write.parquet(...)` — single
-node or distributed. Use preprocessors before a training loop
+result is computed by a terminal op like `collect()` or `write.parquet(...)`, on one
+node or across a cluster. Use preprocessors before a training loop
 ([PyTorch integration](pytorch.md)) or before batch [inference](inference.md).
 
 ## Next steps

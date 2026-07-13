@@ -67,11 +67,29 @@ def test_audio_dataset_helper_takes_native_path():
     assert out[1] is None
 
 
-def test_audio_dataset_resample_falls_back_to_python():
-    # An explicit sample_rate needs librosa resampling — the Python fallback path.
+def test_audio_resample_expression():
+    # `.audio.resample` decodes + sinc-resamples natively; output length is the librosa
+    # length, ceil(n * target / source). 400 frames at 8 kHz -> 800 at 16 kHz (upsample),
+    # -> 200 at 4 kHz (downsample). Undecodable input -> null.
+    samples = [int(16384 * (i % 7 - 3) / 3) for i in range(400)]
+    ds = bt.from_pydict({"a": [_wav(8000, samples), b"not audio"]})
+    up = ds.select(w=col("a").audio.resample(16000)).collect().to_pydict()["w"]
+    assert len(up[0]) == 800
+    assert up[1] is None
+    down = ds.select(w=col("a").audio.resample(4000)).collect().to_pydict()["w"]
+    assert len(down[0]) == 200
+    # Resampling to the source rate is an exact passthrough.
+    same = ds.select(w=col("a").audio.resample(8000)).collect().to_pydict()["w"]
+    assert len(same[0]) == 400
+
+
+def test_audio_dataset_resample_takes_native_path():
+    # An explicit mono sample_rate now resamples natively (Rust sinc) — no per-row Python.
     from batcher.core.udf import has_map_batches
     from batcher.ml.decode import audio_dataset
 
-    ds = bt.from_pydict({"bytes": [_wav(8000, [0, 16384, -16384])]})
+    ds = bt.from_pydict({"bytes": [_wav(8000, [int(16384 * (i % 5 - 2) / 2) for i in range(200)])]})
     decoded = audio_dataset(ds, sample_rate=16000)
-    assert has_map_batches(decoded._plan), "resample must use the Python fallback"
+    assert not has_map_batches(decoded._plan), "mono resample must take the native path"
+    out = decoded.collect().to_pydict()["waveform"]
+    assert len(out[0]) == 400  # 200 frames at 8 kHz -> 400 at 16 kHz

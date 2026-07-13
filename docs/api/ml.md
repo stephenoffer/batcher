@@ -217,6 +217,144 @@ workflow.
    :members:
 ```
 
+## The `batcher.ml` module
+
+The `.ml` accessor above covers the common path. Underneath it, `batcher.ml` exports the
+same machinery as plain functions over Arrow batch iterators — which is what you reach
+for when you are driving the pipeline yourself (a custom training loop, a serving
+process) rather than executing a `Dataset`.
+
+```python
+import batcher.ml as ml
+```
+
+### LLM inference
+
+An *engine* is any callable from a list of prompts to a list of completions. That is the
+whole contract, which is why a local vLLM engine and a remote OpenAI-compatible endpoint
+are interchangeable: swap {py:obj}`vllm_engine <batcher.ml.vllm_engine>` for
+{py:obj}`http_engine <batcher.ml.http_engine>` and nothing else changes.
+
+```{eval-rst}
+.. currentmodule:: batcher.ml
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   vllm_engine
+   http_engine
+   llm_generate
+   llm_udf
+   json_schema
+
+.. autodata:: Engine
+
+.. autodata:: EngineFactory
+```
+
+### Model serving
+
+Call a model that lives in another process or on another host. Each client turns a
+served endpoint into a UDF you can drop into a pipeline.
+
+```{eval-rst}
+.. autoclass:: ServingClient
+   :members:
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   serving_udf
+   serve_deployment
+   triton_client
+   torchserve_client
+   http_client
+```
+
+### Inference pools and pipelines
+
+{py:obj}`InferencePool <batcher.ml.InferencePool>` keeps model-loading off the hot path:
+workers load once and are reused across batches. {py:obj}`run_pipeline <batcher.ml.run_pipeline>`
+chains {py:obj}`Stage <batcher.ml.Stage>`s with credit-based backpressure, which is what
+overlaps a CPU decode with the GPU forward of the previous batch instead of running them
+in lockstep.
+
+```{eval-rst}
+.. autoclass:: InferencePool
+   :members:
+
+.. autoclass:: Stage
+   :members:
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   run_pipeline
+   embed
+
+.. autodata:: Worker
+
+.. autodata:: WorkerFactory
+```
+
+### Training loaders
+
+Stream a dataset into a training loop as tensors, without materializing it.
+{py:obj}`streaming_split <batcher.ml.streaming_split>` gives each DDP rank a disjoint
+shard.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   iter_torch_batches
+   to_torch_iterable
+   to_tf_dataset
+   to_numpy_batches
+   stream_loader
+   shard_stream_loader
+   streaming_split
+```
+
+### Sampling and resumption
+
+Deterministic, resumable epoch ordering — so a training run that dies at step 40,000
+restarts at step 40,000 seeing the same samples in the same order, rather than silently
+re-showing data it already trained on.
+
+```{eval-rst}
+.. autoclass:: ResumableSampler
+   :members:
+   :special-members: __len__, __iter__
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   epoch_order
+   epoch_permutation
+   rank_index_batches
+   usable_length
+   pack_sequences
+```
+
+### Vector search
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   build_vector_index
+   vector_search
+
+.. autodata:: EncoderFactory
+```
+
 ## Next steps
 
 - [Inference](../ml/inference.md): batch prediction and embeddings.

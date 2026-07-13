@@ -17,6 +17,7 @@ from collections.abc import Sequence
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.plan.feedback import FeedbackSink, OperatorFeedback, cpu_utilization
 from batcher.plan.ids import OpId
@@ -150,8 +151,7 @@ class LocalExecutor:
         # Import the native submodule directly (not `from batcher import _native`),
         # so Core never routes through the package root — keeping it independent of
         # the api/kyber/carbonite layers per the import contract.
-        import batcher._native as _native
-
+        _native = engine()
         cfg = active_config()
         # Ship Kyber's per-operator spill budgets alongside the plan so the engine
         # budgets each stateful operator individually (not one global cap for all).
@@ -193,8 +193,7 @@ def execute_local_metered(
     learning loop. A malformed/empty metrics document yields an empty `ops` list
     rather than raising.
     """
-    import batcher._native as _native
-
+    _native = engine()
     cfg = active_config()
     out, metrics_json = _native.execute_plan_metered(
         plan.to_json(), sources, cfg.engine_config_json_with(plan.op_budgets())

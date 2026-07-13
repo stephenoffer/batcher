@@ -156,3 +156,16 @@ class ORCSink(FileSink):
     def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:
         orc = _require_orc()
         orc.write_table(table, fh, compression=self.compression)
+
+    def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:  # noqa: ARG002 (ORCWriter infers the schema from the first write)
+        # Incremental ORCWriter: `write_stream` appends one batch at a time so a
+        # breaker-free read→transform→write never materializes the whole result
+        # (bounded memory), instead of the base default that buffers one table.
+        orc = _require_orc()
+        return orc.ORCWriter(fh, compression=self.compression)
+
+    def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
+        writer.write(pa.Table.from_batches([batch]))
+
+    def _close_stream_writer(self, writer: Any) -> None:
+        writer.close()

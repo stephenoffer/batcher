@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.config import active_config
 
 __all__ = [
@@ -48,8 +49,7 @@ def column_ndv(batches: list[pa.RecordBatch], columns: list[str]) -> dict[str, f
     if not batches or not columns:
         return {}
     try:
-        import batcher._native as _native
-
+        _native = engine()
         return _native.column_ndv(list(columns), batches)
     except Exception:  # pragma: no cover - measurement must never break a query
         return {}
@@ -76,8 +76,7 @@ def column_statistics(
     if not batches or not columns:
         return {}, {}, {}
     try:
-        import batcher._native as _native
-
+        _native = engine()
         # One sketch pass for both summary stats and quantiles (the native side builds
         # each column's HLL+KLL once), instead of two FFI calls that each rebuilt it.
         stats, quants = _native.column_stats_full(list(columns), batches, list(probs))
@@ -103,8 +102,7 @@ def tail_quantiles(
     if not batches or not columns:
         return {}
     try:
-        import batcher._native as _native
-
+        _native = engine()
         out = _native.tail_quantiles(list(columns), batches, list(probs))
     except Exception:  # pragma: no cover - measurement must never break execution
         return {}
@@ -118,8 +116,7 @@ def tdigest_partial(batches: list[pa.RecordBatch], column: str) -> bytes | None:
     if not batches:
         return None
     try:
-        import batcher._native as _native
-
+        _native = engine()
         return _native.tdigest_partial(column, batches)
     except Exception:  # pragma: no cover - measurement must never break execution
         return None
@@ -131,8 +128,7 @@ def tdigest_quantile(sketches: list[bytes], q: float) -> float | None:
     if not sketches:
         return None
     try:
-        import batcher._native as _native
-
+        _native = engine()
         return _native.tdigest_quantile(list(sketches), float(q))
     except Exception:  # pragma: no cover - measurement must never break execution
         return None
@@ -150,8 +146,7 @@ def heavy_hitters(
     if not batches or not columns:
         return {}
     try:
-        import batcher._native as _native
-
+        _native = engine()
         out = _native.heavy_hitters(list(columns), batches, float(fraction))
     except Exception:  # pragma: no cover - measurement must never break execution
         return {}

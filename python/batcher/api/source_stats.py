@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.io.source import Source
 
 if TYPE_CHECKING:
@@ -205,8 +206,7 @@ def _build_bloom_index(table: pa.Table, cols: list[str]) -> dict[str, bytes]:
     """A per-column membership bloom for each indexable (int/text) column — the
     data-skipping index `zonemap_prune_filter` consults for equality/`IN`. Built in
     Rust over the result already in memory; unindexable columns yield no entry."""
-    import batcher._native as nat
-
+    nat = engine()
     batches = table.to_batches()
     out: dict[str, bytes] = {}
     for i, name in enumerate(cols):

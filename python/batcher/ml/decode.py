@@ -168,23 +168,17 @@ def image_tensor_dataset(
 ) -> Dataset:
     """Decode an image-bytes column into a ``(H, W, 3)`` uint8 tensor column.
 
-    The decode/resize runs natively (``col(source).image.to_tensor``); the flat
-    ``FixedSizeList`` result is then re-typed to a fixed-shape-tensor column (zero
-    copy) so it converts straight to an ``(N, H, W, 3)`` training tensor.
+    The decode/resize runs natively (``col(source).image.to_tensor``), and the engine
+    tags the output column with the canonical ``arrow.fixed_shape_tensor`` extension
+    metadata, so it crosses the FFI already shaped as an ``(N, H, W, 3)`` training tensor
+    — no per-batch re-type pass. Staying a pure ``with_columns`` (no ``map_batches``) is
+    what keeps the decode on the fully-parallel native path instead of the slower
+    opaque-UDF path, the difference that made image ingest the pipeline bottleneck.
     """
-    from batcher.io.formats.ml.tensor import as_tensor_column
     from batcher.plan.expr_ir import col
 
     height, width = _require_size(size, "read.images(decode=True)")
-    shape = (height, width, 3)
-    decoded = ds.with_columns(**{output_column: col(source_column).image.to_tensor(width, height)})
-    out_cols = list(decoded.columns)
-
-    def _retype(batch: Any) -> Any:
-        idx = batch.schema.get_field_index(output_column)
-        return batch.set_column(idx, output_column, as_tensor_column(batch.column(idx), shape))
-
-    return decoded.map_batches(_retype, output_columns=out_cols)
+    return ds.with_columns(**{output_column: col(source_column).image.to_tensor(width, height)})
 
 
 def audio_dataset(
@@ -197,20 +191,23 @@ def audio_dataset(
 ) -> Dataset:
     """Decode an audio-bytes column into a ``list<float32>`` waveform column.
 
-    The common mono, native-sample-rate case decodes in the native data plane
-    (Rust ``symphonia`` via ``col(...).audio.to_waveform()``) — no per-row Python.
-    An explicit `sample_rate` (resample) or ``mono=False`` falls back to the
-    `soundfile`/`librosa` Python path (``batcher-engine[audio]``). Waveforms are
-    variable length, so the output is a ``list<float32>`` column (one per row).
+    Every mono case decodes in the native data plane — ``col(...).audio.to_waveform()``
+    at the source rate, or ``col(...).audio.resample(sample_rate)`` when a target rate is
+    given (both Rust ``symphonia`` + sinc, no per-row Python). Only ``mono=False``
+    (multi-channel output) falls back to the `soundfile`/`librosa` Python path
+    (``batcher-engine[audio]``). Waveforms are variable length, so the output is a
+    ``list<float32>`` column (one per row).
     """
-    # Native path: mono channel-average at the source rate is exactly what the
-    # Rust `to_waveform` produces, so the bytes never cross into Python per-row.
-    if sample_rate is None and mono:
+    # Native path: mono decode (and, with a target rate, sinc resample) is exactly what
+    # the Rust kernels produce, so the bytes never cross into Python per-row.
+    if mono:
         from batcher.plan.expr_ir import col
 
-        return ds.with_columns(**{output_column: col(source_column).audio.to_waveform()})
+        source = col(source_column)
+        expr = source.audio.resample(sample_rate) if sample_rate else source.audio.to_waveform()
+        return ds.with_columns(**{output_column: expr})
 
-    # Fallback: explicit resample or multi-channel needs the Python decoder.
+    # Fallback: multi-channel output needs the Python decoder.
     def _decode(batch: Any) -> Any:
         import numpy as np
         import pyarrow as pa

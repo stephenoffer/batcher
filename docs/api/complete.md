@@ -38,6 +38,7 @@ register SQL functions or sessions.
    register_function
    udf
    compact
+   vacuum
    engine_version
 ```
 
@@ -199,6 +200,10 @@ Read and override the engine tunables. See the [configuration guide](configurati
 
    set_config
    config_context
+```
+
+```{eval-rst}
+.. autofunction:: batcher.config.active_config
 ```
 
 ## Dataset
@@ -384,5 +389,11 @@ for what each one does and when to change it.
    :members:
 
 .. autoclass:: batcher.MetadataConfig
+   :members:
+
+.. autoclass:: batcher.config.config.ObservabilityConfig
+   :members:
+
+.. autoclass:: batcher.config.config.ShuffleTlsConfig
    :members:
 ```

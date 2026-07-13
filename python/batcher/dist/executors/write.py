@@ -23,6 +23,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.native import engine
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
@@ -116,7 +117,7 @@ def _write_plan_shard(
     idx: int,
     engine_config: str,
 ) -> list[WrittenFile]:
-    import batcher._native as nat
+    nat = engine()
     from batcher.dist.executors.partition_io import read_partition_descriptor
     from batcher.io.sink import SINKS
 

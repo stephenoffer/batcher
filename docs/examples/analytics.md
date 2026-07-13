@@ -1,9 +1,9 @@
 # Analytics query
 
-A multi-step analytical query — aggregate, join, and window — over a small orders
-table. The same pipeline runs unchanged on millions of rows; the optimizer (Kyber)
-plans the joins and aggregates, and re-plans at pipeline breakers on measured row
-counts.
+Aggregate, join, then window, over a small orders table. Five rows here, but the same
+pipeline runs unchanged on millions: Kyber plans the joins and aggregates up front,
+then re-plans at each pipeline breaker once it has measured what the row counts really
+were. Nothing about the code changes.
 
 ```python
 import batcher as bt
@@ -50,8 +50,9 @@ print(by_name.to_pydict())
 
 ## Window
 
-A running total within each region, ordered by amount — an aggregate made windowed
-with `.over(...)`.
+A running total within each region, ordered by amount. Any aggregate becomes a window
+function once you hang `.over(...)` off it, with the partition and the ordering given as
+keyword arguments rather than a separate window object to declare first.
 
 ```python
 running = orders.with_columns(
@@ -61,7 +62,7 @@ print(running.to_pydict()["running"])
 # [20, 60, 10, 40, 90]
 ```
 
-Ranking functions work the same way — `rank().over(partition_by=..., order_by=...)`
+Ranking functions take the same shape: `rank().over(partition_by=..., order_by=...)`
 numbers rows within each partition.
 
 ```python
@@ -72,10 +73,10 @@ print(ranked.to_pydict()["position"])
 # [1, 2, 1, 2, 3]
 ```
 
-## As SQL
+## The same query in SQL
 
-The same query expressed in SQL — it builds the same plan and returns a lazy
-`Dataset`, so you can mix the two freely.
+SQL builds the identical plan and hands back a lazy `Dataset`, so the two spellings
+mix freely.
 
 ```python
 out = bt.sql(

@@ -30,6 +30,14 @@ def _table_to_ndjson(table: pa.Table) -> bytes:
     return ndjson.encode("utf-8")
 
 
+def _ndjson_bytes(table: pa.Table) -> bytes:
+    """`_table_to_ndjson` with a stdlib fallback when pandas is unavailable."""
+    try:
+        return _table_to_ndjson(table)
+    except Exception:
+        return b"".join((json.dumps(row) + "\n").encode("utf-8") for row in table.to_pylist())
+
+
 def _ipc_bytes(table: pa.Table) -> bytes:
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, table.schema) as writer:
@@ -124,6 +132,14 @@ class JSONSource(FileSource):
     single multi-GB NDJSON file is read in parallel across workers; small files use
     one split each. `pyarrow.json.read_json` reads each range whole, so per-task
     memory scales with the split size, not the whole file.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io import JSONSource  # doctest: +SKIP
+            >>> src = JSONSource("s3://bucket/events/*.json")  # doctest: +SKIP
+            >>> src.schema().names  # doctest: +SKIP
+            ['id', 'payload']
     """
 
     suffix = ".json"
@@ -166,6 +182,14 @@ class JSONSink(FileSink):
 
     pyarrow has no JSON writer, so each row is serialized as one JSON object per
     line via the stdlib — the shape `JSONSource` / `pyarrow.json.read_json` reads.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa  # doctest: +SKIP
+            >>> from batcher.io import JSONSink  # doctest: +SKIP
+            >>> JSONSink().write(pa.table({"x": [1, 2]}), "out.json").rows  # doctest: +SKIP
+            2
     """
 
     suffix = ".json"
@@ -220,12 +244,58 @@ class JSONSink(FileSink):
             return base(table, directory, file_index, resume, max_rows_per_file)
         return [WrittenFile(path=p, rows=r, bytes=b) for p, r, b in parts]
 
+    def write_stream(self, batches, path, *, schema=None, resume=False):  # type: ignore[override]
+        """Stream NDJSON to one file, encoding one batch at a time (bounded memory).
+
+        The base `write_stream` buffers the whole result into one table before encoding
+        (JSON has no incremental pyarrow writer). NDJSON rows are independent, so instead
+        encode each incoming batch to NDJSON bytes and write it straight through — a
+        breaker-free read→transform→write over a huge source never materializes on the
+        driver. Atomic and `resume`-safe like the base; `schema` writes a valid empty
+        file when the stream yields nothing.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt  # doctest: +SKIP
+                >>> from batcher.io import JSONSink  # doctest: +SKIP
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})  # doctest: +SKIP
+                >>> JSONSink().write_stream(ds.iter_batches(), "out.json").rows  # doctest: +SKIP
+                3
+
+        Args:
+            batches: The batches to encode, consumed one at a time.
+            path: Destination file URI.
+            schema: Schema used to write a valid empty file when `batches` yields
+                nothing.
+            resume: Leave an already-present (hence complete) file untouched.
+        """
+        from itertools import chain
+
+        from batcher.io.base import _safe_size
+        from batcher.io.filesystem import resolve_filesystem
+        from batcher.io.manifest import WrittenFile
+
+        fs = resolve_filesystem(path)
+        if resume and fs.exists(path):
+            return WrittenFile(path=path, rows=0, bytes=_safe_size(fs, path))
+        it = iter(batches)
+        first = next(it, None)
+        rows = 0
+        with fs.atomic_writer(path) as fh:
+            if first is None:
+                empty = schema.empty_table() if schema is not None else pa.table({})
+                self._write_serial(empty, fh)
+            else:
+                for batch in chain([first], it):
+                    if not batch.num_rows:
+                        continue
+                    fh.write(_ndjson_bytes(pa.Table.from_batches([batch])))
+                    rows += batch.num_rows
+        return WrittenFile(path=path, rows=rows, bytes=_safe_size(fs, path))
+
     def _write_serial(self, table: pa.Table, fh: IO[Any]) -> None:
-        try:
-            fh.write(_table_to_ndjson(table))
-        except Exception:
-            for row in table.to_pylist():
-                fh.write((json.dumps(row) + "\n").encode("utf-8"))
+        fh.write(_ndjson_bytes(table))
 
     def _write_parallel(self, table: pa.Table, fh: IO[Any], workers: int) -> None:
         import contextlib

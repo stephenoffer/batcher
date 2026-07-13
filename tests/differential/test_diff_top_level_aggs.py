@@ -56,10 +56,14 @@ def test_shorthand_equals_method_and_duckdb(duck, sales, shorthand, method, sql)
 def test_shorthand_accepts_expression_and_names_output(sales):
     ds = bt.from_arrow(sales)
     # A str is a column; an Expr passes through; a keyword renames.
-    out = ds.group_by("dept").agg(
-        bt.sum("amount"),
-        avg_score=bt.mean(bt.col("score")),
-    ).sort("dept")
+    out = (
+        ds.group_by("dept")
+        .agg(
+            bt.sum("amount"),
+            avg_score=bt.mean(bt.col("score")),
+        )
+        .sort("dept")
+    )
     assert out.columns == ["dept", "amount", "avg_score"]
 
 

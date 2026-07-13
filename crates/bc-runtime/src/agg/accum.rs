@@ -209,7 +209,17 @@ pub(crate) fn minmax_acc(
             for (i, &g) in group_ids.iter().enumerate() {
                 if arr.is_valid(i) {
                     let (g, v) = (g as usize, arr.value(i));
-                    if !valid[g] || (is_min && v < cur[g]) || (!is_min && v > cur[g]) {
+                    // NOT `v < cur` / `v > cur`: raw IEEE comparison is false against NaN, so a
+                    // NaN could never win and `max()` silently skipped it — disagreeing with our
+                    // own ORDER BY (which sorts NaN last, i.e. greatest) and with DuckDB. The
+                    // total order lives in `crate::keys` with the rest of the float semantics.
+                    let ord = crate::keys::float_total_cmp(v, cur[g]);
+                    let wins = if is_min {
+                        ord == std::cmp::Ordering::Less
+                    } else {
+                        ord == std::cmp::Ordering::Greater
+                    };
+                    if !valid[g] || wins {
                         cur[g] = v;
                         valid[g] = true;
                     }

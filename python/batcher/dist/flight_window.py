@@ -22,10 +22,9 @@ from batcher.dist.executors.partition_io import partition_descriptors, source_pu
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
     map_barrier,
-    release_placement,
     shuffle_partitions,
 )
-from batcher.dist.fleet import acquire_fleet
+from batcher.dist.fleet import acquire_fleet, release_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Window
@@ -72,7 +71,10 @@ def execute_window_flight(
     n_buckets = shuffle_partitions(workers)
     try:
         # Read only the columns/rows the window's map prefix needs (see flight_aggregate).
-        projection, predicate = source_pushdown(map_plan, sid)
+        # `map_plan`'s scan was relabeled to source 0, so key the analysis on 0, not on the
+        # source's original index: a staged plan whose input is an intermediate (source id >
+        # 0) missed the lookup and silently read every column.
+        projection, predicate = source_pushdown(map_plan, 0)
         parts = partition_descriptors(
             sources[sid], workers, projection=projection, predicate=predicate
         )
@@ -100,11 +102,7 @@ def execute_window_flight(
             actors, addrs, parts, map_ir, key_names, win_json, n_buckets, workers, dead=dead
         )
     finally:
-        if owns:
-            for a in actors:
-                with contextlib.suppress(Exception):
-                    ray.kill(a)
-            release_placement(pg)
+        release_fleet(actors, pg, owns)
 
     table = (
         pa.Table.from_batches(batches)

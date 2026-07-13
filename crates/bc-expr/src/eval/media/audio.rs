@@ -24,10 +24,16 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+use super::map_rows;
 use crate::{AudioFunc, ExprError};
 
-/// Evaluate an audio function over a Binary array of encoded audio bytes.
-pub(crate) fn eval_audio(func: AudioFunc, arr: &ArrayRef) -> Result<ArrayRef, ExprError> {
+/// Evaluate an audio function over a Binary array of encoded audio bytes. `rate` is the
+/// target sample rate for [`AudioFunc::Resample`] (ignored by the other functions).
+pub(crate) fn eval_audio(
+    func: AudioFunc,
+    arr: &ArrayRef,
+    rate: Option<i64>,
+) -> Result<ArrayRef, ExprError> {
     let bytes =
         arr.as_any()
             .downcast_ref::<BinaryArray>()
@@ -38,6 +44,7 @@ pub(crate) fn eval_audio(func: AudioFunc, arr: &ArrayRef) -> Result<ArrayRef, Ex
     match func {
         AudioFunc::Decode => decode_meta(bytes),
         AudioFunc::ToWaveform => to_waveform(bytes),
+        AudioFunc::Resample => resample(bytes, rate),
     }
 }
 
@@ -94,15 +101,21 @@ fn decode_pcm(data: &[u8]) -> Option<Decoded> {
 /// `decode` → struct `{sample_rate: Int32, channels: Int32, num_frames: Int64,
 /// duration_secs: Float64}`. Null/undecodable bytes → null struct.
 fn decode_meta(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
-    let (mut rate, mut chans) = (Vec::new(), Vec::new());
-    let (mut frames, mut dur) = (Vec::new(), Vec::new());
-    let mut valid = Vec::with_capacity(bytes.len());
-    for i in 0..bytes.len() {
-        let d = if bytes.is_null(i) {
+    // Decode every clip in parallel across the shared rayon pool (each is milliseconds of
+    // symphonia work), then fold the results into the column buffers serially — the fold is
+    // a cheap memcpy next to the decode. Without the row-level fan-out a batch smaller than
+    // one morsel (16,384 rows) would decode on a single core; see `super::map_rows`.
+    let decoded: Vec<Option<Decoded>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
             None
         } else {
             decode_pcm(bytes.value(i))
-        };
+        }
+    });
+    let (mut rate, mut chans) = (Vec::new(), Vec::new());
+    let (mut frames, mut dur) = (Vec::new(), Vec::new());
+    let mut valid = Vec::with_capacity(bytes.len());
+    for d in decoded {
         match d {
             Some(a) => {
                 rate.push(a.sample_rate as i32);
@@ -141,13 +154,17 @@ fn decode_meta(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
 
 /// `to_waveform` → `List<Float32>` of mono samples per row. Null/undecodable → null.
 fn to_waveform(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
-    let mut builder = ListBuilder::new(Float32Builder::new());
-    for i in 0..bytes.len() {
-        let d = if bytes.is_null(i) {
+    // Decode every clip in parallel (see `decode_meta`); the `ListBuilder` append is
+    // inherently serial, but it is a memcpy of already-decoded samples, not decode work.
+    let decoded: Vec<Option<Decoded>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
             None
         } else {
             decode_pcm(bytes.value(i))
-        };
+        }
+    });
+    let mut builder = ListBuilder::new(Float32Builder::new());
+    for d in decoded {
         match d {
             Some(a) => {
                 for s in a.samples {
@@ -159,6 +176,59 @@ fn to_waveform(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
         }
     }
     Ok(Arc::new(builder.finish()))
+}
+
+/// `resample(rate)` → `List<Float32>` of mono samples resampled to `rate` Hz per row.
+/// Decode + band-limited (sinc) resample per row in parallel; null/undecodable → null.
+fn resample(bytes: &BinaryArray, rate: Option<i64>) -> Result<ArrayRef, ExprError> {
+    let target = rate.filter(|&r| r > 0).ok_or(ExprError::MissingAudioRate)? as u32;
+    let waves: Vec<Option<Vec<f32>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            None
+        } else {
+            decode_pcm(bytes.value(i)).map(|a| resample_signal(&a.samples, a.sample_rate, target))
+        }
+    });
+    let mut builder = ListBuilder::new(Float32Builder::new());
+    for w in waves {
+        match w {
+            Some(samples) => {
+                for s in samples {
+                    builder.values().append_value(s);
+                }
+                builder.append(true);
+            }
+            None => builder.append(false),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Band-limited resample of a mono signal from `src` to `dst` Hz via a sinc interpolator
+/// (librosa-comparable quality). The output is forced to the deterministic, resampler-
+/// independent length `ceil(n * dst / src)` — the same length librosa produces — so a
+/// decoded frame count agrees across engines and the result is reproducible. `src == dst`
+/// (or an empty signal) is an exact passthrough.
+fn resample_signal(samples: &[f32], src: u32, dst: u32) -> Vec<f32> {
+    if samples.is_empty() || src == dst || src == 0 {
+        return samples.to_vec();
+    }
+    use dasp_interpolate::sinc::Sinc;
+    use dasp_signal::{self as signal, Signal};
+
+    let want = (samples.len() as u128 * dst as u128).div_ceil(src as u128) as usize;
+    let sinc = Sinc::new(dasp_ring_buffer::Fixed::from([0.0f32; 64]));
+    let sig = signal::from_iter(samples.iter().copied());
+    let mut out: Vec<f32> = sig
+        .from_hz_to_hz(sinc, src as f64, dst as f64)
+        .until_exhausted()
+        .collect();
+    // Sinc rounding can overshoot or (with warm-up) fall a few samples short of the exact
+    // ratio length; truncate/pad to `want` so every clip resampled by the same ratio has a
+    // predictable, resampler-independent size.
+    out.truncate(want);
+    out.resize(want, 0.0);
+    out
 }
 
 #[cfg(test)]
@@ -198,7 +268,7 @@ mod tests {
             None,
             Some(b"not audio".as_slice()),
         ]));
-        let out = eval_audio(AudioFunc::Decode, &arr).unwrap();
+        let out = eval_audio(AudioFunc::Decode, &arr, None).unwrap();
         let s = out.as_any().downcast_ref::<StructArray>().unwrap();
         let rate = s.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         let frames = s.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -208,10 +278,97 @@ mod tests {
     }
 
     #[test]
+    fn parallel_batch_preserves_order_and_nulls() {
+        // A batch past PAR_ROW_THRESHOLD (8) with valid / null / undecodable rows
+        // interleaved: the row-parallel decode must keep every result at its own index.
+        let mut rows: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut expect_frames: Vec<Option<i64>> = Vec::new();
+        for i in 0..20 {
+            if i % 3 == 0 {
+                rows.push(None); // null bytes
+                expect_frames.push(None);
+            } else if i % 3 == 1 {
+                rows.push(Some(b"not audio".to_vec())); // undecodable
+                expect_frames.push(None);
+            } else {
+                let n = (i % 5) + 1;
+                rows.push(Some(make_wav(8000, &vec![100i16; n])));
+                expect_frames.push(Some(n as i64));
+            }
+        }
+        let arr: ArrayRef = Arc::new(BinaryArray::from(
+            rows.iter().map(|o| o.as_deref()).collect::<Vec<_>>(),
+        ));
+        let out = eval_audio(AudioFunc::Decode, &arr, None).unwrap();
+        let s = out.as_any().downcast_ref::<StructArray>().unwrap();
+        let frames = s.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        for (i, exp) in expect_frames.iter().enumerate() {
+            match exp {
+                Some(f) => assert!(s.is_valid(i) && frames.value(i) == *f, "row {i}"),
+                None => assert!(s.is_null(i), "row {i} should be null"),
+            }
+        }
+    }
+
+    #[test]
+    fn resample_signal_length_and_identity() {
+        // src == dst → exact passthrough.
+        let x: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.1).sin()).collect();
+        assert_eq!(resample_signal(&x, 8000, 8000), x);
+
+        // Downsample 8000 -> 4000: length is exactly ceil(n * dst / src).
+        let down = resample_signal(&x, 8000, 4000);
+        assert_eq!(down.len(), 500);
+        // Upsample 8000 -> 16000: length doubles.
+        let up = resample_signal(&x, 8000, 16000);
+        assert_eq!(up.len(), 2000);
+        // Odd ratio 44100 -> 16000.
+        let odd = resample_signal(&vec![0.5f32; 44100], 44100, 16000);
+        assert_eq!(odd.len(), 16000);
+    }
+
+    #[test]
+    fn resample_signal_preserves_energy() {
+        // A pure 1 kHz tone at 8 kHz, resampled to 4 kHz, keeps its ~0.5 mean power
+        // (band-limited resampling preserves the signal, unlike a lossy decimation).
+        let n = 8000;
+        let tone: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 8000.0).sin())
+            .collect();
+        let out = resample_signal(&tone, 8000, 4000);
+        // Skip the sinc warm-up region when measuring power.
+        let body = &out[64..];
+        let power: f32 = body.iter().map(|s| s * s).sum::<f32>() / body.len() as f32;
+        assert!((power - 0.5).abs() < 0.1, "power {power} should be ~0.5");
+    }
+
+    #[test]
+    fn resample_over_batch_and_nulls() {
+        let wav = make_wav(8000, &[0, 16384, -16384, 0, 100, -100, 0, 200]); // 8 frames
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(wav.as_slice()),
+            None,
+            Some(b"not audio".as_slice()),
+        ]));
+        let out = eval_audio(AudioFunc::Resample, &arr, Some(4000)).unwrap();
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.value_length(0), 4); // 8 frames at 8k -> 4 at 4k
+        assert!(list.is_null(1) && list.is_null(2)); // null + undecodable -> null
+    }
+
+    #[test]
+    fn resample_requires_rate() {
+        let wav = make_wav(8000, &[0, 1, 2]);
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(wav.as_slice())]));
+        assert!(eval_audio(AudioFunc::Resample, &arr, None).is_err());
+        assert!(eval_audio(AudioFunc::Resample, &arr, Some(0)).is_err());
+    }
+
+    #[test]
     fn to_waveform_decodes_mono_samples() {
         let wav = make_wav(8000, &[0, 16384, -16384]);
         let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(wav.as_slice()), None]));
-        let out = eval_audio(AudioFunc::ToWaveform, &arr).unwrap();
+        let out = eval_audio(AudioFunc::ToWaveform, &arr, None).unwrap();
         let list = out.as_any().downcast_ref::<ListArray>().unwrap();
         assert!(list.is_valid(0) && list.value_length(0) == 3);
         let row0 = list.value(0);

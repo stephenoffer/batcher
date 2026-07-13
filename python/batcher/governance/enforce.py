@@ -56,6 +56,23 @@ def enforce(
     is by construction what was enforced. A denial raises before any event is returned;
     the exception carries the same facts.
 
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.governance import Principal, Redact, SecurityCatalog, enforce
+            >>> from batcher.plan.logical import Scan
+            >>> from batcher.plan.schema import SchemaRef
+            >>> schema = SchemaRef.from_arrow(pa.schema([("id", pa.int64()), ("ssn", pa.string())]))
+            >>> catalog = SecurityCatalog().grant("analyst", on="people", select=["id", "ssn"])
+            >>> catalog = catalog.mask_column("people", "ssn", Redact(show_last=4))
+            >>> analyst = Principal("ana", roles={"analyst"})
+            >>> governed, events = enforce(Scan(0, schema), ["people"], analyst, catalog)
+            >>> events[0].masked
+            ('ssn',)
+            >>> governed.items[1].expr  # `ssn` is read through the mask, at the scan
+            col('ssn').cast('string').str.mask('X', 0, 4)
+
     Args:
         plan: The plan to govern.
         tables: The table name of each source, indexed by a `Scan`'s ``source_id``.

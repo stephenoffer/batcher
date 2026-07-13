@@ -102,6 +102,25 @@ def _select(tr, node) -> Dataset:
     limit = node.args.get("limit")
     offset = node.args.get("offset")
     qualify = node.args.get("qualify")
+
+    # SELECT DISTINCT dedups the *projected* rows, and SQL orders what survives. The
+    # dedup is a hash operation and does not preserve input order, so sorting first and
+    # deduping after would silently discard the ORDER BY. Hold the sort back and apply it
+    # to the deduped rows instead. (With DISTINCT, SQL already requires every ORDER BY
+    # expression to appear in the SELECT list, so it is still resolvable after the
+    # projection.)
+    distinct = node.args.get("distinct")
+    if distinct is not None and distinct.args.get("on") is not None:
+        # DISTINCT ON (keys) keeps one row per key (chosen by ORDER BY), not a
+        # full-row dedup — silently running a plain DISTINCT would drop the wrong
+        # rows. Not yet supported; reject rather than mislead.
+        raise NotImplementedError(
+            "SELECT DISTINCT ON (...) is not supported; use GROUP BY or a window "
+            "function (row_number() ... QUALIFY) to keep one row per key"
+        )
+    deferred_order = order if distinct is not None else None
+    if deferred_order is not None:
+        order = None
     has_agg = group is not None or any(_has_aggregate(p) for p in projections)
     has_window = any(tr._is_window(p) for p in projections)
     if has_agg or has_window:
@@ -130,9 +149,9 @@ def _select(tr, node) -> Dataset:
         ds = tr._aggregate(ds, projections, group, node.args.get("having"))
         if order is not None:
             # _agg_map is still live here, so ORDER BY can reference an
-            # aggregate (e.g. ORDER BY SUM(x)) by its output column.
+            # aggregate (e.g. ORDER BY SUM(x)) by its output column. It stays live
+            # until the DISTINCT block below, which may still owe a deferred sort.
             ds = tr._order(ds, order, projections)
-        tr._agg_map = None
     else:
         # Registered scalar functions in the SELECT list become materialized
         # columns before the projection references them.
@@ -147,18 +166,12 @@ def _select(tr, node) -> Dataset:
         else:
             ds = ds.select(**named)
 
-    # SELECT DISTINCT: dedup the projected rows.
-    distinct = node.args.get("distinct")
+    # SELECT DISTINCT: dedup the projected rows, then sort what survives.
     if distinct is not None:
-        if distinct.args.get("on") is not None:
-            # DISTINCT ON (keys) keeps one row per key (chosen by ORDER BY), not a
-            # full-row dedup — silently running a plain DISTINCT would drop the wrong
-            # rows. Not yet supported; reject rather than mislead.
-            raise NotImplementedError(
-                "SELECT DISTINCT ON (...) is not supported; use GROUP BY or a window "
-                "function (row_number() ... QUALIFY) to keep one row per key"
-            )
         ds = ds.distinct()
+        if deferred_order is not None:
+            ds = tr._order(ds, deferred_order, projections)
+    tr._agg_map = None
 
     if limit is not None or offset is not None:
         skip = int(offset.expression.this) if offset is not None else 0

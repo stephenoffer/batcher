@@ -22,6 +22,7 @@ from batcher.core.executor import (
     record_exec_metrics,
 )
 from batcher.core.runtime import default_hub, reset_default_hub
+from batcher.core.scan_only import scan_only_result
 from batcher.core.stats import (
     column_ndv,
     column_statistics,
@@ -50,6 +51,7 @@ __all__ = [
     "prebuild_factories",
     "record_exec_metrics",
     "reset_default_hub",
+    "scan_only_result",
     "tail_quantiles",
     "tdigest_partial",
     "tdigest_quantile",

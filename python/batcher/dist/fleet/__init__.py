@@ -14,7 +14,10 @@ from batcher.dist.fleet._fleet import (
     acquire_fleet,
     current_fleet,
     maybe_spawn_query_fleet,
+    release_fleet,
+    release_session_fleet,
     reset_fleet,
+    session_fleet_lease,
     set_fleet,
 )
 from batcher.dist.fleet.source import FlightFetchSplit, FlightMaterializedSource
@@ -26,6 +29,9 @@ __all__ = [
     "acquire_fleet",
     "current_fleet",
     "maybe_spawn_query_fleet",
+    "release_fleet",
+    "release_session_fleet",
     "reset_fleet",
+    "session_fleet_lease",
     "set_fleet",
 ]

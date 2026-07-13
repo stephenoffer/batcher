@@ -51,6 +51,14 @@ class Stage:
     and the next before this stage blocks — the backpressure knob (and the prefetch
     depth). `num_gpus` is a placement hint for the distributed scheduler (0 = CPU);
     it does not affect single-node execution.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml import Stage
+            >>> stage = Stage(factory=lambda: (lambda batch: batch), name="decode")
+            >>> stage.credits  # two batches may sit between this stage and the next
+            2
     """
 
     factory: StageFactory
@@ -75,6 +83,26 @@ def run_pipeline(
 
     Raises the first exception any stage raised (propagated to the consumer), after
     signaling the other threads to stop.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.ml import Stage, run_pipeline
+            >>> def double():  # the worker is built once, on the stage's own thread
+            ...     return lambda b: pa.record_batch(
+            ...         {"x": [v * 2 for v in b.column("x").to_pylist()]}
+            ...     )
+            >>> batch = pa.record_batch({"x": [1, 2, 3]})
+            >>> [b.column("x").to_pylist() for b in run_pipeline([batch], [Stage(double)])]
+            [[2, 4, 6]]
+
+    Args:
+        batches: an iterable of `pyarrow.RecordBatch` to feed the first stage.
+        stages: the stages to run, in order (empty → `batches` passes through).
+
+    Returns:
+        An iterator of the final stage's batches, in input order.
     """
     if not stages:
         yield from batches

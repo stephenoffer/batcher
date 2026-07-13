@@ -43,9 +43,9 @@ ds = bt.read.parquet("s3://bucket/year=2024/month=06/*.parquet")
 ## Credentials
 
 Credentials are read from the environment, following the conventions of each
-provider's SDK — the same variables the AWS/GCP/Azure tooling already uses. Set them
-before starting your process. On-prem and self-hosted stores (MinIO, Ceph) are S3
-endpoints: point at them with `AWS_ENDPOINT_URL`, or per-path with an
+provider's SDK. They are the same variables the AWS/GCP/Azure tooling already uses.
+Set them before starting your process. On-prem and self-hosted stores (MinIO, Ceph)
+are S3 endpoints: point at them with `AWS_ENDPOINT_URL`, or per-path with an
 `endpoint_override` in the URI query string.
 
 | Store | Environment variables / settings |
@@ -76,9 +76,9 @@ ds = bt.read("s3://bucket/data/*.parquet?endpoint_override=https://minio.interna
 ```
 
 For Delta tables read through delta-rs, credentials can also be passed explicitly as
-`storage_options` instead of through the environment — the keys are delta-rs's own
-(`aws_access_key_id`, `aws_secret_access_key`, `azure_storage_account_key`,
-`google_service_account_token`, and so on):
+`storage_options` instead of through the environment. The keys there are delta-rs's own:
+`aws_access_key_id`, `aws_secret_access_key`, `azure_storage_account_key`,
+`google_service_account_token`, and so on.
 
 ```python
 # docs: skip
@@ -95,8 +95,8 @@ clear message telling you to install it.
 
 Write helpers take cloud paths as well. Combine with `partition_by` to lay out a
 partitioned dataset, and `distributed=True` to write across workers. Writes to an
-object store go straight to the destination — a single PUT is atomic, so there is no
-truncated-file window; local and HDFS writes use temp-then-rename for the same
+object store go straight to the destination, because a single PUT is atomic and leaves
+no truncated-file window. Local and HDFS writes use temp-then-rename for the same
 guarantee.
 
 ```python
@@ -105,7 +105,7 @@ ds.write.parquet("s3://bucket/curated/events.parquet")
 ds.write("s3://bucket/curated/events", fmt="parquet", partition_by=["region"])
 ```
 
-## Working at scale
+## Working with a large dataset
 
 Large cloud datasets are split into tasks so the driver never has to materialize a
 whole file. For distributed reads, the data plane moves Arrow batches directly

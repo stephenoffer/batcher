@@ -27,15 +27,20 @@ pub(crate) fn eval_video(func: VideoFunc, arr: &ArrayRef) -> Result<ArrayRef, Ex
             })?;
     let VideoFunc::Decode = func;
 
-    let (mut w, mut h) = (Vec::new(), Vec::new());
-    let (mut frames, mut dur, mut fps) = (Vec::new(), Vec::new(), Vec::new());
-    let mut valid = Vec::with_capacity(bytes.len());
-    for i in 0..bytes.len() {
-        let meta = if bytes.is_null(i) {
+    // Probe every clip in parallel (each spawns an FFmpeg probe over its own temp file, so
+    // the rows are independent), then fold into the column buffers serially. See
+    // `super::map_rows` — without it a sub-morsel batch would probe on a single core.
+    let metas: Vec<Option<(i32, i32, i64, f64, f64)>> = super::map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
             None
         } else {
             decode_video_meta(bytes.value(i))
-        };
+        }
+    });
+    let (mut w, mut h) = (Vec::new(), Vec::new());
+    let (mut frames, mut dur, mut fps) = (Vec::new(), Vec::new(), Vec::new());
+    let mut valid = Vec::with_capacity(bytes.len());
+    for meta in metas {
         match meta {
             Some((vw, vh, nf, d, f)) => {
                 w.push(vw);

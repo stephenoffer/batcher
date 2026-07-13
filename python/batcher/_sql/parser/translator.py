@@ -82,16 +82,21 @@ class _Translator:
             node.set("with", None)
             node.set("with_", None)
 
+        # sqlglot sets distinct=True for the bare set operator, False for its ALL form.
+        # Honor it on all three: dropping it on INTERSECT/EXCEPT would silently answer
+        # an `ALL` query with DISTINCT multiplicity.
         if isinstance(node, exp.Union):
             left = self.statement(node.this)
             right = self.statement(node.expression)
-            # sqlglot: distinct=True for `UNION`, False for `UNION ALL`.
-            distinct = bool(node.args.get("distinct"))
-            return left.union(right, distinct=distinct)
+            return left.union(right, distinct=bool(node.args.get("distinct")))
         if isinstance(node, exp.Intersect):
-            return self.statement(node.this).intersect(self.statement(node.expression))
+            left = self.statement(node.this)
+            right = self.statement(node.expression)
+            return left.intersect(right, distinct=bool(node.args.get("distinct")))
         if isinstance(node, exp.Except):
-            return self.statement(node.this).except_(self.statement(node.expression))
+            left = self.statement(node.this)
+            right = self.statement(node.expression)
+            return left.except_(right, distinct=bool(node.args.get("distinct")))
         if isinstance(node, exp.Select):
             return self.select(node)
         raise NotImplementedError(

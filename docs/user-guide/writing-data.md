@@ -22,8 +22,8 @@ ds = bt.from_pydict(
 ## Parquet round trip
 
 This example writes to a temporary directory and reads the file back, so it runs
-end to end. Parquet is the recommended format: columnar, compressed, and pushdown
-friendly.
+end to end. Parquet is the format to reach for: columnar, compressed, friendly to
+pushdown.
 
 ```python
 import os
@@ -100,9 +100,9 @@ ds.write("output/events", fmt="parquet", partition_by=["category"])
 ## Compacting small files
 
 Incremental or streaming writes leave many tiny part files, which slow later reads
-(the small-files problem). `compact` fixes a dataset in place: it reads `path`,
-repartitions to a target file size — or an exact `num_files` — writes the result
-back, and deletes the now-stale parts. It runs on local files, so it executes here:
+(the small-files problem). `compact` fixes a dataset in place. It reads `path`,
+repartitions to a target file size (or an exact `num_files`), writes the result back,
+and deletes the now-stale parts. It runs on local files, so it executes here:
 
 ```python
 import glob
@@ -132,8 +132,8 @@ scheduled.
 
 ## Next steps
 
-- [Lakehouse tables](lakehouse.md): transactional Delta writes, merge/upsert, and
+- [Lakehouse tables](lakehouse.md): transactional Delta writes, merge/upsert,
   slowly-changing dimensions.
 - [Data quality](data-quality.md): validate and quarantine before you write.
-- [Cloud storage](cloud-storage.md): write to object stores.
+- [Cloud storage](cloud-storage.md): write to an object store.
 - [IO API](../api/io.md): the full `ds.write` writer reference.

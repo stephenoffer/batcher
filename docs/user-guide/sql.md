@@ -6,9 +6,9 @@ Because the result is a Dataset, you can keep chaining DataFrame operations onto
 SQL query, or feed a DataFrame pipeline into SQL.
 
 {py:obj}`bt.sql <batcher.sql>` reads DuckDB syntax by default; pass `dialect=` to
-read another sqlglot dialect. For a reusable catalog of tables and Python
-functions, build a {py:obj}`bt.Session <batcher.Session>` (the DuckDB-connection /
-SparkSession analogue) — `bt.sql` and `bt.register_function` use a shared default session.
+read another sqlglot dialect. For a reusable catalog of tables and Python functions,
+build a {py:obj}`bt.Session <batcher.Session>`, the DuckDB-connection / SparkSession
+analogue. `bt.sql` and `bt.register_function` use a shared default session.
 
 ```python
 import batcher as bt
@@ -41,7 +41,7 @@ The keyword name (`t` above) is the table identifier used in the `FROM` clause.
 
 A query may use:
 
-- `SELECT` with column references, scalar expressions, and aggregates
+- `SELECT` with column references, scalar expressions, aggregates
 - `WHERE` filters
 - `GROUP BY` with `HAVING` (and `ROLLUP` / `CUBE` / `GROUPING SETS`)
 - `ORDER BY`, `LIMIT` / `OFFSET`
@@ -51,8 +51,8 @@ A query may use:
 - Window functions, including explicit `ROWS BETWEEN …` frames
 - `CASE` expressions and `CAST`
 
-You can also register Python functions and call them from SQL, and define tables
-and views with `CREATE`/`DROP` — see [Sessions and Python functions](#sessions-tables-and-python-functions).
+You can also register Python functions and call them from SQL, and define tables and
+views with `CREATE`/`DROP`. See [Sessions and Python functions](#sessions-tables-and-python-functions).
 
 ## Filtering and projection
 
@@ -116,16 +116,16 @@ print(out.to_pydict())
 # {'category': ['a'], 'total': [90.0]}
 ```
 
-Both paths build the same logical plan, run through the same optimizer, and execute
-on the same Rust data plane. There is no separate SQL engine.
+Both paths build one logical plan, push it through one optimizer, and execute it on
+one Rust data plane. There is no separate SQL engine.
 
 (sessions-tables-and-python-functions)=
 
 ## Sessions, tables, and Python functions
 
-A {py:obj}`bt.Session <batcher.Session>` holds a catalog of tables, registered
-Python functions, and a dialect. Register a dataset as a table, then query it by
-name:
+A {py:obj}`bt.Session <batcher.Session>` holds a dialect plus a catalog: the tables
+and the Python functions you registered. Register a dataset as a table, then query it
+by name.
 
 ```python
 s = bt.Session()

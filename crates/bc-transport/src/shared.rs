@@ -139,11 +139,30 @@ fn read_mmap_zero_copy(mmap: Mmap) -> Result<Vec<RecordBatch>, arrow::error::Arr
     // memory outlives every decoded batch. `Arc::new(mmap)` coerces to `Arc<dyn Allocation>`.
     let buffer = unsafe { Buffer::from_custom_allocation(ptr, len, Arc::new(mmap)) };
 
+    // A truncated / corrupt / hostile file (the shm dir is world-writable) must NOT panic the
+    // reducer — this same-node fast path is best-effort. Every malformed shape returns an
+    // `ArrowError` the caller turns into a miss (falling back to Flight), never an `unwrap` panic.
+    if len < 10 {
+        return Err(arrow::error::ArrowError::IpcError(
+            "shm file shorter than the 10-byte IPC trailer".into(),
+        ));
+    }
     let trailer_start = len - 10;
-    let footer_len = read_footer_length(buffer[trailer_start..].try_into().unwrap())?;
+    let trailer: [u8; 10] = buffer[trailer_start..]
+        .try_into()
+        .map_err(|_| arrow::error::ArrowError::IpcError("bad shm trailer".into()))?;
+    let footer_len = read_footer_length(trailer)?;
+    if footer_len > trailer_start {
+        return Err(arrow::error::ArrowError::IpcError(
+            "shm footer length exceeds file size".into(),
+        ));
+    }
     let footer = root_as_footer(&buffer[trailer_start - footer_len..trailer_start])
         .map_err(|e| arrow::error::ArrowError::IpcError(format!("bad shm footer: {e}")))?;
-    let schema = Arc::new(fb_to_schema(footer.schema().unwrap()));
+    let footer_schema = footer
+        .schema()
+        .ok_or_else(|| arrow::error::ArrowError::IpcError("shm footer has no schema".into()))?;
+    let schema = Arc::new(fb_to_schema(footer_schema));
     let mut decoder = FileDecoder::new(schema, footer.version());
     for block in footer.dictionaries().iter().flatten() {
         let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;

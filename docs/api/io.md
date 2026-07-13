@@ -3,7 +3,7 @@
 Readers hang off {py:obj}`bt.read <batcher.read>` and return a lazy `Dataset`; writers hang off
 `ds.write` and are terminal (they execute the plan and return a `WriteManifest`).
 {py:obj}`bt.read(path, format=None, **opts) <batcher.read>` infers the format from the path; the dedicated
-readers below are explicit. Some connectors need an optional dependency — the
+readers below are explicit. Some connectors need an optional dependency; the
 "Extra" column gives the install (`pip install 'batcher-engine[<extra>]'`).
 
 ## Readers
@@ -105,6 +105,23 @@ explicit. Each executes the plan and returns a `WriteManifest`.
 | `ds.write.hudi(path, mode="append")` | an Apache Hudi table | |
 | `ds.write.lance(path)` | a Lance dataset | `lance` |
 | `ds.write.merge(target, on=)` | upsert (`MERGE INTO`) this dataset into an existing `target`, keyed on `on` | |
+| `ds.write.merge_into(target, on=)` | the full `MERGE INTO`: ordered `WHEN` clauses, each writing its own columns | |
+
+### Merge clauses
+
+`merge` is the two-clause shorthand. `merge_into` is the whole statement, and inside its
+clauses {py:obj}`source_col <batcher.source_col>` and
+{py:obj}`target_col <batcher.target_col>` name the two sides of the match: the incoming
+row and the row already in the table. See the
+[lakehouse guide](../user-guide/lakehouse.md) for worked upserts.
+
+```{eval-rst}
+.. currentmodule:: batcher
+
+.. autofunction:: source_col
+
+.. autofunction:: target_col
+```
 
 ### Warehouses and databases
 
@@ -114,9 +131,122 @@ explicit. Each executes the plan and returns a `WriteManifest`.
 | `ds.write.sql(...)` | a database table via ADBC / FlightSQL |
 | `ds.write.mongo(...)` | a MongoDB collection |
 
+## The connector surface
+
+Everything above is built from the same four types, exported from `batcher.io`. You only
+need them to add a format the engine doesn't ship. See
+[extending Batcher](../internals/extending.md) for the walkthrough.
+
+```python
+from batcher.io import Source, Sink, Split, SOURCES
+```
+
+A {py:obj}`Source <batcher.io.Source>` answers two questions. What is your schema, and how
+do you break into independently readable pieces? Each piece is a
+{py:obj}`Split <batcher.io.Split>`, and that split is the unit of parallelism. It is why a
+1,000-file Parquet directory and a single 1,000-row-group file both parallelize, and why a
+format that cannot be divided still works, just serially.
+
+### Protocols
+
+```{eval-rst}
+.. currentmodule:: batcher.io
+
+.. autoclass:: Source
+   :members:
+
+.. autoclass:: Sink
+   :members:
+```
+
+### Splits
+
+The unit of read parallelism. A {py:obj}`RowGroupSplit <batcher.io.RowGroupSplit>` reads
+one Parquet row group, a {py:obj}`FileSplit <batcher.io.FileSplit>` reads a byte range of
+one file, and a {py:obj}`WholeSourceSplit <batcher.io.WholeSourceSplit>` is the
+degenerate case for a source that cannot be divided.
+
+```{eval-rst}
+.. autoclass:: Split
+   :members:
+
+.. autoclass:: RowGroupSplit
+   :members:
+
+.. autoclass:: FileSplit
+   :members:
+
+.. autoclass:: WholeSourceSplit
+   :members:
+```
+
+### Built-in sources and sinks
+
+The concrete implementations behind `bt.read.*` and `ds.write.*`.
+
+```{eval-rst}
+.. autoclass:: FileSource
+   :members:
+
+.. autoclass:: FileSink
+   :members:
+
+.. autoclass:: ParquetSource
+   :members:
+
+.. autoclass:: ParquetSink
+   :members:
+
+.. autoclass:: CSVSource
+   :members:
+
+.. autoclass:: CSVSink
+   :members:
+
+.. autoclass:: JSONSource
+   :members:
+
+.. autoclass:: JSONSink
+   :members:
+
+.. autoclass:: InMemorySource
+   :members:
+
+.. autoclass:: IteratorSource
+   :members:
+
+.. autofunction:: read_blob_bytes
+```
+
+### The registries
+
+Formats are discovered, not hard-coded: registering a source under a name is what makes
+`bt.read(path, format="myfmt")` resolve.
+
+```{eval-rst}
+.. autodata:: SOURCES
+
+.. autodata:: SINKS
+```
+
+### Write results
+
+A write is terminal and returns a {py:obj}`WriteManifest <batcher.io.WriteManifest>`: the
+list of files it actually produced. That is what makes a write auditable and a failed run
+resumable.
+
+```{eval-rst}
+.. autoclass:: WriteManifest
+   :members:
+
+.. autoclass:: WrittenFile
+   :members:
+```
+
 ## See also
 
 - [Reading data](../user-guide/reading-data.md) and [Writing data](../user-guide/writing-data.md):
   the guided tour of these readers and writers.
 - [Cloud storage](../user-guide/cloud-storage.md): credentials and object-store paths.
 - [Lakehouse](../user-guide/lakehouse.md): Delta, Iceberg, and Hudi tables.
+- [Extending Batcher](../internals/extending.md): adding your own source or sink.

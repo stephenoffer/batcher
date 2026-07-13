@@ -18,11 +18,29 @@ def _dim():
     return bt.from_pydict({"dept_id": [10, 20, 30], "region": ["EU", "US", "EU"]})
 
 
+def _contains(expr, target: dict) -> bool:
+    """Whether `target` appears anywhere inside the expression `expr`."""
+    if expr == target:
+        return True
+    if isinstance(expr, dict):
+        return any(_contains(v, target) for v in expr.values())
+    if isinstance(expr, list):
+        return any(_contains(v, target) for v in expr)
+    return False
+
+
 def _count_ir(ir: dict, predicate_ir: dict) -> int:
-    """How many times `predicate_ir` appears as a Filter predicate in the IR tree."""
+    """How many Filters in the IR tree *constrain* by `predicate_ir`.
+
+    The predicate is counted when it appears anywhere inside a Filter's predicate, not only
+    when it is the whole of it. A pushed predicate is routinely `AND`-ed with another one
+    the optimizer inferred for the same side (a join key's implied `IS NOT NULL`, say), and
+    an equality test on the whole predicate then reports zero for a side that is in fact
+    constrained — measuring the shape of the conjunction rather than the thing under test.
+    """
     count = 0
     if isinstance(ir, dict):
-        if ir.get("op") == "filter" and ir.get("predicate") == predicate_ir:
+        if ir.get("op") == "filter" and _contains(ir.get("predicate"), predicate_ir):
             count += 1
         for v in ir.values():
             count += _count_ir(v, predicate_ir)

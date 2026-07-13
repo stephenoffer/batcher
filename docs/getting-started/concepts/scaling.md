@@ -1,17 +1,18 @@
 # One core to a cluster
 
-Stateful operators — aggregation, join, distinct, window — are written once as
-*mergeable* primitives: a `partial` step builds partition-local state, `combine`
-merges those states associatively, and `finalize` produces rows. Because `combine`
-is associative and commutative, partials merge in any order.
+Aggregation and join carry state across rows; so do distinct and window. Each of them
+is written exactly once, as a *mergeable* primitive: a `partial` step builds
+partition-local state, `combine` merges those states associatively, and `finalize`
+produces rows. `combine` is associative and commutative, so partials merge in any order.
 
-![Mergeable algebra: each partition computes a partial state, an associative combine merges them in any order, and finalize produces the result — the same code on one core or many machines.](../../_static/diagrams/mergeable.png)
+![Mergeable algebra: each partition computes a partial state, an associative combine merges them in any order, and finalize produces the result. The same code runs on one core or many machines.](../../_static/diagrams/mergeable.png)
 
-The same implementation serves one core, many cores (the parallel executor
-morselizes and merges), and many machines (the distributed path partitions, runs the
-partials, and combines). A distributed run is a *scheduling* concern, not a second
-set of semantics, so a result is identical whether it is produced on a laptop or a
-cluster — and per-node memory stays bounded because partials spill to disk.
+That one implementation then serves a single core, many cores (the parallel executor
+morselizes and merges), and many machines (the distributed path partitions the data,
+then runs the partials and combines them).
+
+Distribution is a *scheduling* concern rather than a second set of semantics. A result
+is identical whether a laptop or a cluster produced it.
 
 ```python
 import batcher as bt
@@ -23,14 +24,14 @@ print(counts.to_pydict())
 # {'g': ['a', 'b'], 'n': [2, 2]}
 ```
 
-Passing `distributed=True` to `collect()` runs the same plan across workers; the
-output matches the single-node result above. There is no separate distributed
-operator to learn — going from a sample to petabytes is a deployment change, not a
-rewrite.
+Passing `distributed=True` to `collect()` runs that same plan across workers, and the
+output matches the single-node result above. There is no separate distributed operator
+to learn. Going from a sample to petabytes is a deployment change, not a rewrite of your
+query.
 
-The mergeable form is also what keeps memory bounded: each `partial` is small, and a
-partition that grows too large spills to disk rather than failing. Scaling out is then
-just a flag — the plan, and the result, are unchanged:
+The mergeable form is also what bounds memory: each `partial` stays small, and a
+partition that grows too large spills to disk instead of failing. So scaling out is a
+flag. The plan and the result do not change.
 
 ```python
 # docs: skip

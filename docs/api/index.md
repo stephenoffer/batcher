@@ -41,7 +41,8 @@ the [quick reference](reference.md) is the cheat sheet.
   `.list` / `.struct` / `.json` accessors.
 - [Reading and writing](io.md) — every reader and writer, with the optional extras.
 - [SQL](sql.md) — the SQL surface and how it lowers to the DataFrame API.
-- [ML](ml.md) — the `.ml` accessor: `map_batches`, `infer`, `embed`.
+- [ML](ml.md) — the `.ml` accessor, plus the LLM, serving, loader, and vector surfaces.
+- [Governance](governance.md) — row filters, column masks, grants, and lineage.
 - [Configuration](configuration.md) — the tunables and how they're set.
 - [Errors](exceptions.md) — the typed exceptions and what raises them.
 
@@ -62,6 +63,7 @@ expressions
 io
 sql
 ml
+governance
 configuration
 exceptions
 ```

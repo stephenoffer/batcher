@@ -83,6 +83,14 @@ class CSVSource(FileSource):
     Large files are split into newline-aligned byte ranges (`CSVRangeSplit`) so a
     single multi-GB CSV reads in parallel across workers; small files use one split
     each. Schema is inferred by pyarrow on first access.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io import CSVSource  # doctest: +SKIP
+            >>> src = CSVSource("s3://bucket/events/*.csv")  # doctest: +SKIP
+            >>> src.schema().names  # doctest: +SKIP
+            ['id', 'ts']
     """
 
     suffix = ".csv"
@@ -129,7 +137,20 @@ class CSVSource(FileSource):
 
 @SINKS.register("csv")
 class CSVSink(FileSink):
-    """Write a CSV file."""
+    """Write a CSV file.
+
+    Row ranges are encoded concurrently into in-memory buffers (only the first
+    carries the header) and written back to back, so a single-file write is not
+    bottlenecked on pyarrow's single-threaded CSV writer.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa  # doctest: +SKIP
+            >>> from batcher.io import CSVSink  # doctest: +SKIP
+            >>> CSVSink().write(pa.table({"x": [1, 2]}), "out.csv").rows  # doctest: +SKIP
+            2
+    """
 
     suffix = ".csv"
     format_name = "csv"
@@ -172,6 +193,22 @@ class CSVSink(FileSink):
         encode them CONCURRENTLY to byte buffers (pyarrow's CSV encoder releases the GIL;
         only the first batch of the whole stream carries the header), writing each window
         back to back. Peak memory is one window, not the whole result — still out-of-core.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt  # doctest: +SKIP
+                >>> from batcher.io import CSVSink  # doctest: +SKIP
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})  # doctest: +SKIP
+                >>> CSVSink().write_stream(ds.iter_batches(), "out.csv").rows  # doctest: +SKIP
+                3
+
+        Args:
+            batches: The batches to encode, consumed one at a time.
+            path: Destination file URI.
+            schema: Schema used to write a valid empty file when `batches` yields
+                nothing.
+            resume: Leave an already-present (hence complete) file untouched.
         """
         from itertools import chain
 

@@ -84,6 +84,11 @@ class ProtobufSource(FileSource):
         super().__init__(path)
         self._message_cls = message_cls
 
+    def _reader_kwargs(self) -> dict[str, object]:
+        # `message_cls` is required — a worker rebuilding the reader without it raises. The
+        # generated protobuf class is picklable (module-qualified), so it ships to the worker.
+        return {"message_cls": self._message_cls}
+
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:  # noqa: ARG002 (from descriptor)
         protarrow = _require_protarrow()
         return protarrow.message_type_to_schema(self._message_cls.DESCRIPTOR)

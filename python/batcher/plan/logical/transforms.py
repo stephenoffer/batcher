@@ -116,9 +116,19 @@ def is_streamable(plan: LogicalPlan) -> bool:
     (aggregate, sort, join, distinct, union, window, limit) that must see the
     whole input. Such plans are partition-independent, so running them per source
     batch yields exactly the same result as running them over the whole input.
+
+    A **fraction** `Sample` qualifies (a row is kept iff a seeded hash of its values
+    falls under the fraction — a per-row predicate). A **fixed-count** `Sample(n=)`
+    does NOT: it keeps the `n` smallest-hash rows of the WHOLE relation, so running it
+    per batch keeps `n` rows from every batch. This mirrors
+    `dist.executors.plan_analysis._is_row_wise`, which draws the same line for the
+    distributed path — the two MUST agree or a plan streams one way and shuffles the
+    other.
     """
     if isinstance(plan, Scan):
         return True
-    if isinstance(plan, (Filter, Project, MapBatches, Unnest, Unpivot, Sample)):
+    if isinstance(plan, Sample):
+        return plan.n is None and is_streamable(plan.input)
+    if isinstance(plan, (Filter, Project, MapBatches, Unnest, Unpivot)):
         return is_streamable(plan.input)
     return False

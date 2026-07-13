@@ -425,6 +425,35 @@ class Reader:
         """
         return _read(path, format="numpy", **opts)
 
+    def point_cloud(self, path: str, **opts: Any) -> Dataset:
+        """Read LiDAR / point-cloud file(s) — ``.pcd`` / ``.ply`` / raw ``.bin`` — as points.
+
+        The native robotics / autonomous-driving point-cloud formats, with no third-party
+        dependency. Each file is one frame; every point becomes a row with a column per
+        field (``x``/``y``/``z``/``intensity``/…) plus a ``frame`` column naming the source
+        file — so region cropping, ground-plane removal, and voxel binning are native
+        operators, and a directory of sweeps stays separable via ``group_by("frame")``.
+
+        Args:
+            path: a point-cloud file, directory, or glob.
+            opts: ``columns`` (field names for a raw ``.bin`` layout, default
+                ``("x", "y", "z", "intensity")``), ``dtype`` (``.bin`` element type),
+                and ``frame_column`` (the appended source-file column; ``None`` to omit).
+
+        Returns:
+            A lazy `Dataset` of point rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, tempfile, os, numpy as np
+                >>> p = os.path.join(tempfile.mkdtemp(), "sweep.bin")
+                >>> np.array([[1, 2, 3, 0.5]], dtype=np.float32).tofile(p)
+                >>> bt.read.point_cloud(p, frame_column=None).to_pydict()
+                {'x': [1.0], 'y': [2.0], 'z': [3.0], 'intensity': [0.5]}
+        """
+        return _read(path, format="point_cloud", **opts)
+
     def webdataset(self, path: str, **opts: Any) -> Dataset:
         """Read WebDataset ``.tar`` shard(s), grouping each sample's member files into one row.
 
@@ -442,6 +471,29 @@ class Reader:
                 >>> ds = bt.read.webdataset("s3://bucket/shards/{000..099}.tar")  # doctest: +SKIP
         """
         return _read(path, format="webdataset", **opts)
+
+    def tfrecord(self, path: str, **opts: Any) -> Dataset:
+        """Read TFRecord file(s) — the Waymo Open Dataset / TFDS / RLDS container format.
+
+        Each length-prefixed, CRC-checked record becomes a row in a ``record`` binary
+        column (the raw serialized payload — commonly a ``tf.train.Example`` protobuf);
+        decode it downstream with a `map_batches`. CRC verification uses ``crc32c`` when
+        installed. Reads records with no TensorFlow dependency.
+
+        Args:
+            path: a ``.tfrecord``/``.tfrecords`` file, directory, or glob.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` with one row per record.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.tfrecord("gs://waymo_open_dataset/*.tfrecord")  # doctest: +SKIP
+        """
+        return _read(path, format="tfrecord", **opts)
 
     def hdf5(self, path: str, **opts: Any) -> Dataset:
         """Read HDF5 file(s) — a file, directory, or glob — with datasets as columns.

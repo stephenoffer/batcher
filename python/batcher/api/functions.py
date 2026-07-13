@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from batcher.api.merge.clauses import source_col, target_col
 from batcher.plan.expr_ir import (
     AggExpr,
     Expr,
@@ -161,12 +162,14 @@ __all__ = [
     "rank",
     "row_number",
     "sequence",
+    "source_col",
     "starts_with",
     "std",
     "string",
     "struct",
     "sum",
     "sum_horizontal",
+    "target_col",
     "temporal",
     "var",
     "when",

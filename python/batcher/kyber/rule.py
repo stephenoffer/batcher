@@ -28,6 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from batcher.kyber.pass_base import OptimizerContext
+from batcher.plan.expr_ir import Expr
 from batcher.plan.logical import LogicalPlan
 from batcher.plan.visitor import transform_up
 
@@ -94,6 +95,14 @@ class Rule:
     node_fn: Callable[[LogicalPlan, OptimizerContext], LogicalPlan | None] | None = field(
         default=None, compare=False
     )
+    # For a rule whose whole body is a leaf `Expr -> Expr` rewrite applied to every
+    # expression the node carries, the leaf itself. The driver uses it to run *every* such
+    # rule in a phase in a **single** expression traversal per node, instead of one full
+    # traversal per rule — which is what keeps a hundred-odd expression rules affordable
+    # (profiled: `transform_expr_up` was two thirds of planning time, one walk per rule per
+    # node). `fn`/`node_fn` remain the equivalent standalone forms, so a rule is still
+    # unit-testable on its own and a phase that cannot fuse runs it exactly as before.
+    expr_fn: Callable[[Expr], Expr] | None = field(default=None, compare=False)
 
     def apply(self, plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
         return self.fn(plan, ctx)
@@ -132,6 +141,7 @@ def node_rule(
     matches: tuple[type, ...],
     category: RuleCategory = RuleCategory.REWRITE,
     idempotent: bool = True,
+    expr_fn: Callable[[Expr], Expr] | None = None,
 ) -> Rule:
     """Wrap a node-local function `fn(node, ctx) -> node | None` as a `Rule`.
 
@@ -160,4 +170,5 @@ def node_rule(
         category=category,
         idempotent=idempotent,
         node_fn=fn,
+        expr_fn=expr_fn,
     )

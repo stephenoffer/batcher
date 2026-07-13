@@ -360,11 +360,16 @@ class StreamingQueryEngine:
         self._checkpoint.record_offsets(self._batches, positions)
 
     def _commit_microbatch(self) -> None:
-        """Snapshot running state (if any) and mark the micro-batch committed."""
+        """Snapshot running state (if any), commit, and prune superseded snapshots."""
         snap = getattr(self._processor, "snapshot_state", None)
         if snap is not None:
             self._checkpoint.snapshot_state(self._batches, snap())
         self._checkpoint.commit(self._batches)
+        # Recovery only ever restores the latest committed snapshot, so drop the older
+        # ones now — a long-running stateful stream keeps a bounded `state/` dir (one live
+        # snapshot) instead of accumulating one file per micro-batch forever.
+        if snap is not None:
+            self._checkpoint.prune_state(self._batches)
 
 
 def make_processor(

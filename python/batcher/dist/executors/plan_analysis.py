@@ -21,15 +21,25 @@ from batcher.plan.logical import (
     LogicalPlan,
     MapBatches,
     Project,
+    RowId,
+    Sample,
     Scan,
     Sort,
     Unnest,
+    Unpivot,
     remap_sources,
 )
 from batcher.plan.schema import SchemaRef
 
-# Single-input nodes we can carry as "post-aggregation" work above the breaker.
-_PASS_THROUGH = (Filter, Project, Sort, Limit, Distinct, Unnest)
+# Single-input nodes we can carry as "post-aggregation" work above the breaker — re-run by
+# `_apply_above` over the breaker's fully-assembled driver-side result. Every one is a row-wise
+# or whole-relation-over-the-assembled-table transform, so applying it on the driver after the
+# distributed breaker equals applying it single-node: `Unpivot`/`Sample` are row-wise, and a
+# `RowId` (`with_row_index`/`with_random`/`tail`) numbers the assembled result in its final global
+# order — exactly what single-node does. Without `Unpivot`/`Sample`/`RowId` here, a breaker
+# followed by one of them (`group_by(...).agg(...).unpivot(...)`, `sort(...).with_row_index()`)
+# matched no dispatch branch and raised `PlanError` on splittable data.
+_PASS_THROUGH = (Filter, Project, Sort, Limit, Distinct, Unnest, Unpivot, Sample, RowId)
 
 # Schema for an intermediate stage's scan: only read when the upstream stage produced
 # zero rows (`_execute_node` falls back to it), where the downstream result is empty
@@ -278,14 +288,26 @@ def requires_staging(plan: LogicalPlan) -> bool:
 def _dispatcher_handles_aggregate_input(node: LogicalPlan) -> bool:
     """Whether `_dispatch` has a real fused path for an aggregate over this (breaker) input.
 
-    A join is fused into the aggregate's reducers (or staged by `_staged_aggregate_over_join`),
-    and a breaker-free `Distinct` is the `COUNT(DISTINCT)` rewrite the dispatcher redirects.
-    Everything else would be run per-partition as a map prefix, which is unsound.
+    A join is fused into the aggregate's reducers (or staged by `_staged_aggregate_over_join`)
+    ONLY when both of its sides are a single, breaker-free source — the same `_join_sides_are_map
+    _only` precondition the dispatcher's fused paths enforce. A breaker-free `Distinct` is the
+    `COUNT(DISTINCT)` rewrite the dispatcher redirects. Everything else would be run per-partition
+    as a map prefix, which is unsound, so it must stage.
+
+    Returning True for *any* join (the previous behavior) was correct only because
+    `requires_staging` also recurses into the join's children and catches a breaker side there.
+    Mirroring the real predicate here removes that fragile coupling: a join with a breaker side
+    now stages directly, never risking a silent `PlanError` if the child recursion ever misses it.
     """
     from batcher.plan.logical import AsofJoin
 
     if isinstance(node, (Join, AsofJoin)):
-        return True
+        return (
+            len(_source_ids(node.left)) == 1
+            and len(_source_ids(node.right)) == 1
+            and not _has_breaker(node.left)
+            and not _has_breaker(node.right)
+        )
     return isinstance(node, Distinct) and not _has_breaker(node.input)
 
 

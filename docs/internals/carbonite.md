@@ -56,8 +56,8 @@ credit_ceiling_factor`.
 
 | Knob (`config.flow_control`) | Default | Meaning |
 |------------------------------|---------|---------|
-| `default_credits` | `4` | In-flight batch slots when an operator has no estimate. |
-| `credit_ceiling_factor` | `16` | Maximum window is `default_credits × this`. |
+| `default_credits` | `16` | In-flight batch slots when an operator has no estimate. |
+| `credit_ceiling_factor` | `4` | Maximum window is `default_credits × this`. |
 | `shuffle_fan_in` | `8` | Inbound streams a shuffle node fans in before the reduce becomes a tree of combiners. |
 | `aimd_alpha` / `aimd_beta` | `1` / `0.5` | Additive increase per round trip; multiplicative decrease on congestion. |
 | `backpressure_high` / `backpressure_low` | `0.70` / `0.40` | Buffer occupancy that throttles, then resumes, the producer. |

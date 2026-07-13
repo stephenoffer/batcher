@@ -12,6 +12,9 @@ arrow.workspace = true
 # win over a per-chunk pyarrow read). Pinned to 56 to match arrow 56 so the
 # RecordBatch/Schema types are identical across the graph.
 parquet = { version = "56", features = ["async", "object_store"] }
+# Native Avro (OCF) decode to Arrow — the columnar replacement for the row-by-row
+# `fastavro` Python path (measured ~33x faster). Version matched to arrow 56.
+arrow-avro = "56"
 # Uniform object storage: S3 (+ MinIO/Ceph via endpoint), GCS, Azure, local, HTTP.
 # Version matched to parquet 56's `object_store` integration so `ParquetObjectReader`
 # accepts the store we build.
@@ -21,6 +24,10 @@ futures = "0.3"
 bytes = "1"
 url = "2"
 thiserror = { workspace = true }
+# Parse the pushed predicate handed over the FFI boundary (a compact JSON the Python
+# `to_native_predicate` emits) for footer-statistics row-group pruning.
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

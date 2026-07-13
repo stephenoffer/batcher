@@ -72,6 +72,16 @@ class BuildSideDecision:
     # is a *byte* threshold (`broadcast_max_bytes`), so its learned fit needs bytes, not
     # rows — and only Kyber, which has the row widths, can supply them.
     build_bytes: float = 0.0
+    # The plan signature SELECTION used to look up this join's learned strategy arm.
+    #
+    # It must be carried, not recomputed from the finished plan, because the two are not the
+    # same key. The ENFORCE phase runs *after* SELECTION and legitimately rewrites a join's
+    # inputs — a runtime/sideways filter lands directly on them — which changes the join's
+    # structural signature. The bandit then *read* under the pre-ENFORCE signature and the
+    # conductor *wrote* the reward under the post-ENFORCE one, so the arm it learned could
+    # never be found again and the loop silently never closed. Stamping the key here makes
+    # read and write the same key by construction, whatever ENFORCE does afterwards.
+    signature: str = ""
 
 
 def adaptive_build_side(
@@ -256,6 +266,7 @@ def _rewrite(
                 broadcast,
                 cost_delta,
                 build_bytes,
+                plan_signature(node),
             )
         )
         return node

@@ -79,13 +79,14 @@ class Session:
         self._tables: dict[str, Dataset] = {}
         self._functions: dict[str, _RegisteredFunction] = {}
         self._dialect = dialect
-        # Prepared-statement cache: query text -> (catalog generation, built Dataset).
+        # Prepared-statement cache: (dialect, query) -> (catalog generation, Dataset).
         # A repeated SELECT against an unchanged catalog skips the sqlglot parse + AST
-        # translation. `_generation` bumps on every catalog mutation (register / drop /
+        # translation. The generation bumps on every catalog mutation (register / drop /
         # create / clear / register_function), invalidating stale entries — so a plan
-        # never outlives the tables or functions it was built against.
-        self._plan_cache: dict[str, tuple[int, Dataset]] = {}
-        self._generation = 0
+        # never outlives the tables or functions it was built against. It is a one-slot
+        # list, not an int, because `_with_dialect` views share it by reference.
+        self._plan_cache: dict[tuple[str, str], tuple[int, Dataset]] = {}
+        self._generation: list[int] = [0]
 
     def __repr__(self) -> str:
         """Show the registered table names, e.g. ``Session(tables=['emp', 'dept'])``."""
@@ -150,7 +151,7 @@ class Session:
 
     def _bump(self) -> None:
         """Invalidate the prepared-statement cache after a catalog mutation."""
-        self._generation += 1
+        self._generation[0] += 1
 
     # --- tables ------------------------------------------------------------
     def register(self, name: str, dataset: Dataset | pa.Table) -> Dataset:
@@ -382,9 +383,10 @@ class Session:
         # bindings — CREATE/DROP mutate the catalog and are never cached, and a
         # `tables` override changes what the names resolve to.
         cacheable = not tables
+        key = (self._dialect, query)
         if cacheable:
-            hit = self._plan_cache.get(query)
-            if hit is not None and hit[0] == self._generation:
+            hit = self._plan_cache.get(key)
+            if hit is not None and hit[0] == self._generation[0]:
                 return hit[1]
 
         import sqlglot
@@ -397,7 +399,7 @@ class Session:
             return self._drop(ast)
         ds = self._translate(ast, tables)
         if cacheable:
-            self._plan_cache[query] = (self._generation, ds)
+            self._plan_cache[key] = (self._generation[0], ds)
         return ds
 
     def _translate(self, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Dataset:
@@ -432,11 +434,20 @@ class Session:
         return self._as_dataset(pa.table({"dropped": pa.array([name], pa.string())}))
 
     def _with_dialect(self, dialect: str) -> Session:
-        """A view of this session reading `dialect`, sharing its tables and functions."""
+        """A view of this session reading `dialect`, sharing its tables and functions.
+
+        Everything mutable is shared *by reference* with the owning session — the
+        catalog, the function registry, the plan cache, and the generation counter —
+        so a table registered on either is visible to both. Only the read dialect
+        differs, and the plan cache is keyed by dialect, so the same query text
+        parsed as Spark and as DuckDB cannot collide.
+        """
         view = Session.__new__(Session)
         view._tables = self._tables
         view._functions = self._functions
         view._dialect = dialect
+        view._plan_cache = self._plan_cache
+        view._generation = self._generation
         return view
 
     @staticmethod

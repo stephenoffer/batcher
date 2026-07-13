@@ -7,10 +7,11 @@ paths) and runs every standard-suite query as SQL.
 from __future__ import annotations
 
 import importlib.util
+import os
 
 import pyarrow as pa
 
-from .base import Engine, SqlRunner
+from .base import Engine, Rename, SqlRunner, sql_projection
 
 
 class DuckDBEngine(Engine):
@@ -57,13 +58,17 @@ class DuckDBEngine(Engine):
             con.unregister(f"__arrow_{name}")
         return lambda query: con.sql(query).to_arrow_table()
 
-    def sql_runner_scan(self, uris: dict[str, str]) -> SqlRunner:
+    def sql_runner_scan(self, uris: dict[str, str], rename: Rename | None = None) -> SqlRunner:
         import duckdb
 
         con = duckdb.connect()
         con.sql("INSTALL httpfs; LOAD httpfs;")
+        region = os.environ.get("BENCH_S3_REGION")
+        if region:
+            con.sql(f"SET s3_region='{region}'")
         for name, uri in uris.items():
-            con.sql(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM read_parquet('{uri}')")
+            cols = sql_projection((rename or {}).get(name))
+            con.sql(f"CREATE OR REPLACE VIEW {name} AS SELECT {cols} FROM read_parquet('{uri}')")
         return lambda query: con.sql(query).to_arrow_table()
 
     def scan_sql_runner(self, glob: str) -> SqlRunner:

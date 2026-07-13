@@ -152,9 +152,9 @@ impl Expr {
                 let arr = input.eval(batch)?;
                 eval_image(*func, &arr, *width, *height)
             }
-            Expr::Audio { func, input } => {
+            Expr::Audio { func, input, rate } => {
                 let arr = input.eval(batch)?;
-                eval_audio(*func, &arr)
+                eval_audio(*func, &arr, *rate)
             }
             Expr::Video { func, input } => {
                 let arr = input.eval(batch)?;

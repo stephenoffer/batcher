@@ -75,12 +75,27 @@ def http_client(
 ) -> type:
     """A `map_batches` class UDF posting each batch to a JSON inference endpoint.
 
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml import http_client  # doctest: +SKIP
+            >>> udf = http_client(  # doctest: +SKIP
+            ...     "http://host:8080/predict",
+            ...     input_columns=["feature"],
+            ...     output_columns=["score"],
+            ... )
+            >>> ds.ml.map_batches(udf, concurrency=4).collect()  # doctest: +SKIP
+
     Args:
         url: the inference endpoint (receives ``{column: list}``, returns the same).
-        input_columns / output_columns: columns sent and appended.
+        input_columns: the columns sent to the endpoint, in order.
+        output_columns: the result columns appended to each batch.
         headers: optional HTTP headers (e.g. an auth token).
         timeout: per-request timeout in seconds.
         retries: retry attempts with backoff on transient failures.
+
+    Returns:
+        A class for ``ds.ml.map_batches(...)`` — the client connects once per worker.
     """
 
     def connect() -> _HttpServingClient:

@@ -15,6 +15,7 @@ pub mod agg;
 mod error;
 pub mod gather;
 pub mod join;
+pub(crate) mod keys;
 pub mod shuffle;
 pub mod window;
 mod window_fill;

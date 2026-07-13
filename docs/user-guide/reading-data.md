@@ -1,9 +1,8 @@
 # Reading data
 
-A pipeline starts by building a `Dataset` from a source. Sources fall into two
-groups: in-memory constructors that wrap data already in the process, and file or
-path readers that load from disk or object storage. Every constructor is lazy and
-returns a `Dataset`.
+A pipeline starts by building a `Dataset` from a source. Sources come in two groups:
+in-memory constructors, which wrap data already in the process, and path readers,
+which load from disk or object storage. Both are lazy.
 
 ## In-memory constructors
 
@@ -26,7 +25,7 @@ print(ds.to_pydict())
 # {'id': [1, 2, 3], 'name': ['alice', 'bob', 'carol'], 'value': [100, 200, 300]}
 ```
 
-### From Arrow
+### From arrow
 
 `from_arrow` wraps a `pyarrow.Table`, a `RecordBatch`, or a list of batches with
 no copy of the underlying buffers.
@@ -62,9 +61,9 @@ print(ds.to_pydict())
 
 ### From items and generators
 
-`from_items` builds a `Dataset` from a Python list — one row per item, Ray Data
-style (a dict item expands to columns, a scalar becomes a single `item` column).
-`date_range` generates a calendar dimension, the date-typed sibling of `range`.
+`from_items` builds a `Dataset` from a Python list, one row per item, Ray Data style.
+A dict item expands to columns; a scalar becomes a single `item` column. `date_range`
+generates a calendar dimension, the date-typed sibling of `range`.
 
 ```python
 print(bt.from_items([1, 2, 3]).to_pydict())
@@ -89,8 +88,8 @@ ds = bt.from_pandas(pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}))
 
 ## File and path readers
 
-File readers load from local paths, glob patterns, and object-store URLs. They
-need real files, so the examples below are shown but not executed here.
+File readers take a local path, a glob pattern, or an object-store URL. They need
+real files, so the examples below are shown but not executed here.
 
 {py:obj}`bt.read(path, format=None, **opts) <batcher.read>` detects the format from the path when
 `format` is omitted. Format-specific helpers (`read.parquet`, `read.csv`,
@@ -110,11 +109,11 @@ ds = bt.read.csv("data/events.csv")
 ds = bt.read.json("data/events.jsonl")
 ```
 
-Many more readers exist for columnar, table, and multimodal formats, including
+Many more readers cover the columnar and table formats, and the multimodal ones:
 `read.orc`, `read.arrow`, `read.avro`, `read.lance`, `read.delta`, `read.iceberg`,
 `read.hudi`, `read.sql`, `read.snowflake`, `read.bigquery`, `read.kafka`,
-`read.images`, `read.audio`, and `read.video`. Each takes a path or connection
-plus format-specific options.
+`read.images`, `read.audio`, and `read.video`. Each takes a path or connection plus
+format-specific options.
 
 ```python
 # docs: skip
@@ -124,20 +123,22 @@ frames = bt.read.images("s3://bucket/photos/*.jpg")
 
 ## Databases, warehouses, and specialized formats
 
-Beyond the file formats above, `bt.read` reaches databases, warehouses, and a set
-of scientific/columnar container formats through the same namespace. They all share
-one shape: `bt.read.<name>(path_or_uri, **opts)` returns a lazy `Dataset`, and
-nothing is fetched until a terminal op runs. The database connectors (`mongo`,
-`cassandra`, `dynamodb`, `elasticsearch`) take their connection as keyword options
-rather than a path.
+The same `bt.read` namespace also reaches databases and warehouses, plus a handful
+of scientific container formats. They share one shape: `bt.read.<name>(path_or_uri,
+**opts)` hands back a lazy `Dataset`, and nothing is fetched until a terminal op
+runs. The database connectors (`mongo`, `cassandra`, `dynamodb`, `elasticsearch`)
+take their connection as keyword options rather than a path.
 
 | Reader | Reads | Needs |
 | --- | --- | --- |
 | `read.parquet_dataset(dir)` | A Hive-partitioned Parquet directory, partition columns recovered from the layout | — |
 | `read.webdataset(path)` | WebDataset `.tar` shards, one row per sample | — |
+| `read.tfrecord(path)` | TFRecord file(s) (Waymo / TFDS / RLDS), one row per record | — |
 | `read.excel(path)` | Excel workbook(s) via python-calamine | `[excel]` |
 | `read.hdf5(path)` | HDF5 file(s), datasets as columns | `[hdf5]` |
 | `read.zarr(path)` | A Zarr store of chunked n-dimensional arrays | `[zarr]` |
+| `read.numpy(path)` | NumPy `.npy`/`.npz` file(s) as tensor rows | — |
+| `read.point_cloud(path)` | LiDAR / point-cloud files (`.pcd`, `.ply`, raw `.bin`), one row per point | — |
 | `read.delta_sharing(url)` | A Delta Sharing `<profile>#<share>.<schema>.<table>` | `[delta-sharing]` |
 | `read.clickhouse(query)` | A ClickHouse query result over the Arrow-native interface | a running ClickHouse |
 | `read.databricks(table)` | A Databricks/Unity Catalog table (credential vending) | a Databricks workspace |
@@ -156,6 +157,32 @@ orders = bt.read.databricks("main.sales.orders")
 events = bt.read.mongo(uri="mongodb://localhost:27017", database="app", collection="events")
 shared = bt.read.delta_sharing("config.share#share.schema.table")
 grids = bt.read.zarr("s3://bucket/array.zarr")
+```
+
+### Point clouds and sensor arrays (robotics)
+
+`read.point_cloud` reads the native LiDAR and autonomous-driving point-cloud formats,
+`.pcd` (PCL/ROS), `.ply`, and raw KITTI-style `.bin`, with no third-party dependency.
+Each file is one frame; every point becomes a row with a column per field
+(`x`/`y`/`z`/`intensity`/…) plus a `frame` column naming the source file. The cloud is
+columnar, so the usual robotics preprocessing (crop a region, remove the ground plane,
+bin into voxels) is a native engine operator. A directory of sweeps stays separable
+with `group_by("frame")`. A raw `.bin` buffer carries no schema, so pass its `columns=`
+layout (default `x, y, z, intensity`).
+
+```python
+import os
+import tempfile
+import numpy as np
+
+path = os.path.join(tempfile.mkdtemp(), "0000.bin")  # a KITTI-style Velodyne sweep
+np.array([[3.0, 1.0, -1.8, 0.2], [4.0, 2.0, 0.5, 0.9]], dtype=np.float32).tofile(path)
+
+sweep = bt.read.point_cloud(path)
+# Ground-plane removal is just a filter on z — done natively, in parallel.
+above_ground = sweep.filter(bt.col("z") > -1.5)
+print(above_ground.select("x", "z").to_pydict())
+# {'x': [4.0], 'z': [0.5]}
 ```
 
 Partitioned Parquet needs only local files, so it runs end to end. `parquet_dataset`
@@ -180,8 +207,8 @@ print(ds.select("value").sort("value").to_pydict())
 
 ## What you get back
 
-Every constructor returns a lazy `Dataset`. Inspect the column names with the
-`columns` property; nothing is read until a terminal operation runs.
+Every constructor hands back a lazy `Dataset`. Inspect the column names with the
+`columns` property. Nothing is read until a terminal operation runs.
 
 ```python
 people = bt.from_pydict({"id": [1, 2], "name": ["alice", "bob"]})
@@ -200,7 +227,8 @@ print(isinstance(bt.engine_version(), str))
 ## Next steps
 
 - [Transformations](transformations.md): reshape and derive columns.
-- [Filtering](filtering.md): select rows and remove duplicates.
-- [Lakehouse tables](lakehouse.md): read Delta/Iceberg tables and time-travel.
+- [Filtering](filtering.md): select rows, drop duplicates.
+- [Lakehouse tables](lakehouse.md): read Delta and Iceberg tables, and travel back
+  through their versions.
 - [Data quality](data-quality.md): validate inputs as they arrive.
 - [IO API](../api/io.md): the full `bt.read` reader reference.
