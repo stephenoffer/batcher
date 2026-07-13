@@ -47,7 +47,7 @@ pub(crate) use quantile_spill::{
     try_bounded_distinct_spill, try_bounded_histogram_spill, try_bounded_mode_spill,
     try_bounded_quantile_spill,
 };
-pub(crate) use repartition::partition_morsels;
+pub(crate) use repartition::{partition_morsels, partition_morsels_by_index};
 pub(crate) use reshape::{
     add_row_ids, sample_batch, sample_n_batches, unnest_batch, unpivot_batch,
 };

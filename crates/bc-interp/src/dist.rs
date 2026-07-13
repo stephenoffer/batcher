@@ -215,14 +215,21 @@ fn in_worker_pool<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T, InterpErro
 
 /// Hash-shuffle `batches` into `num_partitions` buckets by the given key columns.
 /// Returns one (single-batch) relation per bucket — the unit a reducer consumes.
+///
+/// Buckets straight from the mapper's morsels, gathering each row **once**
+/// (`ops::partition_morsels_by_index`). Concatenating first (`materialize`) and then
+/// `partition_by_keys`-ing the result gathers every row a second time — two full copies
+/// of the mapper's entire output, on every shuffle of every distributed query. The
+/// buckets, their contents, and the row order within each are identical either way (a
+/// row's bucket is a deterministic function of its key, and the gather visits morsels
+/// and rows in order), which is what the single-node shuffle join already relies on.
 pub fn partition_batches(
     batches: &[RecordBatch],
     key_indices: &[usize],
     num_partitions: usize,
 ) -> Result<Vec<Vec<RecordBatch>>, InterpError> {
-    let combined = ops::materialize(batches)?;
     let parts =
-        in_worker_pool(|| shuffle::partition_by_keys(&combined, key_indices, num_partitions))??;
+        in_worker_pool(|| ops::partition_morsels_by_index(batches, key_indices, num_partitions))??;
     Ok(parts.into_iter().map(|b| vec![b]).collect())
 }
 
@@ -323,5 +330,64 @@ mod tests {
         assert_eq!(partials[0].group_columns.len(), 1);
         let widths: Vec<usize> = partials[0].states.iter().map(|s| s.len()).collect();
         assert_eq!(widths, vec![2, 1]);
+    }
+
+    /// A keyed relation split across several morsels.
+    fn keyed_morsels() -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        // Repeating keys, nulls, and uneven morsel sizes — the shapes a shuffle must
+        // route identically no matter how the relation happens to be chunked.
+        let chunks: Vec<(Vec<Option<i64>>, Vec<Option<i64>>)> = vec![
+            (
+                vec![Some(1), Some(2), None, Some(3), Some(2)],
+                vec![Some(10), Some(20), Some(30), Some(40), Some(50)],
+            ),
+            (vec![Some(3), Some(1)], vec![Some(60), Some(70)]),
+            (
+                vec![Some(7), None, Some(2), Some(9)],
+                vec![Some(80), Some(90), Some(100), Some(110)],
+            ),
+        ];
+        chunks
+            .into_iter()
+            .map(|(k, v)| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(k)) as ArrayRef,
+                        Arc::new(Int64Array::from(v)) as ArrayRef,
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// `partition_batches` buckets straight from the morsels (gathering each row once)
+    /// instead of concatenating the relation and gathering it again. The two must agree
+    /// **exactly** — same buckets, same contents, same row order within each bucket —
+    /// because a reducer's result depends on it. This pins that equivalence against the
+    /// materialize-then-`partition_by_keys` form it replaced.
+    #[test]
+    fn partition_batches_matches_materialize_then_partition() {
+        let morsels = keyed_morsels();
+        for parts in [1usize, 2, 3, 8] {
+            let got = partition_batches(&morsels, &[0], parts).unwrap();
+
+            let combined = ops::materialize(&morsels).unwrap();
+            let want = shuffle::partition_by_keys(&combined, &[0], parts).unwrap();
+
+            assert_eq!(got.len(), want.len(), "bucket count (parts={parts})");
+            for (bucket, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.len(), 1, "one batch per bucket");
+                assert_eq!(
+                    &g[0], w,
+                    "bucket {bucket} of {parts} differs from the concatenated shuffle"
+                );
+            }
+        }
     }
 }
