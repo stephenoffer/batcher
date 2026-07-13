@@ -63,10 +63,13 @@ pub(crate) type Jit = Option<std::sync::Arc<bc_codegen::CompiledExpr>>;
 /// Returns `None` if the expression is outside the JIT's supported subset — the
 /// interpreter then handles it. (Compiling once and reusing across morsels is
 /// what makes the JIT win; a per-morsel compile would lose to the interpreter.)
+///
+/// Memoized process-wide on `(expr, schema, simd)` — the compile is a pure function of those,
+/// so a query shape pays Cranelift once rather than once per `execute_plan` call. That matters
+/// most where `execute_plan` is itself the loop body: the per-batch streaming path and the
+/// per-operator UDF path.
 pub(crate) fn try_compile(expr: &bc_expr::Expr, sample: &RecordBatch) -> Jit {
-    bc_codegen::compile_expr(expr, sample)
-        .ok()
-        .map(std::sync::Arc::new)
+    bc_codegen::compile_expr_cached(expr, sample, bc_arrow::SimdOverride::default())
 }
 
 /// Evaluate an expression, using the compiled fast path when available and
@@ -403,7 +406,7 @@ pub(crate) fn sort_indices_of(
             None => sort_to_indices(v, Some(opts), None)?,
         });
     }
-    let columns: Vec<SortColumn> = vals
+    let mut columns: Vec<SortColumn> = vals
         .iter()
         .zip(keys)
         .map(|(values, k)| SortColumn {
@@ -414,6 +417,22 @@ pub(crate) fn sort_indices_of(
             }),
         })
         .collect();
+    // Append an ascending row-index as the final tie-break so `lexsort` (which is unstable in
+    // arrow) resolves rows equal on every real key to input order — the stability the single-key
+    // radix/string paths already guarantee. Without it, the parallel sample-sort and the external
+    // merge sort (each calling this over a differently-sized slice) order fully-tied rows
+    // differently from this sequential oracle, breaking seq == par bit-for-bit. The slice this
+    // sorts is always gathered in ascending original-row order, so a slice-local `0..n` preserves
+    // the input's relative order of tied rows.
+    let n = vals.first().map(|v| v.len()).unwrap_or(0);
+    let row_index: ArrayRef = Arc::new(arrow::array::UInt32Array::from_iter_values(0..n as u32));
+    columns.push(SortColumn {
+        values: row_index,
+        options: Some(SortOptions {
+            descending: false,
+            nulls_first: false,
+        }),
+    });
     Ok(lexsort_to_indices(&columns, None)?)
 }
 

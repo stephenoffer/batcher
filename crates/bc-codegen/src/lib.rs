@@ -89,10 +89,13 @@ use crate::compile::{compile, compile_simd};
 use crate::kleene::{is_null_propagating, needs_kleene};
 
 mod analyze;
+mod cache;
 mod compile;
 mod emit;
 mod kleene;
 mod simd;
+
+pub use crate::cache::compile_expr_cached;
 
 /// Errors surfaced by the JIT backend. `Unsupported` is the signal for the
 /// caller to fall back to the interpreter; the rest are genuine failures.
