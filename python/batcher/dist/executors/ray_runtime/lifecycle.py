@@ -22,6 +22,7 @@ import threading
 
 import pyarrow as pa
 
+from batcher._internal.paths import package_dir
 from batcher.config import active_config
 from batcher.io.source import Source, read_source
 from batcher.plan.logical import LogicalPlan
@@ -50,13 +51,25 @@ def engine_config_json() -> str:
     """
     base = active_config().engine_config_json()
     env = current_envelope()
-    if env is None or env.memory_bytes <= 0:
-        return base
     cfg = json.loads(base)
-    existing = int(cfg.get("memory_budget_bytes", 0) or 0)
-    cfg["memory_budget_bytes"] = (
-        env.memory_bytes if existing <= 0 else min(existing, env.memory_bytes)
-    )
+
+    # Pin the worker's rayon width to the CPUs it was actually GRANTED. The driver's
+    # config says `parallelism: 0` — "use every core" — which is right on the driver and
+    # badly wrong on a remote worker: a Ray task/actor holding a 1-CPU bundle would still
+    # open a rayon pool over the whole NODE. On a 16-core node running 16 such workers
+    # that is 256 threads contending for 16 cores, with 16 duplicate sets of per-thread
+    # allocator arenas and morsel buffers — the thrash (and the worker OOM-kills) that
+    # made a distributed shuffle slower than one node. Sizing the pool to the grant is the
+    # Carbonite contract: a worker uses exactly the resources it was admitted for.
+    # `parallelism` never changes a result, only how many threads compute it.
+    if not cfg.get("parallelism"):
+        cfg["parallelism"] = max(1, int(env.num_cpus)) if env is not None else 1
+
+    if env is not None and env.memory_bytes > 0:
+        existing = int(cfg.get("memory_budget_bytes", 0) or 0)
+        cfg["memory_budget_bytes"] = (
+            env.memory_bytes if existing <= 0 else min(existing, env.memory_bytes)
+        )
     return json.dumps(cfg)
 
 
@@ -143,6 +156,22 @@ def _ray_init_kwargs(
     return kwargs
 
 
+# Build output a managed workspace's *injected* `working_dir` may contain, excluded from
+# the Ray upload. None of it is source, all of it is regenerable, and any one of these can
+# on its own exceed Ray's 512 MiB package cap and fail `ray.init` (a `cargo` target/ runs
+# to gigabytes). Patterns are Ray `excludes` globs, matched relative to the working dir.
+_BUILD_ARTIFACT_EXCLUDES = (
+    "**/target/debug/**",  # cargo
+    "**/target/release/**",
+    "**/docs/_build/**",  # sphinx
+    "**/.git/**",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**",
+    "**/node_modules/**",
+    "**/.venv/**",
+)
+
+
 def _self_ship_runtime_env() -> dict | None:
     """A Ray `runtime_env` that uploads the driver's batcher package to workers.
 
@@ -167,18 +196,27 @@ def _self_ship_runtime_env() -> dict | None:
     lost; a job that genuinely needs extra per-worker pip deps sets `distributed.runtime_env`
     (the explicit-override branch above), which wins outright.
 
+    The env also carries `excludes` (see `_BUILD_ARTIFACT_EXCLUDES`). Batcher does not set
+    a `working_dir` — but a managed workspace *injects* one (its whole project directory),
+    and Ray zips it on every `ray.init`. A project that has been built in place carries its
+    build output there, and Ray hard-caps that upload at 512 MiB: a `cargo` `target/` (GBs)
+    or a Sphinx `docs/_build/` is enough to fail `ray.init` outright with "Package size
+    exceeds the maximum size of 512.00MiB" — before any work starts, from a *distributed
+    query*, for a reason that has nothing to do with the query. Excluding build output from
+    an upload that exists to ship *source* is right regardless, and it is the same
+    defence-in-depth as pinning `pip` off above: neutralize what the platform injects.
+
     Returns `{"pip": None}` (neutralize the injected pip, ship nothing) when
     `distributed.trust_cluster_image` is set — a production image that bakes a matching
     batcher into every node and wants to skip the upload.
     """
-    import os
-
-    import batcher
-
     if active_config().distributed.trust_cluster_image:
-        return {"pip": None}
-    pkg = os.path.dirname(os.path.abspath(batcher.__file__))
-    return {"py_modules": [pkg], "pip": None}
+        return {"pip": None, "excludes": list(_BUILD_ARTIFACT_EXCLUDES)}
+    return {
+        "py_modules": [package_dir()],
+        "pip": None,
+        "excludes": list(_BUILD_ARTIFACT_EXCLUDES),
+    }
 
 
 def _neutralize_broken_runtime_env_hook() -> None:
