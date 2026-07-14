@@ -87,6 +87,7 @@ _TASK_FUNCS: dict[str, tuple[str, ...]] = {
     "batcher.dist.executors.sort": ("_sample_task", "_range_task", "_sort_reduce_task"),
     "batcher.dist.executors.window": ("_map_task", "_reduce_task"),
     "batcher.dist.executors.write": ("_write_shard", "_write_plan_shard"),
+    "batcher.dist.streaming.microbatch": ("_stage_shard",),
 }
 
 # Unwrapped originals (so re-wrapping with a new grant never double-wraps) and the

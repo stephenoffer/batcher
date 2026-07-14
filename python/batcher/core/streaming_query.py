@@ -33,6 +33,7 @@ from batcher.plan.streaming import (
 )
 
 if TYPE_CHECKING:
+    from batcher.core.streaming_runner import MicroBatchRunner
     from batcher.io.source import Source
     from batcher.plan.logical import Aggregate
 
@@ -134,7 +135,10 @@ class StreamingQueryEngine:
         trigger: Trigger,
         output_mode: str,
         checkpoint=None,
+        runner_factory: Callable[[Callable[[], bool]], MicroBatchRunner] | None = None,
     ) -> None:
+        from batcher.core.streaming_runner import LocalRunner
+
         self._name = name
         self._source = source
         self._sink = sink
@@ -143,6 +147,15 @@ class StreamingQueryEngine:
         self._output_mode = output_mode
         self._checkpoint = checkpoint
         self._stop = threading.Event()
+        # How a micro-batch actually runs. Default: on this thread. The conductor injects
+        # the Ray fan-out for `distributed=True` — `core` never imports `dist`. The factory
+        # takes the stop predicate, so a runner that waits for data on an idle stream still
+        # observes `stop()` promptly.
+        self._runner: MicroBatchRunner = (
+            runner_factory(self._stop.is_set)
+            if runner_factory is not None
+            else LocalRunner(source, processor, sink)
+        )
         self._thread: threading.Thread | None = None
         self._progress: deque[StreamingQueryProgress] = deque(maxlen=100)
         self._batches = 0
@@ -154,7 +167,8 @@ class StreamingQueryEngine:
         """Recover from the checkpoint (if any), open the sink, launch the loop."""
         self._active = True
         self._recover()
-        self._sink.open()
+        if self._sink is not None:
+            self._sink.open()  # a distributed runner owns its sinks (one per worker)
         self._thread = threading.Thread(
             target=self._run, name=f"batcher-stream-{self._name}", daemon=True
         )
@@ -165,13 +179,12 @@ class StreamingQueryEngine:
         if self._checkpoint is None:
             return
         from batcher.io.formats.streaming.checkpoint import recover
-        from batcher.io.source import is_checkpointable
 
         plan = recover(self._checkpoint)
         self._batches = plan.start_batch
-        if plan.seek and is_checkpointable(self._source) and 0 in plan.seek:
-            self._source.seek(plan.seek[0])
-        restore = getattr(self._processor, "restore_state", None)
+        if plan.seek and 0 in plan.seek:
+            self._runner.seek(plan.seek[0])
+        restore = getattr(self._runner, "restore_state", None)
         if plan.state is not None and restore is not None:
             restore(plan.state)
 
@@ -221,8 +234,9 @@ class StreamingQueryEngine:
             self._error = exc
         finally:
             self._active = False
-            with contextlib.suppress(Exception):
-                self._sink.close()
+            if self._sink is not None:
+                with contextlib.suppress(Exception):
+                    self._sink.close()
 
     def _run_resilient(self) -> None:
         """Run the micro-batch loop, restarting from the checkpoint on a transient fault.
@@ -286,64 +300,59 @@ class StreamingQueryEngine:
 
     def _emit_finalize(self) -> None:
         """Flush any windows still open when the loop ends (the final emission)."""
-        finalize = getattr(self._processor, "finalize", None)
+        finalize = getattr(self._runner, "finalize", None)
         if finalize is None:
             return
         for rows in finalize():
             if rows.num_rows:
-                self._sink.write_batch(self._batches, pa.Table.from_batches([rows]))
+                self._runner.emit_final(self._batches, rows)
 
     def _loop(self) -> None:
         kind = self._trigger.kind
-        iterator = self._source.iter_batches(None)
         if kind == "once":
-            self._process_next(iterator)
+            self._process_next()
             return
         if kind in ("available_now", "continuous"):
             # Continuous: process micro-batches back-to-back with no inter-batch
             # delay (lowest latency), committing a checkpoint epoch per batch, until
             # the query is stopped or the source is exhausted. (`available_now` shares
             # the loop; it is simply expected to drain a finite source and end.)
-            while not self._stop.is_set() and self._process_next(iterator):
+            while not self._stop.is_set() and self._process_next():
                 pass
             return
         # processing_time: fire a micro-batch, then sleep the remainder of the interval.
         interval = self._trigger.interval_seconds or 0.0
         while not self._stop.is_set():
             t0 = perf_counter()
-            if not self._process_next(iterator):
+            if not self._process_next():
                 break  # bounded source exhausted
             remaining = interval - (perf_counter() - t0)
             if remaining > 0:
                 self._stop.wait(remaining)
 
-    def _process_next(self, iterator) -> bool:
-        """Pull one source micro-batch, process and emit it; False if exhausted.
+    def _process_next(self) -> bool:
+        """Run one micro-batch through the runner; False when the source is spent.
 
-        With a checkpoint, the per-micro-batch commit ordering is: record the source
-        offset (write-ahead), process and emit to the sink, snapshot the running
-        state, then commit — so a crash leaves an uncommitted batch the next run
-        replays idempotently (exactly-once for a replayable source + idempotent sink).
+        The ordering is the exactly-once contract, and it is the same whether the runner
+        works on this thread or across a cluster: **stage** the epoch (read it, prepare
+        its output, publish nothing), **write-ahead** the source position it consumed,
+        then **publish** it. A crash can therefore only lose an epoch that was staged and
+        not published — which the next run replays into an idempotent sink, so the rows
+        land once and the log records one transaction for it.
         """
-        try:
-            batch = next(iterator)
-        except StopIteration:
-            return False
         t0 = perf_counter()
+        staged = self._runner.stage(self._batches)
+        if staged is None:
+            return False
         if self._checkpoint is not None:
-            self._record_offset()
-        out = self._processor.process(batch)
-        emitted = 0
-        for rows in out:
-            if rows.num_rows:
-                self._sink.write_batch(self._batches, pa.Table.from_batches([rows]))
-                emitted += rows.num_rows
+            self._checkpoint.record_offsets(self._batches, self._runner.positions())
+        consumed, emitted = self._runner.publish(self._batches, staged)
         if self._checkpoint is not None:
             self._commit_microbatch()
         self._progress.append(
             StreamingQueryProgress(
                 batch_id=self._batches,
-                num_input_rows=batch.num_rows,
+                num_input_rows=consumed,
                 num_output_rows=emitted,
                 duration_ms=(perf_counter() - t0) * 1000.0,
                 timestamp=time(),
@@ -352,16 +361,10 @@ class StreamingQueryEngine:
         self._batches += 1
         return True
 
-    def _record_offset(self) -> None:
-        """Write-ahead the current source position for this micro-batch."""
-        from batcher.io.source import is_checkpointable
-
-        positions = {0: self._source.snapshot_position()} if is_checkpointable(self._source) else {}
-        self._checkpoint.record_offsets(self._batches, positions)
-
     def _commit_microbatch(self) -> None:
         """Snapshot running state (if any), commit, and prune superseded snapshots."""
-        snap = getattr(self._processor, "snapshot_state", None)
+        stateful = getattr(self._runner, "has_state", None)
+        snap = self._runner.snapshot_state if stateful is not None and stateful() else None
         if snap is not None:
             self._checkpoint.snapshot_state(self._batches, snap())
         self._checkpoint.commit(self._batches)

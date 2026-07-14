@@ -263,6 +263,32 @@ class BrokerSplit:
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
         yield from self._reader().iter_batches(projection)
 
+    def read_epoch(
+        self, start_offset: Any | None = None, projection: list[str] | None = None
+    ) -> tuple[list[pa.RecordBatch], Any | None]:
+        """Read **one** micro-batch of this partition, resuming after `start_offset`.
+
+        The distributed streaming path needs a partition read that *ends*: `read` and
+        `iter_batches` poll an unbounded broker forever, which is right for a consumer and
+        useless for an epoch. This polls once and reports the offset it stopped at, so the
+        driver can write-ahead the position and hand it back for the next epoch — the same
+        resume-strictly-after contract the single-node checkpoint uses, evaluated on the
+        worker that owns the partition.
+
+        Returns the batch (empty when the poll had nothing) and the new resume position.
+        """
+        src = self._reader()
+        if start_offset is not None:
+            src.seek({"offsets": {str(self.partition): start_offset}})
+        messages = src._poll()
+        if not messages:  # None (end of stream) or an empty poll
+            return [], start_offset
+        src._track_positions(messages)
+        batch = src._make_batch(messages)
+        if projection is not None:
+            batch = batch.select(projection)
+        return [batch], src.snapshot_position()["offsets"].get(str(self.partition))
+
     def row_count(self) -> int | None:
         return None
 

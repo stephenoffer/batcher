@@ -39,6 +39,20 @@ _SAVE_MODES = ("overwrite", "error", "ignore", "append")
 _MODE_AWARE_SINKS = frozenset({"delta", "iceberg", "hudi", "snowflake"})
 
 
+def _is_distributable_aggregate(plan: Any) -> bool:
+    """Whether `plan` is a streaming aggregation the cluster can fold in parallel.
+
+    A top-level `Aggregate` over a breaker-free input is exactly the shape the mergeable
+    algebra covers: each worker runs `partial` on its share of the epoch and the driver
+    `combine`s the partials into the running state. Anything with a *second* breaker under
+    it (a sort, a join) has no such decomposition here, and is refused rather than run with
+    different semantics than the single-node path.
+    """
+    from batcher.plan.logical import Aggregate, is_streamable
+
+    return isinstance(plan, Aggregate) and is_streamable(plan.input)
+
+
 class Writer:
     """The `ds.write` namespace: callable for autodetect, typed methods per format.
 
@@ -185,7 +199,7 @@ class Writer:
         if trigger is not None or any(not is_bounded(s) for s in self._ds._sources):
             if distributed is True:
                 drain = self._maybe_distributed_stream(
-                    path, fmt, opts, trigger, checkpoint, num_workers, query_name
+                    path, fmt, opts, trigger, checkpoint, num_workers, query_name, output_mode
                 )
                 if drain is not None:
                     return drain
@@ -328,56 +342,82 @@ class Writer:
         checkpoint: str | None,
         num_workers: int | None,
         query_name: str | None,
+        output_mode: str = "append",
     ) -> StreamingQuery | None:
-        """Run a `distributed=True` streaming write as a parallel cluster drain, if eligible.
+        """Run a `distributed=True` streaming write across the cluster, if eligible.
 
-        The supported distributed streaming shape today is a *backfill*: an
-        `available_now`/`once` trigger draining a splittable single source through a
-        stateless pipeline, which fans read+transform+write across workers (Spark's
-        `Trigger.AvailableNow`). Returns a `StreamingQuery` for that case. A benign
-        mismatch (a non-splittable source) returns ``None`` so the caller falls back to
-        the single-node engine; an unsupported *request* (a continuous trigger, a
-        checkpoint, or a stateful plan with `distributed=True`) raises `PlanError` rather
-        than silently ignoring the flag.
+        Two distributed shapes, one for each kind of trigger:
+
+        * a **drain** (`available_now`/`once`) over a bounded, splittable source is a
+          parallel backfill — every worker drains its own partition once (Spark's
+          `Trigger.AvailableNow`);
+        * a **continuous / processing-time** stream runs each micro-batch as a cluster-wide
+          epoch: the workers stage the epoch's data files and the driver publishes them as
+          a single transaction, so the log records one transaction per micro-batch and a
+          replayed epoch adds neither a row nor a commit.
+
+        A benign mismatch (a source with nothing to fan out) returns ``None`` so the caller
+        falls back to the single-node engine. A request we cannot honor *correctly* raises
+        `PlanError` rather than silently ignoring the flag — or, worse, quietly delivering a
+        weaker guarantee than the API implies.
         """
         from batcher._internal.errors import PlanError
         from batcher.api.streaming import _DRAIN_TRIGGER_KINDS, _is_stateless
         from batcher.dist.executor import _is_splittable_source
 
-        if trigger is None or trigger.kind not in _DRAIN_TRIGGER_KINDS:
-            raise PlanError(
-                "distributed=True streaming currently supports Trigger.available_now() / "
-                "once() (a parallel backfill/drain of the currently-available data). "
-                "Continuous and processing-time distributed streaming are not yet "
-                "available — omit distributed for those (single-node), or use a drain "
-                "trigger to fan the backfill across the cluster."
-            )
-        if checkpoint is not None:
-            raise PlanError(
-                "distributed=True streaming does not yet checkpoint (per-partition offset "
-                "coordination is not implemented). Omit checkpoint for the distributed "
-                "drain, or run single-node (distributed=False) for exactly-once recovery."
-            )
-        if not _is_stateless(self._ds._plan):
-            raise PlanError(
-                "distributed=True streaming supports only stateless pipelines "
-                "(filter / select / map_batches). A streaming aggregation must run "
-                "single-node today — omit distributed."
-            )
         srcs = self._ds._sources
         if len(srcs) != 1 or not _is_splittable_source(srcs[0]):
             return None  # not worth (or not able to) fan out — fall back to single-node
-        from batcher.api.streaming import start_distributed_stream_drain
 
-        return start_distributed_stream_drain(
+        drain = trigger is not None and trigger.kind in _DRAIN_TRIGGER_KINDS
+        if drain and checkpoint is None:
+            from batcher.api.streaming import start_distributed_stream_drain
+
+            return start_distributed_stream_drain(
+                self._ds._plan,
+                srcs,
+                path,
+                fmt,
+                opts,
+                self._ds.columns,
+                num_workers=num_workers,
+                name=query_name,
+            )
+
+        if fmt in _MODE_AWARE_SINKS and fmt != "delta":
+            raise PlanError(
+                f"distributed streaming to {fmt!r} is not supported: its writer has no "
+                "transaction-id check, so a replayed micro-batch would duplicate rows "
+                "instead of being recognized as already-committed. Write to Delta for an "
+                "exactly-once distributed stream, or run single-node (distributed=False)."
+            )
+        if not _is_stateless(self._ds._plan) and trigger is not None:
+            if trigger.kind == "continuous":
+                raise PlanError(
+                    "a continuous trigger supports only stateless pipelines (filter / "
+                    "select / map_batches); a streaming aggregation needs a micro-batch "
+                    "boundary to fold — use Trigger.processing_time(...)"
+                )
+            if not _is_distributable_aggregate(self._ds._plan):
+                raise PlanError(
+                    "distributed streaming supports a stateless pipeline or a top-level "
+                    "streaming aggregation; this plan has another pipeline breaker "
+                    "(sort / join / window) — restructure it, or omit distributed."
+                )
+        from batcher.api.streaming import start_distributed_stream
+        from batcher.plan.streaming import Trigger as _Trigger
+
+        return start_distributed_stream(
             self._ds._plan,
             srcs,
             path,
             fmt,
             opts,
-            self._ds.columns,
-            num_workers=num_workers,
+            trigger=trigger or _Trigger.processing_time(0),
+            output_mode=output_mode,
             name=query_name,
+            checkpoint=checkpoint,
+            num_workers=num_workers,
         )
 
     def _stream_sink_for(

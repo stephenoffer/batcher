@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 __all__ = [
     "StreamingQuery",
     "active_streams",
+    "start_distributed_stream",
     "start_distributed_stream_drain",
     "start_streaming_query",
 ]
@@ -320,6 +321,92 @@ def _is_stateless(plan: LogicalPlan) -> bool:
     from batcher.plan.logical import Aggregate, Distinct, is_streamable
 
     return is_streamable(plan) and not isinstance(plan, (Aggregate, Distinct))
+
+
+def start_distributed_stream(
+    plan: LogicalPlan,
+    sources: list[Source],
+    path: str,
+    fmt: str,
+    sink_kwargs: dict,
+    *,
+    trigger: Trigger,
+    output_mode: str = OutputMode.APPEND,
+    name: str | None = None,
+    checkpoint: str | None = None,
+    num_workers: int | None = None,
+) -> StreamingQuery:
+    """Run a continuous streaming query whose micro-batches execute across the cluster.
+
+    The same `StreamingQueryEngine` as the single-node path — same trigger, same offset
+    log, same recovery — with the *epoch* handed to a `DistributedRunner` instead of run on
+    this thread. Each micro-batch fans across workers, which write data files without
+    committing, and the driver publishes the epoch as **one** transaction. The result is a
+    log with one transaction per micro-batch and rows that land exactly once, however many
+    workers or retries produced them.
+
+    The caller (`io_namespace.writer`) has already checked eligibility.
+    """
+    import json
+
+    from batcher import core, kyber
+    from batcher.plan.logical import Aggregate
+
+    output_mode = OutputMode.validate(output_mode)
+    store = None
+    if checkpoint is not None:
+        _warn_if_checkpoint_not_durable(checkpoint)
+        from batcher.io.formats.streaming.checkpoint import CheckpointStore
+
+        store = CheckpointStore(checkpoint)
+
+    # What each worker runs. A stateless epoch runs the whole Kyber-optimized plan (with
+    # its projection pushed into the read); an aggregate's workers run only its *input*
+    # pipeline and hand back a partial, exactly as the single-node fold does — so the two
+    # paths compute the same thing from the same IR.
+    agg = plan if isinstance(plan, Aggregate) else None
+    if agg is None:
+        physical = kyber.optimize(plan, sources=sources, hub=core.default_hub())
+        plan_ir, projection = physical.to_json(), physical.source_projections.get(0)
+    else:
+        plan_ir, projection = json.dumps(agg.input.to_ir()), None
+
+    query_name = name or _next_name()
+    workers = num_workers if num_workers is not None else _drain_workers(sources[0])
+    drain = trigger.kind in _DRAIN_TRIGGER_KINDS
+
+    def make_runner(should_stop):
+        from batcher.dist.streaming.microbatch import DistributedRunner
+
+        return DistributedRunner(
+            plan_ir=plan_ir,
+            projection=projection,
+            source=sources[0],
+            path=path,
+            fmt=fmt,
+            sink_kwargs=sink_kwargs,
+            query_name=query_name,
+            num_workers=workers,
+            drain=drain,
+            should_stop=should_stop,
+            agg=agg,
+        )
+
+    engine = core.StreamingQueryEngine(
+        name=query_name,
+        source=sources[0],
+        sink=None,  # every sink lives on a worker (data files) or in the runner (commit)
+        processor=None,  # the runner runs the plan itself, in Rust, on the workers
+        trigger=trigger,
+        output_mode=output_mode,
+        checkpoint=store,
+        runner_factory=make_runner,
+    )
+    query = StreamingQuery(query_name, engine)
+    with _LOCK:
+        _ACTIVE[query_name] = query
+    engine.start()
+    return query
 
 
 class _DrainEngine:
