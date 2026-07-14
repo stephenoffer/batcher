@@ -440,6 +440,42 @@ pub struct ProjectionItem {
 }
 
 impl RelOp {
+    /// This node's input plans, in the order an executor visits them.
+    ///
+    /// The order is the contract: it is the pre-order the executors and the Python control
+    /// plane both number operators by, so `children()` and [`Self::node_count`] agree with
+    /// the ids a recursive walk hands out.
+    pub fn children(&self) -> Vec<&RelOp> {
+        match self {
+            RelOp::Scan { .. } => Vec::new(),
+            RelOp::Filter { input, .. }
+            | RelOp::Project { input, .. }
+            | RelOp::Aggregate { input, .. }
+            | RelOp::Sort { input, .. }
+            | RelOp::Limit { input, .. }
+            | RelOp::Distinct { input }
+            | RelOp::Window { input, .. }
+            | RelOp::Unnest { input, .. }
+            | RelOp::RowId { input, .. }
+            | RelOp::Unpivot { input, .. }
+            | RelOp::Sample { input, .. } => vec![input],
+            RelOp::HashJoin { left, right, .. } | RelOp::AsofJoin { left, right, .. } => {
+                vec![left, right]
+            }
+            RelOp::Union { inputs, .. } => inputs.iter().collect(),
+        }
+    }
+
+    /// Number of operators in this subtree — i.e. how many pre-order ids executing it consumes.
+    ///
+    /// Lets an executor know a subtree's id span *without running it*, so it can execute the
+    /// children of a node out of order and still hand each the ids a plain recursive walk
+    /// would. The fused join pipeline uses this to test its (cheap) build sides for
+    /// streamability before committing to its (expensive) probe side.
+    pub fn node_count(&self) -> u32 {
+        1 + self.children().iter().map(|c| c.node_count()).sum::<u32>()
+    }
+
     /// True if any expression anywhere in this plan is a library-backed media decode
     /// (`.image`/`.audio`/`.video`).
     ///

@@ -117,6 +117,12 @@ impl ExecMetrics {
 
 /// A pre-order operator-id allocator. Each `next()` hands out the id for the
 /// operator about to be entered, so parents are numbered before their children.
+///
+/// `Clone` so a speculative execution (the fused join pipeline, which can only tell whether
+/// it applies *after* materializing the build sides) can number its operators off a copy and
+/// commit the advanced counter only if it succeeds — a bail leaves the real numbering
+/// untouched, so the fallback path assigns exactly the ids it would have.
+#[derive(Clone)]
 pub(crate) struct IdGen {
     next: u32,
 }
@@ -124,6 +130,20 @@ pub(crate) struct IdGen {
 impl IdGen {
     pub(crate) fn new() -> Self {
         Self { next: 0 }
+    }
+
+    /// An allocator positioned at `next` — the id a subtree starting there would receive.
+    ///
+    /// With `RelOp::node_count` this lets an executor run a node's children out of order and
+    /// still hand each subtree exactly the ids a recursive pre-order walk would (the fused
+    /// join pipeline runs its build sides before its probe side).
+    pub(crate) fn at(next: u32) -> Self {
+        Self { next }
+    }
+
+    /// The id this allocator will hand out next.
+    pub(crate) fn peek(&self) -> u32 {
+        self.next
     }
 
     /// Allocate the id for the operator being entered (pre-order).
