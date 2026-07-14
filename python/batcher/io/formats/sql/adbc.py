@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pyarrow as pa
 
 from batcher.io.formats.base import SINKS, SOURCES
-from batcher.io.formats.sql._common import apply_projection, require_module
+from batcher.io.formats.sql._common import push_down, require_module
 from batcher.io.manifest import WrittenFile
 
 if TYPE_CHECKING:
@@ -168,8 +168,9 @@ class ADBCSource:
 
             raise BackendError("ADBCSource requires either query= or table=")
 
-    def _sql(self, projection: list[str] | None = None) -> str:
-        return apply_projection(self.query, projection, table=self.table)
+    def _sql(self, projection: list[str] | None = None, predicate: dict | None = None) -> str:
+        """The query with Kyber's pushed projection and predicate folded in (see `push_down`)."""
+        return push_down(self.query, predicate, projection, table=self.table)
 
     def schema(self) -> pa.Schema:
         return self.splits()[0].schema()
@@ -213,8 +214,20 @@ class ADBCSource:
     def identity(self) -> str:
         return f"adbc:{self.driver}:{self.query or self.table}"
 
-    def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
-        sql = self._sql()
+    def splits(
+        self,
+        target_size: int | None = None,  # noqa: ARG002 (protocol signature)
+        predicate: dict | None = None,
+        projection: list[str] | None = None,
+    ) -> list[Split]:
+        """One split per server-side partition, each running the *pushed-down* query.
+
+        The pushdown is folded into the SQL the split carries, so the *worker's* query is the
+        filtered one. A predicate left outside the split never reaches the server: the worker
+        rebuilds an unfiltered read and the engine's `Filter` discards the rows after they have
+        already crossed the wire.
+        """
+        sql = self._sql(projection, predicate)
         if self.partition:
             parts = self._execute_partitions(sql)
             if parts is not None:

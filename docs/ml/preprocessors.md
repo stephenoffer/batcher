@@ -242,7 +242,7 @@ validation data, or the splits no longer share a scale:
 ```python
 val = bt.from_pydict({"age": [35.0], "score": [2.5]})
 print(scaler.transform(val).collect().column("age").to_pylist())
-# [-0.4472135954999579]
+# [0.0] — 35.0 is the training mean, so it standardizes to zero
 ```
 
 `MinMaxScaler` maps each column into `feature_range` (default `[0, 1]`) by its learned

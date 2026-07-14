@@ -121,6 +121,12 @@ exclude_patterns = [
     # An engineering audit ledger (findings fixed / still open), kept in-tree so the
     # analysis is recoverable. A working record for contributors, not a site page.
     "internals/audit_ledger.md",
+    # The same: a measured audit of the connectors at TB/PB scale, kept in-tree as the
+    # record behind the scale work. A working document, not a published page.
+    "internals/connector_scale_audit.md",
+    # The same again: the running ledger of the engine-wide defect hunt (found / fixed /
+    # open). A contributor's working record, not a site page.
+    "internals/bug_hunt_ledger.md",
     # Design proposal (RFC), not a published page — kept in-tree for contributors,
     # excluded from the site build until/unless its proposals are accepted.
     "internals/rfc-gpu-transport.md",

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 import pytest
-from tests.differential.conftest import assert_same
+from conftest import assert_same
 
 import batcher as bt
 from batcher import lit, source_col, target_col

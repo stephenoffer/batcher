@@ -109,14 +109,16 @@ def _cgroup_limit_bytes() -> int | None:
     """
     from batcher._internal.hardware import cgroup_v2_dirs
 
-    limits = [v for d in cgroup_v2_dirs() if (v := _read_memory_max(os.path.join(d, "memory.max")))]
+    limits = [
+        v for d in cgroup_v2_dirs() if (v := _read_cgroup_bytes(os.path.join(d, "memory.max")))
+    ]
     if limits:
         return min(limits)
-    return _read_memory_max("/sys/fs/cgroup/memory/memory.limit_in_bytes")  # cgroup v1
+    return _read_cgroup_bytes("/sys/fs/cgroup/memory/memory.limit_in_bytes")  # cgroup v1
 
 
-def _read_memory_max(path: str) -> int | None:
-    """A cgroup memory-limit file as bytes, or `None` when unlimited (`max`/sentinel)/absent."""
+def _read_cgroup_bytes(path: str) -> int | None:
+    """A byte-valued cgroup file, or `None` when absent, unlimited (`max`/sentinel), or empty."""
     try:
         with open(path) as f:
             raw = f.read().strip()
@@ -134,26 +136,57 @@ def _read_memory_max(path: str) -> int | None:
     return value
 
 
-def _cgroup_current_bytes() -> int | None:
-    """The container's *current* memory usage from cgroup v2 (`memory.current`) or v1
-    (`memory.usage_in_bytes`), or `None` when not in a cgroup.
-
-    This is the figure the kernel OOM-killer watches — it counts *all* of the
-    process's anonymous memory, including the in-memory Flight shuffle store and
-    off-pool pyarrow buffers the engine's buffer pool does not track. Reading it is
-    what lets the monitor see the real pressure instead of only the pool's reservations.
-    """
-    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+def _cgroup_file_cache_bytes() -> int:
+    """Page cache charged to this cgroup — `file` (v2) or `total_cache` (v1); 0 if unknown."""
+    for path, key in (
+        ("/sys/fs/cgroup/memory.stat", "file"),
+        ("/sys/fs/cgroup/memory/memory.stat", "total_cache"),
+    ):
         try:
             with open(path) as f:
-                raw = f.read().strip()
+                lines = f.read().splitlines()
         except OSError:
             continue
-        try:
-            value = int(raw)
-        except ValueError:
-            continue
-        if value > 0:
+        for line in lines:
+            field, _, raw = line.partition(" ")
+            if field == key:
+                try:
+                    return max(0, int(raw))
+                except ValueError:
+                    return 0
+    return 0
+
+
+def _cgroup_current_bytes() -> int | None:
+    """The cgroup's *unreclaimable* memory, or `None` when not in a cgroup.
+
+    `memory.current` is routinely mistaken for the OOM number, and is not: it counts
+    anonymous memory **plus every clean file page the kernel happens to be caching**. Cache is
+    reclaimable — dropped long before anything is OOM-killed — so charging it as pressure
+    reads a box that has merely *read files* as one about to die. Measured on a 30 GiB host
+    after loading TPC-H: 24.3 GiB "current", of which 15.3 GiB was cache. That pinned the
+    monitor at ELEVATED, which halves every morsel (`_MORSEL_PRESSURE_FACTORS`) — a 7%
+    throughput loss for the whole run, invisible to every correctness test.
+
+    Subtracting `file` costs the guard nothing, because the two are disjoint: what it exists
+    to see (the Flight shuffle store, off-pool pyarrow buffers) is **anonymous** and stays
+    counted; what is subtracted is cache that was never the engine's. The remainder
+    (anon + slab + sock) is what the kernel cannot get back — the figure the OOM-killer acts on.
+    """
+    total = _cgroup_total_bytes()
+    if total is None:
+        return None
+    return max(0, total - _cgroup_file_cache_bytes())
+
+
+def _cgroup_total_bytes() -> int | None:
+    """The raw cgroup charge, anonymous **and** cached — `memory.current` / `usage_in_bytes`.
+
+    Not a pressure signal on its own; see `_cgroup_current_bytes`.
+    """
+    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        value = _read_cgroup_bytes(path)
+        if value is not None:
             return value
     return None
 
@@ -164,8 +197,10 @@ def _cap_to_cgroup_headroom(host_available: int) -> int:
     `psutil`/`/proc` report the *machine's* free RAM, but a cgroup-limited container (the norm
     under Kubernetes/Ray) OOMs at `memory.max`, not at host exhaustion — on a 184 GB host an
     8 GB container would otherwise read ~180 GB free and over-admit into a kill. The real
-    headroom is `limit - current`; take the smaller of that and the host figure. No cgroup cap
-    (bare metal / unlimited) leaves the reading untouched.
+    headroom is `limit - current`, where `current` excludes the reclaimable page cache (see
+    `_cgroup_current_bytes`) — cache the kernel will evict on demand is headroom, not usage.
+    Take the smaller of that and the host figure. No cgroup cap (bare metal / unlimited)
+    leaves the reading untouched.
     """
     limit = _cgroup_limit_bytes()
     if limit is None:
@@ -348,12 +383,14 @@ class PressureMonitor:
         """Fraction of the memory ceiling in use, by whichever measure is highest.
 
         Takes the MAX of the engine's reserved buffer-pool envelope and the process's
-        *actual* footprint (the cgroup's current usage, else RSS). Memory the pool does
-        not track — the in-memory Flight shuffle `PartitionStore`, off-pool pyarrow
+        *actual* footprint (the cgroup's unreclaimable usage, else RSS). Memory the pool
+        does not track — the in-memory Flight shuffle `PartitionStore`, off-pool pyarrow
         buffers — therefore cannot let the monitor report NORMAL while the kernel
-        OOM-kills a shuffle-heavy worker. Over-reading only spills/throttles a little
-        early (safe); under-reading risks the OOM-kill this guards against. Falls back
-        to the machine's used fraction when neither a pool nor a live reading exists.
+        OOM-kills a shuffle-heavy worker. The footprint term deliberately excludes the
+        page cache: it is reclaimable, so counting it would report a box that has merely
+        *read files* as one under pressure — which is not a safe over-read but a silent
+        throttle (it halves every morsel). Falls back to the machine's used fraction when
+        neither a pool nor a live reading exists.
         """
         from batcher.carbonite.memory.pool import current_process_pool
 

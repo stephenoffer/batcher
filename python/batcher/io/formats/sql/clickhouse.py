@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pyarrow as pa
 
 from batcher.io.formats.base import SOURCES
-from batcher.io.formats.sql._common import require_module
+from batcher.io.formats.sql._common import push_down, require_module
 
 if TYPE_CHECKING:
     from batcher.io.splits import Split
@@ -115,8 +115,11 @@ class ClickHouseSource:
         params.update(self.client_kwargs)
         return params
 
-    def _split(self) -> _ClickHouseSplit:
-        return _ClickHouseSplit(self._params(), self.query)
+    def _split(
+        self, predicate: dict | None = None, projection: list[str] | None = None
+    ) -> _ClickHouseSplit:
+        """The split, with the pushdown already folded into its SQL (see `push_down`)."""
+        return _ClickHouseSplit(self._params(), push_down(self.query, predicate, projection))
 
     def schema(self) -> pa.Schema:
         return self._split().schema()
@@ -124,27 +127,12 @@ class ClickHouseSource:
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
-        if predicate is not None:
-            from batcher.io.predicate import to_sql_where
-
-            where = to_sql_where(predicate)
-            if where:
-                sql = f"SELECT * FROM ({self.query}) AS _bq_pred WHERE {where}"
-                return _ClickHouseSplit(self._params(), sql).read(projection)
-        return self._split().read(projection)
+        return self._split(predicate, projection).read(projection)
 
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        if predicate is not None:
-            from batcher.io.predicate import to_sql_where
-
-            where = to_sql_where(predicate)
-            if where:
-                sql = f"SELECT * FROM ({self.query}) AS _bq_pred WHERE {where}"
-                yield from _ClickHouseSplit(self._params(), sql).iter_batches(projection)
-                return
-        yield from self._split().iter_batches(projection)
+        yield from self._split(predicate, projection).iter_batches(projection)
 
     def row_count(self) -> int | None:
         return None
@@ -152,5 +140,15 @@ class ClickHouseSource:
     def identity(self) -> str:
         return f"clickhouse:{self.host}:{self.query}"
 
-    def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
-        return [self._split()]
+    def splits(
+        self,
+        target_size: int | None = None,  # noqa: ARG002 (protocol signature)
+        predicate: dict | None = None,
+        projection: list[str] | None = None,
+    ) -> list[Split]:
+        """One split, whose SQL already carries the pushdown — so the worker's query is filtered.
+
+        Without this, the worker rebuilt an *unfiltered* query from the split and ClickHouse
+        streamed the whole table for the engine's `Filter` to discard.
+        """
+        return [self._split(predicate, projection)]

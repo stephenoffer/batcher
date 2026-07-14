@@ -167,10 +167,23 @@ You can see it:
 ```python
 with bt.security(catalog, analyst):
     print(bt.read.parquet(customers).explain())
-# project    <- the columns the analyst may select, masked
-#   filter   <- the row filter, below the projection
-#     scan
 ```
+
+The `project` is the columns the analyst may select, read through their masks; the
+`filter` under it is the row-access predicate; the `scan` sees the whole table. The
+estimate drops from 4 rows to 2 because the row policy is a predicate like any other:
+
+```text
+project                         est≈2 (learned)
+  filter                        est≈2 (learned)
+    scan                        est≈4 (exact)
+
+decisions:
+  - [core/io] source read at 0 MB/s (learned) — ~0.0s to read
+```
+
+(The throughput under `decisions:` is measured; it reads 0 MB/s here because the whole
+table is a few kilobytes.)
 
 The order matters in both directions. The filter sits *below* the projection, so a row
 policy may reference `region` even though the analyst has no `SELECT` on it; a row-access

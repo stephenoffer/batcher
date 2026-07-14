@@ -21,6 +21,7 @@ from batcher._internal.errors import BackendError
 __all__ = [
     "apply_predicate",
     "apply_projection",
+    "push_down",
     "require_module",
     "wrap_subquery",
 ]
@@ -77,3 +78,44 @@ def apply_predicate(sql: str, predicate: str | None) -> str:
     if not predicate:
         return sql
     return f"SELECT * FROM (\n{sql}\n) AS _bcp WHERE {predicate}"
+
+
+def push_down(
+    query: str,
+    predicate: dict | None = None,
+    projection: list[str] | None = None,
+    *,
+    table: str | None = None,
+) -> str:
+    """`query` with Kyber's pushed projection and predicate folded into the SQL itself.
+
+    This is the whole of "connect a SQL connector to the optimizer". The `WHERE` and the column
+    list have to execute **in the database**, because that is the only place they can avoid
+    work: a predicate applied after the result set has crossed the wire has already cost the
+    scan, the network, and the driver's memory. On a TB table the difference is not a constant
+    factor — it is whether the query runs at all.
+
+    It has to happen at **split-planning** time, not at read time, for the same reason. A split
+    is a picklable locator that a worker rebuilds a reader from; if the pushdown lives anywhere
+    but inside the split's own query, the worker reconstructs an *unfiltered* read and the
+    server never hears about the filter. That is precisely how every SQL connector here was
+    behaving on the distributed path: correct results, and the entire table pulled per worker.
+
+    A predicate the translator cannot express returns None from `to_sql_where` and is simply not
+    pushed — the engine's `Filter` re-checks every row regardless, so an unpushed predicate is
+    always correct and merely slower.
+
+    Args:
+        query: The base read (a user query, or `SELECT * FROM table` when `table` is given).
+        predicate: The predicate IR Kyber pushed to this scan.
+        projection: The columns Kyber pushed to this scan.
+        table: The table name, when the read is a plain table rather than a query.
+
+    Returns:
+        The SQL to send to the server.
+    """
+    from batcher.io.predicate import to_sql_where
+
+    sql = apply_projection(query, projection, table=table)
+    where = to_sql_where(predicate) if predicate is not None else None
+    return apply_predicate(sql, where)

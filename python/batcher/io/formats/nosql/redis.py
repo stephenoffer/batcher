@@ -110,6 +110,7 @@ class RedisSource(ScanSource):
         self,
         partition: _SlotRange,
         projection: list[str] | None,
+        predicate: dict | None = None,  # noqa: ARG002 (a key/value scan has no server-side filter)
     ) -> Iterator[pa.RecordBatch]:
         client = self._client()
         rows = _scan_range(client, partition, self._conn_kwargs["match"])

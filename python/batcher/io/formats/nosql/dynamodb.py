@@ -56,7 +56,7 @@ class DynamoDBSource(ScanSource):
     # keeps a partial or skipped push correct.
     supports_predicate = True
 
-    __slots__ = ("_pushed_filter",)
+    __slots__ = ()
 
     def __init__(
         self,
@@ -77,20 +77,6 @@ class DynamoDBSource(ScanSource):
             endpoint_url=endpoint_url,
         )
         # The translated ``Scan`` filter for the active read, or None. Set per-read
-        # by `read`/`iter_batches`; consumed in `_read_partition`.
-        self._pushed_filter: _DynamoFilter | None = None
-
-    def read(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> list[pa.RecordBatch]:
-        return list(self.iter_batches(projection, predicate))
-
-    def iter_batches(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> Iterator[pa.RecordBatch]:
-        self._pushed_filter = _to_dynamo_filter(predicate) if predicate is not None else None
-        for partition in self._enumerate_partitions():
-            yield from self._read_partition(partition, projection)
 
     def _client(self) -> Any:
         boto3 = require_driver("boto3", "dynamodb")
@@ -120,7 +106,10 @@ class DynamoDBSource(ScanSource):
         return [(i, total) for i in range(total)]
 
     def _read_partition(
-        self, partition: _Segment, projection: list[str] | None
+        self,
+        partition: _Segment,
+        projection: list[str] | None,
+        predicate: dict | None = None,
     ) -> Iterator[pa.RecordBatch]:
         segment, total = partition
         client = self._client()
@@ -132,7 +121,7 @@ class DynamoDBSource(ScanSource):
         if projection:
             names = {f"#c{i}": col for i, col in enumerate(projection)}
             kwargs["ProjectionExpression"] = ", ".join(names)
-        pushed = self._pushed_filter
+        pushed = _to_dynamo_filter(predicate) if predicate is not None else None
         if pushed is not None:
             kwargs["FilterExpression"] = pushed.expression
             names.update(pushed.names)

@@ -29,7 +29,7 @@ import pyarrow as pa
 from batcher._internal.errors import BackendError
 from batcher.config import active_config
 
-__all__ = ["ScanSource", "rows_to_batches"]
+__all__ = ["ScanSource", "offset_windows", "rows_to_batches"]
 
 # An opaque, picklable partition locator (token range, segment id, offset, …).
 # It is connector-defined; the base treats it as a black box it round-trips to
@@ -108,6 +108,7 @@ class _ScanSplit:
     conn_kwargs: dict[str, Any]
     partition: PartitionLocator
     identity_prefix: str
+    predicate: dict | None = None
 
     def _source(self) -> ScanSource:
         return self.source_cls(**self.conn_kwargs)
@@ -115,17 +116,70 @@ class _ScanSplit:
     def schema(self) -> pa.Schema:
         return self._source().schema()
 
-    def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        return list(self.iter_batches(projection))
+    def read(
+        self, projection: list[str] | None = None, predicate: dict | None = None
+    ) -> list[pa.RecordBatch]:
+        return list(self.iter_batches(projection, predicate))
 
-    def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        yield from self._source()._read_partition(self.partition, projection)
+    def iter_batches(
+        self, projection: list[str] | None = None, predicate: dict | None = None
+    ) -> Iterator[pa.RecordBatch]:
+        # The predicate Kyber pushed at *plan* time is baked into the split (`self.predicate`);
+        # `predicate` is the one the distributed reader hands us at *read* time. They are the
+        # same filter arriving by two routes, so either will do — but one of them must arrive,
+        # or the worker fetches the whole store and the engine's `Filter` throws it away.
+        pushed = predicate if predicate is not None else self.predicate
+        yield from self._source()._read_partition(self.partition, projection, pushed)
 
     def row_count(self) -> int | None:
         return None
 
     def identity(self) -> str:
         return f"{self.identity_prefix}:part={self.partition!r}"
+
+
+def offset_windows(total: int | None, segments: int) -> list[tuple[int, int]]:
+    """``(offset, limit)`` windows that are a disjoint **and exhaustive** cover of a result.
+
+    An offset window is the only way to split a store that has no native shard/token/segment
+    primitive — Couchbase's SQL++ and Neo4j's Cypher both fall here. It is easy to get subtly,
+    silently wrong, and it was:
+
+        return [(i * _WINDOW_ROWS, _WINDOW_ROWS) for i in range(segments)]
+
+    With a fixed window size, `segments` windows cover only ``segments * _WINDOW_ROWS`` rows.
+    Every row past that was **dropped, with no error**: eight segments over a billion-row
+    collection returned 800,000 rows and reported success. Turning on parallelism — the thing
+    you do *because* the data is large — was what silently truncated it.
+
+    Two properties make a set of windows a cover, and both are enforced here:
+
+    * **Exhaustive** — the final window is *unbounded* (``limit == 0``), so the cover runs to
+      the end of the result no matter how far off `total` is, including rows written after it
+      was measured. This is what makes the function safe even when the count is a lie.
+    * **Disjoint** — offsets are strictly increasing and each window's limit exactly reaches
+      the next offset, so no row is read twice.
+
+    Without a `total` there is no way to size the windows, and a guess would either truncate
+    (fatal) or overlap. So an unknown `total` yields a **single unbounded window**: one serial
+    reader, correct, slow — which is the right trade, because a slow right answer is a result
+    and a fast wrong one is a bug.
+
+    Args:
+        total: The result's row count, if the store can be asked cheaply. None if it cannot.
+        segments: The requested parallelism.
+
+    Returns:
+        The windows, in offset order. Always non-empty; the last is always unbounded.
+    """
+    if segments <= 1 or total is None or total <= 0:
+        return [(0, 0)]  # 0 limit = unbounded: read to the end
+    # More segments than rows only makes empty windows; one row per window is the useful floor.
+    segments = min(segments, total)
+    step = -(-total // segments)  # ceil, so the windows reach `total` before the last one
+    windows = [(i * step, step) for i in range(segments - 1)]
+    windows.append(((segments - 1) * step, 0))  # the tail, unbounded — this is the cover
+    return windows
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,12 +235,16 @@ class ScanSource(ABC):
             self._schema_cache = self._infer_schema()
         return self._schema_cache
 
-    def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        return list(self.iter_batches(projection))
+    def read(
+        self, projection: list[str] | None = None, predicate: dict | None = None
+    ) -> list[pa.RecordBatch]:
+        return list(self.iter_batches(projection, predicate))
 
-    def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
+    def iter_batches(
+        self, projection: list[str] | None = None, predicate: dict | None = None
+    ) -> Iterator[pa.RecordBatch]:
         for partition in self._enumerate_partitions():
-            yield from self._read_partition(partition, projection)
+            yield from self._read_partition(partition, projection, predicate)
 
     def row_count(self) -> int | None:
         return None
@@ -194,7 +252,26 @@ class ScanSource(ABC):
     def identity(self) -> str:
         return f"{self.format_name}:{self._identity_suffix()}"
 
-    def splits(self, target_size: int | None = None) -> list[_ScanSplit]:  # noqa: ARG002
+    def splits(
+        self,
+        target_size: int | None = None,  # noqa: ARG002 (protocol signature; a store splits by partition)
+        predicate: dict | None = None,
+    ) -> list[_ScanSplit]:
+        """The store's partitions, each carrying the predicate Kyber pushed to this scan.
+
+        Declaring `predicate` here is what connects a NoSQL store to the optimizer on the
+        **distributed** path. `io.source.plan_splits` only passes a predicate to a `splits()`
+        that asks for one, and `dist...scan_read._split_read` only passes it to a `Split.read`
+        that asks for one — so a source that omits it silently reads its *entire* table on
+        every worker and lets the engine's `Filter` discard the rows. Correct, and ruinous: on
+        DynamoDB you pay read-capacity for every item; on Mongo you drag the collection across
+        the network.
+
+        Baking it into the split (rather than into per-read instance state, which is what the
+        Cassandra/DynamoDB sources used to do) is also what makes pushdown *survive the trip to
+        the worker*: a split is picklable and self-contained, and `_source()` rebuilds a clean
+        connector from `conn_kwargs` that knows nothing about any earlier call.
+        """
         prefix = self.identity()
         return [
             _ScanSplit(
@@ -202,6 +279,7 @@ class ScanSource(ABC):
                 conn_kwargs=dict(self._conn_kwargs),
                 partition=partition,
                 identity_prefix=prefix,
+                predicate=predicate,
             )
             for partition in self._enumerate_partitions()
         ]
@@ -217,9 +295,22 @@ class ScanSource(ABC):
 
     @abstractmethod
     def _read_partition(
-        self, partition: PartitionLocator, projection: list[str] | None
+        self,
+        partition: PartitionLocator,
+        projection: list[str] | None,
+        predicate: dict | None = None,
     ) -> Iterator[pa.RecordBatch]:
-        """Fetch one partition's rows and yield Arrow batches."""
+        """Fetch one partition's rows and yield Arrow batches.
+
+        `predicate` is the filter to push **into the store's own query** — a DynamoDB
+        `FilterExpression`, a CQL `WHERE`, a Mongo query document, an ES DSL clause. It is
+        passed as an argument rather than held on the instance so that pushdown is a pure
+        function of `(partition, projection, predicate)`: reentrant under concurrent reads,
+        and identical whether it runs on the driver or on a worker that rebuilt this source
+        from a pickled split. A connector that cannot push it simply ignores it — the engine's
+        `Filter` re-checks every row regardless, so ignoring a predicate is always correct and
+        merely slower.
+        """
 
     def _identity_suffix(self) -> str:
         """A non-secret identity suffix; defaults to the connection target.

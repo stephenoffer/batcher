@@ -16,15 +16,15 @@ over `boto3` and the classic `GetRecords` API. Read only. There is no Kinesis si
 pip install 'batcher-engine[kinesis]'
 ```
 
-## Set `poll_size` before anything else
+## `poll_size`
 
-:::{warning}
-The default `poll_size` is 16,384, inherited from the broker base. Kinesis caps the
-`GetRecords` `Limit` at 10,000 records, so that default is over the line and the API rejects
-it.
+:::{note}
+Kinesis caps the `GetRecords` `Limit` at 10,000 records, so that is the default and it is also
+a ceiling: a larger `poll_size` is clamped to it rather than sent, because AWS would reject it.
 :::
 
-Pass a legal one:
+A smaller value is passed through untouched, and is worth setting when you want tighter
+micro-batches:
 
 ```python
 # docs: skip
@@ -113,10 +113,15 @@ budget runs out. Add shards, or move the other consumers to enhanced fan-out.
 
 ## Resharding
 
+:::{note}
+`ListShards` is paginated, so every shard of the stream is discovered however many there are.
+The list is then fetched once and cached for the life of the source.
+:::
+
 :::{warning}
-The shard list is fetched once and cached for the life of the source, and `ListShards` is read
-without pagination, so a stream with more shards than one page returns will read only the
-first page.
+Because the list is cached, a stream that is resharded *while a query is running* is not
+re-discovered. Splits are addressed by index into the list captured at planning time. Restart
+the query after a reshard.
 :::
 
 Splits are addressed by *index into that list*. Split a shard, merge two, or scale a stream

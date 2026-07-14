@@ -286,7 +286,10 @@ def answer_n_unique(
     """
     _, stats = _root_stats(plan, sources, source_stats, hub, config)
     stat = _exact_col(stats, column)
-    if stat is None or stat.ndv is None:
+    # `_exact_col` vouches for the *bundle*; the ndv carries its own tag, because a Parquet
+    # column now holds a measured (SKETCH) distinct count alongside its exact bounds. Only an
+    # exact ndv may answer an exact `n_unique`.
+    if stat is None or stat.ndv is None or not stat.ndv_is_exact:
         return None
     return int(stat.ndv)
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from tests.differential.conftest import assert_tables_equal
+from conftest import assert_tables_equal
 
 pytestmark = pytest.mark.differential
 

@@ -11,10 +11,11 @@ use arrow::compute::{cast_with_options, CastOptions};
 use crate::ExprError;
 
 /// Cast `arr` to `target` with DuckDB float→int semantics. Arrow's float→int cast
-/// truncates toward zero; DuckDB rounds half-to-even (`cast(2.5)` = 2, `cast(3.5)`
-/// = 4), so float inputs are rounded to an integral value before the cast. All
-/// other casts defer to the arrow kernel unchanged. (The JIT never compiles
-/// float→int, so this interpreter-only behavior keeps tier parity intact.)
+/// truncates toward zero; DuckDB rounds half **away from zero** (`cast(2.5)` = 3,
+/// `cast(-2.5)` = -3, `cast(0.5)` = 1), the same rule as the `round()` function, so
+/// float inputs are rounded to an integral value before the cast. All other casts
+/// defer to the arrow kernel unchanged. (The JIT never compiles float→int, so this
+/// interpreter-only behavior keeps tier parity intact.)
 ///
 /// `try_cast` selects arrow's *safe* cast (a value that cannot be converted
 /// becomes NULL — DuckDB `TRY_CAST`); the strict default (`false`) errors on an
@@ -44,13 +45,14 @@ pub(crate) fn cast_expr(
     );
     let float_src = matches!(arr.data_type(), Float16 | Float32 | Float64);
     if int_target && float_src {
-        // Round half-to-even first (DuckDB), then cast the now-integral floats.
+        // Round half-away-from-zero first (DuckDB, and the `round()` function), then cast
+        // the now-integral floats. `f64::round` is half-away-from-zero.
         let f = cast_with_options(arr, &Float64, &opts)?;
         let f = f
             .as_any()
             .downcast_ref::<Float64Array>()
             .expect("cast to Float64 yields Float64Array");
-        let rounded: Float64Array = f.iter().map(|o| o.map(f64::round_ties_even)).collect();
+        let rounded: Float64Array = f.iter().map(|o| o.map(f64::round)).collect();
         let rounded: ArrayRef = Arc::new(rounded);
         return Ok(cast_with_options(&rounded, target, &opts)?);
     }

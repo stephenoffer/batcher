@@ -19,7 +19,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import BackendError
 from batcher.io.formats.base import SOURCES
-from batcher.io.formats.sql._common import require_module
+from batcher.io.formats.sql._common import push_down, require_module
 
 if TYPE_CHECKING:
     from batcher.io.splits import Split
@@ -106,8 +106,13 @@ class ODBCSource:
         if self.dsn is None and self.connection_string is None:
             raise BackendError("ODBCSource requires either dsn= or connection_string=")
 
-    def _split(self) -> _ODBCSplit:
-        return _ODBCSplit(self.dsn, self.connection_string, self.query)
+    def _split(
+        self, predicate: dict | None = None, projection: list[str] | None = None
+    ) -> _ODBCSplit:
+        """The split, with the pushdown already folded into its SQL (see `push_down`)."""
+        return _ODBCSplit(
+            self.dsn, self.connection_string, push_down(self.query, predicate, projection)
+        )
 
     def schema(self) -> pa.Schema:
         return self._split().schema()
@@ -115,29 +120,12 @@ class ODBCSource:
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
-        if predicate is not None:
-            from batcher.io.predicate import to_sql_where
-
-            where = to_sql_where(predicate)
-            if where:
-                sql = f"SELECT * FROM ({self.query}) AS _bq_pred WHERE {where}"
-                return _ODBCSplit(self.dsn, self.connection_string, sql).read(projection)
-        return self._split().read(projection)
+        return self._split(predicate, projection).read(projection)
 
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        if predicate is not None:
-            from batcher.io.predicate import to_sql_where
-
-            where = to_sql_where(predicate)
-            if where:
-                sql = f"SELECT * FROM ({self.query}) AS _bq_pred WHERE {where}"
-                yield from _ODBCSplit(self.dsn, self.connection_string, sql).iter_batches(
-                    projection
-                )
-                return
-        yield from self._split().iter_batches(projection)
+        yield from self._split(predicate, projection).iter_batches(projection)
 
     def row_count(self) -> int | None:
         return None
@@ -145,5 +133,16 @@ class ODBCSource:
     def identity(self) -> str:
         return f"odbc:{self.dsn or self.connection_string}:{self.query}"
 
-    def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
-        return [self._split()]
+    def splits(
+        self,
+        target_size: int | None = None,  # noqa: ARG002 (protocol signature)
+        predicate: dict | None = None,
+        projection: list[str] | None = None,
+    ) -> list[Split]:
+        """Splits whose SQL already carries Kyber's pushdown (see `push_down`).
+
+        A split is what a worker rebuilds its reader from, so a filter that is not *in the
+        split's query* never reaches the server: the worker issues an unfiltered read and the
+        engine's `Filter` discards the rows after they have crossed the wire.
+        """
+        return [self._split(predicate, projection)]

@@ -314,7 +314,7 @@ print(total_rows)
 
 ```python
 print(ds.explain().splitlines()[0])
-# Scan  (≈6 rows, exact)
+# scan                            est≈6 (exact)
 ```
 
 Writers persist results; they need a real path, so they are not run here.

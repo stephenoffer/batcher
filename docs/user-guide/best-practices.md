@@ -80,10 +80,22 @@ filter landed near the scan or that a projection trimmed the columns.
 ```python
 plan = ds.filter(bt.col("price") > 20).select("category").explain()
 print(plan)
-# Project  (≈... rows, default)
-#   Filter  (≈... rows, default)
-#     Scan  (≈5 rows, exact)
 ```
+
+The filter sits directly above the scan, and the projection is above it — the shape you
+wanted. Each line carries the row estimate and its provenance (`exact` from the source,
+`default` from a heuristic, `learned` from a previous run):
+
+```text
+project                         est≈4 (default)
+  filter                        est≈4 (default)
+    scan                        est≈5 (exact)
+
+decisions:
+  - [core/io] source read at 6 MB/s (learned)
+```
+
+The read throughput under `decisions:` is measured, so expect a different figure.
 
 ## Use distributed and spill deliberately
 

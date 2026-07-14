@@ -113,6 +113,27 @@ class ColumnStat:
     quantiles: Mapping[str, list[float]] | None = None
     mcv: Mapping[str, float] | None = None
     avg_bytes: float | None = None
+    # The distinct count's *own* provenance, when it differs from the bundle's.
+    #
+    # `provenance` describes the bundle, and that single tag is a real constraint: a Parquet
+    # footer gives EXACT min/max/null_count but **no distinct count**, so the only ndv a
+    # columnar source can ever have is a measured (HLL) one. With one shared tag, attaching
+    # it would tag it EXACT and let an approximate count answer `count_distinct` — so it was
+    # refused, and every Parquet column therefore reached the optimizer with **no ndv at
+    # all**. Join cardinality then fell back to `max(|L|, |R|)`, every join in a query looked
+    # the same size, and join ordering was blind on precisely the workload that matters:
+    # TPC-H q9 applied its 5%-selective `part` filter *last* and ran 5.8x slower than DuckDB.
+    #
+    # Giving the ndv its own tag lets an approximate distinct count ride alongside exact
+    # bounds. `ndv_is_exact` is the gate every answer path reads, so a sketch ndv still can
+    # never answer an exact `count_distinct` — it only ever informs cost and cardinality.
+    ndv_provenance: Provenance | None = None
+
+    @property
+    def ndv_is_exact(self) -> bool:
+        """True iff `ndv` may answer an exact `count_distinct` (never for a sketch)."""
+        tag = self.ndv_provenance if self.ndv_provenance is not None else self.provenance
+        return tag.is_exact
 
     def downgrade(self, floor: Provenance) -> ColumnStat:
         """Return a copy whose provenance is weakened to at least `floor`.
@@ -136,6 +157,10 @@ class ColumnStat:
             quantiles=self.quantiles,
             mcv=self.mcv,
             avg_bytes=self.avg_bytes,
+            ndv_provenance=weakest(
+                self.ndv_provenance if self.ndv_provenance is not None else self.provenance,
+                floor,
+            ),
         )
 
 

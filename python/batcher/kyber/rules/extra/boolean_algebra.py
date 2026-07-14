@@ -161,7 +161,7 @@ def _and_false(expr: Expr) -> Expr:
     name="and_false_annihilator",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _and_false(e),
+    expr=_and_false,
 )
 def and_false_annihilator(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND FALSE → FALSE`. Under the engine's Kleene AND, `NULL AND FALSE` and
@@ -185,7 +185,7 @@ def _or_true(expr: Expr) -> Expr:
     name="or_true_annihilator",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _or_true(e),
+    expr=_or_true,
 )
 def or_true_annihilator(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR TRUE → TRUE`. Under the engine's Kleene OR, `NULL OR TRUE` and
@@ -212,7 +212,7 @@ def _and_idem(expr: Expr) -> Expr:
     name="and_idempotent",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _and_idem(e),
+    expr=_and_idem,
 )
 def and_idempotent(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND x → x`. In Kleene logic `v AND v = v` for every value (`T,F,N`), so a
@@ -236,7 +236,7 @@ def _or_idem(expr: Expr) -> Expr:
     name="or_idempotent",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _or_idem(e),
+    expr=_or_idem,
 )
 def or_idempotent(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR x → x`. In Kleene logic `v OR v = v` for every value, so a
@@ -273,7 +273,7 @@ def _and_absorb(expr: Expr) -> Expr:
     name="and_absorption",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _and_absorb(e),
+    expr=_and_absorb,
 )
 def and_absorption(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND (x OR y) → x`. The Kleene absorption law holds for all three values
@@ -296,7 +296,7 @@ def _or_absorb(expr: Expr) -> Expr:
     name="or_absorption",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _or_absorb(e),
+    expr=_or_absorb,
 )
 def or_absorption(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x OR (x AND y) → x`. The dual Kleene absorption law, valid for all three
@@ -326,7 +326,7 @@ def _complement(expr: Expr) -> Expr:
     name="complement_total_bool",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _complement(e),
+    expr=_complement,
 )
 def complement_total_bool(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x AND NOT x → FALSE` and `x OR NOT x → TRUE`, but **only** when `x` never
@@ -354,7 +354,7 @@ def _fold_not_comparison(expr: Expr) -> Expr:
     name="fold_not_comparison",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _fold_not_comparison(e),
+    expr=_fold_not_comparison,
 )
 def fold_not_comparison(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`NOT (a = b) → a <> b`, `NOT (a < b) → a >= b`, … — push `NOT` into a
@@ -392,7 +392,7 @@ def _bool_eq_literal(expr: Expr) -> Expr:
     name="bool_eq_literal",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _bool_eq_literal(e),
+    expr=_bool_eq_literal,
 )
 def bool_eq_literal(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x = TRUE → x`, `x = FALSE → NOT x` (and the `<>` duals) for a boolean `x`.
@@ -416,7 +416,7 @@ def _single_in_list(expr: Expr) -> Expr:
     name="single_in_list",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _single_in_list(e),
+    expr=_single_in_list,
 )
 def single_in_list(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x IN (v) → x = v`. A one-element membership test is exactly an equality, with
@@ -438,7 +438,7 @@ def _dedup_in_list(expr: Expr) -> Expr:
     name="dedup_in_list",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _dedup_in_list(e),
+    expr=_dedup_in_list,
 )
 def dedup_in_list(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x IN (a, b, a) → x IN (a, b)`. Set membership is unchanged by duplicate values,
@@ -484,7 +484,7 @@ def _coalesce_simplify(expr: Expr) -> Expr:
     name="coalesce_simplify",
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
-    expr=lambda e: _coalesce_simplify(e),
+    expr=_coalesce_simplify,
 )
 def coalesce_simplify(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Flatten and shrink a `COALESCE`: inline a nested `COALESCE`, drop a later

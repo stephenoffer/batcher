@@ -23,6 +23,7 @@ from batcher.io.formats.base import SOURCES
 from batcher.io.formats.nosql.base import (
     PartitionSpec,
     ScanSource,
+    offset_windows,
     require_driver,
     rows_to_batches,
 )
@@ -33,7 +34,6 @@ __all__ = ["Neo4jSource"]
 _Window = tuple[int, int]
 
 # Rows per window when the source is partitioned.
-_WINDOW_ROWS = 100_000
 
 
 @SOURCES.register("neo4j")
@@ -103,13 +103,46 @@ class Neo4jSource(ScanSource):
         return pa.RecordBatch.from_pylist(rows).schema
 
     def _enumerate_partitions(self) -> list[_Window]:
+        """SKIP/LIMIT windows that cover the whole result — see `offset_windows`.
+
+        A window cover over Cypher needs two things the old code had neither of: a total, so
+        the windows can be sized to actually reach the end, and a deterministic order, so two
+        windows cannot return the same row. Without an ``order_by`` the result order is
+        undefined and *no* SKIP/LIMIT split is sound, so this refuses to split at all rather
+        than return a plausible wrong answer.
+        """
         segments = max(1, self._partition_spec.segments)
         if segments == 1:
-            return [(0, 0)]  # 0 limit = the whole query in one window.
-        return [(i * _WINDOW_ROWS, _WINDOW_ROWS) for i in range(segments)]
+            return [(0, 0)]  # one unbounded window: no count needed, and no connection made
+        if not self._conn_kwargs.get("order_by"):
+            # SKIP/LIMIT over an unordered result is not a cover: the windows overlap and miss.
+            return [(0, 0)]
+        return offset_windows(self._total_rows(), segments)
+
+    def _total_rows(self) -> int | None:
+        """The query's row count, via a Cypher ``CALL {…} RETURN count(*)`` subquery.
+
+        Returns None on any failure (an older server with no CALL subqueries, a query that
+        cannot be wrapped), which `offset_windows` reads as "do not split" — correct and
+        serial, never truncated.
+        """
+        cypher = self._conn_kwargs["cypher"]
+        counted = f"CALL {{ {cypher} }} RETURN count(*) AS __bc_n"
+        driver = self._driver()
+        try:
+            rows = list(self._run(driver, counted))
+        except Exception:
+            return None
+        if not rows:
+            return None
+        value = rows[0].get("__bc_n") if isinstance(rows[0], dict) else None
+        return int(value) if isinstance(value, (int, float)) else None
 
     def _read_partition(
-        self, partition: _Window, projection: list[str] | None
+        self,
+        partition: _Window,
+        projection: list[str] | None,
+        predicate: dict | None = None,  # noqa: ARG002 (no server-side filter; the engine's Filter re-checks)
     ) -> Iterator[pa.RecordBatch]:
         skip, limit = partition
         cypher = self._conn_kwargs["cypher"]

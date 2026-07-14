@@ -200,7 +200,7 @@ def _canonicalize_alias(expr: Expr) -> Expr:
     name="canonicalize_cast_dtype_alias",
     phase=Phase.NORMALIZE,
     matches=_NODES,
-    expr=lambda e: _canonicalize_alias(e),
+    expr=_canonicalize_alias,
 )
 def canonicalize_cast_dtype_alias(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Rewrite a cast's dtype name to the one canonical spelling of its Arrow type:
@@ -233,7 +233,7 @@ def _fold_cast_lit(expr: Expr) -> Expr:
     name="fold_cast_of_literal",
     phase=Phase.NORMALIZE,
     matches=_NODES,
-    expr=lambda e: _fold_cast_lit(e),
+    expr=_fold_cast_lit,
 )
 def fold_cast_of_literal(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Evaluate `cast(<literal>, T)` at plan time for the conversions `normalize.fold`

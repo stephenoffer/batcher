@@ -98,7 +98,7 @@ png = buf.getvalue()
 ds = bt.from_pydict({"bytes": [png, png]})
 decoded = ds.with_columns(image=col("bytes").image.to_tensor(8, 8)).collect()
 print(decoded.num_rows, decoded.schema.field("image").type)
-# 2 fixed_size_list<item: uint8 not null>[192]
+# 2 extension<arrow.fixed_shape_tensor[value_type=uint8, shape=[8,8,3]]>
 ```
 
 Each row is now a flat `8 * 8 * 3 = 192`-element RGB block. `bt.read.images(...,

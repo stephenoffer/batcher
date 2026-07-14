@@ -61,7 +61,7 @@ class _CassandraSourceBase(ScanSource):
     # engine's `Filter` re-check then drops the rows. See `_pushed_cql`.
     supports_predicate = True
 
-    __slots__ = ("_pushed_cql",)
+    __slots__ = ()
 
     def __init__(
         self,
@@ -83,21 +83,6 @@ class _CassandraSourceBase(ScanSource):
             port=port,
             auth=auth,
         )
-        # The CQL WHERE fragment for the active read (no token-range part), or None.
-        # Set per-read by `read`/`iter_batches`; consumed in `_read_partition`.
-        self._pushed_cql: str | None = None
-
-    def read(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> list[pa.RecordBatch]:
-        return list(self.iter_batches(projection, predicate))
-
-    def iter_batches(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> Iterator[pa.RecordBatch]:
-        self._pushed_cql = _pushed_cql(predicate)
-        for partition in self._enumerate_partitions():
-            yield from self._read_partition(partition, projection)
 
     def _session(self) -> tuple[Any, Any]:
         cassandra_cluster = require_driver("cassandra.cluster", "cassandra")
@@ -138,10 +123,14 @@ class _CassandraSourceBase(ScanSource):
         return _token_ranges(max(1, self._partition_spec.segments))
 
     def _read_partition(
-        self, partition: _TokenRange, projection: list[str] | None
+        self,
+        partition: _TokenRange,
+        projection: list[str] | None,
+        predicate: dict | None = None,
     ) -> Iterator[pa.RecordBatch]:
         kw = self._conn_kwargs
         start, end = partition
+        pushed = _pushed_cql(predicate)
         cols = ", ".join(projection) if projection else "*"
         pk = self._pk_expr()
         cluster, session = self._session()
@@ -150,8 +139,8 @@ class _CassandraSourceBase(ScanSource):
                 f"SELECT {cols} FROM {kw['table']} "
                 f"WHERE token({pk}) >= {start} AND token({pk}) < {end}"
             )
-            if self._pushed_cql is not None:
-                stmt += f" AND {self._pushed_cql} ALLOW FILTERING"
+            if pushed is not None:
+                stmt += f" AND {pushed} ALLOW FILTERING"
             schema = self.schema()
             rows = (dict(row._asdict()) for row in session.execute(stmt))
             yield from rows_to_batches(rows, schema=schema if not projection else None)

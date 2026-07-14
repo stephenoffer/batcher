@@ -9,11 +9,35 @@ checked against this same oracle.
 
 from __future__ import annotations
 
+import math
+from decimal import Decimal
+
 import pyarrow as pa
 import pytest
 
 duckdb = pytest.importorskip("duckdb")
 pytest.importorskip("batcher._native", reason="native engine not built")
+
+
+def _sort_key(v) -> tuple:
+    """A total order over coerced values that sorts numbers by numeric *value*.
+
+    Sorting by ``str(type(v))`` first (the old key) put ints before floats regardless of
+    magnitude, so a column mixing the two — which now happens because integral values
+    canonicalize to ``int`` and fractional ones stay ``float`` — sorted into a different
+    order than an oracle result of a single numeric type, and the row-by-row comparison
+    then failed on multisets that were actually equal. Numbers therefore share one bucket
+    and sort by value; the exact ``repr`` breaks ties so two distinct large ints that share
+    a float image still order deterministically and identically on both sides.
+    """
+    if v is None:
+        return (0, "")
+    if isinstance(v, bool):
+        return (1, repr(v))
+    if isinstance(v, (int, float)):  # noqa: UP038
+        f = v if math.isfinite(v) else (math.inf if v > 0 else -math.inf)
+        return (2, float(f), repr(v))
+    return (3, str(type(v)), str(v))
 
 
 def _normalize(table: pa.Table) -> list[tuple]:
@@ -24,7 +48,7 @@ def _normalize(table: pa.Table) -> list[tuple]:
     """
     cols = table.column_names
     rows = [tuple(_coerce(r[c]) for c in cols) for r in table.to_pylist()]
-    return sorted(rows, key=lambda t: tuple((v is None, str(type(v)), v) for v in t))
+    return sorted(rows, key=lambda t: tuple(_sort_key(v) for v in t))
 
 
 #: Stand-in for NaN in a comparison. `nan != nan`, so a raw NaN in a result tuple makes the
@@ -39,13 +63,25 @@ def _coerce(v):
     if isinstance(v, bool):
         return v
     if isinstance(v, int):
-        return float(v)
-    if isinstance(v, float):
-        if v != v:  # NaN — any payload, any sign
+        # Keep integers EXACT. Coercing to float (the old behaviour) collapsed any two
+        # int64 values that share a float64 image — e.g. 2^53 and 2^53+1 — so a differential
+        # test over large integers could not see an off-by-one. The int/float divide is
+        # bridged from the float side below (integral floats canonicalize to int), never by
+        # degrading the int side.
+        return v
+    if isinstance(v, (float, Decimal)):  # noqa: UP038
+        if isinstance(v, float) and v != v:  # NaN — any payload, any sign
             return _NAN
-        if v == 0.0:  # -0.0 == 0.0 in SQL grouping, and they must compare equal here too
-            return 0.0
-        return round(v, 9)
+        if not math.isfinite(v):  # ±inf: keep as float, never int() it
+            return float(v)
+        r = round(float(v), 9)
+        # Canonicalize every integral value (float or DuckDB Decimal) to int: it makes int↔
+        # float↔decimal widening compare equal (1 vs 1.0 vs Decimal('1.0')), and it must be
+        # *uniform* — including ±0.0 → int 0 — or a column mixes numeric types across rows.
+        # A genuinely fractional value (1.5) stays float and still differs from an int.
+        if r == int(r):  # True for -0.0/0.0 too (-0.0 == 0), unifying signed zero
+            return int(r)
+        return r
     return v
 
 

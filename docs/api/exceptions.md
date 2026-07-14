@@ -55,7 +55,7 @@ try:
     ds.select(bt.col("missing")).to_pydict()
 except BatcherError as exc:
     print(f"query failed: {exc}")
-# query failed: ...
+# query failed: projection 'missing' references unknown column(s) ['missing']; available: ['a']
 ```
 
 Catching `BatcherError` covers every Batcher-specific failure while letting

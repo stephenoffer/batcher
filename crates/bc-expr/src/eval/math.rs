@@ -97,7 +97,9 @@ fn apply_binary(func: Math2Func, x: f64, y: f64) -> f64 {
             if g == 0 {
                 0.0
             } else {
-                (a / g * b).unsigned_abs() as f64
+                // Compute the product in i128 so a coprime pair near sqrt(i64::MAX) does
+                // not overflow i64 (which panicked in debug and wrapped in release).
+                ((a as i128 / g as i128) * b as i128).unsigned_abs() as f64
             }
         }
         Math2Func::Hypot => x.hypot(y),
@@ -120,15 +122,19 @@ pub(crate) fn eval_extreme(
     let mut acc = inputs[0].eval(batch)?;
     for next in &inputs[1..] {
         let b = next.eval(batch)?;
+        // Promote mixed numeric operands to a common type (e.g. greatest(int, float) →
+        // float) before comparing, so a valid int×float call returns a value instead of
+        // erroring `Int64 >= Float64`. Matches DuckDB and the sibling `coalesce`.
+        let (acc_c, b) = coerce_numeric(&acc, &b)?;
         let cmp = if greatest {
-            cmp::gt_eq(&acc, &b)?
+            cmp::gt_eq(&acc_c, &b)?
         } else {
-            cmp::lt_eq(&acc, &b)?
+            cmp::lt_eq(&acc_c, &b)?
         };
         // Where both are non-null, pick the winner; null elsewhere. Then coalesce
         // with each side so a lone non-null still survives.
-        let both = zip(&cmp, &acc.as_ref(), &b.as_ref())?;
-        acc = coalesce_arrays(&[both, acc, b])?;
+        let both = zip(&cmp, &acc_c.as_ref(), &b.as_ref())?;
+        acc = coalesce_arrays(&[both, acc_c, b])?;
     }
     Ok(acc)
 }

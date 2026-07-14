@@ -381,7 +381,7 @@ Carbonite decisions, and the measured per-operator profile).
 | `log_file_max_bytes` | `10000000` (10 MB) | Bytes per log file before it rotates. |
 | `log_file_backups` | `3` | How many rotated files to keep. |
 | `log_format` | `"human"` | `"human"` is a readable one-line layout; `"json"` writes one JSON object per record, for a log shipper. |
-| `event_log` | `True` | Write the structured per-query event log (the Spark event-log analog). |
+| `event_log` | `False` | Write the structured per-query event log (the Spark event-log analog). Opt-in: it attaches a profile collector for the whole query and then assembles, encodes, and writes one JSON document per query — ~0.3 ms, a quarter of the control plane on a small `collect()`. Turn it on when something will read it. `explain(analyze=True)` and `stats()` give you the same profile on demand without it. |
 | `otel_traces` | `False` | Emit an OpenTelemetry span per query, with a child span per operator, into the tracer your app already configured. Needs `opentelemetry` installed and a provider — Batcher owns no exporter. It reuses the profile the event log already measures, so turning it on adds the emit, not the measurement. |
 | `event_log_dir` | `""` | Directory for event-log documents. Empty resolves to `$BATCHER_HOME/logs` (or `~/.batcher/logs`) at write time. |
 | `event_log_max_files` | `200` | Keep at most this many event-log files; the oldest are pruned on write. `0` is unbounded. |
@@ -399,11 +399,11 @@ cfg = Config().replace(
     observability=ObservabilityConfig(log_level="INFO", log_format="json")
 )
 print((cfg.observability.log_level, cfg.observability.event_log))
-# ('INFO', True)
+# ('INFO', False)
 ```
 
 Every field takes a `BATCHER_OBSERVABILITY_*` env override, so a deployment can raise the
-log level or turn the event log off (`BATCHER_OBSERVABILITY_EVENT_LOG=0`) without touching
+log level or turn the event log on (`BATCHER_OBSERVABILITY_EVENT_LOG=1`) without touching
 code.
 
 Invalid values (a negative retry count, `soft_limit` above `hard_limit`, a

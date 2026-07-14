@@ -13,6 +13,8 @@ within the size budget; the conductor calls these on its single-node and UDF pat
 
 from __future__ import annotations
 
+import random
+
 import pyarrow as pa
 
 from batcher._internal.logging import get_logger
@@ -32,6 +34,10 @@ __all__ = [
 ]
 
 _log = get_logger("metadata")
+
+# Picks each sampled batch's window offset (`_sketch_sample`). Seeded, so a run's learned
+# statistics — and therefore the plans they steer — are reproducible.
+_rng = random.Random(0x5EED)
 
 
 # Row cap for the driver-side column-stat sample (≈ a couple of Parquet row-groups).
@@ -257,6 +263,54 @@ def learnable_columns(plan: LogicalPlan) -> set[str]:
     return ndv_columns(plan) | column_bounds_needed(plan)
 
 
+# How many rows the *expensive* sketches (KLL quantiles, Misra-Gries most-common-values)
+# read, however large the input is. See `_sketch_sample`.
+#
+# 262,144 rows keeps a quantile grid well inside the KLL's own ~1% rank error and resolves a
+# most-common-value down to a fraction of a percent — far finer than the 5% floor that
+# decides whether a key is hot. Doubling it would buy accuracy neither consumer can use.
+_SKETCH_SAMPLE_ROWS = 262_144
+
+
+def _sketch_sample(batches: list[pa.RecordBatch]) -> list[pa.RecordBatch]:
+    """A bounded, order-stratified sample of `batches` — for the sketches too costly to run
+    over everything.
+
+    The three learned statistics do not cost the same. HyperLogLog reads a cell in ~4 ns, so
+    distinct counts are measured over every row. The KLL quantile sketch and the Misra-Gries
+    most-common-value summary cost ~56 ns a cell between them, and running *those* over the
+    whole input is what made the first run of a 3 ms query take 140 ms — the engine paying
+    forty times a query's cost to learn statistics for the next one. They are estimators
+    fitted to a distribution, and a sample identifies that distribution as well as a census
+    does: at 262,144 rows the sampling error sits below the sketches' own approximation
+    error, so this loses nothing they could have told us. It is what `ANALYZE` does in every
+    database that has one.
+
+    The sample is **stratified by batch and taken as a random window within each**: every
+    batch contributes in proportion to its size, so a column sorted across the input (a date,
+    a key) is still covered end to end, and the window's random offset keeps a sorted batch
+    from always donating its own low values. Both are zero-copy `slice`s — no row is read in
+    Python, and the cost does not grow with the input.
+
+    Args:
+        batches: The scanned batches to sample.
+
+    Returns:
+        Zero-copy slices totalling at most `_SKETCH_SAMPLE_ROWS` rows — `batches` itself when
+        it is already that small.
+    """
+    total = sum(b.num_rows for b in batches)
+    if total <= _SKETCH_SAMPLE_ROWS:
+        return batches
+    fraction = _SKETCH_SAMPLE_ROWS / total
+    out: list[pa.RecordBatch] = []
+    for batch in batches:
+        take = max(1, int(batch.num_rows * fraction))
+        offset = _rng.randrange(batch.num_rows - take + 1) if batch.num_rows > take else 0
+        out.append(batch.slice(offset, take))
+    return out
+
+
 def learn_column_stats(
     hub,
     resolved: list[list[pa.RecordBatch]],
@@ -293,6 +347,14 @@ def learn_column_stats(
     * `ndv_sketch_max_cells` caps the total work, so one enormous column cannot turn a
       cheap query into an expensive one. The pre-pass has always honored this cap; this one
       did not, which is why it had no ceiling at all.
+    * **The costly sketches read a sample, not the whole input** (`_sketch_sample`). Bounding
+      the *columns* still left the pass reading every *row* of them: the KLL and Misra-Gries
+      sketches cost ~56 ns a cell against HyperLogLog's ~4, so a cold 3 ms `filter`+`group_by`
+      over 1M rows spent **114 ms** in this function — 38x the query, to inform the next one.
+      Distinct counts still read every row (HLL is cheap, and distinct-count is the one
+      statistic a sample genuinely cannot give you); quantiles, byte widths and
+      most-common-values are fitted to a bounded sample, which is what `ANALYZE` does
+      everywhere else and what their own error bars already assume.
 
     Passing `plan=None` keeps the old learn-everything behavior, for the caller that hands
     in an already-bounded *sample* (`collect_source_metadata`) rather than a whole scan.
@@ -333,8 +395,12 @@ def learn_column_stats(
             rows = sum(b.num_rows for b in batches)
             if rows * len(cols) > max_cells:
                 continue  # too big to sketch cheaply; a worse plan beats a 20x slower query
-            ndv, quants, avg_bytes = core.column_statistics(batches, cols)
-            total = rows
+            # Distinct counts read every row; the quantile/MCV sketches read a bounded
+            # sample. See `_sketch_sample` — one is ~4 ns a cell, the others ~56.
+            ndv = core.column_ndv(batches, cols)
+            sample = _sketch_sample(batches)
+            total = sum(b.num_rows for b in sample)
+            _sample_ndv, quants, avg_bytes = core.column_statistics(sample, cols)
             mcv: dict[str, dict[str, float]] = {}
             # Heavy hitters are measured on **every** column being sketched, not only
             # low-cardinality ones.
@@ -350,7 +416,9 @@ def learn_column_stats(
             # key in the table, which is exactly the key a join is about to be built on. The
             # gate suppressed skew precisely where skew matters, leaving join-key skew
             # structurally unmeasurable (`kyber.hot_join_values` reads this).
-            for col_name, hits in core.heavy_hitters(batches, cols, min_frac).items():
+            # Over the sample, and against the sample's row count: an MCV is a *fraction*
+            # of rows, and a uniform sample preserves a value's frequency.
+            for col_name, hits in core.heavy_hitters(sample, cols, min_frac).items():
                 if total > 0 and hits:
                     mcv[col_name] = {str(v): n / total for v, n in hits}
             if ndv or quants or avg_bytes or mcv:

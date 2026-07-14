@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, ClassVar
 import pyarrow as pa
 
 from batcher.io.formats.base import SOURCES
-from batcher.io.formats.sql._common import apply_projection, require_module
+from batcher.io.formats.sql._common import apply_projection, push_down, require_module
 
 if TYPE_CHECKING:
     from batcher.io.splits import Split
@@ -117,9 +117,15 @@ class ConnectorXSource:
     partition_on: str | None = None
     partition_num: int = 1
 
-    def _split(self, query: str | None = None) -> _ConnectorXSplit:
+    def _split(
+        self, predicate: dict | None = None, projection: list[str] | None = None
+    ) -> _ConnectorXSplit:
+        """The split, with the pushdown already folded into its SQL (see `push_down`)."""
         return _ConnectorXSplit(
-            self.conn_uri, query or self.query, self.partition_on, self.partition_num
+            self.conn_uri,
+            push_down(self.query, predicate, projection),
+            self.partition_on,
+            self.partition_num,
         )
 
     def schema(self) -> pa.Schema:
@@ -128,27 +134,12 @@ class ConnectorXSource:
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
-        if predicate is not None:
-            from batcher.io.predicate import to_sql_where
-
-            where = to_sql_where(predicate)
-            if where:
-                query = f"SELECT * FROM ({self.query}) AS _bq_pred WHERE {where}"
-                return self._split(query).read(projection)
-        return self._split().read(projection)
+        return self._split(predicate, projection).read(projection)
 
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        if predicate is not None:
-            from batcher.io.predicate import to_sql_where
-
-            where = to_sql_where(predicate)
-            if where:
-                query = f"SELECT * FROM ({self.query}) AS _bq_pred WHERE {where}"
-                yield from self._split(query).iter_batches(projection)
-                return
-        yield from self._split().iter_batches(projection)
+        yield from self._split(predicate, projection).iter_batches(projection)
 
     def row_count(self) -> int | None:
         return None
@@ -156,7 +147,12 @@ class ConnectorXSource:
     def identity(self) -> str:
         return f"connectorx:{self.query}"
 
-    def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
+    def splits(
+        self,
+        target_size: int | None = None,  # noqa: ARG002 (protocol signature)
+        predicate: dict | None = None,
+        projection: list[str] | None = None,
+    ) -> list[Split]:
         """The independently-readable slices of this source.
 
         ConnectorX owns range-partitioning itself: a partitioned read fans the
@@ -166,5 +162,10 @@ class ConnectorXSource:
         re-deriving disjoint ranges (which would mean extra bound probes we
         explicitly forbid). So the source is a single split that delegates its
         parallelism to ConnectorX.
+
+        The pushdown is folded into the SQL the split carries, so the *worker's* query is the
+        filtered one. A predicate left outside the split never reaches the server: the worker
+        rebuilds an unfiltered read and the engine's `Filter` discards the rows after they have
+        already crossed the wire.
         """
-        return [self._split()]
+        return [self._split(predicate, projection)]

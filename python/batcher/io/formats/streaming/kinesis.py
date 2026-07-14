@@ -37,6 +37,12 @@ def _import_boto3() -> Any:
     return boto3
 
 
+# AWS caps `GetRecords`'s `Limit` at 10,000 records per call, and rejects anything larger
+# with `InvalidArgumentException`. The engine's usual 16,384-row morsel is therefore not a
+# legal request here, so every poll is clamped to the API's ceiling.
+_GET_RECORDS_MAX_LIMIT = 10_000
+
+
 @SOURCES.register("kinesis")
 class KinesisSource(BrokerSource):
     """An unbounded Kinesis stream, consumed via ``boto3``.
@@ -45,6 +51,9 @@ class KinesisSource(BrokerSource):
     ``iterator_type`` (``"TRIM_HORIZON"`` by default, or ``"LATEST"``), and
     ``partitions`` (the specific shards to read — set by :class:`BrokerSplit` on a
     worker; the values are shard *indices* into the discovered shard list).
+
+    ``poll_size`` is the records requested per ``GetRecords`` call. AWS caps that at
+    10,000, so a larger value is clamped rather than sent (it would be rejected).
     """
 
     format_name = "kinesis"
@@ -55,7 +64,7 @@ class KinesisSource(BrokerSource):
         self,
         topic: str,
         *,
-        poll_size: int = 16_384,
+        poll_size: int = _GET_RECORDS_MAX_LIMIT,
         partitions: list[int] | None = None,
         region: str = "us-east-1",
         iterator_type: str = "TRIM_HORIZON",
@@ -80,10 +89,25 @@ class KinesisSource(BrokerSource):
         return self._client_obj
 
     def _shards(self) -> list[str]:
+        """Every shard of the stream, paginated.
+
+        `list_shards` returns at most 100 shards per call and hands back a `NextToken` for
+        the rest. Reading only the first page looked like it worked — it just silently
+        skipped every shard past the hundredth, which on a large stream is most of the
+        data. Note that `StreamName` and `NextToken` are mutually exclusive in the API.
+        """
         if self._shard_ids is None:
             client = self._client()
-            resp = client.list_shards(StreamName=self.topic)
-            self._shard_ids = [s["ShardId"] for s in resp.get("Shards", [])]
+            shard_ids: list[str] = []
+            kwargs: dict[str, Any] = {"StreamName": self.topic}
+            while True:
+                resp = client.list_shards(**kwargs)
+                shard_ids.extend(s["ShardId"] for s in resp.get("Shards", []))
+                token = resp.get("NextToken")
+                if not token:
+                    break
+                kwargs = {"NextToken": token}
+            self._shard_ids = shard_ids
         return self._shard_ids
 
     def _discover_partitions(self) -> list[int]:
@@ -130,7 +154,7 @@ class KinesisSource(BrokerSource):
         for shard_index, shard_id in enumerate(self._active_shards()):
             resp = client.get_records(
                 ShardIterator=self._iterator(shard_id, shard_index),
-                Limit=self.poll_size,
+                Limit=min(self.poll_size, _GET_RECORDS_MAX_LIMIT),
             )
             next_iter = resp.get("NextShardIterator")
             if next_iter is not None:

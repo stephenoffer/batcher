@@ -95,18 +95,6 @@ class MongoSource(ScanSource):
             partition_spec=self._partition_spec,
         )
 
-    def read(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> list[pa.RecordBatch]:
-        return list(self._with_pushed(predicate).iter_batches(projection))
-
-    def iter_batches(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> Iterator[pa.RecordBatch]:
-        source = self._with_pushed(predicate)
-        for partition in source._enumerate_partitions():
-            yield from source._read_partition(partition, projection)
-
     def _client(self) -> Any:
         pymongo = require_driver("pymongo", "mongo")
         return pymongo.MongoClient(self._conn_kwargs["uri"])
@@ -156,13 +144,19 @@ class MongoSource(ScanSource):
             client.close()
 
     def _read_partition(
-        self, partition: _IdRange, projection: list[str] | None
+        self,
+        partition: _IdRange,
+        projection: list[str] | None,
+        predicate: dict | None = None,
     ) -> Iterator[pa.RecordBatch]:
         require_driver("pymongoarrow", "mongo")
         from pymongoarrow.api import find_arrow_all
 
         lo, hi = partition
-        query = dict(self._conn_kwargs["query"])
+        # Push the predicate into the `find` filter here, not into per-read instance state:
+        # a worker rebuilds this source from the split's `conn_kwargs` and would otherwise
+        # scan the whole collection.
+        query = dict(self._with_pushed(predicate)._conn_kwargs["query"])
         id_filter: dict[str, Any] = {}
         if lo is not None:
             id_filter["$gte"] = lo

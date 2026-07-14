@@ -1,43 +1,31 @@
 """Schema-driven NULL reasoning — rewrites proved by *declared* nullability.
 
-The engine already knows, per column, whether it may hold a NULL: a source schema's Arrow
-fields carry `nullable`, and `Scan` keeps that in `Scan.schema`. Almost nothing consumed it.
-This family does: it derives the columns that provably hold no NULL at a node's input, lifts
-that to a *never-null* judgement over whole expressions, and uses it to fold the null-handling
-shapes a SQL front end emits (`IS NULL`, `COALESCE`, `fill_null`, the null-safe `eq_missing`,
-`COUNT(col)`, a `NULLS FIRST` ordering) into something cheaper — or into nothing at all.
+The engine knows per column whether it may hold a NULL — a source schema's Arrow fields carry
+`nullable`, and `Scan` keeps it — and almost nothing consumed it. This family does: it derives
+the provably non-null columns at a node's input, lifts that to a *never-null* judgement over
+whole expressions, and folds the null-handling shapes a SQL front end emits (`IS NULL`,
+`COALESCE`, `fill_null`, `eq_missing`, `COUNT(col)`, `NULLS FIRST`) into something cheaper —
+or into nothing.
 
-**Declared nullability is a contract, not a statistic.** A field marked `nullable=False`
-that nevertheless carries a NULL is invalid input (pyarrow does not enforce it; DuckDB's
-`NOT NULL` does), and every engine that optimizes on declared nullability — Calcite,
-DuckDB, Spark — reads it as a promise. These rules are exact *given* that promise and use
-nothing else: never a statistic, never an estimate. Where nullability is unknown, the
-analysis answers "may be null" and every rule returns `None`.
+**Declared nullability is a contract, not a statistic.** A `nullable=False` field carrying a
+NULL is invalid input (pyarrow does not enforce it; DuckDB's `NOT NULL` does), and every engine
+that optimizes on it — Calcite, DuckDB, Spark — reads it as a promise. These rules are exact
+*given* that promise. Where nullability is unknown the analysis answers "may be null", and
+every rule returns `None`.
 
-**Three-valued logic is respected literally.** `IS NULL` / `IS NOT NULL` are *total*: TRUE or
-FALSE on every row, never NULL. That is what makes folding them to a boolean literal sound in
-**any** context — inside a `Filter` (where NULL and FALSE both drop a row) and equally inside
-a `Project` (where NULL and FALSE are different *values*). Nothing here folds a rewrite that
-is only valid under a filter's NULL-drops-the-row semantics. The never-null judgement is
-conservative in the other direction: `AND`/`OR` are Kleene (`NULL AND FALSE` is FALSE, not
-NULL), so a null operand *could* still yield a non-null result — the analysis never exploits
-that; it requires both operands non-null.
+**Three-valued logic is respected literally.** `IS NULL` / `IS NOT NULL` are *total* — TRUE or
+FALSE on every row, never NULL — which is what makes folding them to a boolean literal sound
+in **any** context: inside a `Filter` (NULL and FALSE both drop a row) and equally inside a
+`Project` (where they are different *values*). Nothing here relies on a filter's
+NULL-drops-the-row semantics. The never-null judgement is conservative the other way: `AND`/`OR`
+are Kleene, so a null operand could still yield a non-null result — never exploited.
 
-Deliberately **not** implemented, and why:
-
-- `filter_is_null_on_non_nullable_to_empty` — already shipped as
-  `empty_on_impossible_null_check` (`projection_scan.py`): a `WHERE c IS NULL` over a NOT
-  NULL `c` folds to the canonical empty relation. Re-adding it would be a duplicate.
-- `is_null_of_literal` / `is_not_null_of_literal` — subsumed. A `Lit` cannot hold NULL (the
-  IR's typed NULL is the `NULLIF(l, l)` idiom), so a literal *is* the degenerate never-null
-  expression: `drop_is_null_on_non_nullable_column` already folds `IS NULL(lit)` → FALSE and
-  its dual `IS NOT NULL(lit)` → TRUE. Separate rules would be two traversals for nothing.
-- `drop_nullif_when_operand_non_nullable` — **unsound**. `NULLIF(a, b)` *introduces* NULL
-  (wherever `a = b`); non-nullability says nothing about whether the operands are equal, so
-  there is nothing to drop. The provable case (distinct literals) is `nullif_distinct_literals`.
-- `propagate_non_nullability_through_project` — is the *analysis*, not a rewrite:
-  `_non_null_cols` handles `Project`, which is what lets every rule here fire on a
-  `Filter`/`Sort`/`Aggregate` above a projection. As a rule it would be a registered no-op.
+Deliberately **not** implemented: `filter_is_null_on_non_nullable_to_empty` (already shipped as
+`empty_on_impossible_null_check`); `is_null_of_literal` and its dual (subsumed — a `Lit` cannot
+hold NULL, so it *is* the degenerate never-null expression); `drop_nullif_when_operand_non_nullable`
+(**unsound** — `NULLIF` *introduces* NULL wherever its operands are equal, which non-nullability
+says nothing about); and `propagate_non_nullability_through_project` (that is the *analysis*,
+`_non_null_cols`, not a rewrite).
 """
 
 from __future__ import annotations
@@ -134,16 +122,14 @@ def _non_null_cols(node: LogicalPlan) -> frozenset[str]:
 def _never_null(expr: Expr, non_null: frozenset[str]) -> bool:
     """Whether `expr` provably evaluates to a non-NULL value on **every** row.
 
-    A conservative whitelist, given the columns known non-nullable at the expression's input:
-    a `Lit` (the IR has no NULL literal — its typed NULL is `NULLIF(l, l)`); a `Col` declared
-    NOT NULL; `IS NULL`/`IS NOT NULL` (total by construction); `NOT`/`IS NAN`/`IS INF` over a
-    never-null input (each propagates NULL); a **strict** `Cast` of one (an unconvertible
-    value *errors* the query rather than becoming NULL — `try_cast`, which does manufacture a
-    NULL, is excluded); a null-propagating binary from `_SAFE_BINARY_OPS` with both operands
-    never-null (`div`/`mod` and the bit/shift ops are not in that whitelist); and a `COALESCE`
-    with at least one never-null argument.
-
-    Everything else answers False — erring that way prevents a rewrite, never licenses one.
+    A conservative whitelist, given the columns known non-nullable at the input: a `Lit` (the
+    IR has no NULL literal — its typed NULL is `NULLIF(l, l)`); a NOT NULL `Col`; `IS NULL` /
+    `IS NOT NULL` (total by construction); `NOT` / `IS NAN` / `IS INF` over a never-null input;
+    a **strict** `Cast` of one (an unconvertible value *errors* rather than becoming NULL —
+    `try_cast`, which does manufacture one, is excluded); a null-propagating binary from
+    `_SAFE_BINARY_OPS` with both operands never-null (`div`/`mod` and the bit/shift ops are
+    not in it); and a `COALESCE` with a never-null argument. Everything else answers False —
+    erring that way prevents a rewrite, never licenses one.
     """
     if isinstance(expr, Lit):
         return True
@@ -378,7 +364,7 @@ def _expand_is_null_coalesce(expr: Expr) -> Expr:
     name="expand_is_null_of_coalesce",
     phase=Phase.NORMALIZE,
     matches=_EXPR_NODES,
-    expr=lambda e: _expand_is_null_coalesce(e),
+    expr=_expand_is_null_coalesce,
 )
 def expand_is_null_of_coalesce(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`coalesce(a, b) IS NULL` → `a IS NULL AND b IS NULL`.
@@ -406,7 +392,7 @@ def _expand_is_not_null_coalesce(expr: Expr) -> Expr:
     name="expand_is_not_null_of_coalesce",
     phase=Phase.NORMALIZE,
     matches=_EXPR_NODES,
-    expr=lambda e: _expand_is_not_null_coalesce(e),
+    expr=_expand_is_not_null_coalesce,
 )
 def expand_is_not_null_of_coalesce(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`coalesce(a, b) IS NOT NULL` → `a IS NOT NULL OR b IS NOT NULL` — the De Morgan dual
@@ -432,18 +418,16 @@ def _canonicalize_not_null_check(expr: Expr) -> Expr:
     name="canonicalize_not_null_check",
     phase=Phase.NORMALIZE,
     matches=_EXPR_NODES,
-    expr=lambda e: _canonicalize_not_null_check(e),
+    expr=_canonicalize_not_null_check,
 )
 def canonicalize_not_null_check(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`NOT (x IS NULL)` → `x IS NOT NULL`, and `NOT (x IS NOT NULL)` → `x IS NULL`.
 
     Exact under three-valued logic precisely *because* the null checks are total: `IS NULL`
-    never yields NULL, so its `NOT` is a plain boolean complement (for a nullable ordinary
-    predicate this would not hold — `NOT NULL` is NULL). Canonicalizing the two spellings
-    into one is what lets every rule that pattern-matches on `IsNull`/`IsNotNull` — the
-    schema rules here, `drop_redundant_is_not_null`, `empty_on_impossible_null_check` — see
-    a shape they recognize instead of an opaque `NOT`. The output contains no
-    `NOT(IsNull|IsNotNull)`, so it is idempotent.
+    never yields NULL, so its `NOT` is a plain boolean complement (for an ordinary nullable
+    predicate this would fail — `NOT NULL` is NULL). Canonicalizing the two spellings lets
+    every rule that pattern-matches `IsNull`/`IsNotNull` see a shape it recognizes instead of
+    an opaque `NOT`. The output contains no `NOT(IsNull|IsNotNull)`, so it is idempotent.
     """
     return _rewrite_node(node, _canonicalize_not_null_check)
 
@@ -457,12 +441,11 @@ def count_of_non_nullable_column_to_count_star(
 ) -> LogicalPlan | None:
     """`COUNT(x)` → `COUNT(*)` when `x` provably never yields NULL.
 
-    COUNT counts the rows where its argument is non-null; over a NOT NULL column that is
-    every row — exactly `COUNT(*)`, which needs no per-row null check and no column at all.
-    The generalization of `count_constant_to_count_star` (a non-null *literal*) from a
-    constant to a declared-NOT-NULL column or any never-null expression over one. Holds for
-    grouped and global aggregates alike (both count 0 over empty input). Only the unary,
-    non-parametric `count` is touched — `count_distinct` counts distinct values, not rows.
+    COUNT counts the rows where its argument is non-null; over a NOT NULL column that is every
+    row — exactly `COUNT(*)`, which needs no per-row null check and no column at all. It
+    generalizes `count_constant_to_count_star` from a non-null *literal* to any never-null
+    expression, and holds for grouped and global aggregates alike (both count 0 over empty
+    input). Only the unary `count` is touched — `count_distinct` counts values, not rows.
     """
     non_null = _non_null_cols(node.input)
     if not non_null:

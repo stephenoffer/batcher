@@ -210,7 +210,7 @@ out = ds.select(
     first_two=bt.col("name").str.left(2),
 )
 print(out.to_pydict())
-# {'upper': ['ANN', 'BOB', 'CARL'], 'length': [3, 3, 4], 'has_a': [True, False, True], 'first_two': ['An', 'bo']}
+# {'upper': ['ANN', 'BOB', 'CARL'], 'length': [3, 3, 4], 'has_a': [True, False, True], 'first_two': ['An', 'bo', 'CA']}
 ```
 
 More predicates and slicers round out the namespace: `ends_with` mirrors

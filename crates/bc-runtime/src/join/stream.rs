@@ -73,6 +73,26 @@ fn is_probe_driven(join_type: JoinType) -> bool {
     )
 }
 
+/// Whether [`BroadcastProbe`] can serve this join — answerable from the build side's *schema
+/// and row count alone*, before anything is concatenated.
+///
+/// [`BroadcastProbe::new`] re-checks all of this and returns `None` if it disagrees; this
+/// exists so a caller weighing the streaming path against a shuffle can find out **without
+/// first paying to materialize the build side**. The conditions are the module's: a
+/// probe-driven join type, one or two `Int64` key columns, and a build that stays under the
+/// cache-radix cliff.
+pub fn streaming_supported(
+    join_type: JoinType,
+    key_types: &[&arrow::datatypes::DataType],
+    build_rows: usize,
+) -> bool {
+    use arrow::datatypes::DataType;
+    is_probe_driven(join_type)
+        && build_rows <= super::RADIX_MIN_BUILD_ROWS_BROADCAST
+        && matches!(key_types.len(), 1 | 2)
+        && key_types.iter().all(|t| *t == &DataType::Int64)
+}
+
 /// A hash table over a broadcast build side, ready to be probed morsel by morsel.
 pub struct BroadcastProbe {
     table: JoinTable,

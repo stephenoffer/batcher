@@ -1680,7 +1680,10 @@ fn exec_join_pipeline(
     // Walk the chain innermost out. Consecutive stages that should stream are fused into ONE
     // pass over the morsels in flight; a stage that should not is joined the ordinary
     // partitioned way, materializing at that point and no other.
-    let tuning = bc_arrow::RuntimeTuning::default();
+    // The *live* tuning, not the compiled-in default: these values are shipped from Python's
+    // `ExecutionConfig`, and a fused stage must make the same bloom decision the unfused join
+    // would — otherwise fusing a chain would silently change a user's configured behaviour.
+    let tuning = &opts.tuning;
     let mut i = 0usize;
     while i < n {
         let cur_rows = count_rows(&cur);

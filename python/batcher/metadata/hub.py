@@ -56,6 +56,10 @@ _PER_KIND_MAX = 4096
 # costs O(cap) once every O(cap) records rather than O(cap) on every record.
 _TRIM_SLACK = 2
 
+# Sentinel for "the parsed view has no entry under this key" — distinct from a stored `None`,
+# which `_unchanged` must be able to recognize as already-written.
+_MISSING = object()
+
 
 def _trimmed(rows: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
     """`rows` bounded to its newest `cap` entries, trimming only past the slack factor."""
@@ -89,6 +93,10 @@ class MetadataHub:
         # cache missed on every query it existed to serve.
         self._params_generation = 0
         self._keyed_cache: dict[str, tuple[int, dict[str, Any]]] = {}
+        # Per namespace, the keys known to be backed by their own `(namespace, key)` backend
+        # entry — as opposed to merged up from the legacy single-blob shape. `_unchanged`
+        # only elides a redundant write for a key in here, so a legacy entry still migrates.
+        self._keyed_stored: dict[str, set[str]] = {}
         # Bucketed-by-kind view of the feedback history: loaded from the backend once,
         # then folded forward by `record`. Consumers reduce each bucket to a median or a
         # regression, so buckets are bounded (`_PER_KIND_MAX`) — the whole point is that
@@ -251,14 +259,17 @@ class MetadataHub:
             return cached[1]
         out: dict[str, Any] = {}
         legacy: dict[str, Any] = {}
+        stored: set[str] = set()
         for key, value in self._backend.scan(_LEARNED_PARAMS, (namespace,)):
             if len(key) >= 2:
                 out[key[1]] = json.loads(value)
+                stored.add(str(key[1]))
             elif len(key) == 1:
                 legacy = json.loads(value)
         for k, v in legacy.items():
             out.setdefault(k, v)  # per-key entries win over the legacy blob
         self._keyed_cache[namespace] = (self._params_generation, out)
+        self._keyed_stored[namespace] = stored
         return out
 
     def get_keyed_param(self, namespace: str, key: str) -> Any | None:
@@ -272,8 +283,11 @@ class MetadataHub:
         return self.load_keyed_params(namespace).get(key)
 
     def put_keyed_param(self, namespace: str, key: str, value: Any) -> None:
+        if self._unchanged(namespace, key, value):
+            return
         blob = json.dumps(value).encode()
         self._backend.put(_LEARNED_PARAMS, (namespace, key), blob)
+        self._keyed_stored.setdefault(namespace, set()).add(key)
         # Patch the parsed view rather than invalidating it: this write *is* the new value
         # of exactly one entry, and the tuning loops read the namespace back on the very
         # next query. Invalidating instead would re-scan and re-parse the namespace each
@@ -283,3 +297,36 @@ class MetadataHub:
         cached = self._keyed_cache.get(namespace)
         if cached is not None:
             cached[1][key] = json.loads(blob)
+
+    def _unchanged(self, namespace: str, key: str, value: Any) -> bool:
+        """True when `(namespace, key)` already stores exactly `value` — so writing is a no-op.
+
+        The learning loops **re-record what they already know on every query**: a query over
+        the same source re-measures the same distinct counts, and merges them into the same
+        map, and hands the same map back. Serving that write meant a `json.dumps` of the whole
+        column map, a backend `put`, and a `json.loads` of the blob back — per column-stat
+        table, per query — to arrive at the value already sitting in the parsed view. On the
+        default in-process backend (a dict in this very process) the round-trip through JSON
+        bytes was the *entire* cost. It was ~48% of a small query's control plane.
+
+        The parsed view is by construction "what a reader of the store would see", so a value
+        equal to it is a value already stored, and the write can be dropped. Two guards keep
+        that inference honest:
+
+        * the view must be current (`_params_generation`), and
+        * the key must be backed by its own per-key backend entry (`_keyed_stored`) — an entry
+          the view merged up from the *legacy* single-blob shape is readable but not yet
+          migrated, and eliding its first write would defer that migration forever.
+
+        Equality is `==` plus a top-level type check, which pins the int/float distinction
+        JSON preserves. A nested int-vs-float drift under an equal value is not distinguished
+        — it would require a deterministic producer to change a value's type while keeping it
+        numerically equal, and every consumer of these learned stats does float arithmetic.
+        """
+        cached = self._keyed_cache.get(namespace)
+        if cached is None or cached[0] != self._params_generation:
+            return False
+        if key not in self._keyed_stored.get(namespace, ()):
+            return False
+        current = cached[1].get(key, _MISSING)
+        return type(current) is type(value) and current == value

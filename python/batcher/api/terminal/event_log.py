@@ -1,14 +1,25 @@
 """Per-query event log — one JSON document per query (Spark's event-log analog).
 
-When ``observability.event_log`` is on (the default), each executed query writes a
-structured record to ``$BATCHER_HOME/logs`` (or ``~/.batcher/logs``): the logical and
-optimized plan, the Kyber/Carbonite decisions, and the measured per-operator profile —
-the same `QueryProfile` `explain(analyze=True)` renders. It is the developer/operator
-artifact for understanding, after the fact, what a query planned and did.
+When ``observability.event_log`` is on, each executed query writes a structured record to
+``$BATCHER_HOME/logs`` (or ``~/.batcher/logs``): the logical and optimized plan, the
+Kyber/Carbonite decisions, and the measured per-operator profile — the same `QueryProfile`
+`explain(analyze=True)` renders. It is the developer/operator artifact for understanding,
+after the fact, what a query planned and did.
+
+It is **opt-in** (see `ObservabilityConfig.event_log`). An enabled log attaches the
+collector for the whole query and then assembles, JSON-encodes, and writes one document
+per query — ~0.3 ms, which on a small `collect()` is a quarter of the entire control
+plane. Left on by default, every query paid for an artifact almost none of them had a
+reader for.
+
+Note the cost is *not* the disk: the write is a page-cached `open`/`write`/`close` and
+releases the GIL, and moving it to a background writer thread measured **no improvement at
+all** (1.13 ms async vs 1.09 ms sync) because the expensive part — the profile assembly and
+the `json.dumps` — is GIL-bound Python that a thread cannot run in parallel with the query
+anyway. The only way to not pay it is to not do it.
 
 The collector is attached to the execution context only when the feature is on, so a
-disabled event log adds nothing; an enabled one adds the profile assembly plus one small
-file write per query (the native execution already runs metered for the feedback loop).
+disabled event log adds nothing.
 """
 
 from __future__ import annotations

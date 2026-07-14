@@ -25,7 +25,7 @@ import json
 import numpy as np
 import pyarrow as pa
 import pytest
-from tests.differential.conftest import assert_same
+from conftest import assert_same
 
 pytestmark = pytest.mark.differential
 

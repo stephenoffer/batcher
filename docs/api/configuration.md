@@ -17,7 +17,7 @@ from batcher import Config
 
 cfg = Config()
 print(list(cfg.__dataclass_fields__))
-# ['execution', 'memory', 'flow_control', 'optimizer', 'pid', 'metadata', 'distributed']
+# ['execution', 'memory', 'flow_control', 'optimizer', 'pid', 'metadata', 'distributed', 'observability']
 ```
 
 Sections are themselves frozen dataclasses. Read fields directly; derive new configs

@@ -23,13 +23,21 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use crate::Mergeable;
+use crate::{Mergeable, SEED};
+
+/// The counter table. Hashed with the crate's **fixed-seed** ahash rather than std's
+/// randomly-seeded SipHash: the update runs once per row of every sketched column, where
+/// SipHash's per-key cost is a material share of the sketch, and a fixed seed keeps the
+/// summary reproducible across processes (the `Mergeable` contract — partition-built
+/// sketches must merge identically). Iteration order does not reach a result: `heavy_hitters`
+/// sorts its output, and the decrement step touches every counter uniformly.
+type Counters<K> = HashMap<K, u64, ahash::RandomState>;
 
 /// A Misra-Gries summary tracking up to `capacity` candidate heavy-hitter keys.
 #[derive(Clone)]
 pub struct FrequentItems<K: Hash + Eq + Clone> {
     capacity: usize,
-    counters: HashMap<K, u64>,
+    counters: Counters<K>,
     total: u64,
 }
 
@@ -41,9 +49,43 @@ impl<K: Hash + Eq + Clone> FrequentItems<K> {
         assert!(capacity >= 1, "capacity must be >= 1");
         Self {
             capacity,
-            counters: HashMap::with_capacity(capacity + 1),
+            counters: HashMap::with_capacity_and_hasher(capacity + 1, SEED),
             total: 0,
         }
+    }
+
+    /// Add one occurrence of a key held only by reference, cloning it **only if it
+    /// actually enters the summary**.
+    ///
+    /// Misra-Gries monitors at most `capacity` keys (~20 for a 5% frequency floor), and of
+    /// its three branches only one — taking a free slot — needs to *own* the key: the
+    /// increment reads it, and the decrement drops it. Feeding the owned-key `add` from a
+    /// column therefore allocated a `String` for every row and threw it away again on
+    /// essentially all of them. Over a 1M-row join key that was **90.5 ns/value**, against
+    /// 17 ns for the Utf8 cast that produced the strings — the allocator, not the sketch.
+    ///
+    /// Borrowing costs a hash and a lookup, and allocates at most `capacity` times per
+    /// distinct arrival. The summary it builds is identical.
+    pub fn add_ref<Q>(&mut self, key: &Q)
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+    {
+        self.total += 1;
+        if let Some(c) = self.counters.get_mut(key) {
+            *c += 1;
+            return;
+        }
+        if self.counters.len() < self.capacity {
+            self.counters.insert(key.to_owned(), 1);
+            return;
+        }
+        // No free slot and the key isn't monitored: pay for the new arrival by decrementing
+        // every monitored counter, evicting anything that reaches zero. Same as `add_n`.
+        self.counters.retain(|_, c| {
+            *c = c.saturating_sub(1);
+            *c > 0
+        });
     }
 
     /// Add one occurrence of `key`.

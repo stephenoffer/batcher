@@ -73,13 +73,21 @@ the smaller footprint), turn on `shrink_output_dtypes`. A pass-through of a narr
 from batcher.config import Config, ExecutionConfig, config_context
 
 with config_context(Config().replace(execution=ExecutionConfig(shrink_output_dtypes=True))):
-    print(bt.from_arrow(table).collect().schema.field("i32").type)
-# int32
+    narrowed = bt.from_arrow(table).select("i32", "f32").collect()
+    print(narrowed.schema.field("i32").type, narrowed.schema.field("f32").type)
+# int32 float
 ```
 
 It is off by default because it is data-dependent: a derived column has no source width
 to shrink to, so only a straight pass-through narrows. Do not rely on it to control the
 type of a computed column. `cast` that one explicitly.
+
+:::{note}
+The re-narrowing happens on the way out of the engine, so a `collect()` with no operations
+at all (`bt.from_arrow(t).collect()`, a bare scan) skips it and hands back the normalized
+`Int64`. Any real query — a `select`, a `filter`, anything — takes the engine path and
+narrows. If you want the narrow type from a bare scan, project the columns.
+:::
 
 ## cast and try_cast
 

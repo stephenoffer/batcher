@@ -270,7 +270,7 @@ def test_a_once_run_phase_visits_a_subtree_a_rule_just_created():
     freshly-created inner limit at 1.
     """
     import batcher as bt
-    from batcher.kyber.optimizer import _apply_rules
+    from batcher.kyber.optimizer.driver import _apply_rules
     from batcher.kyber.pass_base import OptimizerContext
     from batcher.kyber.rule import Phase, node_rule
     from batcher.kyber.stats import StatsEstimator
@@ -315,7 +315,7 @@ def test_fixpoint_phases_still_fuse():
     # hot path (NORMALIZE/REWRITE/PUSHDOWN/FUSION hold most of the rule set).
     import inspect
 
-    from batcher.kyber.optimizer import _run_phase
+    from batcher.kyber.optimizer.driver import _run_phase
 
     source = inspect.getsource(_run_phase)
     assert "fuse = max_iterations > 1" in source

@@ -1,25 +1,8 @@
-"""The shared Kyber → Carbonite → Core contract loop for relational plans.
-
-This is the single implementation of the conductor's terminal-op orchestration:
-optimize the plan (full Kyber, with per-operator `ResourceBounds`), let Carbonite
-govern it (admission, out-of-core spill, buffer reservation / scheduling
-envelope), execute via Core with the metadata feedback sink, and record what was
-measured so later plans improve. Every relational (non-UDF) terminal path —
-single-node, distributed, and each adaptive stage — routes through
-`run_relational`, so the contract loop is applied in exactly one place and the
-paths cannot drift out of sync.
-
-It lives in `api` because it imports all three subsystems (plus `dist`); the
-independence contract forbids any of them from importing the others, so the
-conductor is the one layer allowed to assemble them.
-"""
+"""The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back."""
 
 from __future__ import annotations
 
-import dataclasses
-import functools
-from collections.abc import Iterable
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
@@ -28,93 +11,18 @@ from batcher.api._join_helpers import _empty_result_schema
 from batcher.api.source_stats import (
     collect_source_stats,
     column_bounds_needed,
-    invalidate_source_stats,
-    persist_written_source_stats,
 )
-from batcher.config import Config, active_config, config_context
+from batcher.config import active_config, config_context
 from batcher.io.source import Source, read_source
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from batcher.core import ExecutionContext
     from batcher.kyber.rules.selection import BuildSideDecision
     from batcher.plan.logical import LogicalPlan
     from batcher.plan.physical import PhysicalPlan
 
-__all__ = [
-    "DEFAULT_PARTITIONS",
-    "approx_quantile",
-    "auto_num_partitions",
-    "collect_source_stats",
-    "invalidate_source_stats",
-    "partitions_from_physical",
-    "persist_written_source_stats",
-    "resolve_auto_config",
-    "run_relational",
-    "with_auto_config",
-]
 
-_R = TypeVar("_R")
-
-
-def resolve_auto_config(config: Config | None = None) -> Config:
-    """Return `config` with auto-sensed tunables filled in (a no-op `config` if none).
-
-    When `memory.max_memory_bytes` is unset and `memory.unbounded_memory` is off, a
-    concrete cap is sensed from the live envelope (host RAM / cgroup, via Carbonite's
-    `PressureMonitor`) and frozen in — driving both the data plane's spill budget and
-    the control plane's admission envelope, so a large query spills instead of OOMing
-    with zero config. An explicit cap or `unbounded_memory=True` is returned untouched
-    (the same object, so a caller can detect the no-op with ``is``).
-    """
-    cfg = config if config is not None else active_config()
-    mem = cfg.memory
-    if mem.max_memory_bytes is not None or mem.unbounded_memory:
-        return cfg
-    # `api` may consult Carbonite (it is the conductor); `config` may not.
-    from batcher.carbonite.memory.pressure import PressureMonitor
-
-    sensed = PressureMonitor(cfg).envelope_bytes()
-    if sensed <= 0:
-        return cfg  # could not sense — keep the safe unbounded fallback
-    return dataclasses.replace(cfg, memory=dataclasses.replace(mem, max_memory_bytes=sensed))
-
-
-def with_auto_config(fn: Callable[..., _R]) -> Callable[..., _R]:
-    """Decorate a terminal entry point to run under the auto-resolved config.
-
-    Fixes a query's sensed memory envelope once, at the materializing-terminal
-    boundary (collect / write / stats and what delegates to them) — not per stage,
-    where adaptive re-planning and the growing working set would drift it. A no-op
-    when the user pinned the memory config or sensing is unavailable.
-    """
-
-    @functools.wraps(fn)
-    def wrapper(*args: object, **kwargs: object) -> _R:
-        resolved = resolve_auto_config()
-        if resolved is active_config():
-            return fn(*args, **kwargs)
-        with config_context(resolved):
-            return fn(*args, **kwargs)
-
-    return wrapper
-
-
-def approx_quantile(batches: Iterable[pa.RecordBatch], column: str, q: float) -> float | None:
-    """Approximate quantile `q` of `column` from a streamed, merged TDigest.
-
-    Opt-in and explicitly approximate: tail-accurate (p99/p999) and far cheaper than
-    an exact sort. Consumes `batches` one at a time — building a per-batch TDigest and
-    merging the (tiny) sketches — so the column is never held whole on the driver; the
-    caller projects to just `column` and streams it (single-node or distributed).
-    Returns None if the column is non-numeric or empty.
-    """
-    from batcher import core
-
-    sketches = [sk for b in batches if (sk := core.tdigest_partial([b], column)) is not None]
-    return core.tdigest_quantile(sketches, q)
-
+from batcher.api.orchestration.autoconfig import resolve_auto_config, with_auto_config  # noqa: F401
 
 # --- Zero-config sizing -----------------------------------------------------
 # When the user leaves a knob unset, fill it from the same analyses Kyber/Carbonite
@@ -145,7 +53,6 @@ def partitions_from_physical(opt: PhysicalPlan) -> int | None:
 
 # `auto_num_partitions` (the data-sized spill/shuffle partition count, learned-seeded) is an
 # adaptive-sizing decision, so it lives in `api.tuning`; re-exported here for its callers.
-from batcher.api.tuning import auto_num_partitions  # noqa: E402
 
 
 def run_relational(
@@ -176,7 +83,6 @@ def run_relational(
     import contextlib
 
     from batcher import carbonite
-    from batcher.config import active_config, config_context
 
     scope: contextlib.AbstractContextManager = contextlib.nullcontext()
     if active_config().execution.adaptive_morsel_sizing:

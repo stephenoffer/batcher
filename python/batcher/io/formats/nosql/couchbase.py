@@ -22,17 +22,16 @@ from batcher.io.formats.base import SOURCES
 from batcher.io.formats.nosql.base import (
     PartitionSpec,
     ScanSource,
+    offset_windows,
     require_driver,
     rows_to_batches,
 )
 
 __all__ = ["CouchbaseSource"]
 
-# An offset-window locator: ``(offset, limit)`` over an ordered SQL++ result.
+# An offset-window locator: ``(offset, limit)`` over an ordered SQL++ result. A ``limit`` of 0
+# is unbounded — the tail of the cover, which is what makes it reach the end of the result.
 _Window = tuple[int, int]
-
-# Rows per offset window when the source is partitioned.
-_WINDOW_ROWS = 100_000
 
 
 @SOURCES.register("couchbase")
@@ -101,10 +100,36 @@ class CouchbaseSource(ScanSource):
         return pa.RecordBatch.from_pylist([rows[0]]).schema
 
     def _enumerate_partitions(self) -> list[_Window]:
+        """Offset windows that cover the whole collection — see `offset_windows`.
+
+        Sized from an actual ``COUNT(*)`` so the windows are balanced, and terminated by an
+        unbounded tail so the cover is exhaustive even if rows land after the count. If the
+        count cannot be obtained, `offset_windows` degrades to one serial unbounded window,
+        which is slow and right rather than fast and short.
+        """
         segments = max(1, self._partition_spec.segments)
         if segments == 1:
-            return [(0, 0)]  # 0 limit = unbounded single window.
-        return [(i * _WINDOW_ROWS, _WINDOW_ROWS) for i in range(segments)]
+            return [(0, 0)]  # one unbounded window: no count needed, and no connection made
+        return offset_windows(self._total_rows(), segments)
+
+    def _total_rows(self) -> int | None:
+        """The collection's row count via SQL++ ``COUNT(*)``, or None if it cannot be had.
+
+        Analytics answers this from metadata; it is one cheap query against the service that
+        is about to be read, and it is what lets the offset windows be a *balanced* cover
+        rather than a serial read.
+        """
+        stmt = f"SELECT VALUE COUNT(*) FROM {self._from_clause()} c"
+        try:
+            rows = list(self._cluster().execute_query(stmt).rows())
+        except Exception:  # a count that fails must not fail the read — fall back to serial
+            return None
+        if not rows:
+            return None
+        value = rows[0]
+        if isinstance(value, dict):
+            value = next(iter(value.values()), None)
+        return int(value) if isinstance(value, (int, float)) else None
 
     @staticmethod
     def _sql_where(predicate: dict | None) -> str | None:
@@ -114,21 +139,15 @@ class CouchbaseSource(ScanSource):
 
         return to_sql_where(predicate)
 
-    def read(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> list[pa.RecordBatch]:
-        return list(self.iter_batches(projection, predicate))
-
-    def iter_batches(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> Iterator[pa.RecordBatch]:
-        where = self._sql_where(predicate)
-        for partition in self._enumerate_partitions():
-            yield from self._read_partition(partition, projection, where)
-
     def _read_partition(
-        self, partition: _Window, projection: list[str] | None, where: str | None = None
+        self,
+        partition: _Window,
+        projection: list[str] | None,
+        predicate: dict | None = None,
     ) -> Iterator[pa.RecordBatch]:
+        # Translate here, not in `iter_batches`: a worker rebuilt from a pickled split never
+        # runs `iter_batches`, so a `where` computed there would never reach the query.
+        where = self._sql_where(predicate)
         offset, limit = partition
         select = ", ".join(f"c.`{c}`" for c in projection) if projection else "VALUE c"
         stmt = f"SELECT {select} FROM {self._from_clause()} c"

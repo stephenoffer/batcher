@@ -234,6 +234,17 @@ class CostModel:
         if isinstance(node, Join):
             build = self._rows(node.right)  # right is the build side by convention
             probe = self._rows(node.left)
+            # NOTE: the output term is deliberately **row**-based, not `rows x width`.
+            #
+            # The gather really does cost `rows x width` (measured: one join at fixed
+            # cardinality takes 12.1 ms carrying two payload columns and 19.8 ms carrying
+            # seven), so charging for width looks obviously right — and it was tried. It made
+            # TPC-H *worse*: 1.47x -> 1.58x against DuckDB in the same run, because
+            # `row_bytes` of an intermediate is itself an estimate, and feeding that
+            # uncertainty into the join enumerator's ranking moved more plans the wrong way
+            # than the right way. The width signal is real but the width *estimate* is not
+            # yet good enough to rank on; it belongs here once intermediate widths are
+            # measured rather than inferred. Recorded so it is not "fixed" again blind.
             return Cost(
                 cpu=c.hash_build_row * build + c.hash_probe_row * probe + c.output_row * out_rows,
                 # Hash table is built over the right side, so its byte width drives mem.

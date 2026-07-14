@@ -107,7 +107,10 @@ class HBaseSource(ScanSource):
         return [(seen[i], seen[i + 1]) for i in range(len(seen) - 1)]
 
     def _read_partition(
-        self, partition: _KeyRange, projection: list[str] | None
+        self,
+        partition: _KeyRange,
+        projection: list[str] | None,
+        predicate: dict | None = None,  # noqa: ARG002 (no server-side filter; the engine's Filter re-checks)
     ) -> Iterator[pa.RecordBatch]:
         start_hex, stop_hex = partition
         conn = self._connection()

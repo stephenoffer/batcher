@@ -113,6 +113,34 @@ def _empty_projection_message(method: str, positional: tuple[object, ...]) -> st
     return f"{method}() requires at least one column"
 
 
+def _reject_sliding_window_key(alias: str, expr: Expr) -> None:
+    """Refuse a sliding `window(...)` used directly as a group key.
+
+    A row belongs to *several* overlapping sliding windows, so `window(ts, w, slide)`
+    evaluates to the **list** of the starts that contain it. Grouping by that list groups
+    by the list — every row whose overlap set happens to be identical lands in one group,
+    keyed by an array. It returns rows, and they are wrong: the windows never overlap, so
+    a row is counted once instead of once per window it belongs to.
+
+    Exploding first is the whole operation ("one row per window this row is in"), and it
+    cannot be inferred: silently fanning the rows out here would change the cardinality of
+    a `group_by` under the caller. So reject, and say what to write instead. A tumbling
+    window (no `slide`) is a scalar start and groups directly, as it should.
+    """
+    from batcher.plan.expr_ir.func_nodes import WindowBuckets
+
+    if isinstance(expr, WindowBuckets):
+        raise PlanError(
+            f"group_by({alias}=window(..., slide=...)): a sliding window puts each row in "
+            "several overlapping windows, so the expression is the *list* of their starts "
+            "— grouping by it groups by the list, not by the windows. Fan the rows out "
+            "first:\n"
+            f"    ds.select({alias}=window(ts, '1h', '30m'), ...)"
+            f".explode({alias!r}).group_by({alias!r}).agg(...)\n"
+            "A tumbling window (no slide) is a single start and can be grouped directly."
+        )
+
+
 class Dataset:
     """A lazy, immutable relation — the fluent entry point to the engine.
 
@@ -2261,6 +2289,7 @@ class Dataset:
         for alias, expr in named.items():
             if not isinstance(expr, Expr):
                 raise PlanError(f"group_by() value for {alias!r} must be an expression")
+            _reject_sliding_window_key(alias, expr)
         return GroupBy(self, keys, named)
 
     def agg(self, *aggs: Expr, **aggregates: Expr) -> Dataset:

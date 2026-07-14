@@ -487,8 +487,23 @@ the scan, or that a join was reordered the way you expected.
 
 ```python
 print(events.filter(bt.col("status") == "active").select("region", "amount").explain())
-# A text rendering of the optimized plan, annotated with estimated row counts.
 ```
+
+One operator per line, indented by depth, each with its row estimate and where that
+estimate came from: `exact` when the source knows, `learned` from a previous run's
+measurements, `default` from a heuristic. Under `decisions:` are the calls the engine
+made along the way.
+
+```text
+project                         est≈4 (learned)
+  filter                        est≈4 (learned)
+    scan                        est≈6 (exact)
+
+decisions:
+  - [core/io] source read at 40 MB/s (learned)
+```
+
+The throughput in `decisions:` is measured, so it moves from run to run.
 
 Where `explain()` shows the *planned* shape, `stats()` runs the query and reports
 what the engine *measured*: rows in/out, wall time, peak bytes, spill, and the

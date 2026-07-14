@@ -37,7 +37,7 @@ Filters are expressions built from {py:obj}`bt.col(...) <batcher.col>`. Combine 
 ```python
 filtered = ds.filter(bt.col("price") >= 30.0)
 print(filtered.to_pydict())
-# {'category': ['a', 'b', 'a'], 'id': [3, 4, 5], 'name': ['cy', 'dan', 'eve'], 'price': [30.0, 40.0, 50.0], 'qty': [3, 4, 5]}
+# {'id': [3, 4, 5], 'name': ['cy', 'dan', 'eve'], 'category': ['a', 'b', 'a'], 'price': [30.0, 40.0, 50.0], 'qty': [3, 4, 5]}
 ```
 
 ## Select and transform columns

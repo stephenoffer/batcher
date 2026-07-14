@@ -19,6 +19,7 @@ from batcher._sql.parser.literals import (
     _apply_interval,
     _dtype_name,
     _fold_const_arith,
+    _int_literal,
     _like_to_regex,
     _literal,
     _temporal_literal,
@@ -192,8 +193,7 @@ def _scalar_function(tr, node):
     if name in _DATE_PART:
         return getattr(tr._scalar(node.this).dt, _DATE_PART[name])()
     if name == "Round":
-        # `ROUND(x, n)` carries the digit count in `decimals`. Dropping it silently
-        # rounded to a whole number — a wrong answer, not a missing feature.
+        # `decimals` is the digit count; dropping it rounded to a whole number instead.
         decimals = node.args.get("decimals")
         if decimals is None:
             return tr._scalar(node.this).round()

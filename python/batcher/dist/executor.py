@@ -399,21 +399,36 @@ def _join_sides_are_map_only(join) -> bool:
 
 
 def _fusable_join_aggregate(agg: Aggregate) -> bool:
-    """Whether `agg` is an aggregate over an inner join, grouped by (a superset of) the
-    join key — so it can be distributed by reusing the join's co-partitioning.
+    """Whether `agg` can be distributed by reusing the join's co-partitioning — no shuffle.
 
-    Requires the join key to appear among the group keys as a plain column: then every
-    group shares one key value, lands in one co-partitioned bucket, and each reducer's
-    per-bucket aggregate is complete (no cross-bucket combine needed, so any aggregate
-    — even a non-mergeable one — is correct).
+    **This is exchange elimination, and it is decided by the physical-property layer.** The
+    shuffle join co-partitions both sides by the join key, so its output is hash-partitioned
+    by that key (`kyber.properties.hash_partitioned_on`). An aggregate whose group keys are a
+    *superset* of it therefore has every group entirely inside one bucket: each reducer joins
+    *and* aggregates its own bucket, the union of the reducer outputs is the complete result,
+    and no second shuffle is needed. Because no cross-bucket combine is needed, even a
+    non-mergeable aggregate is correct here.
+
+    Kyber owns the question "what distribution does this relation already have"; `dist`
+    schedules against the answer rather than re-deriving it, so the two cannot drift.
     """
+    from batcher.kyber.properties import PhysicalProperties, hash_partitioned_on, satisfies
+
     j = agg.input
-    if not isinstance(j, Join) or j.join_type != "inner":
+    if not isinstance(j, Join) or not _join_sides_are_map_only(j):
         return False
-    if not _join_sides_are_map_only(j):
+    group_cols = tuple(gk.expr.name for gk in agg.group_keys if isinstance(gk.expr, Col))
+    if not group_cols:
         return False
-    group_cols = {gk.expr.name for gk in agg.group_keys if isinstance(gk.expr, Col)}
-    return bool(j.left_keys) and set(j.left_keys) <= group_cols
+    partitioned_on = hash_partitioned_on(j)
+    if not partitioned_on:
+        return False  # nothing guaranteed (an outer join, or no equi-key): must re-shuffle
+    # The group keys must *cover* the partitioning, so no group straddles two buckets — the
+    # containment `satisfies` checks, with the group keys as what is on hand.
+    return satisfies(
+        PhysicalProperties(hash_partitioned_on=group_cols),
+        PhysicalProperties(hash_partitioned_on=partitioned_on),
+    )
 
 
 def _aggregate_over_join(agg: Aggregate) -> bool:

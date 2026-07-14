@@ -18,6 +18,17 @@ use crate::Mergeable;
 const DEFAULT_K: usize = 200;
 // Capacity decay between adjacent levels. 2/3 is the KLL paper's choice.
 const C: f64 = 2.0 / 3.0;
+// Smallest a compactor may get, however tall the sketch grows. KLL's capacities decay
+// geometrically *downward* from the top (`k·C^depth`), so on a large stream the level that
+// every value lands in — level 0 — decays toward nothing: at 1M values it reached this
+// floor, and a floor of 2 means sorting and compacting on **every other value**. That
+// single constant was most of what remained of KLL's per-value cost.
+//
+// 8 is the minimum compactor width Apache DataSketches' KLL uses (its `m`), and it is a
+// strict improvement on both axes that matter: a wider buffer compacts less often, and
+// *fewer compactions is less error* — a compaction is the only step that discards
+// information. It costs a few hundred bytes on a tall sketch (six extra slots per level).
+const MIN_COMPACTOR: usize = 8;
 
 /// A KLL quantile sketch over `f64` values.
 #[derive(Clone)]
@@ -28,6 +39,8 @@ pub struct KllSketch {
     min: f64,
     max: f64,
     rng: u64, // deterministic compaction coin
+    // `capacity(h)` for every level, cached — see `refresh_caps`.
+    caps: Vec<usize>,
 }
 
 impl Default for KllSketch {
@@ -41,14 +54,41 @@ impl KllSketch {
     /// memory; `k=200` gives roughly ~1% error.
     pub fn new(k: usize) -> Self {
         assert!(k >= 8, "k must be >= 8");
-        Self {
+        let mut s = Self {
             k,
             compactors: vec![Vec::new()],
             n: 0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             rng: 0x9E37_79B9_7F4A_7C15, // fixed seed → reproducible compaction
-        }
+            caps: Vec::new(),
+        };
+        s.refresh_caps();
+        s
+    }
+
+    /// Recompute the cached per-level capacities. Call after **any** change to the level
+    /// count — a taller sketch shrinks every level below the top, so one push rewrites the
+    /// whole table.
+    ///
+    /// This table is why the sketch is fast. `capacity(h)` costs a float `powi`, a `ceil`
+    /// and a cast, and level 0's capacity decays to the floor of 2 once the sketch is tall
+    /// (`k·C^12 ≈ 1.5` at 1M values) — so `add` overflowed level 0 on roughly *every other
+    /// value*, and each overflow ran `compress`, which re-derived `capacity(h)` for all
+    /// ~13 levels. That put six-plus transcendentals on the path of every value in the
+    /// column: KLL measured **82.7 ns/value**, against 3.0 ns for the HLL beside it, and it
+    /// made sketching a 1M-row join key cost ~90 ms — more than ten times the query it was
+    /// supposed to be informing. The capacities depend only on `k` and the level count, so
+    /// they are derived `O(log n)` times per sketch instead of `O(n)`.
+    fn refresh_caps(&mut self) {
+        let levels = self.compactors.len();
+        self.caps = (0..levels)
+            .map(|h| {
+                let depth_from_top = levels - 1 - h;
+                (((self.k as f64) * C.powi(depth_from_top as i32)).ceil() as usize)
+                    .max(MIN_COMPACTOR)
+            })
+            .collect();
     }
 
     /// Number of values seen.
@@ -86,8 +126,9 @@ impl KllSketch {
         // when *it* overflows — checking that one length is far cheaper than walking
         // every level on every value (the hot path over millions of rows). `compress`
         // still re-checks all levels, so a level-0 compaction that overflows level 1
-        // is handled in the same call.
-        if self.compactors[0].len() >= self.capacity(0) {
+        // is handled in the same call. The bound is read from the cached capacity table:
+        // deriving it here meant a float `powi` per value (see `refresh_caps`).
+        if self.compactors[0].len() >= self.caps[0] {
             self.compress();
         }
     }
@@ -132,13 +173,6 @@ impl KllSketch {
         }
     }
 
-    /// Capacity of level `h`: top level holds `k`, each level down scales by `C`,
-    /// floored at 2. Lower levels shrink as the sketch grows taller (KLL).
-    fn capacity(&self, h: usize) -> usize {
-        let depth_from_top = self.compactors.len() - 1 - h;
-        (((self.k as f64) * C.powi(depth_from_top as i32)).ceil() as usize).max(2)
-    }
-
     fn next_coin(&mut self) -> usize {
         // xorshift64 — fast, deterministic, good enough for an unbiased coin.
         let mut x = self.rng;
@@ -153,30 +187,54 @@ impl KllSketch {
     fn compress(&mut self) {
         let mut h = 0;
         while h < self.compactors.len() {
-            if self.compactors[h].len() >= self.capacity(h) {
+            if self.compactors[h].len() >= self.caps[h] {
                 self.compact_level(h);
             }
             h += 1;
         }
     }
 
+    /// Sort level `h`, promote every other item to `h + 1`, and drop the rest.
+    ///
+    /// **Allocation-free**, which is the difference between a usable sketch and the one
+    /// this replaced. A tall sketch's level 0 holds only `caps[0]` items — which decays to
+    /// the floor of 2 — so this runs on roughly every *other* value in the column, and the
+    /// obvious implementation allocated twice on each call: `std::mem::take` leaves a
+    /// **zero-capacity** `Vec` behind (so pushing the odd leftover back had to reallocate,
+    /// and the taken buffer was then freed), and `sort_by` is a *stable* sort, which
+    /// allocates a merge buffer. Two `malloc`/`free` pairs every two values is what made KLL
+    /// cost 60-80 ns/value against the HLL's 3.
+    ///
+    /// So: sort in place with `sort_unstable_by` (pattern-defeating quicksort — no
+    /// allocation, and for `f64` "stability" is meaningless because equal values are
+    /// indistinguishable), promote through a split borrow, and `clear()` the level, which
+    /// *keeps* its capacity. The retained items, the coin sequence, and therefore the
+    /// sketch itself are bit-for-bit what the old code produced.
     fn compact_level(&mut self, h: usize) {
         if h + 1 == self.compactors.len() {
             self.compactors.push(Vec::new());
+            self.refresh_caps(); // a taller sketch shrinks every level below the top
         }
-        let mut items = std::mem::take(&mut self.compactors[h]);
-        items.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in sketch"));
-        // Odd leftover stays at this level (keeps the count exactly halving).
-        let leftover = (items.len() % 2 == 1).then(|| items.pop().unwrap());
+        self.compactors[h].sort_unstable_by(|a, b| a.partial_cmp(b).expect("no NaN in sketch"));
+        let len = self.compactors[h].len();
+        // An odd leftover (the largest, as the old `pop()` took it after sorting) stays at
+        // this level, so the promoted count halves exactly.
+        let odd = len % 2 == 1;
+        let promotable = len - usize::from(odd);
         // Promote every other item (coin picks the phase) → weight doubles.
         let start = self.next_coin();
+        let (below, above) = self.compactors.split_at_mut(h + 1);
+        let src = &mut below[h];
+        let dst = &mut above[0];
         let mut i = start;
-        while i < items.len() {
-            self.compactors[h + 1].push(items[i]);
+        while i < promotable {
+            dst.push(src[i]);
             i += 2;
         }
+        let leftover = odd.then(|| src[promotable]);
+        src.clear(); // keeps the buffer's capacity — the whole point
         if let Some(v) = leftover {
-            self.compactors[h].push(v);
+            src.push(v);
         }
     }
 
@@ -306,14 +364,17 @@ impl KllSketch {
         if !c.is_done() {
             return None; // trailing garbage → reject
         }
-        Some(Self {
+        let mut s = Self {
             k,
             compactors,
             n,
             min,
             max,
             rng: 0x9E37_79B9_7F4A_7C15,
-        })
+            caps: Vec::new(),
+        };
+        s.refresh_caps();
+        Some(s)
     }
 }
 
@@ -356,8 +417,10 @@ impl Mergeable for KllSketch {
         if other.n == 0 {
             return;
         }
-        while self.compactors.len() < other.compactors.len() {
-            self.compactors.push(Vec::new());
+        if self.compactors.len() < other.compactors.len() {
+            self.compactors
+                .resize_with(other.compactors.len(), Vec::new);
+            self.refresh_caps(); // a taller sketch shrinks every level below the top
         }
         for (h, comp) in other.compactors.iter().enumerate() {
             self.compactors[h].extend_from_slice(comp);

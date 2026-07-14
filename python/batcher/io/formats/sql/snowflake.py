@@ -149,8 +149,25 @@ class SnowflakeSource:
     def identity(self) -> str:
         return f"snowflake:{self.query}"
 
-    def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
-        return [_SnowflakeBatchSplit(rb, i) for i, rb in enumerate(self._result_batches())]
+    def splits(
+        self,
+        target_size: int | None = None,  # noqa: ARG002 (protocol signature)
+        predicate: dict | None = None,
+        projection: list[str] | None = None,  # noqa: ARG002 (see below)
+    ) -> list[Split]:
+        """One split per Snowflake result chunk, from a query that already carries the predicate.
+
+        `_result_batches` submits the query **once** and returns one picklable `ResultBatch` per
+        cloud-storage chunk — the right shape. But it was submitted *unfiltered*: the predicate
+        was applied only on the single-node path, so a distributed read materialized the whole
+        result in Snowflake and shipped every chunk. Pushing it into `_query` means the warehouse
+        does the filtering and the chunks that never match are never produced.
+
+        Projection is not pushed here: the chunks are already materialized by the time they are
+        vended, so `Split.read(projection)` slices them client-side, which is where it has to
+        happen. (`_query` could take it too — that is a separate change to `_query`'s callers.)
+        """
+        return [_SnowflakeBatchSplit(rb, i) for i, rb in enumerate(self._result_batches(predicate))]
 
 
 @SINKS.register("snowflake")

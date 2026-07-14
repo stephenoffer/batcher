@@ -49,13 +49,18 @@ def scan_columns(
     count, a KLL quantile grid, Misra-Gries top values, a measured byte width, none of them
     exact — fills in around them.
 
-    The `ndv` merge is the delicate one. A `ColumnStat` carries **one** provenance for the
-    whole bundle, so writing an approximate ndv onto an `EXACT` footer column would tag
-    that ndv `EXACT` too and let it wrongly answer `count_distinct`. So a learned ndv lands
-    only on a footerless or already-inexact column. The purely *descriptive* statistics
-    (quantiles, mcv, avg_bytes) carry no such risk — nothing answers a query from them,
-    they only sharpen an estimate — so they attach to any column, including an EXACT one,
-    without disturbing its provenance.
+    The `ndv` merge is the one that matters. A Parquet footer gives EXACT min/max and null
+    counts but **never a distinct count**, so the only ndv such a column can have is a
+    measured (HLL) one. This used to refuse it — because a `ColumnStat` carried one provenance
+    for the whole bundle, so attaching an approximate ndv to an EXACT column would have tagged
+    it EXACT and let it answer `count_distinct`. The cost of that refusal was severe: every
+    Parquet column reached the optimizer with no ndv, join cardinality fell back to
+    `max(|L|, |R|)`, and join ordering went blind (TPC-H q9 applied its most selective filter
+    last). `ColumnStat.ndv_provenance` now carries the ndv's *own* tag, so a measured count
+    rides alongside exact bounds while `ndv_is_exact` still refuses to answer from it.
+
+    The descriptive statistics (quantiles, mcv, avg_bytes) never carried that risk — nothing
+    answers a query from them — so they attach to any column, exact or not.
     """
     cols: dict[str, ColumnStat] = dict(source_columns)
     for name, measured in learned.items():
@@ -63,11 +68,12 @@ def scan_columns(
         if existing is None:
             cols[name] = measured
             continue
-        exact = existing.provenance is Provenance.EXACT
-        take_ndv = measured.ndv is not None and existing.ndv is None and not exact
+        take_ndv = measured.ndv is not None and existing.ndv is None
         cols[name] = dataclasses.replace(
             existing,
             ndv=measured.ndv if take_ndv else existing.ndv,
+            # A measured ndv is a sketch, whatever the bundle's bounds are worth.
+            ndv_provenance=Provenance.SKETCH if take_ndv else existing.ndv_provenance,
             quantiles=existing.quantiles or measured.quantiles,
             mcv=existing.mcv or measured.mcv,
             avg_bytes=existing.avg_bytes or measured.avg_bytes,
@@ -347,11 +353,14 @@ def _derive_scalar_aggregate(func: str, input_expr, child: RelStats, plan=None):
         # all-null / empty group — not derivable, fall back rather than divide by zero.
         return stat.mean
     if func == "count_distinct":
-        # SQL `count(distinct col)` excludes NULL; the `ndv` contract is likewise the
-        # number of distinct *non-null* values (what a footer/HLL counts), so an EXACT
-        # ndv is the answer directly. Only EXACT ndv is trusted (a SKETCH HLL count is
-        # rejected above by the provenance gate) — otherwise fall back.
-        return None if stat.ndv is None else int(stat.ndv)
+        # SQL `count(distinct col)` excludes NULL; the `ndv` contract is likewise the number
+        # of distinct *non-null* values, so an EXACT ndv is the answer directly. The gate is
+        # `ndv_is_exact`, not the bundle's provenance: a Parquet column now carries a measured
+        # (SKETCH) ndv alongside its exact bounds, and that measured count must never answer
+        # an exact `count_distinct` — it exists only to inform cost and cardinality.
+        if stat.ndv is None or not stat.ndv_is_exact:
+            return None
+        return int(stat.ndv)
     if func in _BOOL_AND_FUNCS or func in _BOOL_OR_FUNCS:
         return _derive_bool_aggregate(func, stat, child)
     return None

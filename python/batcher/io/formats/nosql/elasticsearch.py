@@ -114,18 +114,6 @@ class ElasticsearchSource(ScanSource):
             partition_spec=self._partition_spec,
         )
 
-    def read(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> list[pa.RecordBatch]:
-        return list(self._with_pushed(predicate).iter_batches(projection))
-
-    def iter_batches(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> Iterator[pa.RecordBatch]:
-        source = self._with_pushed(predicate)
-        for partition in source._enumerate_partitions():
-            yield from source._read_partition(partition, projection)
-
     def _client(self) -> Any:
         es = require_driver("elasticsearch", "elasticsearch")
         kw = self._conn_kwargs
@@ -157,8 +145,12 @@ class ElasticsearchSource(ScanSource):
         return [(i, segments) for i in range(segments)]
 
     def _read_partition(
-        self, partition: _Slice, projection: list[str] | None
+        self,
+        partition: _Slice,
+        projection: list[str] | None,
+        predicate: dict | None = None,
     ) -> Iterator[pa.RecordBatch]:
+        self = self._with_pushed(predicate)  # push into the ES query, on the worker too
         client = self._client()
         if self._conn_kwargs["esql"]:
             table = _esql_arrow(client, self._conn_kwargs["esql"])

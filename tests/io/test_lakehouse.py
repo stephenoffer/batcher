@@ -50,7 +50,7 @@ def test_identity_does_not_require_backend() -> None:
     assert DeltaSharingSource("p#s.sch.t").identity() == "delta_sharing:p#s.sch.t"
 
 
-def test_an_iceberg_identity_distinguishes_catalog_and_row_filter() -> None:
+def test_an_iceberg_identity_distinguishes_catalog_and_row_filter(tmp_path) -> None:
     """The identity keys the statistics cache, so it must name everything that changes the rows.
 
     Two things were missing, and both are real collisions: ``db.t`` in one catalog is a
@@ -59,7 +59,9 @@ def test_an_iceberg_identity_distinguishes_catalog_and_row_filter() -> None:
     came back with the whole table's total.
     """
     plain = IcebergSource("db.t").identity()
-    other_catalog = IcebergSource("db.t", catalog={"type": "sql", "uri": "sqlite:///x"}).identity()
+    other_catalog = IcebergSource(
+        "db.t", catalog={"type": "sql", "uri": f"sqlite:///{tmp_path}/other.db"}
+    ).identity()
     filtered = IcebergSource("db.t", row_filter="id > 5").identity()
 
     assert plain != other_catalog

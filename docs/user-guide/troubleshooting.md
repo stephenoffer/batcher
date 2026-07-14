@@ -64,23 +64,23 @@ print(ok.to_pydict())
 
 To filter with SQL syntax instead, use {py:obj}`bt.sql <batcher.sql>`.
 
-## Aggregates are keyword arguments
+## The keyword to `agg` is the output name
 
-`agg` takes named aggregates as keywords (`out_name=agg_expr`). Passing an
-aggregate positionally fails, and there is no `.alias()` on an aggregate; the
-keyword is the output name.
+A positional aggregate is *self-naming*: it keeps the source column's name. Pass a keyword
+when you want to choose the output name, which is usually what you want, because the
+self-named column shadows the input it was computed from.
 
 ```python
-try:
-    ds.group_by("x").agg(bt.col("y").sum())
-except Exception as exc:
-    print(type(exc).__name__, "-", exc)
-# TypeError - GroupBy.agg() takes 1 positional argument but 2 were given
+selfnamed = ds.group_by("x").agg(bt.col("y").sum())
+print(selfnamed.sort("x").to_pydict())
+# {'x': [1, 2, 3], 'y': [10, 20, 30]}
 
-ok = ds.group_by("x").agg(total=bt.col("y").sum())
-print(ok.sort("x").to_pydict())
+named = ds.group_by("x").agg(total=bt.col("y").sum())
+print(named.sort("x").to_pydict())
 # {'x': [1, 2, 3], 'total': [10, 20, 30]}
 ```
+
+There is no `.alias()` on an aggregate. The keyword is the output name.
 
 ## Boolean operators need parentheses
 

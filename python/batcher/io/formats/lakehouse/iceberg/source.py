@@ -223,13 +223,32 @@ class IcebergSource:
         """What makes this source *this* source, for the statistics cache.
 
         The identity has to name everything that changes the rows the source returns, or the
-        cache hands one source another's statistics. Two things were missing and both are
-        real: the **catalog** (``db.t`` in one warehouse is a different table from ``db.t``
-        in another), and the **row filter** (a filtered read of a table returns fewer rows
+        cache hands one source another's statistics. Three things must be in it, and all
+        three were real bugs: the **catalog** (``db.t`` in one warehouse is a different table
+        from ``db.t`` in another), the **row filter** (a filtered read returns fewer rows
         than an unfiltered one — sharing a cache entry between them is how a filtered
-        `count()` came back with the whole table's total).
+        `count()` came back with the whole table's total), and the **snapshot**.
+
+        The snapshot is the one that bites hardest. `count()`, `is_empty()`, and `min()`/
+        `max()` are answered from the cached statistics without executing, so an identity
+        that says only ``@latest`` lets a row count outlive the table it described: after an
+        append, `count()` kept returning 3 while `collect()` returned 4 — the same table,
+        two different answers. Resolving ``latest`` to the current snapshot id makes a new
+        commit a new identity, so there is no stale entry left to serve. It also fixes it
+        against *any* writer: invalidating on our own commits never covered a table appended
+        to by Spark or another process.
+
+        A table that cannot be opened falls back to the unresolved form rather than raising.
+        An identity is metadata about a source, not a read of it.
         """
-        ref = self._snapshot_id if self._snapshot_id is not None else "latest"
+        if self._snapshot_id is not None:
+            ref: Any = self._snapshot_id
+        else:
+            try:
+                snapshot = self._table().current_snapshot()
+                ref = snapshot.snapshot_id if snapshot is not None else "empty"
+            except Exception:
+                ref = "latest"
         catalog = _catalog_key(self._catalog)
         row_filter = f"|{self._row_filter}" if self._row_filter is not None else ""
         return f"iceberg:{catalog}:{self._identifier}@{ref}{row_filter}"

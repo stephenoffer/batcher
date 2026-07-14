@@ -180,7 +180,7 @@ def _collapse_idempotent(expr: Expr) -> Expr:
     name="collapse_idempotent_math_fn",
     phase=Phase.NORMALIZE,
     matches=_NODES,
-    expr=lambda e: _collapse_idempotent(e),
+    expr=_collapse_idempotent,
 )
 def collapse_idempotent_math_fn(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`f(f(x)) → f(x)` for the idempotent unary math functions — `abs`, `sign`, `floor`,
@@ -213,7 +213,7 @@ def _collapse_nested_rounding(expr: Expr) -> Expr:
     name="collapse_nested_rounding",
     phase=Phase.NORMALIZE,
     matches=_NODES,
-    expr=lambda e: _collapse_nested_rounding(e),
+    expr=_collapse_nested_rounding,
 )
 def collapse_nested_rounding(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop the outer of two *different* nested rounding functions: `floor(round(x))` →
@@ -289,7 +289,7 @@ def _fold_math_lit(expr: Expr) -> Expr:
     name="fold_math_of_int_literal",
     phase=Phase.NORMALIZE,
     matches=_NODES,
-    expr=lambda e: _fold_math_lit(e),
+    expr=_fold_math_lit,
 )
 def fold_math_of_int_literal(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Evaluate a unary math function over an **integer literal** at plan time: `abs(-5)` →
@@ -326,7 +326,7 @@ def _fold_bitwise(expr: Expr) -> Expr:
     name="fold_bitwise_literals",
     phase=Phase.NORMALIZE,
     matches=_NODES,
-    expr=lambda e: _fold_bitwise(e),
+    expr=_fold_bitwise,
 )
 def fold_bitwise_literals(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Fold `bit_and` / `bit_or` / `bit_xor` over two integer literals: `6 & 3` → `2`.

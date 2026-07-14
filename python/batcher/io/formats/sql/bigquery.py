@@ -164,8 +164,17 @@ class BigQuerySource:
             return f"({self.row_restriction}) AND ({pushed})"
         return pushed or self.row_restriction
 
-    def _create_session(self, predicate: dict | None = None) -> tuple[Any, list[str]]:
-        """ONE create_read_session call → (session, stream names)."""
+    def _create_session(
+        self, predicate: dict | None = None, projection: list[str] | None = None
+    ) -> tuple[Any, list[str]]:
+        """ONE create_read_session call → (session, stream names).
+
+        `predicate` and `projection` are applied **here**, when the session is created, because
+        that is the only place BigQuery accepts them: a read session fixes its `row_restriction`
+        and `selected_fields` up front, and every stream it vends is already filtered and
+        projected. A predicate that arrives later, at `Split.read`, cannot be pushed at all —
+        the bytes are already on the wire. That is why `splits()` takes them.
+        """
         storage = require_module(_STORAGE_MODULE, extra=_EXTRA)
         types = require_module(f"{_STORAGE_MODULE}.types", extra=_EXTRA)
         client = storage.BigQueryReadClient()
@@ -174,8 +183,11 @@ class BigQuerySource:
             *self._table_ref(predicate).split(".")
         )
         read_options = types.ReadSession.TableReadOptions()
-        if self.selected_fields:
-            read_options.selected_fields.extend(self.selected_fields)
+        # The constructor's `selected_fields` is the user's own column pin; Kyber's pushed
+        # projection narrows it further. Either alone is a valid selection.
+        fields = self.selected_fields or projection
+        if fields:
+            read_options.selected_fields.extend(fields)
         row_restriction = self._row_restriction(predicate)
         if row_restriction:
             read_options.row_restriction = row_restriction
@@ -198,7 +210,7 @@ class BigQuerySource:
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
         out: list[pa.RecordBatch] = []
-        _session, streams = self._create_session(predicate)
+        _session, streams = self._create_session(predicate, projection)
         for i, name in enumerate(streams):
             out.extend(_BigQueryStreamSplit(name, i).read(projection))
         return out
@@ -206,7 +218,7 @@ class BigQuerySource:
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        _session, streams = self._create_session(predicate)
+        _session, streams = self._create_session(predicate, projection)
         for i, name in enumerate(streams):
             yield from _BigQueryStreamSplit(name, i).iter_batches(projection)
 
@@ -216,6 +228,19 @@ class BigQuerySource:
     def identity(self) -> str:
         return f"bigquery:{self.project}:{self.query or self.table}"
 
-    def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
-        _session, streams = self._create_session()
+    def splits(
+        self,
+        target_size: int | None = None,  # noqa: ARG002 (protocol signature; BQ splits by stream)
+        predicate: dict | None = None,
+        projection: list[str] | None = None,
+    ) -> list[Split]:
+        """One split per Storage Read API stream, filtered and projected server-side.
+
+        The pushdown is baked into the read session, so each stream already carries only the
+        rows and columns the query wants — the worker never sees the rest. Without it, `splits()`
+        created an *unfiltered* session and every worker streamed the whole table across the
+        network for the engine's `Filter` to discard. On a TB table that is the difference
+        between a scan and a bill.
+        """
+        _session, streams = self._create_session(predicate, projection)
         return [_BigQueryStreamSplit(name, i) for i, name in enumerate(streams)]

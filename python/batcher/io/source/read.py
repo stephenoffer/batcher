@@ -23,7 +23,10 @@ __all__ = ["is_bounded", "iter_source", "plan_splits", "read_source", "source_st
 
 
 def plan_splits(
-    source: Source, target_size: int | None = None, predicate: dict | None = None
+    source: Source,
+    target_size: int | None = None,
+    predicate: dict | None = None,
+    projection: list[str] | None = None,
 ) -> list[Split]:
     """A source's splits, with the pushed `predicate` used to skip files when it can.
 
@@ -42,19 +45,27 @@ def plan_splits(
         source: The source to plan a read over.
         target_size: Optional coalescing target in bytes.
         predicate: The predicate Kyber pushed to this scan, if any.
+        projection: The columns Kyber pushed to this scan, if any. A *warehouse* has to be
+            told which columns to read when its read is **created** — a BigQuery read session
+            fixes `selected_fields`, a SQL query fixes its `SELECT` list — so a projection that
+            only arrives at `Split.read` time is a client-side slice of data the server already
+            sent. Sources that can only project after the fact simply do not declare it.
 
     Returns:
         The splits to read, pruned where the source could prune them.
     """
-    if predicate is not None and _accepts_predicate(source.splits):
-        return source.splits(target_size=target_size, predicate=predicate)
-    return source.splits(target_size=target_size)
+    kwargs: dict[str, object] = {"target_size": target_size}
+    if predicate is not None and _accepts(source.splits, "predicate"):
+        kwargs["predicate"] = predicate
+    if projection is not None and _accepts(source.splits, "projection"):
+        kwargs["projection"] = projection
+    return source.splits(**kwargs)
 
 
-def _accepts_predicate(splits_fn: object) -> bool:
-    """Whether a source's `splits` takes a `predicate` keyword."""
+def _accepts(splits_fn: object, name: str) -> bool:
+    """Whether a source's `splits` takes a `name` keyword."""
     try:
-        return "predicate" in inspect.signature(splits_fn).parameters
+        return name in inspect.signature(splits_fn).parameters
     except (TypeError, ValueError):  # pragma: no cover - a builtin/C callable
         return False
 

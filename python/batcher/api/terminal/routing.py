@@ -39,10 +39,18 @@ def resolve_distributed(
             return False
         from batcher import dist
 
-        if dist.cluster_topology()["nodes"] <= 1:
+        topology = dist.cluster_topology()
+        if topology["nodes"] <= 1:
             return False
-        if plan is not None and _plan_has_gpu_stage(plan):
-            return True  # GPU work must reach the cluster's accelerators regardless of size
+        # GPU work must reach the cluster's accelerators regardless of size — but only if the
+        # cluster HAS any. Routing a `num_gpus=1` stage to a GPU-less cluster asks Ray for a
+        # resource no node can ever offer, and the task simply never schedules:
+        # `TaskUnschedulableError`, or a hang, from a query that would have run fine on this
+        # process. The same plan already runs locally when Ray is not up, so falling through
+        # to the size decision here is the consistent answer, not a special case.
+        has_gpus = topology.get("gpus", 0.0) > 0
+        if has_gpus and plan is not None and _plan_has_gpu_stage(plan):
+            return True
         from batcher.config import active_config
 
         min_rows = active_config().distributed.distribute_min_rows

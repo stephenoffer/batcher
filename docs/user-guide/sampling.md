@@ -148,7 +148,7 @@ so they give the same number single-node and distributed.
 
 ```python
 print(ds.approx_n_unique("value"), ds.n_unique("value"))
-# 1011 1000
+# 993 1000
 
 print(ds.approx_median("value"))
 # 499.5

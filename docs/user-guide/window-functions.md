@@ -39,8 +39,8 @@ ranked = ds.window(
     functions={"rnk": "row_number"},
 ).sort("category", "rnk")
 print(ranked.to_pydict())
-# {'category': ['a', 'a', 'a', 'b', 'b'], 'price': [30, 20, 10, 40, 15],
-#  'product': ['x', 'z', 'y', 'p', 'q'], 'rnk': [1, 2, 3, 1, 2]}
+# {'category': ['a', 'a', 'a', 'b', 'b'], 'product': ['x', 'z', 'y', 'p', 'q'],
+#  'price': [30, 20, 10, 40, 15], 'rnk': [1, 2, 3, 1, 2]}
 ```
 
 `rank` leaves gaps after ties; `dense_rank` does not.
@@ -52,8 +52,8 @@ ranks = ds.window(
     functions={"rk": "rank", "dr": "dense_rank"},
 ).sort("category", "price")
 print(ranks.to_pydict())
-# {'category': ['a', 'a', 'a', 'b', 'b'], 'price': [10, 20, 30, 15, 40],
-#  'product': ['y', 'z', 'x', 'q', 'p'], 'rk': [1, 2, 3, 1, 2], 'dr': [1, 2, 3, 1, 2]}
+# {'category': ['a', 'a', 'a', 'b', 'b'], 'product': ['y', 'z', 'x', 'q', 'p'],
+#  'price': [10, 20, 30, 15, 40], 'rk': [1, 2, 3, 1, 2], 'dr': [1, 2, 3, 1, 2]}
 ```
 
 The *normalized* ranking specs are `"percent_rank"` and `"cume_dist"` (SQL
@@ -102,8 +102,8 @@ totals = ds.window(
     functions={"cat_total": ("sum", "price")},
 ).sort("category", "product")
 print(totals.to_pydict())
-# {'category': ['a', 'a', 'a', 'b', 'b'], 'price': [30, 10, 20, 40, 15],
-#  'product': ['x', 'y', 'z', 'p', 'q'], 'cat_total': [60, 60, 60, 55, 55]}
+# {'category': ['a', 'a', 'a', 'b', 'b'], 'product': ['x', 'y', 'z', 'p', 'q'],
+#  'price': [30, 10, 20, 40, 15], 'cat_total': [60, 60, 60, 55, 55]}
 ```
 
 ## Frames
@@ -121,8 +121,8 @@ running = ds.window(
     frame=(None, 0),
 ).sort("category", "price")
 print(running.to_pydict())
-# {'category': ['a', 'a', 'a', 'b', 'b'], 'price': [10, 20, 30, 15, 40],
-#  'product': ['y', 'z', 'x', 'q', 'p'], 'running': [10, 30, 60, 15, 55]}
+# {'category': ['a', 'a', 'a', 'b', 'b'], 'product': ['y', 'z', 'x', 'q', 'p'],
+#  'price': [10, 20, 30, 15, 40], 'running': [10, 30, 60, 15, 55]}
 ```
 
 ## Value functions
