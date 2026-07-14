@@ -184,9 +184,8 @@ the first of them stops, re-raising its exception if it failed. This is the Spar
 
 ## Event-time windows and watermarks
 
-`bt.window(time_col, duration[, slide])` assigns each row to an event-time window;
-group by it like any other key. Tumbling (no `slide`) and sliding windows both work,
-batch or streaming:
+`bt.window(time_col, duration)` assigns each row to one event-time window. Group by it like
+any other key, batch or streaming:
 
 ```python
 import datetime as dt
@@ -199,6 +198,43 @@ clicks = bt.from_pydict({
 hourly = clicks.group_by(w=bt.window(col("ts"), "1h")).agg(hits=col("n").sum())
 print(hourly.to_pydict())  # 00:00 → 3, 01:00 → 3
 ```
+
+### Sliding windows explode, they do not group
+
+Pass a third argument and the windows overlap: `bt.window(col("ts"), "1h", "30m")` is a
+one-hour window advancing every thirty minutes, so a single row belongs to *two* of them.
+The expression therefore evaluates to the **list** of starts that contain the row, not to
+one start. Fan that list out with `explode` and group the result:
+
+```python
+sliding = (
+    clicks.select(w=bt.window(col("ts"), "1h", "30m"), n=col("n"))
+    .explode("w")
+    .group_by("w")
+    .agg(hits=col("n").sum())
+    .sort("w")
+)
+print(sliding.to_pydict()["hits"])
+# [1, 3, 2, 3, 3]
+```
+
+Five windows, from 23:30 the previous day through 01:30, and each click is counted in both
+windows that contain it. The 00:00 window holds the 00:00 and 00:30 clicks, so it sums to 3.
+
+:::{warning}
+Grouping by a sliding window directly, `group_by(w=bt.window(col("ts"), "1h", "30m"))`,
+would group by the *list* rather than by the windows, counting each row once instead of
+once per window it belongs to. That is a wrong answer, so the engine rejects it and points
+at `explode`. A tumbling window (no slide) is a single start and groups directly.
+:::
+
+:::{important}
+Watermark-driven window eviction recognizes tumbling windows only. After the `explode` a
+sliding aggregation groups by an ordinary column, so the engine cannot tell which window is
+closed, and it will not evict one. On an unbounded source that means the aggregation's state
+grows without bound. Sliding windows are a batch operation today; use a tumbling window for
+a long-running stream.
+:::
 
 On an unbounded stream, declare a **watermark** so windowed state stays bounded:
 `ds.with_watermark(time_col, lateness)` lets the engine emit and evict a window once
@@ -291,6 +327,49 @@ q = bt.read.kafka(topic="orders").write(
 # A crash and restart of the same query against the same checkpoint resumes
 # exactly where it left off.
 ```
+
+## Running the stream on a cluster
+
+Add `distributed=True` and each micro-batch runs as one **epoch across the cluster**
+instead of on the driver. The workers read their share of the epoch, run the pipeline,
+and write their own data files; the driver never touches a row.
+
+What it does *not* do is commit once per worker. The workers write their files without
+committing them, and the driver then publishes the whole epoch as a **single**
+transaction. So the guarantees above survive the fan-out unchanged:
+
+- **one transaction per micro-batch**, whatever the worker count — the log still reads as
+  a record of the stream, not of the machines that ran it;
+- **exactly-once**, because that one commit carries the micro-batch's transaction id, so a
+  replayed epoch (a lost worker, a restart) finds itself already committed and writes
+  nothing.
+
+The source's offsets are written to the checkpoint *between* staging an epoch and
+publishing it, which is what bounds a crash to an epoch that was staged and never
+published — one the next run safely replays.
+
+```python
+# docs: skip
+# New files land continuously; each arrival becomes one micro-batch, fanned across
+# the cluster, and one Delta transaction.
+q = (bt.read.files_incremental("lake/landing", "parquet", state_dir="lake/bronze/_seen")
+       .filter(col("status") == "ok")
+       .write.delta("lake/bronze",
+                    trigger=bt.Trigger.processing_time("1 minute"),
+                    checkpoint="lake/bronze/_ck",
+                    query_name="bronze-ingest",
+                    distributed=True, num_workers=16))
+q.stop()   # the query runs until you stop it — an idle minute is not the end of a stream
+```
+
+A streaming aggregation distributes too: each worker aggregates only its share of the
+epoch and returns a partial result, which the driver merges — the same
+`partial → combine → finalize` the single-node aggregate uses, so the answer is identical.
+
+Write to Delta if you want the exactly-once guarantee. Iceberg has no transaction-id
+check, so a replayed micro-batch there would duplicate rows rather than be recognized as
+already-committed; a distributed streaming write to it is refused rather than quietly
+giving you a weaker guarantee than this page promises.
 
 ## The medallion pattern
 
