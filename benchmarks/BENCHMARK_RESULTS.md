@@ -1,5 +1,46 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## Where Batcher stands against every competitor (2026-07-13, measured)
+
+**On identical input, Batcher's execution engine beats DuckDB's on every TPC-H query.**
+
+`duckdb` (the default adapter) ingests each table into DuckDB's *native* compressed store —
+dictionary encoding, zone maps — in an **untimed `CREATE TABLE`**, then times the query. That
+measures DuckDB's storage engine *plus* its execution engine against Batcher's execution
+engine over raw Arrow. `duckdb_arrow` binds the *same zero-copy Arrow* Batcher runs on
+(`con.register`, outside the clock). That is the execution-parity bar, and Batcher wins it
+outright:
+
+| suite | vs `duckdb_arrow` (same Arrow input) | vs `duckdb` (native store) |
+|---|---|---|
+| TPC-H sf1 (21 comparable) | **21 / 21 won** (0.19x-0.94x ⇒ 1.06-5.3x faster) | 6 / 21 |
+| operator mix (11) | **10 / 11 won** | 6 / 11 |
+
+Batcher also beats **Ray Data**, **Daft**, **Spark**, and **PyArrow** outright (single-node and
+distributed), and beats **Polars** on 8 of 11 operators.
+
+**The two honest remaining deficits, and what they actually are:**
+
+1. **DuckDB's *storage* engine, not its execution engine.** Against `duckdb` native, Batcher
+   still trails the join-heavy TPC-H queries (mean b/duckdb ~1.35x). The same queries against
+   `duckdb_arrow` are 2-5x *wins*. The difference is the untimed compressed ingest, which
+   Batcher's "Arrow is the only columnar contract" invariant precludes by design — Batcher has
+   no native store to switch to. Closing it on Arrow input needs a **push-based pipelined
+   executor**: today each operator materializes its output (TPC-H q5's join chain writes 94 MB
+   then 17 MB of intermediates), and CPU utilization on a join query sits at ~50% because the
+   tail of the chain collapses to a handful of morsels. That is an architectural change, not a
+   tuning one — every kernel-level knob tried here (radix floor, window key encoding) measured
+   *worse* and was reverted.
+2. **Polars on three kernels**: `filter-project` (1.59x), `join-agg` (1.19x),
+   `window-sum-partition` (~1.2x). `filter-project` is a straight kernel gap — the compute is
+   6M rows in, 1.9M out, and Batcher runs it at ~8 GB/s against Polars' ~13 GB/s. (A
+   selection-vector filter was already tried and measured a loss; see `ops/mod.rs`.)
+
+Everything above is correctness-gated: every engine must agree as a sorted row multiset before
+any timing is trusted.
+
+---
+
 ## Session 2026-07-13 — projection/JIT + byte-true costing; two harness bugs; two open bugs
 
 **Landed (measured, gated).**
