@@ -22,14 +22,28 @@ distributed), and beats **Polars** on 8 of 11 operators.
 **The two honest remaining deficits, and what they actually are:**
 
 1. **DuckDB's *storage* engine, not its execution engine.** Against `duckdb` native, Batcher
-   still trails the join-heavy TPC-H queries (mean b/duckdb ~1.35x). The same queries against
-   `duckdb_arrow` are 2-5x *wins*. The difference is the untimed compressed ingest, which
-   Batcher's "Arrow is the only columnar contract" invariant precludes by design — Batcher has
-   no native store to switch to. Closing it on Arrow input needs a **push-based pipelined
-   executor**: today each operator materializes its output (TPC-H q5's join chain writes 94 MB
-   then 17 MB of intermediates), and CPU utilization on a join query sits at ~50% because the
-   tail of the chain collapses to a handful of morsels. That is an architectural change, not a
-   tuning one — every kernel-level knob tried here (radix floor, window key encoding) measured
+   still trails the join-heavy TPC-H queries (mean b/duckdb **1.347x**, down from 1.443x — see
+   "Fused join pipeline" below). The same queries against `duckdb_arrow` are 2-5x *wins*. The
+   difference is the untimed compressed ingest, which Batcher's "Arrow is the only columnar
+   contract" invariant precludes by design — Batcher has no native store to switch to.
+
+   The first half of the remaining gap has now been taken by **fusing the left-deep join chain**
+   (`bc-interp::par::exec_join_pipeline`, commit `a505a5c`): the probe's morsels are driven
+   through every stage of the chain in one pass, so intermediate relations are never materialized
+   or reshuffled. Measured back-to-back on a quiet box (DuckDB's own total moved 0.7% between the
+   arms, so these are signal):
+
+   | | mean b/duckdb | batcher total | q5 | q18 |
+   |---|---|---|---|---|
+   | before | 1.443 | 941 ms | 65.4 ms (2.47x) | 96.7 ms (1.64x) |
+   | after | **1.347** | **884 ms** (-6.0%) | **38.6 ms** (1.40x) | **68.5 ms** (1.18x) |
+
+   What is left is **raw hash-join kernel speed**, not plan shape. q3 — now the worst query at
+   2.1x — is already optimal structurally: its chain is right-deep (build the small side, probe
+   once, no intermediate to remove) and its `filter → project → filter → scan` spine is already
+   collapsed into a single pass by `fuse_linear`. Its dominant operator, the top hash join, runs
+   at **58% core utilization**. Closing that is SIMD/hash-table work, not tuning — every
+   kernel-level knob tried here (radix floor, window key encoding, NDV sample guard) measured
    *worse* and was reverted.
 2. **Polars on three kernels**: `filter-project` (1.59x), `join-agg` (1.19x),
    `window-sum-partition` (~1.2x). `filter-project` is a straight kernel gap — the compute is
@@ -37,7 +51,28 @@ distributed), and beats **Polars** on 8 of 11 operators.
    selection-vector filter was already tried and measured a loss; see `ops/mod.rs`.)
 
 Everything above is correctness-gated: every engine must agree as a sorted row multiset before
-any timing is trusted.
+any timing is trusted. Two notes on what the gate says about the *competitors*: Polars cannot
+run most of TPC-H through its SQL frontend at all (`multiple tables in FROM clause are not
+currently supported`, and no `EXISTS`), and on q6 the harness caught **Polars** returning a
+wrong `revenue` (123,141,078 vs DuckDB's 75,207,768). Batcher matches DuckDB on all 21 queries
+it supports; q21 (correlated subqueries) is an unimplemented Batcher feature, not a wrong answer.
+
+### Open bug found this session: Kyber's PUSHDOWN phase never converges
+
+On a multi-join plan the PUSHDOWN fixpoint phase exits at its iteration cap instead of reaching a
+fixpoint (q3: 16 iterations, q5: 24, q7: 25), so **the plan a query gets depends on
+`OptimizerConfig.fixpoint_iterations`** — which is precisely the non-reproducibility the driver's
+own warning was written to flag. `derive_join_keys` and `push_is_not_null_from_join_key` *generate*
+predicates while `push_filter_through_project` *moves* them, and the idempotence guard
+(`_lacks`/`_conjuncts_on`) stops recognising a predicate once pushdown relocates it, so the
+generators re-fire. Across q5's 10 pushdown iterations the Filter count goes 3 → 6 and never
+settles.
+
+It is **not** a runtime cost — the surplus filters are absorbed into the scans and the surviving
+chains are fused by `fuse_linear`. It is an optimizer-time cost, and the benchmark cannot see it
+because the harness warms up and `_cached_or_run` caches the optimized plan. A *cold* query pays
+it in full: q5's first `collect()` is **158 ms vs 52 ms warm**. That matters for the "sub-second
+small queries, low fixed overhead" mandate, where the one-shot ad-hoc query is the common case.
 
 ---
 
