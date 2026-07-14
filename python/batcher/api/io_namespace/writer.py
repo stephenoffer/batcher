@@ -110,8 +110,9 @@ class Writer:
         * ``"overwrite"`` (default) — write, replacing any existing output.
         * ``"error"`` — raise `PlanError` if `path` already exists.
         * ``"ignore"`` — skip the write (return an empty manifest) if `path` exists.
-        * ``"append"`` — add to an existing table; only the transactional lakehouse
-          sinks (`delta`/`iceberg`/`hudi`) support it (others raise).
+        * ``"append"`` — add to an existing table; only the sinks that can add to one
+          (`delta`/`iceberg`/`hudi`/`snowflake`) support it. A file sink raises, because
+          it has nothing to append to.
 
         ``replace_where=<predicate>`` is a dynamic partition/range overwrite (Delta
         ``replaceWhere`` / the backfill pattern): atomically replace only the rows
@@ -364,13 +365,27 @@ class Writer:
         from batcher._internal.errors import PlanError
         from batcher.api.streaming import _DRAIN_TRIGGER_KINDS, _is_stateless
         from batcher.dist.executor import _is_splittable_source
+        from batcher.io.source import is_bounded
 
         srcs = self._ds._sources
-        if len(srcs) != 1 or not _is_splittable_source(srcs[0]):
+        if len(srcs) != 1:
             return None  # not worth (or not able to) fan out — fall back to single-node
+        source = srcs[0]
+
+        # Probing an *unbounded* source with `splits()` is not free: on an incremental file
+        # source a listing IS the discovery pass, so asking "could this be split?" would
+        # consume the very files the epoch was about to read. Unbounded sources therefore
+        # declare `partitionable` instead of being interrogated.
+        splittable = (
+            _is_splittable_source(source)
+            if is_bounded(source)
+            else getattr(source, "partitionable", False)
+        )
+        if not splittable:
+            return None
 
         drain = trigger is not None and trigger.kind in _DRAIN_TRIGGER_KINDS
-        if drain and checkpoint is None:
+        if drain and checkpoint is None and is_bounded(source):
             from batcher.api.streaming import start_distributed_stream_drain
 
             return start_distributed_stream_drain(

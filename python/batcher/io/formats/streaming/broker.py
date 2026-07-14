@@ -83,6 +83,9 @@ class BrokerSource(ABC):
 
     format_name: str = "broker"
     bounded = False  # an infinite poll loop — collect() must not materialize it
+    #: Partitions are independent, offset-addressable work units, so a micro-batch can be
+    #: read partition-per-worker across the cluster (see `BrokerSplit.read_epoch`).
+    partitionable = True
 
     __slots__ = ("_options", "_positions", "_resume_from", "poll_size", "topic")
 

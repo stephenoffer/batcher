@@ -69,6 +69,9 @@ class IncrementalFileSource:
     """
 
     bounded = False  # the directory grows over time — an unbounded stream
+    #: A pass's new files are independent work units, so a micro-batch can be fanned
+    #: across the cluster one file per worker (see `dist.streaming.microbatch`).
+    partitionable = True
 
     __slots__ = (
         "_completed",

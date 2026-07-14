@@ -4,8 +4,13 @@ A `distributed=True` streaming write with an `available_now`/`once` trigger over
 splittable source fans read+transform+write across workers (Spark `Trigger.AvailableNow`).
 The mergeable/shared-nothing write means the result is identical to the single-node
 drain. This proves that equivalence over a real, splittable Parquet source (multiple
-row-groups → multiple splits, read in parallel under Ray local) and that the unsupported
-distributed streaming shapes fail loudly instead of silently degrading to single-node.
+row-groups → multiple splits, read in parallel under Ray local).
+
+The other triggers are no longer refused: a processing-time or continuous distributed
+stream runs each micro-batch as a cluster-wide epoch, and it may checkpoint. The
+transaction-count and exactly-once guarantees of that path live in
+`test_distributed_continuous_streaming.py`; the last two tests here only pin that the
+shapes which used to raise now produce the right rows.
 """
 
 from __future__ import annotations
@@ -15,7 +20,6 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
-from batcher._internal.errors import PlanError
 
 pytestmark = pytest.mark.integration
 
@@ -76,25 +80,56 @@ def test_distributed_drain_returns_streaming_query(tmp_path):
     assert q.last_progress is not None and q.last_progress.num_output_rows == 120
 
 
-def test_distributed_continuous_trigger_raises(tmp_path):
-    # A non-drain distributed streaming request must fail loudly, not silently run local.
+def test_distributed_processing_time_trigger_runs_the_micro_batch_on_the_cluster(tmp_path):
+    """A non-drain distributed stream runs each micro-batch as a cluster-wide epoch.
+
+    This used to raise: only `available_now`/`once` could be distributed, and everything
+    else was refused. It now runs — the epoch fans out and the driver publishes it — so the
+    assertion is that the rows arrive, not that the request is rejected.
+    (`tests/integration/test_distributed_continuous_streaming.py` holds the transaction and
+    exactly-once guarantees.)
+    """
     src = _splittable_parquet(str(tmp_path / "in.parquet"), 10)
-    with pytest.raises(PlanError, match="available_now"):
-        bt.read(src, format="parquet").write(
-            str(tmp_path / "o"),
-            format="parquet",
-            trigger=bt.Trigger.processing_time(0),
-            distributed=True,
-        )
+    out = str(tmp_path / "o")
+    query = bt.read(src, format="parquet").write(
+        out,
+        format="parquet",
+        trigger=bt.Trigger.processing_time(0),
+        distributed=True,
+        num_workers=2,
+    )
+    query.await_termination()
+    assert _ids(out) == list(range(10))
 
 
-def test_distributed_checkpoint_raises(tmp_path):
+def test_distributed_checkpointed_stream_resumes_instead_of_reprocessing(tmp_path):
+    """A distributed stream can checkpoint: a re-run resumes rather than redoing the work.
+
+    Also previously refused ("per-partition offset coordination is not implemented"). The
+    offset log is written between staging an epoch and publishing it, so a second run over
+    the same checkpoint finds the work already committed and drains nothing.
+    """
     src = _splittable_parquet(str(tmp_path / "in.parquet"), 10)
-    with pytest.raises(PlanError, match="checkpoint"):
-        bt.read(src, format="parquet").write(
-            str(tmp_path / "o"),
-            format="parquet",
-            trigger=bt.Trigger.available_now(),
-            distributed=True,
-            checkpoint=str(tmp_path / "ckpt"),
-        )
+    out, ckpt = str(tmp_path / "o"), str(tmp_path / "ckpt")
+
+    first = bt.read(src, format="parquet").write(
+        out,
+        format="parquet",
+        trigger=bt.Trigger.available_now(),
+        distributed=True,
+        checkpoint=ckpt,
+        num_workers=2,
+    )
+    first.await_termination()
+    assert _ids(out) == list(range(10))
+
+    second = bt.read(src, format="parquet").write(
+        out,
+        format="parquet",
+        trigger=bt.Trigger.available_now(),
+        distributed=True,
+        checkpoint=ckpt,
+        num_workers=2,
+    )
+    second.await_termination()
+    assert _ids(out) == list(range(10))  # the replay neither duplicated nor dropped a row
