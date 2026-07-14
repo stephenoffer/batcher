@@ -269,11 +269,28 @@ query opened every file:
 | `count(*) WHERE day = 42` | ms | files opened |
 |---|---:|---:|
 | batcher (before) | 98.8 | 200 |
-| **batcher (now)** | **13.4** | **1** |
-| duckdb `delta_scan` | 19.0 | — |
+| **batcher (now)** | **7.4** | **1** |
+| duckdb `delta_scan` | 21.8 | — |
 
-**7.4× against our own baseline, and 1.42× faster than DuckDB** (we were 2.7× *slower*).
-The provably-empty case (`day = 9999`, no file can match) went 214 ms → 9 ms.
+**13.3× against our own baseline, and 2.9× faster than DuckDB** (we were 2.7× *slower*).
+An unfiltered `count(*)` is 0.85 ms — answered from the log, no file opened. The
+provably-empty case (`day = 9999`, no file can match) went 214 ms → 9 ms.
+
+The last 6 ms came from the log itself. `DeltaTable(path)` replays `_delta_log` from the
+last checkpoint on **every query** (6.1 ms on a 200-commit table) — after file skipping, that
+was the largest cost left in a selective read. The process now keeps one live handle per
+table and rolls it forward with `update_incremental` (0.58 ms: it reads only the commits
+since it last looked), and a snapshot materializes everything version-dependent at
+construction so the shared handle can advance without changing what an already-issued
+snapshot reports.
+
+That work also surfaced a wrong answer: **`count()` and `collect()` disagreed** on the same
+table — 3 versus 5 rows after an append. Terminals answered from cached `SourceStatistics`
+were keyed by an identity (`delta:/t@latest`) that named no version, so a cached row count
+outlived the table it described. Invalidation could not have saved it either: it popped a
+different key than the cache used, and it only ever covered writes Batcher itself made — a
+table appended to by Spark or a streaming job went stale with nothing to notice. The
+identity now names the resolved version, so a new version is simply a new key.
 
 Two bugs were behind the old numbers, and neither was in the connector:
 

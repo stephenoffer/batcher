@@ -157,8 +157,15 @@ def invalidate_source_stats(path: str, fmt: str) -> None:
     and some terminals are answered from statistics without executing — so serving an
     entry that describes a *previous* version of a path yields a wrong answer, not a slow
     plan. Every copy-on-write pattern (`write.merge`, `ds.scd.*`) rewrites a path it reads.
+
+    The cache is keyed by the source's `identity()`, which for a lakehouse table carries a
+    version suffix (``delta:/t@7``) — so popping the bare ``fmt:path`` matched nothing and
+    this never once fired for one. Every key *for this path* is dropped instead, whatever
+    version it names.
     """
-    _SOURCE_STATS_CACHE.pop(f"{fmt}:{path}", None)
+    prefix = f"{fmt}:{path}"
+    for key in [k for k in _SOURCE_STATS_CACHE if k == prefix or k.startswith(prefix + "@")]:
+        _SOURCE_STATS_CACHE.pop(key, None)
 
 
 def _source_identity(source: Source) -> str:

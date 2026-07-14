@@ -351,3 +351,68 @@ def test_a_restarted_query_resumes_without_duplicating(tmp_path) -> None:
 
     assert len(_log_transactions(uri)) == 4
     assert sorted(bt.read.delta(uri).collect().column("id").to_pylist()) == [0, 1, 2, 3]
+
+
+# --- the snapshot cache must never serve an old version ---------------------
+
+
+def test_count_and_collect_agree_after_a_write(tmp_path) -> None:
+    """They did not. `count()` kept answering 3 while `collect()` returned 5.
+
+    Some terminals are answered from the session's cached `SourceStatistics` without
+    executing, and that cache is keyed by the source's `identity()`. A Delta source's
+    identity said ``delta:/t@latest`` — the *same string* for every version — so a cached row
+    count outlived the table it described. Two spellings of the same query, two different
+    answers, and the metadata path is the one that lies.
+
+    The identity now names the resolved version, so a new version is simply a new key.
+    """
+    uri = str(tmp_path / "t")
+    bt.from_pydict({"x": [1, 2, 3]}).write.delta(uri, mode="overwrite")
+    assert bt.read.delta(uri).count() == bt.read.delta(uri).collect().num_rows == 3
+
+    bt.from_pydict({"x": [4]}).write.delta(uri, mode="append")
+    assert bt.read.delta(uri).count() == bt.read.delta(uri).collect().num_rows == 4
+
+
+def test_a_table_written_by_someone_else_is_not_served_stale(tmp_path) -> None:
+    """The case invalidation could never cover.
+
+    Dropping the cache on *our* commits only ever helped writes Batcher made. A table
+    appended to by Spark, by a streaming job, or by another process went stale with nothing
+    to notice. Keying on the version means there is no stale entry to serve, whoever wrote.
+    """
+    uri = str(tmp_path / "t")
+    bt.from_pydict({"x": [1, 2, 3]}).write.delta(uri, mode="overwrite")
+    assert bt.read.delta(uri).count() == 3
+
+    # a writer that is not us
+    deltalake.write_deltalake(uri, pa.table({"x": pa.array([4, 5], pa.int64())}), mode="append")
+
+    assert bt.read.delta(uri).count() == 5
+    assert bt.read.delta(uri).collect().num_rows == 5
+
+
+def test_time_travel_still_pins_its_own_version(tmp_path) -> None:
+    """The shared handle rolls forward; a pinned read must not roll with it."""
+    uri = str(tmp_path / "t")
+    bt.from_pydict({"x": [1, 2, 3]}).write.delta(uri, mode="overwrite")
+    bt.from_pydict({"x": [4]}).write.delta(uri, mode="append")
+
+    assert bt.read.delta(uri, version=0).count() == 3
+    assert bt.read.delta(uri, version=1).count() == 4
+    assert bt.read.delta(uri).count() == 4  # and latest is still latest
+
+
+def test_the_identity_names_the_version_it_reads(tmp_path) -> None:
+    from batcher.io.formats.lakehouse import DeltaSource
+
+    uri = str(tmp_path / "t")
+    bt.from_pydict({"x": [1]}).write.delta(uri, mode="overwrite")
+    first = DeltaSource(uri).identity()
+
+    bt.from_pydict({"x": [2]}).write.delta(uri, mode="append")
+    second = DeltaSource(uri).identity()
+
+    assert first != second, "a new version must be a new cache key"
+    assert DeltaSource(uri, version=0).identity() == first

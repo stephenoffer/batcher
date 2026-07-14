@@ -257,7 +257,33 @@ class DeltaSource:
             raise BackendError(f"failed to read Delta CDF for {self._table_uri!r}: {exc}") from exc
 
     def identity(self) -> str:
-        ref = self._version if self._version is not None else (self._timestamp or "latest")
+        """What makes this source *this* source — including **which version** it reads.
+
+        The identity keys the session's statistics cache, and some terminals (`count()`,
+        `is_empty()`, `min()`/`max()`) are answered from those statistics without executing.
+        So an identity that does not name the version lets a cached row count outlive the
+        table it described: after an append, ``count()`` kept returning 3 while ``collect()``
+        returned 5 — the same query, two different answers.
+
+        Naming the resolved version fixes that at the root, and fixes it against *any*
+        writer. Invalidating on our own commits only ever covered writes Batcher made; a
+        table appended to by Spark, by a streaming job, or by another process went stale with
+        nothing to notice. A new version is simply a new identity, so there is no stale entry
+        to serve.
+
+        Resolving ``latest`` costs one incremental log catch-up (`_snapshot`), not a full
+        replay. A table that cannot be opened falls back to the unresolved form rather than
+        raising — an identity is metadata about a source, not a read of it.
+        """
+        if self._version is not None:
+            ref: Any = self._version
+        elif self._timestamp is not None:
+            ref = self._timestamp
+        else:
+            try:
+                ref = self._snapshot().version
+            except Exception:
+                ref = "latest"
         return f"delta:{self._table_uri}@{ref}"
 
     def splits(

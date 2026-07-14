@@ -24,6 +24,7 @@ sees the new commit. An unpinned read is never cached.
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -39,6 +40,11 @@ __all__ = ["DeltaSnapshot", "open_snapshot", "require_deltalake"]
 # hot ones resident. Mirrors the `fragment_index` cache in `io.splits`.
 _SNAPSHOT_CACHE: OrderedDict[tuple, DeltaSnapshot] = OrderedDict()
 _SNAPSHOT_CACHE_MAX = 8
+
+# One live `DeltaTable` per table, rolled forward with `update_incremental` instead of
+# re-replaying the log on every query. Guarded, because two queries may refresh it at once.
+_LATEST_HANDLES: OrderedDict[tuple, Any] = OrderedDict()
+_HANDLE_LOCK = threading.Lock()
 
 
 def require_deltalake() -> Any:
@@ -64,22 +70,32 @@ class DeltaSnapshot:
     table_uri: str
     version: int
     storage_options: dict[str, str] | None
-    _table: Any
-    _add_actions: pa.Table | None = None
-    _schema: pa.Schema | None = None
-    _masks: dict[str, Any] | None = None
+    _schema: pa.Schema
+    _add_actions: pa.Table
+    _partition_columns: list[str]
+    _masks: dict[str, Any]
     _full_index: tuple[Any, dict[str, Any]] | None = None
+    _pinned: Any = None
 
     @property
     def table(self) -> Any:
-        """The underlying delta-rs `DeltaTable` (log already replayed)."""
-        return self._table
+        """A `DeltaTable` handle pinned to *this* version.
+
+        Built on demand, and only for the two callers that genuinely need a live delta-rs
+        handle (the change-data-feed reader, and the dataset fallback). Everything else
+        reads the metadata materialized at construction — which is what lets the process
+        keep **one** handle per table and roll it forward with `update_incremental`, rather
+        than replaying the whole `_delta_log` on every query.
+        """
+        if self._pinned is None:
+            deltalake = require_deltalake()
+            self._pinned = deltalake.DeltaTable(
+                self.table_uri, version=self.version, storage_options=self.storage_options
+            )
+        return self._pinned
 
     def schema(self) -> pa.Schema:
         """The table's Arrow schema, including partition columns."""
-        if self._schema is None:
-            # delta-rs returns an Arrow C-interface (arro3) schema; adapt to pyarrow.
-            self._schema = pa.schema(self._table.schema().to_arrow())
         return self._schema
 
     def add_actions(self) -> pa.Table:
@@ -89,16 +105,11 @@ class DeltaSnapshot:
         `io.stats.lakehouse_manifest` aggregates — ``path``, ``num_records``, and the
         ``partition.`` / ``min.`` / ``max.`` / ``null_count.`` columns.
         """
-        if self._add_actions is None:
-            self._add_actions = pa.table(self._table.get_add_actions(flatten=True))
         return self._add_actions
 
     def partition_columns(self) -> list[str]:
         """The table's partition columns, in their declared order."""
-        try:
-            return list(self._table.metadata().partition_columns)
-        except Exception:
-            return []
+        return self._partition_columns
 
     def deletion_masks(self) -> dict[str, Any]:
         """Per-file row masks for the table's deletion vectors — ``True`` means *keep*.
@@ -121,16 +132,15 @@ class DeltaSnapshot:
         table — including the overwhelming majority with no deletions at all — to the slow
         path for nothing.
         """
-        if self._masks is None:
-            self._masks = self._read_deletion_masks()
         return self._masks
 
-    def _read_deletion_masks(self) -> dict[str, Any]:
+    @staticmethod
+    def _read_deletion_masks(table: Any, relative: Any) -> dict[str, Any]:
         import pyarrow as _pa
 
         masks: dict[str, Any] = {}
         try:
-            reader = self._table.deletion_vectors()
+            reader = table.deletion_vectors()
         except Exception:  # pragma: no cover - an older delta-rs without the API
             return masks
         try:
@@ -140,7 +150,7 @@ class DeltaSnapshot:
                 for i in range(batch.num_rows):
                     # The mask is a plain Arrow boolean list; keep it Arrow-native (a
                     # `to_pylist()` here was measured 7x slower on a 50k-row mask).
-                    masks[self._relative(paths[i].as_py())] = _pa.array(
+                    masks[relative(paths[i].as_py())] = _pa.array(
                         vectors[i].values, type=_pa.bool_()
                     )
         except Exception:
@@ -149,11 +159,7 @@ class DeltaSnapshot:
 
     def _relative(self, uri: str) -> str:
         """A deletion vector's file URI as the table-relative path the add actions use."""
-        root = self.table_uri.rstrip("/")
-        for prefix in (f"file://{root}/", f"{root}/"):
-            if uri.startswith(prefix):
-                return uri[len(prefix) :]
-        return uri.rsplit("/", 1)[-1] if "/" in uri and root not in uri else uri
+        return _relative_to(uri, self.table_uri)
 
     def has_deletion_vectors(self) -> bool:
         """Whether any data file in this version actually carries a deletion vector."""
@@ -324,10 +330,23 @@ def open_snapshot(
 ) -> DeltaSnapshot:
     """Open (or reuse) the snapshot for a Delta table at a version/timestamp.
 
-    A pinned `version` is served from the process cache — that version's state is
-    immutable, so a hit can never be stale. ``latest`` and a `timestamp` are resolved
-    fresh (a new query must see new commits), but the *resolved* version is then cached
-    under its concrete number, so the workers that receive it reuse the same replay.
+    A pinned `version` is served straight from the process cache — that version's state is
+    immutable, so a hit can never be stale.
+
+    An unpinned (``latest``) read is the common one, and it used to pay a full
+    ``DeltaTable(path)`` on **every query**: delta-rs replays the log from the last
+    checkpoint each time, which measured 6.1 ms on a 200-commit table and was, after file
+    skipping, the single largest cost left in a selective read. Instead the process keeps
+    **one live handle per table** and rolls it forward with ``update_incremental`` (0.58 ms
+    — it reads only the commits since it last looked). If that lands on a version already in
+    the cache, the query pays nothing more at all.
+
+    Rolling a *shared* handle forward is only safe because a `DeltaSnapshot` does not hold
+    it: everything version-dependent — schema, add actions, partition columns, deletion
+    vectors — is materialized when the snapshot is built, while the handle still points at
+    that version. A later query advancing the handle therefore cannot change what an
+    already-issued snapshot reports. (The two callers that genuinely need a live handle get
+    one pinned to their own version, built on demand.)
 
     Args:
         table_uri: The table root.
@@ -343,7 +362,41 @@ def open_snapshot(
         cached = _cache_get((table_uri, version, opts_key))
         if cached is not None:
             return cached
+        table = _open_table(table_uri, version, None, storage_options)
+        return _snapshot_from(table, table_uri, storage_options, opts_key)
 
+    if timestamp is not None:
+        # Time travel by timestamp resolves against the log every time; there is no handle
+        # to roll forward, because the answer is not "the latest version".
+        table = _open_table(table_uri, None, timestamp, storage_options)
+        return _snapshot_from(table, table_uri, storage_options, opts_key)
+
+    with _HANDLE_LOCK:
+        handle = _LATEST_HANDLES.get((table_uri, opts_key))
+        if handle is None:
+            handle = _open_table(table_uri, None, None, storage_options)
+            _LATEST_HANDLES[(table_uri, opts_key)] = handle
+            while len(_LATEST_HANDLES) > _SNAPSHOT_CACHE_MAX:
+                _LATEST_HANDLES.popitem(last=False)
+        else:
+            try:
+                handle.update_incremental()  # catch up on any commits since we last looked
+            except Exception:
+                handle = _open_table(table_uri, None, None, storage_options)
+                _LATEST_HANDLES[(table_uri, opts_key)] = handle
+        resolved = int(handle.version())
+        cached = _cache_get((table_uri, resolved, opts_key))
+        if cached is not None:
+            return cached
+        return _snapshot_from(handle, table_uri, storage_options, opts_key)
+
+
+def _open_table(
+    table_uri: str,
+    version: int | None,
+    timestamp: str | None,
+    storage_options: dict[str, str] | None,
+) -> Any:
     deltalake = require_deltalake()
     try:
         table = deltalake.DeltaTable(table_uri, version=version, storage_options=storage_options)
@@ -351,11 +404,49 @@ def open_snapshot(
             table.load_as_version(timestamp)
     except Exception as exc:
         raise BackendError(f"failed to open Delta table {table_uri!r}: {exc}") from exc
+    return table
 
+
+def _snapshot_from(
+    table: Any,
+    table_uri: str,
+    storage_options: dict[str, str] | None,
+    opts_key: tuple,
+) -> DeltaSnapshot:
+    """Materialize every version-dependent fact `table` currently reports, and cache it.
+
+    Reading them **now**, while the handle is known to be at this version, is what makes the
+    snapshot independent of the handle — and therefore what makes rolling one shared handle
+    forward across queries safe.
+    """
     resolved = int(table.version())
-    snapshot = DeltaSnapshot(table_uri, resolved, storage_options, table)
+    schema = pa.schema(table.schema().to_arrow())
+    add_actions = pa.table(table.get_add_actions(flatten=True))
+    try:
+        partitions = list(table.metadata().partition_columns)
+    except Exception:
+        partitions = []
+    snapshot = DeltaSnapshot(
+        table_uri=table_uri,
+        version=resolved,
+        storage_options=storage_options,
+        _schema=schema,
+        _add_actions=add_actions,
+        _partition_columns=partitions,
+        _masks={},
+    )
+    snapshot._masks = DeltaSnapshot._read_deletion_masks(table, snapshot._relative)
     _cache_put((table_uri, resolved, opts_key), snapshot)
     return snapshot
+
+
+def _relative_to(uri: str, table_uri: str) -> str:
+    """A file URI as the table-relative path the add actions use."""
+    root = table_uri.rstrip("/")
+    for prefix in (f"file://{root}/", f"{root}/"):
+        if uri.startswith(prefix):
+            return uri[len(prefix) :]
+    return uri.rsplit("/", 1)[-1] if "/" in uri and root not in uri else uri
 
 
 def _cache_get(key: tuple) -> DeltaSnapshot | None:
