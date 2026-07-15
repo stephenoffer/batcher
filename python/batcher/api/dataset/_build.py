@@ -17,7 +17,7 @@ from batcher._internal.errors import PlanError
 from batcher.api._join_helpers import _as_key_expr
 from batcher.plan.expr_ir import Col, nullif, when
 from batcher.plan.expr_ir.selectors import Selector, expand_selectors
-from batcher.plan.ir_tags import WINDOW_AGGREGATES
+from batcher.plan.ir_tags import WINDOW_FRAMEABLE
 from batcher.plan.logical import (
     Sample,
     SortKeySpec,
@@ -74,6 +74,12 @@ def build_window(
     for alias, spec in functions.items():
         if isinstance(spec, str):
             specs.append(WindowFuncSpec(spec, None, alias))
+        elif isinstance(spec, tuple) and spec and spec[0] == "ntile":
+            # ntile: a no-input ranking function whose bucket count rides in `offset`
+            # — spelled ``("ntile", n)`` since it takes a count, not a column.
+            if len(spec) != 2:
+                raise PlanError(f"window function {alias!r}: ntile takes ('ntile', n)")
+            specs.append(WindowFuncSpec("ntile", None, alias, int(spec[1]), None))
         elif isinstance(spec, tuple):
             # (func, column) or, for lag/lead, (func, column, offset).
             if len(spec) == 2:
@@ -89,7 +95,7 @@ def build_window(
             # window engine names the aggregate `avg`, so accept both here.
             if func == "mean":
                 func = "avg"
-            fn_frame = wframe if func in WINDOW_AGGREGATES else None
+            fn_frame = wframe if func in WINDOW_FRAMEABLE else None
             specs.append(WindowFuncSpec(func, _as_key_expr(column), alias, int(offset), fn_frame))
         else:
             raise PlanError(

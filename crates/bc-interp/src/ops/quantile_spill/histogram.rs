@@ -37,7 +37,9 @@ pub(crate) fn bounded_group_histogram(
         None => DataType::Null,
     };
 
-    let (flat, schema) = flatten_native_value(parts, group_keys, value_expr)?;
+    // `canon_value = false`: the in-memory `finalize_histogram` keys the map by the raw
+    // `RowConverter` encoding (no float canonicalization), so the spill path matches it.
+    let (flat, schema) = flatten_native_value(parts, group_keys, value_expr, false)?;
     let Some(schema) = schema else {
         let empty = histogram_map(
             new_empty_array(&value_type),

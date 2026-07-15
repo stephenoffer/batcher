@@ -101,6 +101,23 @@ def run_relational(
         return _run_relational(plan, sources, ctx, distributed=distributed, materialize=materialize)
 
 
+def _declared_row_count(src: Source) -> int | None:
+    """The exact row count a source declares without a scan, or None if it cannot.
+
+    Used to decide whether a read saw the source *whole* (so its distinct count may be
+    learned). A source with no `row_count`, or one that raises, is treated as unknown — the
+    safe side, since an unverifiable "did I see everything?" must answer no.
+    """
+    fn = getattr(src, "row_count", None)
+    if not callable(fn):
+        return None
+    try:
+        n = fn()
+    except Exception:  # pragma: no cover - a source that cannot count itself
+        return None
+    return int(n) if n is not None else None
+
+
 def _proven_empty_table(logical_opt: LogicalPlan, plan: LogicalPlan) -> pa.Table | None:
     """A typed, zero-row result when the optimizer proved the plan yields no rows.
 
@@ -319,11 +336,21 @@ def _run_relational(
     from batcher.metadata.io_stats import record_source_io
 
     resolved = []
+    complete_scan: list[bool] = []
     for i, src in enumerate(sources):
         _t0 = _time.perf_counter()
-        batches = read_source(src, opt.source_projections.get(i), opt.source_predicates.get(i))
+        predicate = opt.source_predicates.get(i)
+        batches = read_source(src, opt.source_projections.get(i), predicate)
         _elapsed_ms = (_time.perf_counter() - _t0) * 1000.0
         resolved.append(batches)
+        # Whether this read saw the source *whole* — no predicate filtered it, and the row
+        # count read matches what the source declares. Only a whole scan may teach the learner
+        # a source-level distinct count (a partial scan's ndv is an under-count, not an
+        # estimate; see `learn_column_stats`). Unknown row count → treat as partial, the safe
+        # side: a distinct count we might be wrong about is one we decline to record.
+        declared = _declared_row_count(src)
+        scanned = sum(b.num_rows for b in batches)
+        complete_scan.append(predicate is None and declared is not None and scanned == declared)
         record_source_io(
             ctx.hub, _source_identity(src), sum(b.nbytes for b in batches), _elapsed_ms
         )
@@ -373,7 +400,7 @@ def _run_relational(
     kyber.record_execution(ctx.hub, plan, table.num_rows)
     from batcher.api.terminal._metadata import learn_column_stats
 
-    learn_column_stats(ctx.hub, resolved, sources, plan)
+    learn_column_stats(ctx.hub, resolved, sources, plan, complete_scan)
     kyber.record_selectivity(ctx.hub, plan, sources, table.num_rows)
     # Close the conductor's tuning loops from this run's measured outcomes (breaker volume →
     # partition count, group reduction → pre-aggregation, join wall time → the bandit). Each

@@ -169,6 +169,10 @@ def parquet_statistics(fs: Any, files: list[str], schema: pa.Schema) -> SourceSt
         byte_size=total_bytes or None,
         columns=columns,
         exact_rows=True,
+        row_group_count=row_group_count or None,
+        # Deliberately left at its default (False): the Parquet spec omits NaN from a
+        # column's min/max, so a footer `max` is the largest *non-NaN* value while SQL
+        # ranks NaN greatest. These bounds may prune and may answer `min`, never `max`.
     )
 
 
@@ -276,6 +280,14 @@ def _finalize_columns(
             null_count=float(a.null_count) if a.null_known else None,
             ndv=ndv,
             provenance=Provenance.EXACT if is_exact else Provenance.DEFAULT,
+            # Parquet records a null count per column chunk **for every type**, and summing them
+            # across chunks is exact. That is independent of whether the *bounds* are trustworthy:
+            # a string column's min/max may be writer-truncated (so the bundle is DEFAULT), but
+            # its null count is not an estimate. Tagging it separately is what lets
+            # `n_null("name")` / `null_count()` / `count(name)` / `dq.not_null("name")` be
+            # answered from the footer on precisely the columns most real tables are made of —
+            # before this, the exact answer was discarded because it sat next to an inexact one.
+            null_count_provenance=Provenance.EXACT if a.null_known else Provenance.DEFAULT,
         )
     return columns
 

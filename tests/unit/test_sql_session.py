@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pyarrow as pa
 import pytest
 
@@ -97,14 +99,17 @@ def test_unknown_function_error_names_it():
 
 
 @pytest.mark.unit
-def test_value_window_explicit_frame_rejected():
+def test_value_window_explicit_frame_accepted():
+    # An explicit frame on LAST_VALUE is now honored (frame-aware value functions):
+    # the query must translate to a plan carrying that frame, not raise. The running
+    # semantics are checked against DuckDB in test_diff_sqlwin_value_frame.py.
     s = bt.Session()
     s.register("t", bt.from_pydict({"t": [1, 2, 3], "x": [5, 6, 7]}))
-    with pytest.raises(NotImplementedError, match="FIRST_VALUE / LAST_VALUE"):
-        s.sql(
-            "SELECT LAST_VALUE(x) OVER "
-            "(ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v FROM t"
-        )
+    ds = s.sql(
+        "SELECT LAST_VALUE(x) OVER "
+        "(ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v FROM t"
+    )
+    assert "window" in json.dumps(ds._plan.to_ir())
 
 
 @pytest.mark.unit

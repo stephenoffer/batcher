@@ -750,6 +750,10 @@ pub struct CaseBranch {
 #[serde(rename_all = "snake_case")]
 pub enum Literal {
     Int(i64),
+    /// A float literal. JSON has no NaN/Infinity tokens, so the Python control
+    /// plane encodes a non-finite float as a name string (`"NaN"`/`"inf"`/
+    /// `"-inf"`); a finite float stays a plain JSON number. Accept both.
+    #[serde(deserialize_with = "de_float")]
     Float(f64),
     Bool(bool),
     Str(String),
@@ -793,6 +797,50 @@ pub enum BinaryOp {
     AddMonths,
 }
 
+/// Deserialize a float literal that may arrive as a JSON number (finite) or as a
+/// name string for a non-finite value (`"NaN"`, `"inf"`/`"+inf"`/`"Infinity"`,
+/// `"-inf"`/`"-Infinity"`). JSON cannot carry NaN/Infinity as numbers, so the
+/// control plane spells them out; every other string is parsed as an f64.
+fn de_float<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Unexpected, Visitor};
+    use std::fmt;
+
+    struct FloatVisitor;
+
+    impl Visitor<'_> for FloatVisitor {
+        type Value = f64;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a float number or a non-finite name string")
+        }
+
+        fn visit_f64<E: Error>(self, v: f64) -> Result<f64, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: Error>(self, v: i64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+        fn visit_u64<E: Error>(self, v: u64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+        fn visit_str<E: Error>(self, v: &str) -> Result<f64, E> {
+            match v {
+                "NaN" | "nan" => Ok(f64::NAN),
+                "inf" | "+inf" | "Infinity" | "+Infinity" => Ok(f64::INFINITY),
+                "-inf" | "-Infinity" => Ok(f64::NEG_INFINITY),
+                other => other
+                    .parse::<f64>()
+                    .map_err(|_| E::invalid_value(Unexpected::Str(other), &self)),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(FloatVisitor)
+}
+
 impl Literal {
     /// Materialize the literal as an array of length `n`.
     ///
@@ -807,6 +855,40 @@ impl Literal {
             Literal::Timestamp(v) => Arc::new(TimestampMicrosecondArray::from(vec![*v; n])),
             Literal::Date(v) => Arc::new(Date32Array::from(vec![*v; n])),
         }
+    }
+}
+
+#[cfg(test)]
+mod float_literal_tests {
+    use super::*;
+
+    fn lit_float(json: &str) -> f64 {
+        let e: Expr = serde_json::from_str(json).unwrap();
+        match e {
+            Expr::Lit { value: Literal::Float(v) } => v,
+            other => panic!("expected float literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float_literal_accepts_finite_number_and_nonfinite_names() {
+        // Finite floats keep the plain-number wire form.
+        assert_eq!(lit_float(r#"{"e":"lit","value":{"float":1.5}}"#), 1.5);
+        assert_eq!(lit_float(r#"{"e":"lit","value":{"float":-0.0}}"#), 0.0);
+        // Non-finite floats arrive as name strings (JSON has no NaN/Inf tokens).
+        assert!(lit_float(r#"{"e":"lit","value":{"float":"NaN"}}"#).is_nan());
+        assert_eq!(
+            lit_float(r#"{"e":"lit","value":{"float":"inf"}}"#),
+            f64::INFINITY
+        );
+        assert_eq!(
+            lit_float(r#"{"e":"lit","value":{"float":"-inf"}}"#),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(
+            lit_float(r#"{"e":"lit","value":{"float":"Infinity"}}"#),
+            f64::INFINITY
+        );
     }
 }
 

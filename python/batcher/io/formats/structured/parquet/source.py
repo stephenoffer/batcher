@@ -176,6 +176,14 @@ class ParquetSource(FileSource):
         Returns:
             Every batch of every file, in file order.
         """
+        # A schema-evolving read must reconcile every file's batches to the unified
+        # schema (base `read` does this via `_normalize`). The pushdown fast path below
+        # reads each file with its own on-disk schema and never normalizes, so int32 in
+        # one file and int64 in another come back as differently-typed batches that fail
+        # to concatenate. Pushdown is a pure I/O optimization, so defer to the normalizing
+        # base read; the engine's `Filter` still applies the predicate.
+        if self._schema_mode != "strict":
+            return super().read(projection)
         pa_filter = self._pa_filter(predicate)
         if pa_filter is None:
             batched = self._native_read_many(projection)
@@ -227,6 +235,14 @@ class ParquetSource(FileSource):
         Returns:
             An iterator over the surviving batches, in file order.
         """
+        # A schema-evolving read reconciles each file to the unified schema in the base
+        # `iter_batches` (via `_normalize`); the dataset pushdown path below reads files
+        # with their own schemas and never normalizes, so differently-typed files yield
+        # mismatched batches. Defer to the normalizing base stream — the engine's `Filter`
+        # still applies the predicate, so this is only a lost I/O optimization.
+        if self._schema_mode != "strict":
+            yield from super().iter_batches(projection)
+            return
         pa_filter = self._pa_filter(predicate)
         if pa_filter is None:
             yield from super().iter_batches(projection)
@@ -254,8 +270,10 @@ class ParquetSource(FileSource):
         _ROW_COUNT_CACHE[path] = n
         return n
 
-    def _file_splits(self, path: str, target_size: int | None) -> list[Split]:
-        return parquet_row_group_splits(path, target_size)
+    def _file_splits(
+        self, path: str, target_size: int | None, predicate: dict | None = None
+    ) -> list[Split]:
+        return parquet_row_group_splits(path, target_size, predicate)
 
     def statistics(self) -> SourceStatistics | None:
         """Footer-derived row count + per-column min/max/null, no data scan.

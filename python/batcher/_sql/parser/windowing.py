@@ -83,18 +83,32 @@ def _is_agg_window(win) -> bool:
     return type(win.this).__name__.lower() in {"sum", "avg", "min", "max", "count"}
 
 
-def _resolve_frame(win) -> tuple[int | None, int | None] | None:
-    """The explicit ROWS frame for this window, validated against what the engine
-    can honour. Aggregates take the frame; ranking / LAG / LEAD ignore it (as SQL
-    does); an explicit frame on FIRST_VALUE / LAST_VALUE — which SQL *does* honour
-    but the engine cannot yet — is rejected rather than silently mis-evaluated."""
-    frame = _window_frame(win)
-    if frame is None or _is_agg_window(win):
-        return frame
-    if type(win.this).__name__.lower() in {"firstvalue", "lastvalue"}:
-        raise NotImplementedError(
-            "explicit ROWS frames on FIRST_VALUE / LAST_VALUE are not supported yet"
-        )
+# Positional value functions that pick a frame's first / last / nth row.
+_FRAMED_VALUE = {"firstvalue", "lastvalue", "nthvalue"}
+
+
+def _resolve_frame(win) -> tuple | None:
+    """The window frame this function should run under.
+
+    Aggregates and the positional value functions (`first_value`/`last_value`/
+    `nth_value`) honour an explicit frame. When a value function has *no* explicit
+    frame but *does* have an ORDER BY, SQL's default frame is
+    ``RANGE UNBOUNDED PRECEDING TO CURRENT ROW`` — which makes `last_value` /
+    `nth_value` the *running* value (the current peer's / null-until-the-nth-peer)
+    rather than the whole-partition value. `first_value` is the same either way, so it
+    stays frameless. Ranking / LAG / LEAD ignore frames (as SQL does)."""
+    name = type(win.this).__name__.lower()
+    explicit = _window_frame(win)
+    if _is_agg_window(win):
+        return explicit
+    if name in _FRAMED_VALUE:
+        if explicit is not None:
+            return explicit
+        # Emit the default running frame only for last_value / nth_value (first_value's
+        # frame start is unbounded-preceding, so its result is frame-independent).
+        if win.args.get("order") is not None and name in {"lastvalue", "nthvalue"}:
+            return (None, 0, "range")
+        return None
     return None  # ranking / LAG / LEAD: the frame is meaningless, ignore it
 
 
@@ -171,6 +185,23 @@ def _window_order(win) -> tuple:
     return tuple(specs)
 
 
+def _const_int(node, ctx: str) -> int:
+    """Evaluate a constant integer argument, handling negatives.
+
+    sqlglot parses a negative literal (``-1``) as a ``Neg`` wrapping a ``Literal``, so a
+    naive ``int(node.this)`` reads the inner node and raises ``TypeError``. ``to_py()``
+    folds ``Neg``/``Literal`` to a Python value; a non-constant argument is rejected.
+    """
+    from sqlglot import expressions as exp
+
+    if isinstance(node, (exp.Literal, exp.Neg)):
+        try:
+            return int(node.to_py())
+        except (TypeError, ValueError):
+            pass
+    raise NotImplementedError(f"window function {ctx!r} requires a constant integer argument")
+
+
 def _window_func(win, order):
     """Map a window function node to a `ds.window` functions-value."""
     from sqlglot import expressions as exp
@@ -178,11 +209,28 @@ def _window_func(win, order):
     fn = win.this
     name = type(fn).__name__.lower()
 
-    ranking = {"rownumber": "row_number", "rank": "rank", "denserank": "dense_rank"}
+    # Ranking family (no input; needs ORDER BY). `percent_rank`/`cume_dist` produce
+    # a fraction; the runtime supports all of these.
+    ranking = {
+        "rownumber": "row_number",
+        "rank": "rank",
+        "denserank": "dense_rank",
+        "percentrank": "percent_rank",
+        "cumedist": "cume_dist",
+    }
     if name in ranking:
         if not order:
             raise NotImplementedError(f"window ranking function {name!r} requires ORDER BY")
         return ranking[name]
+
+    # NTILE(n): a no-input ranking function whose bucket count is a constant.
+    if name == "ntile":
+        if not order:
+            raise NotImplementedError("window function 'ntile' requires ORDER BY")
+        n = fn.this
+        if n is None or getattr(n, "this", None) is None:
+            raise NotImplementedError("ntile(n) requires a constant bucket count")
+        return ("ntile", int(n.this))
 
     aggregates = {"sum": "sum", "avg": "avg", "min": "min", "max": "max", "count": "count"}
     if name in aggregates:
@@ -203,6 +251,7 @@ def _window_func(win, order):
         "lead": "lead",
         "firstvalue": "first_value",
         "lastvalue": "last_value",
+        "nthvalue": "nth_value",
     }
     if name in value:
         if not order:
@@ -211,8 +260,25 @@ def _window_func(win, order):
         if not isinstance(arg, exp.Column):
             raise NotImplementedError(f"window {name} supports a plain column argument only")
         if name in ("lag", "lead"):
+            if fn.args.get("default") is not None:
+                # A default value fills the out-of-range rows; the engine has no
+                # such parameter, so honoring the offset while dropping the default
+                # would silently return NULL where SQL returns the default. Reject.
+                raise NotImplementedError(
+                    f"{name}(expr, offset, default) with a default value is not supported yet"
+                )
             off = fn.args.get("offset")
-            return (value[name], arg.name, int(off.this) if off is not None else 1)
+            # A negative offset (`lag(x, -1)`) flips direction (== `lead(x, 1)`), which the
+            # engine supports; sqlglot wraps it in a `Neg` node, so `int(off.this)` would
+            # read the inner Literal and crash. `_const_int` evaluates the constant.
+            return (value[name], arg.name, _const_int(off, name) if off is not None else 1)
+        if name == "nthvalue":
+            n = fn.args.get("offset")
+            if n is None:
+                raise NotImplementedError("nth_value(expr, n) requires a constant N")
+            # The N rides in the offset slot of the (func, column, offset) spec. A
+            # non-positive N yields all-NULL (matching DuckDB), so it is not rejected here.
+            return ("nth_value", arg.name, _const_int(n, "nth_value"))
         return (value[name], arg.name)
 
     raise NotImplementedError(f"unsupported window function: {name}")

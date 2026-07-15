@@ -225,6 +225,18 @@ enum Admit {
 /// against its live reservations. The latter is the runtime backstop a static
 /// estimate cannot enforce on its own. With no envelope (the default) `op_budget`
 /// is `None`, so it always admits with no accounting and the fast path is unchanged.
+impl ExecOptions {
+    /// Worker threads this query may use — `parallelism`, or the rayon pool's width when it is
+    /// `0` ("all available cores"). The streaming executor shards its driving scan by this.
+    pub fn workers(&self) -> usize {
+        if self.parallelism > 0 {
+            self.parallelism
+        } else {
+            rayon::current_num_threads()
+        }
+    }
+}
+
 fn admit(opts: &ExecOptions, op_id: u32, estimate_bytes: usize) -> Admit {
     match opts.pool.as_ref() {
         // The pool accounts *actual* bytes, so it is the spill authority: reserve the
@@ -850,8 +862,18 @@ fn exec(
                 } = input.as_ref()
                 {
                     let jt0 = Stopwatch::start();
-                    let lbs = exec(left, sources, opts, m, ids)?;
-                    let rbs = exec(right, sources, opts, m, ids)?;
+                    // Whether this fusion applies can only be known after the build side is
+                    // materialized, so execute the join's children against a SCRATCH
+                    // `ExecMetrics`/`IdGen` and commit to the real ones only on success — a
+                    // bail must leave operator numbering and metrics exactly as the ordinary
+                    // fallback (which re-executes `input`) would produce them. The scratch ids
+                    // mirror a plain pre-order walk of the fused HashJoin: it consumes `op_id+1`
+                    // (no metric — it is folded into the sort), then its left/right subtrees.
+                    let mut sm = ExecMetrics::default();
+                    let mut sid = IdGen::at(op_id + 1);
+                    let _join_id = sid.next(); // the HashJoin's own pre-order id
+                    let lbs = exec(left, sources, opts, &mut sm, &mut sid)?;
+                    let rbs = exec(right, sources, opts, &mut sm, &mut sid)?;
                     let build_rows = count_rows(&rbs) as usize;
                     let build_bytes = batch_bytes(&rbs) as usize
                         + bc_runtime::join::estimate_build_bytes(build_rows);
@@ -868,6 +890,16 @@ fn exec(
                             p,
                             &opts.tuning,
                         )? {
+                            // Commit the speculative numbering + metrics: `sid` now sits exactly
+                            // where a plain walk of `input` would leave it (`op_id + 1 +
+                            // input.node_count()`), so everything after the sort still aligns
+                            // with the control plane's annotation.
+                            *ids = sid;
+                            m.ops.extend(std::mem::take(&mut sm.ops));
+                            // Commit the speculative numbering + metrics: `sid` now sits exactly
+                            // where a plain walk of `input` would leave it (`op_id + 1 +
+                            // input.node_count()`), so everything after the sort still aligns
+                            // with the control plane's annotation.
                             let rows_in = count_rows(&lbs) + count_rows(&rbs);
                             push_metric(
                                 m,
@@ -882,8 +914,10 @@ fn exec(
                             return Ok(out);
                         }
                     }
-                    // Declined: fall through. The ordinary path below re-executes `input`
-                    // (join included) — rare (spill / computed sort key), so acceptable.
+                    // Declined: drop the scratch metrics/ids (leaving `ids` untouched at
+                    // `op_id + 1`) and fall through. The ordinary path below re-executes
+                    // `input` (join included) and numbers it exactly as a plain walk would —
+                    // rare (spill / computed sort key), so the re-execution is acceptable.
                 }
             }
             let parts = exec(input, sources, opts, m, ids)?;
@@ -1427,6 +1461,9 @@ fn exec(
             for inp in inputs {
                 all.extend(exec(inp, sources, opts, m, ids)?);
             }
+            // Promotable-but-different branch types (`int64 ∪ float64`) are coerced to the
+            // union's advertised supertype before concat/dedup, matching DuckDB.
+            let all = crate::coerce_union_branches(all)?;
             let rows_in = count_rows(&all);
             // Captured before `all` is consumed: the dedup path materializes and hashes it.
             let in_bytes = batch_bytes(&all);
@@ -2500,6 +2537,84 @@ mod tests {
         assert!(
             workers >= 6,
             "byte-heavy source should allow >=6 workers, got {workers}"
+        );
+    }
+
+    /// The fused Sort-top-N-over-inner-hash-join path must number the join's children with
+    /// the SAME pre-order op-ids a plain walk assigns, so the runtime feedback keyed by op-id
+    /// still lines up with the operator the control plane annotated. The join is fused (folded
+    /// into the sort), so it emits no `hash_join` metric and its own id (1) is unused — but its
+    /// left/right subtrees must keep ids 2 and 3, not slide down to 1 and 2. Before the fix the
+    /// children were executed with the live `IdGen`, skipping the join's id, so every descendant
+    /// op-id was shifted by one (and on decline the subtree was numbered twice).
+    #[test]
+    fn fused_join_top_n_keeps_child_op_ids_aligned() {
+        use bc_expr::Expr;
+        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType, SortKey};
+
+        // Sort{limit=2}( HashJoin.Inner.Hash( Scan0, Scan1 ) ), ORDER BY the left key.
+        let plan = RelOp::Sort {
+            input: Box::new(RelOp::HashJoin {
+                left: Box::new(RelOp::Scan { source_id: 0 }),
+                right: Box::new(RelOp::Scan { source_id: 1 }),
+                left_keys: vec!["k".into()],
+                right_keys: vec!["k".into()],
+                join_type: JoinType::Inner,
+                output: vec![
+                    JoinOutputCol {
+                        side: JoinSide::Left,
+                        name: "v".into(),
+                        alias: "lv".into(),
+                    },
+                    JoinOutputCol {
+                        side: JoinSide::Right,
+                        name: "v".into(),
+                        alias: "rv".into(),
+                    },
+                ],
+                strategy: JoinStrategy::Hash,
+            }),
+            keys: vec![SortKey {
+                expr: Expr::Col { name: "lv".into() },
+                descending: false,
+                nulls_first: false,
+            }],
+            limit: Some(2),
+        };
+        let sources = vec![
+            vec![batch(&[1, 2, 3, 4], &[10, 20, 30, 40])],
+            vec![batch(&[1, 2, 3, 4], &[100, 200, 300, 400])],
+        ];
+        let (_out, m) = execute_parallel_with_metrics(&plan, &sources, &ExecOptions::default())
+            .expect("fused join top-n runs");
+
+        // The fused sort is op 0; the join (op 1) is folded in and emits no metric; the two
+        // scans are the join's children and MUST carry the pre-order ids 2 and 3.
+        let sort = m
+            .ops
+            .iter()
+            .find(|o| o.kind == "sort")
+            .expect("a sort metric");
+        assert_eq!(sort.op_id, 0);
+        assert_eq!(
+            sort.backend, "interp-jointopn",
+            "the fused path must engage"
+        );
+        assert!(
+            m.ops.iter().all(|o| o.kind != "hash_join"),
+            "the join is fused, so it records no separate metric"
+        );
+        let mut scan_ids: Vec<u32> = m
+            .ops
+            .iter()
+            .filter(|o| o.kind == "scan")
+            .map(|o| o.op_id)
+            .collect();
+        scan_ids.sort_unstable();
+        assert_eq!(
+            scan_ids,
+            vec![2, 3],
+            "the join's children must keep the pre-order ids a plain walk assigns"
         );
     }
 

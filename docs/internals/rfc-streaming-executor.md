@@ -1,10 +1,32 @@
 # RFC: A streaming (pipelined) executor tier — closing the single-node scale gap to DuckDB
 
-**Status:** Proposed (not implemented). This is the design behind the "how do we surpass
-DuckDB while preserving the architecture" question. Nothing here bends an invariant — most
-of it is the pipeline/breaker model `execution.md` *already documents* but the Tier-0
-interpreter does not yet implement. Requires maintainer sign-off; the Tier-0 rewrite is the
-highest-risk item and must keep the `seq == par == JIT` oracle green.
+**Status: Proposal 1 (the streaming driver) is IMPLEMENTED and default** (`crates/bc-interp/src/
+stream/`, `bc_py::execute_plan`). Proposals 2–5 remain proposed. See
+[Proposal 1 — status](#proposal-1--the-streaming-driver-the-load-bearing-change) for what
+landed and how it is verified. The rest of this document is the original design; nothing in it
+bent an invariant, which is why the highest-risk item shipped behind the same `seq == par ==
+streaming` oracle the design called for.
+
+**What landed (2026-07-14).** A pull-based morsel driver: linear runs (`Scan`/`Filter`/`Project`/
+`Unnest`/`Unpivot`/`RowId`/`Limit`) never materialize; the hash-join **probe** streams through a
+`BroadcastProbe` built once; the aggregate folds incrementally (`partial`→`combine`), state
+bounded by the group count. A parallel form shards the driving scan one-pipeline-per-worker and
+combines at the root. It is the **default executor** for the in-memory path, with a budget check
+that falls back to the spilling (materializing) executor rather than OOM.
+
+- **Correctness:** `execute_streaming == execute` (the oracle), pinned over every operator, both
+  serial and sharded, in `tests/stream_oracle.rs`; metrics agree with the oracle in
+  `tests/stream_metrics.rs`. The full DuckDB differential suite passes with streaming as the
+  default (the one residual failure is B26, a pre-existing IEEE-vs-total-order float-comparison
+  bug in the shared kernel, unrelated to the executor).
+- **Memory (the whole point):** on the q3/q4/q5 shape, peak is **flat in the input** — 3.4 MB at
+  1M rows, 3.3 MB at 4M — where the materializing path grows linearly (198 → 794 MB).
+  `tests/stream_memory.rs` guards that it never doubles across a 4× input growth. This is why the
+  133 GB sf100 OOM disappears *structurally*.
+- **Speed:** on that shape, **1.24× faster** than the materializing parallel path (109 ms vs
+  136 ms), because the copies it stops making were not free.
+
+The original design follows.
 
 ## Background: the gap is the interpreter, not the architecture
 

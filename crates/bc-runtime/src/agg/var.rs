@@ -9,22 +9,30 @@ use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use super::AggFunc;
 use crate::error::RuntimeError;
 
-/// One-pass (sum, sum_of_squares, count) per group, read as f64 (so integer
-/// inputs don't overflow when squared).
+/// One-pass **Welford** (mean, M2, count) per group, read as f64.
+///
+/// `M2` is the sum of squared deviations from the group mean. The earlier state was
+/// `(Σx, Σx², n)`, and `finalize` recovered the variance as `Σx² − (Σx)²/n` — a
+/// subtraction of two nearly equal large numbers that catastrophically cancels when the
+/// mean dwarfs the spread: `var([1e9+1, 1e9+2, 1e9+3])` came back as exactly `0` instead
+/// of `1`. Welford accumulates the centered `M2` directly, so no such subtraction ever
+/// happens, and the state stays mergeable via Chan's parallel formula ([`merge_welford`]).
 pub(crate) fn var_state(
     values: &ArrayRef,
     group_ids: &[u32],
     num_groups: usize,
     func: AggFunc,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
-    let mut sum = vec![0f64; num_groups];
-    let mut sumsq = vec![0f64; num_groups];
+    let mut mean = vec![0f64; num_groups];
+    let mut m2 = vec![0f64; num_groups];
     let mut count = vec![0i64; num_groups];
 
     let mut update = |g: usize, v: f64| {
-        sum[g] += v;
-        sumsq[g] += v * v;
         count[g] += 1;
+        let delta = v - mean[g];
+        mean[g] += delta / count[g] as f64;
+        let delta2 = v - mean[g];
+        m2[g] += delta * delta2;
     };
     match values.data_type() {
         DataType::Int64 => {
@@ -51,10 +59,52 @@ pub(crate) fn var_state(
         }
     }
     Ok(vec![
-        Arc::new(Float64Array::from(sum)),
-        Arc::new(Float64Array::from(sumsq)),
+        Arc::new(Float64Array::from(mean)),
+        Arc::new(Float64Array::from(m2)),
         Arc::new(Int64Array::from(count)),
     ])
+}
+
+/// Merge partial `(mean, M2, count)` states by group using Chan's parallel algorithm —
+/// the mergeable combine for [`var_state`]. Each concatenated partial row `i` carries one
+/// group's partial mean/M2/count and lands in output group `group_ids[i]`; folding them
+/// with Chan's mean-difference correction is associative and commutative, so partials
+/// merge in any order and single-node == distributed.
+pub(crate) fn merge_welford(
+    mean_in: &ArrayRef,
+    m2_in: &ArrayRef,
+    count_in: &ArrayRef,
+    group_ids: &[u32],
+    num_groups: usize,
+) -> Vec<ArrayRef> {
+    let mean_in = mean_in.as_primitive::<Float64Type>();
+    let m2_in = m2_in.as_primitive::<Float64Type>();
+    let count_in = count_in.as_primitive::<Int64Type>();
+
+    let mut mean = vec![0f64; num_groups];
+    let mut m2 = vec![0f64; num_groups];
+    let mut count = vec![0i64; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        let g = g as usize;
+        let nb = count_in.value(i);
+        if nb == 0 {
+            continue;
+        }
+        let mb = mean_in.value(i);
+        let m2b = m2_in.value(i);
+        let na = count[g];
+        let n = na + nb;
+        let delta = mb - mean[g];
+        // mean += delta * nb / n ; M2 += m2b + delta² * na * nb / n
+        mean[g] += delta * nb as f64 / n as f64;
+        m2[g] += m2b + delta * delta * (na as f64) * (nb as f64) / n as f64;
+        count[g] = n;
+    }
+    vec![
+        Arc::new(Float64Array::from(mean)),
+        Arc::new(Float64Array::from(m2)),
+        Arc::new(Int64Array::from(count)),
+    ]
 }
 
 pub(crate) fn count_non_null(values: &ArrayRef, group_ids: &[u32], num_groups: usize) -> ArrayRef {
@@ -83,16 +133,16 @@ pub(crate) fn count_non_null(values: &ArrayRef, group_ids: &[u32], num_groups: u
     Arc::new(Int64Array::from(counts))
 }
 
-/// Finalize sample variance (or its sqrt for stddev) from (sum, sumsq, count).
-/// `var = (Σx² − (Σx)²/n) / (n − 1)`; null when `n < 2`.
+/// Finalize sample variance (or its sqrt for stddev) from Welford `(mean, M2, count)`.
+/// `var = M2 / (n − 1)`; null when `n < 2`. (The first arg is `mean`, unused here but
+/// kept in the state triple because `covar`/`corr` need it; named `_mean` for clarity.)
 pub(crate) fn finalize_var(
-    sum: &ArrayRef,
-    sumsq: &ArrayRef,
+    _mean: &ArrayRef,
+    m2: &ArrayRef,
     count: &ArrayRef,
     stddev: bool,
 ) -> Result<ArrayRef, RuntimeError> {
-    let sum = sum.as_primitive::<Float64Type>();
-    let sumsq = sumsq.as_primitive::<Float64Type>();
+    let m2 = m2.as_primitive::<Float64Type>();
     let count = count.as_primitive::<Int64Type>();
     let mut b = Float64Builder::with_capacity(count.len());
     for i in 0..count.len() {
@@ -101,10 +151,7 @@ pub(crate) fn finalize_var(
             b.append_null();
             continue;
         }
-        let s = sum.value(i);
-        let ss = sumsq.value(i);
-        let var = (ss - s * s / n as f64) / (n - 1) as f64;
-        let var = var.max(0.0); // guard tiny negatives from float cancellation
+        let var = (m2.value(i) / (n - 1) as f64).max(0.0); // guard tiny negatives
         b.append_value(if stddev { var.sqrt() } else { var });
     }
     Ok(Arc::new(b.finish()))

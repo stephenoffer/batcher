@@ -12,6 +12,7 @@ mod chunk;
 mod html;
 mod json;
 mod minhash;
+mod regex_cache;
 
 /// Evaluate a string function over a Utf8 array (preserving nulls).
 pub(crate) fn eval_str(
@@ -77,7 +78,13 @@ pub(crate) fn eval_str(
                 func: format!("{func:?}"),
                 arg: "replacement",
             })?;
-            Arc::new(map_str(s, |v| v.replace(pat, rep)))
+            // An empty search string matches nothing (DuckDB `replace(s, '', r)` = `s`).
+            // Rust's `str::replace("")` instead splices `rep` between every character.
+            if pat.is_empty() {
+                Arc::new(map_str_borrow(s, |v| v))
+            } else {
+                Arc::new(map_str(s, |v| v.replace(pat, rep)))
+            }
         }
         // With a `pattern`, trim that set of characters (DuckDB `trim(s, chars)` /
         // Polars `strip_chars`); without one, trim ASCII/Unicode whitespace.
@@ -88,7 +95,9 @@ pub(crate) fn eval_str(
                     v.trim_matches(|c| set.contains(&c)).to_string()
                 }))
             }
-            None => Arc::new(map_str(s, |v| v.trim().to_string())),
+            None => Arc::new(map_str(s, |v| {
+                v.trim_matches(is_space_separator).to_string()
+            })),
         },
         StrFunc::LTrim => match pattern {
             Some(chars) => {
@@ -97,7 +106,9 @@ pub(crate) fn eval_str(
                     v.trim_start_matches(|c| set.contains(&c)).to_string()
                 }))
             }
-            None => Arc::new(map_str(s, |v| v.trim_start().to_string())),
+            None => Arc::new(map_str(s, |v| {
+                v.trim_start_matches(is_space_separator).to_string()
+            })),
         },
         StrFunc::RTrim => match pattern {
             Some(chars) => {
@@ -106,22 +117,35 @@ pub(crate) fn eval_str(
                     v.trim_end_matches(|c| set.contains(&c)).to_string()
                 }))
             }
-            None => Arc::new(map_str(s, |v| v.trim_end().to_string())),
+            None => Arc::new(map_str(s, |v| {
+                v.trim_end_matches(is_space_separator).to_string()
+            })),
         },
         StrFunc::Reverse => Arc::new(map_str(s, |v| v.chars().rev().collect())),
         StrFunc::Repeat => {
             let n = start.unwrap_or(0).max(0) as usize;
-            Arc::new(map_str(s, |v| v.repeat(n)))
+            // Guard against `repeat(s, 1e9)` overflowing Arrow's 32-bit string offsets:
+            // a clean error, not an allocator abort / offset-overflow panic.
+            Arc::new(map_str_checked(s, func, |v| {
+                v.len()
+                    .checked_mul(n)
+                    .filter(|&t| t <= MAX_STR_BYTES)
+                    .map(|_| v.repeat(n))
+            })?)
         }
         StrFunc::Lpad => {
             let width = start.unwrap_or(0).max(0) as usize;
             let fill = pattern.unwrap_or(" ");
-            Arc::new(map_str(s, |v| pad(v, width, fill, true)))
+            Arc::new(map_str_checked(s, func, |v| {
+                pad_checked(v, width, fill, true)
+            })?)
         }
         StrFunc::Rpad => {
             let width = start.unwrap_or(0).max(0) as usize;
             let fill = pattern.unwrap_or(" ");
-            Arc::new(map_str(s, |v| pad(v, width, fill, false)))
+            Arc::new(map_str_checked(s, func, |v| {
+                pad_checked(v, width, fill, false)
+            })?)
         }
         StrFunc::Position => {
             let pat = require_pattern(pattern, func)?;
@@ -132,10 +156,19 @@ pub(crate) fn eval_str(
             )
         }
         StrFunc::Right => {
-            let n = start.unwrap_or(0).max(0) as usize;
+            // SQL `right(s, n)`: the last `n` characters for `n >= 0`; for `n < 0`,
+            // everything *except* the first `|n|` characters (DuckDB semantics), e.g.
+            // `right('abcdef', -2) = 'cdef'`. A naive `.max(0)` dropped the negative
+            // case to the empty string.
+            let n = start.unwrap_or(0);
             Arc::new(map_str(s, |v| {
                 let chars: Vec<char> = v.chars().collect();
-                let begin = chars.len().saturating_sub(n);
+                let len = chars.len();
+                let begin = if n < 0 {
+                    (n.unsigned_abs() as usize).min(len)
+                } else {
+                    len.saturating_sub(n as usize)
+                };
                 chars[begin..].iter().collect()
             }))
         }
@@ -159,7 +192,7 @@ pub(crate) fn eval_str(
                 func: format!("{func:?}"),
                 arg: "replacement",
             })?;
-            Arc::new(map_str(s, |v| re.replace(v, rep).into_owned()))
+            Arc::new(regexp_replace_with(s, &re, rep, false))
         }
         StrFunc::RegexpReplaceAll => {
             let re = compile_regex(pattern, func)?;
@@ -167,20 +200,12 @@ pub(crate) fn eval_str(
                 func: format!("{func:?}"),
                 arg: "replacement",
             })?;
-            Arc::new(map_str(s, |v| re.replace_all(v, rep).into_owned()))
+            Arc::new(regexp_replace_with(s, &re, rep, true))
         }
         StrFunc::SplitPart => {
             let delim = require_pattern(pattern, func)?;
             let n = start.unwrap_or(1);
-            Arc::new(map_str(s, |v| {
-                if n < 1 {
-                    return String::new();
-                }
-                v.split(delim)
-                    .nth((n - 1) as usize)
-                    .unwrap_or("")
-                    .to_string()
-            }))
+            Arc::new(map_str_borrow(s, |v| split_part(v, delim, n)))
         }
         StrFunc::RegexpExtract => {
             let re = compile_regex(pattern, func)?;
@@ -341,8 +366,22 @@ pub(crate) fn eval_str(
             for o in s.iter() {
                 match o {
                     Some(v) => {
-                        for part in v.split(delim) {
-                            builder.values().append_value(part);
+                        // An empty delimiter splits into individual characters (DuckDB
+                        // `string_split(s, '')`), not the `["", …, ""]` that Rust's
+                        // `str::split("")` yields. An empty string stays a single `[""]`.
+                        if delim.is_empty() {
+                            if v.is_empty() {
+                                builder.values().append_value("");
+                            } else {
+                                let mut buf = [0u8; 4];
+                                for c in v.chars() {
+                                    builder.values().append_value(c.encode_utf8(&mut buf));
+                                }
+                            }
+                        } else {
+                            for part in v.split(delim) {
+                                builder.values().append_value(part);
+                            }
                         }
                         builder.append(true);
                     }
@@ -407,6 +446,21 @@ pub(crate) fn eval_str(
     Ok(out)
 }
 
+/// Whether `c` is a Unicode space separator (general category `Zs`).
+///
+/// DuckDB's argument-less `trim`/`ltrim`/`rtrim` strip exactly the `Zs` category —
+/// the space *separators* (ASCII space, NBSP, the em/en spaces, ideographic space,
+/// …) — and NOT the C0 control whitespace (tab, newline, carriage return, vertical
+/// tab, form feed) that Rust's `str::trim` (Unicode `White_Space`) also removes.
+/// Matching DuckDB means, e.g., `trim("\t\n")` keeps the tab and newline.
+fn is_space_separator(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0020}' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    )
+}
+
 /// `substring_index(s, delim, count)` — the part of `s` before the `count`-th
 /// occurrence of `delim`. Positive `count` counts delimiters from the left,
 /// negative from the right; `0` yields the empty string (Spark semantics).
@@ -415,13 +469,43 @@ fn substring_index(s: &str, delim: &str, count: i64) -> String {
         return String::new();
     }
     let parts: Vec<&str> = s.split(delim).collect();
-    let n = parts.len() as i64;
+    let n = parts.len();
     if count > 0 {
-        let take = count.min(n) as usize;
+        // `count as usize` is safe (count > 0); clamp to the number of parts. The old
+        // `-count` overflowed for `count == i64::MIN`, panicking on the slice index.
+        let take = (count as usize).min(n);
         parts[..take].join(delim)
     } else {
-        let take = (-count).min(n) as usize;
-        parts[parts.len() - take..].join(delim)
+        let take = (count.unsigned_abs() as usize).min(n);
+        parts[n - take..].join(delim)
+    }
+}
+
+/// `split_part(s, delim, n)` — the `n`-th field (1-based) of `s` split on `delim`.
+/// A negative `n` counts fields from the right (DuckDB/Spark). An empty `delim` splits
+/// into characters. Out-of-range or `n == 0` yields `""`.
+fn split_part<'a>(s: &'a str, delim: &str, n: i64) -> &'a str {
+    if n == 0 {
+        return "";
+    }
+    if delim.is_empty() {
+        let count = s.chars().count() as i64;
+        let idx = if n < 0 { count + n } else { n - 1 };
+        if idx < 0 || idx >= count {
+            return "";
+        }
+        let idx = idx as usize;
+        let lo = s.char_indices().nth(idx).map_or(s.len(), |(b, _)| b);
+        let hi = s.char_indices().nth(idx + 1).map_or(s.len(), |(b, _)| b);
+        return &s[lo..hi];
+    }
+    let parts: Vec<&str> = s.split(delim).collect();
+    let len = parts.len() as i64;
+    let idx = if n < 0 { len + n } else { n - 1 };
+    if idx < 0 || idx >= len {
+        ""
+    } else {
+        parts[idx as usize]
     }
 }
 
@@ -431,9 +515,12 @@ fn substring_index(s: &str, delim: &str, count: i64) -> String {
 fn overlay(s: &str, rep: &str, pos: i64, length: Option<i64>) -> String {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len() as i64;
-    let start = (pos - 1).clamp(0, n) as usize;
+    // Saturating arithmetic throughout: `pos`/`length` are user-supplied i64s, so
+    // `pos - 1` and `start + len` overflowed on the extremes (`i64::MIN`, `i64::MAX`),
+    // panicking. Clamped to `[0, n]` the result is identical for in-range inputs.
+    let start = pos.saturating_sub(1).clamp(0, n) as usize;
     let len = length.unwrap_or(rep.chars().count() as i64).max(0);
-    let end = ((start as i64) + len).clamp(0, n) as usize;
+    let end = (start as i64).saturating_add(len).clamp(0, n) as usize;
     let mut out: String = chars[..start].iter().collect();
     out.push_str(rep);
     out.extend(chars[end..].iter());
@@ -441,12 +528,16 @@ fn overlay(s: &str, rep: &str, pos: i64, length: Option<i64>) -> String {
 }
 
 /// Levenshtein edit distance between `a` and `b` (insert/delete/substitute = 1),
-/// over Unicode scalar values. Classic two-row dynamic-programming kernel.
+/// over UTF-8 **bytes**. DuckDB (and PostgreSQL's `fuzzystrmatch`) define `levenshtein`
+/// on octets, so a multi-byte codepoint counts as several edits — e.g.
+/// `levenshtein('héllo', 'abc') = 6`, not the 5 a codepoint-wise distance gives. Matching
+/// the oracle byte-for-byte is what keeps a differential test against DuckDB green (and it
+/// is faster: no per-string `Vec<char>` materialization). Classic two-row DP kernel.
 fn levenshtein(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
+    let b = b.as_bytes();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     let mut curr = vec![0usize; b.len() + 1];
-    for (i, ca) in a.chars().enumerate() {
+    for (i, ca) in a.bytes().enumerate() {
         curr[0] = i + 1;
         for (j, &cb) in b.iter().enumerate() {
             let cost = if ca == cb { 0 } else { 1 };
@@ -579,31 +670,72 @@ fn char_position(v: &str, pat: &str) -> i64 {
     }
 }
 
+/// The largest byte length a single Arrow `Utf8` value can hold: its offsets are
+/// `i32`, so a value (or the array's running total) beyond `i32::MAX` overflows the
+/// offset buffer — an allocator abort or a builder panic. String functions whose
+/// output length is user-controlled (`repeat`, `lpad`, `rpad`) guard against it and
+/// return a clean error instead.
+const MAX_STR_BYTES: usize = i32::MAX as usize;
+
 /// Pad `v` to `width` characters with `fill` cycled (left or right). If `v` is
 /// already at least `width` chars it is truncated to the first `width` (DuckDB
 /// `lpad`/`rpad` semantics). An empty `fill` cannot pad, so `v` is returned as-is.
-fn pad(v: &str, width: usize, fill: &str, left: bool) -> String {
+/// Returns `None` if the padded result would exceed [`MAX_STR_BYTES`].
+fn pad_checked(v: &str, width: usize, fill: &str, left: bool) -> Option<String> {
     let chars: Vec<char> = v.chars().collect();
     if chars.len() >= width {
-        return chars[..width].iter().collect();
+        return Some(chars[..width].iter().collect());
     }
     let fill_chars: Vec<char> = fill.chars().collect();
     if fill_chars.is_empty() {
-        return v.to_string();
+        return Some(v.to_string());
     }
     let pad_len = width - chars.len();
+    let max_fill_bytes = fill_chars.iter().map(|c| c.len_utf8()).max().unwrap_or(1);
+    // Upper bound on the output before allocating the padding — reject overflow early.
+    if pad_len.checked_mul(max_fill_bytes)?.checked_add(v.len())? > MAX_STR_BYTES {
+        return None;
+    }
     let padding: String = (0..pad_len)
         .map(|i| fill_chars[i % fill_chars.len()])
         .collect();
-    if left {
+    Some(if left {
         format!("{padding}{v}")
     } else {
         format!("{v}{padding}")
-    }
+    })
 }
 
 fn map_str(s: &StringArray, f: impl Fn(&str) -> String) -> StringArray {
     s.iter().map(|o| o.map(&f)).collect()
+}
+
+/// `map_str` whose closure may fail: `None` becomes a clean [`ExprError::InvalidArgument`]
+/// (a result too large for Arrow's 32-bit offsets), never an allocator abort or panic.
+fn map_str_checked(
+    s: &StringArray,
+    func: StrFunc,
+    f: impl Fn(&str) -> Option<String>,
+) -> Result<StringArray, ExprError> {
+    use arrow::array::{Array, StringBuilder};
+    let mut b = StringBuilder::with_capacity(s.len(), s.value_data().len());
+    for o in s.iter() {
+        match o {
+            Some(v) => match f(v) {
+                Some(r) => b.append_value(r),
+                None => {
+                    return Err(ExprError::InvalidArgument {
+                        func: format!("{func:?}"),
+                        reason: format!(
+                            "result exceeds the maximum string length of {MAX_STR_BYTES} bytes"
+                        ),
+                    });
+                }
+            },
+            None => b.append_null(),
+        }
+    }
+    Ok(b.finish())
 }
 
 /// `map_str` for functions whose result is a *slice* of the input row (e.g.
@@ -632,11 +764,19 @@ fn map_bool(s: &StringArray, f: impl Fn(&str) -> bool) -> BooleanArray {
 /// multi-byte UTF-8.
 fn substr_slice(v: &str, start: i64, length: Option<i64>) -> &str {
     let n = v.chars().count() as i64;
-    let s = if start < 0 { n + start + 1 } else { start }; // 1-based, may be <= 0
+    // Saturating arithmetic: `start`/`length` are user i64s, so `n + start + 1`,
+    // `s + len - 1`, etc. overflowed at the i64 extremes (panic in debug, wrap in
+    // release — a wrapped window could even yield a wrong slice). Clamped to `[1, n]`
+    // the saturated bounds are identical for in-range inputs.
+    let s = if start < 0 {
+        n.saturating_add(start).saturating_add(1)
+    } else {
+        start
+    }; // 1-based, may be <= 0
     let (lo, hi) = match length {
         None => (s, n), // to the end, inclusive
-        Some(len) if len >= 0 => (s, s + len - 1),
-        Some(len) => (s + len, s - 1), // negative length flips the window
+        Some(len) if len >= 0 => (s, s.saturating_add(len).saturating_sub(1)),
+        Some(len) => (s.saturating_add(len), s.saturating_sub(1)), // negative length flips
     };
     let (lo, hi) = (lo.max(1), hi.min(n)); // clip to [1, n] inclusive
     if hi < lo {
@@ -677,7 +817,7 @@ fn xxhash64(bytes: &[u8]) -> u64 {
 /// `regex::escape`). The whole pattern is anchored with `^…$`, and `(?s)` makes
 /// `.` match newlines too — matching SQL's "any character" semantics. `ilike`
 /// additionally prepends `(?i)` for case-insensitivity.
-fn like_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, ExprError> {
+fn like_regex(pattern: &str, case_insensitive: bool) -> Result<Arc<regex::Regex>, ExprError> {
     let mut re = String::with_capacity(pattern.len() + 8);
     if case_insensitive {
         re.push_str("(?i)");
@@ -702,14 +842,94 @@ fn like_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, Exp
         re.push_str(&regex::escape(&literal));
     }
     re.push('$');
-    regex::Regex::new(&re).map_err(|_| ExprError::InvalidRegex { pattern: re })
+    // Memoized: `eval_str` runs once per morsel, so without the cache a `LIKE` over a large
+    // column rebuilt this automaton for every 16,384 rows. Desugaring the pattern is O(len) and
+    // stays here; the compile is the expensive half and is shared.
+    regex_cache::compile_cached(&re).ok_or(ExprError::InvalidRegex { pattern: re })
 }
 
 /// Compile the (required) regex `pattern` of a regexp string function.
-fn compile_regex(pattern: Option<&str>, func: StrFunc) -> Result<regex::Regex, ExprError> {
+///
+/// Memoized on the pattern source — see [`regex_cache`]. The pattern is a plan literal, so the
+/// cache is keyed by a handful of strings per query, not one per row.
+fn compile_regex(pattern: Option<&str>, func: StrFunc) -> Result<Arc<regex::Regex>, ExprError> {
     let pat = require_pattern(pattern, func)?;
-    regex::Regex::new(pat).map_err(|_| ExprError::InvalidRegex {
+    regex_cache::compile_cached(pat).ok_or_else(|| ExprError::InvalidRegex {
         pattern: pat.to_string(),
+    })
+}
+
+/// A DuckDB/RE2-style `regexp_replace` rewrite template, as opposed to the `regex`
+/// crate's own `$1`/`$name` syntax.
+///
+/// In RE2 (what DuckDB uses) the replacement escapes are `\0`..`\9` — `\0` is the whole
+/// match, `\1`..`\9` are capture groups — `\\` is a literal backslash, and **every other
+/// character, including `$`, is literal**. Passing the template straight to
+/// `regex::Regex::replace` instead interprets `$1` as a group and leaves `\1` untouched,
+/// so `regexp_replace('ab', '(a)(b)', '\2\1')` returned the literal `\2\1` rather than
+/// `ba`. This wraps the template so the substitution matches DuckDB.
+struct Re2Rewrite<'a>(&'a str);
+
+impl regex::Replacer for Re2Rewrite<'_> {
+    fn replace_append(&mut self, caps: &regex::Captures, dst: &mut String) {
+        let mut chars = self.0.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some(d) if d.is_ascii_digit() => {
+                        if let Some(m) = caps.get(d as usize - '0' as usize) {
+                            dst.push_str(m.as_str());
+                        }
+                    }
+                    Some('\\') => dst.push('\\'),
+                    // Unreachable for a template that passed `re2_rewrite_valid`; kept
+                    // total so the function never panics on a hand-written IR document.
+                    Some(other) => dst.push(other),
+                    None => {}
+                }
+            } else {
+                dst.push(c);
+            }
+        }
+    }
+}
+
+/// Whether a rewrite `template` is valid for a regex with `max_group` capture groups.
+///
+/// RE2 rejects a template whose only escapes are not `\0`..`\9` or `\\`, or that
+/// references a group past the pattern's count; DuckDB then returns the input row
+/// **unchanged**. Mirrors that so an invalid template is a no-op, not a wrong answer.
+fn re2_rewrite_valid(template: &str, max_group: usize) -> bool {
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(d) if d.is_ascii_digit() => {
+                    if (d as usize - '0' as usize) > max_group {
+                        return false;
+                    }
+                }
+                Some('\\') => {}
+                _ => return false, // `\<non-digit>` or a trailing backslash
+            }
+        }
+    }
+    true
+}
+
+/// Apply a `regexp_replace`/`regexp_replace_all` with DuckDB rewrite semantics.
+/// `global` picks first-match vs all-matches. An invalid rewrite template leaves each
+/// row unchanged (DuckDB behaviour).
+fn regexp_replace_with(s: &StringArray, re: &regex::Regex, rep: &str, global: bool) -> StringArray {
+    if !re2_rewrite_valid(rep, re.captures_len().saturating_sub(1)) {
+        return map_str_borrow(s, |v| v);
+    }
+    map_str(s, |v| {
+        if global {
+            re.replace_all(v, Re2Rewrite(rep)).into_owned()
+        } else {
+            re.replace(v, Re2Rewrite(rep)).into_owned()
+        }
     })
 }
 
@@ -887,5 +1107,271 @@ mod tests {
             fnv1a64(b"customer-42|2024-06-23")
         );
         assert_ne!(fnv1a64(b"a"), fnv1a64(b"b"));
+    }
+
+    /// Argument-less `trim`/`ltrim`/`rtrim` strip the Unicode `Zs` space-separator
+    /// category (matching DuckDB), NOT the C0 control whitespace (tab/newline/CR/…)
+    /// that Rust's `str::trim` also removes.
+    #[test]
+    fn trim_strips_only_space_separators_like_duckdb() {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, StringArray};
+        use std::sync::Arc;
+        // "\t\n" is pure control whitespace → DuckDB (and now Batcher) keep it whole.
+        // " \u{a0}x\u{3000} " mixes ASCII space, NBSP, ideographic space around 'x'.
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("\t\n"),
+            Some(" \u{a0}x\u{3000} "),
+            Some("\tx\t"),
+        ]));
+        let val = |f, row: usize| {
+            let out = eval_str(f, &arr, None, None, None, None).unwrap();
+            out.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row)
+                .to_string()
+        };
+        assert_eq!(val(StrFunc::Trim, 0), "\t\n"); // controls kept (was "")
+        assert_eq!(val(StrFunc::Trim, 1), "x"); // Zs stripped both sides
+        assert_eq!(val(StrFunc::Trim, 2), "\tx\t"); // tabs kept (was "x")
+        assert_eq!(val(StrFunc::LTrim, 1), "x\u{3000} ");
+        assert_eq!(val(StrFunc::RTrim, 1), " \u{a0}x");
+        assert_eq!(val(StrFunc::LTrim, 0), "\t\n");
+        assert_eq!(val(StrFunc::RTrim, 2), "\tx\t");
+    }
+
+    use super::{overlay, split_part, substring_index};
+
+    /// `right(s, n)` with a negative `n` drops the first `|n|` characters (DuckDB),
+    /// where the old `.max(0)` collapsed it to the empty string.
+    #[test]
+    fn right_negative_drops_the_leading_chars() {
+        use crate::StrFunc;
+        use arrow::array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("abcdef"), Some("中文字")]));
+        let out = eval_str(StrFunc::Right, &arr, None, None, Some(-2), None).unwrap();
+        let got = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(got.value(0), "cdef"); // was "" before the fix
+        assert_eq!(got.value(1), "字"); // char-based, not byte-based
+                                        // |n| beyond the length yields the empty string, not a panic.
+        let out = eval_str(StrFunc::Right, &arr, None, None, Some(i64::MIN), None).unwrap();
+        let got = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(got.value(0), "");
+    }
+
+    /// `split_part` counts from the right for a negative index and splits into
+    /// characters for an empty delimiter (both DuckDB semantics).
+    #[test]
+    fn split_part_negative_and_empty_delimiter() {
+        assert_eq!(split_part("a-b-c", "-", -1), "c"); // was ""
+        assert_eq!(split_part("a-b-c", "-", -3), "a");
+        assert_eq!(split_part("a-b-c", "-", -4), "");
+        assert_eq!(split_part("a-b-c", "-", 0), "");
+        assert_eq!(split_part("abc", "", 2), "b"); // was "a" (Rust split("") artifact)
+        assert_eq!(split_part("中a", "", 1), "中");
+        assert_eq!(split_part("中a", "", 2), "a");
+        // i64::MIN must not overflow.
+        assert_eq!(split_part("a-b-c", "-", i64::MIN), "");
+    }
+
+    /// An empty delimiter splits into individual characters (DuckDB), not the
+    /// `["", …, ""]` that Rust's `str::split("")` produces.
+    #[test]
+    fn split_empty_delimiter_yields_characters() {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, ListArray, StringArray};
+        use std::sync::Arc;
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("abc"), Some("中a"), Some("")]));
+        let out = eval_str(StrFunc::Split, &arr, Some(""), None, None, None).unwrap();
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let row = |i: usize| {
+            let v = list.value(i);
+            let v = v.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..v.len())
+                .map(|j| v.value(j).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(row(0), ["a", "b", "c"]);
+        assert_eq!(row(1), ["中", "a"]);
+        assert_eq!(row(2), [""]);
+    }
+
+    /// `replace(s, '', r)` returns `s` unchanged (DuckDB); Rust's `str::replace("")`
+    /// would splice `r` between every character.
+    #[test]
+    fn replace_empty_pattern_is_a_noop() {
+        use crate::StrFunc;
+        use arrow::array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("abc"), Some("")]));
+        let out = eval_str(StrFunc::Replace, &arr, Some(""), Some("X"), None, None).unwrap();
+        let got = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(got.value(0), "abc"); // was "XaXbXcX"
+        assert_eq!(got.value(1), "");
+    }
+
+    /// `substring_index` with `i64::MIN` must not overflow (`-count` panicked before).
+    #[test]
+    fn substring_index_extremes_do_not_overflow() {
+        assert_eq!(substring_index("a-b-c", "-", 2), "a-b");
+        assert_eq!(substring_index("a-b-c", "-", -2), "b-c");
+        assert_eq!(substring_index("a-b-c", "-", i64::MIN), "a-b-c");
+        assert_eq!(substring_index("a-b-c", "-", i64::MAX), "a-b-c");
+    }
+
+    /// `overlay` at the i64 extremes clamps instead of overflowing (`pos - 1` and
+    /// `start + len` panicked before).
+    #[test]
+    fn overlay_extremes_do_not_overflow() {
+        assert_eq!(overlay("hello", "XY", 2, None), "hXYlo");
+        assert_eq!(overlay("hello", "XY", i64::MAX, None), "helloXY");
+        // pos clamps to the front; the default length (2) still overwrites two chars.
+        assert_eq!(overlay("hello", "XY", i64::MIN, None), "XYllo");
+        assert_eq!(overlay("hello", "XY", 2, Some(i64::MAX)), "hXY");
+        assert_eq!(overlay("hello", "XY", 2, Some(i64::MIN)), "hXYello");
+    }
+
+    /// `repeat`/`lpad`/`rpad` with an absurd count return a clean error rather than
+    /// aborting the process on a failed multi-gigabyte allocation.
+    #[test]
+    fn oversized_output_errors_cleanly() {
+        use crate::StrFunc;
+        use arrow::array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("abcdef")]));
+        assert!(eval_str(StrFunc::Repeat, &arr, None, None, Some(1_000_000_000), None).is_err());
+        assert!(eval_str(StrFunc::Lpad, &arr, Some("*"), None, Some(i64::MAX), None).is_err());
+        assert!(eval_str(StrFunc::Rpad, &arr, Some("*"), None, Some(i64::MAX), None).is_err());
+        // A legitimate, bounded size still succeeds.
+        assert!(eval_str(StrFunc::Repeat, &arr, None, None, Some(3), None).is_ok());
+    }
+
+    /// `substr` with i64-extreme start/length clips to the string instead of
+    /// overflowing (panic in debug, wrong slice in release).
+    #[test]
+    fn substr_extremes_do_not_overflow() {
+        use crate::StrFunc;
+        use arrow::array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("abcdef")]));
+        let one = |start: i64, len: Option<i64>| {
+            let out = eval_str(StrFunc::Substr, &arr, None, None, Some(start), len).unwrap();
+            out.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+                .to_string()
+        };
+        assert_eq!(one(1, Some(i64::MAX)), "abcdef");
+        assert_eq!(one(2, Some(i64::MAX)), "bcdef");
+        assert_eq!(one(i64::MIN, Some(3)), "");
+        assert_eq!(one(i64::MAX, Some(3)), "");
+        assert_eq!(one(3, Some(i64::MIN)), "ab");
+    }
+
+    /// `levenshtein` counts UTF-8 **bytes**, matching DuckDB (a codepoint-wise distance
+    /// would return 5 for `'héllo'` vs `'abc'`; DuckDB and PostgreSQL return 6).
+    #[test]
+    fn levenshtein_is_byte_based_like_duckdb() {
+        use super::levenshtein;
+        assert_eq!(levenshtein("héllo", "abc"), 6); // 'é' is two bytes → 6, not 5
+        assert_eq!(levenshtein("é", "e"), 2); // 0xC3 0xA9 vs 0x65
+        assert_eq!(levenshtein("café", "cafe"), 2);
+        assert_eq!(levenshtein("日本", "日"), 3); // 6 bytes vs 3 bytes
+                                                  // ASCII and empties are unaffected.
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("abc", ""), 3);
+        assert_eq!(levenshtein("abc", "abc"), 0);
+    }
+
+    /// `regexp_replace`/`regexp_replace_all` use DuckDB's RE2 rewrite template: `\1`..`\9`
+    /// are capture-group backreferences, `\0` the whole match, `\\` a literal backslash,
+    /// and `$` is literal. The old code passed the template to the `regex` crate verbatim,
+    /// so `\2\1` came out literal and `$1` was (wrongly) interpreted as a group.
+    #[test]
+    fn regexp_replace_uses_re2_backreferences() {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, StringArray};
+        use std::sync::Arc;
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("ab"),
+            Some("xaby"),
+            Some("abab"),
+        ]));
+        let vals = |f, pat: &str, rep: &str| {
+            let out = eval_str(f, &arr, Some(pat), Some(rep), None, None).unwrap();
+            let a = out.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..a.len())
+                .map(|i| a.value(i).to_string())
+                .collect::<Vec<_>>()
+        };
+        // Swap the two captured letters, first match only vs global.
+        assert_eq!(
+            vals(StrFunc::RegexpReplace, "(a)(b)", r"\2\1"),
+            ["ba", "xbay", "baab"]
+        );
+        assert_eq!(
+            vals(StrFunc::RegexpReplaceAll, "(a)(b)", r"\2\1"),
+            ["ba", "xbay", "baba"]
+        );
+        // `\0` is the whole match; `$` is a literal character.
+        let one: ArrayRef = Arc::new(StringArray::from(vec![Some("a")]));
+        let out = eval_str(
+            StrFunc::RegexpReplace,
+            &one,
+            Some("(a)"),
+            Some(r"[\0]"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out.as_any().downcast_ref::<StringArray>().unwrap().value(0),
+            "[a]"
+        );
+        let out = eval_str(
+            StrFunc::RegexpReplace,
+            &one,
+            Some("a"),
+            Some("$1"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out.as_any().downcast_ref::<StringArray>().unwrap().value(0),
+            "$1"
+        );
+        // An invalid rewrite (`\q`, or a group past the pattern's count) leaves the row
+        // unchanged, like DuckDB.
+        let out = eval_str(
+            StrFunc::RegexpReplace,
+            &one,
+            Some("a"),
+            Some(r"\q"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out.as_any().downcast_ref::<StringArray>().unwrap().value(0),
+            "a"
+        );
+        let out = eval_str(
+            StrFunc::RegexpReplace,
+            &one,
+            Some("(a)"),
+            Some(r"\9"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out.as_any().downcast_ref::<StringArray>().unwrap().value(0),
+            "a"
+        );
     }
 }

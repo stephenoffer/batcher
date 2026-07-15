@@ -123,7 +123,11 @@ impl FusedAcc<'_> {
             }
             FusedAcc::SumDecimal { v, sums, valid, .. } => {
                 if v.is_valid(i) {
-                    sums[g] += v.value(i);
+                    // checked_add: a decimal SUM past i128 range errors, not wraps (as the
+                    // i64 SumInt arm above does).
+                    sums[g] = sums[g]
+                        .checked_add(v.value(i))
+                        .ok_or(RuntimeError::SumOverflow)?;
                     valid[g] = true;
                 }
             }

@@ -249,7 +249,12 @@ class DeltaSnapshot:
         try:
             built = self._pruned_dataset(predicate)
         except Exception:
-            dataset = self._table.to_pyarrow_dataset()
+            # `table`, not `_table`: this is a slots dataclass with no such field, and the
+            # live delta-rs handle is the lazily-pinned property. Written as `_table` this
+            # fallback raised `AttributeError` itself — so the safety net that is supposed to
+            # keep correctness independent of the pruning optimization had a hole straight
+            # through it, and only the pruned path ever actually worked.
+            dataset = self.table.to_pyarrow_dataset()
             built = dataset, {f.path: f for f in dataset.get_fragments()}
         if predicate is None:
             self._full_index = built
@@ -294,10 +299,24 @@ class DeltaSnapshot:
         return targets[0][0], [t[1] for t in targets]
 
     def _absolute(self, path: str) -> str:
-        """An add-action's table-relative path as an absolute URI."""
-        if "://" in path or path.startswith("/"):
-            return path
-        return f"{self.table_uri.rstrip('/')}/{path}"
+        """An add-action's table-relative path as an absolute *filesystem* URI.
+
+        A Delta ``add.path`` is a URI: per the protocol it is URL-encoded and must be
+        **decoded** to get the physical data file path. This matters the moment a
+        partition value contains a URL-special character. Delta writes the value into the
+        directory name Hive-encoded once (``a/b`` → ``p=a%2Fb``), and the log then encodes
+        that path again (``p=a%252Fb``). Handing the raw log path straight to the
+        filesystem looks for ``p=a%252Fb``, which does not exist — so every partitioned
+        table whose partition value held a ``/``, a space, or a ``%`` raised
+        `FileNotFoundError` at read, even though delta-rs's own reader (which decodes)
+        read it fine. Decoding here restores the physical path the file was written to.
+        """
+        from urllib.parse import unquote
+
+        decoded = unquote(path)
+        if "://" in decoded or decoded.startswith("/"):
+            return decoded
+        return f"{self.table_uri.rstrip('/')}/{decoded}"
 
     def _partition_expressions(self, manifest: Any, schema: pa.Schema, pds: Any) -> list[Any]:
         """One partition expression per file, from its recorded partition values.

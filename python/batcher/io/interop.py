@@ -54,8 +54,28 @@ def _source_from_table(table: pa.Table) -> Source:
     """
     batches = table.to_batches()
     if not batches:
-        batches = [pa.RecordBatch.from_arrays([], schema=table.schema)]
+        # A zero-row table yields no batches; build one empty batch that carries the
+        # schema. It MUST have one (empty) array per field — `from_arrays([], schema)`
+        # with a non-empty schema raises "Schema and number of arrays unequal".
+        empty = [pa.array([], type=f.type) for f in table.schema]
+        batches = [pa.RecordBatch.from_arrays(empty, schema=table.schema)]
     return InMemorySource(batches)
+
+
+def _table_from_rows(rows: list[dict[str, Any]]) -> pa.Table:
+    """Build a table from row dicts using the ORDERED UNION of keys as the schema.
+
+    ``pa.Table.from_pylist`` infers the schema from the first row alone, so a key
+    that appears only in a later row is silently dropped and its values lost. This
+    takes every key across every row (first-seen order) and fills missing cells with
+    null — the documented row-ingestion contract. It is column-oriented, so each
+    column's type is inferred independently.
+    """
+    keys: dict[str, None] = {}
+    for row in rows:
+        for k in row:
+            keys.setdefault(k)
+    return pa.table({k: [row.get(k) for row in rows] for k in keys})
 
 
 def _missing(framework: str, extra: str) -> BackendError:
@@ -89,7 +109,7 @@ def from_pylist(rows: list[dict[str, Any]]) -> Source:
     The row-major counterpart to `from_pydict` — the natural shape for JSON records or
     API responses. Missing keys become nulls; the union of keys is the schema.
     """
-    return _source_from_table(pa.Table.from_pylist(rows))
+    return _source_from_table(_table_from_rows(rows))
 
 
 def from_items(items: list[Any], *, column: str = "item") -> Source:
@@ -101,7 +121,7 @@ def from_items(items: list[Any], *, column: str = "item") -> Source:
     """
     rows = list(items)
     if rows and all(isinstance(r, dict) for r in rows):
-        return _source_from_table(pa.Table.from_pylist(rows))
+        return _source_from_table(_table_from_rows(rows))
     return _source_from_table(pa.table({column: rows}))
 
 
@@ -131,12 +151,18 @@ def from_numpy(ndarray: Any, *, column: str = "data") -> Source:
 
 # ---- optional-framework adapters -----------------------------------------
 def from_pandas(df: Any) -> Source:
-    """Build a `Source` from a pandas `DataFrame` via ``pa.Table.from_pandas``."""
+    """Build a `Source` from a pandas `DataFrame` via ``pa.Table.from_pandas``.
+
+    The pandas index is dropped (``preserve_index=False``) — matching DuckDB, Polars,
+    and Ray Data. Keeping it would leak pyarrow's internal ``__index_level_0__``
+    column (or the index name) into the public schema as a phantom extra column; call
+    ``df.reset_index()`` first to ingest the index as a real column.
+    """
     try:
         import pandas  # noqa: F401
     except ImportError as exc:
         raise _missing("pandas", "pandas") from exc
-    return _source_from_table(pa.Table.from_pandas(df))
+    return _source_from_table(pa.Table.from_pandas(df, preserve_index=False))
 
 
 def from_polars(df: Any) -> Source:

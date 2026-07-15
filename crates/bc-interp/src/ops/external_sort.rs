@@ -299,8 +299,164 @@ fn stream_merge_group(
 }
 
 /// Evaluate the sort-key expressions of `batch` into their key columns.
+///
+/// A `Null`-typed (all-null) key is coerced to a constant column so arrow's `RowConverter`
+/// can encode it — the same substitution the in-memory sort applies (see
+/// [`super::coerce_null_sort_key`]) — so the spilling merge orders rows identically to the
+/// serial oracle. Both the converter's [`SortField`]s (built from these arrays' types) and
+/// the per-batch row conversion go through here, so they stay aligned.
 fn eval_sort_keys(batch: &RecordBatch, keys: &[SortKey]) -> Result<Vec<ArrayRef>, InterpError> {
     keys.iter()
-        .map(|k| k.expr.eval(batch).map_err(InterpError::from))
+        .map(|k| {
+            k.expr
+                .eval(batch)
+                .map(super::coerce_null_sort_key)
+                .map_err(InterpError::from)
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Float64Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use bc_runtime::agg::spill::SpillCodec;
+    use std::sync::Arc;
+
+    /// A `(id: Int64, f: Float64)` batch.
+    fn fbatch(ids: &[i64], fs: &[f64]) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("f", DataType::Float64, true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Float64Array::from(fs.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The exact (id, f-bits) sequence a set of batches produces, in row order — so a
+    /// sort can be compared order-dependently (a multiset compare cannot see a sort bug).
+    fn seq(batches: &[RecordBatch]) -> Vec<(i64, u64)> {
+        let mut out = Vec::new();
+        for b in batches {
+            let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let fs = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                out.push((ids.value(i), fs.value(i).to_bits()));
+            }
+        }
+        out
+    }
+
+    /// The external (spilling) merge sort must equal the in-memory `sort_batch` oracle
+    /// **row-for-row** on a NaN/-0.0/0.0-bearing float key with ties — the exact shape
+    /// CLAUDE.md flags (a float sort key under spill shipping unsorted). The in-run
+    /// per-morsel sort uses arrow `lexsort`; the cross-run merge uses the arrow row
+    /// format — they must agree on where NaN and -0.0 sit, or the merge de-sorts.
+    fn assert_external_matches_inmemory(descending: bool) {
+        let nan = f64::NAN;
+        // Ties on `f` (repeated 2.0, repeated 0.0/-0.0) exercise stability; NaN and the
+        // signed zeros exercise the total-order edges.
+        let ids: Vec<i64> = (0..12).collect();
+        let fs: Vec<f64> = vec![
+            2.0, nan, -0.0, 5.0, 2.0, 0.0, -3.0, nan, 1.0, 2.0, 0.0, -0.0,
+        ];
+        let whole = fbatch(&ids, &fs);
+        let keys = vec![SortKey {
+            expr: bc_expr::Expr::Col { name: "f".into() },
+            descending,
+            nulls_first: false,
+        }];
+        let oracle = super::super::sort_batch(&whole, &keys, None).unwrap();
+
+        // Split into 5 runs of non-uniform size (a count that is NOT a multiple of the
+        // run size) so several merge passes run at fan-in 2.
+        let parts: Vec<RecordBatch> = vec![
+            fbatch(&ids[0..3], &fs[0..3]),
+            fbatch(&ids[3..5], &fs[3..5]),
+            fbatch(&ids[5..8], &fs[5..8]),
+            fbatch(&ids[8..9], &fs[8..9]),
+            fbatch(&ids[9..12], &fs[9..12]),
+        ];
+        let dir = std::env::temp_dir().join(format!(
+            "bc_extsort_float_{}_{}",
+            descending,
+            std::process::id()
+        ));
+        let (sorted, _) = external_merge_sort(parts, &keys, &dir, 2, SpillCodec::None).unwrap();
+        assert_eq!(
+            seq(std::slice::from_ref(&oracle)),
+            seq(&sorted),
+            "external merge sort diverged from in-memory sort (descending={descending})"
+        );
+    }
+
+    #[test]
+    fn external_sort_float_nan_signed_zero_ties_ascending() {
+        assert_external_matches_inmemory(false);
+    }
+
+    #[test]
+    fn external_sort_float_nan_signed_zero_ties_descending() {
+        assert_external_matches_inmemory(true);
+    }
+
+    /// A `Null`-typed leading sort key must not crash the spilling merge — arrow's
+    /// `RowConverter` rejects the `Null` type just as its sort kernels do. The key is coerced
+    /// to a constant (all-equal), so the merge orders by the real secondary key `id`, matching
+    /// the in-memory oracle row-for-row.
+    #[test]
+    fn external_sort_null_typed_leading_key() {
+        use arrow::array::NullArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Null, true),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let mk = |ids: &[i64]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(NullArray::new(ids.len())) as ArrayRef,
+                    Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        };
+        // ORDER BY n, id — n is all-null (all-equal), so this orders by id ascending.
+        let keys = vec![
+            SortKey {
+                expr: bc_expr::Expr::Col { name: "n".into() },
+                descending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                expr: bc_expr::Expr::Col { name: "id".into() },
+                descending: false,
+                nulls_first: false,
+            },
+        ];
+        let parts = vec![mk(&[5, 2, 9]), mk(&[1, 7]), mk(&[3, 8, 4, 6])];
+        let dir = std::env::temp_dir().join(format!("bc_extsort_null_{}", std::process::id()));
+        let (sorted, _) = external_merge_sort(parts, &keys, &dir, 2, SpillCodec::None).unwrap();
+        let ids: Vec<i64> = sorted
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
 }

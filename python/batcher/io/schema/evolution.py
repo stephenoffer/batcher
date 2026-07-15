@@ -113,7 +113,20 @@ def normalize_batch(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
     for field in target:
         if field.name in batch.schema.names:
             arr = batch.column(field.name)
-            cols.append(arr if arr.type.equals(field.type) else pc.cast(arr, field.type))
+            if arr.type.equals(field.type):
+                cols.append(arr)
+            else:
+                # `promote` picks `float64` for an int/float column mix — its one
+                # deliberately-lossy widening (a column stored as int in older files,
+                # float in newer ones). A *safe* cast rejects any int64 above 2^53 that
+                # float64 cannot hold exactly, so it would raise on exactly the data the
+                # lattice already decided to coerce. DuckDB coerces such a union to
+                # double (large ints rounded to the nearest float); match it. Every other
+                # promotion the lattice makes is lossless and stays a safe cast.
+                lossy_int_to_float = pa.types.is_integer(arr.type) and pa.types.is_floating(
+                    field.type
+                )
+                cols.append(pc.cast(arr, field.type, safe=not lossy_int_to_float))
         else:
             cols.append(pa.nulls(batch.num_rows, type=field.type))
     return pa.RecordBatch.from_arrays(cols, schema=target)

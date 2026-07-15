@@ -54,6 +54,27 @@ def _memoize_noarg(fn, slot: str):
     return wrapper
 
 
+def _reject_duplicate_aliases(aliases: list[str], *, what: str) -> None:
+    """Raise `PlanError` if `aliases` names a column more than once.
+
+    A relation's output column names must be unique: a duplicate silently collapses
+    when the result is materialized to a name-keyed structure (``to_pydict``), losing
+    one of the columns. Rejecting at build time (as Polars does) turns that silent data
+    loss into an actionable error. `what` labels the site (e.g. ``"select"``).
+    """
+    seen: set[str] = set()
+    dups: list[str] = []
+    for name in aliases:
+        if name in seen and name not in dups:
+            dups.append(name)
+        seen.add(name)
+    if dups:
+        raise PlanError(
+            f"{what} would produce duplicate output column(s) {dups}; each output column "
+            "needs a distinct name — rename one with .alias('...') or a keyword"
+        )
+
+
 def _validate_refs(expr: Expr, available: set[str], *, what: str) -> None:
     """Raise `PlanError` if `expr` references a column not in `available`.
 

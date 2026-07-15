@@ -283,9 +283,11 @@ class SecurityCatalog:
     def mask_for(self, table: str, column: str, principal: Principal) -> MaskFn | None:
         """The mask to read `table`.`column` through, or None to read it raw.
 
-        An explicit `mask_column` wins over any `mask_tag`; among tags, the first
-        matching tag in sorted order wins, so resolution is deterministic regardless of
-        the order tags were declared in.
+        An explicit `mask_column` wins over any `mask_tag`; among tags, the first tag in
+        sorted order whose mask *applies to this principal* wins, so resolution is
+        deterministic regardless of the order tags were declared in. A column may carry
+        several sensitivity tags: being exempt from one tag's mask does not grant raw
+        access while another tag still masks it — the strictest applicable tag governs.
 
         Examples:
             .. doctest::
@@ -315,7 +317,13 @@ class SecurityCatalog:
             tag_mask = self._tag_masks.get(tag)
             if tag_mask is None:
                 continue
-            return None if principal.has_any_role(tag_mask.exempt_roles) else tag_mask.mask
+            # An exemption from *this* tag's mask does not free the column: a column
+            # carrying several tags must still be masked by any tag the principal is not
+            # exempt from. Skip exempted tags and keep looking; only fall through to raw
+            # when no applicable tag masks this principal.
+            if principal.has_any_role(tag_mask.exempt_roles):
+                continue
+            return tag_mask.mask
         return None
 
     def row_filters_for(self, table: str, principal: Principal) -> list[RowFilter]:

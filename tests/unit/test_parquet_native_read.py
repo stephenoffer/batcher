@@ -152,6 +152,62 @@ def test_native_predicate_translation_pushable_and_not():
     assert to_native_predicate(temporal) is None
 
 
+def test_native_predicate_null_test_uses_the_tag_rust_deserializes():
+    """`IS [NOT] NULL` must be tagged `is_null` — the name `bc_io`'s `Pred` enum spells.
+
+    `Pred` is `#[serde(tag = "node", rename_all = "snake_case")]`, so its `IsNull` variant
+    deserializes from `"is_null"`. This emitted `"null"` once, and because an unparseable
+    predicate only costs *pruning* (the `Filter` always still runs), the drift was silent:
+    right answers, zero row-groups skipped. Worse, `parse` is all-or-nothing over a
+    conjunction — so a single null test disabled pruning for the whole filter.
+    """
+    from batcher.io.predicate import to_native_predicate
+    from batcher.plan.expr_ir import col
+
+    assert to_native_predicate(col("a").is_null().to_ir()) == {
+        "node": "is_null",
+        "col": "a",
+        "negated": False,
+    }
+    assert to_native_predicate(col("a").is_not_null().to_ir()) == {
+        "node": "is_null",
+        "col": "a",
+        "negated": True,
+    }
+    # The regression shape: a null test ANDed with a prunable comparison.
+    assert to_native_predicate(((col("a") >= 500) & col("s").is_not_null()).to_ir()) == {
+        "node": "and",
+        "left": {"node": "cmp", "col": "a", "op": "ge", "lit": 500},
+        "right": {"node": "is_null", "col": "s", "negated": True},
+    }
+
+
+def test_native_read_prunes_row_groups_through_a_null_test(tmp_path):
+    """`a >= 500 AND s IS NOT NULL` must still prune — end to end, through the real reader.
+
+    The unit test above pins the tag; this pins the *consequence*. Before the fix the whole
+    conjunction failed to parse, so all 4 row-groups were read. Both reads return the same
+    rows either way (pruning is superset-safe), so the only observable difference is how much
+    was skipped — which is exactly why this needs its own assertion.
+    """
+    import json
+
+    import batcher._native as nat
+
+    from batcher.io.predicate import to_native_predicate
+    from batcher.plan.expr_ir import col
+
+    path = _multi_rg_parquet(tmp_path)  # `s` is non-null in every group
+    pred = json.dumps(to_native_predicate(((col("a") >= 500) & col("s").is_not_null()).to_ir()))
+
+    out = nat.read_parquet_filtered(path, [], ["a"], 65536, pred)
+    vals = sorted(v for b in out for v in b.column(0).to_pylist())
+    # 500 rows, not 1000: groups 0+1 were pruned by the `a >= 500` arm, which can only happen
+    # if the `s IS NOT NULL` arm alongside it parsed.
+    assert len(vals) == 500
+    assert min(vals) == 500 and max(vals) == 999
+
+
 def test_native_filtered_read_prunes_row_groups_superset_safe(tmp_path):
     import json
 

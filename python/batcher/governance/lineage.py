@@ -27,6 +27,7 @@ from collections.abc import Iterable, Sequence
 from batcher.plan.expr_ir import Expr, referenced_columns
 from batcher.plan.logical import (
     Aggregate,
+    AsofJoin,
     Distinct,
     Filter,
     Join,
@@ -40,6 +41,8 @@ from batcher.plan.logical import (
     Union,
     Unnest,
     Unpivot,
+    WatermarkDedup,
+    WatermarkStreamJoin,
     Window,
 )
 from batcher.plan.visitor import children
@@ -111,8 +114,11 @@ def _lineage(node: LogicalPlan, tables: Sequence[str]) -> LineageMap:
         child = _lineage(node.input, tables)
         return {item.alias: _from(child, item.expr) for item in node.items}
 
-    if isinstance(node, Filter | Limit | Sort | Distinct | Sample):
+    if isinstance(node, Filter | Limit | Sort | Distinct | Sample | WatermarkDedup):
         # Row-set operators: they choose *which* rows survive, never what a value is.
+        # `WatermarkDedup` is a streaming `distinct`; without it here the opaque catch-all
+        # would over-report every column as derived from every input column (e.g. a plain
+        # `id` reported as carrying an `ssn` PII tag).
         return _lineage(node.input, tables)
 
     if isinstance(node, Aggregate):
@@ -143,7 +149,13 @@ def _lineage(node: LogicalPlan, tables: Sequence[str]) -> LineageMap:
             )
         return out
 
-    if isinstance(node, Join):
+    if isinstance(node, Join | AsofJoin | WatermarkStreamJoin):
+        # All three carry the same `output` of `JoinOutputCol(side, name, alias)`: each
+        # output column takes its values from *one* named column of *one* side. Without
+        # this, ASOF and stream-stream joins fell through to the opaque catch-all, which
+        # both over-reports (every column from every input) *and* under-reports (its
+        # dict-merge drops a side's origins when the sides share a column name) — a
+        # left-derived output could name only right-side origins, a lineage gap.
         left, right = _lineage(node.left, tables), _lineage(node.right, tables)
         sides = {"left": left, "right": right}
         return {col.alias: sides[col.side].get(col.name, frozenset()) for col in node.output}
@@ -179,8 +191,10 @@ def _lineage(node: LogicalPlan, tables: Sequence[str]) -> LineageMap:
     # An operator this analysis does not model — `map_batches` and anything added later.
     # Every output column is assumed to derive from every input column. Over-approximating
     # is the only safe direction: a false positive costs a review, a false negative a leak.
-    child_lineage: LineageMap = {}
+    everything: frozenset[Origin] = frozenset()
     for child_node in children(node):
-        child_lineage |= _lineage(child_node, tables)
-    everything = _union(child_lineage.values())
+        # Union across children — a plain `dict |=` merge would let a later child's
+        # same-named column *overwrite* an earlier child's origins, dropping a whole
+        # side's provenance for a multi-input operator. `everything` must stay a superset.
+        everything |= _union(_lineage(child_node, tables).values())
     return dict.fromkeys(node.available_columns(), everything)

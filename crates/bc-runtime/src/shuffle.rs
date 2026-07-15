@@ -434,6 +434,12 @@ pub fn range_partition_by_key_array(
         }
     })?;
 
+    // n_buckets buckets need at most n_buckets-1 split points; a caller that passes more
+    // would let `partition_point` (or the NaN case) return an id >= n_buckets and panic
+    // `scatter_into_buckets` with an out-of-bounds index. Clamp so an over-long boundary
+    // list degrades to fewer non-empty buckets — every row preserved and equal keys still
+    // co-located (the clamp is monotonic), no panic on a data path.
+    let last = (n_buckets - 1) as u32;
     let part_of: Vec<u32> = (0..batch.num_rows())
         .map(|i| {
             if key.is_null(i) {
@@ -446,7 +452,7 @@ pub fn range_partition_by_key_array(
                 } else {
                     boundaries.partition_point(|&b| b <= v)
                 };
-                id as u32
+                (id as u32).min(last)
             }
         })
         .collect();
@@ -1043,6 +1049,27 @@ mod tests {
             false,
         );
         assert_eq!(got, vec![0, 1, 1, 2, 2, 1]);
+    }
+
+    #[test]
+    fn range_more_boundaries_than_buckets_does_not_panic() {
+        // A caller that passes more split points than n_buckets-1 (e.g. boundaries sized
+        // for `workers` but only `n_buckets` requested) would make `partition_point`
+        // return an id >= n_buckets and index scatter_into_buckets out of bounds. The
+        // clamp must degrade gracefully: no panic, and every row preserved.
+        let keys: Vec<Option<i64>> = vec![Some(1), Some(3), Some(5), Some(7), Some(9)];
+        let batch = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(Int64Array::from(keys.clone())) as ArrayRef,
+        )])
+        .unwrap();
+        // 3 buckets but 6 boundaries — the exact p5 repro shape.
+        let parts =
+            range_partition_by_key(&batch, 0, &[2.0, 3.0, 4.0, 5.0, 6.0, 7.0], 3, true, false)
+                .expect("must not error");
+        assert_eq!(parts.len(), 3);
+        let total: usize = parts.iter().map(|p| p.num_rows()).sum();
+        assert_eq!(total, keys.len(), "no row may be lost or duplicated");
     }
 
     #[test]

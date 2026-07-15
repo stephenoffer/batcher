@@ -42,6 +42,9 @@ def source_pushdown(plan: LogicalPlan, source_id: int) -> tuple[list[str] | None
     task reads only the columns/rows it needs. Returns ``(None, None)`` if the
     analysis can't run (e.g. an opaque `MapBatches` node) — the worker then reads
     everything and the engine's operators filter/project, which is still correct.
+
+    **Pass the whole operator sub-tree, not just its map prefix** — see
+    `consumer_pushdown`, which is what most shuffle operators want.
     """
     try:
         from batcher.kyber.rules.projections import (
@@ -54,6 +57,28 @@ def source_pushdown(plan: LogicalPlan, source_id: int) -> tuple[list[str] | None
         return projection, predicate
     except Exception:
         return None, None
+
+
+def consumer_pushdown(
+    consumer: LogicalPlan, map_plan: LogicalPlan, source_id: int = 0
+) -> tuple[list[str] | None, dict | None]:
+    """`source_pushdown` for a shuffle operator's map prefix, *including* the operator above it.
+
+    A shuffle operator's map prefix (`agg.input`) alone answers the wrong question: the prefix
+    of `group_by("k").agg(sum("v"))` is a bare `Scan`, which requires every column it has, so
+    the projection came back as the source's full schema — the whole wide table read off disk
+    to answer a two-column aggregate (27 GB vs 6 GB at 1B rows). Re-parenting the operator onto
+    the relabeled prefix restores the context Kyber's `required_columns_per_source` needs, so
+    dist schedules against Kyber's own decision (`["k","v"]`, what single-node reads) instead
+    of a worse re-derived one. Pass-through operators (sort/window/distinct) narrow nothing.
+    """
+    import dataclasses
+
+    try:
+        rooted = dataclasses.replace(consumer, input=map_plan)
+    except Exception:
+        return source_pushdown(map_plan, source_id)
+    return source_pushdown(rooted, source_id)
 
 
 def _scan_splits(
@@ -343,41 +368,8 @@ def iter_partition_descriptor(desc: dict):
     yield from desc["batches"]
 
 
-_FOLD_CHUNK_BYTES = max(1 << 20, int(os.environ.get("BATCHER_FOLD_CHUNK_BYTES", str(256 << 20))))
-
-
-def streaming_partial_aggregate(
-    nat, map_ir, gk, aj, batches, engine_config, chunk_bytes=_FOLD_CHUNK_BYTES
-):
-    """Fold a partition's batches through the (breaker-free) map prefix + partial
-    aggregate into one running partial, a byte-bounded chunk at a time.
-
-    The map-side of a shuffle never holds the whole partition or the whole mapped output:
-    peak is one chunk + the running partial. Correct by the mergeable invariant — combine
-    of per-chunk partials equals one partial over the whole partition (the map prefix is
-    breaker-free, so per-chunk application matches whole-partition application).
-    """
-    running = None
-    chunk: list = []
-    size = 0
-
-    def fold(rows):
-        nonlocal running
-        mapped = nat.execute_plan(map_ir, [rows], engine_config)
-        partial = nat.partial_aggregate(gk, aj, mapped)
-        running = partial if running is None else nat.combine(gk, aj, [running, partial])
-
-    for b in batches:
-        chunk.append(b)
-        size += b.nbytes
-        if size >= chunk_bytes:
-            fold(chunk)
-            chunk, size = [], 0
-    if chunk:
-        fold(chunk)
-    if running is None:  # empty partition → the empty (schema-bearing) partial
-        running = nat.partial_aggregate(gk, aj, nat.execute_plan(map_ir, [[]], engine_config))
-    return running
+# The streaming map-side folds (`streaming_partial_aggregate`, `streaming_topn`) live in
+# `folds.py` — a family of their own, kept out of this file's line budget.
 
 
 def _projected_empty_batch(schema: pa.Schema, projection) -> pa.RecordBatch:

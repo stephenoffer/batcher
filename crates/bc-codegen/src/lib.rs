@@ -1046,6 +1046,91 @@ mod tests {
         }
     }
 
+    /// The interpreter compares floats with Arrow's `cmp` kernel, i.e.
+    /// `f64::total_cmp` (a *total* order) plus raw-bit equality — NOT IEEE. That
+    /// distinguishes cases a positive-NaN-only shim gets wrong:
+    ///   * `-0.0 < 0.0` and `-0.0 != 0.0` (IEEE calls them equal);
+    ///   * a *negative* NaN sorts below `-inf` (a "NaN is greatest" shim sorts it above);
+    ///   * two NaNs are equal only when their bits match (a shim calls any two NaN equal).
+    /// This pins the JIT to that total order on both the scalar and the SIMD emitters,
+    /// at every pinned width. It FAILS against the old IEEE-plus-NaN-shim `emit_cmp`.
+    #[test]
+    fn float_comparison_total_order_signed_zero_and_nan_signs() {
+        use arrow::array::BooleanArray;
+        use bc_arrow::SimdOverride;
+
+        let pnan = f64::NAN; // 0x7ff8_0000_0000_0000, positive
+        let nnan = f64::from_bits(0xfff8_0000_0000_0007); // negative NaN, payload 7
+        let pnan2 = f64::from_bits(0x7ff8_0000_0000_0001); // positive NaN, payload 1
+        // Column pairs spanning the interesting orderings: signed zeros, both NaN
+        // signs against finite values, and NaN-vs-NaN of equal / differing bits.
+        let a = vec![-0.0, 0.0, nnan, pnan, nnan, pnan, nnan, 0.0, f64::NEG_INFINITY];
+        let b = vec![0.0, -0.0, 1.0, 1.0, pnan, nnan, nnan, pnan, nnan];
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Float64, false),
+            Field::new("b", DataType::Float64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Float64Array::from(a)),
+                Arc::new(Float64Array::from(b)),
+            ],
+        )
+        .unwrap();
+
+        // Every emitter the dispatch can pick: forced scalar, and each vector width.
+        let plans = [
+            SimdOverride {
+                force_scalar: true,
+                ..Default::default()
+            },
+            SimdOverride {
+                lanes: 2,
+                unroll: 1,
+                force_scalar: false,
+            },
+            SimdOverride {
+                lanes: 4,
+                unroll: 2,
+                force_scalar: false,
+            },
+            SimdOverride {
+                lanes: 8,
+                unroll: 1,
+                force_scalar: false,
+            },
+        ];
+        for op in [
+            BinaryOp::Eq,
+            BinaryOp::Ne,
+            BinaryOp::Lt,
+            BinaryOp::Le,
+            BinaryOp::Gt,
+            BinaryOp::Ge,
+        ] {
+            for (l, r) in [("a", "b"), ("b", "a")] {
+                let expr = bin(op, col(l), col(r));
+                let oracle = expr.eval(&batch).unwrap();
+                let want = oracle.as_any().downcast_ref::<BooleanArray>().unwrap();
+                for over in plans {
+                    let compiled = compile_expr_with(&expr, &batch, over)
+                        .expect("float comparison compiles");
+                    let got = compiled.eval(&batch).unwrap();
+                    let got = got.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    for i in 0..batch.num_rows() {
+                        assert_eq!(
+                            got.value(i),
+                            want.value(i),
+                            "op={op:?} {l} vs {r} row {i} simd={over:?}: JIT must match \
+                             the interpreter's total-order float comparison"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn jit_handles_more_than_four_columns() {
         // The old fixed-arity ABI capped at 4 distinct columns; the pointer-array

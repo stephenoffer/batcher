@@ -5,12 +5,18 @@ Backed by ``confluent-kafka`` (the optional ``kafka`` extra). A
 messages with ``Consumer.consume(num_messages=N)`` and assembles them into one
 Arrow batch via the shared ``_make_batch`` helper.
 
-Exactly-once delivery is achieved through the consumer group: offsets are
-committed (synchronously) only *after* a batch is assembled, so a crash before
-the commit re-delivers the batch on restart, and a crash after never re-delivers
-it. ``splits()`` returns one split per topic-partition (each carrying its
-partition id as the offset locator), so a distributed reader assigns one consumer
-per partition.
+Offsets advance only *after* an epoch is **published** — not when it is polled. The engine
+write-aheads the position it consumed, publishes, and then `_commit_delivered` moves the
+consumer group forward; a crash in between re-delivers the batch, which an idempotent sink
+absorbs. Committing at poll time instead (as this once did) makes the broker believe messages
+were handled the moment they were *read*, so a crash before the publish skips them forever —
+at-most-once, and silent. The ordering is chosen so the failure mode is a duplicate, never a
+gap. On restart `_on_assign` resumes each partition from Batcher's checkpoint rather than the
+group's own offset, so the engine's log — not the broker's — is the source of truth.
+
+``splits()`` returns one split per topic-partition (each carrying its partition id as the
+offset locator), so a distributed reader assigns one consumer per partition; that path
+write-aheads positions through the driver and never relies on group commits at all.
 
 The ``confluent-kafka`` import is deferred to construction; if the extra is
 missing a :class:`BackendError` instructs the user to install it.
@@ -88,23 +94,44 @@ class KafkaSource(BrokerSource):
         }
         self._consumer = consumer_cls(config)
         if self._partitions is None:
-            self._consumer.subscribe([self.topic])
+            self._consumer.subscribe([self.topic], on_assign=self._on_assign)
         else:
             from confluent_kafka import TopicPartition
 
             self._consumer.assign([TopicPartition(self.topic, p) for p in self._partitions])
         return self._consumer
 
-    def _apply_seek(self, partition: int, token: Any) -> None:
-        """Resume a checkpointed partition strictly after its committed offset.
+    def _on_assign(self, consumer: Any, partitions: list[Any]) -> None:
+        """On a group rebalance, resume each assigned partition from *Batcher's* checkpoint.
 
-        Only meaningful when partitions are explicitly assigned (the distributed
-        split path): the consumer is repositioned to ``offset + 1``. In subscribe
-        mode assignment is decided by a group rebalance, so the consumer group's
-        own committed offset resumes the stream and this is a no-op.
+        Subscribe mode cannot seek eagerly — the partitions this consumer owns are not known
+        until the group assigns them — so the resume has to happen in the assignment callback.
+        Without it, `_apply_seek` was simply a no-op here and recovery silently fell back to
+        the consumer group's committed offset, ignoring the checkpoint the engine had written.
+        That is what made the premature poll-time commit lose data rather than merely duplicate
+        it: the group offset had already advanced past messages the engine never published, and
+        nothing repositioned the consumer back to them.
+
+        A partition with no checkpointed position keeps the offset the broker assigned
+        (``auto.offset.reset``), which is the right default for a partition this consumer has
+        not read before.
+        """
+        for tp in partitions:
+            token = self._resume_from.get(tp.partition)
+            if token is not None:
+                tp.offset = int(token) + 1  # resume strictly *after* the last published row
+        consumer.assign(partitions)
+
+    def _apply_seek(self, partition: int, token: Any) -> None:
+        """Resume a checkpointed partition strictly after its published offset.
+
+        With partitions explicitly assigned (the distributed split path) the consumer already
+        owns them, so it is repositioned immediately. In subscribe mode ownership is decided by
+        a group rebalance, so the seek cannot happen yet — `seek` has recorded the position in
+        `_resume_from` and `_on_assign` applies it the moment the group hands us the partition.
         """
         if self._partitions is None:
-            return
+            return  # deferred to `_on_assign` — see above
         from confluent_kafka import TopicPartition
 
         consumer = self._client()
@@ -119,9 +146,12 @@ class KafkaSource(BrokerSource):
         return sorted(topic_meta.partitions.keys())
 
     def _poll(self) -> list[BrokerMessage] | None:
+        # Deliberately does not commit. Polling is not processing: the engine has not staged,
+        # let alone published, this batch yet. `BrokerSource.iter_batches` calls
+        # `_commit_delivered` once the epoch is published — the only correct moment.
         consumer = self._client()
         records = consumer.consume(num_messages=self.poll_size, timeout=1.0)
-        messages = [
+        return [
             BrokerMessage(
                 value=rec.value() or b"",
                 partition=rec.partition(),
@@ -133,7 +163,14 @@ class KafkaSource(BrokerSource):
             for rec in records
             if rec.error() is None
         ]
-        if messages:
-            # Commit only after the batch is consumed → exactly-once on restart.
-            consumer.commit(asynchronous=False)
-        return messages
+
+    def _commit_delivered(self) -> None:
+        """Commit the group offsets of the epoch that was just published.
+
+        Synchronous on purpose: the commit must land before the next epoch's poll, or a crash
+        in between reopens the very replay window this ordering exists to close. A duplicate
+        (crash *after* publish, *before* commit) re-delivers the batch and the idempotent sink
+        absorbs it; a *skip* would be unrecoverable, so the ordering favours the duplicate.
+        """
+        if self._consumer is not None:
+            self._consumer.commit(asynchronous=False)

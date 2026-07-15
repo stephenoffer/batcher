@@ -36,10 +36,24 @@ pub fn distinct_dense(parts: &[RecordBatch]) -> Result<Option<RecordBatch>, Runt
     if first.num_columns() != 1 || !matches!(first.column(0).data_type(), DataType::Int64) {
         return Ok(None);
     }
-    let cols: Vec<&Int64Array> = parts
+    // Validate *every* part is a single `Int64` column, not just the first. Heterogeneous
+    // batches reach here — a `UNION`'s branches keep their own types, so an `Int64` branch
+    // and a `Float64` branch arrive as differently-typed single-column batches — and blindly
+    // `as_primitive::<Int64Type>()`-ing a non-`Int64` one panics ("primitive array"). Decline
+    // (return `None`) instead, so the caller's general path handles (or cleanly rejects) the
+    // mismatch rather than crashing the query.
+    let cols: Vec<&Int64Array> = match parts
         .iter()
-        .map(|b| b.column(0).as_primitive::<Int64Type>())
-        .collect();
+        .map(|b| {
+            (b.num_columns() == 1)
+                .then(|| b.column(0).as_any().downcast_ref::<Int64Array>())
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(cols) => cols,
+        None => return Ok(None),
+    };
     if cols.iter().any(|c| c.null_count() != 0) {
         return Ok(None);
     }
@@ -409,6 +423,25 @@ mod dense_tests {
     #[test]
     fn nullable_declines() {
         let parts = batches(vec![vec![Some(1), None, Some(2)]]);
+        assert!(distinct_dense(&parts).unwrap().is_none());
+    }
+
+    /// Heterogeneous batch types (a `UNION` of an `Int64` branch and a `Float64` branch
+    /// arrives as differently-typed single-column batches) must DECLINE, not panic. Before
+    /// the fix, `distinct_dense` validated only the first batch's type, then
+    /// `as_primitive::<Int64Type>()`-ed the `Float64` batch — an "primitive array" panic on a
+    /// reachable data path.
+    #[test]
+    fn heterogeneous_batch_types_decline() {
+        let int_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let flt_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
+        let flts: ArrayRef = Arc::new(Float64Array::from(vec![2.0, 3.5]));
+        let parts = vec![
+            RecordBatch::try_new(int_schema, vec![ints]).unwrap(),
+            RecordBatch::try_new(flt_schema, vec![flts]).unwrap(),
+        ];
+        // Must return None (decline), never panic.
         assert!(distinct_dense(&parts).unwrap().is_none());
     }
 

@@ -37,9 +37,12 @@ class StandardScaler(Preprocessor):
     """Standardize columns to zero mean and unit variance: ``(x - mean) / std``.
 
     `std` is the **population** standard deviation (``ddof=0``, matching
-    scikit-learn), computed as ``sqrt(E[x^2] - E[x]^2)`` so `fit` reuses only the
-    mergeable `mean` aggregate. A constant column (zero variance) scales by 1.0
-    (the column becomes its centered value), never dividing by zero.
+    scikit-learn), derived from the engine's numerically stable (Welford) variance
+    aggregate rather than the naive ``E[x^2] - E[x]^2``, which loses all precision
+    to catastrophic cancellation on a large-magnitude column (e.g. values near
+    ``1e8`` gave ``std=sqrt(2)`` instead of the true ``sqrt(1.25)``). A constant
+    column (zero variance) scales by 1.0 (the column becomes its centered value),
+    never dividing by zero.
 
     Examples:
         .. doctest::
@@ -71,7 +74,8 @@ class StandardScaler(Preprocessor):
         """Learn each column's mean and population standard deviation from `ds`.
 
         Both come from one mergeable pass: `mean_[c]` is ``E[x]`` and `scale_[c]` is
-        ``sqrt(E[x^2] - E[x]^2)`` (1.0 for a zero-variance column).
+        the population standard deviation from the engine's stable variance aggregate
+        (1.0 for a zero-variance column).
 
         Examples:
             .. doctest::
@@ -91,13 +95,25 @@ class StandardScaler(Preprocessor):
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__m"] = col(c).mean()
-            aggs[f"{c}__sq"] = (col(c) * col(c)).mean()
+            # Sample variance (ddof=1) + count → population variance, using the engine's
+            # numerically stable (Welford) aggregate. The old `E[x^2] - E[x]^2` form
+            # cancelled catastrophically on large-magnitude columns (x^2 overflows f64's
+            # 2^53 exact-integer range), yielding a badly wrong std.
+            aggs[f"{c}__v"] = col(c).var()
+            aggs[f"{c}__n"] = col(c).count()
         cell = fit_aggregate(ds, aggs)
         for c in self.columns:
             mean = cell[f"{c}__m"]
-            mean_sq = cell[f"{c}__sq"]
+            svar = cell[f"{c}__v"]
+            n = cell[f"{c}__n"]
             mean = 0.0 if mean is None else float(mean)
-            var = max(float(mean_sq) - mean * mean, 0.0) if mean_sq is not None else 0.0
+            # Convert sample variance (n-1 denominator) to population variance (n),
+            # matching scikit-learn's ddof=0; a column with <2 values has zero variance.
+            if svar is None or n is None or int(n) < 2:
+                var = 0.0
+            else:
+                n = int(n)
+                var = max(float(svar) * (n - 1) / n, 0.0)
             self.mean_[c] = mean
             self.scale_[c] = math.sqrt(var) if (self.with_std and var > 0.0) else 1.0
         self._fitted = True

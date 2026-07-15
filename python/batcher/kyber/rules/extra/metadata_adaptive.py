@@ -31,6 +31,7 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+from batcher.kyber.rules.zonemap_pruning import _float_order_is_ambiguous
 from batcher.plan.expr_ir import Binary, Col
 from batcher.plan.logical import Distinct, Filter, Limit, LogicalPlan, Sort
 from batcher.plan.stats import ColumnStat, Provenance
@@ -253,6 +254,12 @@ def _decide_col_cmp(op: str, a: ColumnStat, b: ColumnStat) -> bool | None:
     """
     amin, amax = a.min, a.max
     bmin, bmax = b.min, b.max
+    # A NaN or zero float bound cannot decide a comparison: the engine compares floats on
+    # their total order (NaN greatest, `-0.0 < 0.0`) while the comparisons below are Python's
+    # (NaN unordered, `-0.0 == 0.0`), so folding on one of those bounds can delete a row the
+    # engine would keep. Same rule, same reason, as `zonemap_pruning._float_order_is_ambiguous`.
+    if any(_float_order_is_ambiguous(v) for v in (amin, amax, bmin, bmax)):
+        return None
     no_nulls = a.null_count == 0 and b.null_count == 0
     try:
         if op == "lt":  # a < b

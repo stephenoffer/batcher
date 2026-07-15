@@ -25,6 +25,7 @@ import itertools
 
 import pyarrow as pa
 import pytest
+
 from conftest import assert_same, assert_same_ordered, assert_tables_equal
 
 pytestmark = pytest.mark.differential

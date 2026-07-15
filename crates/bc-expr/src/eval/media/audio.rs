@@ -181,7 +181,12 @@ fn to_waveform(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
 /// `resample(rate)` → `List<Float32>` of mono samples resampled to `rate` Hz per row.
 /// Decode + band-limited (sinc) resample per row in parallel; null/undecodable → null.
 fn resample(bytes: &BinaryArray, rate: Option<i64>) -> Result<ArrayRef, ExprError> {
-    let target = rate.filter(|&r| r > 0).ok_or(ExprError::MissingAudioRate)? as u32;
+    // `u32::try_from` (not `as u32`) so a rate past u32::MAX is rejected rather than
+    // silently wrapped down to a tiny — or zero — sample rate that empties the output.
+    let target = rate
+        .and_then(|r| u32::try_from(r).ok())
+        .filter(|&r| r > 0)
+        .ok_or(ExprError::MissingAudioRate)?;
     let waves: Vec<Option<Vec<f32>>> = map_rows(bytes.len(), |i| {
         if bytes.is_null(i) {
             None
@@ -362,6 +367,11 @@ mod tests {
         let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(wav.as_slice())]));
         assert!(eval_audio(AudioFunc::Resample, &arr, None).is_err());
         assert!(eval_audio(AudioFunc::Resample, &arr, Some(0)).is_err());
+        assert!(eval_audio(AudioFunc::Resample, &arr, Some(-8000)).is_err());
+        // Past u32::MAX must be rejected, not wrapped down (e.g. 2^32 → 0 Hz, which would
+        // silently empty every clip instead of erroring).
+        assert!(eval_audio(AudioFunc::Resample, &arr, Some(i64::from(u32::MAX) + 1)).is_err());
+        assert!(eval_audio(AudioFunc::Resample, &arr, Some(i64::MAX)).is_err());
     }
 
     #[test]

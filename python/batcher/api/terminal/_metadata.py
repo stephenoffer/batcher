@@ -316,6 +316,7 @@ def learn_column_stats(
     resolved: list[list[pa.RecordBatch]],
     sources: list[Source] | None = None,
     plan: LogicalPlan | None = None,
+    complete_scan: list[bool] | None = None,
 ) -> None:
     """Measure per-column ndv/quantiles from the just-scanned input and record them.
 
@@ -395,9 +396,19 @@ def learn_column_stats(
             rows = sum(b.num_rows for b in batches)
             if rows * len(cols) > max_cells:
                 continue  # too big to sketch cheaply; a worse plan beats a 20x slower query
+            # A distinct count is the one measured statistic a *partial* scan gets **wrong**,
+            # not merely approximate. A quantile grid or an MCV from a sample is still a valid
+            # description of the whole column's distribution — sampling preserves shape. But an
+            # ndv from a subset of the rows counts only the distinct values in that subset: a
+            # `filter(id < 100).collect()` that scanned 100 of a table's 2,000,000 rows would
+            # record `ndv=100` under the *source's* key, and `approx_n_unique("id")` — which
+            # reads exactly that record — would then answer 100 for the whole table. So the ndv
+            # is recorded only when this query scanned the source *whole* (no predicate pushed,
+            # every row read); a filtered or limited scan still contributes quantiles and MCVs.
+            saw_whole = complete_scan is None or (i < len(complete_scan) and complete_scan[i])
             # Distinct counts read every row; the quantile/MCV sketches read a bounded
             # sample. See `_sketch_sample` — one is ~4 ns a cell, the others ~56.
-            ndv = core.column_ndv(batches, cols)
+            ndv = core.column_ndv(batches, cols) if saw_whole else {}
             sample = _sketch_sample(batches)
             total = sum(b.num_rows for b in sample)
             _sample_ndv, quants, avg_bytes = core.column_statistics(sample, cols)

@@ -16,6 +16,7 @@ operator function; tasks are re-wrapped when the resource grant changes.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import threading
@@ -32,7 +33,7 @@ from .scaling import cluster_topology
 from .scheduling import current_envelope, set_job_ships_batcher, task_options
 
 
-def engine_config_json() -> str:
+def engine_config_json(num_cpus: float | None = None) -> str:
     """The driver's active `EngineConfig` (morsel size, parallelism) as JSON, to
     ship into remote tasks.
 
@@ -40,6 +41,12 @@ def engine_config_json() -> str:
     driver's `config_context` does not cross the process boundary), so the driver
     must capture this here and pass it as a task argument to every worker-side
     `execute_plan` — otherwise distributed runs silently ignore the session config.
+
+    `num_cpus` pins the rayon width to *this task's* CPU grant, for a caller whose tasks are
+    not all sized by the ambient envelope. The map path is exactly that: it sizes each task's
+    `num_cpus` from its own partition (`map._adaptive_task_cpus`), so the envelope's
+    per-worker grant is not what any individual map task actually holds. Omit it and the
+    envelope's grant is used (the shuffle operators, whose tasks are uniform).
 
     When a `SchedulingEnvelope` is in force (the ambient Carbonite grant for the
     current distributed execution), its per-task `memory_bytes` is folded into
@@ -63,7 +70,13 @@ def engine_config_json() -> str:
     # Carbonite contract: a worker uses exactly the resources it was admitted for.
     # `parallelism` never changes a result, only how many threads compute it.
     if not cfg.get("parallelism"):
-        cfg["parallelism"] = max(1, int(env.num_cpus)) if env is not None else 1
+        if num_cpus is not None:
+            grant = num_cpus
+        elif env is not None:
+            grant = env.num_cpus
+        else:
+            grant = 1.0
+        cfg["parallelism"] = max(1, int(grant))
 
     if env is not None and env.memory_bytes > 0:
         existing = int(cfg.get("memory_budget_bytes", 0) or 0)
@@ -130,13 +143,18 @@ def _ray_init_kwargs(
         "ignore_reinit_error": True,
         "namespace": dc.namespace,
     }
-    attach = not force_local and (
-        force_attach or os.environ.get("RAY_ADDRESS") or detect_managed_cluster()
-    )
+    # `RAY_ADDRESS`'s *value* is the address to attach to, not merely a signal that one
+    # exists. Collapsing it to `"auto"` throws away the only disambiguation Ray offers when a
+    # host has more than one live instance — a managed cluster plus a stray local Ray started
+    # by a colocated test run — and `ray.init(address="auto")` then dies with "Found multiple
+    # active Ray instances ... set the RAY_ADDRESS environment variable", which is precisely
+    # what the user did. `"auto"` remains the default when it names no specific address.
+    env_address = os.environ.get("RAY_ADDRESS")
+    attach = not force_local and (force_attach or env_address or detect_managed_cluster())
     if not force_local and dc.ray_address:
         kwargs["address"] = dc.ray_address
     elif attach:
-        kwargs["address"] = "auto"
+        kwargs["address"] = env_address or "auto"
     else:
         kwargs["num_cpus"] = workers
         # Only a locally started Ray accepts an object-store size; attaching to an
@@ -220,27 +238,42 @@ def _self_ship_runtime_env() -> dict | None:
     }
 
 
-def _neutralize_broken_runtime_env_hook() -> None:
-    """Drop a `RAY_RUNTIME_ENV_HOOK`/`RAY_RUNTIME_ENV_PLUGINS` whose module is missing.
+@contextlib.contextmanager
+def _platform_env_hook_disabled():
+    """Run Batcher's `ray.init` with the platform's runtime-env hook out of the way.
 
-    A deployment env may export a runtime-env hook (some managed platforms'
-    `cgroup_runtime_plugin`) that Ray imports during `ray.init`. When Batcher runs
-    *outside* that runtime the module is absent and `ray.init` raises
-    `ModuleNotFoundError` before any work starts. A hook pointing at an
-    unimportable module is broken regardless of context, so removing it is strictly
-    safer than crashing — and a no-op where the module is present (a real cluster)."""
-    import importlib.util
+    Ray applies `RAY_RUNTIME_ENV_HOOK` to the `runtime_env` *after* the caller builds it, so
+    a managed platform's hook silently rewrites the env `_self_ship_runtime_env` just
+    constructed. Two of those rewrites are fatal, and that function's defences cannot stop
+    them precisely because they run downstream of it:
+
+    - **`pip`.** We pin `pip: None` — ship our package, trust the cluster image. Ray's
+      `RuntimeEnv` drops falsey values, so the hook sees no `pip` key and substitutes the
+      workspace's tracked requirements. When that list names the local editable project
+      itself (`batcher-engine`, resolvable on no index), *every* worker's runtime-env build
+      fails and no task in the job can start.
+    - **`working_dir`.** We set `excludes` for build output, but the hook zips the project
+      directory itself before Ray ever applies them. A `cargo` `target/` (gigabytes) then
+      hangs `ray.init` or blows Ray's 512 MiB package cap — from a distributed query, for a
+      reason that has nothing to do with the query.
+
+    Both were live on the cluster this was written against: dist mode could not run a single
+    Ray task. Batcher fully determines what its workers need (its own package, via
+    `py_modules`), so the hook has nothing to add here and a demonstrated ability to break
+    the job. Disabling it is scoped to our `ray.init` call and restored immediately after, so
+    any other Ray user in the process still gets the platform's behavior. An unimportable
+    hook — Batcher running *outside* the runtime that exported it — is handled by the same
+    removal, which is why this subsumes the narrower "drop a hook whose module is missing".
+    """
     import os
 
-    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
-        value = os.environ.get(var)
-        if not value:
-            continue
-        # The leading dotted path before the first `.` / `[` names the module to import
-        # (`mod._hook`, or `[{"class": "mod.Plugin"}]` JSON). Probe just the base module.
-        head = value.lstrip("[{\"' ").split(".")[0].split("[")[0]
-        if head and importlib.util.find_spec(head) is None:
-            os.environ.pop(var, None)
+    saved = {v: os.environ.pop(v, None) for v in ("RAY_RUNTIME_ENV_HOOK",)}
+    try:
+        yield
+    finally:
+        for var, value in saved.items():
+            if value is not None:
+                os.environ[var] = value
 
 
 # Once we've decided whether the job ships batcher (on the first `_ensure_ray`), the
@@ -254,23 +287,23 @@ def _ensure_ray(workers: int) -> None:
     import ray
 
     if not ray.is_initialized():
-        _neutralize_broken_runtime_env_hook()
-        try:
-            ray.init(**_ray_init_kwargs(workers))
-        except ValueError as e:
-            # A cluster is already running but no address was configured (a managed
-            # workspace that doesn't export `RAY_ADDRESS`): Ray auto-attaches and then
-            # rejects the local-only `num_cpus`/object-store hints. Retry as a plain
-            # attach so the distributed path works on the cluster instead of failing.
-            if "existing cluster" not in str(e):
-                raise
-            ray.init(**_ray_init_kwargs(workers, force_attach=True))
-        except ConnectionError:
-            # A managed-cluster signal routed us to `address="auto"` but no cluster is
-            # actually reachable (e.g. a local dev run inside a workspace whose cluster is
-            # down): start a local single-node Ray instead of failing the job outright.
-            if not ray.is_initialized():
-                ray.init(**_ray_init_kwargs(workers, force_local=True))
+        with _platform_env_hook_disabled():
+            try:
+                ray.init(**_ray_init_kwargs(workers))
+            except ValueError as e:
+                # A cluster is already running but no address was configured (a managed
+                # workspace that doesn't export `RAY_ADDRESS`): Ray auto-attaches and then
+                # rejects the local-only `num_cpus`/object-store hints. Retry as a plain
+                # attach so the distributed path works on the cluster instead of failing.
+                if "existing cluster" not in str(e):
+                    raise
+                ray.init(**_ray_init_kwargs(workers, force_attach=True))
+            except ConnectionError:
+                # A managed-cluster signal routed us to `address="auto"` but no cluster is
+                # actually reachable (e.g. a local dev run inside a workspace whose cluster
+                # is down): start a local single-node Ray instead of failing the job.
+                if not ray.is_initialized():
+                    ray.init(**_ray_init_kwargs(workers, force_local=True))
         # Batcher initialized Ray: a local cluster shares the driver's modules and a
         # remote one carries the self-shipped runtime_env, so the job makes batcher
         # importable — no per-remote shipping needed.

@@ -15,7 +15,7 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr
 from batcher.plan.ir_tags import Op
-from batcher.plan.logical.base import LogicalPlan, _validate_refs
+from batcher.plan.logical.base import LogicalPlan, _reject_duplicate_aliases, _validate_refs
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import infer_type, promote, widen
 
@@ -99,6 +99,7 @@ class Project(LogicalPlan):
         available = set(self.input.available_columns())
         for item in self.items:
             _validate_refs(item.expr, available, what=f"projection {item.alias!r}")
+        _reject_duplicate_aliases([item.alias for item in self.items], what="select/with_columns")
 
     def to_ir(self) -> dict[str, Any]:
         return {
@@ -252,6 +253,13 @@ class Unnest(LogicalPlan):
             raise PlanError(
                 f"unnest column {self.column!r} not found in input columns: {available}"
             )
+        # The exploded column is renamed to `alias` in place; if `alias` names a *different*
+        # existing column the output would carry two same-named columns and silently drop
+        # one. Reject the collision instead of losing data.
+        if self.alias != self.column and self.alias in available:
+            raise PlanError(
+                f"explode alias {self.alias!r} collides with an existing column: {available}"
+            )
 
     def to_ir(self) -> dict[str, Any]:
         return {
@@ -341,6 +349,16 @@ class Unpivot(LogicalPlan):
             raise PlanError(f"unpivot columns {missing} not found in input columns: {available}")
         if not self.on:
             raise PlanError("unpivot requires at least one column in `on`")
+        # The output columns are [*index, variable_name, value_name]; a collision among
+        # them (e.g. value_name == an index column) would produce two columns of the same
+        # name and silently drop one on the way out. Reject it, like Polars does.
+        out = [*self.index, self.variable_name, self.value_name]
+        dups = sorted({c for c in out if out.count(c) > 1})
+        if dups:
+            raise PlanError(
+                f"unpivot output columns collide: {dups} — variable_name/value_name must "
+                "differ from each other and from every index column"
+            )
 
     def to_ir(self) -> dict[str, Any]:
         return {

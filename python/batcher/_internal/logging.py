@@ -111,7 +111,13 @@ def native_tracing_settings() -> tuple[str, bool] | None:
 
 def _level_value(name: str) -> int:
     """Map a level name to its numeric value, defaulting to WARNING on an unknown name."""
-    return logging.getLevelName(name.upper()) if isinstance(name, str) else logging.WARNING
+    if not isinstance(name, str):
+        return logging.WARNING
+    # `logging.getLevelName` returns the *string* ``"Level FOO"`` (not an int) for an
+    # unrecognized name, which then makes `logger.setLevel` raise ``ValueError``. Guard on
+    # the return type so an unknown name genuinely falls back to WARNING as documented.
+    value = logging.getLevelName(name.upper())
+    return value if isinstance(value, int) else logging.WARNING
 
 
 class _HumanFormatter(logging.Formatter):

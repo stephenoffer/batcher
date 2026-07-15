@@ -205,7 +205,11 @@ def run_profiled(
             "portion instead."
         )
     collector = ProfileCollector()
-    distributed = _resolve_distributed("auto")
+    # Pass plan + sources so the size-aware "auto" decision matches `collect()`. Resolving
+    # with neither hit `resolve_distributed`'s `sources is None -> True` fall-through, forcing
+    # every profiled run to distribute on a multi-node cluster — measuring a path a small
+    # query runs single-node, the opposite of "reflects reality".
+    distributed = _resolve_distributed("auto", plan, sources)
     ctx = core.ExecutionContext(columns=columns, hub=core.default_hub(), profile=collector)
     t0 = time.perf_counter()
     table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)

@@ -45,6 +45,10 @@ def _literal(ir: dict[str, Any]) -> Any:
         import datetime as _dt
 
         return _dt.datetime(1970, 1, 1) + _dt.timedelta(microseconds=value)
+    if kind == "time":
+        import datetime as _dt
+
+        return (_dt.datetime(1970, 1, 1) + _dt.timedelta(microseconds=value)).time()
     return value
 
 
@@ -136,12 +140,26 @@ def _to_pa(ir: dict[str, Any], ds: Any) -> Any | None:
 
 
 def _sql_literal(value: Any) -> str:
+    import datetime as _dt
+
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
     if isinstance(value, str):
         return "'" + value.replace("'", "''") + "'"
     if value is None:
         return "NULL"
+    # Temporal literals MUST be emitted as typed, quoted SQL literals. A bare
+    # ``str(date)`` renders ``2021-01-15``, which the server parses as the integer
+    # arithmetic ``2021 - 1 - 15`` (→ 2005), and ``str(datetime)`` renders an
+    # unquoted ``2021-01-15 00:00:00`` that is a syntax error. ANSI ``DATE '…'`` /
+    # ``TIMESTAMP '…'`` / ``TIME '…'`` literals are accepted across the warehouses
+    # these connectors target. (datetime is a subclass of date — check it first.)
+    if isinstance(value, _dt.datetime):
+        return f"TIMESTAMP '{value.isoformat(sep=' ')}'"
+    if isinstance(value, _dt.date):
+        return f"DATE '{value.isoformat()}'"
+    if isinstance(value, _dt.time):
+        return f"TIME '{value.isoformat()}'"
     return str(value)
 
 
@@ -166,6 +184,14 @@ def to_sql_where(ir: dict[str, Any]) -> str | None:
         if parsed is None:
             return None
         col, value, flipped = parsed
+        # NaN/Inf have no portable SQL literal spelling: ``col = nan`` / ``col < inf``
+        # are rejected by every warehouse these connectors target (Snowflake,
+        # BigQuery, ClickHouse, …). Leave the term unpushed — the engine's Filter
+        # re-checks every row, so a non-pushed predicate is always correct.
+        import math
+
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
         effective = _FLIP[op] if flipped else op
         return f"{col} {_SQL_OP[effective]} {_sql_literal(value)}"
     return None
@@ -229,17 +255,23 @@ def to_native_predicate(ir: dict[str, Any]) -> dict[str, Any] | None:
     """Translate the pushable subset of `ir` to the native reader's compact predicate.
 
     The shape `bc_io`'s `predicate` module deserializes: ``{"node":"cmp","col":..,"op":..,
-    "lit":..}`` / ``{"node":"and"/"or","left":..,"right":..}`` / ``{"node":"null","col":..,
+    "lit":..}`` / ``{"node":"and"/"or","left":..,"right":..}`` / ``{"node":"is_null","col":..,
     "negated":..}``. Comparisons are normalized so the column is on the left. Returns
     ``None`` if any term is not pushable (a non-column/literal comparison, a temporal
     literal, or an unsupported node) — the caller then reads without native pruning.
+
+    The ``"is_null"`` tag is load-bearing: `bc_io`'s `Pred` is
+    ``#[serde(tag = "node", rename_all = "snake_case")]``, so its `IsNull` variant is spelled
+    ``is_null``. Emitting anything else makes `parse()` reject the *whole* predicate — and
+    because pruning is only ever an optimization, that failure is silent (correct results, zero
+    row-groups pruned). Keep this in lockstep with `crates/bc-io/src/predicate.rs`.
     """
     e = ir.get("e")
     if e in ("is_null", "is_not_null"):
         inner = ir["input"]
         if inner.get("e") != "col":
             return None
-        return {"node": "null", "col": inner["name"], "negated": e == "is_not_null"}
+        return {"node": "is_null", "col": inner["name"], "negated": e == "is_not_null"}
     if e != "binary":
         return None
     op = ir["op"]

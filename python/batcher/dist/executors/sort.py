@@ -88,7 +88,14 @@ def _distributed_sort(
         grids = gather_with_backups(
             [_sample_for(w) for w in range(len(partitions))], _sample_for, pol
         )
-        boundaries = merge_boundaries(grids, workers)
+        # Boundaries must cut into exactly `n_buckets` ranges, so size the split by the
+        # actual reducer count — NOT `workers`. `shuffle_partitions` can trim the reducer
+        # count below the mapper fan-out (the `max_shuffle_partitions` cap, the learned
+        # fan-out), and `merge_boundaries(grids, workers)` would then emit up to `workers-1`
+        # boundaries — more than `n_buckets-1` — routing rows into bucket ids past the last
+        # bucket and panicking the range partitioner. (The out-of-core sort already uses
+        # `n_buckets` here.)
+        boundaries = merge_boundaries(grids, n_buckets)
 
         # MAP: range-partition each split by the boundaries, one IPC file per bucket.
         def _range_for(w: int):

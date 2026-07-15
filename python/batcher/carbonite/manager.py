@@ -36,6 +36,7 @@ from batcher.carbonite.policies import (
     DefaultSchedulingPolicy,
     StaticCreditFlowControl,
     credit_ceiling,
+    learned_channel_morsel_bytes,
     load_shuffle_window,
 )
 from batcher.config import Config, active_config
@@ -145,7 +146,12 @@ class ResourceManager:
         if signature is not None:
             learned = load_shuffle_window(self._hub, signature)
             if learned is not None and learned > 0:
-                return max(1, min(learned, credit_ceiling(self._config)))
+                # Honor the byte bound (`credit_byte_budget`) via the learned wide-row width,
+                # exactly as the static grant does — otherwise a wide-row shuffle's learned
+                # window would be clamped only by the un-corrected count ceiling and buffer far
+                # past the byte budget (C53). Cold/narrow model → the plain count ceiling.
+                ceiling = credit_ceiling(self._config, learned_channel_morsel_bytes(self._ctx))
+                return max(1, min(learned, ceiling))
         return self._flow_control.grant(requested, self._ctx)
 
     def scheduling_envelope(
@@ -183,7 +189,14 @@ class ResourceManager:
         result) is unchanged — only its starting point moves. Cold signature → the default
         start."""
         initial = load_shuffle_window(self._hub, signature) if signature is not None else None
-        return AIMDFlowControl(self._config, initial_window=initial)
+        # Thread the learned wide-row width so AIMD's ceiling keeps the same byte bound the
+        # static grant enforces — a wide-row channel must not grow its window past
+        # `credit_byte_budget` (C53) just because it took the adaptive path.
+        return AIMDFlowControl(
+            self._config,
+            initial_window=initial,
+            effective_morsel_bytes=learned_channel_morsel_bytes(self._ctx),
+        )
 
     def recommend_morsel_target(
         self, families: Iterable[str] | None = None

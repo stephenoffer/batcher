@@ -24,7 +24,7 @@ from batcher.plan.logical import LogicalPlan
 from batcher.plan.types import DTYPE_REGISTRY
 from batcher.plan.visitor import transform_up
 
-__all__ = ["ConstantFolding", "fold_constants"]
+__all__ = ["ConstantFolding", "fold_constants", "fold_expression"]
 
 _INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 _COMPARISONS = {"gt": ">", "ge": ">=", "lt": "<", "le": "<=", "eq": "==", "ne": "!="}
@@ -41,8 +41,26 @@ def fold_constants(plan: LogicalPlan) -> LogicalPlan:
     return transform_up(plan, lambda n: map_node_expressions(n, _fold_expr))
 
 
-def _fold_expr(expr: Expr) -> Expr:
+def fold_expression(expr: Expr) -> Expr:
+    """Fold one expression's constant sub-trees, bottom-up — a `Lit` if it is fully constant.
+
+    The plan-free entry point. The estimator uses it to decide whether a *projection* is
+    constant: it substitutes each provably-constant column with its literal value and folds,
+    and a `Lit` result means the output column is a known constant. Sharing this function is
+    the point — an estimator that folded arithmetic its own way would be a second, drifting
+    definition of what `a - b` means.
+
+    Args:
+        expr: The expression to fold.
+
+    Returns:
+        The expression with its constant sub-trees folded to literals.
+    """
     return transform_expr_up(expr, _fold)
+
+
+def _fold_expr(expr: Expr) -> Expr:
+    return fold_expression(expr)
 
 
 def _fold(expr: Expr) -> Expr:

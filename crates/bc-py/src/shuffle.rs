@@ -40,6 +40,33 @@ use crate::process::shared_runtime;
 use crate::{parse_aggregates, parse_group_keys, to_pyerr, unwrap_batches};
 use crate::{FlightShuffleServer, ShuffleClient};
 
+/// Validate partition-key inputs at the FFI boundary before they reach the engine.
+///
+/// An out-of-range key index or a zero partition count would otherwise index a column
+/// out of bounds / trip a `debug_assert` deep in the runtime and **panic through the
+/// FFI** — a `PanicException`, which derives from `BaseException` and so slips past a
+/// caller's `except Exception`. Reject them here with a clean, catchable `ValueError`.
+fn validate_partition_args(
+    batches: &[RecordBatch],
+    key_indices: &[usize],
+    num_partitions: usize,
+) -> PyResult<()> {
+    if num_partitions == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "num_partitions must be >= 1",
+        ));
+    }
+    for batch in batches {
+        let ncols = batch.num_columns();
+        if let Some(&bad) = key_indices.iter().find(|&&i| i >= ncols) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "key index {bad} out of range for a batch with {ncols} columns"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Hash-shuffle batches into `num_partitions` buckets by the given key columns.
 #[pyfunction]
 pub(crate) fn partition_batches(
@@ -47,9 +74,10 @@ pub(crate) fn partition_batches(
     key_indices: Vec<usize>,
     num_partitions: usize,
 ) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
-    let parts =
-        bc_interp::dist::partition_batches(&unwrap_batches(batches), &key_indices, num_partitions)
-            .map_err(to_pyerr)?;
+    let batches = unwrap_batches(batches)?;
+    validate_partition_args(&batches, &key_indices, num_partitions)?;
+    let parts = bc_interp::dist::partition_batches(&batches, &key_indices, num_partitions)
+        .map_err(to_pyerr)?;
     Ok(wrap_buckets(parts))
 }
 
@@ -67,8 +95,10 @@ pub(crate) fn range_partition_batches(
     nulls_first: bool,
     descending: bool,
 ) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
+    let batches = unwrap_batches(batches)?;
+    validate_partition_args(&batches, std::slice::from_ref(&key_index), n_buckets)?;
     let parts = bc_interp::dist::range_partition_batches(
-        &unwrap_batches(batches),
+        &batches,
         key_index,
         &boundaries,
         n_buckets,
@@ -95,8 +125,10 @@ pub(crate) fn salted_partition_batches(
     replicate: bool,
 ) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
     let hot: std::collections::HashSet<String> = hot_keys.into_iter().collect();
+    let batches = unwrap_batches(batches)?;
+    validate_partition_args(&batches, &key_indices, num_partitions)?;
     let parts = bc_interp::dist::salted_partition_batches(
-        &unwrap_batches(batches),
+        &batches,
         &key_indices,
         num_partitions,
         &hot,
@@ -389,6 +421,50 @@ pub(crate) fn gather_concat(
 
     let (rows, unreachable) = out.map_err(GatherErr::into_pyerr)?;
     Ok((rows.into_iter().map(PyArrowType).collect(), unreachable))
+}
+
+/// Spilling distributed reduce: merge the partials the shuffle wrote to `input_paths`
+/// (Arrow-IPC stream files, one per mapper for this reducer) and finalize, out of core.
+///
+/// The reducer's other half from [`gather_combine`]: where that folds every mapper's partial
+/// into one running state in RAM, this reads the reducer's shuffle files one at a time and
+/// grace-partitions them to disk under `memory_budget_bytes`, so a high-cardinality
+/// `GROUP BY` / `DISTINCT` / `COUNT(DISTINCT)` whose merged group state exceeds one worker's
+/// RAM completes instead of OOMing — the distributed arm of Batcher's out-of-core guarantee.
+/// Result-identical to the in-memory reduce over the same partials (group order differs).
+/// `spill_dir` is scratch for the grace partitions (defaults to the OS temp dir);
+/// `spill_compression` selects the spill IPC codec (`"lz4"`/`"zstd"`/`"auto"`/None). The GIL
+/// is released for the fold.
+#[pyfunction]
+#[pyo3(signature = (group_keys_json, aggregates_json, input_paths, memory_budget_bytes, spill_dir=None, spill_compression=None))]
+pub(crate) fn combine_finalize_spilling(
+    py: Python<'_>,
+    group_keys_json: &str,
+    aggregates_json: &str,
+    input_paths: Vec<String>,
+    memory_budget_bytes: usize,
+    spill_dir: Option<String>,
+    spill_compression: Option<String>,
+) -> PyResult<PyArrowType<RecordBatch>> {
+    let group_keys = parse_group_keys(group_keys_json)?;
+    let aggregates = parse_aggregates(aggregates_json)?;
+    let paths: Vec<std::path::PathBuf> = input_paths.into_iter().map(Into::into).collect();
+    let dir = spill_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let out = py
+        .allow_threads(|| {
+            bc_interp::dist::combine_finalize_spilling(
+                &group_keys,
+                &aggregates,
+                &paths,
+                memory_budget_bytes,
+                &dir,
+                spill_compression.as_deref(),
+            )
+        })
+        .map_err(to_pyerr)?;
+    Ok(PyArrowType(out))
 }
 
 /// Parse the `(addr, ticket_string)` sources into `(addr, ShuffleTicket)`.

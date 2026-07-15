@@ -31,6 +31,7 @@ __all__ = [
     "DefaultSchedulingPolicy",
     "StaticCreditFlowControl",
     "credit_ceiling",
+    "learned_channel_morsel_bytes",
     "load_shuffle_window",
     "record_shuffle_window",
 ]
@@ -162,7 +163,7 @@ def credit_ceiling(config: Config, effective_morsel_bytes: int | None = None) ->
     return max(1, min(count_ceiling, byte_ceiling))
 
 
-def _learned_channel_morsel_bytes(ctx: ResourceContext) -> int | None:
+def learned_channel_morsel_bytes(ctx: ResourceContext) -> int | None:
     """A channel's effective per-batch bytes from the learned row width, or `None`.
 
     The credit→bytes conversion assumes a `morsel_bytes`-sized batch; a workload whose
@@ -197,7 +198,7 @@ class StaticCreditFlowControl:
 
     def grant(self, requested: int, ctx: ResourceContext) -> int:
         fc = ctx.config.flow_control
-        ceiling = credit_ceiling(ctx.config, _learned_channel_morsel_bytes(ctx))
+        ceiling = credit_ceiling(ctx.config, learned_channel_morsel_bytes(ctx))
         if requested <= 0:
             return min(fc.default_credits, ceiling)
         return min(max(requested, 1), ceiling)
@@ -241,7 +242,13 @@ class AIMDFlowControl:
     argument because the controller, not the caller, owns the evolving window.
     """
 
-    def __init__(self, config: Config | None = None, *, initial_window: int | None = None) -> None:
+    def __init__(
+        self,
+        config: Config | None = None,
+        *,
+        initial_window: int | None = None,
+        effective_morsel_bytes: int | None = None,
+    ) -> None:
         cfg = config or active_config()
         fc = cfg.flow_control
         self._alpha = max(1, fc.aimd_alpha)
@@ -251,7 +258,11 @@ class AIMDFlowControl:
         # Clamped rather than raised: flow control must never fail a query on a tunable.
         self._beta = min(max(fc.aimd_beta, _MIN_AIMD_BETA), _MAX_AIMD_BETA)
         self._floor = 1
-        self._ceiling = credit_ceiling(cfg)  # count + byte bound (C53)
+        # `effective_morsel_bytes` carries the learned wide-row width (embeddings/blobs) so the
+        # ceiling's *byte* bound (`credit_byte_budget`) is honored on this adaptive path exactly
+        # as it is on the static grant — otherwise AIMD would grow the window to the un-corrected
+        # count ceiling and a fast producer would buffer far past the byte budget (C53).
+        self._ceiling = credit_ceiling(cfg, effective_morsel_bytes)  # count + byte bound (C53)
         # A recurring shuffle warm-starts at the window its past runs converged to
         # (`initial_window`, learned per shuffle signature) instead of re-climbing from
         # `default_credits` every time — the AIMD control law still governs from there,

@@ -109,6 +109,16 @@ pub(crate) fn parallel_sort_batch(
         }
         dt if dt.is_integer() => {
             let key_i64 = arrow::compute::cast(key, &DataType::Int64)?;
+            // Routing compares the leading key as i64. That is order-preserving for every
+            // integer width except a `UInt64` value above `i64::MAX`, which the (safe) cast
+            // turns into a null — so it would route by the null bucket (smallest/largest end
+            // by flag) instead of by its true, largest unsigned magnitude. That silently
+            // reorders a descending or nulls-first sort. When the cast loses a value this
+            // way, decline: the caller's serial sort compares `u64` by unsigned order and is
+            // correct. (A `UInt64` column that fits in i64 keeps the parallel fast path.)
+            if key_i64.null_count() > key.null_count() {
+                return Ok(None);
+            }
             let keyv = key_i64
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
@@ -340,6 +350,84 @@ mod tests {
             None => sort_batch(&b, &key(false, false), None).unwrap(),
         };
         assert_eq!(want, got);
+    }
+
+    #[test]
+    fn uint64_above_i64_max_matches_serial() {
+        use arrow::array::UInt64Array;
+        // A large UInt64 key column whose values straddle i64::MAX. The serial oracle sorts
+        // by *unsigned* order; the sample-sort must produce the identical relation. If the
+        // range routing casts the key to i64 (lossy for u64 > i64::MAX), those large values
+        // misroute and the relation diverges.
+        let n = 1usize << 18;
+        let mut vals: Vec<u64> = Vec::with_capacity(n);
+        let mut s: u64 = 12345;
+        for _ in 0..n {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Spread across the whole u64 range, so many values exceed i64::MAX.
+            vals.push(s);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::UInt64, false),
+            Field::new("p", DataType::Int64, false),
+        ]));
+        let ka: ArrayRef = Arc::new(UInt64Array::from(vals));
+        let pa: ArrayRef = Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()));
+        let b = RecordBatch::try_new(schema, vec![ka, pa]).unwrap();
+        for (descending, nulls_first) in [(false, false), (true, false), (true, true)] {
+            let keys = vec![SortKey {
+                expr: Expr::Col { name: "k".into() },
+                descending,
+                nulls_first,
+            }];
+            let want = sort_batch(&b, &keys, None).unwrap();
+            // The parallel path may engage (and must then match) or decline (falling back to
+            // the correct serial sort). It must never return a *wrong* relation — which it did
+            // before the lossy-cast guard, for descending / nulls-first on u64 > i64::MAX.
+            let got = match parallel_sort_batch(&b, &keys, None).unwrap() {
+                Some(ranges) => concat_ranges(&b.schema(), ranges),
+                None => sort_batch(&b, &keys, None).unwrap(),
+            };
+            assert_eq!(
+                want, got,
+                "uint64 sample-sort diverges (descending={descending} nulls_first={nulls_first})"
+            );
+        }
+    }
+
+    #[test]
+    fn uint64_within_i64_range_still_parallelizes() {
+        use arrow::array::UInt64Array;
+        // A large UInt64 key whose values all fit in i64 must keep the parallel fast path
+        // (the lossy-cast guard must not over-decline) and match the serial oracle.
+        let n = 1usize << 18;
+        let mut vals: Vec<u64> = Vec::with_capacity(n);
+        let mut s: u64 = 777;
+        for _ in 0..n {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            vals.push((s >> 1) & (i64::MAX as u64)); // strictly < 2^63
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::UInt64, false),
+            Field::new("p", DataType::Int64, false),
+        ]));
+        let ka: ArrayRef = Arc::new(UInt64Array::from(vals));
+        let pa: ArrayRef = Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()));
+        let b = RecordBatch::try_new(schema, vec![ka, pa]).unwrap();
+        let keys = vec![SortKey {
+            expr: Expr::Col { name: "k".into() },
+            descending: true,
+            nulls_first: false,
+        }];
+        let want = sort_batch(&b, &keys, None).unwrap();
+        let ranges = parallel_sort_batch(&b, &keys, None)
+            .unwrap()
+            .expect("in-range uint64 must keep the parallel path");
+        assert_eq!(want, concat_ranges(&b.schema(), ranges));
     }
 
     #[test]

@@ -10,7 +10,9 @@ use arrow::compute::kernels::boolean;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{is_not_null, is_null};
 
-use crate::eval::binary::{as_bool, coerce_numeric, eval_binary, try_scalar_binary};
+use crate::eval::binary::{
+    as_bool, coerce_numeric, eval_binary, try_dict_compare, try_scalar_binary,
+};
 use crate::eval::cast::cast_expr;
 use crate::eval::date::{
     eval_date, eval_date_offset, eval_date_trunc, eval_strftime, eval_strptime,
@@ -71,6 +73,14 @@ impl Expr {
                 Ok(Arc::new(boolean::not(b)?))
             }
             Expr::Binary { op, left, right } => {
+                // Fast path: comparing a *dictionary* column to a literal compares the
+                // distinct values and gathers through the keys, never decoding the column.
+                // Checked first, because `try_scalar_binary` would `eval` the column — which
+                // decodes the dictionary at the leaf — only to then reject a non-numeric type
+                // and fall through, having already paid for the decode it was trying to avoid.
+                if let Some(out) = try_dict_compare(*op, left, right, batch)? {
+                    return Ok(out);
+                }
                 // Fast path: a numeric literal operand broadcasts as a scalar instead
                 // of materializing a full N-length array (bit-identical result).
                 if let Some(out) = try_scalar_binary(*op, left, right, batch)? {
@@ -302,9 +312,15 @@ impl Expr {
                 let arr = input.eval(batch)?;
                 let list = require_list(&arr, "list.slice")?;
                 rebuild_list(list, |s, e| {
-                    let begin = (s as i64 + (*offset).max(0)).min(e as i64) as usize;
+                    // Saturating throughout: a huge `offset`/`length` (up to i64::MAX)
+                    // otherwise overflows the `+` before the `.min(e)` clamp — panicking
+                    // in debug and wrapping to a giant `usize` (capacity overflow) in
+                    // release. `list.slice(3, i64::MAX)` must clamp to the list end.
+                    let begin = (s as i64).saturating_add((*offset).max(0)).min(e as i64) as usize;
                     let end = match length {
-                        Some(l) => (begin as i64 + (*l).max(0)).min(e as i64) as usize,
+                        Some(l) => {
+                            (begin as i64).saturating_add((*l).max(0)).min(e as i64) as usize
+                        }
                         None => e,
                     };
                     (begin..end).map(|k| k as u32).collect()

@@ -51,6 +51,7 @@ from batcher.api.dataset._window import (
     windowed_project,
 )
 from batcher.api.dataset.dq import DatasetDQ
+from batcher.api.dataset.meta import DatasetMeta
 from batcher.api.dataset.ml import DatasetML
 from batcher.api.dataset.scd import DatasetSCD
 from batcher.api.groupby import GroupBy
@@ -844,6 +845,34 @@ class Dataset:
         return DatasetDQ(self)
 
     @property
+    def meta(self) -> DatasetMeta:
+        """Metadata accessor: answer a question from statistics instead of from the data.
+
+        A footer, a manifest, a catalog, and an immutable in-memory relation already know a
+        great deal a query would otherwise be run to rediscover — the row count, a column's
+        extremes, how many values are missing, whether a key is unique, whether a join can
+        match at all. Every shortcut under `meta` asks for that first and only executes when
+        the answer is not provable, so what it returns is always what executing would return.
+
+        Reach the breadth through the sub-accessors: ``.col("x")`` (and ``.col("x").check``),
+        ``.schema``, ``.nulls``, ``.approx``, ``.storage``, and ``.against(other)``.
+
+        Returns:
+            The metadata accessor bound to this dataset.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.meta.col("x").bounds()
+                (1, 3)
+                >>> ds.meta.none_match(bt.col("x") > 100)
+                True
+        """
+        return DatasetMeta(self)
+
+    @property
     def scd(self) -> DatasetSCD:
         """Slowly-changing-dimension accessor: upsert this snapshot into a target.
 
@@ -1419,7 +1448,14 @@ class Dataset:
         """
         from batcher.plan.expr_ir import lit
 
+        # The temporary equi-join key must not shadow a real column on either side:
+        # `with_columns` replaces a same-named column, so a user column literally named
+        # `__cross_key__` would be silently overwritten and then dropped — losing its
+        # data. Pick a name absent from both schemas.
+        taken = set(self.columns) | set(other.columns)
         key = "__cross_key__"
+        while key in taken:
+            key += "_"
         left = self.with_columns(**{key: lit(1)})
         right = other.with_columns(**{key: lit(1)})
         return left.join(right, on=key, suffix=suffix).drop(key)

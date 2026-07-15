@@ -385,19 +385,26 @@ class IcebergTableSplit:
     ) -> Iterator[pa.RecordBatch]:
         yield from self._read_table(projection, predicate).to_batches()
 
+    def _data_file_path(self) -> str:
+        """This split's data file, taken from the scan task it already carries.
+
+        The manifest is the authority here, and the split holds it: `plan_files()` hands back
+        a `FileScanTask` whose `.file` is the manifest's `DataFile`. Nothing else needs to be
+        stored or re-derived — and nothing else *should* be, because a path re-derived from a
+        filesystem is absolute while every key the table uses (a deletion vector's mask, a
+        statistics-cache entry) is the table-relative path the manifest wrote.
+        """
+        return str(self._task.file.file_path)
+
     def row_count(self) -> int | None:
-        if self._rows is not None:
-            return self._rows
-        import pyarrow.parquet as pq
-
-        from batcher.io.filesystem import resolve_filesystem
-
-        fs = resolve_filesystem(self._data_file_path)
-        with fs.open(self._data_file_path) as fh:
-            return pq.ParquetFile(fh).metadata.num_rows
+        # The manifest's `record_count`, captured at split time. There is no fallback to
+        # opening the footer: an Iceberg data file always carries its row count in the
+        # manifest, so a miss here means the manifest was malformed, and reporting "unknown"
+        # (which the planner handles) beats an extra S3 round-trip per split.
+        return self._rows
 
     def identity(self) -> str:
-        return f"iceberg:{self._identifier}:{self._data_file_path}"
+        return f"iceberg:{self._identifier}:{self._data_file_path()}"
 
 
 def _catalog_key(spec: Any) -> str:

@@ -129,24 +129,39 @@ def _resident_subset_stats(source: Source, need_columns: set[str]):
 
 
 def column_bounds_needed(plan: LogicalPlan) -> set[str]:
-    """The column names whose min/max bounds the plan could consume, from its predicates.
+    """The column names whose min/max bounds the plan could consume — predicates *and* join keys.
 
-    Only a `Filter` (zone-map pruning + range selectivity) reads a source's column bounds
-    on the execution path; a plain group-by / aggregate / sort / join never does (join
-    ordering uses NDV, learned separately). So the needed set is the union of every filter
-    predicate's referenced columns — empty for a filter-free plan (skip the scan entirely),
-    and just the predicate columns for a filter over a wide relation. Computing a column
-    the optimizer does not read only wastes work; omitting one only forgoes pruning (never
-    changes a result), so a predicate-columns superset is exactly right.
+    Two consumers read a source's column bounds on the execution path:
+
+    * a `Filter`, for zone-map pruning and range selectivity — the union of its predicate's
+      referenced columns; and
+    * a **`Join`**, for the disjointness proof. If the two sides' key ranges do not overlap,
+      no pair can be equal and an inner/semi join emits nothing — provable from four numbers,
+      with neither side read (`join_disjoint_keys_to_empty`, `no_match_join_to_preserved_side`).
+
+    The join half used to be missing, and the omission was self-concealing: the rules were
+    written, tested, and correct, but the bounds they needed were never *fetched*, so on a real
+    query they had nothing to reason about and a join whose key ranges provably cannot overlap
+    ran a full shuffle. A rule that cannot see is indistinguishable from a rule that is absent.
+
+    Computing a column the optimizer does not read only wastes a little footer work; omitting
+    one only forgoes pruning (it never changes a result), so a superset is exactly right.
     """
     from batcher.plan.expr_ir import referenced_columns
-    from batcher.plan.logical import Filter
+    from batcher.plan.logical import AsofJoin, Filter, Join
     from batcher.plan.visitor import walk
 
     needed: set[str] = set()
     for node in walk(plan):
         if isinstance(node, Filter):
             needed |= referenced_columns(node.predicate)
+        elif isinstance(node, Join):
+            needed |= set(node.left_keys) | set(node.right_keys)
+        elif isinstance(node, AsofJoin):
+            # The `on` key is an ordering column (a range bound prunes the right side), and the
+            # `by` keys are equi-keys like a hash join's.
+            needed |= {node.left_on, node.right_on}
+            needed |= set(node.left_by) | set(node.right_by)
     return needed
 
 

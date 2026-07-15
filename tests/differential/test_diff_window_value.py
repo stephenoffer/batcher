@@ -139,3 +139,24 @@ def test_sql_value_window(duck, t, fn):
 
     q = f"SELECT p, v, {fn}(v) OVER (PARTITION BY p ORDER BY v) r FROM t"
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "lag(v, -1)",  # negative offset flips direction (== lead(v, 1))
+        "lead(v, -2)",  # == lag(v, 2)
+        "lag(v, -3)",
+        "nth_value(v, -1)",  # non-positive n → all NULL (matches DuckDB)
+        "nth_value(v, 0)",
+    ],
+)
+def test_sql_negative_offset_value_window(duck, t, expr):
+    # A negative literal offset parses in sqlglot as a `Neg` node; the translator used
+    # to read its inner Literal (`int(off.this)`) and crash with a TypeError on a valid
+    # query. The engine supports signed offsets, so the SQL path must too. Ordered
+    # compare because a window result is order-sensitive.
+    from conftest import assert_same_ordered
+
+    q = f"SELECT p, v, {expr} OVER (PARTITION BY p ORDER BY v) r FROM t ORDER BY p, v"
+    assert_same_ordered(bt.sql(q, t=t).collect(), duck.sql(q))

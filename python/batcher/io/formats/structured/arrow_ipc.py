@@ -102,7 +102,12 @@ class ArrowIPCSource(FileSource):
             reader = ipc.open_file(fh)
             return sum(reader.get_batch(i).num_rows for i in range(reader.num_record_batches))
 
-    def _file_splits(self, path: str, target_size: int | None) -> list[Split]:  # noqa: ARG002
+    def _file_splits(
+        self,
+        path: str,
+        target_size: int | None,  # noqa: ARG002
+        predicate: dict | None = None,  # noqa: ARG002 (no IPC block statistics to prune with)
+    ) -> list[Split]:
         ipc = _require_ipc()
         with self._fs.open(path) as fh:
             n = ipc.open_file(fh).num_record_batches

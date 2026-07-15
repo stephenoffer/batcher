@@ -263,8 +263,9 @@ class DatasetML:
         """
         from batcher.api.dataset.callbacks import _RowMap
 
+        cols = tuple(output_columns) if output_columns is not None else None
         return self.map_batches(
-            _RowMap(fn),
+            _RowMap(fn, cols),
             batch_size=batch_size,
             output_columns=output_columns,
             num_workers=num_workers,
@@ -305,8 +306,9 @@ class DatasetML:
         """
         from batcher.api.dataset.callbacks import _RowFlatMap
 
+        cols = tuple(output_columns) if output_columns is not None else None
         return self.map_batches(
-            _RowFlatMap(fn),
+            _RowFlatMap(fn, cols),
             batch_size=batch_size,
             output_columns=output_columns,
             num_workers=num_workers,

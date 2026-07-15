@@ -21,6 +21,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+
 from conftest import assert_tables_equal
 
 pytestmark = pytest.mark.differential
@@ -53,13 +54,21 @@ def parquet_path(tmp_path_factory) -> str:
     return path
 
 
-def _executed(ds):
-    """Force real execution, defeating any metadata shortcut, without changing the answer.
+def _forced(ds):
+    """The same relation, with the metadata layer switched off — the comparison's whole point.
 
-    A `filter(true)` is semantically the identity but makes the relation's stats inexact, so
-    the metadata layer declines and the engine runs the query for real.
+    This used to be a `filter(true)`, on the theory that an identity filter "downgrades the
+    stats away from EXACT". It does not: the optimizer folds an always-true predicate away, the
+    statistics come back EXACT, and the "forced" path was answered from metadata too — so the
+    test compared a metadata answer to itself and could not have caught the very class of bug
+    it was written for.
+
+    `map_batches` genuinely forces it: the IR cannot describe a Python callback, so Kyber
+    refuses to reason about the plan at all and every terminal falls through to the engine. The
+    callback is the identity, so not a row changes — this is the same relation, computed the
+    long way round.
     """
-    return ds.collect()
+    return ds.map_batches(lambda batch: batch)
 
 
 @pytest.mark.parametrize("column", sorted(COLUMNS))
@@ -71,9 +80,8 @@ def test_metadata_answer_equals_execution(parquet_path, source, column, agg):
     base = bt.from_arrow(table) if source == "memory" else bt.read.parquet(parquet_path)
     shortcut = base.agg(out=AGGREGATES[agg](column)).collect()
 
-    # The same query, forced through the engine: an always-true filter is the identity on rows
-    # but downgrades the stats away from EXACT, so no metadata answer can fire.
-    forced = base.filter(bt.lit(True)).agg(out=AGGREGATES[agg](column)).collect()
+    # The same query, genuinely forced through the engine (see `_forced`).
+    forced = _forced(base).agg(out=AGGREGATES[agg](column)).collect()
 
     assert_tables_equal(shortcut, forced)
 

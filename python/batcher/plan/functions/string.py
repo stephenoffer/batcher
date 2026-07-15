@@ -69,8 +69,10 @@ def concat_ws(separator: str, *exprs: IntoExpr) -> Expr:
     if not exprs:
         raise PlanError("concat_ws() requires at least one value argument")
     # array(...).list.join skips nulls, which is exactly concat_ws's contract.
+    # `list.join` of an all-null (non-empty) list is NULL, but DuckDB `concat_ws`
+    # returns the empty string when every value argument is NULL — coalesce to "".
     elements = [_wrap(e).cast("string") for e in exprs]
-    return ListJoin(Array(elements), separator)
+    return Coalesce([ListJoin(Array(elements), separator), Lit("")])
 
 
 def format_string(format: str, *exprs: IntoExpr) -> Expr:

@@ -16,8 +16,11 @@ Learning *within* a single test (multiple `collect()`s in one function) is prese
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
+
+_DOCS_TESTS = Path(__file__).parent / "docs"
 
 
 def pytest_configure(config):
@@ -42,6 +45,34 @@ def pytest_configure(config):
     """
     for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
         os.environ.pop(var, None)
+
+
+@pytest.fixture(autouse=True)
+def _docs_run_like_a_reader(request, monkeypatch):
+    """Doc examples execute the way a reader runs them: one process, no attached cluster.
+
+    `resolve_distributed("auto", ...)` consults the *live* Ray session, which makes the docs
+    suite order-dependent. Run it alone and every example executes locally, exactly as a
+    reader sees it; run it after a suite that happened to start Ray (the io and distributed
+    tests do) and the same examples suddenly route to a multi-node cluster.
+
+    That is not hypothetical. A doc example that defines its own `Source` — the custom
+    connector guide does, and it is the whole point of that page — cannot report a row
+    count, so "auto" takes the *unknown size means assume large* branch and distributes it.
+    The class is defined in the doc block, so it exists on no worker, and the page fails for
+    a reason that has nothing to do with the page.
+
+    Scoped by path here rather than in a `tests/docs/conftest.py`, because a second
+    top-level module named `conftest` shadows `tests/differential/conftest.py` — and 174
+    differential tests import `assert_same` from it by bare name.
+    """
+    if _DOCS_TESTS not in request.path.parents:
+        return
+    try:
+        import ray
+    except ImportError:
+        return
+    monkeypatch.setattr(ray, "is_initialized", lambda: False)
 
 
 @pytest.fixture(autouse=True)

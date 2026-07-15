@@ -247,3 +247,91 @@ def test_an_unpushable_predicate_is_simply_not_pushed() -> None:
         predicate=opaque
     )[0]
     assert "WHERE" not in split.query.upper()
+
+
+# --------------------------------------------------------------------------------------
+# Parquet: prune at PLAN time, so a ruled-out file never becomes a task at all
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def clustered(tmp_path):
+    """20 files x 5 row-groups, `day` strictly increasing across the corpus."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    for f in range(20):
+        table = pa.table(
+            {"day": np.repeat(np.arange(f * 5, f * 5 + 5), 1000), "v": np.arange(5000)}
+        )
+        pq.write_table(table, f"{tmp_path}/p{f:03d}.parquet", row_group_size=1000)
+    return str(tmp_path)
+
+
+def _splits(path, predicate=None):
+    from batcher.io.source import plan_splits
+
+    return plan_splits(SOURCES.get("parquet")(path), predicate=predicate)
+
+
+def test_a_selective_predicate_eliminates_files_before_they_become_tasks(clustered) -> None:
+    """Read-time row-group pruning still opens the file. Plan-time pruning does not.
+
+    A row-group ruled out here never becomes a `Split`, so it is never balanced, never shipped
+    to a worker, and never opened. A file whose every row-group is ruled out drops out of the
+    query entirely.
+    """
+    assert len(_splits(clustered)) == 100  # 20 files x 5 row-groups
+
+    day_is_7 = {
+        "e": "binary",
+        "op": "eq",
+        "left": {"e": "col", "name": "day"},
+        "right": {"e": "lit", "value": {"int": 7}},
+    }
+    pruned = _splits(clustered, day_is_7)
+
+    assert len(pruned) == 1, f"expected one surviving row-group, got {len(pruned)}"
+    assert len({s.path for s in pruned}) == 1, "19 of 20 files should never be opened"
+
+
+def test_a_range_predicate_prunes_to_the_matching_files(clustered) -> None:
+    day_ge_90 = {
+        "e": "binary",
+        "op": "ge",
+        "left": {"e": "col", "name": "day"},
+        "right": {"e": "lit", "value": {"int": 90}},
+    }
+    pruned = _splits(clustered, day_ge_90)
+    assert len({s.path for s in pruned}) == 2, "only the last two files can hold day >= 90"
+
+
+def test_pruning_never_changes_the_answer(clustered) -> None:
+    """The whole point. Pruning is an I/O optimization; the rows must be identical."""
+    import batcher as bt
+
+    exact = bt.read.parquet(clustered).filter(bt.col("day") == 7).collect()
+    assert exact.num_rows == 1000
+    assert set(exact.to_pydict()["day"]) == {7}
+
+    ranged = bt.read.parquet(clustered).filter(bt.col("day") >= 90).collect()
+    assert ranged.num_rows == 10_000
+    assert min(ranged.to_pydict()["day"]) == 90
+
+
+def test_a_predicate_that_matches_nothing_reads_no_files(clustered) -> None:
+    """Provably empty ⇒ zero splits ⇒ zero tasks. Not one file is opened."""
+    no_such_day = {
+        "e": "binary",
+        "op": "eq",
+        "left": {"e": "col", "name": "day"},
+        "right": {"e": "lit", "value": {"int": 9999}},
+    }
+    assert _splits(clustered, no_such_day) == []
+
+
+def test_an_unprunable_predicate_keeps_every_split(clustered) -> None:
+    """Unknown keeps the file — the only unsound answer is a false prune."""
+    on_a_column_with_no_stats = {"e": "unknown_node_kind"}
+    assert len(_splits(clustered, on_a_column_with_no_stats)) == 100

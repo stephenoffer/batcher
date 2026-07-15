@@ -9,10 +9,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, UInt64Array};
 use arrow::compute::SortOptions;
-use arrow::compute::{filter_record_batch, lexsort_to_indices, sort_to_indices, SortColumn};
-use arrow::datatypes::{Field, Schema};
+use arrow::compute::{filter_record_batch, lexsort_to_indices, SortColumn};
+use arrow::datatypes::{DataType, Field, Schema};
 use bc_ir::{
     AggFunc, AggregateItem, FrameBound, FrameUnits, ProjectionItem, SortKey, WindowFn, WindowFrame,
     WindowFunc,
@@ -326,6 +326,25 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
 
 // --- sort / limit / materialize ---------------------------------------------
 
+/// Coerce an evaluated sort-key column so arrow's order-based kernels can sort it.
+///
+/// A sort key that evaluates to the `Null` type (an all-null column, e.g. a `from_pydict`
+/// column that is entirely `None`) has no natural order, and `lexsort_to_indices` /
+/// `RowConverter` reject it outright — turning `ORDER BY <all-null col>` into a hard error
+/// on a path DuckDB executes fine. Such a key is all-equal, so it must contribute *nothing*
+/// to the ordering: substitute a constant (all-equal) column, and ties fall through to the
+/// following keys and the trailing row-index tie-break — exactly DuckDB's "order by the
+/// remaining keys". The asc/desc/nulls-first flags on the key are then irrelevant (a constant
+/// sorts identically under any of them). Applied at every sort-key eval site so the serial,
+/// parallel, top-N, and spilling merge paths all agree.
+pub(crate) fn coerce_null_sort_key(arr: ArrayRef) -> ArrayRef {
+    if matches!(arr.data_type(), DataType::Null) {
+        Arc::new(Int64Array::from(vec![0i64; arr.len()]))
+    } else {
+        arr
+    }
+}
+
 /// Sort a single (already-materialized) batch by the given keys.
 pub(crate) fn sort_batch(
     batch: &RecordBatch,
@@ -384,9 +403,14 @@ pub(crate) fn sort_indices_of(
     vals: &[ArrayRef],
     keys: &[SortKey],
 ) -> Result<arrow::array::UInt32Array, InterpError> {
+    // An all-null `Null`-typed key has no natural order (arrow's kernels reject it) and is
+    // all-equal anyway; substitute a constant so it contributes nothing to the ordering.
+    let coerced: Vec<ArrayRef> = vals.iter().cloned().map(coerce_null_sort_key).collect();
+    let vals: &[ArrayRef] = &coerced;
     if let ([k], [v]) = (keys, vals) {
-        // Single-key *full* sort uses arrow's specialized per-type `sort_to_indices` (a
-        // dedicated primitive path) rather than the general multi-column `lexsort`.
+        // Single-key *full* sort uses a stable specialized path per key type (string / radix)
+        // rather than the general multi-column `lexsort`; anything neither handles falls
+        // through to the stable lexsort path below.
         let opts = SortOptions {
             descending: k.descending,
             nulls_first: k.nulls_first,
@@ -400,11 +424,18 @@ pub(crate) fn sort_indices_of(
             return Ok(idx);
         }
         // Radix fast path on a fixed-width integer/temporal key: O(n) vs the comparison
-        // sort's O(n log n), producing the identical relation. Falls back for other types.
-        return Ok(match radix_sort::radix_sort_indices(v, opts) {
-            Some(idx) => idx,
-            None => sort_to_indices(v, Some(opts), None)?,
-        });
+        // sort's O(n log n), producing the identical relation.
+        if let Some(idx) = radix_sort::radix_sort_indices(v, opts) {
+            return Ok(idx);
+        }
+        // Any other single key (boolean, decimal, a NaN-bearing float the radix declines)
+        // has no stable specialized path. Arrow's `sort_to_indices` is UNSTABLE, so its tie
+        // order is arbitrary and input-size-dependent — which makes the serial oracle, the
+        // per-range parallel sample-sort, and the per-run external merge sort disagree on
+        // rows equal on the key. Fall through to the general lexsort path below, which
+        // appends an ascending row-index tie-break: ties resolve to input order, the same
+        // stability the radix/string single-key paths guarantee. (Not the specialized arrow
+        // primitive, but this type is off the fast path anyway.)
     }
     let mut columns: Vec<SortColumn> = vals
         .iter()
@@ -484,7 +515,7 @@ pub(crate) fn parallel_top_n(
             let key_cols = keys
                 .iter()
                 .map(|key| {
-                    let col = key.expr.eval(b)?;
+                    let col = coerce_null_sort_key(key.expr.eval(b)?);
                     Ok(bc_runtime::gather::take_column(col.as_ref(), &idx)?)
                 })
                 .collect::<Result<Vec<ArrayRef>, InterpError>>()?;
@@ -515,7 +546,7 @@ pub(crate) fn parallel_top_n(
             .map(|(_, _, kc)| kc[j].as_ref())
             .collect::<Vec<_>>();
         let values = if col_j.is_empty() {
-            key.expr.eval(&parts[0])? // empty: unreachable shape, keeps types
+            coerce_null_sort_key(key.expr.eval(&parts[0])?) // empty: unreachable shape, keeps types
         } else {
             arrow::compute::concat(&col_j)?
         };
@@ -564,7 +595,7 @@ fn eval_sort_columns(
     keys.iter()
         .map(|k| {
             Ok(SortColumn {
-                values: k.expr.eval(batch)?,
+                values: coerce_null_sort_key(k.expr.eval(batch)?),
                 options: Some(SortOptions {
                     descending: k.descending,
                     nulls_first: k.nulls_first,
@@ -1133,6 +1164,74 @@ mod sort_tests {
         );
     }
 
+    /// A single-key sort whose key type has no specialized stable path (boolean here, and a
+    /// NaN-bearing float that the radix declines) MUST still be stable: rows equal on the key
+    /// keep input order. Before the fix this branch called arrow's UNSTABLE `sort_to_indices`,
+    /// so ties came back in an arbitrary, input-size-dependent order — making the serial
+    /// oracle, the parallel sample-sort's per-range sorts, and the external-merge-sort runs
+    /// disagree on the payload of tied rows (a seq != par != spill divergence). The payload is
+    /// a distinct ascending id, so any tie-order scramble shows as a non-ascending run.
+    #[test]
+    fn single_key_fallback_is_stable_on_ties() {
+        use arrow::array::BooleanArray;
+        let n = 4096usize;
+
+        // Boolean key: two big tie groups (false, then true).
+        let bk: Vec<bool> = (0..n).map(|i| i % 2 == 1).collect();
+        let bp: Vec<i64> = (0..n as i64).collect();
+        let bb = RecordBatch::try_from_iter(vec![
+            ("k", Arc::new(BooleanArray::from(bk)) as ArrayRef),
+            ("p", Arc::new(Int64Array::from(bp)) as ArrayRef),
+        ])
+        .unwrap();
+        // Float key with a NaN so the radix declines and the fallback path is taken; heavy
+        // ties on 0.0 exercise the tie-break.
+        let fk: Vec<f64> = (0..n)
+            .map(|i| if i == 0 { f64::NAN } else { (i % 3) as f64 })
+            .collect();
+        let fp: Vec<i64> = (0..n as i64).collect();
+        let fb = RecordBatch::try_from_iter(vec![
+            ("k", Arc::new(Float64Array::from(fk)) as ArrayRef),
+            ("p", Arc::new(Int64Array::from(fp)) as ArrayRef),
+        ])
+        .unwrap();
+
+        for (batch, label) in [(&bb, "bool"), (&fb, "float-nan")] {
+            let keys = vec![SortKey {
+                expr: Expr::Col { name: "k".into() },
+                descending: false,
+                nulls_first: false,
+            }];
+            let out = sort_batch(batch, &keys, None).unwrap();
+            let kc = out.column(0);
+            let pc = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            // A comparable per-row key token (null distinct from any value; NaN by bits) so a
+            // run of equal keys can be identified without gathering.
+            let tok = |i: usize| -> (u8, u64) {
+                if kc.is_null(i) {
+                    (0, 0)
+                } else if let Some(b) = kc.as_any().downcast_ref::<BooleanArray>() {
+                    (1, b.value(i) as u64)
+                } else {
+                    let f = kc.as_any().downcast_ref::<Float64Array>().unwrap();
+                    (2, f.value(i).to_bits())
+                }
+            };
+            // Within each run of equal keys the payload ids must be strictly ascending
+            // (stable = input order preserved).
+            for i in 1..out.num_rows() {
+                if tok(i) == tok(i - 1) {
+                    assert!(
+                        pc.value(i) > pc.value(i - 1),
+                        "{label}: tie order not stable at row {i}: {} !> {}",
+                        pc.value(i),
+                        pc.value(i - 1)
+                    );
+                }
+            }
+        }
+    }
+
     /// The parallel path declines for a small input (sampling + partition overhead would
     /// dominate), so the caller uses the serial sort.
     #[test]
@@ -1186,5 +1285,68 @@ mod sort_tests {
                 "descending={descending} nulls_first={nulls_first}"
             );
         }
+    }
+
+    /// A `Null`-typed (all-null) sort key has no natural order — arrow's sort kernels reject
+    /// it, which turned `ORDER BY <all-null col>` into a hard error on a path DuckDB runs
+    /// fine. It must instead sort as all-equal: with a real secondary key present, the result
+    /// is ordered by that key; with only the null key, the input order is preserved (stable).
+    /// Covers both the top-N (`limit`) and full-sort code paths.
+    #[test]
+    fn null_typed_sort_key_orders_by_remaining_keys() {
+        // `n` (Null type) is the leading key; `y` is a real Int64 tiebreak; `p` a distinct
+        // payload proving stability. Rows deliberately out of `y` order on input.
+        let ys = vec![3i64, 1, 2, 1, 3];
+        let ps = vec![10i64, 11, 12, 13, 14];
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "n",
+                Arc::new(arrow::array::NullArray::new(ys.len())) as ArrayRef,
+            ),
+            ("y", Arc::new(Int64Array::from(ys)) as ArrayRef),
+            ("p", Arc::new(Int64Array::from(ps)) as ArrayRef),
+        ])
+        .unwrap();
+
+        // ORDER BY n, y  → the null key contributes nothing; rows come out in `y` order,
+        // ties on `y` (rows p=11,13) resolved to input order (11 before 13).
+        let keys = vec![
+            SortKey {
+                expr: Expr::Col { name: "n".into() },
+                descending: false,
+                nulls_first: false,
+            },
+            SortKey {
+                expr: Expr::Col { name: "y".into() },
+                descending: false,
+                nulls_first: false,
+            },
+        ];
+        let out = sort_batch(&batch, &keys, None).expect("null-typed key must not error");
+        let p = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(
+            p.values(),
+            &[11, 13, 12, 10, 14],
+            "ordered by y, stable ties"
+        );
+
+        // Top-N (limit) path over the same keys: the first 3 by `y`.
+        let topn = sort_batch(&batch, &keys, Some(3)).expect("null-typed top-N must not error");
+        let p = topn
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(p.values(), &[11, 13, 12]);
+
+        // ORDER BY n alone → all rows equal, input order preserved (stable no-op sort).
+        let only_null = vec![SortKey {
+            expr: Expr::Col { name: "n".into() },
+            descending: true,
+            nulls_first: true,
+        }];
+        let out = sort_batch(&batch, &only_null, None).expect("sole null key must not error");
+        let p = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(p.values(), &[10, 11, 12, 13, 14], "input order preserved");
     }
 }

@@ -466,13 +466,14 @@ def _coalesce_simplify(expr: Expr) -> Expr:
                 continue  # an earlier identical (deterministic) arg already covers it
             seen.add(k)
         out.append(arg)
-    # A non-null literal makes every later argument unreachable — drop them when the
-    # dropped tail cannot error (so removing it changes neither value nor errors).
-    for i, arg in enumerate(out):
-        if isinstance(arg, Lit):
-            if all(_safe(rest) for rest in out[i + 1 :]):
-                out = out[: i + 1]
-            break
+    # NB: truncating the tail after the first non-null *literal* is deliberately NOT done
+    # here. It is sound only when the dropped tail's type is already carried by a kept arm
+    # — otherwise it narrows the result type (a `COALESCE`'s type is the *join* of its
+    # arms', so dropping `CAST(-1 AS DOUBLE)` from `coalesce(5, CAST(-1 AS DOUBLE))` turns
+    # a DOUBLE `5.0` into an INT `5`). That type-guarded truncation lives in
+    # `coalesce_drop_nulls_after_first_non_null` (`_droppable`); doing an unguarded version
+    # here silently changed the output dtype and value. Flatten + dedup below only ever
+    # drop an arm structurally identical to a kept one, so they cannot move the type.
     if len(out) == 1:
         return out[0]
     if _keys(out) == _keys(expr.inputs):
@@ -488,9 +489,11 @@ def _coalesce_simplify(expr: Expr) -> Expr:
 )
 def coalesce_simplify(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Flatten and shrink a `COALESCE`: inline a nested `COALESCE`, drop a later
-    duplicate of an earlier `_safe` argument, truncate everything after the first
-    non-null literal (when the dropped tail cannot error), and unwrap `COALESCE(x)` to
-    `x`. Each step preserves "first non-null argument" exactly — a repeated or
-    post-literal argument is only ever reached when it is null (or never), so removing
-    it is sound."""
+    duplicate of an earlier `_safe` argument, and unwrap `COALESCE(x)` to `x`. Each step
+    preserves "first non-null argument" *and* the result type: a repeated argument is only
+    ever reached when it is null and is structurally identical to a kept one, so removing
+    it moves neither the value nor the type. Truncating the tail after the first non-null
+    *literal* is left to `coalesce_drop_nulls_after_first_non_null`, which guards it with a
+    type check (`_droppable`) — dropping a differently-typed tail here would narrow the
+    `COALESCE`'s join type (turning DOUBLE `5.0` into INT `5`)."""
     return _rewrite_node(node, _coalesce_simplify)

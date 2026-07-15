@@ -16,6 +16,7 @@ from batcher.plan.expr_ir import Expr
 from batcher.plan.ir_tags import (
     WINDOW_AGGREGATES,
     WINDOW_FILL,
+    WINDOW_FRAMEABLE,
     WINDOW_FUNCS,
     WINDOW_RANKING,
     WINDOW_VALUE,
@@ -31,6 +32,10 @@ __all__ = ["Window", "WindowFrame", "WindowFuncSpec"]
 
 def _window_func_type(fn: WindowFuncSpec, input_schema: SchemaRef) -> pa.DataType | None:
     """The Arrow type a window function appends, or ``None`` if not certain."""
+    # `percent_rank`/`cume_dist` are ranking functions but produce a fraction in [0, 1],
+    # so they are Float64 — the plain-int64 ranking branch below would misreport the schema.
+    if fn.func in ("percent_rank", "cume_dist"):
+        return pa.float64()
     if fn.func in WINDOW_RANKING or fn.func == "count":
         return pa.int64()
     if fn.func == "avg":
@@ -106,8 +111,10 @@ class WindowFuncSpec:
     `row_number`/`rank`/`dense_rank`; aggregates `sum`/`avg`/`min`/`max`/`count`;
     value `first_value`/`last_value`/`lag`/`lead`). The ranking functions take no
     `input`; the aggregates and value functions require one. `offset` is the
-    lag/lead distance (ignored otherwise). `frame` is an explicit ``ROWS`` frame,
-    valid only on the aggregate functions.
+    lag/lead distance (ignored otherwise). `frame` is an explicit frame, valid on
+    the aggregate functions and the positional value functions
+    (`first_value`/`last_value`/`nth_value`) — which then pick the frame's
+    first/last/nth row.
     """
 
     func: str
@@ -125,7 +132,7 @@ class WindowFuncSpec:
             raise PlanError(f"window function {self.func!r} requires an input column")
         if self.func in WINDOW_RANKING and self.input is not None:
             raise PlanError(f"window ranking function {self.func!r} takes no input")
-        if self.frame is not None and self.func not in WINDOW_AGGREGATES:
+        if self.frame is not None and self.func not in WINDOW_FRAMEABLE:
             raise PlanError(f"window function {self.func!r} does not support an explicit frame")
 
     def to_ir(self) -> dict[str, Any]:

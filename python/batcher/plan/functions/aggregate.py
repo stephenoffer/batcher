@@ -7,7 +7,7 @@ single-node and distributed with no new engine state.
 
 from __future__ import annotations
 
-from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit, _wrap
+from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit
 from batcher.plan.functions.conditional import iff
 
 
@@ -33,7 +33,7 @@ def corr(x: IntoExpr, y: IntoExpr) -> AggExpr:
             >>> ds.agg(c=bt.corr(bt.col("x"), bt.col("y"))).to_pydict()
             {'c': [1.0]}
     """
-    return AggExpr("corr", _wrap(x), input2=_wrap(y))
+    return AggExpr("corr", _as_column(x), input2=_as_column(y))
 
 
 def covar_pop(x: IntoExpr, y: IntoExpr) -> AggExpr:
@@ -56,7 +56,7 @@ def covar_pop(x: IntoExpr, y: IntoExpr) -> AggExpr:
             >>> ds.agg(c=bt.covar_pop(bt.col("x"), bt.col("y"))).to_pydict()
             {'c': [2.0]}
     """
-    return AggExpr("covar_pop", _wrap(x), input2=_wrap(y))
+    return AggExpr("covar_pop", _as_column(x), input2=_as_column(y))
 
 
 def covar_samp(x: IntoExpr, y: IntoExpr) -> AggExpr:
@@ -80,7 +80,7 @@ def covar_samp(x: IntoExpr, y: IntoExpr) -> AggExpr:
             >>> ds.agg(c=bt.covar_samp(bt.col("x"), bt.col("y"))).to_pydict()
             {'c': [4.0]}
     """
-    return AggExpr("covar_samp", _wrap(x), input2=_wrap(y))
+    return AggExpr("covar_samp", _as_column(x), input2=_as_column(y))
 
 
 def count_if(condition: Expr) -> AggExpr:

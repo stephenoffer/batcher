@@ -25,13 +25,14 @@ unmetered result rather than failing the query.
 
 from __future__ import annotations
 
-from batcher._internal.native import engine
 import contextlib
 import json
 from collections.abc import Iterable
 from typing import Any
 
 import pyarrow as pa
+
+from batcher._internal.native import engine
 
 __all__ = ["execute_metered", "record_worker_metrics"]
 

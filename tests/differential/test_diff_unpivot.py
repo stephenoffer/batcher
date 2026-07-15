@@ -88,3 +88,42 @@ def test_unpivot_custom_names_and_filter(duck):
             "(UNPIVOT t ON q1, q2 INTO NAME quarter VALUE amount)) WHERE amount > 25"
         ),
     )
+
+
+def test_unpivot_mixed_numeric_promotes(duck):
+    """Melting an Int64 column together with a Float64 column promotes to Float64
+    (DuckDB/Polars), rather than erroring on the concat of differing types."""
+    from conftest import assert_same
+
+    wide = pa.table(
+        {
+            "id": pa.array([1, 2], type=pa.int64()),
+            "a": pa.array([10, 20], type=pa.int64()),
+            "b": pa.array([1.5, 2.5], type=pa.float64()),
+        }
+    )
+    out = bt.from_arrow(wide).unpivot(index=["id"], on=["a", "b"]).collect()
+    # The stacked value column is the promoted supertype (Float64), matching the schema.
+    assert pa.types.is_floating(out.schema.field("value").type)
+    duck.register("t", wide)
+    assert_same(
+        out,
+        duck.sql(
+            "SELECT id, variable, value FROM (UNPIVOT t ON a, b INTO NAME variable VALUE value)"
+        ),
+    )
+
+
+def test_unpivot_name_collision_raises():
+    """A `value_name`/`variable_name` that collides with an index column must raise —
+    silently producing two same-named columns dropped one on the way out."""
+    from batcher._internal.errors import PlanError
+
+    ds = bt.from_pydict({"id": [1, 2], "a": [10, 20], "b": [30, 40]})
+    for kwargs in (
+        {"index": ["id"], "value_name": "id"},
+        {"index": ["id"], "variable_name": "id"},
+        {"index": ["id"], "variable_name": "v", "value_name": "v"},
+    ):
+        with pytest.raises(PlanError, match="collide"):
+            ds.unpivot(**kwargs)

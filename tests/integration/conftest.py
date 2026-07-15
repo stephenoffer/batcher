@@ -21,23 +21,21 @@ def init_test_ray(num_cpus: int) -> bool:
     """
     import ray
 
-    from batcher.dist.executors.ray_runtime.lifecycle import (
-        _neutralize_broken_runtime_env_hook,
-    )
+    from batcher.dist.executors.ray_runtime.lifecycle import _platform_env_hook_disabled
 
     if ray.is_initialized():
         return False
-    _neutralize_broken_runtime_env_hook()
-    try:
-        ray.init(
-            num_cpus=num_cpus,
-            include_dashboard=False,
-            logging_level="ERROR",
-            ignore_reinit_error=True,
-        )
-    except (ValueError, ConnectionError):
-        # A cluster is already running but wants to be attached to (no local pinning).
-        ray.init(address="auto", ignore_reinit_error=True)
+    with _platform_env_hook_disabled():
+        try:
+            ray.init(
+                num_cpus=num_cpus,
+                include_dashboard=False,
+                logging_level="ERROR",
+                ignore_reinit_error=True,
+            )
+        except (ValueError, ConnectionError):
+            # A cluster is already running but wants to be attached to (no local pinning).
+            ray.init(address="auto", ignore_reinit_error=True)
     return True
 
 

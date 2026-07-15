@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from batcher.plan.expr_ir.audio import AudioFunc
 from batcher.plan.expr_ir.core import (
+    Aliased,
     Binary,
     Cast,
     Coalesce,
@@ -113,6 +114,11 @@ def referenced_columns(expr: Expr) -> set[str]:
 def _referenced_columns_impl(expr: Expr) -> set[str]:
     if isinstance(expr, Col):
         return {expr.name}
+    if isinstance(expr, Aliased):
+        # A mid-expression alias (``(col("x").alias("y") + 1)``) is transparent — it
+        # reads whatever its wrapped expression reads. Missing this arm pruned the
+        # underlying column and failed the query with "unknown column".
+        return referenced_columns(expr.inner)
     if isinstance(expr, Binary):
         return referenced_columns(expr.left) | referenced_columns(expr.right)
     if isinstance(
@@ -124,8 +130,10 @@ def _referenced_columns_impl(expr: Expr) -> set[str]:
             IsNull,
             IsNotNull,
             IsNan,
+            IsInf,
             StrFunc,
             Strftime,
+            Strptime,
             ConvertTimezone,
             DateFunc,
             DateOffset,
@@ -190,6 +198,8 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
     """
     if isinstance(expr, Col):
         return Col(mapping.get(expr.name, expr.name))
+    if isinstance(expr, Aliased):
+        return Aliased(remap_columns(expr.inner, mapping), expr.name)
     if isinstance(expr, Binary):
         return Binary(
             expr.op, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)

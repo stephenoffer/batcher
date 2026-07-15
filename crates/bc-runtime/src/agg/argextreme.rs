@@ -19,8 +19,9 @@ use crate::error::RuntimeError;
 
 /// Pick, per group, the `(key, value)` pair at the extreme key — the shared core of
 /// the partial step (over input columns) and the merge step (over partial winners).
-/// Returns two columns: `[winning_key, winning_value]`. Rows with a null key are
-/// ignored; an all-null-key group yields a null pair.
+/// Returns two columns: `[winning_key, winning_value]`. Rows where **either** the key
+/// or the value is null are ignored (matching DuckDB `arg_max`/`arg_min`, which skip a
+/// row with a null in either argument); an all-ignored group yields a null pair.
 pub(crate) fn arg_extreme_pick(
     keys: &ArrayRef,
     values: &ArrayRef,
@@ -35,8 +36,12 @@ pub(crate) fn arg_extreme_pick(
 
     let mut best: Vec<Option<usize>> = vec![None; num_groups];
     for (i, &g) in group_ids.iter().enumerate() {
-        if !keys.is_valid(i) {
-            continue; // a null key can't be an extreme
+        // A null key can't be an extreme, and a null value can't be selected — DuckDB
+        // ignores the whole row if either is null, so `arg_max(v, k)` returns the value
+        // at the largest key *among rows with a non-null value* (not NULL because the
+        // absolute-max-key row happened to have a null value).
+        if !keys.is_valid(i) || !values.is_valid(i) {
+            continue;
         }
         let g = g as usize;
         let take_it = match best[g] {
@@ -103,6 +108,27 @@ mod tests {
         let amin = arg_extreme_pick(&keys, &vals, &gids, 2, false).unwrap();
         let amin_v = amin[1].as_primitive::<Int64Type>();
         assert_eq!((amin_v.value(0), amin_v.value(1)), (10, 50));
+    }
+
+    #[test]
+    fn arg_extreme_skips_null_values() {
+        // group 0: v=[10, NULL, 30], k=[1, 9, 5]. The absolute-max key is 9 (row 1), but
+        // its value is NULL, so DuckDB ignores that row: arg_max = value at the next-
+        // highest key among non-null values = key 5 → 30 (NOT null). arg_min = key 1 → 10.
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![Some(10), None, Some(30)]));
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 9, 5]));
+        let gids = [0u32, 0, 0];
+
+        let amax = arg_extreme_pick(&keys, &vals, &gids, 1, true).unwrap();
+        assert_eq!(amax[1].as_primitive::<Int64Type>().value(0), 30);
+        let amin = arg_extreme_pick(&keys, &vals, &gids, 1, false).unwrap();
+        assert_eq!(amin[1].as_primitive::<Int64Type>().value(0), 10);
+
+        // A group whose only rows have null values yields a null pair.
+        let v2: ArrayRef = Arc::new(Int64Array::from(vec![None, None]));
+        let k2: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        let r = arg_extreme_pick(&k2, &v2, &[0u32, 0], 1, true).unwrap();
+        assert!(r[1].is_null(0), "all-null-value group must yield null");
     }
 
     #[test]

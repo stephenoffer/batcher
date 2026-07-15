@@ -13,8 +13,9 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.errors import PlanError
 from batcher._sql.parser import clauses, grouping, scalar, subquery, windowing
-from batcher._sql.parser.core_utils import _alias_of, _has_aggregate
+from batcher._sql.parser.core_utils import _alias_of, _disambiguate_columns, _has_aggregate
 from batcher.api.dataset import Dataset
 from batcher.api.session import from_arrow
 from batcher.plan.expr_ir import AggExpr, Expr
@@ -46,6 +47,23 @@ def translate_ast(
     """
     registry = {name: _as_dataset(t) for name, t in tables.items()}
     return _Translator(registry, functions or {}).statement(ast)
+
+
+def _align_setop_columns(left: Dataset, right: Dataset) -> Dataset:
+    """Rename `right`'s columns to `left`'s positionally, for a set operation.
+
+    SQL set ops (UNION/INTERSECT/EXCEPT) pair columns by position and adopt the
+    left query's names. The engine's `union`/`intersect`/`except_` require matching
+    names, so re-map the right side before handing it over.
+    """
+    lc, rc = left.columns, right.columns
+    if len(lc) != len(rc):
+        raise PlanError(
+            f"set operation needs both sides to have the same number of columns: "
+            f"left has {len(lc)} {lc}, right has {len(rc)} {rc}"
+        )
+    mapping = {old: new for old, new in zip(rc, lc, strict=True) if old != new}
+    return right.rename(mapping) if mapping else right
 
 
 def _as_dataset(t: Dataset | pa.Table) -> Dataset:
@@ -85,24 +103,74 @@ class _Translator:
         # sqlglot sets distinct=True for the bare set operator, False for its ALL form.
         # Honor it on all three: dropping it on INTERSECT/EXCEPT would silently answer
         # an `ALL` query with DISTINCT multiplicity.
-        if isinstance(node, exp.Union):
+        if isinstance(node, (exp.Union, exp.Intersect, exp.Except)):
             left = self.statement(node.this)
             right = self.statement(node.expression)
-            return left.union(right, distinct=bool(node.args.get("distinct")))
-        if isinstance(node, exp.Intersect):
-            left = self.statement(node.this)
-            right = self.statement(node.expression)
-            return left.intersect(right, distinct=bool(node.args.get("distinct")))
-        if isinstance(node, exp.Except):
-            left = self.statement(node.this)
-            right = self.statement(node.expression)
-            return left.except_(right, distinct=bool(node.args.get("distinct")))
+            # SQL set operations combine by column *position*, taking the left query's
+            # output names — not by name. Align the right side's names to the left's,
+            # or an operand whose columns merely differ in name (`... id ... UNION
+            # ... dept_id ...`) is wrongly rejected as "identical columns" required.
+            right = _align_setop_columns(left, right)
+            distinct = bool(node.args.get("distinct"))
+            if isinstance(node, exp.Union):
+                ds = left.union(right, distinct=distinct)
+            elif isinstance(node, exp.Intersect):
+                ds = left.intersect(right, distinct=distinct)
+            else:
+                ds = left.except_(right, distinct=distinct)
+            # ORDER BY / LIMIT / OFFSET can trail a set operation and apply to its
+            # combined result. Ignoring them silently returned unordered / unlimited
+            # rows (e.g. `... UNION ALL ... LIMIT 3` kept every row).
+            return self._apply_setop_tail(node, ds)
         if isinstance(node, exp.Select):
             return self.select(node)
+        if isinstance(node, exp.Values):
+            # A bare `VALUES (..), (..)` statement is an inline literal relation.
+            return clauses._values_table(node)
+        if isinstance(node, exp.Command) and str(node.this).upper() == "EXPLAIN":
+            # sqlglot does not model EXPLAIN; it parses as a Command carrying the rest
+            # of the query as text. Re-parse it, render the *planned* tree (no
+            # execution), and hand it back as a one-row relation like DuckDB's EXPLAIN.
+            return self._explain(node)
         raise NotImplementedError(
-            f"only SELECT / UNION / INTERSECT / EXCEPT statements are supported, "
+            f"only SELECT / UNION / INTERSECT / EXCEPT / VALUES statements are supported, "
             f"got {type(node).__name__}"
         )
+
+    def _explain(self, node) -> Dataset:
+        """Translate an ``EXPLAIN [ANALYZE] <query>`` command into a plan relation."""
+        import sqlglot
+
+        text = node.args["expression"].this if node.args.get("expression") else ""
+        analyze = False
+        stripped = text.lstrip()
+        if stripped[:8].upper() == "ANALYZE ":
+            analyze, text = True, stripped[8:]
+        inner = sqlglot.parse_one(text, read="duckdb")
+        plan = self.statement(inner).explain(analyze=analyze)
+        return _as_dataset(pa.table({"explain_key": ["plan"], "explain_value": [plan]}))
+
+    def _apply_setop_tail(self, node, ds: Dataset) -> Dataset:
+        """Apply a trailing ORDER BY / LIMIT / OFFSET on a set-operation result."""
+        import sys
+
+        from sqlglot import expressions as exp
+
+        order = node.args.get("order")
+        if order is not None:
+            # Positional ORDER BY (`ORDER BY 1`) resolves against the leftmost
+            # SELECT's projection list (the set op's output columns).
+            leftmost = node.this
+            while not isinstance(leftmost, exp.Select):
+                leftmost = leftmost.this
+            ds = self._order(ds, order, leftmost.expressions)
+        limit = node.args.get("limit")
+        offset = node.args.get("offset")
+        if limit is not None or offset is not None:
+            skip = int(offset.expression.this) if offset is not None else 0
+            n = int(limit.expression.this) if limit is not None else sys.maxsize
+            ds = ds.limit(n, offset=skip)
+        return ds
 
     # --- clause building (clauses.py) --------------------------------------
     def select(self, node) -> Dataset:
@@ -133,8 +201,8 @@ class _Translator:
     def _reject_correlated(self, select_node) -> None:
         subquery._reject_correlated(select_node)
 
-    def _rewrite_self_joins(self, select_node) -> None:
-        subquery._rewrite_self_joins(self, select_node)
+    def _disambiguate_columns(self, select_node) -> None:
+        _disambiguate_columns(self, select_node)
 
     # --- grouping / aggregation (grouping.py) ------------------------------
     def _grouping_sets_union(self, node, group) -> Dataset:

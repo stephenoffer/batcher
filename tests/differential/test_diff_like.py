@@ -75,6 +75,21 @@ def test_like_literal_metachars_vs_duckdb(duck, t):
     assert_same(out, expected)
 
 
+@pytest.mark.parametrize(
+    "pat",
+    ["%%c", "a%%", "%%%", "%%abc", "abc%%", "%%b%%"],
+)
+@pytest.mark.parametrize("op", ["LIKE", "ILIKE", "NOT LIKE"])
+def test_sql_like_consecutive_percent_vs_duckdb(duck, t, op, pat):
+    # The SQL fast path peeled a single boundary `%`, so a pattern with two or more
+    # consecutive leading/trailing wildcards left an interior `%` that was matched
+    # literally: `'abc' LIKE '%%c'` returned false where DuckDB returns true.
+    from conftest import assert_same
+
+    q = f"SELECT (s {op} '{pat}') AS v FROM t"
+    assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
+
+
 def test_like_empty_and_case_vs_duckdb(duck, t):
     from conftest import assert_same
 

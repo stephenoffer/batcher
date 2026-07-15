@@ -28,6 +28,20 @@ from batcher.plan.logical import LogicalPlan
 __all__ = ["_iter_batches", "_iter_streaming"]
 
 
+def _event_micros(col: pa.Array | pa.ChunkedArray | pa.Scalar) -> pa.Array | pa.ChunkedArray | pa.Scalar:
+    """Event-time ticks as int64 **microseconds**, whatever the column's resolution.
+
+    Watermarks, `within`, and `lateness` are all microseconds. Reading the raw int64
+    ticks of a non-`us` timestamp (e.g. `timestamp[ns]`) would scale the watermark by
+    up to 1000x — evicting keys too early (re-emitting duplicates) or missing valid
+    interval-join matches. Normalizing through `timestamp[us]` first keeps every
+    comparison in the same unit. A column already in `us` (or int64) is unchanged.
+    """
+    import pyarrow.compute as pc
+
+    return pc.cast(pc.cast(col, pa.timestamp("us")), pa.int64())
+
+
 def _check_stream_state(table: pa.Table | None, label: str) -> None:
     """Raise a clear `ResourceError` if a streaming operator's retained state has
     outgrown the configured cap.
@@ -346,7 +360,7 @@ def _stream_watermark_dedup(
                 continue
             table = pa.Table.from_batches([b])
             if wm is not None:  # drop rows below the watermark (late)
-                table = table.filter(pc.greater_equal(pc.cast(table.column(et), pa.int64()), wm))
+                table = table.filter(pc.greater_equal(_event_micros(table.column(et)), wm))
                 if table.num_rows == 0:
                     continue
             # Duplicate check against the seen-keys state *before* advancing the
@@ -361,13 +375,13 @@ def _stream_watermark_dedup(
             # batch, so duplicates falling out of the window are forgotten (bounded).
             hi = pc.max(table.column(et))
             if hi.is_valid:
-                cand = pc.cast(hi, pa.int64()).as_py() - lateness
+                cand = _event_micros(hi).as_py() - lateness
                 wm = cand if wm is None else max(wm, cand)
             if new.num_rows:
                 fresh = new.select([*subset, et])
                 seen = fresh if seen is None else pa.concat_tables([seen, fresh])
             if seen is not None and wm is not None:
-                keep = pc.greater_equal(pc.cast(seen.column(et), pa.int64()), wm)
+                keep = pc.greater_equal(_event_micros(seen.column(et)), wm)
                 seen = seen.filter(keep)
             _check_stream_state(seen, "watermark-dedup")
             if new.num_rows:
@@ -407,7 +421,7 @@ def _stream_stream_join(
 
     def micros(col):
         hi = pc.max(col)
-        return pc.cast(hi, pa.int64()).as_py() if hi.is_valid else None
+        return _event_micros(hi).as_py() if hi.is_valid else None
 
     def evict():
         # A buffered row can be dropped once the *other* stream's watermark has moved
@@ -415,12 +429,12 @@ def _stream_stream_join(
         # t >= wmR - within (and symmetrically).
         if state["wmR"] is not None and state["bufL"] is not None:
             keep = pc.greater_equal(
-                pc.cast(state["bufL"].column(lt), pa.int64()), state["wmR"] - within
+                _event_micros(state["bufL"].column(lt)), state["wmR"] - within
             )
             state["bufL"] = state["bufL"].filter(keep)
         if state["wmL"] is not None and state["bufR"] is not None:
             keep = pc.greater_equal(
-                pc.cast(state["bufR"].column(rt), pa.int64()), state["wmL"] - within
+                _event_micros(state["bufR"].column(rt)), state["wmL"] - within
             )
             state["bufR"] = state["bufR"].filter(keep)
 
@@ -431,7 +445,11 @@ def _stream_stream_join(
         left_ds = from_arrow(side_table if left_side else other_buf)
         right_ds = from_arrow(other_buf if left_side else side_table)
         joined = left_ds.join(right_ds, left_on=lk, right_on=rk, how="inner")
-        diff = joined[lt].cast("int64") - joined[rt].cast("int64")
+        # Normalize event time to microseconds (`within` is micros) before differencing,
+        # so a non-`us` timestamp (e.g. ns) is not compared 1000x off and missing matches.
+        diff = joined[lt].cast("timestamp").cast("int64") - joined[rt].cast("timestamp").cast(
+            "int64"
+        )
         res = joined.filter((diff <= within) & (diff >= -within)).collect()
         if res.num_rows == 0:
             return []

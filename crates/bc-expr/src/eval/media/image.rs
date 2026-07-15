@@ -40,20 +40,50 @@ pub(crate) fn eval_image(
     }
 }
 
+/// Validate and narrow a target dimension to `u32`.
+///
+/// A plain `as u32` cast silently wraps an out-of-range `i64`: a negative value becomes a
+/// ~4-billion dimension (an unbounded allocation that aborts the process), and a value past
+/// `u32::MAX` wraps to a small one (a silently wrong output size). Both are rejected with a
+/// clear error instead — the dimension is a query parameter, so a bad one is a caller bug to
+/// surface, not a crash to suffer or a wrong answer to return.
+fn dim(func: &str, arg: &'static str, value: Option<i64>) -> Result<u32, ExprError> {
+    let value = value.ok_or(ExprError::MissingImageArg {
+        func: func.to_string(),
+        arg,
+    })?;
+    u32::try_from(value)
+        .ok()
+        .filter(|&v| v > 0)
+        .ok_or(ExprError::InvalidImageDim {
+            func: func.to_string(),
+            arg,
+            value,
+            max: u32::MAX,
+        })
+}
+
 /// `resize(w, h)` → re-encoded PNG bytes at the new size. Null/undecodable → null.
 fn resize(
     bytes: &BinaryArray,
     width: Option<i64>,
     height: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
-    let w = width.ok_or(ExprError::MissingImageArg {
-        func: "resize".into(),
-        arg: "width",
-    })? as u32;
-    let h = height.ok_or(ExprError::MissingImageArg {
-        func: "resize".into(),
-        arg: "height",
-    })? as u32;
+    let w = dim("resize", "width", width)?;
+    let h = dim("resize", "height", height)?;
+    // Each dimension is a valid `u32`, but the resize allocates a `w * h * 3`-byte RGB
+    // buffer per row; an absurd product (e.g. 50_000²) is a multi-gigabyte allocation bomb
+    // driven by a query parameter. Cap it at `i32::MAX` — no legitimate thumbnail approaches
+    // 2 GiB — computed in `u64` so the multiply itself cannot overflow.
+    if (w as u64) * (h as u64) * 3 > i32::MAX as u64 {
+        return Err(ExprError::InvalidArgument {
+            func: "resize".to_string(),
+            reason: format!(
+                "resize to {w}x{h}x3 bytes exceeds the maximum of {} bytes",
+                i32::MAX
+            ),
+        });
+    }
     let out: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
         if bytes.is_null(i) {
             None
@@ -122,15 +152,27 @@ fn to_tensor(
     width: Option<i64>,
     height: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
-    let w = width.ok_or(ExprError::MissingImageArg {
-        func: "to_tensor".into(),
-        arg: "width",
-    })? as u32;
-    let h = height.ok_or(ExprError::MissingImageArg {
-        func: "to_tensor".into(),
-        arg: "height",
-    })? as u32;
-    let per_row = (w as usize) * (h as usize) * 3;
+    let w = dim("to_tensor", "width", width)?;
+    let h = dim("to_tensor", "height", height)?;
+    // Each dimension is individually a valid `u32` (guarded by `dim`), but the *product*
+    // `w * h * 3` is the per-row byte count — and it is also the `FixedSizeList` element
+    // length, an Arrow `i32`. At ~26_755² it already exceeds `i32::MAX`: the `as i32` cast
+    // below would wrap negative (an invalid array / panic), and `bytes.len() * per_row`
+    // would pre-allocate a multi-gigabyte zeroed buffer (an OOM bomb driven by a query
+    // parameter). Reject the request cleanly instead — computed in `u64` so the multiply
+    // itself cannot overflow.
+    let per_row = (w as u64) * (h as u64) * 3;
+    if per_row > i32::MAX as u64 {
+        return Err(ExprError::InvalidArgument {
+            func: "to_tensor".to_string(),
+            reason: format!(
+                "tensor of {w}x{h}x3 = {per_row} bytes per row exceeds the maximum \
+                 element length of {} bytes",
+                i32::MAX
+            ),
+        });
+    }
+    let per_row = per_row as usize;
     // Decode + resize every row in parallel (this is the training-data hot path:
     // `read.images(decode=True)` lowers to exactly this kernel). Each row yields its
     // own `per_row`-byte RGB8 buffer, or `None` on null/undecodable/wrong-size input.
@@ -424,6 +466,52 @@ mod tests {
             decode_jpeg_scaled(&sbuf.into_inner(), 128, 128).is_none(),
             "130→128 is not a ≥2× downscale; the scaled path should decline it"
         );
+    }
+
+    #[test]
+    fn out_of_range_dimensions_are_rejected_not_wrapped() {
+        // A dimension is `i64` in the IR. A plain `as u32` cast silently wraps:
+        //   * a value past u32::MAX → a small one, silently producing a wrong-size tensor;
+        //   * a negative value → ~4 billion, an unbounded allocation that aborts the process.
+        // Both must be rejected with a clear error rather than wrapped.
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(4, 4).as_slice())]));
+        for &bad in &[-1_i64, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            assert!(
+                eval_image(ImageFunc::ToTensor, &arr, Some(bad), Some(4)).is_err(),
+                "to_tensor width {bad} should be rejected"
+            );
+            assert!(
+                eval_image(ImageFunc::ToTensor, &arr, Some(4), Some(bad)).is_err(),
+                "to_tensor height {bad} should be rejected"
+            );
+            assert!(
+                eval_image(ImageFunc::Resize, &arr, Some(bad), Some(4)).is_err(),
+                "resize width {bad} should be rejected"
+            );
+        }
+        // The error names the arg but never the (potentially huge) allocation it prevented.
+        let err = eval_image(ImageFunc::ToTensor, &arr, Some(-1), Some(4)).unwrap_err();
+        assert!(err.to_string().contains("width"), "{err}");
+    }
+
+    #[test]
+    fn to_tensor_rejects_dimensions_whose_product_overflows() {
+        // Each dimension is a valid `u32`, but `w * h * 3` exceeds `i32::MAX` (the
+        // FixedSizeList element length). The old `(w as usize) * (h as usize) * 3` then
+        // `per_row as i32` wrapped negative and pre-allocated a multi-GB buffer; it must
+        // now be a clean error, returned *before* any allocation.
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(4, 4).as_slice())]));
+        // 40_000 * 40_000 * 3 = 4.8e12 > i32::MAX, but each dim is well within u32.
+        let err = eval_image(ImageFunc::ToTensor, &arr, Some(40_000), Some(40_000)).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        // Just over the boundary: 26_756 * 26_756 * 3 = 2_147_449_008 > i32::MAX (2_147_483_647)?
+        // 26_756^2 * 3 = 2_147_608_... let's use a clearly-over value.
+        assert!(eval_image(ImageFunc::ToTensor, &arr, Some(30_000), Some(30_000)).is_err());
+        // A legitimate, bounded request still succeeds.
+        assert!(eval_image(ImageFunc::ToTensor, &arr, Some(64), Some(64)).is_ok());
+        // `resize` guards the same product (its per-row RGB buffer is `w * h * 3`).
+        assert!(eval_image(ImageFunc::Resize, &arr, Some(40_000), Some(40_000)).is_err());
+        assert!(eval_image(ImageFunc::Resize, &arr, Some(8), Some(8)).is_ok());
     }
 
     #[test]

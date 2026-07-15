@@ -12,12 +12,25 @@ unchanged and there is exactly one place to find either.
 from __future__ import annotations
 
 from batcher.dist.executors.partition_io._sources import (
-    _apply_above,
-    _balance,
-    _eager_range_split,
-    _partition_source,
-    _projected_empty_batch,
-    _slice_rows_evenly,
+    _apply_above as _apply_above,
+)
+from batcher.dist.executors.partition_io._sources import (
+    _balance as _balance,
+)
+from batcher.dist.executors.partition_io._sources import (
+    _eager_range_split as _eager_range_split,
+)
+from batcher.dist.executors.partition_io._sources import (
+    _partition_source as _partition_source,
+)
+from batcher.dist.executors.partition_io._sources import (
+    _projected_empty_batch as _projected_empty_batch,
+)
+from batcher.dist.executors.partition_io._sources import (
+    _slice_rows_evenly as _slice_rows_evenly,
+)
+from batcher.dist.executors.partition_io._sources import (
+    consumer_pushdown,
     descriptor_rows,
     iter_partition,
     iter_partition_descriptor,
@@ -26,7 +39,10 @@ from batcher.dist.executors.partition_io._sources import (
     read_partition,
     read_partition_descriptor,
     source_pushdown,
+)
+from batcher.dist.executors.partition_io.folds import (
     streaming_partial_aggregate,
+    streaming_topn,
 )
 from batcher.dist.executors.partition_io.ranges import (
     SAMPLE_PROBS,
@@ -37,6 +53,7 @@ from batcher.dist.executors.partition_io.ranges import (
 __all__ = [
     "SAMPLE_PROBS",
     "bucketize",
+    "consumer_pushdown",
     "descriptor_rows",
     "iter_partition",
     "iter_partition_descriptor",
@@ -47,4 +64,5 @@ __all__ = [
     "read_partition_descriptor",
     "source_pushdown",
     "streaming_partial_aggregate",
+    "streaming_topn",
 ]

@@ -14,7 +14,10 @@
 //! Both are flying starts: execution begins immediately, so JIT compilation is
 //! never on the critical path.
 
-use arrow::array::RecordBatch;
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema};
 use bc_ir::RelOp;
 
 mod agg_par;
@@ -24,12 +27,17 @@ mod join_par;
 pub mod metrics;
 mod ops;
 pub mod par;
+pub mod stream;
 mod window_spill;
 
 pub use error::InterpError;
 pub use metrics::{ExecMetrics, OpMetric};
 pub use par::{
     execute_parallel, execute_parallel_with, execute_parallel_with_metrics, ExecOptions,
+};
+pub use stream::{
+    execute_streaming, execute_streaming_metered, execute_streaming_parallel,
+    execute_streaming_parallel_metered,
 };
 
 use metrics::{IdGen, Stopwatch};
@@ -428,6 +436,9 @@ fn exec_seq(
             for inp in inputs {
                 all.extend(exec_seq(inp, sources, m, ids)?);
             }
+            // Promotable-but-different branch types (`int64 ∪ float64`) are coerced to the
+            // union's advertised supertype before concat/dedup, matching DuckDB.
+            let all = coerce_union_branches(all)?;
             let rows_in = count_rows(&all);
             let in_bytes = batch_bytes(&all);
             let t0 = Stopwatch::start();
@@ -520,4 +531,179 @@ fn distinct(batches: &[RecordBatch]) -> Result<RecordBatch, InterpError> {
         combined.schema(),
         partial.group_columns,
     )?)
+}
+
+/// Coerce the branches of a set operation (UNION / INTERSECT / EXCEPT — all of which lower
+/// to `RelOp::Union`) to one common column type before they are concatenated / deduped.
+///
+/// A set op's branches may carry promotable-but-different numeric types — `int64 ∪
+/// float64` is the canonical case — and the union's advertised output schema is already
+/// the promoted supertype (`promote(int64, float64) = float64`, per the Python type
+/// lattice). Arrow's `concat`/`materialize`, however, reject a type mismatch outright, so
+/// the branches must first be cast up to the supertype here. DuckDB likewise coerces both
+/// sides to DOUBLE and returns a result; without this an ordinary `A UNION B` errored even
+/// though `Dataset.schema` promised the promoted type.
+///
+/// A no-op that returns the input untouched when every branch already shares a column type
+/// (the overwhelmingly common single-type union), so it pays only one scan of the schemas.
+pub(crate) fn coerce_union_branches(
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    let Some(first) = batches.first() else {
+        return Ok(batches);
+    };
+    let ncols = first.num_columns();
+    // Fold the per-column supertype across every branch's schema.
+    let mut target: Vec<DataType> = first
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.data_type().clone())
+        .collect();
+    let mut mismatch = false;
+    for b in batches.iter().skip(1) {
+        for (c, t) in target.iter_mut().enumerate().take(ncols) {
+            let bt = b.column(c).data_type();
+            if bt != t {
+                // Only coerce when the two branch types have a SAFE common supertype
+                // (a numeric widening). For a genuinely incompatible pair — e.g. int64
+                // vs string — there is none, so fail fast with a typed error rather than
+                // arrow's *lenient* string→int64 cast silently nulling the non-numeric
+                // values (data corruption), or a downstream downcast panic on the
+                // still-mismatched schema.
+                match promote_union_type(t, bt) {
+                    Some(common) => {
+                        *t = common;
+                        mismatch = true;
+                    }
+                    None => {
+                        return Err(InterpError::IncompatibleSetOpTypes {
+                            col: c,
+                            left: t.to_string(),
+                            right: bt.to_string(),
+                        })
+                    }
+                }
+            }
+        }
+    }
+    if !mismatch {
+        return Ok(batches);
+    }
+    // Rebuild a schema carrying the promoted types (a column is nullable if any branch's is).
+    let base = first.schema();
+    let fields: Vec<Field> = (0..ncols)
+        .map(|c| {
+            let nullable = batches.iter().any(|b| b.schema().field(c).is_nullable());
+            base.field(c)
+                .clone()
+                .with_data_type(target[c].clone())
+                .with_nullable(nullable)
+        })
+        .collect();
+    let schema = Arc::new(Schema::new_with_metadata(fields, base.metadata().clone()));
+    batches
+        .into_iter()
+        .map(|b| {
+            let cols: Vec<ArrayRef> = (0..ncols)
+                .map(|c| {
+                    if b.column(c).data_type() == &target[c] {
+                        Ok(Arc::clone(b.column(c)))
+                    } else {
+                        Ok(arrow::compute::cast(b.column(c), &target[c])?)
+                    }
+                })
+                .collect::<Result<_, InterpError>>()?;
+            Ok(RecordBatch::try_new(Arc::clone(&schema), cols)?)
+        })
+        .collect()
+}
+
+/// The common type two set-operation branch columns must both widen to, so neither side is
+/// narrowed — or `None` when there is no safe numeric supertype. Mirrors the Python type
+/// lattice's `promote`: a float on either side wins (→ `Float64`, as DuckDB promotes int∪float
+/// to DOUBLE), otherwise two integers meet at `Int64`. Any non-numeric pairing (e.g. int64 vs
+/// string) returns `None`, so the caller declines to coerce and the mismatch surfaces as a
+/// clean error — never a lossy string→int cast that silently nulls the incompatible branch.
+fn promote_union_type(a: &DataType, b: &DataType) -> Option<DataType> {
+    use DataType::*;
+    let is_float = |t: &DataType| matches!(t, Float16 | Float32 | Float64);
+    let is_int = |t: &DataType| {
+        matches!(
+            t,
+            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+        )
+    };
+    let numeric = |t: &DataType| is_float(t) || is_int(t);
+    if numeric(a) && numeric(b) {
+        // A float on either side wins (→ Float64, as DuckDB promotes int∪float to
+        // DOUBLE); otherwise two integers meet at Int64. No branch is ever narrowed.
+        if is_float(a) || is_float(b) {
+            Some(Float64)
+        } else {
+            Some(Int64)
+        }
+    } else {
+        // No safe common numeric supertype (e.g. int64 vs string). Return None so the
+        // caller declines to coerce and the mismatch surfaces as a clean error rather
+        // than a lossy cast — never silently null out the incompatible branch.
+        None
+    }
+}
+
+#[cfg(test)]
+mod union_coerce_tests {
+    use super::*;
+    use arrow::array::{Float64Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn batch(name: &str, ty: DataType, col: ArrayRef) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, ty, true)]));
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    /// An `int64 ∪ float64` union must coerce both branches to Float64 so `concat`/`distinct`
+    /// accept them — matching DuckDB (which promotes to DOUBLE) and the union's own advertised
+    /// schema, instead of erroring on the type mismatch.
+    #[test]
+    fn int64_and_float64_branches_coerce_to_double() {
+        let left = batch(
+            "x",
+            DataType::Int64,
+            Arc::new(Int64Array::from(vec![1i64, 2])),
+        );
+        let right = batch(
+            "x",
+            DataType::Float64,
+            Arc::new(Float64Array::from(vec![3.5f64, 4.5])),
+        );
+        let out = coerce_union_branches(vec![left, right]).unwrap();
+        assert_eq!(out.len(), 2);
+        for b in &out {
+            assert_eq!(b.column(0).data_type(), &DataType::Float64);
+        }
+        // The int branch's values survive the widening exactly.
+        let l = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(l.value(0), 1.0);
+        assert_eq!(l.value(1), 2.0);
+        // Concatenation of the coerced branches now succeeds (it would error pre-coercion).
+        let cols: Vec<&dyn arrow::array::Array> =
+            out.iter().map(|b| b.column(0).as_ref()).collect();
+        let cat = arrow::compute::concat(&cols).unwrap();
+        assert_eq!(cat.len(), 4);
+    }
+
+    /// A same-type union is returned untouched (identity), paying only the schema scan.
+    #[test]
+    fn matching_types_are_untouched() {
+        let a = batch("x", DataType::Int64, Arc::new(Int64Array::from(vec![1i64])));
+        let b = batch("x", DataType::Int64, Arc::new(Int64Array::from(vec![2i64])));
+        let out = coerce_union_branches(vec![a, b]).unwrap();
+        assert_eq!(out[0].column(0).data_type(), &DataType::Int64);
+        assert_eq!(out[1].column(0).data_type(), &DataType::Int64);
+    }
 }

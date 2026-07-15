@@ -353,8 +353,11 @@ class Session:
 
         Keyword `tables` bind or override names for this call only (they do not
         mutate the catalog). ``CREATE TABLE/VIEW AS`` registers a lazy `Dataset`
-        into this session; ``DROP TABLE`` unregisters one. Everything else is a
-        ``SELECT``-family query returning a lazy `Dataset`.
+        into this session and ``DROP TABLE`` unregisters one; ``INSERT`` /
+        ``DELETE`` / ``UPDATE`` rebind the target table to its new state (a pure
+        plan rewrite — union / filter / projected CASE — that runs only on a later
+        terminal op). Everything else is a ``SELECT``-family query. Every form
+        returns a lazy `Dataset` — the query result, or the table's new state.
 
         Args:
             query: A SQL statement.
@@ -397,6 +400,8 @@ class Session:
             return self._create(ast, tables)
         if isinstance(ast, exp.Drop):
             return self._drop(ast)
+        if isinstance(ast, (exp.Insert, exp.Delete, exp.Update)):
+            return self._dml(ast, tables)
         ds = self._translate(ast, tables)
         if cacheable:
             self._plan_cache[key] = (self._generation[0], ds)
@@ -423,6 +428,22 @@ class Session:
         self._tables[name] = ds
         self._bump()
         return ds
+
+    def _dml(self, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Dataset:
+        """Handle ``INSERT`` / ``DELETE`` / ``UPDATE`` — rebind the target table.
+
+        DML is a pure plan rewrite (union / filter / projected CASE) that produces
+        the target table's new lazy state; the catalog is rebound to it and the new
+        state is returned. Per-call `tables` bindings are visible to the rewrite but
+        the rebind lands on the session catalog (matching ``CREATE``).
+        """
+        from batcher._sql.dml import apply_dml
+
+        registry = {name: Session._as_dataset(t) for name, t in {**self._tables, **tables}.items()}
+        name, new_state = apply_dml(ast, registry, self._functions)
+        self._tables[name] = new_state
+        self._bump()
+        return new_state
 
     def _drop(self, ast: Any) -> Dataset:
         """Handle ``DROP TABLE [IF EXISTS] name`` — unregister the table."""

@@ -5,9 +5,11 @@
 //! keep `eval/` within its file-count limit.
 
 pub(crate) mod list_hof;
+pub(crate) mod list_reshape;
 pub(crate) mod list_set;
 pub(crate) mod simhash;
 
 pub(crate) use list_hof::{eval_list_filter, eval_list_transform};
+pub(crate) use list_reshape::eval_flatten;
 pub(crate) use list_set::eval_list_set;
 pub(crate) use simhash::eval_list_simhash;

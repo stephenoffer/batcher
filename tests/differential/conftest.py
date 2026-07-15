@@ -34,7 +34,7 @@ def _sort_key(v) -> tuple:
         return (0, "")
     if isinstance(v, bool):
         return (1, repr(v))
-    if isinstance(v, (int, float)):  # noqa: UP038
+    if isinstance(v, (int, float)):
         f = v if math.isfinite(v) else (math.inf if v > 0 else -math.inf)
         return (2, float(f), repr(v))
     return (3, str(type(v)), str(v))
@@ -69,7 +69,7 @@ def _coerce(v):
         # bridged from the float side below (integral floats canonicalize to int), never by
         # degrading the int side.
         return v
-    if isinstance(v, (float, Decimal)):  # noqa: UP038
+    if isinstance(v, (float, Decimal)):
         if isinstance(v, float) and v != v:  # NaN — any payload, any sign
             return _NAN
         if not math.isfinite(v):  # ±inf: keep as float, never int() it

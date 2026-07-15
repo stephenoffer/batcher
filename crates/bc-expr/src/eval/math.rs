@@ -4,10 +4,12 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch};
+use arrow::compute::kernels::arity::try_binary;
 use arrow::compute::kernels::cmp;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{cast, is_not_null};
 use arrow::datatypes::DataType;
+use arrow::error::ArrowError;
 
 use crate::eval::binary::coerce_numeric;
 use crate::{Expr, ExprError, Math2Func, MathFunc};
@@ -59,6 +61,13 @@ pub(crate) fn eval_math2(
     l: &ArrayRef,
     r: &ArrayRef,
 ) -> Result<ArrayRef, ExprError> {
+    // `gcd`/`lcm` are integer functions (DuckDB returns an integer, not a double).
+    // Routing an i64 through f64 (a) mistypes the public schema as `double` and
+    // (b) silently loses precision above 2^53 (`gcd(2^53+1, 3)` returned 1.0 instead
+    // of 3). Compute them on the true i64 bits and return Int64.
+    if matches!(func, Math2Func::Gcd | Math2Func::Lcm) {
+        return eval_int_math2(func, l, r);
+    }
     let lf = cast(l, &DataType::Float64)?;
     let rf = cast(r, &DataType::Float64)?;
     let a = lf.as_any().downcast_ref::<Float64Array>().expect("f64");
@@ -90,20 +99,59 @@ fn apply_binary(func: Math2Func, x: f64, y: f64) -> f64 {
             let f = 10f64.powi(y as i32);
             (x * f).round() / f
         }
-        Math2Func::Gcd => gcd_i64(x as i64, y as i64) as f64,
-        Math2Func::Lcm => {
-            let (a, b) = (x as i64, y as i64);
-            let g = gcd_i64(a, b);
-            if g == 0 {
-                0.0
+        Math2Func::Hypot => x.hypot(y),
+        // Gcd/Lcm are handled by the integer path (`eval_int_math2`).
+        Math2Func::Gcd | Math2Func::Lcm => unreachable!("integer path"),
+    }
+}
+
+/// Integer two-argument math (`gcd`/`lcm`): cast both sides to Int64 and apply on the
+/// true i64 values, returning Int64. `lcm` errors on i64 overflow (matching DuckDB's
+/// "lcm value is out of range") rather than wrapping or losing precision through f64.
+fn eval_int_math2(func: Math2Func, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
+    let li = cast(l, &DataType::Int64)?;
+    let ri = cast(r, &DataType::Int64)?;
+    let a = li.as_any().downcast_ref::<Int64Array>().expect("i64");
+    let b = ri.as_any().downcast_ref::<Int64Array>().expect("i64");
+    let out: Int64Array = match func {
+        Math2Func::Gcd => {
+            if a.null_count() == 0 && b.null_count() == 0 {
+                a.values()
+                    .iter()
+                    .zip(b.values())
+                    .map(|(&x, &y)| Some(gcd_i64(x, y)))
+                    .collect()
             } else {
-                // Compute the product in i128 so a coprime pair near sqrt(i64::MAX) does
-                // not overflow i64 (which panicked in debug and wrapped in release).
-                ((a as i128 / g as i128) * b as i128).unsigned_abs() as f64
+                (0..a.len())
+                    .map(|i| {
+                        (!a.is_null(i) && !b.is_null(i)).then(|| gcd_i64(a.value(i), b.value(i)))
+                    })
+                    .collect()
             }
         }
-        Math2Func::Hypot => x.hypot(y),
+        Math2Func::Lcm => {
+            // `try_binary` propagates nulls and short-circuits on the first overflow.
+            let out: Int64Array = try_binary(a, b, lcm_i64)?;
+            return Ok(Arc::new(out));
+        }
+        _ => unreachable!("only gcd/lcm reach here"),
+    };
+    Ok(Arc::new(out))
+}
+
+/// Least common multiple of two i64s, erroring on overflow (never wrapping). `lcm(0, n)`
+/// is 0. Computes `|a / gcd * b|` and checks the multiply, so a coprime pair whose product
+/// exceeds i64 raises rather than returning a wrapped (wrong) value.
+fn lcm_i64(a: i64, b: i64) -> Result<i64, ArrowError> {
+    let g = gcd_i64(a, b);
+    if g == 0 {
+        return Ok(0);
     }
+    // `a / g` is exact (g divides a); the remaining multiply is the only overflow risk.
+    (a / g)
+        .checked_mul(b)
+        .and_then(i64::checked_abs)
+        .ok_or_else(|| ArrowError::ComputeError("lcm value is out of range".into()))
 }
 
 /// `GREATEST`/`LEAST`: fold the inputs element-wise, ignoring nulls (a null
@@ -174,13 +222,24 @@ pub(crate) fn eval_coalesce(inputs: &[Expr], batch: &RecordBatch) -> Result<Arra
 /// yield Float64 (integer inputs are promoted).
 pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, ExprError> {
     use MathFunc::*;
+    // `bit_count`/`factorial` are integer functions: their result is defined by the
+    // two's-complement i64 bits, not an f64 approximation. Routing them through f64
+    // (a) mistyped the schema as `double` and (b) gave wrong answers above 2^53 —
+    // `bit_count(2^53+1)` returned 1.0 instead of 2. Compute on the true i64 value.
+    if matches!(func, BitCount | Factorial) {
+        return eval_int_math(func, arr);
+    }
     match (func, arr.data_type()) {
         (Abs, DataType::Int64) => {
             let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+            // `i64::MIN.abs()` overflows (no positive i64 exists for it): `v.abs()` panicked
+            // in debug and returned i64::MIN — a *negative* "absolute value" — in release.
+            // `saturating_abs` maps i64::MIN → i64::MAX: no panic, always non-negative, and
+            // the JIT emits the same saturation so the two tiers stay bit-for-bit identical.
             let out: Int64Array = if a.null_count() == 0 {
-                a.values().iter().map(|&v| v.abs()).collect()
+                a.values().iter().map(|&v| v.saturating_abs()).collect()
             } else {
-                a.iter().map(|o| o.map(|v| v.abs())).collect()
+                a.iter().map(|o| o.map(|v| v.saturating_abs())).collect()
             };
             Ok(Arc::new(out))
         }
@@ -244,16 +303,66 @@ fn apply_unary(func: MathFunc, v: f64) -> f64 {
         Degrees => v.to_degrees(),
         Radians => v.to_radians(),
         Cot => 1.0 / v.tan(),
-        Factorial => {
-            let n = v as i64;
-            if n < 0 {
-                f64::NAN
+        // Integer-only functions are handled by `eval_int_math`.
+        Factorial | BitCount => unreachable!("integer path"),
+    }
+}
+
+/// Integer unary math (`bit_count`/`factorial`): cast the input to Int64 and compute on
+/// the true i64 value, returning Int64.
+///
+/// `bit_count` is the population count of the two's-complement bits. `factorial` is
+/// computed with a *checked* product that errors on i64 overflow (`21!` and above): this
+/// both fixes a hang — the previous f64 path looped `1..=n` for a huge `n` — and refuses
+/// to silently return a wrong (wrapped or rounded-double) value. `factorial(n)` for
+/// `n > 20` therefore raises rather than overflowing i64. (DuckDB widens to HUGEINT and so
+/// spans `n ≤ 33`; the engine has no 128-bit output type, so the exact-or-error contract
+/// stops one step earlier — a documented, safe difference.)
+fn eval_int_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, ExprError> {
+    use MathFunc::*;
+    let i = cast(arr, &DataType::Int64)?;
+    let a = i.as_any().downcast_ref::<Int64Array>().expect("i64");
+    let out: Int64Array = match func {
+        BitCount => {
+            if a.null_count() == 0 {
+                a.values()
+                    .iter()
+                    .map(|&v| Some(i64::from(v.count_ones())))
+                    .collect()
             } else {
-                (1..=n).map(|i| i as f64).product()
+                a.iter()
+                    .map(|o| o.map(|v| i64::from(v.count_ones())))
+                    .collect()
             }
         }
-        BitCount => (v as i64).count_ones() as f64,
+        Factorial => a
+            .iter()
+            .map(|o| o.map(factorial_i64).transpose())
+            .collect::<Result<Int64Array, ExprError>>()?,
+        _ => unreachable!("only bit_count/factorial reach here"),
+    };
+    Ok(Arc::new(out))
+}
+
+/// `n!` in i64. `0! = 1`; a negative `n` errors (matching DuckDB, which raises "factorial
+/// of a negative number"); overflow past `20!` raises instead of wrapping or hanging.
+fn factorial_i64(n: i64) -> Result<i64, ExprError> {
+    if n < 0 {
+        return Err(ExprError::Arrow(ArrowError::ComputeError(
+            "factorial of a negative number".into(),
+        )));
     }
+    let mut acc: i64 = 1;
+    let mut k: i64 = 2;
+    while k <= n {
+        acc = acc.checked_mul(k).ok_or_else(|| {
+            ExprError::Arrow(ArrowError::ComputeError(format!(
+                "factorial({n}) is out of range for a 64-bit integer"
+            )))
+        })?;
+        k += 1;
+    }
+    Ok(acc)
 }
 
 /// Greatest common divisor of two integers (Euclid; non-negative result).
@@ -263,4 +372,107 @@ fn gcd_i64(a: i64, b: i64) -> i64 {
         (a, b) = (b, a % b);
     }
     a as i64
+}
+
+#[cfg(test)]
+mod int_math_tests {
+    use super::*;
+
+    fn i64arr(v: Vec<Option<i64>>) -> ArrayRef {
+        Arc::new(Int64Array::from(v))
+    }
+
+    fn as_i64(a: &ArrayRef) -> Vec<Option<i64>> {
+        let a = a.as_any().downcast_ref::<Int64Array>().expect("i64 out");
+        (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+            .collect()
+    }
+
+    /// `gcd`/`bit_count` stay Int64 and are exact above 2^53 — the old f64 route both
+    /// mistyped the schema and gave wrong answers (`gcd(2^53+1, 3)` → 1.0 not 3).
+    #[test]
+    fn gcd_bit_count_are_exact_int64_above_2_pow_53() {
+        let two53p1 = (1i64 << 53) + 1; // 9_007_199_254_740_993, not f64-representable
+        let g = eval_math2(
+            Math2Func::Gcd,
+            &i64arr(vec![Some(two53p1)]),
+            &i64arr(vec![Some(3)]),
+        )
+        .unwrap();
+        assert_eq!(g.data_type(), &DataType::Int64);
+        assert_eq!(as_i64(&g), vec![Some(3)]);
+
+        let bc = eval_math(MathFunc::BitCount, &i64arr(vec![Some(two53p1)])).unwrap();
+        assert_eq!(bc.data_type(), &DataType::Int64);
+        assert_eq!(as_i64(&bc), vec![Some(2)]); // bit 53 and bit 0 set
+    }
+
+    /// `lcm` is Int64 and errors on i64 overflow rather than wrapping or losing precision.
+    #[test]
+    fn lcm_int64_and_overflow_errors() {
+        let ok = eval_math2(
+            Math2Func::Lcm,
+            &i64arr(vec![Some(4)]),
+            &i64arr(vec![Some(6)]),
+        )
+        .unwrap();
+        assert_eq!(ok.data_type(), &DataType::Int64);
+        assert_eq!(as_i64(&ok), vec![Some(12)]);
+        assert_eq!(
+            as_i64(
+                &eval_math2(
+                    Math2Func::Lcm,
+                    &i64arr(vec![Some(0)]),
+                    &i64arr(vec![Some(5)])
+                )
+                .unwrap()
+            ),
+            vec![Some(0)]
+        );
+        // Two large coprimes whose lcm exceeds i64 → error, never a wrapped value.
+        let big = eval_math2(
+            Math2Func::Lcm,
+            &i64arr(vec![Some(3_037_000_500)]),
+            &i64arr(vec![Some(3_037_000_507)]),
+        );
+        assert!(big.is_err(), "lcm overflow must error");
+    }
+
+    /// `factorial` is Int64, terminates on a huge input (no hang), and errors on overflow
+    /// and on negatives instead of looping or returning a wrong double.
+    #[test]
+    fn factorial_int64_terminates_and_errors() {
+        let f = eval_math(
+            MathFunc::Factorial,
+            &i64arr(vec![Some(0), Some(5), Some(20)]),
+        )
+        .unwrap();
+        assert_eq!(f.data_type(), &DataType::Int64);
+        assert_eq!(
+            as_i64(&f),
+            vec![Some(1), Some(120), Some(2_432_902_008_176_640_000)]
+        );
+        // 21! overflows i64 → error (not a wrapped/rounded value).
+        assert!(eval_math(MathFunc::Factorial, &i64arr(vec![Some(21)])).is_err());
+        // A huge input must not hang; it errors quickly at the first overflow.
+        assert!(eval_math(MathFunc::Factorial, &i64arr(vec![Some(i64::MAX)])).is_err());
+        // Negative → error (matches DuckDB).
+        assert!(eval_math(MathFunc::Factorial, &i64arr(vec![Some(-1)])).is_err());
+    }
+
+    /// Nulls propagate through the integer-math paths.
+    #[test]
+    fn int_math_nulls_propagate() {
+        assert_eq!(
+            as_i64(&eval_math(MathFunc::BitCount, &i64arr(vec![Some(7), None])).unwrap()),
+            vec![Some(3), None]
+        );
+        assert_eq!(
+            as_i64(
+                &eval_math2(Math2Func::Gcd, &i64arr(vec![None]), &i64arr(vec![Some(3)])).unwrap()
+            ),
+            vec![None]
+        );
+    }
 }

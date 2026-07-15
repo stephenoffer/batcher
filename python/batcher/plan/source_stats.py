@@ -80,6 +80,22 @@ class SourceStatistics:
     sorted_by: tuple[str, ...] = ()
     partition_keys: tuple[str, ...] = ()
     exact_rows: bool = True
+    # How many physical blocks the source is stored in (Parquet row groups, ORC
+    # stripes) — the granularity a zone-map prune actually skips at, so a shortcut
+    # can report what a scan *would* have read without reading it.
+    row_group_count: int | None = None
+    # Whether this source's float min/max bounds account for NaN.
+    #
+    # This is the difference between a bound that can answer `max(f)` and one that
+    # cannot. SQL's total order — the one our own `ORDER BY` uses — makes NaN the
+    # *greatest* value, but the Parquet spec omits NaN from column statistics, so a
+    # footer's `max` is the largest **non-NaN** value and answering `max(f)` from it
+    # silently disagrees with executing the query. A source that computes its own
+    # bounds over the real values (an immutable in-memory relation) records NaN as
+    # the max and may say so here; a footer-derived one leaves this False and every
+    # float value-fact falls back to execution. Never set it unless the bounds were
+    # produced by an ordering that ranks NaN highest.
+    bounds_include_nan: bool = False
 
     def is_empty(self) -> bool:
         """True iff the source is known to contain zero rows."""

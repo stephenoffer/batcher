@@ -138,6 +138,12 @@ def _td(micros: int) -> datetime.timedelta:
     return datetime.timedelta(microseconds=micros)
 
 
+#: Schema-metadata key under which a windowed fold's watermark travels with its state batch.
+#: The `StateStore` persists exactly one `RecordBatch`, and the watermark is a scalar — this is
+#: how the scalar rides along without forking that contract.
+_WATERMARK_META = b"batcher.watermark_micros"
+
+
 def _window_key(agg: Aggregate) -> tuple[str, int] | None:
     """The (alias, width_micros) of the `window_start` group key, or None."""
     from batcher.plan.expr_ir.func_nodes import WindowStart
@@ -205,7 +211,12 @@ class _WindowedAggFold:
         hi = pc.max(col)
         if not hi.is_valid:
             return
-        micros = pc.cast(hi, pa.int64()).as_py()
+        # The watermark, window widths, and `window_start` all live in microseconds
+        # (the engine's `window_start` output is always `timestamp[us]`), but the event-
+        # time column may be any timestamp resolution (s/ms/us/ns). Normalize to
+        # microseconds first — reading the raw int64 ticks of a non-`us` column would
+        # scale the watermark by 1000× (dropping every row, or overflowing the literal).
+        micros = pc.cast(pc.cast(hi, pa.timestamp("us")), pa.int64()).as_py()
         candidate = micros - self._lateness
         self._wm = candidate if self._wm is None else max(self._wm, candidate)
 
@@ -215,11 +226,13 @@ class _WindowedAggFold:
         if batch.num_rows == 0:
             return []
         cfg = active_config().engine_config_json()
-        # Drop rows below the current watermark (late records) in Rust.
+        # Drop rows below the current watermark (late records) in Rust. The watermark
+        # literal is microseconds (`timestamp[us]`); normalize the event-time column to
+        # the same resolution so a non-`us` timestamp neither mis-compares nor raises a
+        # unit-mismatch error in the engine.
         if self._wm is not None:
-            kept = self._nat.execute_plan(
-                _scan_filter_ir(col(self._time_col) >= lit(_EPOCH + _td(self._wm))), [[batch]], cfg
-            )
+            on_time = col(self._time_col).cast("timestamp") >= lit(_EPOCH + _td(self._wm))
+            kept = self._nat.execute_plan(_scan_filter_ir(on_time), [[batch]], cfg)
         else:
             kept = [batch]
         self._advance_watermark(batch)
@@ -287,6 +300,36 @@ class _WindowedAggFold:
         result = self._nat.combine_finalize(self._gk, self._ag, [self._running])
         self._running = None
         return result if result.num_rows else None
+
+    def state(self) -> pa.RecordBatch | None:
+        """The open-window partials **and the watermark**, as one checkpointable batch.
+
+        Both halves are state, and checkpointing only the partials would be worse than
+        checkpointing nothing: on restore the engine would hold windows it could never close,
+        and would re-admit as on-time the very rows the old watermark had already ruled late.
+        So the watermark rides in the batch's schema metadata (Arrow IPC persists it), keeping
+        the `StateStore`'s "state is one RecordBatch" contract intact.
+
+        A watermark that has advanced with no open windows still has to survive, so that case
+        snapshots a zero-column batch carrying only the metadata — dropping it would silently
+        rewind event time to the next batch's maximum.
+        """
+        if self._running is None and self._wm is None:
+            return None
+        meta = {_WATERMARK_META: b"" if self._wm is None else str(self._wm).encode()}
+        if self._running is None:
+            return pa.RecordBatch.from_pylist([], schema=pa.schema([], metadata=meta))
+        return self._running.replace_schema_metadata(
+            {**(self._running.schema.metadata or {}), **meta}
+        )
+
+    def restore(self, state: pa.RecordBatch) -> None:
+        """Resume the open windows and the watermark from a checkpoint snapshot."""
+        raw = (state.schema.metadata or {}).get(_WATERMARK_META)
+        # `b""` means "no watermark yet"; `b"0"` and `b"-5"` are real watermarks, so test for
+        # emptiness rather than truthiness of the decoded int.
+        self._wm = int(raw) if raw else None
+        self._running = state if state.num_columns else None
 
 
 def stream_windowed_aggregate(
@@ -407,8 +450,9 @@ def stream_topn(
     if not running:
         return
     result = pa.Table.from_batches(running)
+    # `to_batches` yields `RecordBatch`es (the `iter_batches` contract); slicing the
+    # `Table` directly would leak `pa.Table` objects to the caller.
     if batch_size is None:
         yield from result.to_batches()
     else:
-        for off in range(0, result.num_rows, batch_size):
-            yield result.slice(off, batch_size)
+        yield from result.to_batches(max_chunksize=batch_size)

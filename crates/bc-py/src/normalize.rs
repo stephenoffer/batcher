@@ -14,6 +14,7 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_pyarrow::PyArrowType;
 use bc_ir::{AggregateItem, ProjectionItem};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::PyResult;
 
 use crate::to_pyerr;
@@ -80,7 +81,15 @@ fn normalize_to(dt: &DataType) -> Option<DataType> {
 /// Upcast narrow numeric columns of one batch to Int64/Float64 and decode any
 /// dictionary-encoded columns to their value type. Non-numeric, already-wide,
 /// non-dictionary columns are passed through untouched (a cheap `Arc` clone).
-pub(crate) fn normalize_batch(batch: &RecordBatch) -> RecordBatch {
+///
+/// Widening is meant to be **value-preserving**, and every recorded narrow→wide cast is
+/// (Int8/16/32, UInt8/16/32 all fit in Int64; Float16/32 in Float64) — *except*
+/// `UInt64 → Int64`, whose upper half (values above `i64::MAX`) has no Int64
+/// representation. Arrow's safe cast turns such a value into a **null**, silently
+/// replacing real data with a missing value. Rather than hand back a corrupted column,
+/// this refuses the batch with a clear error naming the column: a `UInt64` above
+/// `i64::MAX` is unsupported at the boundary, not silently lost.
+pub(crate) fn normalize_batch(batch: &RecordBatch) -> PyResult<RecordBatch> {
     let schema = batch.schema();
     let mut changed = false;
     let mut fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
@@ -90,6 +99,17 @@ pub(crate) fn normalize_batch(batch: &RecordBatch) -> RecordBatch {
         match normalize_to(col.data_type()) {
             Some(target) => match cast(col, &target) {
                 Ok(arr) => {
+                    // A lossless widening never introduces a null. The one cast that can
+                    // (UInt64 → Int64 overflow) would corrupt data silently — refuse it.
+                    if arr.null_count() > col.null_count() {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "column {:?}: {} value exceeds the Int64 range the engine \
+                             normalizes to (a value above i64::MAX cannot be represented \
+                             without data loss); unsupported at the FFI boundary",
+                            field.name(),
+                            col.data_type(),
+                        )));
+                    }
                     changed = true;
                     fields.push(Field::new(field.name(), target, field.is_nullable()));
                     columns.push(arr);
@@ -106,13 +126,14 @@ pub(crate) fn normalize_batch(batch: &RecordBatch) -> RecordBatch {
         }
     }
     if !changed {
-        return batch.clone();
+        return Ok(batch.clone());
     }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap_or_else(|_| batch.clone())
+    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .unwrap_or_else(|_| batch.clone()))
 }
 
 /// Unwrap a Python list of pyarrow batches into normalized Arrow record batches.
-pub(crate) fn unwrap_batches(batches: Vec<PyArrowType<RecordBatch>>) -> Vec<RecordBatch> {
+pub(crate) fn unwrap_batches(batches: Vec<PyArrowType<RecordBatch>>) -> PyResult<Vec<RecordBatch>> {
     batches.into_iter().map(|b| normalize_batch(&b.0)).collect()
 }
 

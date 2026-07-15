@@ -76,9 +76,18 @@ def has_map_batches(plan: LogicalPlan) -> bool:
 
 
 def execute_with_udfs(
-    plan: LogicalPlan, sources: list, source_projections: dict[int, list[str]] | None = None
+    plan: LogicalPlan,
+    sources: list,
+    source_projections: dict[int, list[str]] | None = None,
+    engine_config: str | None = None,
 ) -> list[pa.RecordBatch]:
     """Execute a (possibly non-linear) pipeline that contains `map_batches`.
+
+    `engine_config` is the driver's `EngineConfig` JSON, shipped in by a distributed caller.
+    A Ray worker's own `active_config()` is that process's default — it never sees the
+    driver's session config, and its `parallelism: 0` ("use every core") would give each of
+    many concurrent tasks on one node a full-width rayon pool. `None` (the in-process caller)
+    uses the ambient config.
 
     `source_projections` is the per-source column list Kyber decided (Core executes the plan it
     is given; it does not compute projections — see `.claude/rules/architecture.md`). Without it
@@ -98,11 +107,53 @@ def execute_with_udfs(
     from batcher.core.udf.stream import linear_map_chain, stream_eligible, stream_linear_chain
 
     projections = source_projections or {}
+    cfg = engine_config or active_config().engine_config_json()
+    if not has_map_batches(plan):
+        return _run_whole_plan(plan, sources, projections, cfg)
     chain = linear_map_chain(plan)
     if chain is not None and stream_eligible(chain[1]):
         return list(stream_linear_chain(chain[0], chain[1], sources, projections))
-    batches, _schema = _execute_node(plan, sources, projections)
+    batches, _schema = _execute_node(plan, sources, projections, cfg)
     return batches
+
+
+def _run_whole_plan(
+    plan: LogicalPlan, sources: list, projections: dict[int, list[str]], cfg: str
+) -> list[pa.RecordBatch]:
+    """Run a plan with no `map_batches` in ONE engine call — the whole plan, one pass.
+
+    This entry point exists for pipelines that mix Python UDFs with relational operators, so
+    it walks the plan as a tree and runs each operator separately (`_execute_node`). But it is
+    also the *distributed map task's* executor (`dist.executors.map._map_udf_task`), and the
+    dispatcher routes every breaker-free scan/filter/project over a splittable source there —
+    plans that contain no UDF at all. Walking those as a tree costs, per operator, an IR
+    serialization, an FFI crossing, and a full Python materialization of the partition
+    *between* operators: a `Project(Filter(Scan))` partition was decoded, handed to Rust to
+    filter, rebuilt as Python `RecordBatch`es, handed back to Rust to project, and rebuilt
+    again — while the engine fuses and morsel-pipelines the whole thing in one pass.
+
+    So when there is no UDF to orchestrate, don't orchestrate: hand the engine the whole plan,
+    exactly as the single-node `LocalExecutor` does. Same operators, same engine, same result —
+    one crossing instead of N, and no Python-side intermediate.
+    """
+    nat = engine()
+    # `execute_plan` addresses sources positionally by `Scan.source_id`, so the list must keep
+    # each source at its own index; only the ones the plan actually scans are read.
+    scanned = _scanned_source_ids(plan)
+    inputs = [
+        list(src.read(projections.get(i))) if i in scanned else [] for i, src in enumerate(sources)
+    ]
+    return list(nat.execute_plan(_to_json(plan), inputs, cfg))
+
+
+def _scanned_source_ids(node: LogicalPlan) -> set[int]:
+    """The `source_id`s the plan actually reads."""
+    if isinstance(node, Scan):
+        return {node.source_id}
+    ids: set[int] = set()
+    for child in children(node):
+        ids |= _scanned_source_ids(child)
+    return ids
 
 
 def _resilient_call(
@@ -138,7 +189,10 @@ def _resilient_call(
 
 
 def _execute_node(
-    node: LogicalPlan, sources: list, projections: dict[int, list[str]] | None = None
+    node: LogicalPlan,
+    sources: list,
+    projections: dict[int, list[str]] | None = None,
+    cfg: str | None = None,
 ) -> tuple[list[pa.RecordBatch], pa.Schema]:
     """Materialize `node` to `(batches, schema)`.
 
@@ -147,13 +201,14 @@ def _execute_node(
     operator — the case that makes joins/unions over filtered-to-empty inputs work.
     """
     projections = projections or {}
+    cfg = cfg or active_config().engine_config_json()
     if isinstance(node, Scan):
         # Read only the columns the plan needs. Kyber computed them; a `map_batches` that
         # declared no `input_columns` yields None here, so the whole source is read (safe).
         batches = list(sources[node.source_id].read(projections.get(node.source_id)))
         return batches, (batches[0].schema if batches else node.schema.arrow)
     if isinstance(node, MapBatches):
-        inputs, in_schema = _execute_node(node.input, sources, projections)
+        inputs, in_schema = _execute_node(node.input, sources, projections, cfg)
         # Reconcile a UDF whose output schema drifts across batches (e.g. LLM structured
         # outputs with varying fields) to one union schema, so the stage's batches concat
         # instead of failing — the schema-inference footgun Ray Data hits.
@@ -162,19 +217,23 @@ def _execute_node(
         return out, (out[0].schema if out else in_schema)
     # Any other relational operator: materialize each child, then run this single
     # operator on the engine with its children replaced by scans of those batches.
-    child_results = [_execute_node(c, sources) for c in children(node)]
-    return _run_engine_op(node, child_results)
+    # `projections` must reach those children: a Scan under a Filter/Join is still the
+    # scan Kyber pruned columns for, and dropping the map here made it read every column.
+    child_results = [_execute_node(c, sources, projections, cfg) for c in children(node)]
+    return _run_engine_op(node, child_results, cfg)
 
 
 def _run_engine_op(
-    node: LogicalPlan, child_results: list[tuple[list[pa.RecordBatch], pa.Schema]]
+    node: LogicalPlan,
+    child_results: list[tuple[list[pa.RecordBatch], pa.Schema]],
+    cfg: str,
 ) -> tuple[list[pa.RecordBatch], pa.Schema]:
     """Run one relational operator natively over already-materialized child inputs."""
     nat = engine()
     inputs = [batches for batches, _ in child_results]
     scans = [Scan(i, SchemaRef.from_arrow(schema)) for i, (_, schema) in enumerate(child_results)]
     rebuilt = with_children(node, scans)
-    out = list(nat.execute_plan(_to_json(rebuilt), inputs, active_config().engine_config_json()))
+    out = list(nat.execute_plan(_to_json(rebuilt), inputs, cfg))
     # Output schema: the result's own when non-empty; otherwise a best-effort from
     # the first input (exact for schema-preserving/union ops, an approximation only
     # for the rare empty-result-feeds-a-parent case).
@@ -398,7 +457,19 @@ def _coerce_udf_result(result: object) -> list[pa.RecordBatch]:
     if isinstance(result, pa.RecordBatch):
         return [result]
     if isinstance(result, pa.Table):
-        return result.to_batches()
+        batches = result.to_batches()
+        # A 0-row Table yields *no* batches, which would drop the stage's output schema
+        # (the parent then falls back to the input schema and a downstream reference to a
+        # UDF-added column fails). Keep a single empty batch so the schema survives — the
+        # same behavior a 0-row RecordBatch return already has.
+        if batches:
+            return batches
+        return [
+            pa.RecordBatch.from_arrays(
+                [pa.array([], type=field.type) for field in result.schema],
+                schema=result.schema,
+            )
+        ]
     if isinstance(result, dict):
         return [pa.RecordBatch.from_pydict(_tensorize_columns(result))]
     raise TypeError(

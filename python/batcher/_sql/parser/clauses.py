@@ -12,7 +12,12 @@ import sys
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
-from batcher._sql.parser.core_utils import _has_aggregate, _positional, _unwrap_alias
+from batcher._sql.parser.core_utils import (
+    _has_aggregate,
+    _positional,
+    _unwrap_alias,
+    _within_group_to_agg,
+)
 from batcher.api.dataset import Dataset
 from batcher.api.session import from_arrow
 from batcher.plan.expr_ir import lit
@@ -56,6 +61,15 @@ def _filter_to_case(node):
     agg = node.this.copy()
     cond = node.expression.this  # Where -> condition
     arg = agg.this
+    # `agg(DISTINCT x) FILTER (WHERE c)` must push the guard *inside* the DISTINCT:
+    # `count(DISTINCT CASE WHEN c THEN x END)`. Wrapping the whole `DISTINCT x` in a
+    # CASE (`count(CASE WHEN c THEN DISTINCT x END)`) is not valid SQL and would crash
+    # the scalar translator on the bare `Distinct` node. NULL from a false guard is
+    # dropped by the distinct set, so the guarded distinct-count matches DuckDB.
+    if isinstance(arg, exp.Distinct) and len(arg.expressions) == 1:
+        inner = exp.case().when(cond.copy(), arg.expressions[0].copy())
+        agg.set("this", exp.Distinct(expressions=[inner]))
+        return agg
     # COUNT(*) has no argument (or a Star) — count the constant 1 where c holds.
     arg = exp.Literal.number(1) if arg is None or isinstance(arg, exp.Star) else arg.copy()
     agg.set("this", exp.case().when(cond.copy(), arg))
@@ -68,9 +82,13 @@ def _select(tr, node) -> Dataset:
     # AST rewrites done up front so the normal aggregate path handles them.
     node = node.transform(_bool_agg_to_filter)
     node = node.transform(_filter_to_case)
-    # A self-join (same table aliased twice) is rewritten so the alias-blind column
-    # resolver sees distinct, uniquely-named columns.
-    tr._rewrite_self_joins(node)
+    # `agg(...) WITHIN GROUP (ORDER BY x)` → the ordinary aggregate over `x`, so the
+    # ordered column is not silently dropped (the fraction was being read as it).
+    node = node.transform(_within_group_to_agg)
+    # Sources that expose the same column name (a self-join, or two different tables
+    # sharing a name) are rewritten so the alias-blind column resolver sees distinct,
+    # uniquely-named columns.
+    tr._disambiguate_columns(node)
     # Inline `WINDOW w AS (...)` definitions into the `OVER w` references.
     tr._inline_named_windows(node)
 
@@ -376,6 +394,10 @@ def _table(tr, node) -> Dataset:
             raise PlanError(f"{fname!r} is a scalar function; call it in SELECT, not FROM")
         return _apply_tablesample(udf._apply_table_function(tr, node.this, rf), node)
 
+    # FROM (VALUES (..), (..)) AS t(c1, c2) — an inline literal relation.
+    if isinstance(node, exp.Values):
+        return _apply_tablesample(_values_table(node), node)
+
     # FROM (SELECT ...) AS t  → translate the inner SELECT to a Dataset.
     if isinstance(node, exp.Subquery):
         ds = tr.statement(node.this)
@@ -390,6 +412,49 @@ def _table(tr, node) -> Dataset:
             )
         ds = tr._registry[name]
     return _apply_tablesample(ds, node)
+
+
+def _values_literal(node):
+    """The Python value a VALUES cell denotes (constant literals only)."""
+    from sqlglot import expressions as exp
+
+    if isinstance(node, exp.Null):
+        return None
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    if isinstance(node, exp.Neg):
+        inner = _values_literal(node.this)
+        return None if inner is None else -inner
+    if isinstance(node, exp.Literal):
+        if node.is_string:
+            return node.this
+        text = node.this
+        return float(text) if ("." in text or "e" in text.lower()) else int(text)
+    raise NotImplementedError(
+        f"VALUES supports only constant literals per cell, got {type(node).__name__}"
+    )
+
+
+def _values_table(node) -> Dataset:
+    """Build a `Dataset` from an inline ``VALUES (..), (..)`` relation.
+
+    Column names come from the table alias (``AS t(c1, c2)``) or default to
+    ``col0, col1, ...`` (DuckDB's convention). Cells are constant literals; a
+    column's type is inferred from its values (mixed NULLs allowed).
+    """
+    rows = [[_values_literal(cell) for cell in tup.expressions] for tup in node.expressions]
+    width = len(rows[0])
+    if any(len(r) != width for r in rows):
+        raise PlanError("every VALUES row must have the same number of columns")
+    alias = node.args.get("alias")
+    named = [c.name for c in alias.args.get("columns", [])] if alias is not None else []
+    if named and len(named) != width:
+        raise PlanError(
+            f"VALUES column-alias count ({len(named)}) does not match the row width ({width})"
+        )
+    names = named or [f"col{i}" for i in range(width)]
+    columns = {names[i]: pa.array([r[i] for r in rows]) for i in range(width)}
+    return from_arrow(pa.table(columns))
 
 
 def _apply_tablesample(ds: Dataset, node) -> Dataset:

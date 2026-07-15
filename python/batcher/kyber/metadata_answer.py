@@ -40,6 +40,7 @@ __all__ = [
     "answer_n_unique",
     "answer_null_count",
     "approx_count_distinct",
+    "exact_null_count",
 ]
 
 
@@ -180,29 +181,52 @@ def _has_float_column(columns: set[str], sources: list) -> bool:
     return False
 
 
-def _bound_cannot_answer(column_or_expr: Any, sources: list) -> bool:
+def nan_aware_bounds(sources: list, source_stats: list | None) -> bool:
+    """Whether **every** source declares that its bounds rank NaN the way SQL does.
+
+    The one gate that decides whether a float column's upper bound (and anything derived
+    from it) may answer a query. A source sets `bounds_include_nan` only when it computed
+    its own bounds over the real values and recorded NaN as the maximum; a footer-derived
+    source cannot, and leaves it False. Unknown or missing statistics count as *not*
+    NaN-aware, so the safe answer is the default.
+    """
+    if source_stats is None or len(source_stats) != len(sources):
+        return False
+    return bool(sources) and all(
+        stat is not None and getattr(stat, "bounds_include_nan", False) for stat in source_stats
+    )
+
+
+def _bound_cannot_answer(column_or_expr: Any, sources: list, source_stats: list | None) -> bool:
     """Whether a **`max`** over this column may NOT be answered from a stored bound.
 
-    A float bound is not a sound answer for `max`, even when its provenance is `EXACT` —
-    because **both** producers of the bound deliberately exclude NaN:
+    A float bound is not a sound answer for `max` unless the source that produced it ranks
+    NaN the way SQL does — because the usual producers of a bound deliberately exclude NaN:
 
     * the KLL quantile sketch drops NaN on `add` ("it has no place in an ordered sketch"),
       which is right for quantiles and fatal for a bound; and
     * the Parquet spec omits NaN from a column's min/max statistics.
 
     But SQL's total order — the one our own `ORDER BY` uses — makes NaN the *greatest*
-    value, so `max(f)` over a column containing a NaN **is** NaN. Answering from the bound
-    returns the largest non-NaN value instead, and the query silently disagrees with what
-    executing it would produce. The bound cannot represent the answer, and nothing in the
-    stats says whether a NaN was dropped, so the only sound move is to execute.
+    value, so `max(f)` over a column containing a NaN **is** NaN. Answering from such a
+    bound returns the largest non-NaN value instead, and the query silently disagrees with
+    what executing it would produce. The bound cannot represent the answer, and nothing in
+    the stats says whether a NaN was dropped, so the only sound move is to execute.
 
-    `min` is deliberately **not** gated: because NaN is the greatest value, a dropped NaN can
-    never have been the minimum, so a float `min` bound is sound. (An all-NaN column has no
-    bound at all, so it falls through to execution rather than answering wrongly.) Integers,
-    strings, and temporals have no NaN and answer from metadata for both.
+    A source that computes its bounds itself (an immutable in-memory relation) *does* record
+    NaN as the max, and says so via `bounds_include_nan` — its float bound is then a sound
+    answer and this returns False. Everything else is gated.
+
+    `min` is deliberately **not** gated at all: because NaN is the greatest value, a dropped
+    NaN can never have been the minimum, so a float `min` bound is sound whatever produced
+    it. (An all-NaN column has no bound at all, so it falls through to execution rather than
+    answering wrongly.) Integers, strings, and temporals have no NaN and answer from metadata
+    for both.
     """
     from batcher.plan.expr_ir.walk import referenced_columns
 
+    if nan_aware_bounds(sources, source_stats):
+        return False
     if isinstance(column_or_expr, str):
         columns = {column_or_expr}
     else:
@@ -242,11 +266,27 @@ def answer_max(
 
     Mirror of `answer_min`; None (execute) unless the upper bound is provably exact.
     """
-    if _bound_cannot_answer(column, sources):
+    if _bound_cannot_answer(column, sources, source_stats):
         return None
     _, stats = _root_stats(plan, sources, source_stats, hub, config)
     stat = _exact_col(stats, column)
     return None if stat is None else stat.max
+
+
+def exact_null_count(stats: RelStats, column: str) -> int | None:
+    """`column`'s null count iff it is provably exact, else None — the one gate for nulls.
+
+    Deliberately **not** `_exact_col`. That gate asks whether the column's whole statistics
+    bundle is EXACT, which is the right question for a *bound* and the wrong one for a null
+    count: a Parquet footer records the null count exactly for every type, but a string
+    column's min/max may be writer-truncated, so the bundle is DEFAULT and a bundle-gated
+    answer threw the exact null count away with the inexact bounds. `null_count_is_exact`
+    reads the null count's own provenance, so the two facts are trusted independently.
+    """
+    stat = stats.columns.get(column)
+    if stat is None or stat.null_count is None or not stat.null_count_is_exact:
+        return None
+    return int(stat.null_count)
 
 
 def answer_null_count(
@@ -259,14 +299,11 @@ def answer_null_count(
 ) -> int | None:
     """Exact null count of `column` (`count(*) - count(column)`) from metadata, or None.
 
-    Needs both an EXACT row count and an EXACT per-column null count (a Parquet/ORC
-    footer records the latter per row group). Any weaker input → None (execute).
+    Needs an EXACT per-column null count — which a Parquet/ORC footer records per row group,
+    for every column type. Any weaker input → None (execute).
     """
     _, stats = _root_stats(plan, sources, source_stats, hub, config)
-    stat = _exact_col(stats, column)
-    if not stats.rows_exact or stat is None or stat.null_count is None:
-        return None
-    return int(stat.null_count)
+    return exact_null_count(stats, column)
 
 
 def answer_n_unique(
@@ -304,10 +341,8 @@ def answer_has_nulls(
 ) -> bool | None:
     """Whether `column` contains any null, from an EXACT null count, or None (execute)."""
     _, stats = _root_stats(plan, sources, source_stats, hub, config)
-    stat = _exact_col(stats, column)
-    if stat is None or stat.null_count is None:
-        return None
-    return stat.null_count > 0
+    nulls = exact_null_count(stats, column)
+    return None if nulls is None else nulls > 0
 
 
 def answer_all_null(
@@ -324,10 +359,10 @@ def answer_all_null(
     relation is *not* reported all-null). Needs both counts EXACT; else None (execute).
     """
     _, stats = _root_stats(plan, sources, source_stats, hub, config)
-    stat = _exact_col(stats, column)
-    if not stats.rows_exact or stat is None or stat.null_count is None:
+    nulls = exact_null_count(stats, column)
+    if not stats.rows_exact or nulls is None:
         return None
-    return stats.rows > 0 and int(stat.null_count) == int(stats.rows)
+    return stats.rows > 0 and nulls == int(stats.rows)
 
 
 def answer_learned_quantile(

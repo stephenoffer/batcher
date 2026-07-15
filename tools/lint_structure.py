@@ -173,6 +173,35 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # selectivity dispatch) memoized by node identity. The arms share that per-instance
     # cache state, so splitting scatters one estimator across files for ~a dozen lines.
     "python/batcher/kyber/stats/estimator.py": "cardinality/stats estimator hub; shared per-instance caches",
+    # The scalar string-function family: one cohesive `StrFunc` dispatch (`.str.*`) whose
+    # ~50 arms share the same UTF-8/1-based-index/null-propagation scaffolding. It grows by
+    # one small arm per function; splitting the family across files would scatter the shared
+    # helpers and the single match the interpreter dispatches through — same "many small
+    # things = one family module" rationale the maintainability rule prescribes.
+    "crates/bc-expr/src/eval/str/mod.rs": "the one .str function-family dispatch; per-fn arms share UTF-8/index/null scaffolding",
+    # The window engine's per-function evaluation: frameless / running / value / ranking
+    # paths over one shared partition+order scaffold. Like the executor hubs, splitting the
+    # arms scatters the frame/partition logic that must agree across paths; the runtime
+    # state already lives in sibling `window_frame`/`window_partition_agg` files.
+    "crates/bc-runtime/src/window.rs": "window per-function dispatch; frame/partition scaffold shared across paths",
+    # The canonical shuffle/partition primitive: hash + range partitioning, the parallel
+    # counting-sort scatter, and the null/NaN/−0.0 routing that EVERY hash path derives key
+    # identity from. It is the one place co-partitioning is defined; splitting it risks two
+    # partitioners disagreeing — the exact bug class keys.rs exists to prevent.
+    "crates/bc-runtime/src/shuffle.rs": "the one partition/shuffle primitive; co-partitioning defined in one place",
+    # The Tier-0 executor's operator bodies: one cohesive module of the sequential-oracle
+    # implementations (sort, materialize, gather) sharing the morsel/spill scaffolding. Like
+    # `par.rs`, splitting the operators scatters the shared execution helpers.
+    "crates/bc-interp/src/ops/mod.rs": "Tier-0 operator bodies hub; shared morsel/spill scaffolding",
+    # The join primitive hub: hash / sort-merge / radix / asof strategies over one shared
+    # build/probe/gather + key-canonicalization scaffold. Splitting the strategies forces a
+    # base<->strategy import cycle and scatters the key-identity logic they must share.
+    "crates/bc-runtime/src/join/mod.rs": "join strategy hub; strategies share build/probe/key scaffold",
+    # Group-key assignment: the one place a batch's rows are mapped to group ids, over every
+    # key dtype (int/float/string/bool/multi-column) with the canonical −0.0/NaN folding. It
+    # is a single per-dtype dispatch; splitting scatters the folding that grouping/shuffle
+    # must agree on.
+    "crates/bc-runtime/src/agg/group/assign.rs": "group-id assignment per key dtype; canonical folding in one place",
 }
 
 fails: list[str] = []

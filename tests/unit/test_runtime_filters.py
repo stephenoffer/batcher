@@ -223,6 +223,28 @@ def test_is_not_null_skipped_when_null_count_proven_zero():
     assert not _has_not_null(_rewrite(ds, stats), "k")
 
 
+def test_is_not_null_skipped_when_a_filter_hides_the_proven_zero():
+    """The same skip, but with a `Filter` between the scan and the join — the non-confluence bug.
+
+    `_may_hold_null` is read at the join, and a `Filter` below it sets `null_count` to *unknown*,
+    so the evidence up there says "maybe null" for a column the scan proves is null-free. The rule
+    then added `k IS NOT NULL`; pushdown sank it to the scan; `drop_filter_conjunct_implied_by_
+    zonemap` read the scan's EXACT `null_count=0`, proved it a tautology and deleted it; and this
+    rule, finding nothing on the spine, added it right back. PUSHDOWN then ran to its iteration cap
+    on every query — 16 iterations on TPC-H q3, 24 on q5, 25 on q7 — each re-walking the whole plan
+    and every expression in it, and the plan a query got depended on `fixpoint_iterations`.
+
+    The two rules must ask the same question in the same place: `_provably_true_at_source` asks it
+    at the scan, where the predicate would land.
+    """
+    ds = _fact().filter(col("v") > 15).join(_dim(), on="k")
+    stats = [
+        _kstat(4, min=1, max=3, null_count=0, provenance=Provenance.EXACT),
+        _kstat(null_count=0),
+    ]
+    assert not _has_not_null(_rewrite(ds, stats), "k")
+
+
 def test_is_not_null_on_every_key_of_a_composite_join():
     left = bt.from_pydict({"a": [1], "b": [2], "v": [3]})
     right = bt.from_pydict({"a": [1], "b": [2], "w": [4]})

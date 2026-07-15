@@ -22,6 +22,16 @@ from batcher.dist.executors.ray_runtime import scaling
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _fresh_ceiling():
+    # The learned ceiling is process-global; reset it before each test so one test's fixed
+    # cluster doesn't cap another's. The persistence tests drive their own two `_run` calls
+    # within a single test, so this per-test reset doesn't undercut them.
+    scaling._reset_capacity_ceiling()
+    yield
+    scaling._reset_capacity_ceiling()
+
+
 class _FakeClock:
     """A deterministic monotonic clock advanced only by `sleep` — no real waiting."""
 
@@ -35,7 +45,7 @@ class _FakeClock:
         self.t += dt
 
 
-def _run(monkeypatch, cpus_series, *, target, wait=180.0, poll=5.0, stall=90.0):
+def _run(monkeypatch, cpus_series, *, target, wait=180.0, poll=5.0, stall=90.0, startup=12.0):
     """Drive `_await_autoscale` with a scripted CPU-capacity series and a fake clock.
 
     `cpus_series` is a callable time -> cpus (GPUs held at 0). Returns
@@ -47,43 +57,117 @@ def _run(monkeypatch, cpus_series, *, target, wait=180.0, poll=5.0, stall=90.0):
     monkeypatch.setattr(
         scaling, "cluster_topology", lambda: {"nodes": 1, "cpus": cpus_series(clock.t), "gpus": 0.0}
     )
+    monkeypatch.setattr(scaling, "_ray_initialized", lambda: True, raising=False)
     base = active_config()
     dc = dataclasses.replace(
-        base.distributed, autoscale_wait_s=wait, autoscale_poll_s=poll, autoscale_stall_s=stall
+        base.distributed,
+        autoscale_wait_s=wait,
+        autoscale_poll_s=poll,
+        autoscale_stall_s=stall,
+        autoscale_startup_grace_s=startup,
     )
     with config_context(base.replace(distributed=dc)):
-        result = scaling._await_autoscale(target, cpus_series(0.0), 0.0, 0.0)
+        # Route through the public entry so the learned-ceiling short-circuit is exercised;
+        # it reads the initial capacity from `cluster_topology` (already patched) itself.
+        import ray
+
+        monkeypatch.setattr(ray, "is_initialized", lambda: True)
+        before = clock.t
+        scaling.await_autoscale(target, 0.0)
+        # `await_autoscale` returns None; recover the observed capacity from the topology at
+        # the clock position it left off (the same value `_await_autoscale` would have
+        # returned), and whether it actually waited from the elapsed time.
+        result = int(cpus_series(clock.t))
+        _ = before
     return result, clock.t
 
 
-def test_flat_cluster_bails_after_grace_not_full_wait(monkeypatch):
-    # A fixed cluster (capacity never grows) must give up after ~the stall grace, not
-    # block for the whole 180s budget on nodes that will never arrive.
-    result, elapsed = _run(monkeypatch, lambda _t: 8, target=32, wait=180.0, poll=5.0, stall=90.0)
+def test_flat_cluster_bails_after_startup_grace_not_stall_window(monkeypatch):
+    # A fixed cluster (capacity never grows) never enters the "growing" regime, so it must
+    # give up after the SHORT startup grace — not the long post-growth stall window, and far
+    # from the whole 180s budget. This is the 90s-per-cold-query tax the startup grace kills:
+    # a large aggregate's fan-out routinely asks for more cores than a fixed cluster has.
+    result, elapsed = _run(
+        monkeypatch, lambda _t: 8, target=32, wait=180.0, poll=5.0, stall=90.0, startup=12.0
+    )
     assert result == 8
-    assert elapsed <= 90.0 + 5.0  # grace window + one poll, far below the 180s budget
+    assert elapsed <= 12.0 + 5.0  # startup grace + one poll, not the 90s stall window
 
 
 def test_growing_cluster_reaches_target(monkeypatch):
-    # Capacity climbs a node (16 CPUs) every 30s; the wait must stay until it covers the
-    # request and then return the satisfied capacity.
+    # Capacity climbs a node (16 CPUs) every 15s; the first node arrives within the startup
+    # grace, flipping into the growing regime so the wait stays until it covers the request
+    # and returns the satisfied capacity. `startup` is set past the first growth to model a
+    # cluster whose nodes register inside the startup window.
     def series(t: float) -> float:
-        return 8 + 16 * int(t // 30)  # 8, 24, 40, ...
+        return 8 + 16 * int(t // 15)  # 8, 24, 40, ...
 
-    result, _elapsed = _run(monkeypatch, series, target=32, wait=180.0, poll=5.0, stall=90.0)
+    result, _elapsed = _run(
+        monkeypatch, series, target=32, wait=180.0, poll=5.0, stall=90.0, startup=20.0
+    )
     assert result >= 32
 
 
 def test_growth_then_stall_returns_partial(monkeypatch):
     # Grows to 24 (below the target 32) then stalls — spot capacity ran out mid-scale-up.
-    # It should ride the growth, then bail a grace window after the last gain with the
-    # partial capacity, not hang for the full budget.
+    # It should ride the growth, then bail a STALL grace window after the last gain with the
+    # partial capacity, not hang for the full budget. `startup` covers the first growth (15s).
     def series(t: float) -> float:
-        return 24 if t >= 20 else 8
+        return 24 if t >= 15 else 8
 
-    result, elapsed = _run(monkeypatch, series, target=32, wait=300.0, poll=5.0, stall=60.0)
+    result, elapsed = _run(
+        monkeypatch, series, target=32, wait=300.0, poll=5.0, stall=60.0, startup=20.0
+    )
     assert result == 24
-    assert elapsed <= 20.0 + 60.0 + 5.0  # last growth at ~20s + grace + a poll
+    assert elapsed <= 15.0 + 60.0 + 5.0  # last growth at ~15s + STALL grace + a poll
+
+
+def test_growth_within_startup_grace_earns_the_full_stall_window(monkeypatch):
+    # A single early growth (a node registers at 10s, inside the 12s startup grace) flips the
+    # wait into the "growing" regime: the LONG stall window then governs, so a cluster still
+    # bringing nodes up is not abandoned. It stalls at 24 (never reaches 32) and bails a full
+    # stall window after that lone gain — proving the regime switched, not the startup grace.
+    def series(t: float) -> float:
+        return 24 if t >= 10 else 8
+
+    result, elapsed = _run(
+        monkeypatch, series, target=32, wait=300.0, poll=5.0, stall=60.0, startup=12.0
+    )
+    assert result == 24
+    # Bailed well after the 12s startup grace would have (10s growth + 60s stall), proving the
+    # single growth earned the long window rather than the short one.
+    assert elapsed > 12.0 + 5.0
+    assert elapsed <= 10.0 + 60.0 + 5.0
+
+
+def test_flat_wait_learns_a_ceiling_that_short_circuits_later_waits(monkeypatch):
+    # After a wait stalls below target on a fixed cluster, the cluster's unreachable ceiling
+    # is remembered: a later query asking for more than the observed capacity must skip the
+    # wait entirely (0 elapsed), so a fixed-at-max cluster pays the startup grace ONCE, not on
+    # every cold query — the whole point of the ceiling.
+    scaling._reset_capacity_ceiling()
+    try:
+        _r1, e1 = _run(monkeypatch, lambda _t: 8, target=32, wait=180.0, poll=5.0, startup=12.0)
+        assert e1 > 0.0  # the first wait actually probed (and learned 8 is the ceiling)
+        _r2, e2 = _run(monkeypatch, lambda _t: 8, target=64, wait=180.0, poll=5.0, startup=12.0)
+        assert e2 == 0.0  # a larger request than the learned ceiling short-circuits
+    finally:
+        scaling._reset_capacity_ceiling()
+
+
+def test_reached_target_lifts_a_stale_ceiling(monkeypatch):
+    # A ceiling is not permanent: once capacity has climbed past it (the cluster recovered /
+    # more nodes joined), the bound is dropped so a later request that the grown cluster can
+    # now satisfy is served immediately instead of being wrongly short-circuited.
+    scaling._reset_capacity_ceiling()
+    try:
+        _run(monkeypatch, lambda _t: 8, target=32, wait=180.0, poll=5.0, startup=12.0)  # ceiling=8
+        # The cluster has since grown to 40 cores; a 40-core request is now satisfiable and
+        # must return immediately (current capacity already covers it), not stay capped at 8.
+        _r, e = _run(monkeypatch, lambda _t: 40, target=40, wait=180.0, poll=5.0)
+        assert _r >= 40 and e == 0.0
+    finally:
+        scaling._reset_capacity_ceiling()
 
 
 def test_disabled_wait_is_immediate(monkeypatch):

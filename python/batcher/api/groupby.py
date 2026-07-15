@@ -408,6 +408,12 @@ class GroupBy:
         out: dict[str, AggExpr] = {}
         for a in aggs:
             if isinstance(a, AggExpr) and isinstance(a.input, Col):
+                if a.input.name in out:
+                    raise PlanError(
+                        f"agg() got two positional aggregates over column {a.input.name!r}, "
+                        "which would both be named after it; give one a keyword name, "
+                        "e.g. agg(total=col('x').sum(), avg=col('x').mean())"
+                    )
                 out[a.input.name] = a
             else:
                 raise PlanError(

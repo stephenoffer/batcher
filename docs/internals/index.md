@@ -32,7 +32,10 @@ Kyber is Batcher's query optimization engine. It transforms logical plans into e
   selection from sketch/learned cardinality
 - **Learned cardinality** that sharpens across runs via the MetadataHub
 - **Intra-query adaptive re-optimization** - re-plans at pipeline breakers on
-  *measured* sizes, single-node and distributed (the moat over DuckDB/Spark AQE)
+  *measured* sizes, single-node and distributed. This is stage-boundary adaptation,
+  the same granularity as Spark AQE — the difference is that Batcher does it on a
+  single node too, where DuckDB's static optimizer has no equivalent, and pairs it
+  with a cross-query learned-stats loop that neither has
 
 [Learn more about Kyber](kyber.md)
 

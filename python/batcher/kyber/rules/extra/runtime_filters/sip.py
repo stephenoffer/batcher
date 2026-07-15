@@ -38,6 +38,7 @@ from batcher.kyber.rules.extra.runtime_filters.evidence import (
     _may_hold_null,
     _membership_values,
     _out_of_range,
+    _provably_true_at_source,
     _real_key_pairs,
     _rebuild,
     _rebuild_membership,
@@ -89,9 +90,25 @@ def push_is_not_null_from_join_key(node: Join, ctx: OptimizerContext) -> Logical
     left_preds: list[tuple[str, Expr]] = []
     right_preds: list[tuple[str, Expr]] = []
     for lk, rk in _real_key_pairs(node):
-        if "left" in sides and _scan_rooted(node.left) and _may_hold_null(left_stats.column(lk)):
+        # `_may_hold_null` is read here, at the join — but a `Filter` between here and the scan
+        # has already set `null_count` to unknown, so it says "maybe" for a column the scan
+        # proves is null-free. `_provably_true_at_source` asks the same oracle down at the scan,
+        # where the predicate would land and where `drop_filter_conjunct_implied_by_zonemap`
+        # would then delete it as a tautology — leaving this rule to add it again, forever.
+        # Both questions must be asked in the same place or the two rules cannot converge.
+        if (
+            "left" in sides
+            and _scan_rooted(node.left)
+            and _may_hold_null(left_stats.column(lk))
+            and not _provably_true_at_source(node.left, lk, IsNotNull(Col(lk)), ctx)
+        ):
             left_preds.append((lk, IsNotNull(Col(lk))))
-        if "right" in sides and _scan_rooted(node.right) and _may_hold_null(right_stats.column(rk)):
+        if (
+            "right" in sides
+            and _scan_rooted(node.right)
+            and _may_hold_null(right_stats.column(rk))
+            and not _provably_true_at_source(node.right, rk, IsNotNull(Col(rk)), ctx)
+        ):
             right_preds.append((rk, IsNotNull(Col(rk))))
     left = _add_conjuncts(node.left, left_preds)
     right = _add_conjuncts(node.right, right_preds)

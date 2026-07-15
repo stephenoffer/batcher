@@ -66,6 +66,70 @@ def _alias_of(p) -> str:
     return p.sql().lower()
 
 
+def _split_and(pred) -> list:
+    """Flatten a conjunction (and parentheses) into its leaf predicates."""
+    from sqlglot import expressions as exp
+
+    out: list = []
+    stack = [pred]
+    while stack:
+        p = stack.pop()
+        if isinstance(p, exp.And):
+            stack.extend((p.this, p.expression))
+        elif isinstance(p, exp.Paren):
+            stack.append(p.this)
+        else:
+            out.append(p)
+    return out
+
+
+def _join_and(preds):
+    """Re-combine leaf predicates into a single AND chain."""
+    from sqlglot import expressions as exp
+
+    out = preds[0]
+    for p in preds[1:]:
+        out = exp.And(this=out, expression=p)
+    return out
+
+
+def _within_group_to_agg(node):
+    """`agg(...) WITHIN GROUP (ORDER BY x)` → the ordinary aggregate over `x`.
+
+    Ordered-set aggregates parse as ``WithinGroup(this=<agg>, expression=Order)``
+    where the sort column lives in the ``ORDER BY`` and the fraction (if any) sits
+    inside the aggregate. Left unrewritten, ``find_all(AggFunc)`` sees the inner
+    ``PercentileCont(this=<fraction>)`` and *silently drops the ORDER BY column*,
+    treating the fraction as the value column. Rewrite the two forms the engine
+    supports into their normal shapes so the aggregate path handles them:
+
+    * ``percentile_cont(f) WITHIN GROUP (ORDER BY x)`` → ``PercentileCont(x, f)``
+      (the two-argument quantile form).
+    * ``mode() WITHIN GROUP (ORDER BY x)`` → ``Mode(x)``.
+    """
+    from sqlglot import expressions as exp
+
+    if not isinstance(node, exp.WithinGroup):
+        return node
+    agg = node.this
+    order = node.expression
+    ordered = order.expressions if isinstance(order, exp.Order) else []
+    if len(ordered) != 1:
+        raise NotImplementedError(
+            "WITHIN GROUP (ORDER BY ...) requires exactly one ordering expression"
+        )
+    column = ordered[0].this
+    if isinstance(agg, exp.PercentileCont):
+        return exp.PercentileCont(this=column.copy(), expression=agg.this.copy())
+    if isinstance(agg, exp.Mode):
+        return exp.Mode(this=column.copy())
+    if isinstance(agg, exp.PercentileDisc):
+        raise NotImplementedError(
+            "percentile_disc WITHIN GROUP is not supported; use percentile_cont"
+        )
+    raise NotImplementedError(f"WITHIN GROUP is not supported for {type(agg).__name__.lower()}")
+
+
 def _has_aggregate(node) -> bool:
     from sqlglot import expressions as exp
 
@@ -79,3 +143,90 @@ def _has_aggregate(node) -> bool:
             continue
         return True
     return False
+
+
+def _disambiguate_columns(tr, node) -> None:
+    """Rename colliding columns so the alias-blind resolver sees distinct names.
+
+    Two sources exposing the same column name — two aliases of one table
+    (``nation n1, nation n2``), or two different tables sharing a name
+    (``emp e, dept d`` both with ``dept``) — otherwise collapse onto one physical
+    column, so a qualified ``d.dept`` silently resolves to the *left* ``dept`` (and a
+    comma-join ``WHERE e.dept = d.dept`` degenerates to a cartesian product). Each
+    source owning a colliding column is wrapped in a subquery renaming it to a flat
+    ``alias__col`` name, and matching ``alias.col`` references are rewritten. Columns
+    merged by a USING / NATURAL / same-name-``ON``-equi join keep their bare name.
+    """
+    from sqlglot import expressions as exp
+
+    from_ = node.args.get("from") or node.args.get("from_")
+    if from_ is None:
+        return
+    joins = node.args.get("joins", []) or []
+    tables = [t for t in [from_.this, *(j.this for j in joins)] if isinstance(t, exp.Table)]
+    if len(tables) < 2:
+        return
+
+    # Columns a USING / same-name-ON-equi join merges must keep their bare name (the
+    # join unifies them; flattening would make it drop the right key). Comma joins
+    # have no ON, so their WHERE equi is not a key here and is still flattened.
+    protected: set[str] = set()
+    natural = False
+    for j in joins:
+        protected |= {u.name for u in j.args.get("using") or ()}
+        natural = natural or (j.args.get("method") or "").upper() == "NATURAL"
+        on = j.args.get("on")
+        for eq in on.find_all(exp.EQ) if on is not None else ():
+            a, b = eq.this, eq.expression
+            if isinstance(a, exp.Column) and isinstance(b, exp.Column) and a.name == b.name:
+                protected.add(a.name)
+
+    names = [t.name for t in tables]
+    per_source: list[tuple] = []  # (table_node, alias, columns)
+    counts: dict[str, int] = {}
+    for t in tables:
+        if t.name not in tr._registry:
+            if names.count(t.name) > 1:
+                raise NotImplementedError(
+                    f"self-join on {t.name!r} is not supported (its columns can't be "
+                    f"enumerated to disambiguate the aliases)"
+                )
+            continue
+        cols = list(tr._registry[t.name].columns)
+        per_source.append((t, t.alias or t.name, cols))
+        for c in set(cols):
+            counts[c] = counts.get(c, 0) + 1
+
+    shared = {c for c, n in counts.items() if n > 1}
+    if natural:  # NATURAL merges every shared column; leave them all bare.
+        protected |= shared
+    flatten = shared - protected
+    if not flatten:
+        return
+
+    alias_map: dict[str, dict[str, str]] = {}
+    for t, alias, cols in per_source:
+        flat = {c: f"{alias}__{c}" for c in cols if c in flatten}
+        if not flat:
+            continue
+        alias_map[alias] = flat
+        # Non-colliding columns keep their bare name so an unqualified unique
+        # reference (`sal`) still resolves.
+        inner = exp.Select(
+            expressions=[
+                exp.alias_(exp.column(c), flat[c]) if c in flat else exp.column(c) for c in cols
+            ]
+        ).from_(exp.table_(t.name))
+        t.replace(exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier(alias))))
+
+    # A bare `alias.col` projected directly keeps its output name (`col`).
+    for p in list(node.expressions):
+        if isinstance(p, exp.Column) and p.table in alias_map and p.name in alias_map[p.table]:
+            p.replace(exp.alias_(exp.column(alias_map[p.table][p.name]), p.name))
+    for c in list(node.find_all(exp.Column)):
+        if (
+            c.table in alias_map
+            and c.name in alias_map[c.table]
+            and c.find_ancestor(exp.Select) is node
+        ):
+            c.replace(exp.column(alias_map[c.table][c.name]))

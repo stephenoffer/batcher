@@ -262,8 +262,9 @@ pub(crate) fn analyze(
                 ));
             }
             match func {
-                // `abs` preserves the input type (int abs -> int, float abs ->
-                // float), matching the interpreter's `eval_math`.
+                // `abs` preserves the input type (int abs -> int, float abs -> float),
+                // matching the interpreter's `eval_math`. Integer `abs(i64::MIN)` saturates
+                // to i64::MAX in both tiers (see `emit.rs` / `eval/math.rs`).
                 Abs => Ok(inner),
                 // floor/ceil/sqrt/trunc always produce f64 (ints are promoted to
                 // f64 first, exactly as the interpreter does via `cast`).

@@ -318,7 +318,7 @@ class FileSource(ABC):
         digest = hashlib.sha256("\n".join(self._pinned).encode()).hexdigest()[:16]
         return f"{base}#{digest}"
 
-    def splits(self, target_size: int | None = None) -> list[Split]:
+    def splits(self, target_size: int | None = None, predicate: dict | None = None) -> list[Split]:
         """Independently-readable slices — one per file, or finer where the format allows.
 
         Parquet subdivides into row-group runs; line-delimited text into byte ranges.
@@ -335,6 +335,9 @@ class FileSource(ABC):
         Args:
             target_size: Rough size (bytes) to aim for per split. The format's own
                 granularity is used when omitted.
+            predicate: An optional pushed-down filter, as its IR dictionary. Splits whose
+                recorded bounds prove they cannot match it are pruned, so a selective read
+                never opens the files it does not need.
 
         Returns:
             The splits covering the source exactly once.
@@ -356,9 +359,9 @@ class FileSource(ABC):
         # order is preserved so a downstream that assumes file order is unaffected. A
         # single file (the common small case) skips the pool entirely.
         if len(files) <= 1:
-            return [s for f in files for s in self._file_splits(f, target_size)]
+            return [s for f in files for s in self._file_splits(f, target_size, predicate)]
         with ThreadPoolExecutor(max_workers=min(_FOOTER_READ_CONCURRENCY, len(files))) as pool:
-            per_file = pool.map(lambda f: self._file_splits(f, target_size), files)
+            per_file = pool.map(lambda f: self._file_splits(f, target_size, predicate), files)
         return [s for file_splits in per_file for s in file_splits]
 
     # ---- override points --------------------------------------------------
@@ -389,5 +392,18 @@ class FileSource(ABC):
         """
         return {}
 
-    def _file_splits(self, path: str, target_size: int | None) -> list[Split]:  # noqa: ARG002
+    def _file_splits(
+        self,
+        path: str,
+        target_size: int | None,  # noqa: ARG002 (a whole-file format has no sub-file granularity)
+        predicate: dict | None = None,  # noqa: ARG002 (no footer stats to prune with)
+    ) -> list[Split]:
+        """This file's splits. A format with footer statistics overrides this to *prune*.
+
+        `predicate` is Kyber's pushed filter, offered here so a format that records per-chunk
+        bounds (Parquet row-groups, ORC stripes) can drop the chunks that provably hold no
+        matching row — at **plan** time, so they never become a task, never get balanced, and
+        never get opened. A format with no such statistics ignores it; the engine's `Filter`
+        re-checks every row regardless, so ignoring it is always correct and merely slower.
+        """
         return [FileSplit(self.format_name, path, self._reader_kwargs())]

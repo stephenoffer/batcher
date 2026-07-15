@@ -12,6 +12,7 @@ sharing one scratch root do not corrupt each other's results.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 
 import numpy as np
@@ -213,6 +214,89 @@ def test_scratch_is_cleaned_on_the_error_path(tmp_path, monkeypatch):
             .collect(spill=True, num_partitions=32)
         )
     assert _leftover_dirs(root) == []  # scratch removed despite the mid-flight error
+
+
+def _dist_json(group_cols, aggs):
+    """The (group_keys_json, aggregates_json) the distributed aggregate ships to workers."""
+    gk = json.dumps([{"expr": col(c).to_ir(), "alias": c} for c in group_cols])
+    ag = json.dumps([spec.to_ir(alias) for alias, spec in aggs])
+    return gk, ag
+
+
+def test_distributed_reduce_spills_high_cardinality(tmp_path):
+    # The distributed reducer folds its shuffle partials into one running group state; a
+    # high-cardinality GROUP BY makes that state exceed a worker's RAM. `combine_finalize_spilling`
+    # reads the shuffle files one at a time and grace-partitions them to disk, so the reducer
+    # completes out of core. Drive the real FFI end-to-end (native partial/partition + on-disk
+    # Arrow-IPC shuffle files) and assert the spilling reduce equals the in-memory reduce and the
+    # single-node aggregate — the mergeable invariant holding out-of-core, no Ray needed.
+    from batcher.dist.shuffle_io import read_ipc, write_ipc
+
+    nat = pytest.importorskip("batcher._native", reason="native engine not built")
+
+    # ~120k rows, ~mostly-distinct keys → a reducer's merged state is large relative to a tiny
+    # budget, forcing real grace partitioning + its recursion.
+    rng = np.random.default_rng(3)
+    n = 120_000
+    ks = rng.integers(0, 100_000, n).astype("int64")
+    vs = rng.integers(0, 1000, n).astype("int64")
+    table = pa.table({"k": ks, "v": vs})
+    batches = table.to_batches(max_chunksize=8_192)
+
+    gk_json, ag_json = _dist_json(["k"], [("s", col("v").sum()), ("n", count())])
+
+    # MAP: partial-aggregate each chunk, then hash-shuffle its partials to `n_reducers`.
+    n_reducers = 5
+    reducer_paths: list[list[str]] = [[] for _ in range(n_reducers)]
+    work = str(tmp_path)
+    for mi, b in enumerate(batches):
+        partial = nat.partial_aggregate(gk_json, ag_json, [b])
+        buckets = nat.partition_batches([partial], [0], n_reducers)
+        for r, bucket in enumerate(buckets):
+            if bucket:
+                p = os.path.join(work, f"m{mi}_r{r}.arrow")
+                write_ipc(bucket, p)
+                reducer_paths[r].append(p)
+
+    def _reduce(spilling: bool) -> list:
+        rows: list = []
+        for paths in reducer_paths:
+            if not paths:
+                continue
+            if spilling:
+                # A 1 KiB budget forces the deepest out-of-core path for every non-trivial reducer.
+                out = nat.combine_finalize_spilling(gk_json, ag_json, list(paths), 1024, work, None)
+            else:
+                partials = [b for p in paths for b in read_ipc(p)]
+                out = nat.combine_finalize(gk_json, ag_json, partials)
+            if out.num_rows:
+                rows.extend(pa.Table.from_batches([out]).to_pylist())
+        return sorted(tuple(r.values()) for r in rows)
+
+    spilled = _reduce(spilling=True)
+    in_memory = _reduce(spilling=False)
+    single_node = _norm(
+        bt.from_arrow(table).group_by("k").agg(s=col("v").sum(), n=count()).collect()
+    )
+    assert spilled == in_memory
+    assert spilled == single_node
+
+
+def test_distributed_reduce_spill_all_empty_reducer(tmp_path):
+    # A reducer that receives only empty keyed shards must spill to a zero-row result, not
+    # raise — the out-of-core path must tolerate the all-empty bucket the in-memory fold does.
+    from batcher.dist.shuffle_io import write_ipc
+
+    nat = pytest.importorskip("batcher._native", reason="native engine not built")
+    gk_json, ag_json = _dist_json(["k"], [("s", col("v").sum())])
+    empty = pa.record_batch(
+        {"k": pa.array([], type=pa.int64()), "v": pa.array([], type=pa.int64())}
+    )
+    partial = nat.partial_aggregate(gk_json, ag_json, [empty])
+    p = os.path.join(str(tmp_path), "empty.arrow")
+    write_ipc([partial], p)
+    out = nat.combine_finalize_spilling(gk_json, ag_json, [p], 1, str(tmp_path), None)
+    assert out.num_rows == 0
 
 
 def test_concurrent_spilling_queries_share_a_root_without_corruption(tmp_path):

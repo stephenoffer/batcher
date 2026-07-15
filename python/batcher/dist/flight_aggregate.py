@@ -26,7 +26,7 @@ from batcher.dist.executor import (
     _ensure_ray,
     _relabel_single_source,
 )
-from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
+from batcher.dist.executors.partition_io import consumer_pushdown, partition_descriptors
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
     map_barrier,
@@ -137,7 +137,14 @@ def execute_aggregate_flight(
         # `map_plan`'s scan was relabeled to source 0, so key the analysis on 0, not on the
         # source's original index: a staged plan whose input is an intermediate (source id >
         # 0) missed the lookup and silently read every column.
-        projection, predicate = source_pushdown(map_plan, 0)
+        # Ask about the aggregate *over* the prefix, not the prefix alone. The prefix of a
+        # plain `group_by(k).agg(sum(v))` is a bare `Scan`, and a bare scan requires every
+        # column it has — so the projection came back as the source's full schema and the
+        # pruning described above silently did nothing for the commonest aggregate shape (it
+        # bit only when the user's own filter/project happened to sit in the prefix).
+        # `consumer_pushdown` re-parents the aggregate so Kyber's analysis sees what the
+        # reducers actually read.
+        projection, predicate = consumer_pushdown(agg, map_plan)
         partitions = partition_descriptors(
             sources[sid], workers, projection=projection, predicate=predicate
         )

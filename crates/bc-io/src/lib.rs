@@ -227,6 +227,13 @@ async fn read_parquet_async(
     }
 
     // Leaf-column projection by name, pushed into the decode (computed once, shared).
+    // A `ProjectionMask` is a *set* of leaf indices — it selects columns but does NOT
+    // reorder them, so the decoded batch keeps the file's column order. PyArrow's
+    // `read_table(columns=[...])` (the fallback this reader must be byte-identical to)
+    // returns the columns in the *requested* order, so a reordered projection
+    // (`["c","a"]` on a file laid out `a,b,c`) would otherwise come back as `[a,c]`
+    // here but `[c,a]` from PyArrow — a silent column-order divergence. We reorder the
+    // output below to the requested order to honor that contract.
     let projection = columns.map(|cols| {
         ProjectionMask::columns(arrow_meta.parquet_schema(), cols.iter().map(|s| s.as_str()))
     });
@@ -268,7 +275,52 @@ async fn read_parquet_async(
         })
         .try_collect()
         .await?;
-    Ok(per_rg_batches.into_iter().flatten().collect())
+    let mut batches: Vec<RecordBatch> = per_rg_batches.into_iter().flatten().collect();
+    // Match PyArrow: return columns in the requested projection order, not file order.
+    if let Some(cols) = columns {
+        reorder_to_projection(&mut batches, cols);
+    }
+    Ok(batches)
+}
+
+/// Reorder each batch's columns to the requested projection order (PyArrow parity).
+///
+/// The decoder emits columns in the file's schema order regardless of the order the
+/// caller asked for. When the requested names map one-to-one onto the batch's top-level
+/// fields, reorder to the requested order so the result is identical to PyArrow's
+/// `read_table(columns=[...])`. When they do not form a clean bijection (a nested/leaf
+/// projection, a duplicated or absent name), leave the batch untouched — the reorder is
+/// only defined for the flat top-level projections the engine actually issues, and
+/// touching the exotic cases would risk mangling them.
+fn reorder_to_projection(batches: &mut [RecordBatch], columns: &[String]) {
+    let Some(first) = batches.first() else {
+        return;
+    };
+    let schema = first.schema();
+    // A clean bijection: same count, and every requested name resolves to a distinct field.
+    if columns.len() != schema.fields().len() {
+        return;
+    }
+    let mut order = Vec::with_capacity(columns.len());
+    for name in columns {
+        match schema.index_of(name) {
+            Ok(idx) if !order.contains(&idx) => order.push(idx),
+            _ => return, // absent or duplicate name → not a clean reorder, leave as-is
+        }
+    }
+    if order.iter().enumerate().all(|(i, &idx)| i == idx) {
+        return; // already in requested order (the common case) — no work
+    }
+    for b in batches.iter_mut() {
+        let cols: Vec<_> = order.iter().map(|&i| b.column(i).clone()).collect();
+        let fields: Vec<_> = order.iter().map(|&i| b.schema().field(i).clone()).collect();
+        let new_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+        // Reindexing existing columns of a valid batch cannot fail; keep the original on
+        // the impossible error rather than dropping data.
+        if let Ok(nb) = RecordBatch::try_new(new_schema, cols) {
+            *b = nb;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -367,6 +419,95 @@ mod tests {
         // A malformed / non-pushable predicate must read everything (never fail/underread).
         let out_all = read_parquet_filtered(path, &[], None, 4096, "not json").unwrap();
         assert_eq!(out_all.iter().map(|b| b.num_rows()).sum::<usize>(), 1000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn sample3(n: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Float64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let a = Int64Array::from((0..n).collect::<Vec<_>>());
+        let b = Float64Array::from((0..n).map(|x| x as f64 * 0.5).collect::<Vec<_>>());
+        let c = Int64Array::from((0..n).map(|x| x * 100).collect::<Vec<_>>());
+        RecordBatch::try_new(schema, vec![Arc::new(a), Arc::new(b), Arc::new(c)]).unwrap()
+    }
+
+    #[test]
+    fn reordered_projection_returns_requested_order() {
+        // File is laid out [a, b, c]. Requesting ["c", "a"] must return columns in the
+        // REQUESTED order (matching PyArrow's `read_table(columns=[...])`, the fallback
+        // this reader is contracted to be byte-identical to) — not the file order [a, c].
+        let dir = std::env::temp_dir().join(format!("bcio_reorder_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.parquet");
+        write_parquet(&p, &[sample3(300)], 1000);
+        let cols = vec!["c".to_string(), "a".to_string()];
+        let out = read_parquet(p.to_str().unwrap(), &[], Some(&cols), 4096).unwrap();
+        let schema = out[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["c", "a"], "columns must follow requested order");
+        // And the data must travel with its name: column 0 is `c` (values x*100).
+        let c0 = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(c0.value(0), 0);
+        assert_eq!(c0.value(1), 100);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn predicate_ignores_nested_field_with_colliding_leaf_name() {
+        // A struct column `s{a}` shares the leaf name `a` with a top-level column `a`.
+        // A predicate on the top-level `a` must prune using the TOP-LEVEL column's stats,
+        // never the nested field's — otherwise the wrong (nested) min/max drops rows that
+        // actually match. Here the nested `s.a` is 0..3 while the top-level `a` is 500..800;
+        // `a >= 500` must keep all rows, but leaf-name matching would prune the group to 0.
+        use arrow::array::{ArrayRef, StructArray};
+        use arrow::datatypes::Fields;
+
+        let dir = std::env::temp_dir().join(format!("bcio_nest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.parquet");
+        let inner_a = Arc::new(Int64Array::from(vec![0i64, 1, 2, 3])) as ArrayRef;
+        let struct_fields: Fields = vec![Field::new("a", DataType::Int64, false)].into();
+        let s = StructArray::new(struct_fields.clone(), vec![inner_a], None);
+        let top_a = Arc::new(Int64Array::from(vec![500i64, 600, 700, 800])) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Struct(struct_fields), false),
+            Field::new("a", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(s), top_a]).unwrap();
+        write_parquet(&p, &[batch], 1000);
+        let pred = r#"{"node":"cmp","col":"a","op":"ge","lit":500}"#;
+        let out = read_parquet_filtered(p.to_str().unwrap(), &[], None, 4096, pred).unwrap();
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 4,
+            "top-level `a` matched all rows; nested `s.a` must not prune"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn out_of_range_row_group_with_predicate_errs_not_panics() {
+        // An out-of-range split index must produce the SAME clean error with a predicate
+        // as without one — predicate pushdown must never turn a bad index into a panic
+        // (`meta.row_group(rg)` panics on OOB; the fix keeps the index for the decoder).
+        let dir = std::env::temp_dir().join(format!("bcio_oob_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.parquet");
+        write_parquet(&p, &[sample(100)], 1000); // one row-group (index 0 only)
+        let path = p.to_str().unwrap();
+        let pred = r#"{"node":"cmp","col":"a","op":"ge","lit":0}"#;
+        // Must be a clean Err, not a panic (would abort the process across FFI).
+        let filtered = read_parquet_filtered(path, &[5], None, 4096, pred);
+        assert!(filtered.is_err(), "OOB row group must error, not panic");
+        // Identical to the no-predicate path's behavior.
+        assert!(read_parquet(path, &[5], None, 4096).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

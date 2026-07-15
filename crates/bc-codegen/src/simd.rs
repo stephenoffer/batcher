@@ -35,7 +35,7 @@
 //! converted to consecutive `0`/`1` bits in the Arrow bitmask only at the store site
 //! (in `compile_simd`).
 
-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{types, InstBuilder, MemFlags, Type, Value};
 use cranelift_frontend::FunctionBuilder;
 
@@ -281,63 +281,38 @@ impl SimdCodegen<'_, '_> {
     }
 
     /// Vector comparison producing an `I64xL` canonical mask (all-ones for true).
-    /// Mirrors the scalar [`Codegen::emit_cmp`](crate::emit::Codegen) lane-wise: for
-    /// floats it builds the same total-order NaN result (NaN == NaN, NaN sorts above
-    /// every non-NaN) from IEEE compares plus `Unordered` NaN tests, so the vector
-    /// path agrees with the interpreter on NaN, not bare IEEE. For NaN-free lanes
-    /// every NaN test is zero and it collapses to the plain IEEE compare.
+    /// Mirrors the scalar [`Codegen::emit_cmp`](crate::emit::Codegen) lane-wise: the
+    /// interpreter compares floats with Arrow's `cmp` kernel, i.e. `f64::total_cmp`
+    /// (a TOTAL order — `-0.0 < 0.0`, negative NaN below `-inf`, positive NaN above
+    /// `+inf`) plus raw-bit equality. We reproduce that exactly by mapping each lane's
+    /// bits to `total_cmp`'s monotonic i64 key and doing a signed integer compare, so
+    /// the vector path is bit-for-bit identical to the interpreter — not bare IEEE.
     fn emit_cmp(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value, is_float: bool) -> Value {
         use bc_expr::BinaryOp::*;
+        let cc = match op {
+            Eq => IntCC::Equal,
+            Ne => IntCC::NotEqual,
+            Lt => IntCC::SignedLessThan,
+            Le => IntCC::SignedLessThanOrEqual,
+            Gt => IntCC::SignedGreaterThan,
+            Ge => IntCC::SignedGreaterThanOrEqual,
+            _ => unreachable!("emit_cmp only handles comparisons"),
+        };
         if is_float {
-            let a_nan = self.b.ins().fcmp(FloatCC::Unordered, l, l);
-            let b_nan = self.b.ins().fcmp(FloatCC::Unordered, r, r);
-            let a_ord = self.b.ins().bnot(a_nan); // l is not NaN
-            let b_ord = self.b.ins().bnot(b_nan); // r is not NaN
-            let both_nan = self.b.ins().band(a_nan, b_nan);
-            match op {
-                Eq => {
-                    let feq = self.b.ins().fcmp(FloatCC::Equal, l, r);
-                    self.b.ins().bor(feq, both_nan)
-                }
-                Ne => {
-                    let feq = self.b.ins().fcmp(FloatCC::Equal, l, r);
-                    let eq = self.b.ins().bor(feq, both_nan);
-                    self.b.ins().bnot(eq)
-                }
-                Lt => {
-                    let lt = self.b.ins().fcmp(FloatCC::LessThan, l, r);
-                    let rhs = self.b.ins().bor(b_nan, lt);
-                    self.b.ins().band(a_ord, rhs)
-                }
-                Le => {
-                    let le = self.b.ins().fcmp(FloatCC::LessThanOrEqual, l, r);
-                    let rhs = self.b.ins().bor(b_nan, le);
-                    let main = self.b.ins().band(a_ord, rhs);
-                    self.b.ins().bor(main, both_nan)
-                }
-                Gt => {
-                    let gt = self.b.ins().fcmp(FloatCC::GreaterThan, l, r);
-                    let rhs = self.b.ins().bor(a_nan, gt);
-                    self.b.ins().band(b_ord, rhs)
-                }
-                Ge => {
-                    let ge = self.b.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r);
-                    let rhs = self.b.ins().bor(a_nan, ge);
-                    let main = self.b.ins().band(b_ord, rhs);
-                    self.b.ins().bor(main, both_nan)
-                }
-                _ => unreachable!("emit_cmp only handles comparisons"),
-            }
+            // Lane-wise `bits ^ (((bits >> 63) as u64) >> 1)` — the same monotonic key
+            // `f64::total_cmp` uses (see `emit::total_order_key`), then a signed
+            // integer compare on the i64 lanes.
+            let ity = vec_ty(ScalarTy::I64, self.lanes);
+            let lb = self.b.ins().bitcast(ity, MemFlags::new(), l);
+            let rb = self.b.ins().bitcast(ity, MemFlags::new(), r);
+            let ls = self.b.ins().sshr_imm(lb, 63);
+            let rs = self.b.ins().sshr_imm(rb, 63);
+            let lm = self.b.ins().ushr_imm(ls, 1);
+            let rm = self.b.ins().ushr_imm(rs, 1);
+            let lk = self.b.ins().bxor(lb, lm);
+            let rk = self.b.ins().bxor(rb, rm);
+            self.b.ins().icmp(cc, lk, rk)
         } else {
-            let cc = match op {
-                Eq => IntCC::Equal,
-                Ne => IntCC::NotEqual,
-                Lt => IntCC::SignedLessThan,
-                Le => IntCC::SignedLessThanOrEqual,
-                Gt => IntCC::SignedGreaterThan,
-                Ge => IntCC::SignedGreaterThanOrEqual,
-                _ => unreachable!("emit_cmp only handles comparisons"),
-            };
             self.b.ins().icmp(cc, l, r)
         }
     }

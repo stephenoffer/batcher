@@ -10,6 +10,23 @@ use arrow::array::{Array, ArrayRef};
 
 use crate::{HyperLogLog, KllSketch, Mergeable};
 
+/// In-memory Arrow bytes attributable to *this* array's rows.
+///
+/// [`Array::get_array_memory_size`] reports the whole backing buffer, so for a
+/// **sliced** array — a morsel carved from a larger buffer, which is the common case
+/// in the engine — it returns the parent buffer's size, not the slice's. That would
+/// inflate `avg_byte_width` by the slice ratio (a 10-row slice of a 100k-row buffer
+/// reported ~80 KB/row instead of ~8 B/row), poisoning the cost model's memory /
+/// broadcast sizing. `get_slice_memory_size` counts only the sliced rows' bytes;
+/// fall back to the buffer size for the exotic nested types it does not support.
+fn slice_bytes(array: &ArrayRef) -> u64 {
+    array
+        .to_data()
+        .get_slice_memory_size()
+        .map(|b| b as u64)
+        .unwrap_or_else(|_| array.get_array_memory_size() as u64)
+}
+
 /// Cheap, mergeable statistics for one column, computed in a single pass.
 #[derive(Clone)]
 pub struct ColumnStats {
@@ -40,7 +57,7 @@ impl ColumnStats {
         Self {
             count: array.len(),
             null_count: array.null_count(),
-            total_bytes: array.get_array_memory_size() as u64,
+            total_bytes: slice_bytes(array),
             distinct,
             quantiles,
         }
@@ -394,6 +411,36 @@ mod tests {
         assert!(iw > 0.0 && sw > 0.0);
         // A column of ~7-char strings (plus offsets) is wider per row than i64.
         assert!(sw > iw, "string width {sw} should exceed int width {iw}");
+    }
+
+    #[test]
+    fn avg_byte_width_of_a_slice_is_not_inflated_by_the_parent_buffer() {
+        // A morsel is often a slice of a much larger buffer. `avg_byte_width` must
+        // reflect the slice's own rows (~8 B/row for i64), not the whole parent
+        // buffer — otherwise the cost model sees a wildly inflated per-row width.
+        let big: ArrayRef = Arc::new(Int64Array::from((0..100_000i64).collect::<Vec<_>>()));
+        let slice: ArrayRef = big.slice(0, 10);
+        let w = ColumnStats::from_array(&slice).avg_byte_width();
+        assert!(
+            w < 16.0,
+            "sliced i64 avg_byte_width {w} inflated by the parent buffer (expected ~8)"
+        );
+        // Sanity: an unsliced array of the same 10 rows measures the same.
+        let small: ArrayRef = Arc::new(Int64Array::from((0..10i64).collect::<Vec<_>>()));
+        let ws = ColumnStats::from_array(&small).avg_byte_width();
+        assert!((w - ws).abs() < 1e-9, "slice {w} vs unsliced {ws} disagree");
+    }
+
+    #[test]
+    fn avg_byte_width_of_a_string_slice_tracks_only_its_rows() {
+        // Variable-width columns must also measure only the sliced rows' value bytes.
+        let big: ArrayRef = Arc::new(StringArray::from(
+            (0..10_000).map(|i| format!("value-{i}")).collect::<Vec<_>>(),
+        ));
+        let slice: ArrayRef = big.slice(0, 5);
+        let w = ColumnStats::from_array(&slice).avg_byte_width();
+        // ~7-char strings + 4-byte offsets ≈ 11-15 B/row, nowhere near the parent buffer.
+        assert!(w < 100.0, "sliced string avg_byte_width {w} inflated by parent buffer");
     }
 
     #[test]

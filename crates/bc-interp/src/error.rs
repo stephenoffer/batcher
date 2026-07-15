@@ -49,6 +49,19 @@ pub enum InterpError {
     ThreadPool(usize),
 
     #[error(
+        "set operation (UNION/INTERSECT/EXCEPT) column {col} has incompatible branch \
+         types {left} and {right} with no common type"
+    )]
+    IncompatibleSetOpTypes {
+        /// The 0-based output column whose branch types cannot be unified.
+        col: usize,
+        /// The type accumulated from the earlier branch(es).
+        left: String,
+        /// The conflicting later-branch type.
+        right: String,
+    },
+
+    #[error(
         "malformed partial-state batch: expected {expected} columns \
          ({n_keys} group keys + {state} state), got {got}"
     )]

@@ -48,7 +48,7 @@ from batcher.plan.logical import (
     Projection,
 )
 from batcher.plan.logical.transforms import is_cartesian_key_pair
-from batcher.plan.stats import ColumnStat, Provenance
+from batcher.plan.stats import ColumnStat, Provenance, ambiguous_float_bound
 
 __all__ = [
     "drop_redundant_cross_key",
@@ -427,8 +427,23 @@ def _narrows(source: ColumnStat, target: ColumnStat) -> bool:
 
     Both ranges must be known: without the target's spread we cannot tell the filter
     is selective, and adding a non-selective filter is pure overhead.
+
+    An **ambiguous float bound refuses outright**, and this is a soundness gate, not a
+    heuristic. The rule's whole licence is that the pushed `BETWEEN` "drops only
+    provably-non-matching rows, never a real match" — and on a float key that is false. An
+    equi-join *canonicalizes* its key (`bc_runtime::keys` folds `-0.0` into `0.0` and every NaN
+    into one value), so the join matches `-0.0` on one side to `0.0` on the other; a `BETWEEN`
+    does not canonicalize, and on the engine's total order `-0.0 < 0.0`, so the filter deletes
+    precisely that matching row. Joining `k = [-0.0, 1.5, 2.0]` to `k = [0.0, 1.5]` returned one
+    row where the join returns two.
+
+    The bug was latent for as long as float join-key bounds were never *fetched* (they weren't:
+    `column_bounds_needed` only collected filter columns). It became reachable the moment they
+    were, which is the honest reason it is being fixed here and not earlier.
     """
     if source.min is None or source.max is None or target.min is None or target.max is None:
+        return False
+    if any(ambiguous_float_bound(v) for v in (source.min, source.max, target.min, target.max)):
         return False
     try:
         return source.min > target.min or source.max < target.max

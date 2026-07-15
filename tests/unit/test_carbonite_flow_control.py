@@ -32,8 +32,8 @@ def test_credit_ceiling_shrinks_for_wide_learned_rows():
     from batcher.carbonite.memory.learned import LearnedMemoryModel
     from batcher.carbonite.policies import (
         StaticCreditFlowControl,
-        _learned_channel_morsel_bytes,
         credit_ceiling,
+        learned_channel_morsel_bytes,
     )
 
     cfg = Config().replace(
@@ -50,7 +50,7 @@ def test_credit_ceiling_shrinks_for_wide_learned_rows():
         _spill_per_row={},
     )
     ctx = ResourceContext(config=cfg, memory_model=wide_model)
-    eff = _learned_channel_morsel_bytes(ctx)
+    eff = learned_channel_morsel_bytes(ctx)
     assert eff is not None and eff > cfg.execution.morsel_bytes
     assert credit_ceiling(cfg, eff) < narrow
     # The static policy grants the tighter window for the wide-row channel.

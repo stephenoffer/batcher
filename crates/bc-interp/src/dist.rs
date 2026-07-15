@@ -15,11 +15,18 @@
 //! single-node aggregation — the same property the `bc-runtime` tests assert,
 //! now spanning machines.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Field, Schema};
+use arrow::error::ArrowError;
+use arrow::ipc::reader::StreamReader;
 use bc_ir::{AggregateItem, ProjectionItem};
+use bc_runtime::agg::spill::{
+    combine_finalize_spilling as rt_combine_finalize_spilling, DiskSpillStore, SpillCodec,
+    SpillStore,
+};
 use bc_runtime::{agg, shuffle};
 use rayon::prelude::*;
 
@@ -199,6 +206,152 @@ pub fn combine_finalize(
     ops::build_agg_batch(group_keys, aggregates, &merged.group_columns, &agg_cols)
 }
 
+/// Spilling reduce step: the out-of-core sibling of [`combine_finalize`].
+///
+/// A reducer must merge every partial routed to its key slice and finalize the result. When
+/// that slice's group cardinality is large — a high-cardinality `GROUP BY`, a `DISTINCT`, a
+/// `COUNT(DISTINCT)` — the merged state can exceed one worker's RAM, and the in-memory
+/// [`combine_finalize`] OOMs. This reads the reducer's partials from their on-disk shuffle
+/// files **one at a time**, grace-partitions them to disk by the group key, and merges one
+/// hash partition at a time, so the reducer's peak memory is bounded to a single file plus a
+/// single partition — independent of how large this reducer's slice of the dataset is. It is
+/// the distributed arm of the single-node spilling aggregate: it reuses the *same* recursive
+/// [`bc_runtime::agg::spill::combine_finalize_spilling`], so the result is identical to
+/// [`combine_finalize`] over the same partials (group order differs — these are unordered
+/// relations) and to the single-node aggregate. That is the mergeable-algebra invariant,
+/// now holding out-of-core across machines.
+///
+/// `input_paths` are the Arrow-IPC *stream* files the shuffle wrote (one per mapper for this
+/// reducer). `budget_bytes` is the reducer's memory envelope; `spill_dir` is scratch for the
+/// grace partitions; `spill_compression` selects the IPC codec (see
+/// [`SpillCodec::from_config_str`]). Reading the files here — rather than handing the reducer
+/// a fully-materialized batch list — is what makes the bound hold end to end.
+pub fn combine_finalize_spilling(
+    group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
+    input_paths: &[PathBuf],
+    budget_bytes: usize,
+    spill_dir: &Path,
+    spill_compression: Option<&str>,
+) -> Result<RecordBatch, InterpError> {
+    let widths = agg_widths(aggregates);
+    let funcs = ops::agg_funcs(aggregates);
+    let n_keys = group_keys.len();
+
+    let partitions = reduce_grace_partitions(input_paths, budget_bytes);
+    let codec = SpillCodec::from_config_str(spill_compression);
+    let dir = spill_dir.join(format!("reduce-{partitions}p"));
+    let mut store = DiskSpillStore::with_codec(dir, partitions, codec)?;
+
+    // A lazy, one-file-at-a-time stream of partials. The spill phase of
+    // `combine_finalize_spilling` routes each partial to a hash partition and drops it, so
+    // only one shuffle file's partials are ever resident. The iterator cannot yield a
+    // `Result`, so a read/decode error is stashed and surfaced *after* the fold — a stashed
+    // error stops the iterator early, the spiller finalizes whatever it routed, and we
+    // discard that partial result and return the error.
+    let mut read_err: Option<InterpError> = None;
+    let res = {
+        let iter = PartialFiles {
+            paths: input_paths.iter(),
+            buf: Vec::new().into_iter(),
+            n_keys,
+            widths: &widths,
+            err: &mut read_err,
+        };
+        rt_combine_finalize_spilling(iter, &funcs, &mut store, budget_bytes)?
+    };
+    if let Some(e) = read_err {
+        return Err(e);
+    }
+    // Touch the store's measured spill volume so a future metrics side-channel can read it;
+    // for now it only anchors `store`'s lifetime past the fold. Correctness never depends on it.
+    let _spilled = store.spilled_bytes();
+    if res.group_columns.is_empty() && res.agg_columns.is_empty() {
+        // The reducer's whole slice was empty (it received only empty keyed shards). Report a
+        // zero-row result — the reducer's own schema is discarded downstream (the driver
+        // supplies the result schema), and this matches the in-memory reduce's zero-row output
+        // for the same input. A 0-column batch needs an explicit row count in Arrow.
+        return Ok(RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            Vec::new(),
+            &RecordBatchOptions::new().with_row_count(Some(0)),
+        )?);
+    }
+    ops::build_agg_batch(group_keys, aggregates, &res.group_columns, &res.agg_columns)
+}
+
+/// Initial grace fan-out for the reducer, estimated from the partials' *on-disk* bytes
+/// (cheap — a `stat` per file, no read). On-disk bytes are a floor for the in-memory state
+/// (IPC never expands), so an under-estimate is safe: `combine_finalize_spilling` re-partitions
+/// any partition still over budget once it sees the true in-memory size. At least 2 (spilling
+/// with 1 partition saves no memory); capped so a pathological ratio cannot open a huge fan-out.
+fn reduce_grace_partitions(paths: &[PathBuf], budget_bytes: usize) -> usize {
+    let total: u64 = paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    let budget = budget_bytes.max(1) as u64;
+    total.div_ceil(budget).clamp(2, 1 << 12) as usize
+}
+
+/// Read one Arrow-IPC stream file (a shuffle bucket for this reducer) into its partials.
+/// Bounded by a single file — the reducer never holds more than one at a time.
+fn read_partials_file(
+    path: &Path,
+    n_keys: usize,
+    widths: &[usize],
+) -> Result<Vec<agg::Partial>, InterpError> {
+    let file = std::fs::File::open(path).map_err(ArrowError::from)?;
+    let reader = StreamReader::try_new(std::io::BufReader::new(file), None)?;
+    let batches = reader.collect::<Result<Vec<RecordBatch>, ArrowError>>()?;
+    let partials = batches_to_partials(n_keys, widths, &batches)?;
+    // Drop *keyed* zero-row partials (empty shuffle shards): they carry no groups and no
+    // state, so routing them is a no-op — but if a reducer receives *only* such shards, the
+    // spiller must see no partials at all and return the empty result, rather than routing
+    // zero rows into every partition and then `concat`-ing an empty set of arrays (which
+    // errors). A *global* (n_keys == 0) partial always carries one state row (COUNT over
+    // nothing is 0), so it is never dropped.
+    Ok(partials
+        .into_iter()
+        .filter(|p| n_keys == 0 || p.group_columns.first().is_some_and(|c| !c.is_empty()))
+        .collect())
+}
+
+/// A lazy iterator over the partials in a list of shuffle files, opened one file at a time.
+/// Yields `Partial`s for `combine_finalize_spilling` to route+drop; a read error is recorded
+/// in `err` and ends iteration (see [`combine_finalize_spilling`]).
+struct PartialFiles<'a> {
+    paths: std::slice::Iter<'a, PathBuf>,
+    buf: std::vec::IntoIter<agg::Partial>,
+    n_keys: usize,
+    widths: &'a [usize],
+    err: &'a mut Option<InterpError>,
+}
+
+impl Iterator for PartialFiles<'_> {
+    type Item = agg::Partial;
+
+    fn next(&mut self) -> Option<agg::Partial> {
+        loop {
+            if let Some(p) = self.buf.next() {
+                return Some(p);
+            }
+            if self.err.is_some() {
+                return None;
+            }
+            let path = self.paths.next()?;
+            match read_partials_file(path, self.n_keys, self.widths) {
+                Ok(v) => self.buf = v.into_iter(),
+                Err(e) => {
+                    *self.err = Some(e);
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 /// Run a rayon-parallel data-plane step inside the worker's **width-sized** pool rather
 /// than rayon's global pool. A Ray map/reduce actor leaves the global pool sized to one
 /// thread — it is built before the actor's cgroup CPU affinity lands — so the
@@ -332,6 +485,418 @@ mod tests {
         assert_eq!(widths, vec![2, 1]);
     }
 
+    // ----------------------------------------------------------------------------------
+    // Full mergeable-invariant composition tests: the distributed map/shuffle/reduce
+    // pipeline (`partial_aggregate` -> `partition_batches` -> `combine_finalize`) over N
+    // partitions MUST equal the single-node aggregate, for every aggregate and every edge
+    // key (-0.0/0.0, NaN, NULL, dup keys spanning morsels/partitions). Composed directly,
+    // no Ray.
+    // ----------------------------------------------------------------------------------
+    use arrow::array::{BooleanArray, Float64Array};
+    use bc_ir::{AggFunc, AggregateItem, ProjectionItem};
+    use std::collections::BTreeMap;
+
+    fn col(name: &str) -> bc_expr::Expr {
+        bc_expr::Expr::Col { name: name.into() }
+    }
+
+    fn gk(name: &str) -> Vec<ProjectionItem> {
+        vec![ProjectionItem {
+            expr: col(name),
+            alias: name.into(),
+        }]
+    }
+
+    /// One aggregate item over `input` (and optional `input2` ordering key / second input).
+    fn agg(
+        func: AggFunc,
+        input: Option<&str>,
+        input2: Option<&str>,
+        param: Option<f64>,
+        alias: &str,
+    ) -> AggregateItem {
+        AggregateItem {
+            func,
+            input: input.map(col),
+            input2: input2.map(col),
+            param,
+            alias: alias.into(),
+        }
+    }
+
+    /// A test relation split into morsels: an Int64 group key `k` (dups spanning morsels,
+    /// nulls), a Float64 value `v` (with a null), an Int64 order key `o`, and a Boolean `b`.
+    fn agg_morsels() -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Float64, true),
+            Field::new("o", DataType::Int64, true),
+            Field::new("b", DataType::Boolean, true),
+        ]));
+        // (k, v, o, b) columns for one morsel.
+        type Chunk = (
+            Vec<Option<i64>>,
+            Vec<Option<f64>>,
+            Vec<Option<i64>>,
+            Vec<Option<bool>>,
+        );
+        let chunks: Vec<Chunk> = vec![
+            (
+                vec![Some(1), Some(2), None, Some(3), Some(2)],
+                vec![Some(10.0), Some(20.0), Some(30.0), None, Some(50.0)],
+                vec![Some(5), Some(2), Some(9), Some(1), Some(7)],
+                vec![Some(true), Some(false), Some(true), None, Some(true)],
+            ),
+            (
+                vec![Some(3), Some(1), None, Some(2)],
+                vec![Some(60.0), Some(70.0), Some(80.0), Some(90.0)],
+                vec![Some(3), Some(8), Some(4), Some(6)],
+                vec![Some(false), Some(true), Some(false), Some(true)],
+            ),
+            (
+                vec![Some(1), Some(3), Some(3), Some(2), Some(4)],
+                vec![Some(11.0), Some(21.0), Some(31.0), Some(41.0), Some(51.0)],
+                vec![Some(0), Some(2), Some(2), Some(9), Some(3)],
+                vec![Some(true), Some(true), Some(false), Some(false), Some(true)],
+            ),
+        ];
+        chunks
+            .into_iter()
+            .map(|(k, v, o, b)| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(k)) as ArrayRef,
+                        Arc::new(Float64Array::from(v)) as ArrayRef,
+                        Arc::new(Int64Array::from(o)) as ArrayRef,
+                        Arc::new(BooleanArray::from(b)) as ArrayRef,
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// The single-node oracle: partial over the whole relation, finalize.
+    fn single_node(
+        group_keys: &[ProjectionItem],
+        aggregates: &[AggregateItem],
+        input: &[RecordBatch],
+    ) -> RecordBatch {
+        let whole = ops::materialize(input).unwrap();
+        let partial = ops::eval_partial(&whole, group_keys, aggregates).unwrap();
+        let funcs = ops::agg_funcs(aggregates);
+        let cols = agg::finalize(&funcs, &partial).unwrap();
+        ops::build_agg_batch(group_keys, aggregates, &partial.group_columns, &cols).unwrap()
+    }
+
+    /// The distributed pipeline over `map_partitions` map tasks and `n` reducers.
+    fn distributed(
+        group_keys: &[ProjectionItem],
+        aggregates: &[AggregateItem],
+        map_partitions: &[Vec<RecordBatch>],
+        n: usize,
+    ) -> Vec<RecordBatch> {
+        // Map: each partition -> partial state batch.
+        let map_partials: Vec<RecordBatch> = map_partitions
+            .iter()
+            .map(|p| partial_aggregate(group_keys, aggregates, p).unwrap())
+            .collect();
+        // Shuffle: route each map partial's rows to reducers by the group-key columns.
+        let key_idx: Vec<usize> = (0..group_keys.len()).collect();
+        let mut reduce_inputs: Vec<Vec<RecordBatch>> = vec![Vec::new(); n];
+        for mp in &map_partials {
+            let buckets = partition_batches(std::slice::from_ref(mp), &key_idx, n).unwrap();
+            for (i, bucket) in buckets.into_iter().enumerate() {
+                // Keep EVERY shard, including the empty ones: a real reducer receives one
+                // (possibly zero-row) partial per map task, so `combine_finalize` must
+                // tolerate a mix of empty and non-empty partial-state batches.
+                reduce_inputs[i].extend(bucket);
+            }
+        }
+        // Reduce: combine+finalize each reducer (its input is never an empty *list* — one
+        // shard per map task — but may be all zero-row shards, which finalize to zero rows).
+        reduce_inputs
+            .into_iter()
+            .filter(|inp| !inp.is_empty())
+            .map(|inp| combine_finalize(group_keys, aggregates, &inp).unwrap())
+            .collect()
+    }
+
+    /// Map from group-key string to the remaining (aggregate) column strings, over any
+    /// number of output batches. `arrow`'s formatter stringifies every type (incl. list/map).
+    fn result_map(batches: &[RecordBatch]) -> BTreeMap<String, Vec<String>> {
+        use arrow::util::display::{ArrayFormatter, FormatOptions};
+        let opts = FormatOptions::default();
+        let mut out = BTreeMap::new();
+        for b in batches {
+            let fmts: Vec<ArrayFormatter> = b
+                .columns()
+                .iter()
+                .map(|c| ArrayFormatter::try_new(c, &opts).unwrap())
+                .collect();
+            for r in 0..b.num_rows() {
+                let key = fmts[0].value(r).to_string();
+                let vals: Vec<String> = fmts[1..].iter().map(|f| f.value(r).to_string()).collect();
+                assert!(
+                    out.insert(key.clone(), vals).is_none(),
+                    "duplicate group key {key} in output — a group was split across reducers"
+                );
+            }
+        }
+        out
+    }
+
+    /// The multiset of a formatted list/map's elements, sorted — so an order difference
+    /// between single-node (relation order) and distributed (per-partition order) is not a
+    /// false mismatch, but a *dropped or duplicated* element still is.
+    fn as_sorted_tokens(s: &str) -> Option<Vec<String>> {
+        let inner = s.strip_prefix('[').and_then(|x| x.strip_suffix(']'));
+        let inner = inner.or_else(|| s.strip_prefix('{').and_then(|x| x.strip_suffix('}')))?;
+        let mut toks: Vec<String> = if inner.trim().is_empty() {
+            Vec::new()
+        } else {
+            inner.split(',').map(|t| t.trim().to_string()).collect()
+        };
+        toks.sort();
+        Some(toks)
+    }
+
+    /// Compare two stringified values: element-multiset for list/map collections, numeric
+    /// (tolerant) when both parse as f64, else exactly. Tolerates float summation-order and
+    /// collection-order differences between combine orders — but not lost/duplicated data.
+    fn values_match(a: &str, b: &str) -> bool {
+        if let (Some(ta), Some(tb)) = (as_sorted_tokens(a), as_sorted_tokens(b)) {
+            return ta == tb;
+        }
+        match (a.parse::<f64>(), b.parse::<f64>()) {
+            (Ok(x), Ok(y)) => {
+                if x.is_nan() && y.is_nan() {
+                    return true;
+                }
+                (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0)
+            }
+            _ => a == b,
+        }
+    }
+
+    fn assert_dist_matches_single_node(
+        group_keys: &[ProjectionItem],
+        aggregates: &[AggregateItem],
+        label: &str,
+    ) {
+        let morsels = agg_morsels();
+        let want = result_map(&[single_node(group_keys, aggregates, &morsels)]);
+        // A few map-partition splits x reducer counts, including a count that does not
+        // divide the group count and a single reducer.
+        let map_splits: Vec<Vec<Vec<RecordBatch>>> = vec![
+            vec![morsels.clone()],                              // 1 map task
+            vec![morsels[..1].to_vec(), morsels[1..].to_vec()], // 2 map tasks
+            morsels.iter().map(|m| vec![m.clone()]).collect(),  // 1 map task per morsel
+        ];
+        for (mi, maps) in map_splits.iter().enumerate() {
+            for n in [1usize, 2, 3, 7, 64] {
+                let got = result_map(&distributed(group_keys, aggregates, maps, n));
+                assert_eq!(
+                    got.keys().collect::<Vec<_>>(),
+                    want.keys().collect::<Vec<_>>(),
+                    "{label}: group-key set differs (map_split={mi}, reducers={n})"
+                );
+                for (k, wv) in &want {
+                    let gv = &got[k];
+                    assert_eq!(wv.len(), gv.len(), "{label}: arity for key {k}");
+                    for (wc, gc) in wv.iter().zip(gv) {
+                        assert!(
+                            values_match(wc, gc),
+                            "{label}: key {k} value {gc:?} != single-node {wc:?} \
+                             (map_split={mi}, reducers={n})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every scalar aggregate: the distributed pipeline equals the single-node oracle across
+    /// {1,2,3,7,64} reducers and several map-partition splits. This exercises the wire-format
+    /// state arity (`agg_widths`/`state_arity`), the shuffle disjointness, and combine.
+    #[test]
+    fn every_aggregate_survives_the_distributed_pipeline() {
+        let g = gk("k");
+        let cases: Vec<(&str, Vec<AggregateItem>)> = vec![
+            (
+                "count_star",
+                vec![agg(AggFunc::CountStar, None, None, None, "a")],
+            ),
+            (
+                "count",
+                vec![agg(AggFunc::Count, Some("v"), None, None, "a")],
+            ),
+            (
+                "count_distinct",
+                vec![agg(AggFunc::CountDistinct, Some("k"), None, None, "a")],
+            ),
+            ("sum", vec![agg(AggFunc::Sum, Some("v"), None, None, "a")]),
+            ("min", vec![agg(AggFunc::Min, Some("v"), None, None, "a")]),
+            ("max", vec![agg(AggFunc::Max, Some("v"), None, None, "a")]),
+            ("mean", vec![agg(AggFunc::Mean, Some("v"), None, None, "a")]),
+            ("var", vec![agg(AggFunc::Var, Some("v"), None, None, "a")]),
+            (
+                "stddev",
+                vec![agg(AggFunc::Stddev, Some("v"), None, None, "a")],
+            ),
+            (
+                "median",
+                vec![agg(AggFunc::Median, Some("v"), None, None, "a")],
+            ),
+            (
+                "quantile",
+                vec![agg(AggFunc::Quantile, Some("v"), None, Some(0.25), "a")],
+            ),
+            (
+                "bool_and",
+                vec![agg(AggFunc::BoolAnd, Some("b"), None, None, "a")],
+            ),
+            (
+                "bool_or",
+                vec![agg(AggFunc::BoolOr, Some("b"), None, None, "a")],
+            ),
+            ("mode", vec![agg(AggFunc::Mode, Some("o"), None, None, "a")]),
+            (
+                "arg_min",
+                vec![agg(AggFunc::ArgMin, Some("v"), Some("o"), None, "a")],
+            ),
+            (
+                "arg_max",
+                vec![agg(AggFunc::ArgMax, Some("v"), Some("o"), None, "a")],
+            ),
+            (
+                "product",
+                vec![agg(AggFunc::Product, Some("v"), None, None, "a")],
+            ),
+            (
+                "bit_and",
+                vec![agg(AggFunc::BitAnd, Some("o"), None, None, "a")],
+            ),
+            (
+                "bit_or",
+                vec![agg(AggFunc::BitOr, Some("o"), None, None, "a")],
+            ),
+            (
+                "bit_xor",
+                vec![agg(AggFunc::BitXor, Some("o"), None, None, "a")],
+            ),
+            (
+                "covar_pop",
+                vec![agg(AggFunc::CovarPop, Some("v"), Some("o"), None, "a")],
+            ),
+            (
+                "covar_samp",
+                vec![agg(AggFunc::CovarSamp, Some("v"), Some("o"), None, "a")],
+            ),
+            (
+                "corr",
+                vec![agg(AggFunc::Corr, Some("v"), Some("o"), None, "a")],
+            ),
+            (
+                "skewness",
+                vec![agg(AggFunc::Skewness, Some("v"), None, None, "a")],
+            ),
+            (
+                "kurtosis",
+                vec![agg(AggFunc::Kurtosis, Some("v"), None, None, "a")],
+            ),
+            // Order-sensitive collection outputs: distributed may reorder, but must never
+            // drop or duplicate an element (compared as a sorted multiset).
+            (
+                "list_agg",
+                vec![agg(AggFunc::ListAgg, Some("o"), None, None, "a")],
+            ),
+            (
+                "histogram",
+                vec![agg(AggFunc::Histogram, Some("o"), None, None, "a")],
+            ),
+            (
+                "multi",
+                vec![
+                    agg(AggFunc::Sum, Some("v"), None, None, "s"),
+                    agg(AggFunc::Mean, Some("v"), None, None, "m"),
+                    agg(AggFunc::Var, Some("v"), None, None, "vr"),
+                    agg(AggFunc::ArgMax, Some("v"), Some("o"), None, "am"),
+                    agg(AggFunc::Corr, Some("v"), Some("o"), None, "cr"),
+                    agg(AggFunc::CountStar, None, None, None, "c"),
+                ],
+            ),
+        ];
+        for (label, aggs) in &cases {
+            assert_dist_matches_single_node(&g, aggs, label);
+        }
+    }
+
+    /// Float group keys that group-equal but bit-differ (`-0.0`/`0.0`), all-NaN, and NULL
+    /// keys must land in one group each — the shuffle must route them exactly as single-node
+    /// grouping does. A split here returns more groups distributed than single-node.
+    #[test]
+    fn edge_float_group_keys_route_identically() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Float64, true),
+            Field::new("v", DataType::Float64, true),
+        ]));
+        let nan = f64::NAN;
+        let chunks: Vec<(Vec<Option<f64>>, Vec<Option<f64>>)> = vec![
+            (
+                vec![Some(0.0), Some(-0.0), Some(nan), None, Some(1.0)],
+                vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0), Some(5.0)],
+            ),
+            (
+                vec![Some(-0.0), Some(0.0), Some(nan), None, Some(1.0)],
+                vec![Some(6.0), Some(7.0), Some(8.0), Some(9.0), Some(10.0)],
+            ),
+        ];
+        let morsels: Vec<RecordBatch> = chunks
+            .into_iter()
+            .map(|(k, v)| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Float64Array::from(k)) as ArrayRef,
+                        Arc::new(Float64Array::from(v)) as ArrayRef,
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let g = gk("k");
+        let aggs = vec![
+            agg(AggFunc::Sum, Some("v"), None, None, "s"),
+            agg(AggFunc::CountStar, None, None, None, "c"),
+        ];
+        let want = result_map(&[single_node(&g, &aggs, &morsels)]);
+        // 0.0/-0.0 collapse to one group, all NaN to one, all NULL to one, plus 1.0.
+        assert_eq!(
+            want.len(),
+            4,
+            "single-node group count over edge float keys"
+        );
+        for n in [1usize, 2, 3, 7, 64] {
+            let maps = vec![morsels[..1].to_vec(), morsels[1..].to_vec()];
+            let got = result_map(&distributed(&g, &aggs, &maps, n));
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "reducers={n}: distributed split an edge-key group the single-node oracle merged"
+            );
+            for (k, wv) in &want {
+                for (wc, gc) in wv.iter().zip(&got[k]) {
+                    assert!(
+                        values_match(wc, gc),
+                        "reducers={n} key {k}: {gc:?} != {wc:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A keyed relation split across several morsels.
     fn keyed_morsels() -> Vec<RecordBatch> {
         let schema = Arc::new(Schema::new(vec![
@@ -389,5 +954,177 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ----------------------------------------------------------------------------------
+    // The distributed *spilling* reduce (`combine_finalize_spilling`, reading partials from
+    // on-disk shuffle files under a byte budget) MUST equal the in-memory reduce and the
+    // single-node oracle — the mergeable invariant holding out-of-core. A tiny budget forces
+    // real grace partitioning (and its recursion) rather than an in-memory shortcut.
+    // ----------------------------------------------------------------------------------
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SPILL_TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// A private scratch dir for one spill-reduce test, removed on drop.
+    struct ScratchDir(PathBuf);
+    impl ScratchDir {
+        fn new() -> Self {
+            let seq = SPILL_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("bc-dist-spill-{}-{seq}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            ScratchDir(dir)
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Write partial-state batches to an Arrow-IPC stream file (the format the shuffle uses).
+    fn write_ipc_stream(path: &Path, batches: &[RecordBatch]) {
+        use arrow::ipc::writer::StreamWriter;
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = StreamWriter::try_new(file, &batches[0].schema()).unwrap();
+        for b in batches {
+            w.write(b).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    /// The distributed pipeline over `map_partitions` map tasks and `n` reducers, but each
+    /// reducer's partials are written to on-disk IPC files and reduced by the *spilling*
+    /// `combine_finalize_spilling` under `budget`. Mirrors [`distributed`].
+    fn distributed_spilling(
+        group_keys: &[ProjectionItem],
+        aggregates: &[AggregateItem],
+        map_partitions: &[Vec<RecordBatch>],
+        n: usize,
+        budget: usize,
+        scratch: &Path,
+    ) -> Vec<RecordBatch> {
+        let map_partials: Vec<RecordBatch> = map_partitions
+            .iter()
+            .map(|p| partial_aggregate(group_keys, aggregates, p).unwrap())
+            .collect();
+        let key_idx: Vec<usize> = (0..group_keys.len()).collect();
+        // reducer -> list of on-disk file paths (one per mapper).
+        let mut reduce_paths: Vec<Vec<PathBuf>> = vec![Vec::new(); n];
+        for (mi, mp) in map_partials.iter().enumerate() {
+            let buckets = partition_batches(std::slice::from_ref(mp), &key_idx, n).unwrap();
+            for (ri, bucket) in buckets.into_iter().enumerate() {
+                let path = scratch.join(format!("m{mi}_r{ri}.arrow"));
+                write_ipc_stream(&path, &bucket);
+                reduce_paths[ri].push(path);
+            }
+        }
+        reduce_paths
+            .into_iter()
+            .filter_map(|paths| {
+                let out = combine_finalize_spilling(
+                    group_keys, aggregates, &paths, budget, scratch, None,
+                )
+                .unwrap();
+                (out.num_rows() > 0).then_some(out)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn spilling_reduce_matches_single_node() {
+        let g = gk("k");
+        // A representative mix: constant-state, value-list (median/quantile/mode), a
+        // collection output, and a multi-aggregate row — each must merge identically
+        // out-of-core.
+        let cases: Vec<(&str, Vec<AggregateItem>)> = vec![
+            ("sum", vec![agg(AggFunc::Sum, Some("v"), None, None, "a")]),
+            (
+                "count_star",
+                vec![agg(AggFunc::CountStar, None, None, None, "a")],
+            ),
+            (
+                "count_distinct",
+                vec![agg(AggFunc::CountDistinct, Some("k"), None, None, "a")],
+            ),
+            ("mean", vec![agg(AggFunc::Mean, Some("v"), None, None, "a")]),
+            ("var", vec![agg(AggFunc::Var, Some("v"), None, None, "a")]),
+            (
+                "median",
+                vec![agg(AggFunc::Median, Some("v"), None, None, "a")],
+            ),
+            (
+                "quantile",
+                vec![agg(AggFunc::Quantile, Some("v"), None, Some(0.25), "a")],
+            ),
+            ("mode", vec![agg(AggFunc::Mode, Some("o"), None, None, "a")]),
+            (
+                "list_agg",
+                vec![agg(AggFunc::ListAgg, Some("o"), None, None, "a")],
+            ),
+            (
+                "multi",
+                vec![
+                    agg(AggFunc::Sum, Some("v"), None, None, "s"),
+                    agg(AggFunc::Mean, Some("v"), None, None, "m"),
+                    agg(AggFunc::Median, Some("v"), None, None, "md"),
+                    agg(AggFunc::CountStar, None, None, None, "c"),
+                ],
+            ),
+        ];
+        let morsels = agg_morsels();
+        let map_splits: Vec<Vec<Vec<RecordBatch>>> = vec![
+            vec![morsels.clone()],
+            vec![morsels[..1].to_vec(), morsels[1..].to_vec()],
+            morsels.iter().map(|m| vec![m.clone()]).collect(),
+        ];
+        for (label, aggs) in &cases {
+            let want = result_map(&[single_node(&g, aggs, &morsels)]);
+            for maps in &map_splits {
+                for n in [1usize, 2, 3, 7] {
+                    // Budget of 1 byte forces the deepest grace partitioning + recursion; a
+                    // larger one exercises the single-partition merge. Both must agree.
+                    for budget in [1usize, 64, 1 << 20] {
+                        let scratch = ScratchDir::new();
+                        let got = result_map(&distributed_spilling(
+                            &g, aggs, maps, n, budget, &scratch.0,
+                        ));
+                        assert_eq!(
+                            got.keys().collect::<Vec<_>>(),
+                            want.keys().collect::<Vec<_>>(),
+                            "{label}: group-key set differs (reducers={n}, budget={budget})"
+                        );
+                        for (k, wv) in &want {
+                            let gv = &got[k];
+                            assert_eq!(wv.len(), gv.len(), "{label}: arity for key {k}");
+                            for (wc, gc) in wv.iter().zip(gv) {
+                                assert!(
+                                    values_match(wc, gc),
+                                    "{label}: key {k} value {gc:?} != single-node {wc:?} \
+                                     (reducers={n}, budget={budget})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An empty reducer (all-empty shuffle files) spills to a zero-row result, not an error —
+    /// the disk reducer must tolerate the all-empty-shard case the same as the in-memory fold.
+    #[test]
+    fn spilling_reduce_all_empty_is_zero_rows() {
+        let g = gk("k");
+        let aggs = vec![agg(AggFunc::Sum, Some("v"), None, None, "a")];
+        let scratch = ScratchDir::new();
+        // One empty partial (zero-row) written to disk.
+        let empty = agg_morsels()[0].slice(0, 0);
+        let partial = partial_aggregate(&g, &aggs, &[empty]).unwrap();
+        let path = scratch.0.join("empty.arrow");
+        write_ipc_stream(&path, &[partial]);
+        let out = combine_finalize_spilling(&g, &aggs, &[path], 1, &scratch.0, None).unwrap();
+        assert_eq!(out.num_rows(), 0, "an all-empty reducer yields zero rows");
     }
 }

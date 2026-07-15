@@ -186,8 +186,18 @@ def start_distributed_stream_drain(
     shared-nothing write means the output is identical to the single-node drain; this
     just fans the read+transform+write across nodes. Returns a completed `StreamingQuery`.
 
-    The caller (`io_namespace.writer`) guarantees eligibility (stateless plan, splittable
-    single source, drain trigger, no checkpoint, file/lakehouse sink).
+    The caller (`io_namespace.writer`) guarantees a splittable single source, a drain trigger,
+    no checkpoint, a bounded source, and a file/lakehouse sink. It does **not** guarantee a
+    stateless plan, and does not need to: a drain reads its bounded source once and hands the
+    plan to `_write`, the ordinary distributed batch path, which already covers an aggregate
+    through the mergeable algebra.
+
+    That includes a *watermarked* plan, and this is the part worth stating explicitly, because
+    it looks like the hole that was real on the micro-batch path. It is not one. A single pass
+    over a bounded source sees its first batch with the watermark still unset, so no row can be
+    behind it and the late-drop never fires — streaming and batch semantics coincide here, and
+    both paths return the same rows (verified). Refusing a watermarked drain would cost a
+    capability and buy no correctness.
     """
     from time import perf_counter, time
 

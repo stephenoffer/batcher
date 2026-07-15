@@ -93,9 +93,21 @@ impl<K: Hash + Eq + Clone> FrequentItems<K> {
         self.add_n(key, 1);
     }
 
-    /// Add `count` occurrences of `key` (standard Misra-Gries update):
-    /// increment if monitored, else take a free slot, else decrement every
-    /// monitored counter by `count` (saturating) and evict any that hit zero.
+    /// Add `count` occurrences of `key` (weighted Misra-Gries update):
+    /// increment if monitored, else take a free slot, else admit the arrival and
+    /// reduce the (now `capacity + 1`) summary back to `capacity` keys the
+    /// mergeable way — subtract the `(capacity + 1)`-th largest count from every
+    /// counter and drop the non-positive.
+    ///
+    /// Admitting the arrival first is what preserves the frequency guarantee for
+    /// `count > 1`: the old "decrement every counter by `count`, drop the arrival"
+    /// step would evict *everything* and silently lose the arriving key when its
+    /// `count` exceeded the monitored counters — so a heavy key fed via a single
+    /// large-`count` update (e.g. a pre-aggregated stream) vanished even though its
+    /// frequency far exceeded `N / (capacity + 1)`. For `count == 1` this reduces
+    /// to exactly the classic "decrement all by one, drop the arrival" step (the
+    /// `(capacity + 1)`-th largest of `capacity` survivors plus a unit arrival is
+    /// `1`), so single-increment behaviour is unchanged.
     pub fn add_n(&mut self, key: K, count: u64) {
         if count == 0 {
             return;
@@ -110,12 +122,28 @@ impl<K: Hash + Eq + Clone> FrequentItems<K> {
             self.counters.insert(key, count);
             return;
         }
-        // No free slot and the key isn't monitored: pay for the new arrival by
-        // decrementing every monitored counter by `count` (saturating), evicting
-        // anything that reaches zero. Counters that survive are reduced; the
-        // arriving key is dropped this round.
+        // No free slot and the key isn't monitored: admit it, then prune back to
+        // capacity by subtracting the (capacity + 1)-th largest count. Identical to
+        // `merge`'s reduction, so a heavy arrival is never dropped outright.
+        self.counters.insert(key, count);
+        self.reduce_to_capacity();
+    }
+
+    /// Prune the summary back to at most `capacity` monitored keys when it has
+    /// grown past it: subtract the `(capacity + 1)`-th largest count from every
+    /// counter (saturating) and drop the non-positive. This is the mergeable
+    /// Misra-Gries reduction — it preserves the `N / (capacity + 1)` guarantee — and
+    /// is shared by both the weighted single-stream update and [`merge`](Self::merge).
+    fn reduce_to_capacity(&mut self) {
+        if self.counters.len() <= self.capacity {
+            return;
+        }
+        let mut counts: Vec<u64> = self.counters.values().copied().collect();
+        // Descending so index `capacity` is the (capacity + 1)-th largest.
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let threshold = counts[self.capacity];
         self.counters.retain(|_, c| {
-            *c = c.saturating_sub(count);
+            *c = c.saturating_sub(threshold);
             *c > 0
         });
     }
@@ -164,21 +192,8 @@ impl<K: Hash + Eq + Clone> Mergeable for FrequentItems<K> {
             *self.counters.entry(k.clone()).or_insert(0) += c;
         }
 
-        if self.counters.len() <= self.capacity {
-            return;
-        }
-
-        // Reduce the union back to ≤ capacity keys the mergeable Misra-Gries way:
-        // find the (capacity + 1)-th largest counter and subtract it from all.
-        let mut counts: Vec<u64> = self.counters.values().copied().collect();
-        // Descending so index `capacity` is the (capacity + 1)-th largest.
-        counts.sort_unstable_by(|a, b| b.cmp(a));
-        let threshold = counts[self.capacity];
-
-        self.counters.retain(|_, c| {
-            *c = c.saturating_sub(threshold);
-            *c > 0
-        });
+        // Reduce the union back to ≤ capacity keys the mergeable Misra-Gries way.
+        self.reduce_to_capacity();
     }
 }
 
@@ -286,6 +301,59 @@ mod tests {
         let mut seen: Vec<(&str, u64)> = fi.items().map(|(k, c)| (*k, c)).collect();
         seen.sort();
         assert_eq!(seen, vec![("a", 10), ("b", 3), ("c", 1)]);
+    }
+
+    #[test]
+    fn add_n_keeps_a_heavy_arrival_that_fills_a_full_table() {
+        // Regression: a heavy key arriving via a single large-`count` update, once
+        // the table is full of light keys, must NOT be dropped. The old
+        // "decrement every counter by `count`, drop the arrival" step evicted all
+        // the light keys AND lost the heavy arrival, violating the Misra-Gries
+        // guarantee (every key with frequency > N/(capacity+1) is retained).
+        let cap = 2;
+        let mut fi = FrequentItems::new(cap);
+        fi.add(1u64); // {1:1}
+        fi.add(2u64); // {1:1, 2:1} — table now full
+        fi.add_n(999u64, 1_000); // heavy arrival, unmonitored, table full
+
+        let n = fi.total();
+        assert_eq!(n, 1_002);
+        let slack = n / (cap as u64 + 1); // 334
+        let est = fi.estimate(&999);
+        assert!(
+            est >= 1_000 - slack,
+            "heavy key dropped/undercounted: est={est}, expected >= {}",
+            1_000 - slack
+        );
+        // And it must surface as a heavy hitter at any reasonable threshold.
+        let heavy = fi.heavy_hitters(0.25);
+        assert!(
+            heavy.iter().any(|(k, _)| *k == 999),
+            "heavy key 999 (count 1000/{n}) missing from heavy hitters: {heavy:?}"
+        );
+    }
+
+    #[test]
+    fn add_n_unit_count_matches_classic_decrement() {
+        // For count == 1 the weighted update must behave exactly like the classic
+        // single-increment Misra-Gries step (this is what `add` relies on).
+        let cap = 3;
+        let mut fi = FrequentItems::new(cap);
+        // Fill the table, then push several distinct singletons to force decrements.
+        for k in 0..20u64 {
+            fi.add(k);
+        }
+        assert!(fi.items().count() <= cap);
+        assert_eq!(fi.total(), 20);
+        // A dominant key must still be recoverable.
+        let mut fi2 = FrequentItems::new(cap);
+        for _ in 0..1_000 {
+            fi2.add(7u64);
+        }
+        for k in 100..130u64 {
+            fi2.add(k);
+        }
+        assert_eq!(fi2.estimate(&7) > 900, true, "hot key undercounted");
     }
 
     #[test]

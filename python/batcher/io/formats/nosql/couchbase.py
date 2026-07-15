@@ -33,6 +33,12 @@ __all__ = ["CouchbaseSource"]
 # is unbounded — the tail of the cover, which is what makes it reach the end of the result.
 _Window = tuple[int, int]
 
+# SQL++ makes ``OFFSET`` a sub-clause of ``LIMIT`` (``LIMIT expr [OFFSET expr]``), so an
+# offset can only be expressed alongside a limit. The unbounded tail window therefore uses
+# this astronomically large limit — larger than any real result — so it reaches the end while
+# still applying its offset. No dataset approaches 2**63 rows, so this never truncates.
+_UNBOUNDED_LIMIT = (1 << 63) - 1
+
 
 @SOURCES.register("couchbase")
 class CouchbaseSource(ScanSource):
@@ -153,8 +159,14 @@ class CouchbaseSource(ScanSource):
         stmt = f"SELECT {select} FROM {self._from_clause()} c"
         if where:
             stmt += f" WHERE {where}"
-        if limit:
-            stmt += f" ORDER BY META(c).id LIMIT {limit} OFFSET {offset}"
+        # A window is ``(offset, limit)`` where ``limit == 0`` means *unbounded* — the tail of
+        # the cover, which must still honour its ``offset`` and run to the end. Guarding on
+        # ``limit`` alone dropped the ``OFFSET`` for that tail window, so it re-read the whole
+        # collection and every prior window's rows came back a second time. The single serial
+        # window ``(0, 0)`` still emits no ORDER BY/LIMIT/OFFSET (a plain full scan).
+        if limit or offset:
+            effective_limit = limit if limit else _UNBOUNDED_LIMIT
+            stmt += f" ORDER BY META(c).id LIMIT {effective_limit} OFFSET {offset}"
         cluster = self._cluster()
         schema = self.schema() if not projection else None
         rows = (

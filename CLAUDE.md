@@ -4,9 +4,21 @@ Batcher is a native, JIT-compiling, **adaptive** data engine: a Python control
 plane over a Rust data plane on Apache Arrow. The goal is to beat DuckDB, Spark,
 Ray Data, and Polars across the whole range — **sub-second small queries to
 PB-scale**, **batch and streaming**, **single-node and distributed** — for
-SQL-style, DataFrame, and ML/multimodal workloads. The moat is an adaptive
-control layer that re-optimizes *during* a query (which DuckDB's static optimizer
-and Spark AQE's stage-boundary adaptation cannot match).
+SQL-style, DataFrame, and ML/multimodal workloads.
+
+The moat is a two-part adaptive control layer: **stage-boundary re-optimization on
+*measured* cardinalities** (`api/adaptive.py`) — the same granularity as Spark AQE, but
+available single-node too, where DuckDB's static optimizer has no equivalent — **plus a
+sketch-backed cross-query learned-stats and bandit loop** (`kyber/learning.py`,
+`learned_tuning.py`) that neither DuckDB nor Spark has, so plans sharpen the more a query
+runs.
+
+That is the honest claim, and it is worth more than the overclaim it replaces. It is **not**
+finer-grained than AQE (there is no operator-internal adaptation anywhere), and it is off by
+default below 20M input rows. **This goal is aspirational, not a description of today.**
+`docs/internals/competitive_architecture.md` is the code-checked scorecard of where Batcher
+actually wins and loses today, and the structural ceilings still open — read it before making a
+competitive claim, and do not restore a claim it retires.
 
 This file is the always-loaded contract. It is law. The `@import`ed rule files
 carry the detail; read the one for the layer you are touching before you edit.

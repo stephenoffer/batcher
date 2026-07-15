@@ -51,6 +51,20 @@ pub enum ExprError {
     #[error("image function {func} requires a {arg} argument")]
     MissingImageArg { func: String, arg: &'static str },
 
+    /// A target dimension (width/height) that is not a positive value representable as a
+    /// `u32`. Casting an out-of-range `i64` with `as u32` would silently wrap — a negative
+    /// value to a ~4-billion dimension (an unbounded allocation / OOM), or a value past
+    /// `u32::MAX` to a small one (a silently wrong output size) — so it is rejected here.
+    #[error(
+        "image function {func}: {arg} must be a positive integer no larger than {max}, got {value}"
+    )]
+    InvalidImageDim {
+        func: String,
+        arg: &'static str,
+        value: i64,
+        max: u32,
+    },
+
     #[error("audio.resample requires a positive target sample rate")]
     MissingAudioRate,
 

@@ -33,7 +33,7 @@ from batcher.kyber.learning import (
 from batcher.kyber.properties import project_ordering
 from batcher.kyber.stats import columns as col_prop
 from batcher.kyber.stats.selectivity import predicate_selectivity
-from batcher.plan.expr_ir import Col, Expr, Lit
+from batcher.plan.expr_ir import Col, Expr, IsNotNull, Lit
 from batcher.plan.logical import (
     Aggregate,
     AsofJoin,
@@ -361,6 +361,19 @@ class StatsEstimator:
         # the join instead. Emptiness is the one property a filter can never destroy.
         if child.rows == 0 and child.provenance is Provenance.EXACT:
             return RelStats(0.0, Provenance.EXACT)
+        # `col IS NOT NULL` is the one predicate whose effect is *recorded*: it drops exactly
+        # the rows the column's null count counts. So the surviving row count is EXACT, and so
+        # are that column's bounds — `min`/`max`/`ndv` are defined over the non-null values, and
+        # dropping the nulls removes none of them.
+        #
+        # This is not a corner case, it is the common one: the optimizer *inserts* these filters
+        # itself, one on each side of every equi-join (`push_is_not_null_from_join_key`). Losing
+        # exactness here meant one rule destroyed precisely the statistic another needed, and a
+        # join whose key ranges provably cannot overlap ran a full shuffle to discover what the
+        # two footers already said.
+        exact = self._not_null_stats(node, child)
+        if exact is not None:
+            return exact
         sel = self._selectivity(node, child)
         # `prov` is LEARNED (measured selectivity) or DEFAULT (Selinger) — never
         # EXACT — so a filtered row count is never EXACT, however exact the child.
@@ -369,6 +382,44 @@ class StatsEstimator:
             child.rows * sel,
             weakest(child.provenance, prov),
             col_prop.filter_columns(child),
+            child.sorted_by,
+        )
+
+    def _not_null_stats(self, node: Filter, child: RelStats) -> RelStats | None:
+        """EXACT stats for a `Filter(col IS NOT NULL)`, or None when this isn't that shape.
+
+        The one filter whose effect is already *recorded*: it drops exactly the rows the
+        column's null count counts. So the surviving count is EXACT — and so are that column's
+        bounds, because `min`/`max`/`ndv` are defined over the non-null values and dropping the
+        nulls removes none of them. Its null count becomes a known zero.
+
+        Every **other** column still downgrades, and must: a row dropped for a null in `col` may
+        have carried the extreme value of some other column.
+
+        Needs an EXACT child row count and an EXACT null count for the tested column; any weaker
+        input falls through to the ordinary selectivity estimate, exactly as before.
+        """
+        pred = node.predicate
+        if not isinstance(pred, IsNotNull) or not isinstance(pred.input, Col):
+            return None
+        name = pred.input.name
+        stat = child.columns.get(name)
+        if (
+            not child.rows_exact
+            or stat is None
+            or stat.null_count is None
+            or not stat.null_count_is_exact
+        ):
+            return None
+        columns = col_prop.filter_columns(child)
+        # The column's own statistics survive the filter (see the docstring); its null count is
+        # now a known zero. Its *bundle* provenance is whatever it was — a string column keeps
+        # its truncatable bounds untrusted, and that is right.
+        columns[name] = replace(stat, null_count=0.0)
+        return RelStats(
+            float(child.rows - stat.null_count),
+            Provenance.EXACT,
+            columns,
             child.sorted_by,
         )
 

@@ -261,6 +261,43 @@ mod tests {
         );
     }
 
+    /// The probe-side bloom is a pure performance short-circuit even on the **sharded**
+    /// build path, where each shard fills its own bloom and they are bit-OR merged. A
+    /// merge that dropped a set bit would be a false negative — a silently dropped match.
+    /// Force the bloom on over a build large enough to shard and assert the relation is
+    /// identical to the bloom-off run, for every left-driven join type.
+    #[test]
+    fn sharded_build_bloom_never_drops_a_match() {
+        use crate::join::hash_join_indices_impl;
+        // 40k distinct build keys (each once) -> shards, and every probe key is present so
+        // any false-negative bloom rejection would delete a real match.
+        let build: Vec<Option<i64>> = (0..40_000i64).map(Some).collect();
+        assert!(shard_count(build.len()) >= 2, "must shard");
+        // probe: every build key plus some misses, and some nulls.
+        let probe: Vec<Option<i64>> = (0..40_000i64)
+            .map(|k| if k % 11 == 0 { None } else { Some(k) })
+            .chain((40_000..40_050).map(Some))
+            .collect();
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let with =
+                hash_join_indices_impl(&keys(probe.clone()), &keys(build.clone()), jt, true, 0.01)
+                    .unwrap();
+            let without =
+                hash_join_indices_impl(&keys(probe.clone()), &keys(build.clone()), jt, false, 0.01)
+                    .unwrap();
+            let mut a = pairs(&with);
+            let mut b = pairs(&without);
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "sharded bloom-on disagrees with bloom-off for {jt:?}");
+        }
+    }
+
     /// Nulls never join (NULL != NULL), and a `Left` join must still emit their probe rows
     /// unmatched. Sharding must not lose that: a null-key build row is never inserted into
     /// any shard.

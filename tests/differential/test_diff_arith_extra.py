@@ -149,11 +149,14 @@ def test_fold_math_of_large_int_literal(duck, t):
     assert_same(out, duck.sql(f"SELECT floor({big}) AS a, sqrt({big}) AS b FROM t"))
 
 
-def test_abs_of_int64_min_literal_is_left_to_the_engine(duck, t):
-    # Not folded (no i64 result); Batcher's `abs` wraps, so this is a Batcher-only check —
-    # DuckDB raises "Overflow on abs(INT64_MIN)" and cannot serve as the oracle here.
+def test_abs_of_int64_min_literal_saturates(duck, t):
+    # i64::MIN has no positive i64 image, so `abs` saturates to i64::MAX. This is a
+    # Batcher-only check — DuckDB raises "Overflow on abs(INT64_MIN)" and cannot serve as
+    # the oracle. The contract that matters is that an absolute value is never *negative*
+    # (it once returned i64::MIN, and panicked in a debug build); the interpreter and the
+    # Cranelift JIT saturate identically, so the two tiers stay bit-for-bit equal.
     out = bt.from_arrow(t).select(r=abs(lit(-(2**63)))).collect()
-    assert out.column("r").to_pylist() == [-(2**63)] * t.num_rows
+    assert out.column("r").to_pylist() == [2**63 - 1] * t.num_rows
 
 
 def test_fold_bitwise_literals(duck, t):

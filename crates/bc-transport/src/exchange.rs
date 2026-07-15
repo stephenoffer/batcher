@@ -181,11 +181,18 @@ impl ShuffleExchange {
     /// concrete win over routing every partition through an object store. `None`
     /// if nothing was published under `ticket` here. RecordBatch clones are shallow
     /// (Arc buffer bumps), so this does not copy the underlying data.
+    ///
+    /// Zero-row batches are dropped so the result is identical to what a network
+    /// `fetch` of the same ticket returns: the credit-gated `do_exchange` producer
+    /// filters empty batches (the Flight encoder emits no message for one), so if
+    /// `local_partition` did *not*, a co-located source would hand the reducer stray
+    /// zero-row batches a remote source never would — a divergence between the
+    /// DIRECT_MEMORY and network transfer modes for the same published partition.
     pub async fn local_partition(&self, ticket: &ShuffleTicket) -> Option<Vec<RecordBatch>> {
         self.store
             .get(&ticket.to_string())
             .await
-            .map(|b| (*b).clone())
+            .map(|b| b.iter().filter(|rb| rb.num_rows() > 0).cloned().collect())
     }
 
     /// High-water mark of how many batches the producer had in flight (sent but

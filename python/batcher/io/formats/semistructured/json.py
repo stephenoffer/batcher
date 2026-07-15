@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import IO, Any
 
@@ -22,20 +23,96 @@ _JSON_PARALLEL_MIN_ROWS = 200_000
 _JSON_COUNTER = 0
 
 
+def _nullable_int_mapper(arrow_type: pa.DataType) -> Any:
+    """Map an integer Arrow type to pandas' nullable integer dtype (else default).
+
+    ``Table.to_pandas`` upcasts an integer column that contains a null to float64 —
+    which silently turns ``9007199254740993`` into ``9007199254740992.0`` and changes
+    the column's type on a JSON round-trip. Mapping integer columns to pandas' nullable
+    integer extension dtypes keeps every value exact and integer-typed through
+    ``to_json``.
+    """
+    import pandas as pd
+
+    if pa.types.is_integer(arrow_type):
+        return pd.ArrowDtype(arrow_type)
+    return None
+
+
 def _table_to_ndjson(table: pa.Table) -> bytes:
     """Encode `table` as newline-delimited JSON bytes via pandas' C-accelerated writer."""
-    ndjson = table.to_pandas().to_json(orient="records", lines=True)
+    df = table.to_pandas(types_mapper=_nullable_int_mapper)
+    ndjson = df.to_json(orient="records", lines=True)
     if ndjson and not ndjson.endswith("\n"):
         ndjson += "\n"  # so shard outputs concatenate into valid NDJSON
     return ndjson.encode("utf-8")
 
 
+def _schema_has_float(schema: pa.Schema) -> bool:
+    """True if `schema` holds a floating-point value anywhere (nested included)."""
+
+    def _has_float(t: pa.DataType) -> bool:
+        if pa.types.is_floating(t):
+            return True
+        if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t):
+            return _has_float(t.value_type)
+        if pa.types.is_struct(t):
+            return any(_has_float(t.field(i).type) for i in range(t.num_fields))
+        if pa.types.is_map(t):
+            return _has_float(t.key_type) or _has_float(t.item_type)
+        return False
+
+    return any(_has_float(f.type) for f in schema)
+
+
+def _sanitize_nonfinite(value: Any) -> Any:
+    """Replace NaN/±Inf floats with None (JSON has no non-finite; match pandas → ``null``)."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, list):
+        return [_sanitize_nonfinite(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _sanitize_nonfinite(v) for k, v in value.items()}
+    return value
+
+
+def _table_to_ndjson_exact(table: pa.Table) -> bytes:
+    """Encode via the stdlib, so every float round-trips bit-for-bit.
+
+    pandas' ``to_json`` rounds floats to ``double_precision`` (default 10) decimal
+    places — ``3.141592653589793`` becomes ``3.1415926536`` — and even the maximum
+    ``double_precision=15`` can round the largest double up to ``inf``. Python's
+    ``json.dumps`` renders each float with ``repr`` (the shortest round-tripping form),
+    so the value read back equals the value written. Raises on non-JSON-native leaves
+    (timestamp/decimal/bytes), letting the caller fall back to the pandas encoder.
+    """
+    if table.num_rows == 0:
+        # A 0-byte file is not valid NDJSON (`pyarrow.json.read_json` rejects it as
+        # "Empty JSON file"); emit a single newline for a readable empty file, matching
+        # the pandas encoder's output so a float-schema empty write reads back cleanly.
+        return b"\n"
+    return b"".join(
+        (json.dumps(_sanitize_nonfinite(row)) + "\n").encode("utf-8") for row in table.to_pylist()
+    )
+
+
 def _ndjson_bytes(table: pa.Table) -> bytes:
-    """`_table_to_ndjson` with a stdlib fallback when pandas is unavailable."""
+    """Encode `table` as NDJSON, preserving float precision, with a pandas fast path.
+
+    Float columns route through the exact stdlib encoder (pandas' ``to_json`` silently
+    truncates them); float-free tables take pandas' faster C encoder. Either way falls
+    back to the other on failure so a missing pandas or a non-JSON-native leaf still
+    produces output.
+    """
+    if _schema_has_float(table.schema):
+        try:
+            return _table_to_ndjson_exact(table)
+        except (TypeError, ValueError):
+            pass  # mixed with a non-JSON-native leaf (e.g. timestamp) — use pandas
     try:
         return _table_to_ndjson(table)
     except Exception:
-        return b"".join((json.dumps(row) + "\n").encode("utf-8") for row in table.to_pylist())
+        return _table_to_ndjson_exact(table)
 
 
 def _ipc_bytes(table: pa.Table) -> bytes:
@@ -93,7 +170,7 @@ def _json_encode_shard(task: tuple[bytes, str]) -> str:
     with pa.ipc.open_stream(pa.py_buffer(ipc)) as reader:
         table = reader.read_all()
     with open(out_path, "wb") as fh:
-        fh.write(_table_to_ndjson(table))
+        fh.write(_ndjson_bytes(table))
     return out_path
 
 
@@ -111,7 +188,7 @@ def _json_write_part(task: tuple[bytes, str, bool]) -> tuple[str, int, int]:
         table = reader.read_all()
     if resume and fs.exists(path):
         return path, table.num_rows, _size_or_zero(fs, path)
-    data = _table_to_ndjson(table)
+    data = _ndjson_bytes(table)
     with fs.atomic_writer(path) as fh:
         fh.write(data)
     return path, table.num_rows, len(data)
@@ -160,7 +237,12 @@ class JSONSource(FileSource):
             table = table.select(projection)
         return table.to_batches()
 
-    def _file_splits(self, path: str, target_size: int | None) -> list[Split]:
+    def _file_splits(
+        self,
+        path: str,
+        target_size: int | None,
+        predicate: dict | None = None,  # noqa: ARG002 (NDJSON has no footer statistics to prune with)
+    ) -> list[Split]:
         # Default byte-range split size (so one huge NDJSON file fans across workers
         # instead of reading on a single node) is `ExecutionConfig.split_bytes`.
         chunk = target_size or active_config().execution.split_bytes

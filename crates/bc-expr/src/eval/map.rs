@@ -7,10 +7,11 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int64Array, ListArray, MapArray, StringArray, UInt32Array};
+use arrow::array::{Array, ArrayRef, ListArray, MapArray, UInt32Array};
 use arrow::compute::take;
 use arrow::datatypes::Field;
 
+use crate::eval::list::eq_against_literal;
 use crate::{ExprError, Literal, MapFunc};
 
 /// Evaluate a map function over a `Map` array.
@@ -58,7 +59,11 @@ fn element_at(map: &MapArray, key: Option<&Literal>) -> Result<ArrayRef, ExprErr
         func: "element_at".into(),
         arg: "key",
     })?;
-    let keys = map.keys();
+    // Compare every key element against the literal, both promoted to a common type, so
+    // the lookup works regardless of the map's key width/encoding (Int32, LargeUtf8, …).
+    // Previously only exact Int64/Utf8 keys matched, so a get on an Int32-keyed map (the
+    // narrow types are not normalized inside a nested Map) always returned null.
+    let eq = eq_against_literal(map.keys(), key)?;
     let offsets = map.value_offsets();
     let mut idx: Vec<Option<u32>> = Vec::with_capacity(map.len());
     for row in 0..map.len() {
@@ -69,36 +74,17 @@ fn element_at(map: &MapArray, key: Option<&Literal>) -> Result<ArrayRef, ExprErr
         let (s, e) = (offsets[row] as usize, offsets[row + 1] as usize);
         idx.push(
             (s..e)
-                .find(|&j| key_matches(keys, j, key))
+                .find(|&j| eq.is_valid(j) && eq.value(j))
                 .map(|j| j as u32),
         );
     }
     Ok(take(map.values().as_ref(), &UInt32Array::from(idx), None)?)
 }
 
-/// Does the key at flat index `j` equal the literal `key`? Supports the common key
-/// types (Utf8, Int64); other key types never match (→ null lookup).
-fn key_matches(keys: &ArrayRef, j: usize, key: &Literal) -> bool {
-    if keys.is_null(j) {
-        return false;
-    }
-    match key {
-        Literal::Str(s) => keys
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .is_some_and(|a| a.value(j) == s),
-        Literal::Int(n) => keys
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .is_some_and(|a| a.value(j) == *n),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Builder, MapBuilder, StringBuilder};
+    use arrow::array::{Int32Builder, Int64Array, Int64Builder, MapBuilder, StringBuilder};
 
     fn sample_map() -> ArrayRef {
         // Rows: {a:1, b:2}, {c:3}, null.
@@ -123,6 +109,29 @@ mod tests {
         assert_eq!(a.value(0), 1); // {a:1,b:2} → 1
         assert!(a.is_null(1)); // {c:3} has no 'a'
         assert!(a.is_null(2)); // null map → null
+    }
+
+    #[test]
+    fn element_at_matches_a_narrow_int_key() {
+        // A Map with Int32 keys (narrow types are not normalized inside a nested Map): a
+        // lookup with an Int literal must still match, not silently return null.
+        let mut b = MapBuilder::new(None, Int32Builder::new(), Int64Builder::new());
+        b.keys().append_value(1);
+        b.values().append_value(10);
+        b.keys().append_value(2);
+        b.values().append_value(20);
+        b.append(true).unwrap();
+        let m: ArrayRef = Arc::new(b.finish());
+        let out = eval_map(MapFunc::ElementAt, &m, Some(&Literal::Int(2))).unwrap();
+        let a = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(a.value(0), 20);
+        // A key that is not present is still null.
+        let miss = eval_map(MapFunc::ElementAt, &m, Some(&Literal::Int(9))).unwrap();
+        assert!(miss
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .is_null(0));
     }
 
     #[test]

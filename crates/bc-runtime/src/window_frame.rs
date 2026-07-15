@@ -12,15 +12,20 @@
 //! (`sum`/`avg`/`min`/`max`/`count`) take a frame.
 //!
 //! Both frame edges are non-decreasing in the row position (each is `pos + const`,
-//! clamped), so the frame only ever slides right. The kernel exploits this to run
-//! in **one pass**: `sum`/`avg`/`count` keep a running accumulator (add the entering
-//! row, subtract the leaving one — O(n)); `min`/`max` keep a monotonic deque
-//! (O(n) amortized). No frame is rescanned.
+//! clamped), so the frame only ever slides right — the frame is a FIFO queue. The
+//! kernel exploits this to run in **one pass**: `count`/`sum` over integers keep a
+//! running accumulator (drop the leaving row, add the entering one — O(n)); `sum`/`avg`
+//! over floats use a [`FifoSum`] (a two-stack sliding aggregate that never subtracts,
+//! because subtracting floats is catastrophically unstable); `min`/`max` keep a
+//! monotonic deque (O(n) amortized). No frame is rescanned.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, Float64Array, Int64Array};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int64Array, StringArray, UInt32Array,
+};
+use arrow::compute::take;
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use arrow::row::Rows;
 
@@ -101,6 +106,50 @@ impl PeerGroups {
     }
 }
 
+/// Sliding-window sum over `f64` that only ever **adds**, never subtracts — a FIFO of
+/// values kept as two cumulative-sum stacks (the classic "queue from two stacks").
+///
+/// The naive O(1) slide (`sum += entering; sum -= leaving`) is catastrophically
+/// unstable on floats: over `[1e16, 1, 1]` a trailing 2-row sum computes
+/// `1e16 + 1 - 1e16 == 0`, where the true window sum `1 + 1` is `2` (this is exactly
+/// the divergence from DuckDB that motivated the structure). Here the reported sum is
+/// always the cumulative sum of precisely the values currently in the window, so it
+/// equals a fresh re-add — at O(1) amortized cost, no subtraction of a stale value.
+#[derive(Default)]
+struct FifoSum {
+    /// `(value, cumulative sum of this entry and all below it)` — the push side.
+    back: Vec<(f64, f64)>,
+    /// The pop side; filled by draining `back` in reverse when it empties.
+    front: Vec<(f64, f64)>,
+}
+
+impl FifoSum {
+    /// Append a value at the back of the window.
+    fn push(&mut self, v: f64) {
+        let s = self.back.last().map_or(0.0, |&(_, s)| s) + v;
+        self.back.push((v, s));
+    }
+
+    /// Remove the oldest value from the front of the window.
+    fn pop(&mut self) {
+        if self.front.is_empty() {
+            // Reverse `back` into `front`, rebuilding cumulative sums bottom-up so the
+            // oldest value ends up on top of `front` (popped first — FIFO order).
+            let mut s = 0.0;
+            while let Some((v, _)) = self.back.pop() {
+                s += v;
+                self.front.push((v, s));
+            }
+        }
+        self.front.pop();
+    }
+
+    /// The exact sum of every value currently in the window.
+    fn sum(&self) -> f64 {
+        self.back.last().map_or(0.0, |&(_, s)| s) + self.front.last().map_or(0.0, |&(_, s)| s)
+    }
+}
+
 /// Resolve a frame to the half-open `[a, b)` position range within an ordered
 /// partition of length `len` for the row at `pos`. `ROWS` counts physical rows;
 /// `RANGE`/`GROUPS` count peer groups via `peers`. Both `a` and `b` are
@@ -117,12 +166,16 @@ fn frame_bounds(
             let pg = peers.expect("RANGE/GROUPS frame requires peer groups");
             let g = pg.group_of[pos] as i64;
             let ng = pg.num() as i64;
+            // Offsets saturate into `i64` (they are `u64` in the IR) so a huge peer-group
+            // offset clamps to the partition edge instead of wrapping negative / overflowing.
             let lo = match frame.start {
                 FrameBound::UnboundedPreceding => 0,
-                FrameBound::Preceding(k) => pg.group_start[(g - k as i64).max(0) as usize],
+                FrameBound::Preceding(k) => {
+                    pg.group_start[g.saturating_sub(sat_i64(k)).max(0) as usize]
+                }
                 FrameBound::CurrentRow => pg.group_start[g as usize],
                 FrameBound::Following(k) => {
-                    let gi = g + k as i64;
+                    let gi = g.saturating_add(sat_i64(k));
                     if gi >= ng {
                         len
                     } else {
@@ -134,7 +187,7 @@ fn frame_bounds(
             let hi = match frame.end {
                 FrameBound::UnboundedPreceding => 0,
                 FrameBound::Preceding(k) => {
-                    let gi = g - k as i64;
+                    let gi = g.saturating_sub(sat_i64(k));
                     if gi < 0 {
                         0
                     } else {
@@ -142,12 +195,25 @@ fn frame_bounds(
                     }
                 }
                 FrameBound::CurrentRow => pg.group_end[g as usize],
-                FrameBound::Following(k) => pg.group_end[(g + k as i64).min(ng - 1) as usize],
+                FrameBound::Following(k) => {
+                    pg.group_end[g.saturating_add(sat_i64(k)).min(ng - 1) as usize]
+                }
                 FrameBound::UnboundedFollowing => len,
             };
             (lo.min(len), hi.min(len))
         }
     }
+}
+
+/// Saturate a `u64` frame offset into an `i64`. The IR carries offsets as `u64`, so a
+/// bound like `10_000_000_000_000_000_000 PRECEDING` (valid, `> i64::MAX`) must NOT be
+/// truncated by a raw `as i64` (which wraps negative and silently flips the bound's
+/// direction). Capping at `i64::MAX` keeps a huge offset a huge offset — it clamps to the
+/// partition edge below, as intended — and, combined with saturating adds, removes the
+/// `pos + k + 1` overflow panic that `ROWS BETWEEN CURRENT ROW AND <i64::MAX> FOLLOWING`
+/// triggered (DuckDB accepts that frame).
+fn sat_i64(k: u64) -> i64 {
+    k.min(i64::MAX as u64) as i64
 }
 
 /// Resolve a `ROWS` frame to the half-open `[a, b)` row range within an ordered
@@ -156,18 +222,20 @@ fn frame_bounds(
 /// what lets the aggregate slide in one pass. An empty frame yields `a >= b`.
 fn frame_half_open(frame: Frame, pos: usize, len: usize) -> (usize, usize) {
     let (pos, n) = (pos as i64, len as i64);
+    // `pos + 1` cannot overflow (`pos < len <= isize::MAX`); the offset adds saturate so a
+    // near-`i64::MAX` offset clamps to the partition edge instead of overflowing.
     let lo = match frame.start {
         FrameBound::UnboundedPreceding => 0,
-        FrameBound::Preceding(k) => pos - k as i64,
+        FrameBound::Preceding(k) => pos.saturating_sub(sat_i64(k)),
         FrameBound::CurrentRow => pos,
-        FrameBound::Following(k) => pos + k as i64,
+        FrameBound::Following(k) => pos.saturating_add(sat_i64(k)),
         FrameBound::UnboundedFollowing => n, // start past the last row → empty
     };
     let hi_excl = match frame.end {
         FrameBound::UnboundedPreceding => 0, // end before the first row → empty
-        FrameBound::Preceding(k) => pos - k as i64 + 1,
+        FrameBound::Preceding(k) => (pos + 1).saturating_sub(sat_i64(k)),
         FrameBound::CurrentRow => pos + 1,
-        FrameBound::Following(k) => pos + k as i64 + 1,
+        FrameBound::Following(k) => (pos + 1).saturating_add(sat_i64(k)),
         FrameBound::UnboundedFollowing => n,
     };
     (lo.clamp(0, n) as usize, hi_excl.clamp(0, n) as usize)
@@ -191,12 +259,21 @@ pub fn framed_aggregate(
     match func {
         WindowFn::Count => Ok(framed_count(ordered, values, frame, order_rows, num_rows)),
         WindowFn::Sum | WindowFn::Avg | WindowFn::Min | WindowFn::Max => match values.data_type() {
-            DataType::Int64 => Ok(framed_i64(
-                func, ordered, values, frame, order_rows, num_rows,
-            )),
+            DataType::Int64 => framed_i64(func, ordered, values, frame, order_rows, num_rows),
             DataType::Float64 => Ok(framed_f64(
                 func, ordered, values, frame, order_rows, num_rows,
             )),
+            // String MIN/MAX over an explicit frame — the running/whole-partition paths
+            // already support Utf8 min/max, so the framed path must too (DuckDB answers
+            // `min(s) OVER (… ROWS …)`; erroring here aborted the query).
+            DataType::Utf8 if matches!(func, WindowFn::Min | WindowFn::Max) => Ok(
+                framed_str_minmax(func, ordered, values, frame, order_rows, num_rows),
+            ),
+            // Boolean framed MIN (AND) / MAX (OR), `false < true` — consistent with the
+            // running and whole-partition boolean paths and DuckDB.
+            DataType::Boolean if matches!(func, WindowFn::Min | WindowFn::Max) => Ok(
+                framed_bool_minmax(func, ordered, values, frame, order_rows, num_rows),
+            ),
             other => Err(RuntimeError::UnsupportedWindow {
                 func: func.name().to_string(),
                 dtype: other.to_string(),
@@ -207,6 +284,65 @@ pub fn framed_aggregate(
             dtype: "explicit frame".to_string(),
         }),
     }
+}
+
+/// Positional value functions (`first_value`/`last_value`/`nth_value`) over an
+/// explicit frame: each output row selects its frame's first / last / nth row's
+/// value (type-generic via `take`), or `null` when the frame is empty (or the
+/// `nth` row is past the frame end).
+///
+/// This is what makes SQL's default value-function frame —
+/// `RANGE UNBOUNDED PRECEDING TO CURRENT ROW` — a *running* value: `last_value`
+/// becomes the current peer group's value and `nth_value` is null until the frame
+/// grows to the `nth` row, rather than the whole-partition value the frameless
+/// [`crate::window`] path computes. `lag`/`lead`/the fills never carry a frame, so
+/// they are rejected here.
+pub fn framed_value(
+    func: WindowFn,
+    ordered: &[Vec<usize>],
+    values: &ArrayRef,
+    nth: i64,
+    frame: Frame,
+    order_rows: Option<&Rows>,
+    num_rows: usize,
+) -> Result<ArrayRef, RuntimeError> {
+    if frame.unit != FrameUnit::Rows && order_rows.is_none() {
+        return Err(RuntimeError::WindowRequiresOrder {
+            func: func.name().to_string(),
+        });
+    }
+    // Per output row, the ordered-partition position whose value it takes (`None` →
+    // null). Scatter back to original row order via a single `take`.
+    let mut src: Vec<Option<u32>> = vec![None; num_rows];
+    for part in ordered {
+        let len = part.len();
+        let peers = peer_groups(frame, part, order_rows);
+        for pos in 0..len {
+            let (a, b) = frame_bounds(frame, pos, len, peers.as_ref());
+            let take_pos: Option<usize> = if a >= b {
+                None // empty frame → null
+            } else {
+                match func {
+                    WindowFn::FirstValue => Some(a),
+                    WindowFn::LastValue => Some(b - 1),
+                    // `nth_value`: the `nth`-th row (1-based) counting from the frame
+                    // start; null if the frame holds fewer than `nth` rows.
+                    WindowFn::NthValue => {
+                        let idx = a as i64 + (nth - 1);
+                        (nth >= 1 && idx < b as i64).then_some(idx as usize)
+                    }
+                    other => {
+                        return Err(RuntimeError::UnsupportedWindow {
+                            func: other.name().to_string(),
+                            dtype: "explicit frame".to_string(),
+                        })
+                    }
+                }
+            };
+            src[part[pos]] = take_pos.map(|p| part[p] as u32);
+        }
+    }
+    Ok(take(values.as_ref(), &UInt32Array::from(src), None)?)
 }
 
 /// Build the peer-group structure for a partition when the frame needs it (RANGE/
@@ -267,7 +403,7 @@ fn framed_i64(
     frame: Frame,
     order_rows: Option<&Rows>,
     num_rows: usize,
-) -> ArrayRef {
+) -> Result<ArrayRef, RuntimeError> {
     let arr = values.as_primitive::<Int64Type>();
     let mut out_i = vec![None::<i64>; num_rows];
     let mut out_f = vec![None::<f64>; num_rows];
@@ -286,7 +422,9 @@ fn framed_i64(
                 let row = part[cur_b];
                 if arr.is_valid(row) {
                     let v = arr.value(row);
-                    sum += v;
+                    // `checked_add` so an i64 framed SUM that overflows errors instead of
+                    // wrapping (matching the non-framed running/whole-partition SUM paths).
+                    sum = sum.checked_add(v).ok_or(RuntimeError::SumOverflow)?;
                     cnt += 1;
                     if need_extreme {
                         while let Some(&back) = dq.back() {
@@ -332,11 +470,11 @@ fn framed_i64(
             }
         }
     }
-    if func == WindowFn::Avg {
+    Ok(if func == WindowFn::Avg {
         Arc::new(Float64Array::from(out_f))
     } else {
         Arc::new(Int64Array::from(out_i))
-    }
+    })
 }
 
 /// Float-input frame aggregate (`sum`/`avg`/`min`/`max`, all `Float64`).
@@ -352,24 +490,45 @@ fn framed_f64(
     let mut out = vec![None::<f64>; num_rows];
     let is_min = func == WindowFn::Min;
     let need_extreme = matches!(func, WindowFn::Min | WindowFn::Max);
+    let need_sum = matches!(func, WindowFn::Sum | WindowFn::Avg);
     for part in ordered {
         let len = part.len();
         let peers = peer_groups(frame, part, order_rows);
         let (mut cur_a, mut cur_b) = (0usize, 0usize);
-        let (mut sum, mut cnt) = (0f64, 0i64);
+        // `sum` is a two-stack FIFO (adds only, never subtracts) so a sliding SUM/AVG
+        // over large-magnitude floats stays exact; `cnt` is an exact integer counter.
+        let mut sum = FifoSum::default();
+        let mut cnt = 0i64;
         let mut dq: VecDeque<usize> = VecDeque::new();
         for pos in 0..len {
             let (a, b) = frame_bounds(frame, pos, len, peers.as_ref());
             while cur_b < b {
                 let row = part[cur_b];
+                // One FIFO entry per physical position (nulls contribute 0.0 to the sum
+                // but are not counted), so the FIFO length tracks `cur_b - cur_a` exactly
+                // and pops stay aligned with the sliding `[cur_a, cur_b)` window.
+                if need_sum {
+                    sum.push(if arr.is_valid(row) {
+                        arr.value(row)
+                    } else {
+                        0.0
+                    });
+                }
                 if arr.is_valid(row) {
                     let v = arr.value(row);
-                    sum += v;
                     cnt += 1;
                     if need_extreme {
+                        // Total-order comparison so NaN sorts greatest, matching aggregate
+                        // MIN/MAX and DuckDB; raw `>=`/`<=` are all-false against NaN, which
+                        // corrupted the monotonic deque (NaN neither popped nor was popped).
                         while let Some(&back) = dq.back() {
                             let bv = arr.value(part[back]);
-                            if (is_min && bv >= v) || (!is_min && bv <= v) {
+                            let drop = if is_min {
+                                crate::keys::float_total_cmp(bv, v).is_ge()
+                            } else {
+                                crate::keys::float_total_cmp(bv, v).is_le()
+                            };
+                            if drop {
                                 dq.pop_back();
                             } else {
                                 break;
@@ -381,9 +540,13 @@ fn framed_f64(
                 cur_b += 1;
             }
             while cur_a < a {
-                if cur_a < cur_b && arr.is_valid(part[cur_a]) {
-                    sum -= arr.value(part[cur_a]);
-                    cnt -= 1;
+                if cur_a < cur_b {
+                    if need_sum {
+                        sum.pop();
+                    }
+                    if arr.is_valid(part[cur_a]) {
+                        cnt -= 1;
+                    }
                 }
                 cur_a += 1;
             }
@@ -401,14 +564,124 @@ fn framed_f64(
                 continue;
             }
             out[part[pos]] = Some(match func {
-                WindowFn::Sum => sum,
-                WindowFn::Avg => sum / cnt as f64,
-                WindowFn::Min | WindowFn::Max => dq.front().map_or(sum, |&f| arr.value(part[f])),
+                WindowFn::Sum => sum.sum(),
+                WindowFn::Avg => sum.sum() / cnt as f64,
+                WindowFn::Min | WindowFn::Max => dq.front().map_or(0.0, |&f| arr.value(part[f])),
                 _ => unreachable!("framed_f64 on non-aggregate"),
             });
         }
     }
     Arc::new(Float64Array::from(out))
+}
+
+/// String-input frame aggregate (`min`/`max` only). Same monotonic-deque slide as the
+/// numeric `min`/`max`, comparing UTF-8 byte order (`<`/`>`, matching the running and
+/// whole-partition string paths and DuckDB's binary collation). An empty / all-null
+/// frame yields null.
+fn framed_str_minmax(
+    func: WindowFn,
+    ordered: &[Vec<usize>],
+    values: &ArrayRef,
+    frame: Frame,
+    order_rows: Option<&Rows>,
+    num_rows: usize,
+) -> ArrayRef {
+    let arr = values.as_any().downcast_ref::<StringArray>().expect("utf8");
+    let is_min = func == WindowFn::Min;
+    let mut out: Vec<Option<String>> = vec![None; num_rows];
+    for part in ordered {
+        let len = part.len();
+        let peers = peer_groups(frame, part, order_rows);
+        let (mut cur_a, mut cur_b) = (0usize, 0usize);
+        // Monotonic deque of partition positions holding the running min/max front.
+        let mut dq: VecDeque<usize> = VecDeque::new();
+        for pos in 0..len {
+            let (a, b) = frame_bounds(frame, pos, len, peers.as_ref());
+            while cur_b < b {
+                let row = part[cur_b];
+                if arr.is_valid(row) {
+                    let v = arr.value(row);
+                    while let Some(&back) = dq.back() {
+                        let bv = arr.value(part[back]);
+                        if (is_min && bv >= v) || (!is_min && bv <= v) {
+                            dq.pop_back();
+                        } else {
+                            break;
+                        }
+                    }
+                    dq.push_back(cur_b);
+                }
+                cur_b += 1;
+            }
+            while cur_a < a {
+                cur_a += 1;
+            }
+            cur_b = cur_b.max(cur_a);
+            while let Some(&front) = dq.front() {
+                if front < cur_a {
+                    dq.pop_front();
+                } else {
+                    break;
+                }
+            }
+            out[part[pos]] = dq.front().map(|&f| arr.value(part[f]).to_string());
+        }
+    }
+    Arc::new(StringArray::from(out))
+}
+
+/// Boolean-input frame aggregate (`min`/`max` only), ordering `false < true` (min = AND,
+/// max = OR). Same monotonic-deque slide as the string/numeric min/max; an empty /
+/// all-null frame yields null.
+fn framed_bool_minmax(
+    func: WindowFn,
+    ordered: &[Vec<usize>],
+    values: &ArrayRef,
+    frame: Frame,
+    order_rows: Option<&Rows>,
+    num_rows: usize,
+) -> ArrayRef {
+    let arr = values.as_boolean();
+    let is_min = func == WindowFn::Min;
+    let mut out: Vec<Option<bool>> = vec![None; num_rows];
+    for part in ordered {
+        let len = part.len();
+        let peers = peer_groups(frame, part, order_rows);
+        let (mut cur_a, mut cur_b) = (0usize, 0usize);
+        let mut dq: VecDeque<usize> = VecDeque::new();
+        for pos in 0..len {
+            let (a, b) = frame_bounds(frame, pos, len, peers.as_ref());
+            while cur_b < b {
+                let row = part[cur_b];
+                if arr.is_valid(row) {
+                    let v = arr.value(row);
+                    while let Some(&back) = dq.back() {
+                        let bv = arr.value(part[back]);
+                        if (is_min && bv >= v) || (!is_min && bv <= v) {
+                            dq.pop_back();
+                        } else {
+                            break;
+                        }
+                    }
+                    dq.push_back(cur_b);
+                }
+                cur_b += 1;
+            }
+            while cur_a < a {
+                cur_a += 1;
+            }
+            cur_b = cur_b.max(cur_a);
+            while let Some(&front) = dq.front() {
+                if front < cur_a {
+                    dq.pop_front();
+                } else {
+                    break;
+                }
+            }
+            out[part[pos]] = dq.front().map(|&f| arr.value(part[f]));
+        }
+    }
+    Arc::new(BooleanArray::from(out))
 }
 
 #[cfg(test)]
@@ -436,6 +709,52 @@ mod tests {
         assert!(a >= b);
         let (a0, b0) = frame_half_open(f, 0, 0); // empty partition
         assert!(a0 >= b0);
+    }
+
+    /// A frame offset near/above `i64::MAX` (valid in the `u64` IR) must saturate to the
+    /// partition edge, not wrap negative (`k as i64`) or overflow (`pos + k + 1`). Before
+    /// the fix, `CURRENT ROW .. i64::MAX FOLLOWING` panicked with "attempt to add with
+    /// overflow", and `<huge> PRECEDING .. CURRENT ROW` flipped to an empty frame (all
+    /// null). DuckDB accepts the `i64::MAX` frame and returns the suffix/prefix aggregate.
+    #[test]
+    fn huge_frame_offsets_saturate_not_overflow() {
+        let len = 5usize;
+        // CURRENT ROW .. i64::MAX FOLLOWING → to the partition end.
+        let f_end = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::CurrentRow,
+            end: FrameBound::Following(i64::MAX as u64),
+        };
+        assert_eq!(frame_half_open(f_end, 0, len), (0, 5));
+        assert_eq!(frame_half_open(f_end, 3, len), (3, 5));
+
+        // A huge (> i64::MAX) PRECEDING start → the partition start (whole prefix).
+        let f_start = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::Preceding(u64::MAX),
+            end: FrameBound::CurrentRow,
+        };
+        assert_eq!(frame_half_open(f_start, 0, len), (0, 1));
+        assert_eq!(frame_half_open(f_start, 4, len), (0, 5));
+
+        // A huge PRECEDING *end* still yields an empty frame (ends before the start).
+        let f_pe = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::Preceding(u64::MAX),
+        };
+        let (a, b) = frame_half_open(f_pe, 3, len);
+        assert!(a >= b, "huge PRECEDING end must be empty, got ({a},{b})");
+
+        // End to end through the aggregate kernel: suffix SUM must not panic and equals
+        // the whole-suffix total.
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50]));
+        let ordered = vec![vec![0usize, 1, 2, 3, 4]];
+        let s = framed_aggregate(WindowFn::Sum, &ordered, &values, f_end, None, len).unwrap();
+        assert_eq!(
+            s.as_primitive::<Int64Type>().values(),
+            &[150, 140, 120, 90, 50]
+        );
     }
 
     #[test]
@@ -476,6 +795,81 @@ mod tests {
         assert_eq!(c.as_primitive::<Int64Type>().values(), &[2, 3, 3, 3, 2]);
     }
 
+    /// String MIN/MAX over an explicit ROWS frame must slide like the numeric path
+    /// (and match a naive per-row recompute), not error `UnsupportedWindow`.
+    #[test]
+    fn rows_frame_string_min_max() {
+        use arrow::array::StringArray;
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("d"),
+            None,
+            Some("a"),
+            Some("c"),
+            Some("b"),
+        ]));
+        let ordered = vec![vec![0usize, 1, 2, 3, 4]];
+        let frame = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::Preceding(1),
+            end: FrameBound::Following(1),
+        };
+        let raw = ["d", "", "a", "c", "b"];
+        let valid = [true, false, true, true, true];
+        let mn = framed_aggregate(WindowFn::Min, &ordered, &values, frame, None, 5).unwrap();
+        let mx = framed_aggregate(WindowFn::Max, &ordered, &values, frame, None, 5).unwrap();
+        let mn = mn.as_any().downcast_ref::<StringArray>().unwrap();
+        let mx = mx.as_any().downcast_ref::<StringArray>().unwrap();
+        for pos in 0..5usize {
+            let (a, b) = frame_half_open(frame, pos, 5);
+            let win: Vec<&str> = (a..b).filter(|&j| valid[j]).map(|j| raw[j]).collect();
+            let want_mn = win.iter().min().copied();
+            let want_mx = win.iter().max().copied();
+            assert_eq!(
+                mn.is_valid(pos).then(|| mn.value(pos)),
+                want_mn,
+                "min pos {pos}"
+            );
+            assert_eq!(
+                mx.is_valid(pos).then(|| mx.value(pos)),
+                want_mx,
+                "max pos {pos}"
+            );
+        }
+    }
+
+    /// Boolean MIN (AND) / MAX (OR) over an explicit ROWS frame must slide (not error),
+    /// ordering `false < true`, matching a naive recompute.
+    #[test]
+    fn rows_frame_bool_min_max() {
+        use arrow::array::BooleanArray;
+        let raw = [Some(true), Some(false), None, Some(true), Some(false)];
+        let values: ArrayRef = Arc::new(BooleanArray::from(raw.to_vec()));
+        let ordered = vec![vec![0usize, 1, 2, 3, 4]];
+        let frame = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::Preceding(1),
+            end: FrameBound::Following(1),
+        };
+        let mn = framed_aggregate(WindowFn::Min, &ordered, &values, frame, None, 5).unwrap();
+        let mx = framed_aggregate(WindowFn::Max, &ordered, &values, frame, None, 5).unwrap();
+        let mn = mn.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let mx = mx.as_any().downcast_ref::<BooleanArray>().unwrap();
+        for pos in 0..5usize {
+            let (a, b) = frame_half_open(frame, pos, 5);
+            let win: Vec<bool> = (a..b).filter_map(|j| raw[j]).collect();
+            assert_eq!(
+                mn.is_valid(pos).then(|| mn.value(pos)),
+                win.iter().copied().min(),
+                "min pos {pos}"
+            );
+            assert_eq!(
+                mx.is_valid(pos).then(|| mx.value(pos)),
+                win.iter().copied().max(),
+                "max pos {pos}"
+            );
+        }
+    }
+
     /// GROUPS frames aggregate by peer group (ties in the ORDER BY key), not by
     /// physical row count.
     #[test]
@@ -514,6 +908,149 @@ mod tests {
         };
         let s3 = framed_aggregate(WindowFn::Sum, &ordered, &values, f3, Some(&rows), 5).unwrap();
         assert_eq!(s3.as_primitive::<Int64Type>().values(), &[3, 3, 10, 10, 15]);
+    }
+
+    /// The default value-function frame (`RANGE UNBOUNDED PRECEDING TO CURRENT ROW`)
+    /// makes `last_value` running (the current peer group's value) and `nth_value`
+    /// null-until-the-nth-row — matching DuckDB / standard SQL, not the whole-partition
+    /// value the frameless path gives. Order key `[10,10,20,20,30]` has peer groups
+    /// {0,1},{2,3},{4}, so `last_value` = [2,2,4,4,5] and `nth_value(v,2)` = [null,2,2,2,4].
+    #[test]
+    fn default_range_frame_running_last_and_nth_value() {
+        use arrow::row::{RowConverter, SortField};
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![10, 10, 20, 20, 30]));
+        let conv = RowConverter::new(vec![SortField::new(keys.data_type().clone())]).unwrap();
+        let rows = conv.convert_columns(std::slice::from_ref(&keys)).unwrap();
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5]));
+        let ordered = vec![vec![0usize, 1, 2, 3, 4]];
+        let frame = Frame {
+            unit: FrameUnit::Range,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
+        };
+
+        let lv = framed_value(
+            WindowFn::LastValue,
+            &ordered,
+            &values,
+            1,
+            frame,
+            Some(&rows),
+            5,
+        )
+        .unwrap();
+        assert_eq!(lv.as_primitive::<Int64Type>().values(), &[2, 2, 4, 4, 5]);
+
+        let fv = framed_value(
+            WindowFn::FirstValue,
+            &ordered,
+            &values,
+            1,
+            frame,
+            Some(&rows),
+            5,
+        )
+        .unwrap();
+        assert_eq!(fv.as_primitive::<Int64Type>().values(), &[1, 1, 1, 1, 1]);
+
+        let nv = framed_value(
+            WindowFn::NthValue,
+            &ordered,
+            &values,
+            2,
+            frame,
+            Some(&rows),
+            5,
+        )
+        .unwrap();
+        let nv = nv.as_primitive::<Int64Type>();
+        let got: Vec<Option<i64>> = (0..5)
+            .map(|i| nv.is_valid(i).then(|| nv.value(i)))
+            .collect();
+        // Frames [0,2),[0,2),[0,4),[0,4),[0,5) all hold the 2nd row (index 1 = value 2),
+        // even at the first output row, because its peer includes row 1.
+        assert_eq!(got, vec![Some(2), Some(2), Some(2), Some(2), Some(2)]);
+
+        // nth_value past the frame end is null: nth_value(v, 3) is null until the frame
+        // holds 3 rows (from the second peer group onward: index 2 = value 3).
+        let nv3 = framed_value(
+            WindowFn::NthValue,
+            &ordered,
+            &values,
+            3,
+            frame,
+            Some(&rows),
+            5,
+        )
+        .unwrap();
+        let nv3 = nv3.as_primitive::<Int64Type>();
+        let got3: Vec<Option<i64>> = (0..5)
+            .map(|i| nv3.is_valid(i).then(|| nv3.value(i)))
+            .collect();
+        assert_eq!(got3, vec![None, None, Some(3), Some(3), Some(3)]);
+    }
+
+    /// A ROWS frame on a value function selects the frame's first/last/nth physical row.
+    #[test]
+    fn rows_frame_value_functions() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50]));
+        let ordered = vec![vec![0usize, 1, 2, 3, 4]];
+        // ROWS BETWEEN 1 PRECEDING AND CURRENT ROW.
+        let frame = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::Preceding(1),
+            end: FrameBound::CurrentRow,
+        };
+        let lv = framed_value(WindowFn::LastValue, &ordered, &values, 1, frame, None, 5).unwrap();
+        assert_eq!(
+            lv.as_primitive::<Int64Type>().values(),
+            &[10, 20, 30, 40, 50]
+        );
+        let fv = framed_value(WindowFn::FirstValue, &ordered, &values, 1, frame, None, 5).unwrap();
+        // frame start = max(pos-1, 0): [10,10,20,30,40].
+        assert_eq!(
+            fv.as_primitive::<Int64Type>().values(),
+            &[10, 10, 20, 30, 40]
+        );
+    }
+
+    /// A sliding float SUM over large-magnitude values must stay exact. The naive
+    /// add-then-subtract slide computed `1e16 + 1 - 1e16 == 0` for a trailing 2-row
+    /// window over `[1e16, 1, 1, 1]`, where DuckDB (and a fresh re-add) gives 2.0. The
+    /// FIFO-of-two-stacks sum never subtracts, so it recovers the exact window sum.
+    #[test]
+    fn sliding_float_sum_is_exact_over_large_magnitudes() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![1e16, 1.0, 1.0, 1.0]));
+        let ordered = vec![vec![0usize, 1, 2, 3]];
+        let frame = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::Preceding(1),
+            end: FrameBound::CurrentRow,
+        };
+        let s = framed_aggregate(WindowFn::Sum, &ordered, &values, frame, None, 4).unwrap();
+        assert_eq!(
+            s.as_primitive::<Float64Type>().values(),
+            &[1e16, 1e16, 2.0, 2.0]
+        );
+        // AVG shares the same accumulator, so it must be exact too: (1+1)/2 = 1.0.
+        let a = framed_aggregate(WindowFn::Avg, &ordered, &values, frame, None, 4).unwrap();
+        assert_eq!(a.as_primitive::<Float64Type>().values()[2], 1.0);
+    }
+
+    /// An i64 framed SUM that overflows must error (like the non-framed running SUM),
+    /// not wrap silently / panic in debug. A trailing 2-row window whose two entries
+    /// sum past i64::MAX triggers it.
+    #[test]
+    fn framed_i64_sum_overflow_errors() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, 1]));
+        let ordered = vec![vec![0usize, 1]];
+        let frame = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::Preceding(1),
+            end: FrameBound::CurrentRow,
+        };
+        let r = framed_aggregate(WindowFn::Sum, &ordered, &values, frame, None, 2);
+        assert!(matches!(r, Err(RuntimeError::SumOverflow)));
     }
 
     /// The O(n) sliding kernel must match a naive O(n·w) recompute for every frame
@@ -567,6 +1104,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The float SUM/AVG sliding kernel (FIFO of two stacks) must match a naive
+    /// per-row recompute across every frame shape, including nulls and empty frames —
+    /// the same cross-check as `sliding_matches_naive_oracle` but on the float path.
+    #[test]
+    fn sliding_float_matches_naive_oracle() {
+        let raw: Vec<Option<f64>> = vec![
+            Some(5.0),
+            None,
+            Some(3.0),
+            Some(8.0),
+            Some(1.0),
+            None,
+            Some(7.0),
+            Some(2.0),
+            Some(4.0),
+        ];
+        let values: ArrayRef = Arc::new(Float64Array::from(raw.clone()));
+        let ordered = vec![vec![0usize, 2, 4, 6, 8], vec![1usize, 3, 5, 7]];
+        let n = raw.len();
+        let bounds = [
+            FrameBound::UnboundedPreceding,
+            FrameBound::Preceding(2),
+            FrameBound::Preceding(1),
+            FrameBound::CurrentRow,
+            FrameBound::Following(1),
+            FrameBound::Following(2),
+            FrameBound::UnboundedFollowing,
+        ];
+        for &start in &bounds {
+            for &end in &bounds {
+                let frame = Frame {
+                    unit: FrameUnit::Rows,
+                    start,
+                    end,
+                };
+                for func in [WindowFn::Sum, WindowFn::Avg] {
+                    let got = framed_aggregate(func, &ordered, &values, frame, None, n).unwrap();
+                    let want = naive_f64(func, &ordered, &raw, frame, n);
+                    assert_eq!(fmt(&got), want, "func={func:?} start={start:?} end={end:?}");
+                }
+            }
+        }
+    }
+
+    // Naive float reference: recompute each row's frame directly.
+    fn naive_f64(
+        func: WindowFn,
+        ordered: &[Vec<usize>],
+        raw: &[Option<f64>],
+        frame: Frame,
+        n: usize,
+    ) -> Vec<Option<f64>> {
+        let mut out = vec![None; n];
+        for part in ordered {
+            let len = part.len();
+            for pos in 0..len {
+                let (a, b) = frame_half_open(frame, pos, len);
+                let vals: Vec<f64> = (a..b).filter_map(|j| raw[part[j]]).collect();
+                out[part[pos]] = if vals.is_empty() {
+                    None
+                } else {
+                    let s: f64 = vals.iter().sum();
+                    Some(if func == WindowFn::Avg {
+                        s / vals.len() as f64
+                    } else {
+                        s
+                    })
+                };
+            }
+        }
+        out
     }
 
     // Naive reference: recompute each row's frame directly. Returns each output as

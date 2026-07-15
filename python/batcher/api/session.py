@@ -364,7 +364,7 @@ def from_pylist(rows: list[dict[str, Any]]) -> Dataset:
     Returns:
         A lazy `Dataset` over the rows.
     """
-    return from_arrow(pa.Table.from_pylist(rows))
+    return _scan(interop.from_pylist(rows))
 
 
 def from_items(items: list[Any], *, column: str = "item") -> Dataset:

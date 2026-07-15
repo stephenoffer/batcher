@@ -26,15 +26,15 @@ from collections import deque
 
 import pyarrow as pa
 
-from batcher._internal.native import engine
 from batcher._internal.hardware import available_cpu_count
+from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     descriptor_rows,
     partition_descriptors,
     source_pushdown,
 )
 from batcher.dist.executors.plan_analysis import _relabel_single_source
-from batcher.dist.executors.ray_runtime import _ensure_ray
+from batcher.dist.executors.ray_runtime import _ensure_ray, engine_config_json
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, MapBatches
 
@@ -409,8 +409,15 @@ def _distributed_map(
             # Intra-task workers = this task's own CPU share (>=1); cluster-wide
             # parallelism is the many tasks, not a full-width pool inside each one.
             workers = max(1, round(shares[idx]))
+            # Ship the DRIVER's engine config, with the engine's rayon width pinned to this
+            # task's own CPU grant. Every other distributed operator does this; the map path
+            # did not, so a worker fell back to its own `active_config()` — whose
+            # `parallelism: 0` means "use every core on this box". Dozens of concurrent map
+            # tasks on a 16-core node each opened a 16-thread pool: hundreds of threads
+            # thrashing 16 cores, and the session config (morsel size, memory budget)
+            # silently ignored on every distributed scan.
             return _map_udf_task.options(**{**opts, "num_cpus": shares[idx], **sched}).remote(
-                plan0, partitions[idx], workers
+                plan0, partitions[idx], workers, engine_config_json(shares[idx])
             )
 
         results = gather_map_results(_launch, len(partitions))
@@ -1055,7 +1062,7 @@ def _with_map_workers(plan, n: int):
     return plan
 
 
-def _map_udf_task(plan0, partition, workers: int = 1):
+def _map_udf_task(plan0, partition, workers: int = 1, cfg_json: str | None = None):
     from batcher import core
     from batcher.dist.executors.partition_io import read_partition_descriptor
     from batcher.io.source import InMemorySource
@@ -1063,7 +1070,9 @@ def _map_udf_task(plan0, partition, workers: int = 1):
     rows = read_partition_descriptor(partition)
     if not rows:
         return None
-    out = core.execute_with_udfs(_with_map_workers(plan0, workers), [InMemorySource(rows)])
+    out = core.execute_with_udfs(
+        _with_map_workers(plan0, workers), [InMemorySource(rows)], engine_config=cfg_json
+    )
     if not out or sum(b.num_rows for b in out) == 0:
         return None
     return out

@@ -16,19 +16,24 @@
 
 use serde_json::Value;
 
-/// One step of a JSON path: an object key or a zero-based array index.
+/// One step of a JSON path: an object key or an array index.
+///
+/// The index is signed: a non-negative index counts from the front (`[0]` is the
+/// first element), a negative index counts from the back (`[-1]` is the last),
+/// matching DuckDB's JSON path semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PathPart {
     Key(String),
-    Index(usize),
+    Index(i64),
 }
 
 /// Parse a `$.a.b[0].c` path into its component steps.
 ///
 /// The leading `$` is optional. Dots separate object keys; `[n]` selects an array
-/// element. A key that itself carries a subscript (`tags[0]`) splits into a
-/// [`PathPart::Key`] followed by a [`PathPart::Index`]. Empty segments are ignored,
-/// so `$.a`, `a`, and `.a` are equivalent.
+/// element (`[-1]` the last, counting from the back — DuckDB semantics). A key that
+/// itself carries a subscript (`tags[0]`) splits into a [`PathPart::Key`] followed by
+/// a [`PathPart::Index`]. Empty segments are ignored, so `$.a`, `a`, and `.a` are
+/// equivalent.
 pub(super) fn parse_path(path: &str) -> Vec<PathPart> {
     let mut parts = Vec::new();
     for segment in path.trim_start_matches('$').split('.') {
@@ -47,7 +52,7 @@ pub(super) fn parse_path(path: &str) -> Vec<PathPart> {
         let mut cur = rest;
         while let Some(close) = cur.find(']') {
             let inner = cur[1..close].trim();
-            if let Ok(idx) = inner.parse::<usize>() {
+            if let Ok(idx) = inner.parse::<i64>() {
                 parts.push(PathPart::Index(idx));
             }
             cur = &cur[close + 1..];
@@ -109,7 +114,13 @@ fn seek_key(bytes: &[u8], pos: usize, key: &str) -> Option<usize> {
 }
 
 /// Within the array starting at `pos` (`[`), position at the start of element `idx`.
-fn seek_index(bytes: &[u8], pos: usize, idx: usize) -> Option<usize> {
+///
+/// A non-negative `idx` counts from the front and terminates as soon as it is reached
+/// (the fast path — no need to see the rest of the array). A negative `idx` counts from
+/// the back (`-1` is the last element, DuckDB semantics); since the element count is not
+/// known up front, the array is scanned once, recording each element's start, then
+/// indexed from the end.
+fn seek_index(bytes: &[u8], pos: usize, idx: i64) -> Option<usize> {
     if bytes.get(pos)? != &b'[' {
         return None;
     }
@@ -117,20 +128,40 @@ fn seek_index(bytes: &[u8], pos: usize, idx: usize) -> Option<usize> {
     if bytes.get(i) == Some(&b']') {
         return None; // empty array
     }
-    let mut cur = 0usize;
-    loop {
-        if cur == idx {
-            return Some(i);
+    if idx >= 0 {
+        let target = idx as usize;
+        let mut cur = 0usize;
+        loop {
+            if cur == target {
+                return Some(i);
+            }
+            i = skip_value(bytes, i)?;
+            i = skip_ws(bytes, i);
+            match bytes.get(i)? {
+                b',' => i = skip_ws(bytes, i + 1),
+                b']' => return None,
+                _ => return None,
+            }
+            cur += 1;
         }
+    }
+    // Negative index: fold from the end, so scan the whole array once recording starts.
+    let mut starts: Vec<usize> = Vec::new();
+    loop {
+        starts.push(i);
         i = skip_value(bytes, i)?;
         i = skip_ws(bytes, i);
         match bytes.get(i)? {
             b',' => i = skip_ws(bytes, i + 1),
-            b']' => return None,
+            b']' => break,
             _ => return None,
         }
-        cur += 1;
     }
+    let eff = starts.len() as i64 + idx;
+    if eff < 0 {
+        return None;
+    }
+    starts.get(eff as usize).copied()
 }
 
 /// Position just past the complete JSON value that starts at `pos`.
@@ -228,27 +259,134 @@ fn leaf(text: &str, path: &[PathPart]) -> Option<Value> {
     serde_json::from_str(seek(text, path)?).ok()
 }
 
+/// Minify a *validated* JSON slice: drop whitespace that sits outside string tokens,
+/// copying every string verbatim. Unlike round-tripping through `serde_json::Value`,
+/// this **preserves object key order** — `serde_json`'s default `Map` re-sorts keys,
+/// which silently reordered an extracted sub-object relative to its source (and to
+/// DuckDB's `json_extract_string`, which keeps insertion order). The input is already
+/// structurally valid (its caller parsed it), so stripping inter-token whitespace
+/// yields the same compact text DuckDB does.
+fn compact(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                // A string may hold whitespace and escaped quotes — copy it whole.
+                let end = parse_string(bytes, i).map_or(bytes.len(), |(_, e)| e);
+                out.push_str(&raw[i..end]);
+                i = end;
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            // Everything else outside a string in valid JSON is ASCII structure.
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Extract the value at `path` as a string: string leaves verbatim, everything else
 /// (numbers, bools, objects, arrays) as its compact JSON text. `None` on absent path,
 /// JSON null, or a malformed leaf.
+///
+/// Object/array leaves keep their **source key/element order** (see [`compact`]) rather
+/// than being re-serialized through `serde_json::Value`, which alphabetizes object keys.
 pub(super) fn extract_string(text: &str, path: &[PathPart]) -> Option<String> {
-    match leaf(text, path)? {
+    let raw = seek(text, path)?;
+    match serde_json::from_str::<Value>(raw).ok()? {
         Value::String(s) => Some(s),
         Value::Null => None,
+        // Compact the original slice so object keys keep their source order.
+        Value::Object(_) | Value::Array(_) => Some(compact(raw)),
+        Value::Number(n) => {
+            // An integer literal larger than u64 (e.g. a 20+ digit id) is parsed by
+            // serde_json as f64, whose Display renders it in lossy scientific form
+            // (`1e+20`). DuckDB keeps the exact digits, so return the source token for
+            // that case; everything representable (i64/u64) or fractional uses serde's
+            // canonical form (which also matches DuckDB: `1.50` -> `1.5`).
+            if n.as_i64().is_none() && n.as_u64().is_none() && is_integer_literal(raw) {
+                // `-0` is an integer literal serde parses as f64 (as_i64/as_u64 both
+                // None); numerically it is zero, and DuckDB canonicalizes it to "0"
+                // rather than keeping the raw "-0". A genuine out-of-i64/u64-range
+                // integer (e.g. `1e20` worth of digits) never has an all-zero magnitude,
+                // so it still keeps its exact digits.
+                let magnitude = raw.strip_prefix('-').unwrap_or(raw);
+                if magnitude.bytes().all(|b| b == b'0') {
+                    Some("0".to_string())
+                } else {
+                    Some(raw.to_string())
+                }
+            } else {
+                Some(n.to_string())
+            }
+        }
+        // Bool has no ordering or precision to preserve.
         other => Some(other.to_string()),
     }
 }
 
+/// Whether `s` is a bare JSON integer literal (`-?[0-9]+`, no fraction or exponent).
+fn is_integer_literal(s: &str) -> bool {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Extract the value at `path` as an `i64`, matching DuckDB's `json_extract(...)::BIGINT`
+/// **numeric** cast: an integer leaf verbatim, a JSON float rounded to nearest (ties to
+/// even, as DuckDB does), and a JSON bool as `1`/`0`. A value outside `i64`'s range
+/// (DuckDB raises there) yields `None`, as do a container/string/JSON-null leaf, a
+/// missing path, or malformed JSON. Previously a JSON *float* (`3.5`, or an integrally
+/// valued `42.0`/`1e2`) returned `None`, silently dropping data DuckDB extracts.
 pub(super) fn extract_int(text: &str, path: &[PathPart]) -> Option<i64> {
-    leaf(text, path)?.as_i64()
+    match leaf(text, path)? {
+        Value::Number(n) => number_to_i64(&n),
+        Value::Bool(b) => Some(b as i64),
+        _ => None,
+    }
 }
 
+/// A JSON number as `i64`: exact for an integer that fits, else the float rounded to the
+/// nearest integer (ties to even — DuckDB's cast rounding). Out-of-`i64`-range → `None`
+/// (DuckDB errors; we stay lenient). `2^63` is the exclusive upper bound so the `as i64`
+/// never saturates on a value the check let through.
+fn number_to_i64(n: &serde_json::Number) -> Option<i64> {
+    if let Some(i) = n.as_i64() {
+        return Some(i);
+    }
+    let r = n.as_f64()?.round_ties_even();
+    // -2^63 ..= just-below 2^63 (2^63 is exactly representable and out of i64 range).
+    if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r) {
+        Some(r as i64)
+    } else {
+        None
+    }
+}
+
+/// Extract the value at `path` as an `f64`, matching DuckDB's `json_extract(...)::DOUBLE`:
+/// any JSON number (widened, `inf` on overflow like DuckDB), and a JSON bool as `1.0`/`0.0`.
+/// A container/string/JSON-null leaf, a missing path, or malformed JSON yields `None`.
 pub(super) fn extract_float(text: &str, path: &[PathPart]) -> Option<f64> {
-    leaf(text, path)?.as_f64()
+    match leaf(text, path)? {
+        Value::Number(n) => n.as_f64(),
+        Value::Bool(b) => Some(if b { 1.0 } else { 0.0 }),
+        _ => None,
+    }
 }
 
+/// Extract the value at `path` as a `bool`, matching DuckDB's `json_extract(...)::BOOLEAN`:
+/// a JSON bool verbatim, and a JSON *number* as `n != 0` (so `1`/`2`/`1.0` → `true`,
+/// `0`/`-0.0` → `false`). A container/string/JSON-null leaf, a missing path, or malformed
+/// JSON yields `None`. Previously a numeric leaf (a `0`/`1` flag) returned `None`.
 pub(super) fn extract_bool(text: &str, path: &[PathPart]) -> Option<bool> {
-    leaf(text, path)?.as_bool()
+    match leaf(text, path)? {
+        Value::Bool(b) => Some(b),
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -300,17 +438,114 @@ mod tests {
 
     #[test]
     fn objects_and_arrays_serialize_compactly() {
-        // Object leaves round-trip through serde_json, whose default Map sorts keys — the
-        // same normalization the previous full-parse path produced (keys alphabetized).
+        // Object leaves keep their SOURCE key order (matching DuckDB's
+        // json_extract_string), not serde_json's alphabetized Map order.
         let doc = r#"{"user":{"id":7,"country":"US"}}"#;
         assert_eq!(
             extract_string(doc, &parts("$.user")),
-            Some(r#"{"country":"US","id":7}"#.into())
+            Some(r#"{"id":7,"country":"US"}"#.into())
         );
         assert_eq!(
             extract_string(r#"{"a":[1,2,3]}"#, &parts("$.a")),
             Some("[1,2,3]".into())
         );
+    }
+
+    #[test]
+    fn a_huge_integer_keeps_its_digits_rather_than_scientific_notation() {
+        // An integer beyond u64 is parsed as f64 by serde_json; its Display is lossy
+        // scientific (`1e20`). DuckDB preserves the exact digits — so must we.
+        let doc = r#"{"id":100000000000000000000}"#;
+        assert_eq!(
+            extract_string(doc, &parts("$.id")),
+            Some("100000000000000000000".into())
+        );
+        // Values that fit and true floats keep their canonical serde form.
+        assert_eq!(
+            extract_string(r#"{"x":30}"#, &parts("$.x")),
+            Some("30".into())
+        );
+        assert_eq!(
+            extract_string(r#"{"x":1.50}"#, &parts("$.x")),
+            Some("1.5".into())
+        );
+        // `-0` (an integer literal serde parses as f64) is numerically zero; DuckDB
+        // renders it "0", not the raw "-0". Only genuine huge integers keep raw digits.
+        assert_eq!(
+            extract_string(r#"{"x":-0}"#, &parts("$.x")),
+            Some("0".into())
+        );
+        // A negative-zero *float* keeps its sign (DuckDB: "-0.0").
+        assert_eq!(
+            extract_string(r#"{"x":-0.0}"#, &parts("$.x")),
+            Some("-0.0".into())
+        );
+    }
+
+    #[test]
+    fn object_leaves_preserve_source_key_order_and_compact_whitespace() {
+        // Regression: serde_json's default Map sorts keys, so extracting a sub-object
+        // reordered its keys (b,a,c -> a,b,c) and disagreed with DuckDB, which keeps
+        // insertion order. Whitespace between tokens is still stripped (compact).
+        let doc = r#"{"obj":{ "b" : 1,  "a":2, "c":3 }}"#;
+        assert_eq!(
+            extract_string(doc, &parts("$.obj")),
+            Some(r#"{"b":1,"a":2,"c":3}"#.into())
+        );
+        // A string value containing significant whitespace/braces is copied verbatim.
+        let doc2 = r#"{"o":{"msg":"a  b { x }","z":9,"a":1}}"#;
+        assert_eq!(
+            extract_string(doc2, &parts("$.o")),
+            Some(r#"{"msg":"a  b { x }","z":9,"a":1}"#.into())
+        );
+    }
+
+    #[test]
+    fn extract_int_coerces_floats_and_bools_like_duckdb() {
+        // A JSON float extracted as int rounds to nearest, ties to even — exactly what
+        // DuckDB's `json_extract(...)::BIGINT` does (verified: 0.5->0, 2.5->2, 3.5->4,
+        // -2.5->-2). Previously every one of these returned None (silent data loss).
+        assert_eq!(extract_int(r#"{"x":42.0}"#, &parts("$.x")), Some(42));
+        assert_eq!(extract_int(r#"{"x":1e2}"#, &parts("$.x")), Some(100));
+        assert_eq!(extract_int(r#"{"x":3.5}"#, &parts("$.x")), Some(4));
+        assert_eq!(extract_int(r#"{"x":2.5}"#, &parts("$.x")), Some(2));
+        assert_eq!(extract_int(r#"{"x":0.5}"#, &parts("$.x")), Some(0));
+        assert_eq!(extract_int(r#"{"x":-2.5}"#, &parts("$.x")), Some(-2));
+        assert_eq!(extract_int(r#"{"x":2.6}"#, &parts("$.x")), Some(3));
+        // A JSON bool -> 1/0 (DuckDB coerces it too).
+        assert_eq!(extract_int(r#"{"x":true}"#, &parts("$.x")), Some(1));
+        assert_eq!(extract_int(r#"{"x":false}"#, &parts("$.x")), Some(0));
+        // Out of i64 range stays None (DuckDB errors; we are lenient), not a wrapped value.
+        assert_eq!(extract_int(r#"{"x":1e30}"#, &parts("$.x")), None);
+        // A plain integer that fits is still exact (no float round-trip).
+        assert_eq!(
+            extract_int(r#"{"x":9223372036854775807}"#, &parts("$.x")),
+            Some(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn extract_bool_coerces_numbers_like_duckdb() {
+        // A numeric flag extracted as bool: nonzero -> true, zero (incl -0.0) -> false,
+        // matching DuckDB's `json_extract(...)::BOOLEAN`. Previously all returned None.
+        assert_eq!(extract_bool(r#"{"x":1}"#, &parts("$.x")), Some(true));
+        assert_eq!(extract_bool(r#"{"x":2}"#, &parts("$.x")), Some(true));
+        assert_eq!(extract_bool(r#"{"x":1.0}"#, &parts("$.x")), Some(true));
+        assert_eq!(extract_bool(r#"{"x":0}"#, &parts("$.x")), Some(false));
+        assert_eq!(extract_bool(r#"{"x":-0.0}"#, &parts("$.x")), Some(false));
+        // A genuine JSON bool is unchanged.
+        assert_eq!(extract_bool(r#"{"x":true}"#, &parts("$.x")), Some(true));
+        // A container/null leaf is still None.
+        assert_eq!(extract_bool(r#"{"x":[1]}"#, &parts("$.x")), None);
+        assert_eq!(extract_bool(r#"{"x":null}"#, &parts("$.x")), None);
+    }
+
+    #[test]
+    fn extract_float_coerces_bools_like_duckdb() {
+        assert_eq!(extract_float(r#"{"x":true}"#, &parts("$.x")), Some(1.0));
+        assert_eq!(extract_float(r#"{"x":false}"#, &parts("$.x")), Some(0.0));
+        assert_eq!(extract_float(r#"{"x":42}"#, &parts("$.x")), Some(42.0));
+        assert_eq!(extract_float(r#"{"x":3.5}"#, &parts("$.x")), Some(3.5));
     }
 
     #[test]
@@ -321,6 +556,39 @@ mod tests {
         assert_eq!(extract_int("not json", &parts("$.a")), None);
         assert_eq!(extract_string(r#"{"a":null}"#, &parts("$.a")), None);
         assert_eq!(extract_int(r#"{"tags":[1]}"#, &parts("$.tags[5]")), None);
+    }
+
+    #[test]
+    fn negative_array_index_counts_from_the_end() {
+        // DuckDB's JSON path folds a negative subscript from the back: `[-1]` is the
+        // last element, `[-2]` the second-to-last; out of range -> None. Previously the
+        // `-1` failed to parse as a `usize` and the subscript was silently DROPPED, so
+        // `$.arr[-1]` returned the whole parent array instead of its last element.
+        let doc = r#"{"arr":[10,20,30]}"#;
+        assert_eq!(extract_int(doc, &parts("$.arr[-1]")), Some(30));
+        assert_eq!(extract_int(doc, &parts("$.arr[-2]")), Some(20));
+        assert_eq!(extract_int(doc, &parts("$.arr[-3]")), Some(10));
+        assert_eq!(extract_int(doc, &parts("$.arr[-4]")), None); // past the front
+                                                                 // A negative index on a root array works too, and the fast forward path is intact.
+        assert_eq!(extract_int("[1,2,3]", &parts("$[-1]")), Some(3));
+        assert_eq!(extract_int("[1,2,3]", &parts("$[0]")), Some(1));
+        // Negative into a nested object element.
+        assert_eq!(
+            extract_int(r#"{"a":[{"z":1},{"z":2}]}"#, &parts("$.a[-1].z")),
+            Some(2)
+        );
+        // Chained negative subscripts on an array-of-arrays, each folded independently.
+        let m = r#"{"a":[[1,2],[3,4]]}"#;
+        assert_eq!(extract_int(m, &parts("$.a[-1][-1]")), Some(4));
+        assert_eq!(extract_int(m, &parts("$.a[1][-2]")), Some(3));
+        assert_eq!(extract_string(m, &parts("$.a[-1]")), Some("[3,4]".into()));
+        // A negative index into an empty array is out of range -> None (not the array).
+        assert_eq!(extract_string(r#"{"a":[]}"#, &parts("$.a[-1]")), None);
+        // The parser now keeps the negative subscript as a real step.
+        assert_eq!(
+            parts("$.arr[-1]"),
+            vec![PathPart::Key("arr".into()), PathPart::Index(-1)]
+        );
     }
 
     #[test]
@@ -379,7 +647,7 @@ mod tests {
                 for part in path {
                     cur = match part {
                         PathPart::Key(k) => cur.get(k).cloned().unwrap_or(Value::Null),
-                        PathPart::Index(i) => cur.get(i).cloned().unwrap_or(Value::Null),
+                        PathPart::Index(i) => cur.get(*i as usize).cloned().unwrap_or(Value::Null),
                     };
                 }
                 sink = sink.wrapping_add(cur.to_string().len() as u64);

@@ -23,10 +23,10 @@ from __future__ import annotations
 
 import pyarrow as pa
 import pytest
-from conftest import assert_same
 
 import batcher as bt
 from batcher import lit, source_col, target_col
+from conftest import assert_same
 
 pytestmark = pytest.mark.differential
 

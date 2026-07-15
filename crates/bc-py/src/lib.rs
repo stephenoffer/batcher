@@ -70,9 +70,25 @@ fn execute_plan(
     sources: Vec<Vec<PyArrowType<RecordBatch>>>,
     engine_config: &str,
 ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
-    let (plan, sources, opts, narrow) = prepare_exec(plan_json, sources, engine_config)?;
+    let (plan, sources, opts, narrow, streaming, budget) =
+        prepare_exec(plan_json, sources, engine_config)?;
     let out = py
-        .allow_threads(|| bc_interp::execute_parallel_with(&plan, &sources, &opts))
+        .allow_threads(|| {
+            if streaming {
+                match bc_interp::execute_streaming_parallel(&plan, &sources, opts.workers(), budget)
+                {
+                    // A breaker would have blown the envelope. The materializing executor spills
+                    // it; re-run there rather than OOM. The work already done is lost, which is
+                    // the price of the fast path — and far cheaper than the crash it replaces.
+                    Err(e) if needs_spill(&e) => {
+                        bc_interp::execute_parallel_with(&plan, &sources, &opts)
+                    }
+                    other => other,
+                }
+            } else {
+                bc_interp::execute_parallel_with(&plan, &sources, &opts)
+            }
+        })
         .map_err(to_pyerr)?;
     let out = narrow_output(out, &narrow);
     Ok(out.into_iter().map(PyArrowType).collect())
@@ -93,9 +109,26 @@ fn execute_plan_metered(
     sources: Vec<Vec<PyArrowType<RecordBatch>>>,
     engine_config: &str,
 ) -> PyResult<(Vec<PyArrowType<RecordBatch>>, String)> {
-    let (plan, sources, opts, narrow) = prepare_exec(plan_json, sources, engine_config)?;
+    let (plan, sources, opts, narrow, streaming, budget) =
+        prepare_exec(plan_json, sources, engine_config)?;
     let (out, metrics) = py
-        .allow_threads(|| bc_interp::execute_parallel_with_metrics(&plan, &sources, &opts))
+        .allow_threads(|| {
+            if streaming {
+                match bc_interp::execute_streaming_parallel_metered(
+                    &plan,
+                    &sources,
+                    opts.workers(),
+                    budget,
+                ) {
+                    Err(e) if needs_spill(&e) => {
+                        bc_interp::execute_parallel_with_metrics(&plan, &sources, &opts)
+                    }
+                    other => other,
+                }
+            } else {
+                bc_interp::execute_parallel_with_metrics(&plan, &sources, &opts)
+            }
+        })
         .map_err(to_pyerr)?;
     let out = narrow_output(out, &narrow);
     Ok((
@@ -111,7 +144,41 @@ type ExecSetup = (
     Vec<Vec<RecordBatch>>,
     bc_interp::ExecOptions,
     std::collections::HashMap<String, DataType>,
+    bool,
+    usize,
 );
+
+/// Whether this query runs on the streaming executor. `true` by default.
+///
+/// Streaming pulls morsels through the linear runs and materializes only at breakers, so its peak
+/// memory is a constant rather than the sum of every operator's output — and on the shapes where
+/// that matters it is also *faster*, because the copies it stops making were not free.
+///
+/// **The two executors do not dominate one another, and that is why this is not a simple swap.**
+/// Streaming bounds the *intermediates* but its breakers fold in memory; the materializing
+/// executor has unbounded intermediates but breakers that spill out of core. A plan whose
+/// aggregate state exceeds the envelope is one the materializing executor survives and this one
+/// would OOM on. So the streaming breakers check their state against `memory_budget_bytes` and
+/// return `MemoryBudgetExceeded` instead of dying — and `execute_plan` catches exactly that and
+/// re-runs on the executor that can spill. Streaming takes the queries it fits (the
+/// overwhelming majority, and every one whose intermediates were the problem) and gives way on
+/// the ones it does not, rather than quietly turning a spill into a crash.
+///
+/// Set `streaming = false` to force the materializing executor — a bisecting escape hatch, not a
+/// tuning knob.
+fn use_streaming(cfg: &EngineConfig) -> bool {
+    cfg.streaming
+}
+
+/// The memory envelope the streaming breakers must stay inside — `0` means unbounded.
+fn stream_budget(cfg: &EngineConfig) -> usize {
+    cfg.memory_budget_bytes
+}
+
+/// True for the one error that means "this plan needs to spill, and I cannot".
+fn needs_spill(e: &bc_interp::InterpError) -> bool {
+    matches!(e, bc_interp::InterpError::MemoryBudgetExceeded { .. })
+}
 
 fn prepare_exec(
     plan_json: &str,
@@ -127,6 +194,8 @@ fn prepare_exec(
     if cfg.memory_budget_bytes > 0 {
         opts.pool = Some(shared_memory_pool(cfg.memory_budget_bytes));
     }
+    let streaming = use_streaming(&cfg);
+    let budget = stream_budget(&cfg);
     let sources: Vec<Vec<RecordBatch>> = sources
         .into_iter()
         .map(|relation| relation.into_iter().map(|b| b.0).collect())
@@ -141,9 +210,14 @@ fn prepare_exec(
     };
     let sources: Vec<Vec<RecordBatch>> = sources
         .into_iter()
-        .map(|relation| relation.iter().map(normalize_batch).collect())
-        .collect();
-    Ok((plan, sources, opts, narrow))
+        .map(|relation| {
+            relation
+                .iter()
+                .map(normalize_batch)
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok((plan, sources, opts, narrow, streaming, budget))
 }
 
 /// Map any engine error into a Python exception. The error hierarchy mapping
@@ -162,9 +236,9 @@ fn partial_aggregate(
 ) -> PyResult<PyArrowType<RecordBatch>> {
     let group_keys = parse_group_keys(group_keys_json)?;
     let aggregates = parse_aggregates(aggregates_json)?;
+    let batches = unwrap_batches(batches)?;
     let out =
-        bc_interp::dist::partial_aggregate(&group_keys, &aggregates, &unwrap_batches(batches))
-            .map_err(to_pyerr)?;
+        bc_interp::dist::partial_aggregate(&group_keys, &aggregates, &batches).map_err(to_pyerr)?;
     Ok(PyArrowType(out))
 }
 
@@ -198,7 +272,8 @@ fn execute_plan_aggregated(
     engine_config: &str,
     finalize: bool,
 ) -> PyResult<PyArrowType<RecordBatch>> {
-    let (plan, sources, opts, narrow) = prepare_exec(plan_json, sources, engine_config)?;
+    let (plan, sources, opts, narrow, _streaming, _budget) =
+        prepare_exec(plan_json, sources, engine_config)?;
     let group_keys = parse_group_keys(group_keys_json)?;
     let aggregates = parse_aggregates(aggregates_json)?;
     let out = py.allow_threads(|| {
@@ -225,9 +300,9 @@ fn combine_finalize(
 ) -> PyResult<PyArrowType<RecordBatch>> {
     let group_keys = parse_group_keys(group_keys_json)?;
     let aggregates = parse_aggregates(aggregates_json)?;
+    let partials = unwrap_batches(partials)?;
     let out =
-        bc_interp::dist::combine_finalize(&group_keys, &aggregates, &unwrap_batches(partials))
-            .map_err(to_pyerr)?;
+        bc_interp::dist::combine_finalize(&group_keys, &aggregates, &partials).map_err(to_pyerr)?;
     Ok(PyArrowType(out))
 }
 
@@ -242,8 +317,8 @@ fn combine(
 ) -> PyResult<PyArrowType<RecordBatch>> {
     let group_keys = parse_group_keys(group_keys_json)?;
     let aggregates = parse_aggregates(aggregates_json)?;
-    let out = bc_interp::dist::combine(&group_keys, &aggregates, &unwrap_batches(partials))
-        .map_err(to_pyerr)?;
+    let partials = unwrap_batches(partials)?;
+    let out = bc_interp::dist::combine(&group_keys, &aggregates, &partials).map_err(to_pyerr)?;
     Ok(PyArrowType(out))
 }
 
@@ -489,7 +564,10 @@ impl FlightShuffleServer {
         batches: Vec<PyArrowType<RecordBatch>>,
     ) -> PyResult<()> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
-        let batches: Vec<RecordBatch> = batches.iter().map(|b| normalize_batch(&b.0)).collect();
+        let batches: Vec<RecordBatch> = batches
+            .iter()
+            .map(|b| normalize_batch(&b.0))
+            .collect::<PyResult<_>>()?;
         py.allow_threads(|| shared_runtime().block_on(self.exchange.publish(&t, batches)));
         Ok(())
     }
@@ -519,13 +597,24 @@ impl FlightShuffleServer {
     /// Mirror `ticket`'s `batches` to a same-node shared-memory file (Arrow IPC over a
     /// memory map) under this server's advertised address, so a reducer in *another*
     /// process on the same host can read them with no gRPC/loopback hop. Best-effort:
-    /// a write error is swallowed (the reducer falls back to Flight).
-    fn publish_shared(&self, py: Python<'_>, ticket: &str, batches: Vec<PyArrowType<RecordBatch>>) {
-        let batches: Vec<RecordBatch> = batches.iter().map(|b| normalize_batch(&b.0)).collect();
+    /// a write error is swallowed (the reducer falls back to Flight). A batch the boundary
+    /// cannot normalize (a `UInt64` above `i64::MAX`) surfaces as an error rather than being
+    /// mirrored in a corrupted form.
+    fn publish_shared(
+        &self,
+        py: Python<'_>,
+        ticket: &str,
+        batches: Vec<PyArrowType<RecordBatch>>,
+    ) -> PyResult<()> {
+        let batches: Vec<RecordBatch> = batches
+            .iter()
+            .map(|b| normalize_batch(&b.0))
+            .collect::<PyResult<_>>()?;
         let addr = self.addr.clone();
         py.allow_threads(|| {
             let _ = bc_transport::publish_shared(&addr, ticket, &batches);
         });
+        Ok(())
     }
 
     /// Read a partition a same-node peer published under `(source_addr, ticket)` from
@@ -744,6 +833,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(execute_plan_aggregated, m)?)?;
     m.add_function(wrap_pyfunction!(combine, m)?)?;
     m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::combine_finalize_spilling, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle::partition_batches, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle::range_partition_batches, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle::salted_partition_batches, m)?)?;

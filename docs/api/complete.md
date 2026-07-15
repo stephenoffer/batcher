@@ -334,6 +334,46 @@ and slowly-changing-dimension workflows.
    :member-order: bysource
 ```
 
+## Metadata shortcuts
+
+The `ds.meta` namespace and the accessors it hands out — answers read from footers,
+manifests, and catalogs instead of from the data. See the
+[metadata shortcuts guide](../user-guide/metadata-shortcuts.md).
+
+```{eval-rst}
+.. autoclass:: batcher.api.dataset.meta.frame.DatasetMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.column.ColumnMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.checks.ColumnChecks
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.schema.SchemaMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.nulls.NullsMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.approx.ApproxMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.storage.StorageMeta
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.meta.pair.PairMeta
+   :members:
+   :member-order: bysource
+```
+
 ## SQL sessions
 
 ```{eval-rst}

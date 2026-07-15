@@ -20,7 +20,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, Float64Array, Int64Array, StringArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int64Array, StringArray, UInt32Array,
+};
 use arrow::compute::{take, SortOptions};
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use arrow::row::{RowConverter, Rows, SortField};
@@ -284,12 +286,28 @@ pub(crate) fn window_serial(
             WindowFn::PercentRank => percent_rank(&ordered, order_rows.as_ref(), num_rows)?,
             WindowFn::CumeDist => cume_dist(&ordered, order_rows.as_ref(), num_rows)?,
             WindowFn::Ntile => ntile(&ordered, call.offset, num_rows),
-            // first_value/last_value/lag/lead select a row's value by position.
-            f if f.is_value() => value_window(
+            // Value functions with no explicit frame select a row's value by
+            // position within the *whole* ordered partition
+            // (first_value/last_value/lag/lead/nth_value/fills).
+            f if f.is_value() && call.frame.is_none() => value_window(
                 f,
                 &ordered,
                 require(call.values.as_ref(), f)?,
                 call.offset,
+                num_rows,
+            )?,
+            // first_value/last_value/nth_value over an explicit frame — the frame's
+            // first / last / nth row. SQL's default value-function frame is
+            // `RANGE UNBOUNDED PRECEDING TO CURRENT ROW`, which makes last_value /
+            // nth_value *running* (the current peer's value / null-until-nth-peer)
+            // rather than the whole-partition value the frameless path computes.
+            f if f.is_value() => crate::window_frame::framed_value(
+                f,
+                &ordered,
+                require(call.values.as_ref(), f)?,
+                call.offset,
+                call.frame.expect("frame present"),
+                order_rows.as_ref(),
                 num_rows,
             )?,
             // An explicit ROWS frame aggregates the physical rows in [start, end]
@@ -336,19 +354,31 @@ fn value_window(
     if func.is_fill() {
         return crate::window_fill::fill_window(func, ordered, values, num_rows);
     }
-    let off = offset.max(0) as usize;
     let mut src: Vec<Option<u32>> = vec![None; num_rows];
     for part in ordered {
         let len = part.len();
         for (pos, &row) in part.iter().enumerate() {
-            let take_pos = match func {
+            let pos = pos as i64;
+            let take_pos: Option<usize> = match func {
                 WindowFn::FirstValue => Some(0),
                 WindowFn::LastValue => Some(len - 1),
-                WindowFn::Lag => pos.checked_sub(off),
-                WindowFn::Lead => (pos + off < len).then_some(pos + off),
-                // nth_value: the `off`-th row (1-based), same for every row of the
-                // partition; null if the partition is shorter than `off`.
-                WindowFn::NthValue => (off >= 1 && off <= len).then_some(off - 1),
+                // A negative `lag`/`lead` offset flips direction (`lag(v, -n)` == `lead(v, n)`,
+                // matching DuckDB), so index by the SIGNED target and range-check it — a plain
+                // `offset.max(0)` would collapse every negative offset to the current row.
+                // `checked_*` guards an absurd offset (e.g. i64::MIN) that would overflow.
+                WindowFn::Lag => pos
+                    .checked_sub(offset)
+                    .filter(|&t| (0..len as i64).contains(&t))
+                    .map(|t| t as usize),
+                WindowFn::Lead => pos
+                    .checked_add(offset)
+                    .filter(|&t| (0..len as i64).contains(&t))
+                    .map(|t| t as usize),
+                // nth_value: the `offset`-th row (1-based), same for every row of the
+                // partition; null if the partition is shorter than `offset`.
+                WindowFn::NthValue => {
+                    (offset >= 1 && offset <= len as i64).then_some((offset - 1) as usize)
+                }
                 _ => unreachable!("value_window on non-value/non-fill function"),
             };
             src[row] = take_pos.map(|p| part[p] as u32);
@@ -651,6 +681,11 @@ fn running_aggregate(
         DataType::Utf8 if matches!(func, WindowFn::Min | WindowFn::Max) => {
             running_str_minmax(func, ordered, order_rows, values, num_rows)
         }
+        // Boolean running MIN (AND) / MAX (OR), `false < true` — matches the aggregate
+        // MIN/MAX (B23), the whole-partition path, and DuckDB.
+        DataType::Boolean if matches!(func, WindowFn::Min | WindowFn::Max) => {
+            running_bool_minmax(func, ordered, order_rows, values, num_rows)
+        }
         other => Err(RuntimeError::UnsupportedWindow {
             func: func.name().to_string(),
             dtype: other.to_string(),
@@ -675,14 +710,19 @@ fn running_numeric_i64(
     if func == WindowFn::Avg {
         let mut out: Vec<Option<f64>> = vec![None; num_rows];
         for part in ordered {
-            let (mut sum, mut cnt, mut gs) = (0f64, 0i64, 0usize);
+            // Accumulate the running sum in i128 (like DuckDB's HUGEINT), not f64: a
+            // running `AVG(i64)` over values past 2^53 (e.g. `[2^53+1, 1]`) loses its low
+            // bit in an f64 accumulator (avg came back `…496.0` instead of `…497.0`). The
+            // exact i128 sum divided once at the peer boundary matches the interpreter and
+            // DuckDB; i128 can't overflow for any realistic i64 column (~2^64 rows).
+            let (mut sum, mut cnt, mut gs) = (0i128, 0i64, 0usize);
             for pos in 0..part.len() {
                 if arr.is_valid(part[pos]) {
-                    sum += arr.value(part[pos]) as f64;
+                    sum += arr.value(part[pos]) as i128;
                     cnt += 1;
                 }
                 if peer_boundary(part, order_rows, pos) {
-                    let v = (cnt > 0).then(|| sum / cnt as f64);
+                    let v = (cnt > 0).then(|| sum as f64 / cnt as f64);
                     for j in gs..=pos {
                         out[part[j]] = v;
                     }
@@ -701,7 +741,10 @@ fn running_numeric_i64(
                 let v = arr.value(row);
                 acc = Some(match (func, acc) {
                     (_, None) => v,
-                    (WindowFn::Sum, Some(a)) => a + v,
+                    // checked_add: an i64 running-SUM overflow errors instead of wrapping.
+                    (WindowFn::Sum, Some(a)) => {
+                        a.checked_add(v).ok_or(RuntimeError::SumOverflow)?
+                    }
                     (WindowFn::Min, Some(a)) => a.min(v),
                     (WindowFn::Max, Some(a)) => a.max(v),
                     (_, Some(a)) => a,
@@ -735,11 +778,24 @@ fn running_numeric_f64(
             if arr.is_valid(row) {
                 let v = arr.value(row);
                 cnt += 1;
+                // Total-order min/max so NaN is greatest (matches aggregate MIN/MAX/DuckDB).
                 acc = Some(match (func, acc) {
                     (_, None) => v,
                     (WindowFn::Sum | WindowFn::Avg, Some(a)) => a + v,
-                    (WindowFn::Min, Some(a)) => a.min(v),
-                    (WindowFn::Max, Some(a)) => a.max(v),
+                    (WindowFn::Min, Some(a)) => {
+                        if crate::keys::float_total_cmp(v, a).is_lt() {
+                            v
+                        } else {
+                            a
+                        }
+                    }
+                    (WindowFn::Max, Some(a)) => {
+                        if crate::keys::float_total_cmp(v, a).is_gt() {
+                            v
+                        } else {
+                            a
+                        }
+                    }
                     (_, Some(a)) => a,
                 });
             }
@@ -790,6 +846,41 @@ fn running_str_minmax(
         }
     }
     Ok(Arc::new(StringArray::from(out)))
+}
+
+/// Running boolean MIN (AND) / MAX (OR) over the ordered partition, `false < true`,
+/// with the same peer-tie sharing as the numeric running aggregates.
+fn running_bool_minmax(
+    func: WindowFn,
+    ordered: &[Vec<usize>],
+    order_rows: &Rows,
+    values: &ArrayRef,
+    num_rows: usize,
+) -> Result<ArrayRef, RuntimeError> {
+    let arr = values.as_boolean();
+    let is_min = func == WindowFn::Min;
+    let mut out: Vec<Option<bool>> = vec![None; num_rows];
+    for part in ordered {
+        let (mut acc, mut gs): (Option<bool>, usize) = (None, 0);
+        for pos in 0..part.len() {
+            let row = part[pos];
+            if arr.is_valid(row) {
+                let v = arr.value(row);
+                acc = Some(match acc {
+                    None => v,
+                    Some(a) if is_min => a && v,
+                    Some(a) => a || v,
+                });
+            }
+            if peer_boundary(part, order_rows, pos) {
+                for j in gs..=pos {
+                    out[part[j]] = acc;
+                }
+                gs = pos + 1;
+            }
+        }
+    }
+    Ok(Arc::new(BooleanArray::from(out)))
 }
 
 /// Whole-partition aggregate: compute one value per partition and broadcast it to
@@ -922,6 +1013,39 @@ mod tests {
                 "parallel != serial for {func:?}"
             );
         }
+    }
+
+    /// A negative `lag`/`lead` offset flips direction (`lag(v, -1)` == `lead(v, 1)`,
+    /// `lead(v, -1)` == `lag(v, 1)`), matching DuckDB — a `.max(0)` clamp returned the
+    /// current row for every negative offset instead.
+    #[test]
+    fn negative_offset_lag_lead_flip_direction() {
+        let order = i64s(&[1, 2, 3, 4]);
+        let vals = i64s(&[10, 20, 30, 40]);
+        let opt_ints = |a: &ArrayRef| -> Vec<Option<i64>> {
+            let x = a.as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..x.len())
+                .map(|i| x.is_valid(i).then(|| x.value(i)))
+                .collect()
+        };
+        // lag(v, -1) == lead(v, 1): [20, 30, 40, NULL]
+        let f = [WindowCall {
+            func: WindowFn::Lag,
+            values: Some(vals.clone()),
+            offset: -1,
+            frame: None,
+        }];
+        let out = window(&[], &[asc(order.clone())], &f, 4).unwrap();
+        assert_eq!(opt_ints(&out[0]), vec![Some(20), Some(30), Some(40), None]);
+        // lead(v, -1) == lag(v, 1): [NULL, 10, 20, 30]
+        let f = [WindowCall {
+            func: WindowFn::Lead,
+            values: Some(vals),
+            offset: -1,
+            frame: None,
+        }];
+        let out = window(&[], &[asc(order)], &f, 4).unwrap();
+        assert_eq!(opt_ints(&out[0]), vec![None, Some(10), Some(20), Some(30)]);
     }
 
     #[test]
@@ -1142,6 +1266,52 @@ mod tests {
     }
 
     #[test]
+    fn min_max_over_booleans() {
+        use arrow::array::BooleanArray;
+        // partition a: [true, false, null] → min=false (AND), max=true (OR).
+        // partition b: [true] → min=max=true.
+        let part = strs(&["a", "a", "a", "b"]);
+        let vals: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+        ]));
+        let funcs = [
+            WindowCall {
+                func: WindowFn::Min,
+                values: Some(vals.clone()),
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::Max,
+                values: Some(vals),
+                offset: 1,
+                frame: None,
+            },
+        ];
+        // Whole-partition (no ORDER BY).
+        let out = window(std::slice::from_ref(&part), &[], &funcs, 4).unwrap();
+        let mn = out[0].as_any().downcast_ref::<BooleanArray>().unwrap();
+        let mx = out[1].as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(!mn.value(0)); // a: AND
+        assert!(mx.value(0)); // a: OR
+        assert!(mn.value(3)); // b
+        assert!(mx.value(3));
+
+        // Running (with an ORDER BY) — cumulative AND/OR.
+        let ord = i64s(&[1, 2, 3, 1]);
+        let out = window(std::slice::from_ref(&part), &[asc(ord)], &funcs, 4).unwrap();
+        let mn = out[0].as_any().downcast_ref::<BooleanArray>().unwrap();
+        let mx = out[1].as_any().downcast_ref::<BooleanArray>().unwrap();
+        // a ordered [true, false, null]: min running = [true, false, false]; max = [true,true,true].
+        assert!(mn.value(0));
+        assert!(!mn.value(1));
+        assert!(mx.value(1));
+    }
+
+    #[test]
     fn min_max_over_strings() {
         let part = strs(&["g", "g", "h"]);
         let vals = strs(&["banana", "apple", "cherry"]);
@@ -1341,5 +1511,40 @@ mod tests {
             let parallel = window_with(&[part.clone()], &order, &funcs, n, 1).unwrap();
             assert_eq!(opt_ints(&serial[0]), opt_ints(&parallel[0]), "{func:?}");
         }
+    }
+
+    /// `window()` must route a value function that carries an explicit frame to the
+    /// frame-aware path (SQL's default value frame). `last_value` over
+    /// `RANGE UNBOUNDED PRECEDING TO CURRENT ROW` with a tied order key is the current
+    /// peer group's value, not the whole-partition last (the frameless path).
+    #[test]
+    fn last_value_with_range_frame_is_running() {
+        use crate::window_frame::{Frame, FrameBound, FrameUnit};
+        // Order key [10,10,20,20,30]: peer groups {0,1},{2,3},{4}.
+        let ord = i64s(&[10, 10, 20, 20, 30]);
+        let vals = i64s(&[1, 2, 3, 4, 5]);
+        let range_running = Frame {
+            unit: FrameUnit::Range,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
+        };
+        let framed = [WindowCall {
+            func: WindowFn::LastValue,
+            values: Some(vals.clone()),
+            offset: 1,
+            frame: Some(range_running),
+        }];
+        let out = window(&[], &[asc(ord.clone())], &framed, 5).unwrap();
+        assert_eq!(ints(&out[0]), vec![2, 2, 4, 4, 5]);
+
+        // Frameless last_value stays whole-partition (the DataFrame default).
+        let frameless = [WindowCall {
+            func: WindowFn::LastValue,
+            values: Some(vals),
+            offset: 1,
+            frame: None,
+        }];
+        let out2 = window(&[], &[asc(ord)], &frameless, 5).unwrap();
+        assert_eq!(ints(&out2[0]), vec![5, 5, 5, 5, 5]);
     }
 }

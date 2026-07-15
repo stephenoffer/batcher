@@ -1299,6 +1299,86 @@ mod tests {
         assert!(anon.fetch(ticket.to_string()).await.is_err());
     }
 
+    fn zero_row_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(Vec::<i64>::new()))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn all_zero_row_bucket_resolves_to_empty_without_hanging() {
+        // A bucket made only of zero-row batches must resolve to "no rows" promptly. The
+        // Flight encoder emits no message for a zero-row batch, so without the producer's
+        // filter the consumer would wait the whole idle window for a batch that never
+        // comes and then report this healthy worker as unreachable. The outer timeout
+        // (well below the default idle window) turns any such regression into a failure
+        // rather than a hang.
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(77, 0, 0, 0, 0);
+        producer
+            .publish(
+                &ticket,
+                vec![zero_row_batch(), zero_row_batch(), zero_row_batch()],
+            )
+            .await;
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ShuffleExchange::fetch_with_credits(&addr, &ticket, 2),
+        )
+        .await
+        .expect("must not hang on an all-zero-row bucket")
+        .unwrap();
+        assert!(out.is_empty(), "all-zero-row bucket resolves to no rows");
+    }
+
+    #[tokio::test]
+    async fn local_partition_matches_network_fetch_for_zero_row_bucket() {
+        // The `local_partition` doc claims DIRECT_MEMORY is "byte-for-byte equal to what a
+        // network fetch would return". A bucket with an interior zero-row batch exercises
+        // that claim: the network path filters zero-row batches; local must agree.
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(99, 0, 0, 0, 0);
+        producer
+            .publish(&ticket, vec![one_row(1), zero_row_batch(), one_row(2)])
+            .await;
+        let net = ShuffleExchange::fetch_with_credits(&addr, &ticket, 4)
+            .await
+            .unwrap();
+        let local = producer.local_partition(&ticket).await.unwrap();
+        assert_eq!(
+            local, net,
+            "DIRECT_MEMORY must return the same batches as a network fetch"
+        );
+    }
+
+    fn one_row(v: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![v]))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn credited_path_preserves_nulls_and_strings_under_every_codec() {
+        // The credited do_exchange path with nulls + variable-length strings under each
+        // wire codec must be byte-identical. Existing codec tests only cover Int64.
+        for code in [0u64, 1, 2] {
+            crate::set_compression(code);
+            let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+            let addr = producer.addr().to_string();
+            let ticket = ShuffleTicket::new(88, code as u32, 0, 0, 0);
+            producer.publish(&ticket, vec![batch_a(), batch_a2()]).await;
+            let got = ShuffleExchange::fetch_with_credits(&addr, &ticket, 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                got,
+                vec![batch_a(), batch_a2()],
+                "codec {code}: exact bytes"
+            );
+        }
+        crate::set_compression(1);
+    }
+
     #[test]
     fn https_uri_upgrades_bare_and_http_addresses() {
         assert_eq!(tls::https_uri("1.2.3.4:50"), "https://1.2.3.4:50");

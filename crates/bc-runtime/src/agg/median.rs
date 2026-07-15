@@ -31,6 +31,23 @@ pub(crate) fn median_state(
     bucket_values_into_list(&Int64Array::from(kept_groups), &kept_values, num_groups)
 }
 
+/// Partial state for `array_agg`/`list_agg`: each group's values as one `List` column,
+/// **keeping NULL elements** and their arrival order within the partial.
+///
+/// Unlike [`median_state`], which filters nulls (correct for a median, which ignores
+/// them), SQL `array_agg(x)` collects every value including NULLs — `array_agg` over
+/// `[3, NULL, 1]` is `[3, NULL, 1]`, not `[3, 1]`. Reusing `median_state` here dropped
+/// them. The merge (`merge_median`) and finalize (the list itself) already preserve
+/// nulls, so collecting them at `partial` is the whole fix.
+pub(crate) fn listagg_state(
+    values: &ArrayRef,
+    group_ids: &[u32],
+    num_groups: usize,
+) -> Result<ArrayRef, RuntimeError> {
+    let groups: Vec<i64> = group_ids.iter().map(|&g| g as i64).collect();
+    bucket_values_into_list(&Int64Array::from(groups), values, num_groups)
+}
+
 /// Merge per-group value lists across partitions (flatten to `(group, value)`,
 /// re-bucket — no dedup, unlike COUNT(DISTINCT)).
 pub(crate) fn merge_median(
@@ -188,7 +205,15 @@ fn quickselect_quantile(v: &mut [f64], q: f64) -> f64 {
 /// The output preserves the input element type; empty groups → null.
 pub(crate) fn finalize_mode(state: &ArrayRef) -> Result<ArrayRef, RuntimeError> {
     let list = state.as_list::<i32>();
-    let child = list.values();
+    // Canonicalize float leaves BEFORE grouping so `-0.0`/`0.0` (and every NaN bit pattern)
+    // count as one value — the same distinct identity `GROUP BY`, `count(distinct)`, and
+    // DuckDB use. Arrow's row format is NOT canonical for floats, so without this
+    // `mode([-0.0, -0.0, 0.0])` returned `-0.0` (a spurious 2-vs-1 frequency split) instead
+    // of `0.0`, and multi-NaN groups fractured. `take`ing the winner from the canonical
+    // column also returns the canonical representative (`0.0`, one quiet NaN) DuckDB does.
+    let child_ref = list.values();
+    let canon = crate::keys::canonicalize_float_keys(std::slice::from_ref(child_ref));
+    let child: &ArrayRef = canon.as_ref().map_or(child_ref, |c| &c[0]);
     // Encode every value once into arrow's order-preserving row format, so values
     // of any type can be compared/grouped (and ties broken by the smallest value).
     let converter = RowConverter::new(vec![SortField::new(child.data_type().clone())])?;
@@ -238,7 +263,14 @@ pub(crate) fn finalize_histogram(state: &ArrayRef) -> Result<ArrayRef, RuntimeEr
     use arrow::datatypes::{Field, Fields};
 
     let list = state.as_list::<i32>();
-    let child = list.values();
+    // Canonicalize float leaves BEFORE grouping so `-0.0`/`0.0` (and every NaN bit pattern)
+    // form ONE histogram key with the summed count — matching `GROUP BY`, `count(distinct)`,
+    // and DuckDB. Arrow's row format is not canonical for floats, so without this
+    // `histogram([0.0, -0.0])` produced two keys of count 1 instead of `{0.0: 2}`. The map
+    // keys are `take`n from the canonical column, so they read back as the canonical value.
+    let child_ref = list.values();
+    let canon = crate::keys::canonicalize_float_keys(std::slice::from_ref(child_ref));
+    let child: &ArrayRef = canon.as_ref().map_or(child_ref, |c| &c[0]);
     let converter = RowConverter::new(vec![SortField::new(child.data_type().clone())])?;
     let rows = converter.convert_columns(std::slice::from_ref(child))?;
     let offsets = list.value_offsets();
@@ -320,6 +352,61 @@ mod tests {
         assert!(modes.is_valid(0) && !modes.is_valid(1));
     }
 
+    /// `mode` over a Float64 group must fold `-0.0`/`0.0` (and every NaN) into one value —
+    /// the same distinct identity `GROUP BY`/`count(distinct)`/DuckDB use. Before the fix the
+    /// non-canonical row encoding split `[-0.0, -0.0, 0.0]` into a 2-vs-1 frequency race and
+    /// returned `-0.0`; the canonical mode is `0.0` (frequency 3).
+    #[test]
+    fn mode_folds_signed_zero_and_nan() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![-0.0, -0.0, 0.0]));
+        let state = median_state(&values, &[0u32, 0, 0], 1).unwrap();
+        let modes = finalize_mode(&state).unwrap();
+        let m = modes.as_primitive::<Float64Type>();
+        // Canonical `+0.0` (bits 0), NOT `-0.0` (bits 0x8000…): the two zeros are one value.
+        assert_eq!(m.value(0).to_bits(), 0.0f64.to_bits(), "mode must fold -0.0 into +0.0");
+
+        // Two differing NaN bit patterns are one value → mode is that (canonical) NaN, not a tie.
+        let nans: ArrayRef = Arc::new(Float64Array::from(vec![
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            1.0,
+        ]));
+        let st = median_state(&nans, &[0u32, 0, 0], 1).unwrap();
+        let out = finalize_mode(&st).unwrap();
+        assert!(
+            out.as_primitive::<Float64Type>().value(0).is_nan(),
+            "the two NaNs collapse to frequency 2 and win over the single 1.0"
+        );
+    }
+
+    /// `histogram` over a Float64 group must fold `-0.0`/`0.0` (and every NaN) into ONE key
+    /// with the summed count. Before the fix `[0.0, -0.0]` produced two keys of count 1
+    /// instead of `{0.0: 2}`.
+    #[test]
+    fn histogram_folds_signed_zero_and_nan() {
+        use arrow::array::MapArray;
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![0.0, -0.0]));
+        let state = median_state(&values, &[0u32, 0], 1).unwrap();
+        let out = finalize_histogram(&state).unwrap();
+        let m = out.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(m.value_length(0), 1, "-0.0 and 0.0 are ONE histogram key");
+        let counts = m.value(0);
+        let counts = counts.column(1).as_primitive::<Int64Type>();
+        assert_eq!(counts.value(0), 2, "the folded zero key has count 2");
+
+        // Two NaN bit patterns → one key, count 2.
+        let nans: ArrayRef = Arc::new(Float64Array::from(vec![
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001),
+        ]));
+        let st = median_state(&nans, &[0u32, 0], 1).unwrap();
+        let o = finalize_histogram(&st).unwrap();
+        let mm = o.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(mm.value_length(0), 1, "all NaN is ONE histogram key");
+        let c = mm.value(0);
+        assert_eq!(c.column(1).as_primitive::<Int64Type>().value(0), 2);
+    }
+
     #[test]
     fn histogram_counts_and_null_group() {
         use arrow::array::{Int64Array, MapArray};
@@ -335,6 +422,41 @@ mod tests {
         assert_eq!(counts.value(0), 2); // key 1 → count 2 (sorted ascending)
         assert_eq!(counts.value(1), 1); // key 2 → count 1
         assert!(m.is_null(1)); // all-null group → NULL map
+    }
+
+    #[test]
+    fn listagg_keeps_nulls_and_order_and_merges() {
+        use arrow::array::ListArray;
+        // group 0: [3, NULL, 1, 3]  → array_agg keeps the NULL and arrival order.
+        // group 1: [NULL]           → a single NULL element (not an empty list).
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(3),
+            None,
+            Some(1),
+            Some(3),
+            None,
+        ]));
+        let group_ids = [0u32, 0, 0, 0, 1];
+        let state = listagg_state(&values, &group_ids, 2).unwrap();
+        let list = state.as_any().downcast_ref::<ListArray>().unwrap();
+
+        let row0 = list.value(0);
+        let g0 = row0.as_primitive::<Int64Type>();
+        let got0: Vec<Option<i64>> = (0..g0.len())
+            .map(|i| g0.is_valid(i).then(|| g0.value(i)))
+            .collect();
+        assert_eq!(got0, vec![Some(3), None, Some(1), Some(3)]);
+
+        let row1 = list.value(1);
+        let g1 = row1.as_primitive::<Int64Type>();
+        assert_eq!(g1.len(), 1);
+        assert!(g1.is_null(0)); // a lone NULL is preserved, not dropped to an empty list
+
+        // median_state, by contrast, filters the nulls — the two states must differ.
+        let med = median_state(&values, &group_ids, 2).unwrap();
+        let med_list = med.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(med_list.value(0).len(), 3); // [3,1,3] — the NULL is gone
+        assert_eq!(med_list.value(1).len(), 0); // all-null group → empty list
     }
 
     #[test]
@@ -378,6 +500,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn median_and_quantile_with_nan_do_not_panic() {
         // A NaN in the value list previously panicked via partial_cmp(..).unwrap().
         let values: ArrayRef = Arc::new(Float64Array::from(vec![1.0, f64::NAN, 3.0, 2.0]));

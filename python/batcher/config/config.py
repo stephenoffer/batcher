@@ -20,6 +20,7 @@ import dataclasses
 import functools
 import json
 import os
+import typing
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -54,6 +55,7 @@ _ENGINE_CONFIG_FIELDS = (
     "spill_compression",
     "fuse_linear",
     "shrink_output_dtypes",
+    "streaming",
     # Performance-threshold knobs (mirror `bc_arrow::RuntimeTuning`).
     "bloom_fp_rate",
     "bloom_min_build_rows",
@@ -142,6 +144,18 @@ class ExecutionConfig:
     # untouched) and is a measured win on linear pipelines with no regression elsewhere.
     # Set to False to pin the staged operator-at-a-time path.
     fuse_linear: bool = True
+    #: Run plans on the **streaming** executor: pull morsels through the linear runs and
+    #: materialize only at breakers, instead of collecting every operator's full output.
+    #: Peak memory becomes a constant (the breakers' state plus one morsel per worker) rather
+    #: than the sum of every intermediate — which is why TPC-H sf100's deep join trees peaked at
+    #: 133 GB and were OOM-killed — and on those shapes it is also *faster*, because the copies
+    #: it stops making were not free. Shipped to Rust as `EngineConfig.streaming`.
+    #:
+    #: The streaming breakers fold in memory rather than spilling, so one whose state exceeds
+    #: `memory.max_memory_bytes` hands the query back and it is re-run on the materializing
+    #: executor, which spills. Set False to force that executor for every query — a bisecting
+    #: escape hatch, not a tuning knob.
+    streaming: bool = True
     # Re-narrow output columns to their source numeric width. The FFI widens narrow
     # numerics (Int8/16/32, Float16/32) to Int64/Float64 once on input so every kernel
     # stays on two well-tested paths; with this on, an output column that is a
@@ -870,6 +884,18 @@ class DistributedConfig:
     # follow). Sized longer than a node's boot time so a genuinely-launching node is not
     # abandoned before it joins.
     autoscale_stall_s: float = 90.0
+    # Grace window for the FIRST sign of growth. Distinct from `autoscale_stall_s`, which
+    # governs a stall *after* the cluster has started growing: this bounds how long to wait
+    # before concluding the autoscaler is not going to act at all. A request the autoscaler
+    # cannot satisfy — a fixed cluster already at max, or infeasible spot capacity — produces
+    # zero growth from the start, and the query is already runnable on the capacity it has
+    # (the fan-out clamps to it), so the extra nodes are an optimization, not a prerequisite.
+    # Waiting the full `autoscale_stall_s` for them taxed EVERY cold query that asked for more
+    # cores than the cluster has (a large aggregate's data-parallel fan-out routinely exceeds
+    # the node count) — 90 s of dead time before a 9 s query. Kept above a couple of poll
+    # intervals so a cluster whose nodes register as pending within a few seconds still gets
+    # its full `autoscale_stall_s`; the moment any growth appears, that longer window governs.
+    autoscale_startup_grace_s: float = 12.0
     # Skew-aware join salting for a huge x huge hot key. When a single join key is
     # dominated by a few "hot" values, those rows otherwise co-partition onto one
     # reducer and overload it (memory + the output explosion + a straggler). With
@@ -1306,6 +1332,7 @@ class Config:
             self.memory.spill_compression,
             self.execution.fuse_linear,
             self.execution.shrink_output_dtypes,
+            self.execution.streaming,
             self.execution.bloom_fp_rate,
             self.execution.bloom_min_build_rows,
             self.execution.window_parallel_row_threshold,
@@ -1420,19 +1447,56 @@ class Config:
         return _resolved(_overlay_dict(base if base is not None else cls(), data))
 
 
-def _coerce(raw: str, to: type) -> object:
+_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
+_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def _coerce(raw: str, to: object) -> object:
     if to is bool:
-        return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return raw.strip().lower() in _TRUE_TOKENS
     if to is int:
         return int(raw)
     if to is float:
         return float(raw)
+    # A `bool | str` field (e.g. `runtime_bloom_join = "auto"`): a recognized boolean
+    # token coerces to a real bool, everything else stays the string. Without this the
+    # whole union was returned uncoerced, so `BATCHER_..._RUNTIME_BLOOM_JOIN=true` shipped
+    # the *string* "true" — which then failed validation ("must be True, False, or 'auto'")
+    # while the string literal "auto" happened to pass. Enabling/disabling the feature via
+    # env raised `ConfigError`; a string-valued sentinel like "auto" still passes through.
+    members = [a for a in typing.get_args(to) if a is not type(None)]
+    if bool in members and raw.strip().lower() in (_TRUE_TOKENS | _FALSE_TOKENS):
+        return raw.strip().lower() in _TRUE_TOKENS
+    if str in members:
+        return raw
     return raw
+
+
+def _scalar_type(annotation: object) -> object:
+    """The scalar member of an `Optional`/`X | None` annotation, else the annotation itself.
+
+    So an env override of an optional-typed field (`int | None`, `float | None`) coerces to
+    `int`/`float` rather than to the *default value's* runtime type — which is `NoneType` when
+    the default is `None`, and would leave the raw string uncoerced (a wrong-typed config that
+    then fails validation or ships a string across the Rust wire contract)."""
+    args = typing.get_args(annotation)
+    if args:
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            return non_none[0]
+    return annotation
+
+
+@functools.cache
+def _field_scalar_types(cls: type) -> dict[str, object]:
+    """Each field's coercion target type, resolved from the class annotations (cached)."""
+    return {name: _scalar_type(ann) for name, ann in typing.get_type_hints(cls).items()}
 
 
 def _overlay_env(obj: Config, prefix: str, env: dict[str, str]) -> Config:
     """Recursively overlay env vars onto a (possibly nested) frozen config object."""
     updates: dict[str, object] = {}
+    field_types = _field_scalar_types(type(obj))
     for field in dataclasses.fields(obj):
         current = getattr(obj, field.name)
         key = f"{prefix}_{field.name.upper()}"
@@ -1441,7 +1505,9 @@ def _overlay_env(obj: Config, prefix: str, env: dict[str, str]) -> Config:
             if replaced is not current:
                 updates[field.name] = replaced
         elif key in env:
-            updates[field.name] = _coerce(env[key], type(current))
+            # Coerce against the *declared* field type, not `type(current)`: an optional
+            # field defaulting to None would otherwise resolve to NoneType and skip coercion.
+            updates[field.name] = _coerce(env[key], field_types.get(field.name, type(current)))
     return replace(obj, **updates) if updates else obj
 
 

@@ -1772,3 +1772,54 @@ The single-GPU-fits case reads the shard **on the worker** (no driver materializ
 small queries on the CPU and only reaches for the GPU where it pays. *Caveat:* the CPU reference
 here runs single-node (the workspace's broken default pip blocks Batcher's distributed CPU
 tasks), so it is the correctness oracle, not a CPU-vs-Ray-Data-distributed claim.
+
+### Metadata shortcuts — what the *ordinary* API costs (`benchmarks/metadata_bench.py`)
+
+Not a new surface: the same calls people already write, made cheap. Each query below is timed
+twice over the same 10 M-row Parquet file — once normally, once with the metadata layer
+genuinely switched off (`map_batches` is opaque to the IR, so Kyber declines to reason about the
+plan; the identity callback changes no row). Each pair is asserted **equal** before either is
+timed; a differing answer is a bug, not a result.
+
+**Nothing in this table mentions `ds.meta`.** That is the point — the metadata layer is not a
+surface to opt into, it is the cost of the surface you already use.
+
+| query | metadata | executed | speedup |
+|-------------------------------------|---------:|----------:|--------:|
+| `ds.count()` | 0.11 ms | 580 ms | **5105×** |
+| `ds.min("amount")` | 0.13 ms | 646 ms | **4963×** |
+| `ds.max("amount")` | 0.14 ms | 607 ms | **4280×** |
+| `ds.n_null("amount")` | 0.19 ms | 541 ms | **2836×** |
+| `ds.n_null("name")` (**string** column) | 0.15 ms | 112 ms | **766×** |
+| `ds.null_count()` (every column) | 0.27 ms | 585 ms | **2182×** |
+| `ds.limit(n).count()`, `n` ≥ rows | 0.21 ms | 604 ms | **2811×** |
+| `ds.filter(amount > 0).count()` (always true) | 0.70 ms | 710 ms | **1013×** |
+| `ds.drop_nulls(["id"]).count()` (no nulls) | 0.63 ms | 613 ms | **968×** |
+| `ds.join(disjoint_keys).collect()` | 1.04 ms | 999 ms | **959×** |
+| `ds.filter(amount > 1e9).collect()` (refuted) | 0.83 ms | 548 ms | **658×** |
+| `ds.dq.in_range(...).validate()` | 1.35 ms | 645 ms | **476×** |
+| `ds.dq.not_null(...).in_range(...).fail()` | 2.21 ms | 848 ms | **384×** |
+
+The last three are the ones that change what a query *costs* rather than shaving it. A join
+whose key ranges cannot overlap emits nothing — provable from four numbers, with neither side
+built, probed, or shuffled. And a data-quality contract exists precisely to *confirm* that data
+is fine, which is the answer a footer usually already contains: `in_range(amount, 0, 10000)`
+over a column whose recorded range is `[1, 1000]` cannot be violated.
+
+A string column's **null** answers (`n_null`, `has_nulls`, `null_count()`, `count(name)`,
+`dq.not_null`) are free too: a Parquet footer records the null count exactly for every type,
+even when the column's min/max are writer-truncated. That was previously discarded — the exact
+null count was thrown away with the inexact bounds (B32).
+
+**Known gap.** `sum`/`mean`/`n_unique`/`distinct(key)`/`describe` still scan on a file source,
+and cannot not: a Parquet footer records no distinct count and no total. An in-memory relation
+computes and caches both (so the *second* query is free), but a file source has no
+content-sensitive identity, so caching a measurement under its path would go stale the moment
+anything rewrote the file — a wrong answer, not a slow one. Closing this properly needs a
+content digest in `Source.identity()`, which is a separate change.
+
+**Known gap (floats).** The maximum of a float column is not answerable from a Parquet footer:
+the spec omits NaN from column statistics, so the recorded max is the largest *non-NaN* value
+while SQL ranks NaN above every number. The minimum still comes free (a dropped NaN can never
+have been the minimum). Integer and temporal columns pay nothing, and neither does an in-memory
+source (it computes NaN-aware bounds and declares so via `SourceStatistics.bounds_include_nan`).

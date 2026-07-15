@@ -115,11 +115,18 @@ def _disjoint_keys(node: Join, ctx: OptimizerContext) -> bool:
     Nulls need no care: `min`/`max` ignore them and a null key matches nothing anyway.
     Incomparable bound types (a `TypeError` on the comparison) are simply undecidable.
     """
+    from batcher.plan.stats import ambiguous_float_bound
+
     left = ctx.estimator.estimate(node.left)
     right = ctx.estimator.estimate(node.right)
     for lk, rk in zip(node.left_keys, node.right_keys, strict=True):
         a, b = left.column(lk), right.column(rk)
         if not (_exact_range(a) and _exact_range(b)):
+            continue
+        # A NaN or zero float bound proves no disjointness: the engine's key equality is
+        # *canonicalized* (`-0.0` folds into `0.0`, every NaN into one value) while this
+        # comparison is Python's, so the two can disagree about which values are "the same".
+        if any(ambiguous_float_bound(v) for v in (a.min, a.max, b.min, b.max)):
             continue
         try:
             if a.max < b.min or b.max < a.min:

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml.preprocessors.base import Preprocessor, distinct_values
-from batcher.plan.expr_ir import Expr, col, when
+from batcher.plan.expr_ir import Expr, col, lit, when
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -30,7 +30,11 @@ def _ordinal_expr(column: str, categories: list[Any], unknown_value: int) -> Exp
         cond = col(column) == cat
         builder = when(cond).then(idx) if builder is None else builder.when(cond).then(idx)
     if builder is None:
-        return col(column) * 0 + unknown_value
+        # No categories were learned (an all-null column, or an empty fit set): every row
+        # is "unseen", so the whole column is `unknown_value`. A broadcast literal is the
+        # only correct constant here — `col(column) * 0` raises on a null/string column
+        # (`Null * Int64` / `Utf8 * Int64`), crashing the documented all-unknown result.
+        return lit(unknown_value)
     return builder.otherwise(unknown_value)
 
 

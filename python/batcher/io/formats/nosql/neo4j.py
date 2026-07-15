@@ -146,11 +146,17 @@ class Neo4jSource(ScanSource):
     ) -> Iterator[pa.RecordBatch]:
         skip, limit = partition
         cypher = self._conn_kwargs["cypher"]
-        if limit:
+        # A window is ``(skip, limit)`` where ``limit == 0`` means *unbounded* — the tail of
+        # the cover, which must still honour its ``skip`` and run to the end of the result.
+        # Guarding on ``limit`` alone dropped the ``SKIP`` for that tail window, so it re-read
+        # the whole result and every prior window's rows came back a second time.
+        if skip or limit:
             order = self._conn_kwargs["order_by"]
             if order:
                 cypher += f" ORDER BY {order}"
-            cypher += f" SKIP {skip} LIMIT {limit}"
+            cypher += f" SKIP {skip}"
+            if limit:
+                cypher += f" LIMIT {limit}"
         driver = self._driver()
         schema = self.schema() if not projection else None
         try:

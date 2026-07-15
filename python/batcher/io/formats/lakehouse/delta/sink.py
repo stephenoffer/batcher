@@ -209,7 +209,16 @@ class DeltaSink:
 
         mask = None
         for column, value in written.partition_values.items():
-            eq = pc.equal(table.column(column), pa.scalar(value, table.schema.field(column).type))
+            col = table.column(column)
+            # A null partition value selects the rows where the column IS NULL — `col == NULL`
+            # evaluates to NULL for every row (never True), so an equality mask would match no
+            # rows and hand this file all-zero statistics: num_records 0, no bounds. The reader
+            # then prunes the file on any predicate and its rows vanish. `is_null` selects them.
+            eq = (
+                pc.is_null(col)
+                if value is None
+                else pc.equal(col, pa.scalar(value, table.schema.field(column).type))
+            )
             mask = eq if mask is None else pc.and_(mask, eq)
         rows = table.filter(mask) if mask is not None else table
         return collect_file_stats(rows.drop_columns(list(written.partition_values)))

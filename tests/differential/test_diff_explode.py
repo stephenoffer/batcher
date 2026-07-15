@@ -46,3 +46,38 @@ def test_explode_with_alias(duck):
     out = bt.from_arrow(_lists()).explode("a", alias="x").collect()
     duck.register("t", _lists())
     assert_same(out, duck.sql("SELECT UNNEST(a) AS x, b FROM t"))
+
+
+def test_explode_fixed_size_list(duck):
+    """`explode` of a fixed-size-list column expands each row into its elements, like a
+    variable-length list — previously it errored though the planner advertised a schema
+    for it. Null rows drop (UNNEST semantics)."""
+    from conftest import assert_same
+
+    t = pa.table(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int64()),
+            "xs": pa.array([[1, 2], None, [3, 4]], type=pa.list_(pa.int64(), 2)),
+        }
+    )
+    out = bt.from_arrow(t).explode("xs").collect()
+    assert out.num_rows == 4  # row 1 (null) drops; rows 0 and 2 give two elems each
+    # DuckDB reads the fixed-size list as a regular list for UNNEST.
+    reg = pa.table(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int64()),
+            "xs": pa.array([[1, 2], None, [3, 4]], type=pa.list_(pa.int64())),
+        }
+    )
+    duck.register("t", reg)
+    assert_same(out, duck.sql("SELECT id, UNNEST(xs) AS xs FROM t"))
+
+
+def test_explode_alias_collision_raises():
+    """`explode(col, alias=other)` where `other` is an existing column must raise —
+    otherwise the output carries two same-named columns and silently drops one."""
+    from batcher._internal.errors import PlanError
+
+    t = pa.table({"a": [1, 2], "xs": pa.array([[10], [20]])})
+    with pytest.raises(PlanError, match="collides"):
+        bt.from_arrow(t).explode("xs", alias="a")

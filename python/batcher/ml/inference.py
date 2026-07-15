@@ -91,8 +91,12 @@ def _run_with_oom_retry(worker: Worker, batch: pa.RecordBatch) -> tuple[pa.Recor
         right, right_ms = _run_with_oom_retry(worker, batch.slice(mid))
         import pyarrow as pa
 
-        merged = pa.Table.from_batches([left, right]).combine_chunks().to_batches()
-        out = merged[0] if merged else left
+        # Concatenate the halves into a single batch. `concat_batches` keeps every
+        # row (and raises a clear error on a genuine >2 GiB offset overflow) — unlike
+        # `Table.from_batches(...).combine_chunks().to_batches()[0]`, which splits into
+        # multiple batches at the 32-bit offset limit and would then silently DROP all
+        # but the first, losing rows for large binary/string/list inference outputs.
+        out = pa.concat_batches([left, right])
         return out, left_ms + right_ms
 
 

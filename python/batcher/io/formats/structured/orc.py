@@ -54,6 +54,12 @@ class ORCStripeSplit:
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         batch = self._file().read_stripe(self.stripe, columns=projection)
+        # `read_stripe(columns=...)` returns columns in the file's schema order, not
+        # the requested order — unlike Parquet/CSV/Arrow. Re-select so a projection is
+        # honored as an ordered list (a `select("c", "a")` pushed to the scan must
+        # yield `c, a`).
+        if projection is not None:
+            batch = batch.select(projection)
         return [batch]
 
     def schema(self) -> pa.Schema:
@@ -87,7 +93,13 @@ class ORCSource(FileSource):
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
         orc = _require_orc()
-        return orc.ORCFile(fh).read(columns=projection).to_batches()
+        table = orc.ORCFile(fh).read(columns=projection)
+        # `ORCFile.read(columns=...)` returns columns in file order, not the requested
+        # order (Parquet/CSV/Arrow all preserve it). Re-select so projection order is
+        # honored — otherwise `select("c", "a")` pushed to an ORC scan yields `a, c`.
+        if projection is not None:
+            table = table.select(projection)
+        return table.to_batches()
 
     @staticmethod
     def _pa_filter(predicate: dict | None) -> Any:
@@ -125,7 +137,12 @@ class ORCSource(FileSource):
         with self._fs.open(path) as fh:
             return orc.ORCFile(fh).nrows
 
-    def _file_splits(self, path: str, target_size: int | None) -> list[Split]:  # noqa: ARG002
+    def _file_splits(
+        self,
+        path: str,
+        target_size: int | None,  # noqa: ARG002
+        predicate: dict | None = None,  # noqa: ARG002 (ORC stripe pruning not wired here)
+    ) -> list[Split]:
         orc = _require_orc()
         with self._fs.open(path) as fh:
             nstripes = orc.ORCFile(fh).nstripes

@@ -371,22 +371,47 @@ def release_autoscale() -> None:
             _apply_autoscale_floor(0, 0)
 
 
+# The capacity a wait *confirmed* the autoscaler won't exceed (set when a wait stalls below
+# target): a later query asking for more skips the wait instead of re-discovering the same
+# ceiling, so a fixed-at-max cluster pays the startup grace ONCE, not per cold query. A wait
+# that grows the cluster lifts it (`_note_reached`), so real scale-up is never pinned stale.
+_reachable_ceiling: float = float("inf")
+_ceiling_lock = threading.Lock()
+
+
+def _note_ceiling(best_cpus: int) -> None:
+    """Record that the autoscaler stalled at `best_cpus` — the cluster will not exceed it."""
+    global _reachable_ceiling
+    with _ceiling_lock:
+        _reachable_ceiling = min(_reachable_ceiling, float(best_cpus))
+
+
+def _note_reached(cpus: int) -> None:
+    """Lift a stale ceiling once capacity has climbed past it (the cluster grew/recovered)."""
+    global _reachable_ceiling
+    with _ceiling_lock:
+        if cpus > _reachable_ceiling:
+            _reachable_ceiling = float("inf")
+
+
+def _reset_capacity_ceiling() -> None:
+    """Forget the learned ceiling (tests; and any caller that wants a fresh probe)."""
+    global _reachable_ceiling
+    with _ceiling_lock:
+        _reachable_ceiling = float("inf")
+
+
 def await_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
     """Block (bounded, growth-detected) until the autoscaler grows the cluster toward
     `target_cpus` cores (and `target_gpus` GPUs).
 
-    Called *before* the fan-out is sized to the cluster, so a query that triggered a
-    scale-up (`request_autoscale`) fills the SCALED-UP cluster rather than the pre-scale
-    one — the load-bearing step for out-of-the-box cluster saturation. Without it, the
-    worker-per-node fill reads the current (small) topology and the query never uses the
-    nodes it asked for; the wait inside `clamp_workers` can't fix that because the fill
-    has already made `workers == capacity`.
-
-    A no-op when the wait is disabled (`autoscale_wait_s <= 0`), Ray is down, or the
-    cluster already covers the target. On a fixed cluster (or spot capacity the autoscaler
-    cannot get) it returns quickly via `_await_autoscale`'s stall-window bail, so it never
-    blocks the whole budget on nodes that will not arrive. Pure scheduling — the result is
-    identical whether it waits or not.
+    Called *before* the fan-out is sized to the cluster, so a query that triggered a scale-up
+    (`request_autoscale`) fills the SCALED-UP cluster rather than the pre-scale one — without
+    it the worker-per-node fill reads the current (small) topology and the query never uses
+    the nodes it asked for. A no-op when the wait is disabled, Ray is down, the cluster already
+    covers the target, or a previous wait learned it will not reach the target
+    (`_reachable_ceiling`) — so a fixed cluster pays the startup grace once, not per query.
+    Pure scheduling — the result is identical whether it waits or not.
     """
     if active_config().distributed.autoscale_wait_s <= 0 or target_cpus <= 0:
         return
@@ -395,7 +420,21 @@ def await_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
     if not ray.is_initialized():
         return
     topo = cluster_topology()
-    _await_autoscale(target_cpus, int(topo["cpus"]), target_gpus, float(topo["gpus"]))
+    avail = int(topo["cpus"])
+    # Read current capacity BEFORE the ceiling short-circuit, so a cluster grown since the
+    # ceiling was learned re-probes: covering the target returns satisfied (lifting the stale
+    # ceiling); merely exceeding it drops the bound and waits for the rest.
+    if avail >= target_cpus and float(topo["gpus"]) >= target_gpus:
+        if target_gpus <= 0:
+            _note_reached(avail)
+        return
+    with _ceiling_lock:
+        ceiling = _reachable_ceiling
+    if avail > ceiling:
+        _note_reached(avail)  # capacity climbed past the old ceiling — it is stale
+    elif target_cpus > ceiling and target_gpus <= 0:
+        return  # a prior wait proved this is unreachable — don't re-discover it
+    _await_autoscale(target_cpus, avail, target_gpus, float(topo["gpus"]))
 
 
 def _await_autoscale(
@@ -404,15 +443,11 @@ def _await_autoscale(
     """Wait (bounded) for the cluster to grow to `target_cpus` (and `target_gpus`), returning
     observed CPUs.
 
-    Polls the live CPU/GPU counts every `autoscale_poll_s` until both cover their targets
-    or `autoscale_wait_s` elapses, then returns the CPU count — so a query that triggered a
-    scale-up runs on the bigger cluster. A GPU stage waits for the GPUs to arrive too, not
-    just the cores (otherwise it would clamp to the 0 GPUs visible before the GPU node is
-    up). A no-op (returns `avail` immediately) when the wait is disabled or the cluster
-    already fits. Stops the instant capacity is sufficient, and — via the
-    `autoscale_stall_s` grace window — also stops early once capacity has been flat that
-    long (a fixed cluster, or spot capacity the autoscaler cannot get), so it never blocks
-    the whole budget on nodes that will not arrive.
+    Polls the live CPU/GPU counts every `autoscale_poll_s` until both cover their targets or
+    `autoscale_wait_s` elapses, then returns the CPU count. A GPU stage waits for the GPUs
+    too, not just the cores (else it clamps to the 0 GPUs visible before the GPU node boots).
+    A no-op (returns `avail`) when the wait is disabled or the cluster already fits; stops
+    early via the grace windows below when capacity goes flat.
     """
     dc = active_config().distributed
     if dc.autoscale_wait_s <= 0 or (avail >= target_cpus and avail_gpus >= target_gpus):
@@ -421,12 +456,21 @@ def _await_autoscale(
 
     deadline = time.monotonic() + dc.autoscale_wait_s
     poll = max(0.1, dc.autoscale_poll_s)
-    # Give up early once capacity has been flat for the grace window: the autoscaler is
-    # done (fixed cluster) or cannot satisfy the request (spot capacity unavailable), so
-    # the rest of the budget would block on nodes that will not arrive. Any capacity gain
-    # resets the window — a cluster that is still growing keeps its full wait.
-    grace = max(dc.autoscale_stall_s, poll * 2)
+    # Give up early once capacity has been flat for the grace window — the autoscaler is done
+    # (fixed cluster) or cannot satisfy the request (spot unavailable), so the rest of the
+    # budget would block on nodes that will not arrive; any gain resets the window. Two
+    # regimes: until the FIRST growth a short `startup_grace` applies — an infeasible request
+    # (a fixed cluster already at max, the common case where a large aggregate's fan-out
+    # exceeds the node count) grows zero from the start, and the query already runs on current
+    # capacity, so it must not eat the full 90 s stall for nodes that never come. Once any
+    # growth appears the cluster is genuinely scaling and the longer `autoscale_stall_s`
+    # governs. `startup_grace` sits above a couple of polls so nodes registering within a few
+    # seconds still cross into the growing regime.
+    stall_grace = max(dc.autoscale_stall_s, poll * 2)
+    startup_grace = max(dc.autoscale_startup_grace_s, poll * 2)
     best = (avail, avail_gpus)
+    saw_growth = False
+    reached = False
     last_growth = time.monotonic()
     while time.monotonic() < deadline:
         time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
@@ -434,10 +478,20 @@ def _await_autoscale(
         avail = int(topo["cpus"])
         avail_gpus = float(topo["gpus"])
         if avail >= target_cpus and avail_gpus >= target_gpus:
+            reached = True
             break
         if (avail, avail_gpus) > best:
             best = (avail, avail_gpus)
+            saw_growth = True
             last_growth = time.monotonic()
-        elif time.monotonic() - last_growth >= grace:
-            break  # no new capacity for the grace window — nothing more is coming
+        elif time.monotonic() - last_growth >= (stall_grace if saw_growth else startup_grace):
+            break  # nothing is coming (never started, or grew then stopped)
+    # A CPU-only wait that stalled below its target has learned a ceiling; one that reached
+    # (or grew past a stale ceiling) lifts it. GPU waits don't participate — a 0-GPU snapshot
+    # before a GPU node boots must not cap future GPU requests.
+    if target_gpus <= 0:
+        if reached or avail >= target_cpus:
+            _note_reached(avail)
+        else:
+            _note_ceiling(int(best[0]))
     return avail

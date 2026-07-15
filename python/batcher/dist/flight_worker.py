@@ -556,17 +556,33 @@ try:
             rows = sum(b.num_rows for b in batches)
             return ("ok", (self.session.addr, ticket, rows, batches[0].schema))
 
-        def local_topn(self, plan_ir, partition):
+        def local_topn(self, plan_ir, partition, merge_ir=None):
             """Run `plan_ir` (the map prefix + sort + limit) on this worker's own split and
             return its local top-N rows — no shuffle. For a top-N (`ORDER BY ... LIMIT k`)
             the global answer is the top-N of the union of per-worker top-Ns, so each
             worker reads its split, applies the single-node top-N heap, and ships only k
-            rows; the driver merges. Reads the split directly (never on the driver)."""
-            nat = engine()
-            from batcher.dist.executors.partition_io import read_partition_descriptor
+            rows; the driver merges. Reads the split directly (never on the driver).
 
-            return nat.execute_plan(
-                plan_ir, [read_partition_descriptor(partition)], self._engine_config
+            With `merge_ir` (the same sort+limit over the projected output schema the driver
+            merges with), the split is folded through the heap a **chunk at a time**, so peak
+            memory is one chunk plus `k` rows instead of the whole split — the same fold the
+            aggregate map side already uses. Reading the split whole made a worker hold ~125M
+            rows at 1B scale just to pick 100: ~25 GB, an OOM-killed actor, and 130 s for a
+            100-row answer.
+            """
+            nat = engine()
+            from batcher.dist.executors.partition_io import (
+                iter_partition_descriptor,
+                read_partition_descriptor,
+                streaming_topn,
+            )
+
+            if merge_ir is None:  # legacy call: materialize (kept so an older driver still works)
+                return nat.execute_plan(
+                    plan_ir, [read_partition_descriptor(partition)], self._engine_config
+                )
+            return streaming_topn(
+                nat, plan_ir, merge_ir, iter_partition_descriptor(partition), self._engine_config
             )
 
         def sample_quantiles(self, map_ir, key_name, probs, partition):

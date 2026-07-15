@@ -47,6 +47,17 @@ def _wrap(value: IntoExpr) -> Expr:
     return value if isinstance(value, Expr) else Lit(value)
 
 
+def _col_or_expr(value: IntoExpr) -> Expr:
+    """An ordering/source argument: a bare string names a *column*, not a string literal.
+
+    ``_wrap`` would turn ``arg_max(v, "k")`` into an ordering by the constant ``'k'``;
+    an ``Expr`` passes through unchanged. Mirrors SQL ``arg_max(v, k)`` / DuckDB.
+    """
+    from batcher.plan.expr_ir.constructors import col
+
+    return col(value) if isinstance(value, str) else _wrap(value)
+
+
 def _cut_labels(edges: list[float], left_closed: bool) -> list[str]:
     """Interval notation for `Expr.cut`'s bins, e.g. ``["(-inf, 1]", "(1, inf]"]``."""
     bounds = [float("-inf"), *edges, float("inf")]
@@ -341,6 +352,20 @@ class Expr:
             return ListSlice(self, offset, length)
         raise PlanError(f"cannot index an expression with {type(key).__name__}")
 
+    def __iter__(self) -> Any:
+        """Refuse iteration: an expression is a scalar column, not a sequence.
+
+        `__getitem__` accepts an int index (``col("a")[2]`` → list element), which makes an
+        expression *look* iterable to ``list(expr)`` / ``for x in expr`` — but the index has
+        no upper bound (every ``expr[i]`` yields a fresh node), so the default iteration
+        protocol would loop forever and exhaust memory. Raising here turns any accidental
+        ``list(expr)`` (e.g. ``over(partition_by=col("g"))``) into an immediate, clear error.
+        """
+        raise TypeError(
+            "a batcher expression is not iterable; wrap it in a list "
+            "(e.g. over(partition_by=[col('g')]), not over(partition_by=col('g')))"
+        )
+
     # --- bitwise integer operators (distinct from the boolean `&`/`|`) ------
     def bitwise_and(self, other: IntoExpr) -> Expr:
         """Bitwise AND ``self & other`` of two integer expressions.
@@ -580,11 +605,25 @@ class Expr:
                 {'r': [True, False, True]}
         """
         vals = list(values)
-        if not vals:
+        # SQL three-valued logic: a NULL member never yields True, but it turns a
+        # would-be False into NULL (``x IN (1, NULL)`` is True for x=1, NULL otherwise;
+        # DuckDB agrees). A NULL member contributes an always-null disjunct, which
+        # `nullif(lit(True), lit(True))` builds without a first-class null literal.
+        has_null = any(v is None for v in vals)
+        non_null = [v for v in vals if v is not None]
+        if not non_null:
+            if has_null:
+                from batcher.plan.expr_ir.constructors import lit, nullif
+
+                return nullif(lit(True), lit(True))
             return Lit(False)
-        expr: Expr = self == vals[0]
-        for v in vals[1:]:
+        expr: Expr = self == non_null[0]
+        for v in non_null[1:]:
             expr = expr | (self == v)
+        if has_null:
+            from batcher.plan.expr_ir.constructors import lit, nullif
+
+            expr = expr | nullif(lit(True), lit(True))
         return expr
 
     def between(self, low: IntoExpr, high: IntoExpr, closed: str = "both") -> Expr:
@@ -1465,7 +1504,9 @@ class Expr:
 
         Nulls are preserved (a null stays null, not pulled to a bound): the lowering
         is a conditional, so a comparison against a null input is null and falls
-        through to the original value.
+        through to the original value. NaN is likewise left untouched (matching
+        Polars/pandas), even though the engine's total order ranks NaN above every
+        finite value — an explicit guard re-injects it after the bounds are applied.
 
         Args:
             lower: Lower bound; ``None`` leaves the low side unclamped.
@@ -1485,10 +1526,17 @@ class Expr:
         from batcher.plan.expr_ir.constructors import when
 
         result: Expr = self
+        clamped = False
         if lower is not None:
             result = when(result < _wrap(lower)).then(lower).otherwise(result)
+            clamped = True
         if upper is not None:
             result = when(result > _wrap(upper)).then(upper).otherwise(result)
+            clamped = True
+        if clamped:
+            # NaN is total-order-greatest, so an upper bound would otherwise pull it
+            # down to `upper`; Polars/pandas leave NaN alone. Restore the original.
+            result = when(self.is_nan()).then(self).otherwise(result)
         return result
 
     # --- aggregate constructors (used inside group_by().agg(...)) -----------
@@ -1834,7 +1882,7 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").first(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2, 10]}
         """
-        return AggExpr("arg_min", self, input2=_wrap(order_by))
+        return AggExpr("arg_min", self, input2=_col_or_expr(order_by))
 
     def last(self, order_by: IntoExpr) -> AggExpr:
         """This expression's value at the last row in `order_by` order (SQL ``last``).
@@ -1857,7 +1905,7 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").last(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [1, 10]}
         """
-        return AggExpr("arg_max", self, input2=_wrap(order_by))
+        return AggExpr("arg_max", self, input2=_col_or_expr(order_by))
 
     def arg_min(self, by: IntoExpr) -> AggExpr:
         """This expression's value at the row where `by` is minimal (SQL ``arg_min``/``min_by``).
@@ -1879,7 +1927,7 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").arg_min(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2, 10]}
         """
-        return AggExpr("arg_min", self, input2=_wrap(by))
+        return AggExpr("arg_min", self, input2=_col_or_expr(by))
 
     def arg_max(self, by: IntoExpr) -> AggExpr:
         """This expression's value at the row where `by` is maximal (SQL ``arg_max``/``max_by``).
@@ -1898,7 +1946,7 @@ class Expr:
                 >>> ds.group_by("g").agg(r=bt.col("x").arg_max(bt.col("t"))).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [1, 10]}
         """
-        return AggExpr("arg_max", self, input2=_wrap(by))
+        return AggExpr("arg_max", self, input2=_col_or_expr(by))
 
     def bool_and(self) -> AggExpr:
         """Logical AND of this boolean expression's non-null values per group.
@@ -2580,8 +2628,10 @@ class Expr:
             )
         # A null value makes every comparison null, so without this guard it would fall
         # through the CASE chain into the final `otherwise` and be labelled as the top
-        # bin. `nullif(x, x)` is a null of the label column's own type.
-        builder = when(self.is_null()).then(nullif(lit(names[0]), lit(names[0])))
+        # bin. NaN needs the same guard: the engine's total order ranks it above every
+        # edge, so it too would land in the top bin, but Polars/pandas leave it null.
+        # `nullif(x, x)` is a null of the label column's own type.
+        builder = when(self.is_null() | self.is_nan()).then(nullif(lit(names[0]), lit(names[0])))
         for edge, name in zip(edges, names, strict=False):
             below = self < lit(edge) if left_closed else self <= lit(edge)
             builder = builder.when(below).then(lit(name))
@@ -2707,7 +2757,20 @@ class Lit(Expr):
         elif isinstance(v, int):
             tagged = {"int": v}
         elif isinstance(v, float):
-            tagged = {"float": v}
+            # JSON has no NaN/Infinity tokens, and serde_json rejects the
+            # non-standard ones Python's ``json.dumps`` would emit — so a
+            # ``lit(float("nan"))`` / ``lit(inf)`` used to fail plan parsing
+            # entirely. Encode a non-finite float as a name string the Rust
+            # ``Literal::Float`` deserializer understands; finite floats stay
+            # numeric (unchanged wire, fast path).
+            if v != v:
+                tagged = {"float": "NaN"}
+            elif v == float("inf"):
+                tagged = {"float": "inf"}
+            elif v == float("-inf"):
+                tagged = {"float": "-inf"}
+            else:
+                tagged = {"float": v}
         elif isinstance(v, str):
             tagged = {"str": v}
         elif isinstance(v, _dt.datetime):
@@ -2829,6 +2892,21 @@ class Aliased(Expr):
         return self.inner.to_ir()
 
 
+def normalize_key_list(keys: IntoExpr | Iterable[IntoExpr]) -> list[IntoExpr]:
+    """Normalize a ``partition_by``/``order_by`` argument to a list of key expressions.
+
+    A single ``str`` column name or a lone ``Expr`` is wrapped in a one-element list; an
+    existing iterable of keys is materialized with ``list``. Without this, the natural
+    scalar spellings silently corrupt: ``over(partition_by="grp")`` would ``list("grp")``
+    into ``['g', 'r', 'p']`` (partition by three phantom columns), and
+    ``over(partition_by=col("g"))`` would iterate an `Expr` — which has an unbounded
+    `__getitem__` — until memory is exhausted.
+    """
+    if isinstance(keys, (str, Expr)):
+        return [keys]
+    return list(keys)
+
+
 class AggExpr:
     """An aggregate over an optional input expression.
 
@@ -2939,7 +3017,13 @@ class AggExpr:
 
         # `mean` is the DataFrame spelling; the window engine names the aggregate `avg`.
         func = "avg" if self.func == "mean" else self.func
-        return WindowExpr(func, self.input, list(partition_by), list(order_by), frame)
+        return WindowExpr(
+            func,
+            self.input,
+            normalize_key_list(partition_by),
+            normalize_key_list(order_by),
+            frame,
+        )
 
 
 @expr_node

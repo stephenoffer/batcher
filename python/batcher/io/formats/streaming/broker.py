@@ -140,8 +140,26 @@ class BrokerSource(ABC):
             self._track_positions(messages)
             batch = self._make_batch(messages)
             yield batch.select(projection) if projection is not None else batch
+            # Control reaches here only when the consumer asks for the *next* batch — and the
+            # consumer is the micro-batch loop, which asks only after it has staged,
+            # write-ahead-logged, and **published** the epoch this batch became
+            # (`core/streaming_query.py::_process_next`). So this is the first moment the
+            # broker's own offsets may safely advance. Committing them any earlier — inside
+            # `_poll`, at read time — means a crash between the poll and the publish leaves
+            # the broker believing those messages were handled: on restart it resumes past
+            # them and they are never processed. That is at-most-once, i.e. silent data loss,
+            # and it is the exact opposite of what this module promises.
+            self._commit_delivered()
 
     # ---- exactly-once checkpoint/resume (Checkpointable protocol) ----------
+    def _commit_delivered(self) -> None:  # noqa: B027
+        """Advance the broker's own offsets to the last *published* batch.
+
+        Called after an epoch is published, never before. The base is a no-op: a broker whose
+        only offset store is Batcher's checkpoint log has nothing to advance. A broker that
+        also keeps server-side offsets (a Kafka consumer group) overrides this to commit them.
+        """
+
     def _track_positions(self, messages: list[BrokerMessage]) -> None:
         """Record the latest resume position per partition from a poll.
 

@@ -19,6 +19,7 @@ import itertools
 
 import pyarrow as pa
 import pytest
+
 from conftest import assert_same, assert_same_ordered, assert_tables_equal
 
 pytestmark = pytest.mark.differential
@@ -115,6 +116,43 @@ def test_spilling_distinct_matches_duckdb(duck, spill_table):
     _register(duck, spill_table)
     out = bt.from_arrow(spill_table).select(bt.col("g")).distinct().collect(spill=True)
     assert_same(out, duck.sql("SELECT DISTINCT g FROM t"))
+
+
+def test_streaming_distinct_under_a_budget_matches_duckdb(duck):
+    """A high-cardinality DISTINCT run through the *normal* `collect()` (not `spill=True`) under
+    a tight memory budget must never OOM and must match DuckDB.
+
+    This exercises the streaming executor's deferred-breaker path: DISTINCT is handed to the
+    oracle, but under a budget the streaming driver bounds it — over budget it yields to the
+    spilling parallel executor. The regression it guards: that deferral used to run the oracle
+    *unbounded*, so a DISTINCT whose key set exceeded RAM crashed where the parallel path spills.
+    """
+    import numpy as np
+
+    from batcher.config import Config, MemoryConfig, config_context
+
+    rng = np.random.default_rng(5)
+    n = 300_000
+    t = pa.table(
+        {
+            "k": rng.integers(0, 250_000, n).astype("int64"),
+            "v": rng.integers(0, 100, n).astype("int64"),
+        }
+    )
+    _register(duck, t)
+    # A 2 MB envelope is far smaller than the ~175k-group DISTINCT state, so the streaming
+    # breaker goes over budget and must spill rather than OOM.
+    cfg = Config().replace(memory=MemoryConfig(max_memory_bytes=2_000_000))
+    with config_context(cfg):
+        distinct = bt.from_arrow(t).select(bt.col("k")).distinct().collect()
+        union = (
+            bt.from_arrow(t)
+            .select(bt.col("k"))
+            .union(bt.from_arrow(t).select(bt.col("k")), distinct=True)
+            .collect()
+        )
+    assert_same(distinct, duck.sql("SELECT DISTINCT k FROM t"))
+    assert_same(union, duck.sql("SELECT DISTINCT k FROM t"))  # union-distinct of t with itself
 
 
 def test_spilling_join_matches_duckdb(duck, spill_table):

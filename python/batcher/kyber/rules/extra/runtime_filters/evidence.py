@@ -34,7 +34,7 @@ import math
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.rule import Phase, RuleCategory
 from batcher.kyber.rules.joins import _FILTERABLE_SIDES
-from batcher.kyber.rules.zonemap_pruning import _same_bloom_domain
+from batcher.kyber.rules.zonemap_pruning import _predicate_status, _same_bloom_domain
 from batcher.plan.bloom_index import BloomIndex
 from batcher.plan.expr_ir import Binary, Col, Expr, InList, Lit, referenced_columns, remap_columns
 from batcher.plan.expr_rewrite import (
@@ -53,11 +53,12 @@ from batcher.plan.logical import (
     LogicalPlan,
     Project,
     Sample,
+    Scan,
     Sort,
     Union,
     is_cartesian_key_pair,
 )
-from batcher.plan.stats import ColumnStat, Provenance, RelStats
+from batcher.plan.stats import ColumnStat, Provenance, RelStats, ambiguous_float_bound
 
 __all__ = ["FILTERABLE_SIDES", "SIP"]
 
@@ -202,8 +203,55 @@ def _may_hold_null(stat: ColumnStat) -> bool:
 
     A *known-zero* null count (at any provenance — a filter sets it to unknown rather than
     claiming zero) means the filter could never drop a row, so adding it is pure per-row cost.
+
+    Ask this **where the predicate will land**, not where the rule stands — see
+    `_provably_true_at_source`, which is the guard that keeps this evidence confluent.
     """
     return stat.null_count != 0
+
+
+def _provably_true_at_source(
+    side: LogicalPlan, col: str, pred: Expr, ctx: OptimizerContext
+) -> bool:
+    """Whether `pred` is *already always true* at the scan `side` is rooted in.
+
+    `_may_hold_null` is read at the join, above the side's filters — and a `Filter` sets
+    `null_count` to *unknown* (`stats/columns.py`). So a column the scan proves is null-free
+    reads as "may hold null" up there, and `push_is_not_null_from_join_key` adds an
+    `IS NOT NULL` that is a tautology. Pushdown then sinks that filter to the scan, where
+    `drop_filter_conjunct_implied_by_zonemap` reads the *scan's* stats, proves the very same
+    predicate always true, and deletes it — whereupon the adder, finding nothing on the spine,
+    adds it back. The two rules ping-pong and PUSHDOWN never reaches a fixpoint: measured at 16
+    iterations on TPC-H q3, 24 on q5, 25 on q7, every one of them re-walking the whole plan and
+    every expression in it.
+
+    The disagreement is *positional*, not logical: both rules consult `_predicate_status`, just
+    at different depths. Asking it at the same place — the scan the predicate would sink to — is
+    what makes the pair confluent. Column renames are followed down through projections, so the
+    question is asked about the column the scan actually holds.
+
+    Declining to add is always semantically safe: an equi-join drops null keys itself, so this
+    predicate is a pure optimization and never load-bearing.
+    """
+    node: LogicalPlan = side
+    name = col
+    while True:
+        if isinstance(node, Filter | Limit):
+            node = node.input
+        elif isinstance(node, Project):
+            src = next(
+                (i.expr.name for i in node.items if i.alias == name and isinstance(i.expr, Col)),
+                None,
+            )
+            if src is None:  # computed, or not produced here — not provably the same column
+                return False
+            name = src
+            node = node.input
+        else:
+            break
+    if not isinstance(node, Scan):
+        return False
+    return _predicate_status(remap_columns(pred, {col: name}), ctx.estimator.estimate(node)) is True
 
 
 def _all_null_key(side: LogicalPlan, keys: tuple[str, ...], ctx: OptimizerContext) -> bool:
@@ -379,8 +427,16 @@ def _bloom_refutes(stat: ColumnStat, value: object) -> bool:
 
 
 def _out_of_range(stat: ColumnStat, value: object) -> bool:
-    """Whether `value` lies outside the column's `[min, max]` — so no row can hold it."""
+    """Whether `value` lies outside the column's `[min, max]` — so no row can hold it.
+
+    A NaN or zero float bound refutes nothing (`ambiguous_float_bound`): the engine orders
+    floats on a total order where `-0.0 < 0.0`, and its key paths canonicalize them back
+    together, so a value this comparison calls out-of-range may be one the engine matches.
+    Deleting an `IN`-list member on that reasoning deletes rows.
+    """
     if stat.min is None or stat.max is None:
+        return False
+    if ambiguous_float_bound(stat.min) or ambiguous_float_bound(stat.max):
         return False
     try:
         return value < stat.min or value > stat.max

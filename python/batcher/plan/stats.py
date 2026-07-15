@@ -28,11 +28,45 @@ provenance may only *inform* cost/cardinality or power an explicitly-named
 from __future__ import annotations
 
 import enum
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["ColumnStat", "Provenance", "RelStats", "weakest"]
+__all__ = ["ColumnStat", "Provenance", "RelStats", "ambiguous_float_bound", "weakest"]
+
+
+def ambiguous_float_bound(value: Any) -> bool:
+    """Whether reasoning about this bound with Python's comparisons could contradict the engine.
+
+    The engine does not order floats the way Python does, and the two disagree in exactly two
+    places:
+
+    * **NaN** — the engine's comparisons follow arrow-rs's *total* order, which ranks NaN above
+      every number; Python's `>` ranks it nowhere. (And a key path goes further: `bc_runtime::
+      keys` canonicalizes every NaN to one value, so a *join* matches NaN to NaN while a
+      comparison need not.)
+    * **zero** — the engine separates `-0.0` from `0.0` in a comparison (`-0.0 < 0.0` on that
+      total order), while Python calls them equal; and the key paths canonicalize them *back*
+      together, so a join matches `-0.0` to `0.0` that a `BETWEEN` would have filtered apart.
+
+    Any rewrite that reasons about a float bound with a Python comparison — folding a predicate
+    to FALSE, pushing a `BETWEEN` onto a join side, proving two key ranges disjoint — is
+    therefore unsound on such a bound, and must decline. Declining costs a scan; not declining
+    costs a row. This is the single definition, shared by every such rule, so they cannot drift
+    apart on the question of when a float bound may be trusted.
+
+    (The underlying engine divergence — its scalar float comparisons follow the total order
+    rather than IEEE, so `WHERE f = 0.0` misses `-0.0` and disagrees with DuckDB — is recorded
+    as B26 in `docs/internals/bug_hunt_ledger.md`. This guard is sound under either semantics.)
+
+    Args:
+        value: A recorded `min` or `max` bound.
+
+    Returns:
+        ``True`` if the bound is a float NaN or a float zero, and so cannot be reasoned from.
+    """
+    return isinstance(value, float) and (math.isnan(value) or value == 0.0)
 
 
 class Provenance(enum.IntEnum):
@@ -128,11 +162,35 @@ class ColumnStat:
     # bounds. `ndv_is_exact` is the gate every answer path reads, so a sketch ndv still can
     # never answer an exact `count_distinct` — it only ever informs cost and cardinality.
     ndv_provenance: Provenance | None = None
+    # The null count's *own* provenance — the same lesson, learned in the other direction.
+    #
+    # The bundle's single tag was refusing an **exact** statistic because it sat next to an
+    # inexact one. A Parquet footer records every column's null count exactly, whatever the
+    # type — but a *string* column's min/max may be byte-truncated by the writer, so the whole
+    # bundle was tagged `DEFAULT` and the exact null count went with it. The consequence was
+    # quiet and large: `n_null("name")`, `has_nulls("name")`, `null_count()`, `count(name)`, and
+    # `dq.not_null("name")` all fell back to a full scan on precisely the columns most real
+    # tables are made of. The footer knew the answer; the trust model could not express it.
+    #
+    # `null_count_is_exact` is the gate every null-answer path now reads, so an exact null count
+    # rides alongside untrustworthy bounds — exactly as `ndv_provenance` lets a sketched distinct
+    # count ride alongside exact ones.
+    null_count_provenance: Provenance | None = None
 
     @property
     def ndv_is_exact(self) -> bool:
         """True iff `ndv` may answer an exact `count_distinct` (never for a sketch)."""
         tag = self.ndv_provenance if self.ndv_provenance is not None else self.provenance
+        return tag.is_exact
+
+    @property
+    def null_count_is_exact(self) -> bool:
+        """True iff `null_count` may answer an exact question, whatever the bounds are worth."""
+        tag = (
+            self.null_count_provenance
+            if self.null_count_provenance is not None
+            else self.provenance
+        )
         return tag.is_exact
 
     def downgrade(self, floor: Provenance) -> ColumnStat:
@@ -159,6 +217,12 @@ class ColumnStat:
             avg_bytes=self.avg_bytes,
             ndv_provenance=weakest(
                 self.ndv_provenance if self.ndv_provenance is not None else self.provenance,
+                floor,
+            ),
+            null_count_provenance=weakest(
+                self.null_count_provenance
+                if self.null_count_provenance is not None
+                else self.provenance,
                 floor,
             ),
         )

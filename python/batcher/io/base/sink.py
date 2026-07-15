@@ -301,7 +301,20 @@ class FileSink(ABC):
             key_vals = [(c, keys.column(c)[i].as_py()) for c in cols]
             mask: Any = None
             for c, v in key_vals:
-                eq = pc.equal(table.column(c), pa.scalar(v, table.schema.field(c).type))
+                col = table.column(c)
+                # `col == NULL` is NULL for every row, not True, so a NULL partition key
+                # would select zero rows and silently drop them (they land under
+                # `__HIVE_DEFAULT_PARTITION__` with an empty file). Match nulls with
+                # `is_null` so the NULL group keeps its rows. `NaN == NaN` is likewise
+                # False for every row, so a NaN partition key (a float column with a NaN)
+                # would select zero rows and drop them too — `group_by` puts NaN in its own
+                # group, but `equal` can never re-select it. Match NaN with `is_nan`.
+                if v is None:
+                    eq = pc.is_null(col)
+                elif isinstance(v, float) and v != v:  # NaN
+                    eq = pc.is_nan(col)
+                else:
+                    eq = pc.equal(col, pa.scalar(v, table.schema.field(c).type))
                 mask = eq if mask is None else pc.and_(mask, eq)
             yield key_vals, table.filter(mask).drop_columns(cols)
 
@@ -311,7 +324,19 @@ class FileSink(ABC):
 
 
 def _hive_str(value: Any) -> str:
-    return _HIVE_NULL if value is None else str(value)
+    """The Hive path segment for a partition `value`, URL-encoded like Spark/Hive.
+
+    A raw value containing ``/`` would spawn a spurious subdirectory (``c=x/y`` reads
+    back as ``c=x``), and other reserved characters break directory discovery. pyarrow's
+    Hive partitioning URI-decodes segment values on read, so the write must URI-encode
+    them (``x/y`` → ``x%2Fy``) for the value to survive the round trip. NULL keeps its
+    sentinel unencoded — the reader special-cases that exact string.
+    """
+    if value is None:
+        return _HIVE_NULL
+    from urllib.parse import quote
+
+    return quote(str(value), safe="")
 
 
 def _safe_size(fs: Any, path: str) -> int:

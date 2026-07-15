@@ -15,33 +15,79 @@ from batcher.plan.expr_ir import AggExpr, Expr, col
 from batcher.plan.expr_ir.selectors import expand_selectors, has_selector
 
 
-def _grouping_sets_union(tr, node, group) -> Dataset:
-    """Expand ROLLUP/CUBE/GROUPING SETS into a UNION ALL over grouping levels.
+def _grouping_key(e) -> str:
+    """Identity of a grouping expression across levels.
 
-    Each level groups by its active columns; the inactive grouping columns are
-    projected as NULL. (Matches DuckDB's row output for non-null group keys.)
+    A bare column is identified by its (unqualified) name so a `GROUP BY a`
+    key matches a `SELECT t.a` projection; any other expression is identified
+    by its SQL text (`b * 10`, `extract(...)`).
+    """
+    from sqlglot import expressions as exp
+
+    return e.name if isinstance(e, exp.Column) else e.sql()
+
+
+def _grouping_set_members(m) -> list:
+    """The grouping expressions in one GROUPING SETS member.
+
+    `(a, b)` → `[a, b]`, `(b + 1)` → `[b + 1]`, `()` → `[]`, bare `a` → `[a]`.
+    """
+    from sqlglot import expressions as exp
+
+    if isinstance(m, exp.Tuple):
+        return list(m.expressions)  # `(a, b)` and `()`
+    if isinstance(m, exp.Paren):
+        return [m.this]  # `(a)` / `(b + 1)`
+    return [m]  # a bare column / expression
+
+
+def _grouping_factors(group) -> list[list[list]]:
+    """The GROUP BY as a list of factors; the levels are their cross product.
+
+    A plain item list, `ROLLUP(...)`, `CUBE(...)`, and `GROUPING SETS(...)` each
+    contribute one factor — a list of alternative grouping sets. DuckDB's overall
+    set of levels is the Cartesian product of the factors (so `GROUP BY ROLLUP(a),
+    ROLLUP(b)` yields the product of the two rollups), which is what `itertools.
+    product` over these factors produces.
     """
     import itertools
 
-    from sqlglot import expressions as exp
+    factors: list[list[list]] = []
+    if group.expressions:  # plain items — present in every level
+        factors.append([list(group.expressions)])
+    for r in group.args.get("rollup") or ():
+        cols = list(r.expressions)
+        factors.append([cols[:i] for i in range(len(cols), -1, -1)])
+    for cu in group.args.get("cube") or ():
+        cols = list(cu.expressions)
+        factors.append(
+            [list(c) for k in range(len(cols), -1, -1) for c in itertools.combinations(cols, k)]
+        )
+    for gs in group.args.get("grouping_sets") or ():
+        factors.append([_grouping_set_members(m) for m in gs.expressions])
+    return factors or [[[]]]
 
-    base = [c.name for c in group.expressions if isinstance(c, exp.Column)]
-    levels: list[list[str]]
-    if group.args.get("rollup"):
-        cols = [c.name for c in group.args["rollup"][0].expressions]
-        levels = [cols[:i] for i in range(len(cols), -1, -1)]
-    elif group.args.get("cube"):
-        cols = [c.name for c in group.args["cube"][0].expressions]
-        levels = [
-            list(c) for r in range(len(cols), -1, -1) for c in itertools.combinations(cols, r)
-        ]
-    else:  # GROUPING SETS
-        members = group.args["grouping_sets"][0].expressions
-        levels = [_grouping_set_columns(s) for s in members]
 
-    every = set(base) | {c for level in levels for c in level}
+def _grouping_sets_union(tr, node, group) -> Dataset:
+    """Expand ROLLUP/CUBE/GROUPING SETS into a UNION ALL over grouping levels.
+
+    Each level groups by its active expressions; the inactive grouping expressions
+    are projected as NULL. (Matches DuckDB's row output for non-null group keys.)
+    """
+    import itertools
+
+    factors = _grouping_factors(group)
+    levels = [[e for part in combo for e in part] for combo in itertools.product(*factors)]
+
+    # Every grouping expression that appears in any level, deduped by identity.
+    every: dict[str, object] = {}
+    for level in levels:
+        for e in level:
+            every.setdefault(_grouping_key(e), e)
+
     datasets = [
-        tr.select(_grouping_level_node(node, set(base) | set(level), every)) for level in levels
+        tr.select(_grouping_level_node(node, {_grouping_key(e): e for e in level}, every))
+        for level in levels
     ]
     out = datasets[0]
     for d in datasets[1:]:
@@ -49,35 +95,39 @@ def _grouping_sets_union(tr, node, group) -> Dataset:
     return out
 
 
-def _grouping_set_columns(node) -> list[str]:
-    """Column names in one GROUPING SETS member (`(a, b)` / `(a)` / `()`)."""
-    from sqlglot import expressions as exp
-
-    return [c.name for c in node.find_all(exp.Column)]
-
-
-def _grouping_level_node(node, active: set[str], every: set[str]):
-    """A copy of `node` grouping only by `active`; inactive grouping columns in
+def _grouping_level_node(node, active: dict, every: dict):
+    """A copy of `node` grouping only by `active`; inactive grouping expressions in
     the SELECT list become NULL so every level shares one output schema."""
     from sqlglot import expressions as exp
 
     m = node.copy()
-    inactive = every - active
+    inactive = {k: v for k, v in every.items() if k not in active}
 
-    def typed_null(name: str):
-        # NULLIF(col, col) is a NULL *of the column's type*; used both as a
+    def typed_null(e):
+        # NULLIF(e, e) is a NULL *of the expression's type*; used both as a
         # (constant) group key — so it survives aggregation and the output
         # schema matches across levels — and as the projected value.
-        return exp.Nullif(this=exp.column(name), expression=exp.column(name))
+        return exp.Nullif(this=e.copy(), expression=e.copy())
 
-    group_exprs = [exp.column(c) for c in sorted(active)]
-    group_exprs += [typed_null(c) for c in sorted(inactive)]
+    group_exprs = [e.copy() for e in active.values()]
+    group_exprs += [typed_null(e) for e in inactive.values()]
     m.set("group", exp.Group(expressions=group_exprs))
+
+    # GROUPING(x, y, ...) is a per-level constant: the integer whose bits mark which
+    # of its arguments are rolled up (inactive) in this level, first argument the
+    # most-significant bit (DuckDB/SQL-standard). Replace it with that literal.
+    for gnode in list(m.find_all(exp.Grouping)):
+        bits = 0
+        for arg in gnode.expressions:
+            bits = (bits << 1) | (0 if _grouping_key(arg) in active else 1)
+        # Paren-wrap so an `ORDER BY GROUPING(a)` constant is not mistaken for a
+        # 1-based positional SELECT-item reference.
+        gnode.replace(exp.Paren(this=exp.Literal.number(bits)))
 
     for proj in list(m.expressions):
         inner = proj.this if isinstance(proj, exp.Alias) else proj
-        if isinstance(inner, exp.Column) and inner.name in inactive:
-            proj.replace(exp.alias_(typed_null(inner.name), proj.alias_or_name))
+        if _grouping_key(inner) in inactive:
+            proj.replace(exp.alias_(typed_null(inner), proj.alias_or_name))
     return m
 
 
@@ -155,6 +205,13 @@ def _projection_map(tr, ds: Dataset, projections) -> dict[str, Expr]:
 def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
     from sqlglot import expressions as exp
 
+    # Plain (non-ROLLUP/CUBE/GROUPING SETS) GROUP BY: no level is ever rolled up, so
+    # GROUPING(...) is the constant 0. (The grouping-sets path handles it per level.)
+    scopes = [*projections, having.this] if having is not None else list(projections)
+    for scope in scopes:
+        for g in list(scope.find_all(exp.Grouping)):
+            g.replace(exp.Paren(this=exp.Literal.number(0)))
+
     group_cols: list[str] = []
     group_exprs: dict[str, Expr] = {}  # internal alias -> derived key expression
     group_expr_alias: dict[str, str] = {}  # GROUP BY expr SQL text -> alias
@@ -203,7 +260,16 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
                 _register_agg(tr, a, None, used_aliases)
 
     agg_kwargs = dict(tr._agg_map.values())
-    ds = ds.group_by(*group_cols, **group_exprs).agg(**agg_kwargs)
+    if agg_kwargs:
+        ds = ds.group_by(*group_cols, **group_exprs).agg(**agg_kwargs)
+    else:
+        # A GROUP BY with no aggregate anywhere (`SELECT k FROM t GROUP BY k`, incl.
+        # with a HAVING over the keys) collapses to one row per distinct key — a
+        # DISTINCT over the group columns. Calling `.agg()` with nothing errors.
+        if group_exprs:
+            ds = ds.with_columns(**group_exprs)
+        keys = [*group_cols, *group_exprs]
+        ds = ds.select(*keys).distinct() if keys else ds.limit(1)
 
     if having is not None:
         ds = ds.filter(tr._scalar(having.this))
@@ -263,8 +329,30 @@ def _agg(tr, node) -> AggExpr:
     # array_agg(x) and string_agg(x, sep) both collect into a list; the separator
     # join for string_agg happens in the projection (see scalar._scalar).
     if fname in ("arrayagg", "groupconcat"):
+        if isinstance(node.this, exp.Distinct):
+            # The engine's list aggregate has no per-group dedup flag; reject cleanly
+            # rather than letting the bare `Distinct` node crash the scalar translator.
+            raise NotImplementedError(
+                "array_agg(DISTINCT x) / string_agg(DISTINCT x) is not supported; "
+                "pre-aggregate the distinct values in a subquery"
+            )
         return AggExpr("list_agg", tr._scalar(node.this))
     mapped = _AGG_FUNCS.get(fname)
     if mapped is None:
         raise NotImplementedError(f"unsupported aggregate: {fname}")
-    return AggExpr(mapped, tr._scalar(node.this))
+    arg = node.this
+    if isinstance(arg, exp.Distinct):
+        # `MIN(DISTINCT x)` / `MAX(DISTINCT x)` — dedup is a no-op for the extrema, so
+        # they equal `MIN(x)` / `MAX(x)`. Other DISTINCT aggregates (SUM/AVG/…) need a
+        # per-group dedup the engine's aggregate has no flag for; reject cleanly rather
+        # than letting the bare `Distinct` node fall through to a confusing scalar error.
+        exprs = arg.expressions
+        if len(exprs) != 1:
+            raise NotImplementedError(f"{fname}(DISTINCT ...) supports exactly one expression")
+        if mapped in ("min", "max"):
+            return AggExpr(mapped, tr._scalar(exprs[0]))
+        raise NotImplementedError(
+            f"{fname.upper()}(DISTINCT x) is not supported (only COUNT/MIN/MAX(DISTINCT) are); "
+            f"pre-aggregate the distinct values in a subquery"
+        )
+    return AggExpr(mapped, tr._scalar(arg))

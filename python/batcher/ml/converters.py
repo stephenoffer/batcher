@@ -19,6 +19,32 @@ if TYPE_CHECKING:
 __all__ = ["arrays_to_torch", "to_numpy_batches", "to_tf_dataset", "to_torch_iterable"]
 
 
+def _worker_stride() -> tuple[int, int]:
+    """This DataLoader worker's ``(offset, stride)`` over a batch sequence.
+
+    ``(0, 1)`` outside a worker process — a plain loop, or ``num_workers=0``.
+
+    An `IterableDataset` is *replicated* into every DataLoader worker process, and each one
+    runs ``__iter__`` in full. So a dataset that ignores `get_worker_info` yields its entire
+    sequence once per worker: ``DataLoader(ds, num_workers=4)`` — the ordinary thing to write —
+    silently trains on every sample **four times per epoch**, with no error and no warning. The
+    loss curve just quietly means something else.
+
+    Striding by ``(id, num_workers)`` partitions the batches instead: the union across workers
+    is exactly the rank's sequence, each batch produced by exactly one worker, order preserved.
+    Batches are strided (not rows) so a worker skips the shard read and the tensorize for the
+    batches it does not own, which is what makes `num_workers` buy anything.
+    """
+    try:
+        from torch.utils.data import get_worker_info
+    except ImportError:  # torch is an optional extra; a non-torch caller is single-stream.
+        return 0, 1
+    info = get_worker_info()
+    if info is None or info.num_workers <= 1:
+        return 0, 1
+    return int(info.id), int(info.num_workers)
+
+
 def arrays_to_torch(arrays: dict[str, np.ndarray], *, zero_copy: bool = False) -> dict[str, Any]:
     """Convert a `{column: np.ndarray}` dict to `{column: torch.Tensor}`.
 
@@ -106,9 +132,14 @@ def _column_to_numpy(column: pa.Array) -> np.ndarray:
         return arr.to_numpy_ndarray()  # (n, *shape), shape from the tensor type
     if pa.types.is_fixed_size_list(arr.type) and pa.types.is_primitive(arr.type.value_type):
         w = arr.type.list_size
-        child = arr.flatten().to_numpy(zero_copy_only=False)
+        n = len(arr)
+        # Slice the child buffer by (offset, length) rather than `flatten()`, which *drops*
+        # null rows — that would return fewer than `n` rows and silently misalign this
+        # column against its siblings (a feature row falling out from under its label). The
+        # offset-aware slice keeps every row; a null row surfaces as NaN via `to_numpy`.
+        child = arr.values.slice(arr.offset * w, n * w).to_numpy(zero_copy_only=False)
         if child.dtype.kind in "biufc":  # numeric child → (n, W); else fall through
-            return child.reshape(-1, w)
+            return child.reshape(n, w)
     return arr.to_numpy(zero_copy_only=False)
 
 
@@ -148,8 +179,10 @@ def to_torch_iterable(
 
     class _ArrowIterable(IterableDataset):  # type: ignore[misc]
         def __iter__(self) -> Iterator[dict[str, Any]]:
-            for arrays in to_numpy_batches(source, columns=select):
-                yield arrays_to_torch(arrays)
+            offset, stride = _worker_stride()
+            for i, arrays in enumerate(to_numpy_batches(source, columns=select)):
+                if i % stride == offset:
+                    yield arrays_to_torch(arrays)
 
     return _ArrowIterable()
 

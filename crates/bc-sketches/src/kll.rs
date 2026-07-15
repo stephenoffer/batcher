@@ -357,7 +357,16 @@ impl KllSketch {
             let len = c.u64()? as usize;
             let mut level = Vec::with_capacity(len);
             for _ in 0..len {
-                level.push(c.f64()?);
+                let v = c.f64()?;
+                // `add` filters NaN, so a well-formed sketch never stores one; the
+                // compaction/query sorts rely on that (`partial_cmp` on NaN panics).
+                // Reject a NaN from a corrupt/foreign blob here rather than letting a
+                // later `quantile`/`merge` panic on the shuffle/spill path. (±inf is a
+                // value `add` legitimately accepts and sorts fine, so it is allowed.)
+                if v.is_nan() {
+                    return None;
+                }
+                level.push(v);
             }
             compactors.push(level);
         }
@@ -574,6 +583,35 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(s.quantile(0.5), None);
         assert_eq!(s.rank(0.0), 0.0);
+    }
+
+    #[test]
+    fn from_bytes_rejects_nan_level_value() {
+        // A corrupt/foreign blob carrying a NaN must be rejected, not deserialized
+        // into a sketch that panics ("no NaN in sketch") on the next quantile/merge.
+        let mut b = Vec::new();
+        b.extend_from_slice(&8u64.to_le_bytes()); // k
+        b.extend_from_slice(&2u64.to_le_bytes()); // n
+        b.extend_from_slice(&1.0f64.to_le_bytes()); // min
+        b.extend_from_slice(&2.0f64.to_le_bytes()); // max
+        b.extend_from_slice(&1u64.to_le_bytes()); // level_count
+        b.extend_from_slice(&2u64.to_le_bytes()); // level 0 len
+        b.extend_from_slice(&f64::NAN.to_le_bytes());
+        b.extend_from_slice(&1.5f64.to_le_bytes());
+        assert!(KllSketch::from_bytes(&b).is_none());
+    }
+
+    #[test]
+    fn from_bytes_preserves_infinities() {
+        // ±inf is a value `add` accepts and sorts fine, so a roundtrip must keep it.
+        let mut s = KllSketch::new(8);
+        s.add(f64::INFINITY);
+        s.add(1.0);
+        s.add(f64::NEG_INFINITY);
+        let back = KllSketch::from_bytes(&s.to_bytes()).expect("inf roundtrips");
+        assert_eq!(back.count(), 3);
+        assert_eq!(back.min(), Some(f64::NEG_INFINITY));
+        assert_eq!(back.max(), Some(f64::INFINITY));
     }
 
     // ---- Property / fuzz tests (deterministic xorshift64, fixed seed) -------

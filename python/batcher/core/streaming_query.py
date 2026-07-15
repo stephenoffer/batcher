@@ -121,6 +121,23 @@ class WindowedAggregateProcessor:
         result = self._fold.flush()
         return [result] if result is not None else []
 
+    def snapshot_state(self) -> pa.RecordBatch | None:
+        """The open windows and the watermark, for a checkpoint snapshot.
+
+        This processor previously defined neither `snapshot_state` nor `restore_state`, and
+        `StreamingRunner.has_state` duck-types on exactly this method — so it reported
+        *stateless* and its state was never written. Offsets were committed regardless. A crash
+        therefore resumed **past** consumed data with every open window and the watermark gone:
+        those windows were silently never emitted. That is data loss in the one query shape the
+        whole watermark machinery exists to serve, so these two methods are load-bearing, not a
+        nicety.
+        """
+        return self._fold.state()
+
+    def restore_state(self, state: pa.RecordBatch) -> None:
+        """Resume the open windows and the watermark from a checkpointed snapshot."""
+        self._fold.restore(state)
+
 
 class StreamingQueryEngine:
     """Drives a streaming query on a background thread; the `api` handle wraps it."""

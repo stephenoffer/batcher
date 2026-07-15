@@ -210,7 +210,12 @@ def execute_sort_flight(
             ),
             dead=dead,
         )
-        boundaries = merge_boundaries(grids, workers)
+        # Cut into exactly `n_buckets` ranges: `shuffle_partitions` can trim the reducer
+        # count below `workers` (the `max_shuffle_partitions` cap / learned fan-out), and
+        # `merge_boundaries(grids, workers)` would emit up to `workers-1` boundaries — more
+        # than `n_buckets-1` — routing rows past the last bucket and panicking the range
+        # partitioner. Size the boundaries by the actual bucket count.
+        boundaries = merge_boundaries(grids, n_buckets)
         if _prof:
             print(f"[sort] SAMPLE {_t.perf_counter() - _s:.1f}s", flush=True)
 

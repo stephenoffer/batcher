@@ -91,6 +91,12 @@ Long to wide and back.
 :link-type: doc
 Full SQL that lowers to the same engine.
 :::
+
+:::{grid-item-card} {octicon}`zap;1.1em` Metadata shortcuts
+:link: metadata-shortcuts
+:link-type: doc
+Answer from the footer instead of the data — `ds.meta`.
+:::
 ::::
 
 ## Move data
@@ -182,6 +188,7 @@ joins
 window-functions
 pivoting
 sql
+metadata-shortcuts
 ```
 
 ```{toctree}

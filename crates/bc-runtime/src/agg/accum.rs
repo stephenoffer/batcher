@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
+    Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Decimal128Array, Float64Array, Int64Array,
+    LargeBinaryArray, LargeStringArray, StringArray,
 };
 use arrow::compute::concat;
 use arrow::datatypes::{DataType, Decimal128Type, Float64Type, Int64Type};
@@ -138,14 +139,19 @@ pub(crate) fn sum_acc(
             }
             Ok(Arc::new(masked_f64(sums, valid)))
         }
-        // Decimal sums are exact (i128 accumulation, scale preserved).
+        // Decimal sums accumulate in i128 (scale preserved). `checked_add` so a sum past
+        // i128's range errors instead of silently wrapping to a negative value, mirroring
+        // the i64 SUM path (DuckDB raises on decimal overflow).
         DataType::Decimal128(p, s) => {
             let arr = values.as_primitive::<Decimal128Type>();
             let mut sums = vec![0i128; num_groups];
             let mut valid = vec![false; num_groups];
             for (i, &g) in group_ids.iter().enumerate() {
                 if arr.is_valid(i) {
-                    sums[g as usize] += arr.value(i);
+                    let slot = &mut sums[g as usize];
+                    *slot = slot
+                        .checked_add(arr.value(i))
+                        .ok_or(RuntimeError::SumOverflow)?;
                     valid[g as usize] = true;
                 }
             }
@@ -242,28 +248,109 @@ pub(crate) fn minmax_acc(
             }
             masked_decimal(cur, valid, *p, *s)
         }
-        DataType::Utf8 => {
-            let arr = values.as_any().downcast_ref::<StringArray>().expect("utf8");
-            let mut cur: Vec<Option<String>> = vec![None; num_groups];
-            for (i, &g) in group_ids.iter().enumerate() {
-                if arr.is_valid(i) {
-                    let (g, v) = (g as usize, arr.value(i));
-                    let replace = match &cur[g] {
-                        None => true,
-                        Some(c) => (is_min && v < c.as_str()) || (!is_min && v > c.as_str()),
-                    };
-                    if replace {
-                        cur[g] = Some(v.to_string());
-                    }
-                }
-            }
-            Ok(Arc::new(StringArray::from(cur)))
-        }
+        // Byte-ordered min/max over string and binary columns. Rust's `<`/`>` on `&str` and
+        // `&[u8]` is lexicographic by byte, which is exactly DuckDB's default (binary) collation,
+        // so `min`/`max` agree on ordering, NULL-skipping, empty strings, and unicode. The four
+        // arms cover the 32- and 64-bit offset variants of both `Utf8` and `Binary`; without the
+        // `LargeUtf8`/`Binary`/`LargeBinary` arms these raised "not supported for column type",
+        // while DuckDB happily computes them.
+        DataType::Utf8 => byte_minmax(
+            values.as_string::<i32>(),
+            group_ids,
+            num_groups,
+            is_min,
+            |cur| {
+                Arc::new(
+                    cur.into_iter()
+                        .map(bytes_to_string)
+                        .collect::<StringArray>(),
+                )
+            },
+        ),
+        DataType::LargeUtf8 => byte_minmax(
+            values.as_string::<i64>(),
+            group_ids,
+            num_groups,
+            is_min,
+            |cur| {
+                Arc::new(
+                    cur.into_iter()
+                        .map(bytes_to_string)
+                        .collect::<LargeStringArray>(),
+                )
+            },
+        ),
+        DataType::Binary => byte_minmax(
+            values.as_binary::<i32>(),
+            group_ids,
+            num_groups,
+            is_min,
+            |cur| Arc::new(BinaryArray::from_iter(cur)),
+        ),
+        DataType::LargeBinary => byte_minmax(
+            values.as_binary::<i64>(),
+            group_ids,
+            num_groups,
+            is_min,
+            |cur| Arc::new(LargeBinaryArray::from_iter(cur)),
+        ),
+        // SQL orders booleans `false < true`, so a group's minimum is the AND of its values
+        // and its maximum is the OR — the very folds `bool_and`/`bool_or` already perform
+        // (which is how DuckDB defines them too). Delegating rather than restating the fold
+        // keeps one implementation of the boolean reduction.
+        //
+        // This arm is not a new capability so much as the closing of a gap that had already
+        // become a *wrong answer*: a boolean column's footer records an exact min/max, so
+        // `min(flag)` over a Parquet scan was answered `false` from metadata while the same
+        // query over the same rows in memory raised "aggregate min is not supported for
+        // column type Boolean". A metadata shortcut that can answer what the engine cannot
+        // is not a shortcut; it is a second, disagreeing implementation.
+        DataType::Boolean => bool_acc(values, group_ids, num_groups, is_min, func),
         other => Err(RuntimeError::UnsupportedAggregate {
             func: func.name().to_string(),
             dtype: other.to_string(),
         }),
     }
+}
+
+/// Per-group byte-lexicographic min/max over a string/binary column. Stores each group's
+/// winning bytes and lets `build` re-wrap them as the concrete output array (string or
+/// binary, 32- or 64-bit offsets). Null-skipping; an all-null group stays `None` (→ null).
+/// The comparison is `&[u8]` order — identical to DuckDB's default binary collation, and to
+/// `&str` order for valid UTF-8.
+fn byte_minmax<T, F>(
+    arr: &arrow::array::GenericByteArray<T>,
+    group_ids: &[u32],
+    num_groups: usize,
+    is_min: bool,
+    build: F,
+) -> Result<ArrayRef, RuntimeError>
+where
+    T: arrow::array::types::ByteArrayType,
+    T::Native: AsRef<[u8]>,
+    F: FnOnce(Vec<Option<Vec<u8>>>) -> ArrayRef,
+{
+    let mut cur: Vec<Option<Vec<u8>>> = vec![None; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        if arr.is_valid(i) {
+            let g = g as usize;
+            let v: &[u8] = arr.value(i).as_ref();
+            let replace = match &cur[g] {
+                None => true,
+                Some(c) => (is_min && v < c.as_slice()) || (!is_min && v > c.as_slice()),
+            };
+            if replace {
+                cur[g] = Some(v.to_vec());
+            }
+        }
+    }
+    Ok(build(cur))
+}
+
+/// Reconstruct a `String` from bytes that came out of a `Utf8`/`LargeUtf8` array (so they are
+/// valid UTF-8 by construction — the `expect` guards a genuine invariant, never user data).
+fn bytes_to_string(b: Option<Vec<u8>>) -> Option<String> {
+    b.map(|b| String::from_utf8(b).expect("bytes from a Utf8 array are valid UTF-8"))
 }
 
 /// Boolean reduction per group: `bool_and` (logical AND of non-null values) or
@@ -416,6 +503,50 @@ mod tests {
         let group_ids = [0u32, 0, 0, 0];
         let out = product_acc(&values, &group_ids, 1).unwrap();
         assert_eq!(out.as_primitive::<Float64Type>().value(0), 24.0);
+    }
+
+    #[test]
+    fn minmax_over_binary_and_large_strings() {
+        use arrow::array::{BinaryArray, LargeBinaryArray, LargeStringArray};
+        // Two groups over each byte type; nulls are skipped, ordering is bytewise.
+        let g = [0u32, 0, 1, 0];
+
+        // Binary: g0 = {b"foo", b"bar", null}; g1 = {b"zzz"}.
+        let bin: ArrayRef = Arc::new(BinaryArray::from_opt_vec(vec![
+            Some(b"foo"),
+            Some(b"bar"),
+            Some(b"zzz"),
+            None,
+        ]));
+        let min = minmax_acc(&bin, &g, 2, true, AggFunc::Min).unwrap();
+        let max = minmax_acc(&bin, &g, 2, false, AggFunc::Max).unwrap();
+        let min = min.as_any().downcast_ref::<BinaryArray>().unwrap();
+        let max = max.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(min.value(0), b"bar");
+        assert_eq!(max.value(0), b"foo");
+        assert_eq!(min.value(1), b"zzz");
+
+        // LargeUtf8 min/max.
+        let ls: ArrayRef = Arc::new(LargeStringArray::from(vec![
+            Some("delta"),
+            Some("alpha"),
+            Some("omega"),
+            None,
+        ]));
+        let lmin = minmax_acc(&ls, &g, 2, true, AggFunc::Min).unwrap();
+        let lmin = lmin.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(lmin.value(0), "alpha");
+
+        // LargeBinary max.
+        let lb: ArrayRef = Arc::new(LargeBinaryArray::from_opt_vec(vec![
+            Some(b"aa"),
+            Some(b"ab"),
+            Some(b"zz"),
+            None,
+        ]));
+        let lbmax = minmax_acc(&lb, &g, 2, false, AggFunc::Max).unwrap();
+        let lbmax = lbmax.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+        assert_eq!(lbmax.value(0), b"ab");
     }
 
     #[test]

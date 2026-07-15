@@ -10,6 +10,7 @@ fails unless the package is uploaded via `runtime_env={"py_modules": [...]}`.
 from __future__ import annotations
 
 import dataclasses
+import os
 
 import pytest
 
@@ -142,6 +143,56 @@ def test_managed_cluster_attaches_without_ray_address(_no_cluster_signal, restor
         "pip": None,
         "excludes": _EXCLUDES,
     }
+
+
+def test_ray_address_env_value_is_the_address_not_just_a_signal(_no_cluster_signal, monkeypatch):
+    """`RAY_ADDRESS` names *which* cluster to attach to. Collapsing it to `"auto"` discards
+    the only disambiguation Ray has when a host runs more than one instance (a managed
+    cluster plus a stray local Ray from a colocated test run), and `ray.init(address="auto")`
+    then dies with "Found multiple active Ray instances ... set the RAY_ADDRESS environment
+    variable" — the very thing the user had already set.
+    """
+    monkeypatch.setattr(lifecycle, "package_dir", lambda: "/repo/python/batcher")
+    monkeypatch.setenv("RAY_ADDRESS", "10.0.3.113:6379")
+    _with_distributed(ray_address=None, runtime_env=None)
+    assert lifecycle._ray_init_kwargs(workers=4)["address"] == "10.0.3.113:6379"
+
+
+def test_managed_cluster_without_ray_address_still_uses_auto(_no_cluster_signal, restore_config):
+    _no_cluster_signal.setattr(lifecycle, "package_dir", lambda: "/repo/python/batcher")
+    _no_cluster_signal.setenv("ANYSCALE_SESSION_ID", "ses_abc")
+    _with_distributed(ray_address=None, runtime_env=None)
+    assert lifecycle._ray_init_kwargs(workers=4)["address"] == "auto"
+
+
+def test_platform_env_hook_is_disabled_across_our_ray_init(monkeypatch):
+    """Ray applies `RAY_RUNTIME_ENV_HOOK` to the runtime_env *after* we build it, so a
+    managed platform's hook rewrites the env `_self_ship_runtime_env` just constructed: it
+    substitutes the workspace's tracked pip list for our `pip: None` (Ray's `RuntimeEnv`
+    drops falsey values, so the hook sees no `pip` key) and zips the project dir as a
+    `working_dir` before our `excludes` are ever applied. Both are fatal — an unresolvable
+    requirement makes every worker's runtime-env build fail, and a `cargo target/` blows
+    Ray's package cap. Neutralize the hook for the duration of our own `ray.init`.
+    """
+    monkeypatch.setenv("RAY_RUNTIME_ENV_HOOK", "platform_plugin._hook")
+    with lifecycle._platform_env_hook_disabled():
+        assert "RAY_RUNTIME_ENV_HOOK" not in os.environ
+    # Scoped, not global: any other Ray user in the process still gets the platform's hook.
+    assert os.environ["RAY_RUNTIME_ENV_HOOK"] == "platform_plugin._hook"
+
+
+def test_platform_env_hook_restored_even_when_ray_init_raises(monkeypatch):
+    monkeypatch.setenv("RAY_RUNTIME_ENV_HOOK", "platform_plugin._hook")
+    with pytest.raises(RuntimeError), lifecycle._platform_env_hook_disabled():
+        raise RuntimeError("ray.init blew up")
+    assert os.environ["RAY_RUNTIME_ENV_HOOK"] == "platform_plugin._hook"
+
+
+def test_platform_env_hook_absent_is_a_no_op(monkeypatch):
+    monkeypatch.delenv("RAY_RUNTIME_ENV_HOOK", raising=False)
+    with lifecycle._platform_env_hook_disabled():
+        assert "RAY_RUNTIME_ENV_HOOK" not in os.environ
+    assert "RAY_RUNTIME_ENV_HOOK" not in os.environ
 
 
 def test_force_local_overrides_managed_detection(_no_cluster_signal, restore_config):

@@ -67,6 +67,7 @@ def test_engine_config_json_shape_and_defaults():
         "spill_compression": "auto",
         "fuse_linear": True,
         "shrink_output_dtypes": False,
+        "streaming": True,
         **_TUNING_DEFAULTS,
     }
 
@@ -83,6 +84,7 @@ def test_engine_config_json_shape_and_defaults():
         "spill_compression": "auto",
         "fuse_linear": True,
         "shrink_output_dtypes": False,
+        "streaming": True,
         **_TUNING_DEFAULTS,
     }
 

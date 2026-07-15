@@ -50,6 +50,40 @@ def test_greatest_least_with_literal(duck, t):
     assert_same(out, duck.sql("SELECT greatest(a, 4) g, least(a, 4) l FROM t"))
 
 
+def test_nonfinite_float_literals_parse_and_match(duck, t):
+    from conftest import assert_same
+
+    # A NaN/Inf float literal used to blow up plan parsing entirely: Python's
+    # ``json.dumps`` emits the non-standard ``NaN``/``Infinity`` tokens that
+    # serde_json rejects, so ANY query carrying such a constant raised
+    # "malformed plan IR". The wire now spells non-finite floats as name
+    # strings and the Rust ``Literal::Float`` deserializer accepts them.
+    out = (
+        bt.from_arrow(t)
+        .select(
+            gi=greatest(col("a").cast("float64"), bt.lit(float("inf"))),
+            ln=least(col("a").cast("float64"), bt.lit(float("-inf"))),
+            cn=bt.coalesce(col("a").cast("float64"), bt.lit(float("nan"))),
+        )
+        .collect()
+    )
+    assert_same(
+        out,
+        duck.sql(
+            "SELECT greatest(a::double, 'inf'::double) gi, "
+            "least(a::double, '-inf'::double) ln, "
+            "coalesce(a::double, 'nan'::double) cn FROM t"
+        ),
+    )
+
+
+def test_nan_literal_is_selectable():
+    # A bare NaN literal column must materialize as NaN, not fail to parse.
+    out = bt.from_pydict({"x": [1.0, 2.0]}).select(n=bt.lit(float("nan"))).collect()
+    got = out.column("n").to_pylist()
+    assert all(v != v for v in got)  # every value is NaN
+
+
 def test_sum_horizontal_ignores_nulls():
     ds = bt.from_pydict(
         {

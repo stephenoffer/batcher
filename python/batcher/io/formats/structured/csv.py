@@ -47,15 +47,21 @@ class CSVRangeSplit:
 
         import pyarrow.csv as pacsv
 
+        schema = self.schema()
         data = read_aligned_range(self.path, self.start, self.end)
         if self.start != 0:
             data = self._header() + data  # supply column names to a mid-file range
         if not data.strip():
-            from batcher.io.formats.base import SOURCES
-
-            empty = SOURCES.get("csv")(self.path).schema().empty_table()
+            empty = schema.empty_table()
             return empty.select(projection) if projection is not None else empty
-        table = pacsv.read_csv(io.BytesIO(data))
+        # Force each range to the file's declared column types. pyarrow infers types
+        # independently per `read_csv` call, so without this an early range that happens
+        # to hold only integers parses that column as int64 while a later range with a
+        # string parses it as string — the ranges of one file disagree with each other
+        # and with the source schema. Pinning `column_types` makes every range parse to
+        # the same schema the source advertises.
+        convert = pacsv.ConvertOptions(column_types=schema)
+        table = pacsv.read_csv(io.BytesIO(data), convert_options=convert)
         return table.select(projection) if projection is not None else table
 
     def schema(self) -> pa.Schema:
@@ -120,7 +126,12 @@ class CSVSource(FileSource):
         table = pacsv.read_csv(fh, convert_options=convert)
         return table.to_batches()
 
-    def _file_splits(self, path: str, target_size: int | None) -> list[Split]:
+    def _file_splits(
+        self,
+        path: str,
+        target_size: int | None,
+        predicate: dict | None = None,  # noqa: ARG002 (CSV has no footer statistics to prune with)
+    ) -> list[Split]:
         # Default byte-range split size (so one huge file fans across workers instead
         # of reading on a single node) is the configured `ExecutionConfig.split_bytes`.
         chunk = target_size or active_config().execution.split_bytes

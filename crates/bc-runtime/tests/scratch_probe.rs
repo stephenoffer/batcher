@@ -24,7 +24,12 @@ const MORSEL: usize = 16_384;
 
 /// (build_ms, probe_ms) best-of-N. `bloom` off is expressed by lifting the min-build threshold
 /// above the build, which is exactly what `use_probe_bloom_with` keys on — nothing else changes.
-fn run(build: &[ArrayRef], morsels: &[Vec<ArrayRef>], probe_rows: usize, bloom: bool) -> (f64, f64) {
+fn run(
+    build: &[ArrayRef],
+    morsels: &[Vec<ArrayRef>],
+    probe_rows: usize,
+    bloom: bool,
+) -> (f64, f64) {
     let rows = build[0].len();
     let min_build = if bloom { 1 << 12 } else { rows + 1 };
     let mut b_ms = f64::MAX;

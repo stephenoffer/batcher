@@ -17,8 +17,8 @@ use rayon::prelude::*;
 use super::assign::assign_groups;
 use super::{NULL_HASH, SEED};
 use crate::agg::{
-    accumulate, merge_approx_distinct, merge_approx_quantile, merge_arg_extreme, merge_distinct,
-    merge_median, AggFunc,
+    accumulate, merge_approx_distinct, merge_approx_quantile, merge_arg_extreme, merge_covar,
+    merge_distinct, merge_median, merge_moments, merge_welford, AggFunc,
 };
 use crate::error::RuntimeError;
 use crate::keys::canon_f64;
@@ -396,36 +396,20 @@ pub(crate) fn merge_state(
                 .next()
                 .unwrap(),
         ],
-        // (sum, sumsq, count) all merge by summing.
-        AggFunc::Var | AggFunc::Stddev => (0..3)
-            .map(|c| {
-                accumulate(AggFunc::Sum, Some(&state[c]), group_ids, num_groups)
-                    .map(|mut v| v.swap_remove(0))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        // The sum-of-powers state columns (5 for skew/kurt, 6 for covar/corr) all
-        // merge by summing — the property that makes these mergeable.
-        AggFunc::Skewness | AggFunc::Kurtosis => sum_each_column(state, group_ids, num_groups)?,
+        // Welford (mean, M2, count) states merge with Chan's parallel formula — summing
+        // them would be wrong (mean/M2 are not additive across partitions).
+        AggFunc::Var | AggFunc::Stddev => {
+            merge_welford(&state[0], &state[1], &state[2], group_ids, num_groups)
+        }
+        // Central-moment states merge with the parallel (Terriberry/Chan) higher-moment
+        // formulas — summing them would be wrong (mean/M2/M3/M4 and the co-moment are not
+        // additive across partitions), and the old sum-of-powers form catastrophically
+        // cancelled at a large offset.
+        AggFunc::Skewness | AggFunc::Kurtosis => merge_moments(state, group_ids, num_groups)?,
         AggFunc::CovarPop | AggFunc::CovarSamp | AggFunc::Corr => {
-            sum_each_column(state, group_ids, num_groups)?
+            merge_covar(state, group_ids, num_groups)?
         }
     })
-}
-
-/// Merge each partial-state column by summing it across partitions (the shared
-/// reducer for every sum-of-powers aggregate). Column 0 is an Int64 count; summing
-/// it stays Int64, the Float64 moment columns stay Float64.
-fn sum_each_column(
-    state: &[ArrayRef],
-    group_ids: &[u32],
-    num_groups: usize,
-) -> Result<Vec<ArrayRef>, RuntimeError> {
-    (0..state.len())
-        .map(|c| {
-            accumulate(AggFunc::Sum, Some(&state[c]), group_ids, num_groups)
-                .map(|mut v| v.swap_remove(0))
-        })
-        .collect()
 }
 
 // --- serial group-id assignment (the per-morsel grouping core; the parallel

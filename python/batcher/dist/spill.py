@@ -34,7 +34,7 @@ import pyarrow as pa
 from batcher._internal.native import engine
 from batcher.carbonite.spill import TieredSpillStore
 from batcher.config import active_config
-from batcher.dist.executor import _relabel_single_source
+from batcher.dist.executor import _relabel_single_source, _single_source
 from batcher.io.source import Source
 from batcher.plan.expr_ir import col
 from batcher.plan.logical import (
@@ -201,12 +201,23 @@ def spill_collect(
             from batcher.dist.executors.partition_io import _apply_above
 
             return _apply_above([plan], inner)
+        # INTERSECT/EXCEPT lower to `Aggregate(bool_or) over Union(left, right)` — an aggregate
+        # whose input spans TWO sources, which the one-shot spilling aggregate cannot relabel
+        # (`_relabel_single_source` asserts a single source). Decline so the caller runs it in
+        # memory (the same mergeable oracle), exactly as the Join path declines a multi-source
+        # join via `supports_spilling_join`.
+        if not _single_source(plan.input):
+            return None
         return execute_spilling_aggregate(plan, sources, num_partitions)
     # DISTINCT is a group-by over every column with no aggregates, so it rides the same
     # hash-partition-and-spill path — the fix for a high-cardinality `DISTINCT` (and the
     # `COUNT(DISTINCT)` the planner lowers to `DISTINCT → COUNT`) failing fast under a tight
     # memory envelope instead of completing out-of-core, which it must at PB scale.
     if isinstance(plan, Distinct):
+        # Same multi-source guard: a `DISTINCT` over a `Union` (a set-op shape) can't ride the
+        # single-source spill path — decline to the in-memory engine.
+        if not _single_source(plan.input):
+            return None
         cols = plan.input.available_columns()
         group_keys = tuple(Projection(alias=c, expr=col(c)) for c in cols)
         equiv = Aggregate(input=plan.input, group_keys=group_keys, aggregates=())

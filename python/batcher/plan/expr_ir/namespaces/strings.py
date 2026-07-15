@@ -300,10 +300,15 @@ class _StrNamespace:
         return StrFunc("substr", self._e, start=start, length=length)
 
     def left(self, n: int) -> StrFunc:
-        """Take the first ``n`` characters (SQL ``left``) — a 1-based ``substr``.
+        """Take the first ``n`` characters (SQL ``left``); negative ``n`` drops the last ``|n|``.
+
+        Matches DuckDB: ``left('abcdef', -2) = 'abcd'``. ``substr(1, n)`` covers the
+        non-negative case; for ``n < 0`` the leading-keep is the mirror of ``right``'s
+        negative case, so we reverse, drop the (now-leading) ``|n|`` with ``right``, and
+        reverse back — reusing the engine's DuckDB-correct negative ``right``.
 
         Args:
-            n: Number of leading characters to keep.
+            n: Number of leading characters to keep; negative drops the trailing ``|n|``.
 
         Returns:
             A new Utf8 expression: the leading characters.
@@ -315,7 +320,14 @@ class _StrNamespace:
                 >>> ds = bt.from_pydict({"s": ["hello"]})
                 >>> ds.select(bt.col("s").str.left(3).alias("r")).to_pydict()
                 {'r': ['hel']}
+
+                >>> ds.select(bt.col("s").str.left(-2).alias("r")).to_pydict()
+                {'r': ['hel']}
         """
+        if n < 0:
+            reversed_e = StrFunc("reverse", self._e)
+            dropped = StrFunc("right", reversed_e, start=n)
+            return StrFunc("reverse", dropped)
         return StrFunc("substr", self._e, start=1, length=n)
 
     def repeat(self, n: int) -> StrFunc:

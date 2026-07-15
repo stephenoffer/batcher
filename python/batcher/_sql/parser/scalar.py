@@ -11,18 +11,21 @@ from batcher._sql.parser.core_utils import _columns_selector
 from batcher._sql.parser.json import json_extract
 from batcher._sql.parser.literals import (
     _BINOPS,
-    _DATE_PART,
     _EXTRACT_PART,
     _TEMPORAL_KINDS,
-    _UNARY_MATH,
-    _UNARY_STR,
     _apply_interval,
     _dtype_name,
     _fold_const_arith,
-    _int_literal,
     _like_to_regex,
     _literal,
     _temporal_literal,
+    regexp_flags_prefix,
+)
+from batcher._sql.parser.scalar_funcs import (
+    _date_diff,
+    _list_function,
+    _regexp_replace,
+    _scalar_function,
 )
 from batcher.plan.expr_ir import (
     Array,
@@ -64,6 +67,10 @@ def _scalar(tr, node) -> Expr:
         return col(node.name)
     if isinstance(node, exp.Literal):
         return _literal(node)
+    if isinstance(node, exp.ByteString):
+        # An `E'…'` escape string: sqlglot has already decoded the C-escapes
+        # (`\n`, `\t`, …) into `node.this`; it is a text value, not binary.
+        return lit(node.this)
     if isinstance(node, exp.Boolean):
         return lit(bool(node.this))
     if isinstance(node, exp.Neg):
@@ -75,9 +82,13 @@ def _scalar(tr, node) -> Expr:
         # string literal to a temporal type — fold to a real temporal literal.
         inner = node.this
         kind = node.to.this.name if node.to and node.to.this else ""
+        # TRY_CAST (sqlglot `exp.TryCast`, a subclass of Cast) returns NULL on an
+        # unconvertible value instead of erroring — carry that through, or a plain
+        # Cast is built and the query errors on the first bad row.
+        try_cast = isinstance(node, exp.TryCast)
         if isinstance(inner, exp.Literal) and inner.is_string and kind in _TEMPORAL_KINDS:
             return _temporal_literal(inner.this, kind)
-        return Cast(tr._scalar(inner), _dtype_name(node.to))
+        return Cast(tr._scalar(inner), _dtype_name(node.to), try_cast=try_cast)
     if isinstance(node, exp.Case):
         return _case(tr, node)
     if isinstance(node, exp.Null):
@@ -142,6 +153,16 @@ def _scalar(tr, node) -> Expr:
         return tr._scalar(node.this).dt.truncate(unit.name.lower())
     if isinstance(node, exp.RegexpReplace):
         return _regexp_replace(tr, node)
+    if isinstance(node, exp.RegexpLike):  # regexp_matches(s, pattern[, options])
+        pat = node.expression
+        if not (isinstance(pat, exp.Literal) and pat.is_string):
+            raise NotImplementedError("regexp_matches requires a constant string pattern")
+        flag_node = node.args.get("flag")
+        is_str_lit = isinstance(flag_node, exp.Literal) and flag_node.is_string
+        if flag_node is not None and not is_str_lit:
+            raise NotImplementedError("regexp_matches options must be a constant string")
+        prefix = regexp_flags_prefix(flag_node.this if is_str_lit else None)
+        return tr._scalar(node.this).str.regexp_matches(prefix + pat.this)
     if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
         return json_extract(tr, node)
 
@@ -179,144 +200,6 @@ def _scalar(tr, node) -> Expr:
             f"is not registered (use bt.register_function to call a Python function)"
         )
     raise NotImplementedError(f"unsupported SQL expression: {type(node).__name__}")
-
-
-def _scalar_function(tr, node):
-    """Map a SQL scalar function call to its `Expr` builder, or None."""
-    from sqlglot import expressions as exp
-
-    name = type(node).__name__
-    if name in _UNARY_MATH:
-        return getattr(tr._scalar(node.this), _UNARY_MATH[name])()
-    if name in _UNARY_STR:
-        return getattr(tr._scalar(node.this).str, _UNARY_STR[name])()
-    if name in _DATE_PART:
-        return getattr(tr._scalar(node.this).dt, _DATE_PART[name])()
-    if name == "Round":
-        # `decimals` is the digit count; dropping it rounded to a whole number instead.
-        decimals = node.args.get("decimals")
-        if decimals is None:
-            return tr._scalar(node.this).round()
-        digits = _int_literal(decimals)
-        if digits is None:
-            raise NotImplementedError("ROUND(x, n): n must be an integer literal")
-        return tr._scalar(node.this).round(digits)
-    if name == "Log":
-        # log(x) → log10(x); log10(x)/log2(x) parse as log(base, value) with
-        # the base in `this` and the value in `expression`.
-        value = node.args.get("expression")
-        if value is None:
-            return tr._scalar(node.this).log10()
-        base = node.this
-        if isinstance(base, exp.Literal) and base.this == "10":
-            return tr._scalar(value).log10()
-        if isinstance(base, exp.Literal) and base.this == "2":
-            return tr._scalar(value).log2()
-        # General base: log_b(x) = ln(x) / ln(b).
-        return tr._scalar(value).ln() / tr._scalar(base).ln()
-    if name == "Trim":
-        return tr._scalar(node.this).str.trim()
-    if name == "Substring":
-        base = tr._scalar(node.this).str
-        start = int(node.args["start"].this)
-        length = node.args.get("length")
-        return base.substr(start, int(length.this)) if length is not None else base.substr(start)
-    if name == "StrPosition":
-        pat = node.args["substr"]
-        if not isinstance(pat, exp.Literal) or not pat.is_string:
-            raise NotImplementedError("position() requires a string literal pattern")
-        return tr._scalar(node.this).str.position(pat.this)
-    if name == "Pad":
-        width = int(node.args["expression"].this)
-        fill_node = node.args.get("fill_pattern")
-        fill = fill_node.this if fill_node is not None else " "
-        base = tr._scalar(node.this).str
-        is_left = bool(node.args.get("is_left"))
-        return base.lpad(width, fill) if is_left else base.rpad(width, fill)
-    return None
-
-
-# Typed `Array*`/`SortArray` reduction nodes → `.list` method name.
-_LIST_REDUCE = {
-    "ArrayMin": "min",
-    "ArrayMax": "max",
-    "ArraySum": "sum",
-    "ArrayDistinct": "unique",
-    "SortArray": "sort",
-}
-# `list_*` functions that sqlglot parses as `Anonymous` → `.list` method name.
-_LIST_ANON = {
-    "list_sum": "sum",
-    "list_avg": "mean",
-    "list_mean": "mean",
-    "list_product": "product",
-    "list_reverse": "reverse",
-    "list_unique": "unique",
-    "list_count": "len",
-    "list_min": "min",
-    "list_max": "max",
-}
-
-
-def _list_function(tr, node):
-    """List/array operations dispatched to the `.list` namespace, or None."""
-    from sqlglot import expressions as exp
-
-    if isinstance(node, exp.ArraySize):  # array_length / len(list)
-        return tr._scalar(node.this).list.len()
-    if isinstance(node, exp.ArrayContains):  # list_contains(a, v)
-        return tr._scalar(node.this).list.contains(_raw_value(node.expression))
-    if isinstance(node, exp.Bracket):  # a[i] — sqlglot already 0-bases the index
-        idxs = node.expressions
-        if len(idxs) == 1 and not isinstance(idxs[0], exp.Slice):
-            return tr._scalar(node.this).list.get(int(idxs[0].name))
-        return None  # slices (a[lo:hi]) not supported
-    reduce = _LIST_REDUCE.get(type(node).__name__)
-    if reduce is not None:
-        return getattr(tr._scalar(node.this).list, reduce)()
-    if isinstance(node, exp.Anonymous):
-        method = _LIST_ANON.get(node.name.lower())
-        if method is not None and node.expressions:
-            return getattr(tr._scalar(node.expressions[0]).list, method)()
-    return None
-
-
-def _raw_value(node):
-    """The Python value of a literal node (for `.list.contains`)."""
-    from sqlglot import expressions as exp
-
-    if not isinstance(node, exp.Literal):
-        raise NotImplementedError("list_contains requires a constant value")
-    if node.is_string:
-        return node.name
-    text = node.name
-    return float(text) if ("." in text or "e" in text.lower()) else int(text)
-
-
-def _regexp_replace(tr, node) -> Expr:
-    """`regexp_replace(s, pattern, replacement)` — replace the first match (DuckDB
-    default; constant pattern/replacement)."""
-    from sqlglot import expressions as exp
-
-    pat = node.expression
-    repl = node.args.get("replacement")
-    if not (isinstance(pat, exp.Literal) and pat.is_string):
-        raise NotImplementedError("regexp_replace requires a constant string pattern")
-    if not (isinstance(repl, exp.Literal) and repl.is_string):
-        raise NotImplementedError("regexp_replace requires a constant string replacement")
-    return tr._scalar(node.this).str.regexp_replace(pat.this, repl.this)
-
-
-def _date_diff(tr, node) -> Expr:
-    """`date_diff(unit, a, b)` = (b - a) in `unit` (DAY/WEEK), for DATE inputs."""
-    unit = (node.text("unit") or "DAY").upper()
-    # sqlglot: this=end (b), expression=start (a).
-    days = Cast(tr._scalar(node.this), "int64") - Cast(tr._scalar(node.expression), "int64")
-    if unit.startswith("DAY"):
-        return days
-    if unit.startswith("WEEK"):
-        return days / lit(7)
-    raise NotImplementedError(f"date_diff unit {unit} not supported (only DAY/WEEK)")
 
 
 def _case(tr, node) -> Expr:
@@ -366,12 +249,39 @@ def _scalar_subquery(tr, select_node) -> Expr:
         table = inner_ds.collect()
     finally:
         tr._agg_map, tr._agg_n = saved_agg_map, saved_agg_n
-    if table.num_rows != 1:
+    if table.num_rows == 0:
+        # SQL: a scalar subquery with no rows is NULL (typed as its output column),
+        # not an error — e.g. `(SELECT sal FROM emp WHERE id=999)` is NULL per row.
+        return _typed_null(table.schema.field(0).type)
+    if table.num_rows > 1:
         raise NotImplementedError(
-            f"scalar subquery must return exactly one row, got {table.num_rows}"
+            f"scalar subquery must return at most one row, got {table.num_rows}"
         )
     value = table.column(0)[0].as_py()
     return lit(value)
+
+
+def _typed_null(arrow_type) -> Expr:
+    """A NULL literal typed to match `arrow_type` (the subquery's output column).
+
+    Built as `NULLIF(1, 1)` (a typed NULL of int) cast to the target type, so the
+    output schema matches DuckDB's — a scalar subquery yields a column of its own
+    type even when it produces no row.
+    """
+    import pyarrow as pa
+
+    typed = nullif(lit(1), lit(1))
+    if pa.types.is_floating(arrow_type):
+        return Cast(typed, "float64")
+    if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+        return Cast(typed, "string")
+    if pa.types.is_boolean(arrow_type):
+        return Cast(typed, "bool")
+    if pa.types.is_date(arrow_type):
+        return Cast(typed, "date")
+    if pa.types.is_timestamp(arrow_type):
+        return Cast(typed, "timestamp")
+    return typed  # integer (and any other) → the int-typed NULL
 
 
 def _in(tr, node) -> Expr:
@@ -424,21 +334,47 @@ def _concat(tr, node) -> Expr:
     """`concat(a, b, …)` / `concat_ws(sep, a, b, …)` → chained `||`.
 
     Unlike the `||` operator, the SQL concat functions ignore NULL arguments
-    (DuckDB semantics), so each argument is coalesced to ''.
+    (DuckDB semantics). `concat` drops each NULL (coalesce to ''); `concat_ws`
+    additionally emits **no separator** for a dropped argument — so
+    `concat_ws(',', NULL, 'x', NULL)` is `'x'`, not `',x,'`.
     """
     from sqlglot import expressions as exp
 
     empty = lit("")
-    parts = [coalesce(p, empty) for p in _scalar_args(tr, node)]
+    arg_nodes = [node.this, *node.expressions] if node.this is not None else list(node.expressions)
+    arg_nodes = [a for a in arg_nodes if a is not None]
+
     if isinstance(node, exp.ConcatWs):
-        sep, parts = parts[0], parts[1:]
+        sep_node, val_nodes = arg_nodes[0], arg_nodes[1:]
+        sep = tr._scalar(sep_node)
+        # A constant separator lets us emit `sep || arg` only for non-null args and
+        # strip the single leading separator — the exact DuckDB null-skip semantics.
+        if isinstance(sep_node, exp.Literal) and sep_node.is_string:
+            sep_len = len(sep_node.this)
+            raw: Expr | None = None
+            for vn in val_nodes:
+                v = tr._scalar(vn)
+                piece = when(v.is_not_null()).then(Binary("concat", sep, v)).otherwise(empty)
+                raw = piece if raw is None else Binary("concat", raw, piece)
+            if raw is None:
+                return empty
+            stripped = raw.str.substr(sep_len + 1)  # drop the one leading separator
+            return when(raw.str.len() > lit(0)).then(stripped).otherwise(empty)
+        # Non-constant separator: best-effort (coalesce dropped args to '').
+        parts = [coalesce(tr._scalar(vn), empty) for vn in val_nodes]
         out = None
         for p in parts:
             out = p if out is None else Binary("concat", Binary("concat", out, sep), p)
         return out if out is not None else empty
-    out = parts[0]
-    for p in parts[1:]:
-        out = Binary("concat", out, p)
+
+    # DuckDB's `concat` casts every argument to text (so `concat(id, name)` works on
+    # a numeric column) and skips NULLs (treats them as ''). Coalescing to `''`
+    # up front raised "arguments need the same data type" on a non-string column, so
+    # concatenate through the kernel (which casts) and drop nulls with a guard.
+    out: Expr = empty
+    for a in arg_nodes:
+        v = tr._scalar(a)
+        out = when(v.is_not_null()).then(Binary("concat", out, v)).otherwise(out)
     return out
 
 
@@ -473,8 +409,12 @@ def _like(tr, node, case_insensitive: bool = False, escape: str | None = None) -
 def _like_simple(target: Expr, pattern: str) -> Expr:
     starts = pattern.startswith("%")
     ends = pattern.endswith("%")
-    inner = pattern[1:] if starts else pattern
-    inner = inner[:-1] if ends else inner
+    # Strip *all* boundary `%`, not just one: a pattern like `%%c` / `a%%` carries
+    # consecutive leading/trailing wildcards, and the caller's `simple` guard already
+    # proved the stripped core holds no `%`/`_`, so it is a pure literal. Peeling only a
+    # single `%` left an interior `%` in `inner` that `starts_with`/`ends_with`/`contains`
+    # then matched literally (`'abc' LIKE '%%c'` → false instead of true).
+    inner = pattern.strip("%")
     if starts and ends:
         return target.str.contains(inner)
     if ends:  # 'abc%'

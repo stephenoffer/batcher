@@ -39,7 +39,8 @@ from batcher.plan.expr_ir import (
     StrFunc,
     StructField,
 )
-from batcher.plan.expr_ir.core import IsInf
+from batcher.plan.expr_ir.audio import AudioFunc
+from batcher.plan.expr_ir.core import Aliased, IsInf
 from batcher.plan.expr_ir.func_nodes import (
     ConvertTimezone,
     DateOffset,
@@ -55,7 +56,8 @@ from batcher.plan.expr_ir.func_nodes import (
     WindowStart,
 )
 from batcher.plan.expr_ir.image import ImageFunc
-from batcher.plan.expr_ir.nodes import HashRows
+from batcher.plan.expr_ir.nodes import HashRows, MakeStruct, Sequence
+from batcher.plan.expr_ir.video import VideoFunc
 
 __all__ = ["ExprRule", "transform_expr_up"]
 
@@ -70,6 +72,11 @@ def _case_kids(e: Case) -> tuple[Expr, ...]:
 def _case_rebuild(_e: Case, kids: tuple[Expr, ...]) -> Expr:
     pairs = [(kids[i], kids[i + 1]) for i in range(0, len(kids) - 1, 2)]
     return Case(pairs, kids[-1])
+
+
+def _make_struct_rebuild(e: MakeStruct, kids: tuple[Expr, ...]) -> Expr:
+    """Rebuild a `MakeStruct` from rewritten field values, keeping each field's name."""
+    return MakeStruct([(name, kid) for (name, _value), kid in zip(e.fields, kids, strict=True)])
 
 
 # Exact-type → (children, rebuild) dispatch for `transform_expr_up`. `_EXPR_KIDS` yields
@@ -119,6 +126,11 @@ _EXPR_KIDS: dict[type, Callable[[Any], tuple[Expr, ...]]] = {
     # must not descend into them. `walk.remap_columns` draws the line in the same place.
     ListTransform: lambda e: (e.input,),
     ListFilter: lambda e: (e.input,),
+    Aliased: lambda e: (e.inner,),
+    AudioFunc: lambda e: (e.input,),
+    VideoFunc: lambda e: (e.input,),
+    MakeStruct: lambda e: tuple(value for _name, value in e.fields),
+    Sequence: lambda e: (e.start, e.stop, e.step),
     Case: _case_kids,
 }
 
@@ -169,6 +181,11 @@ _EXPR_REBUILD: dict[type, Callable[[Any, tuple[Expr, ...]], Expr]] = {
     WindowBuckets: lambda e, k: WindowBuckets(k[0], e.width_micros, e.slide_micros),
     ListTransform: lambda e, k: ListTransform(k[0], e.func),
     ListFilter: lambda e, k: ListFilter(k[0], e.pred),
+    Aliased: lambda e, k: Aliased(k[0], e.name),
+    AudioFunc: lambda e, k: AudioFunc(e.fn, k[0], e.rate),
+    VideoFunc: lambda e, k: VideoFunc(e.fn, k[0]),
+    MakeStruct: _make_struct_rebuild,
+    Sequence: lambda _e, k: Sequence(k[0], k[1], k[2]),
     Case: _case_rebuild,
 }
 

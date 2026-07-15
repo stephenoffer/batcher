@@ -244,13 +244,145 @@ def pack_row_groups(
     return runs
 
 
-def parquet_row_group_splits(path: str, target_size: int | None) -> list[Split]:
-    """Build `RowGroupSplit`s for a single Parquet file (used by ParquetSource)."""
+def parquet_row_group_splits(
+    path: str, target_size: int | None, predicate: dict | None = None
+) -> list[Split]:
+    """Build `RowGroupSplit`s for a single Parquet file, dropping the ones that cannot match.
+
+    `predicate` prunes at **plan** time, from the footer this function already reads. That is a
+    different thing from the row-group pruning the reader does at read time, and a strictly
+    better one: a row-group eliminated here never becomes a `Split`, so it is never balanced,
+    never shipped to a worker, and never *opened*. A file whose every row-group is ruled out
+    returns **no splits at all** and drops out of the query entirely — the task is never created.
+
+    Sound by construction: `file_prune_mask` drops a row-group only when its recorded bounds
+    *prove* it holds no matching row, and anything unknown (a missing statistic, an
+    unrepresentable predicate) keeps it. The engine's `Filter` re-checks every surviving row
+    regardless, so an over-broad survivor set only costs I/O; an over-narrow one would lose rows,
+    and cannot happen.
+    """
     # The cached footer avoids re-reading the metadata here AND on the worker that later
     # reads these splits (a ~100ms object-store round trip per call); see `_parquet_footer`.
     meta = _parquet_footer(path)
+    targets = list(range(meta.num_row_groups))
+    if predicate is not None:
+        targets = _surviving_row_groups(meta, predicate)
+        if not targets:
+            return []  # provably no matching row in this file — do not create a task for it
+
     sizes = [meta.row_group(i).total_byte_size for i in range(meta.num_row_groups)]
     rows = [meta.row_group(i).num_rows for i in range(meta.num_row_groups)]
-    runs = pack_row_groups(meta.num_row_groups, sizes, target_size)
+    runs = _pack(targets, sizes, target_size)
     # Carry the footer-derived row count so balancing never re-opens the file.
     return [RowGroupSplit(path, run, sum(rows[i] for i in run)) for run in runs]
+
+
+def _pack(targets: list[int], sizes: list[int], target_size: int | None) -> list[list[int]]:
+    """Group `targets` (already pruned, ascending) into runs of ~`target_size` bytes.
+
+    Only *adjacent surviving* groups are coalesced. Pruning can leave gaps, and a run must stay
+    a contiguous row-group range for the reader — so a gap ends the run.
+    """
+    if not target_size:
+        return [[i] for i in targets]
+    runs: list[list[int]] = []
+    current: list[int] = []
+    total = 0
+    for i in targets:
+        if current and (i != current[-1] + 1 or total + sizes[i] > target_size):
+            runs.append(current)
+            current, total = [], 0
+        current.append(i)
+        total += sizes[i]
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _surviving_row_groups(meta: Any, predicate: dict) -> list[int]:
+    """The row-groups whose footer statistics do not rule them out.
+
+    Shapes the per-row-group stats into the very same **add-action layout** a lakehouse
+    transaction log publishes (``path | num_records | min.<col> | max.<col> | null_count.<col>``)
+    and hands them to `io.stats.file_skipping.file_prune_mask`. That evaluator is already
+    vectorized over the file dimension, already three-valued-sound, and already tested — a
+    Parquet footer is just another manifest, so it should not have a second zone-map
+    implementation to keep in step with the first.
+    """
+    try:
+        import pyarrow.compute as pc
+
+        from batcher.io.stats.file_skipping import file_prune_mask
+
+        columns = _columns_in(predicate)
+        if not columns:
+            return list(range(meta.num_row_groups))
+        manifest = _row_group_manifest(meta, sorted(columns))
+        if manifest is None:
+            return list(range(meta.num_row_groups))
+        mask = file_prune_mask(predicate, manifest)
+        if mask is None:
+            return list(range(meta.num_row_groups))
+        keep = pc.fill_null(mask, True).to_pylist()
+        return [i for i, k in enumerate(keep) if k]
+    except Exception:
+        return list(range(meta.num_row_groups))  # a footer we cannot read prunes nothing
+
+
+def _row_group_manifest(meta: Any, columns: list[str]) -> pa.Table | None:
+    """Per-row-group bounds for `columns`, in the add-action layout `file_skipping` consumes."""
+    names = meta.schema.names
+    wanted = {c: names.index(c) for c in columns if c in names}
+    if not wanted:
+        return None
+
+    n = meta.num_row_groups
+    data: dict[str, Any] = {
+        "path": [str(i) for i in range(n)],
+        "num_records": [meta.row_group(i).num_rows for i in range(n)],
+    }
+    for name, index in wanted.items():
+        lows: list[Any] = []
+        highs: list[Any] = []
+        nulls: list[int | None] = []
+        for i in range(n):
+            stats = meta.row_group(i).column(index).statistics
+            if stats is None or not getattr(stats, "has_min_max", False):
+                lows.append(None)
+                highs.append(None)
+                nulls.append(None)
+                continue
+            low, high = stats.min, stats.max
+            # A NaN bound is unordered; treat it as "unknown", which keeps the row-group.
+            if _is_nan(low) or _is_nan(high):
+                low = high = None
+            lows.append(low)
+            highs.append(high)
+            nulls.append(stats.null_count if getattr(stats, "has_null_count", False) else None)
+        data[f"min.{name}"] = lows
+        data[f"max.{name}"] = highs
+        data[f"null_count.{name}"] = nulls
+    try:
+        return pa.table(data)
+    except (pa.ArrowInvalid, pa.ArrowTypeError):
+        return None  # bounds that will not unify into one column type prune nothing
+
+
+def _columns_in(node: Any, out: set[str] | None = None) -> set[str]:
+    """Every column name the predicate IR reads. Walks the dict, so no node kind is missed."""
+    out = set() if out is None else out
+    if isinstance(node, dict):
+        if node.get("e") == "col" and isinstance(node.get("name"), str):
+            out.add(node["name"])
+        for value in node.values():
+            _columns_in(value, out)
+    elif isinstance(node, list):
+        for value in node:
+            _columns_in(value, out)
+    return out
+
+
+def _is_nan(value: Any) -> bool:
+    import math
+
+    return isinstance(value, float) and math.isnan(value)

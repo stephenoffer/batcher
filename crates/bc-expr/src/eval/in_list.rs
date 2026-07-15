@@ -10,7 +10,9 @@ use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Date32Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
+};
 use arrow::datatypes::DataType;
 use arrow::error::ArrowError;
 
@@ -80,6 +82,31 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
                 |i| members.contains(&a.value(i)),
             )
         }
+        // A float column can reach `InList`: the fold rule collapses a chain of
+        // `float_col = <int literal>` disjuncts (integers are foldable literals) into an
+        // `InList` without inspecting the column's type. Membership is keyed by the raw
+        // 64-bit pattern so it is bit-for-bit identical to the `col = lit` path it folds
+        // from: that path compares by total order (`-0.0 != 0.0`, `NaN` matches nothing),
+        // and total-order equality *is* bit equality. The fold only ever produces
+        // integer-valued literals (0.0, 1.0, …, all canonical positive bits), so a column
+        // `-0.0`/`NaN` correctly never lands in the set.
+        DataType::Float64 => {
+            let a = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("float64");
+            let members = Members::new(
+                set.iter()
+                    .filter_map(literal_f64)
+                    .map(f64::to_bits)
+                    .collect(),
+            );
+            membership(
+                a.len(),
+                |i| a.is_valid(i),
+                |i| members.contains(&a.value(i).to_bits()),
+            )
+        }
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().expect("utf8");
             let members = Members::new(set.iter().filter_map(literal_str).collect());
@@ -125,6 +152,16 @@ fn membership(
 fn literal_i64(lit: &Literal) -> Option<i64> {
     match lit {
         Literal::Int(v) => Some(*v),
+        _ => None,
+    }
+}
+
+fn literal_f64(lit: &Literal) -> Option<f64> {
+    match lit {
+        // An integer literal promotes to `f64` exactly as the folded `col = lit` compare
+        // does (both lose precision identically above 2^53).
+        Literal::Int(v) => Some(*v as f64),
+        Literal::Float(v) => Some(*v),
         _ => None,
     }
 }
@@ -212,6 +249,54 @@ mod tests {
         assert_eq!(
             run(Arc::new(dict), &set),
             vec![Some(true), Some(false), None, Some(true), Some(false)]
+        );
+    }
+
+    /// A float column can reach `InList` (the fold collapses `float_col = <int>` chains).
+    /// It must not error, and must match the `col = lit` total-order semantics it folds
+    /// from: `-0.0` does not match integer `0`, and `NaN` matches nothing.
+    #[test]
+    fn float_membership_matches_total_order_equality() {
+        use arrow::array::Float64Array;
+        let arr: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            Some(2.0),
+            Some(3.0),
+            Some(-0.0),
+            Some(0.0),
+            Some(f64::NAN),
+            None,
+        ]));
+        // The fold only produces integer-valued literals for a float column.
+        let set = [Literal::Int(0), Literal::Int(1), Literal::Int(2)];
+        assert_eq!(
+            run(arr, &set),
+            vec![
+                Some(true),  // 1.0 ∈
+                Some(true),  // 2.0 ∈
+                Some(false), // 3.0 ∉
+                Some(false), // -0.0 does NOT match literal 0 (total order, like `col = 0`)
+                Some(true),  // 0.0 matches literal 0
+                Some(false), // NaN matches nothing
+                None,        // null → null
+            ]
+        );
+    }
+
+    #[test]
+    fn float_membership_uses_hashed_path_past_threshold() {
+        use arrow::array::Float64Array;
+        // > LINEAR_SCAN_MAX members exercises the HashSet<u64> branch identically.
+        let set: Vec<Literal> = (0..12).map(Literal::Int).collect();
+        let arr: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            Some(11.0),
+            Some(12.0),
+            None,
+        ]));
+        assert_eq!(
+            run(arr, &set),
+            vec![Some(true), Some(true), Some(false), None]
         );
     }
 

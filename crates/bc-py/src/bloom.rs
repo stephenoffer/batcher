@@ -44,7 +44,7 @@ pub fn build_column_bloom(
     col_index: usize,
     expected_items: u64,
 ) -> PyResult<Option<Vec<u8>>> {
-    let batches = unwrap_batches(batches);
+    let batches = unwrap_batches(batches)?;
     let mut bloom = BloomFilter::with_params(expected_items, 0.01);
     let mut indexed = false;
     for batch in &batches {
@@ -94,6 +94,15 @@ pub fn build_column_bloom(
 /// per record). Equal key *values* encode to identical bytes regardless of converter
 /// instance, so a bloom built on one side and probed on the other agrees on equality.
 fn key_rows(batch: &RecordBatch, key_indices: &[usize]) -> PyResult<arrow::row::Rows> {
+    // Validate at the boundary: an out-of-range key index would otherwise index
+    // `batch.column(i)` out of bounds and *panic* through the FFI (a `PanicException`,
+    // which is a `BaseException` normal handlers miss). Surface a clean, catchable error.
+    let ncols = batch.num_columns();
+    if let Some(&bad) = key_indices.iter().find(|&&i| i >= ncols) {
+        return Err(PyRuntimeError::new_err(format!(
+            "key index {bad} out of range for a batch with {ncols} columns"
+        )));
+    }
     let fields: Vec<SortField> = key_indices
         .iter()
         .map(|&i| SortField::new(batch.column(i).data_type().clone()))
@@ -119,7 +128,7 @@ pub fn build_key_bloom(
     key_indices: Vec<usize>,
     expected_items: u64,
 ) -> PyResult<Vec<u8>> {
-    let batches = unwrap_batches(batches);
+    let batches = unwrap_batches(batches)?;
     let mut bloom = BloomFilter::with_params(expected_items, 0.01);
     for batch in &batches {
         if batch.num_rows() == 0 {
@@ -165,7 +174,7 @@ pub fn bloom_filter_batches(
 ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
     let bloom = BloomFilter::from_bytes(&bloom_bytes)
         .ok_or_else(|| PyRuntimeError::new_err("malformed bloom-filter bytes"))?;
-    let batches = unwrap_batches(batches);
+    let batches = unwrap_batches(batches)?;
     let mut out = Vec::with_capacity(batches.len());
     for batch in &batches {
         if batch.num_rows() == 0 {

@@ -22,6 +22,9 @@ _AGG_FUNCS = {
     "stddev": "stddev",
     "stddevsamp": "stddev",
     "median": "median",
+    # `mode() WITHIN GROUP (ORDER BY x)` is rewritten to `Mode(this=x)` up front
+    # (see clauses._within_group_to_agg) so it reaches here as a plain aggregate.
+    "mode": "mode",
 }
 
 # sqlglot DataType.Type names that fold a string literal into a temporal literal.
@@ -53,16 +56,25 @@ _UNARY_MATH = {
     "Degrees": "degrees",
     "Radians": "radians",
 }
-_UNARY_STR = {"Upper": "upper", "Lower": "lower", "Length": "len", "Reverse": "reverse"}
+_UNARY_STR = {
+    "Upper": "upper",
+    "Lower": "lower",
+    "Length": "len",
+    "Reverse": "reverse",
+    "Ascii": "ascii",
+}
 _DATE_PART = {
     "Year": "year",
     "Month": "month",
     "Day": "day",
+    "DayOfMonth": "day",
     "Hour": "hour",
     "Minute": "minute",
     "Second": "second",
     "Quarter": "quarter",
     "Week": "week",
+    "DayOfWeek": "dayofweek",
+    "DayOfYear": "dayofyear",
 }
 # EXTRACT(<part> FROM ts) field name (lowercased) → `.dt` method.
 _EXTRACT_PART = {
@@ -107,6 +119,39 @@ def _like_to_regex(pattern: str, escape: str | None = None) -> str:
         i += 1
     out.append("$")
     return "".join(out)
+
+
+def regexp_flags_prefix(flag: str | None) -> str:
+    """Translate a DuckDB regex option string into an inline `(?…)` flag prefix.
+
+    DuckDB's ``regexp_*`` functions take an option string (e.g. ``'i'``); the Rust
+    ``regex`` crate honours the same letters as an inline prefix on the pattern. Only
+    the options whose Rust mapping is verified bit-identical to DuckDB are accepted —
+    ``'i'`` (case-insensitive) and ``'s'`` (``.`` matches newline); ``'c'`` is the
+    (default) case-sensitive mode and is a no-op. Any other option (``'m'``/``'n'``
+    line-anchoring, ``'l'`` literal, ``'g'`` global, …) raises rather than being
+    silently dropped, which would return a wrong (e.g. case-sensitive) result.
+
+    Args:
+        flag: The DuckDB option string, or None when no options were given.
+
+    Returns:
+        An inline flag prefix such as ``"(?i)"``, or ``""`` for no active flags.
+    """
+    if not flag:
+        return ""
+    active = ""
+    for opt in flag:
+        if opt == "c":
+            continue  # case-sensitive is the default
+        if opt in "is":
+            if opt not in active:
+                active += opt
+        else:
+            raise NotImplementedError(
+                f"regexp option {opt!r} is not supported (only 'i', 's', 'c')"
+            )
+    return f"(?{active})" if active else ""
 
 
 def _literal(node) -> Expr:
@@ -221,26 +266,41 @@ def _temporal_literal(text: str, kind: str) -> Expr:
 
 def _dtype_name(to) -> str:
     name = to.sql().lower()
+    # Longest-prefix wins so that e.g. ``bigint`` isn't shadowed by ``int`` — a
+    # dict iteration order is not a reliable tiebreak, and ``smallint`` must not
+    # fall through to the ``string`` default (which silently cast integers to text).
     table = {
+        "tinyint": "int64",
+        "smallint": "int64",
         "bigint": "int64",
+        "hugeint": "int64",
+        "int128": "int64",
         "int": "int64",
         "integer": "int64",
         "long": "int64",
+        "ubigint": "int64",
+        "uinteger": "int64",
+        "usmallint": "int64",
+        "utinyint": "int64",
         "double": "float64",
+        "decimal": "float64",
+        "numeric": "float64",
         "float": "float64",
         "real": "float64",
         "varchar": "string",
         "text": "string",
         "string": "string",
         "boolean": "bool",
+        "bool": "bool",
         "date": "date",
         "timestamp": "timestamp",
         "datetime": "timestamp",
     }
+    best = None
     for k, v in table.items():
-        if name.startswith(k):
-            return v
-    return "string"
+        if name.startswith(k) and (best is None or len(k) > len(best[0])):
+            best = (k, v)
+    return best[1] if best is not None else "string"
 
 
 def _build_binops():
@@ -251,6 +311,8 @@ def _build_binops():
         exp.Sub: lambda a, b: a - b,
         exp.Mul: lambda a, b: a * b,
         exp.Div: lambda a, b: a / b,
+        exp.IntDiv: lambda a, b: a // b,  # SQL `//` integer floor division
+        exp.Pow: lambda a, b: a**b,  # SQL `^` / power() / `**`
         exp.Mod: lambda a, b: a % b,
         exp.EQ: lambda a, b: a == b,
         exp.NEQ: lambda a, b: a != b,

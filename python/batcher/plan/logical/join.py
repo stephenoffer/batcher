@@ -12,7 +12,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.plan.ir_tags import Op
-from batcher.plan.logical.base import LogicalPlan
+from batcher.plan.logical.base import LogicalPlan, _reject_duplicate_aliases
 from batcher.plan.schema import SchemaRef
 
 __all__ = ["AsofJoin", "Join", "JoinOutputCol", "WatermarkStreamJoin"]
@@ -47,6 +47,54 @@ def _join_output_schema(
             return None
         fields.append(pa.field(o.alias, src.field(o.name).type))
     return SchemaRef.from_arrow(pa.schema(fields))
+
+
+def _validate_key_types(
+    left: LogicalPlan,
+    right: LogicalPlan,
+    left_keys: tuple[str, ...],
+    right_keys: tuple[str, ...],
+) -> None:
+    """Reject a join whose key columns have mismatched types.
+
+    The engine's row-encoder compares keys byte-for-byte and requires each paired
+    key to have the *same* Arrow type (it does not coerce ``Int64`` against
+    ``Float64`` or ``Utf8``). Without this check a mismatch surfaces only at
+    execution as an opaque ``RowConverter column schema mismatch`` — so we validate
+    at build time when both sides' schemas are known, and stay silent otherwise.
+    """
+    pairs = _paired_key_types(left, right, left_keys, right_keys)
+    for lk, rk, lt, rt in pairs:
+        if not lt.equals(rt):
+            raise PlanError(
+                f"join key type mismatch: left {lk!r} is {lt} but right {rk!r} is {rt}; "
+                f"cast one side so the keys share a type"
+            )
+
+
+def _paired_key_types(
+    left: LogicalPlan,
+    right: LogicalPlan,
+    left_keys: tuple[str, ...],
+    right_keys: tuple[str, ...],
+) -> list[tuple[str, str, pa.DataType, pa.DataType]]:
+    """Resolve each key pair to its (left, right) Arrow types, skipping the unknown.
+
+    Returns only the pairs both of whose types are known. Any failure to introspect
+    a side's schema yields no pairs — the validation stays silent rather than raise a
+    non-``PlanError`` (a plan may legitimately have an un-inferable schema)."""
+    try:
+        left_schema = left.available_schema()
+        right_schema = right.available_schema()
+    except Exception:
+        return []
+    if left_schema is None or right_schema is None:
+        return []
+    out: list[tuple[str, str, pa.DataType, pa.DataType]] = []
+    for lk, rk in zip(left_keys, right_keys, strict=True):
+        if left_schema.has(lk) and right_schema.has(rk):
+            out.append((lk, rk, left_schema.field(lk).type, right_schema.field(rk).type))
+    return out
 
 
 # The join semantics the engine understands — the `join_type` wire vocabulary,
@@ -94,6 +142,11 @@ class Join(LogicalPlan):
             raise PlanError(f"unknown join type {self.join_type!r}; expected {sorted(JOIN_TYPES)}")
         if self.strategy not in JOIN_STRATEGIES:
             raise PlanError(f"unknown join strategy {self.strategy!r}; expected {JOIN_STRATEGIES}")
+        _validate_key_types(self.left, self.right, self.left_keys, self.right_keys)
+        # A join must disambiguate colliding names (via `suffix`), never silently emit
+        # two columns of the same name — one would be lost when the result is
+        # materialized to a name-keyed structure.
+        _reject_duplicate_aliases([o.alias for o in self.output], what="join output")
 
     def to_ir(self) -> dict[str, Any]:
         return {

@@ -39,18 +39,98 @@ _SAVE_MODES = ("overwrite", "error", "ignore", "append")
 _MODE_AWARE_SINKS = frozenset({"delta", "iceberg", "hudi", "snowflake"})
 
 
-def _is_distributable_aggregate(plan: Any) -> bool:
-    """Whether `plan` is a streaming aggregation the cluster can fold in parallel.
+def _prune_stale_after_overwrite(path: str, fmt: str, manifest: WriteManifest) -> None:
+    """Delete files a prior write left under `path` that this overwrite did not rewrite.
+
+    A file sink writes ``part-NNNNN`` (and Hive ``col=v/…``) files whose *names* depend
+    on the shard/chunk count and partition values of the current data — not the previous
+    write's. So overwriting a 5-file output with a 2-file one, or a ``{a, b}``-partitioned
+    table with an ``{a}``-only one, leaves the extra ``part-`` files / ``col=b`` directory
+    in place, and the next read unions the stale rows back in (silent data corruption). A
+    plain overwrite must *replace* the output, so any surviving file this write did not
+    produce is deleted after the (atomic, hence complete) write commits.
+
+    Runs only for the plain file sinks (`FileSink`): the lakehouse/warehouse sinks manage
+    their own overwrite through a transaction log or a target table. Fails safe — if the
+    manifest's own files are not all found in the listing (a path-normalization mismatch),
+    nothing is deleted rather than risk removing a live file.
+    """
+    import contextlib
+    import os.path
+
+    from batcher._internal.errors import IOError as _IOError
+    from batcher.io.base.sink import FileSink
+    from batcher.io.filesystem import resolve_filesystem
+    from batcher.io.sink import SINKS
+
+    sink_cls = SINKS.get(fmt)
+    if not (isinstance(sink_cls, type) and issubclass(sink_cls, FileSink)):
+        return
+    keep = {f.path for f in manifest.files}
+    # A single-file write (`<path>` is the file itself) is replaced atomically in place —
+    # there is no sibling directory of parts to prune.
+    if not keep or keep == {path}:
+        return
+    # The format extension to list by, read from the files this write actually produced
+    # (a sink's `suffix` can be an instance property — e.g. a per-write token — so it is
+    # not reliably readable off the class). All shards of one write share the extension.
+    suffixes = tuple(
+        {os.path.splitext(f.path)[1] for f in manifest.files if os.path.splitext(f.path)[1]}
+    )
+    if not suffixes:
+        return
+    fs = resolve_filesystem(path)
+
+    def _walk(directory: str) -> list[str]:
+        found: list[str] = []
+        # A directory with no matching data files (e.g. a partition root) raises.
+        with contextlib.suppress(OSError, ValueError, _IOError):
+            found.extend(fs.expand(directory, suffix=suffixes))
+        for sub in fs.list_dirs(directory):
+            found.extend(_walk(sub))
+        return found
+
+    existing = set(_walk(path))
+    if not keep.issubset(existing):
+        return  # listing did not surface our own files — do not risk a wrong deletion
+    for stale in existing - keep:
+        fs.remove(stale)
+
+
+def _undistributable_stream_reason(plan: Any) -> str | None:
+    """Why the cluster cannot fold this streaming plan with single-node semantics, or None.
 
     A top-level `Aggregate` over a breaker-free input is exactly the shape the mergeable
     algebra covers: each worker runs `partial` on its share of the epoch and the driver
-    `combine`s the partials into the running state. Anything with a *second* breaker under
-    it (a sort, a join) has no such decomposition here, and is refused rather than run with
-    different semantics than the single-node path.
+    `combine`s the partials into the running state. Anything else is **refused rather than run
+    with different semantics than the single-node path** — which is invariant #7
+    (single-node == distributed), and is not a slogan: the one shape that slipped through this
+    gate silently returned a different answer on a cluster than on one box.
     """
     from batcher.plan.logical import Aggregate, is_streamable
 
-    return isinstance(plan, Aggregate) and is_streamable(plan.input)
+    if not isinstance(plan, Aggregate) or not is_streamable(plan.input):
+        return (
+            "distributed streaming supports a stateless pipeline or a top-level "
+            "streaming aggregation; this plan has another pipeline breaker "
+            "(sort / join / window) — restructure it, or omit distributed."
+        )
+    if plan.watermark is not None:
+        # The shape that slipped through. A watermarked aggregate is an `Aggregate` over a
+        # streamable input, so the old gate waved it past — and `dist/` implements no
+        # watermark at all (no window eviction, no late-row drop, no append mode). It
+        # degraded to an unbounded complete-mode aggregate that re-emits the whole running
+        # result every epoch and grows state forever: the same query, single-node vs
+        # distributed, produced different results with no error and no warning.
+        return (
+            "distributed streaming does not implement event-time watermarks: the distributed "
+            "runner has no window eviction, no late-row drop, and no append output mode, so a "
+            "watermarked aggregation would silently degrade to an unbounded complete-mode "
+            "aggregate and return a different result than the same query run single-node. Run "
+            "it with distributed=False, or drop the watermark to accept complete-mode "
+            "semantics."
+        )
+    return None
 
 
 class Writer:
@@ -295,7 +375,7 @@ class Writer:
             if spec.target_size_mb is not None:
                 target_bytes = int(spec.target_size_mb * 1024 * 1024)
 
-        return _write(
+        manifest = _write(
             self._ds._plan,
             self._ds._sources,
             self._ds.columns,
@@ -311,6 +391,14 @@ class Writer:
             target_bytes_per_file=target_bytes,
             sink_kwargs=sink_kwargs,
         )
+        # Overwrite must REPLACE the output: drop any stale files a prior, differently
+        # shaped write left under `path` that this write did not rewrite (else the next
+        # read unions them back in). `resume` is exempt — it intentionally keeps and skips
+        # already-present files. Only the plain file sinks need this; the mode-aware sinks
+        # overwrite through their own log/table.
+        if mode == "overwrite" and not resume and fmt not in _MODE_AWARE_SINKS:
+            _prune_stale_after_overwrite(path, fmt, manifest)
+        return manifest
 
     # --- streaming sink targets -------------------------------------------
     def _start_stream(
@@ -413,12 +501,9 @@ class Writer:
                     "select / map_batches); a streaming aggregation needs a micro-batch "
                     "boundary to fold — use Trigger.processing_time(...)"
                 )
-            if not _is_distributable_aggregate(self._ds._plan):
-                raise PlanError(
-                    "distributed streaming supports a stateless pipeline or a top-level "
-                    "streaming aggregation; this plan has another pipeline breaker "
-                    "(sort / join / window) — restructure it, or omit distributed."
-                )
+            reason = _undistributable_stream_reason(self._ds._plan)
+            if reason is not None:
+                raise PlanError(reason)
         from batcher.api.streaming import start_distributed_stream
         from batcher.plan.streaming import Trigger as _Trigger
 

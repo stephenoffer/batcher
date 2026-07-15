@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 
+from batcher.kyber.stats.constants import constant_projection_stat
 from batcher.plan.expr_ir import Cast, Col, Lit
 from batcher.plan.logical import Aggregate, Join, Projection
 from batcher.plan.schema import SchemaRef
@@ -111,6 +112,10 @@ def project_columns(
             carried = _identity_cast_column(item.expr, input_schema, child)
             if carried is not None:
                 out[item.alias] = carried
+        else:
+            folded = constant_projection_stat(item.expr, child)
+            if folded is not None:
+                out[item.alias] = folded
     return out
 
 
@@ -312,7 +317,10 @@ def _derive_scalar_aggregate(func: str, input_expr, child: RelStats, plan=None):
         if not child.rows_exact or col_name is None:
             return None
         stat = child.columns.get(col_name)
-        if stat is None or stat.provenance is not Provenance.EXACT or stat.null_count is None:
+        # The null count's own tag, not the bundle's: a string column's bounds may be truncated
+        # (so the bundle is DEFAULT) while its footer null count is exact — and `count(name)` is
+        # derived from the null count, not from the bounds.
+        if stat is None or stat.null_count is None or not stat.null_count_is_exact:
             return None
         return int(child.rows - stat.null_count)
     if col_name is None:

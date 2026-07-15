@@ -137,6 +137,11 @@ exclude_patterns = [
     # Design/migration note for porting the optimizer's cold hot-path passes to Rust.
     # A contributor working record (scope + dependency-ordered migration), not a site page.
     "internals/rust_optimizer_port.md",
+    # A code-checked audit of Batcher's architecture against DuckDB / Polars / Spark /
+    # Flink / Ray Data / Daft / Snowflake: where it genuinely wins, where it loses, the
+    # structural ceilings, and the claims the code does not support. A working record for
+    # contributors (and deliberately blunt about our own marketing), not a site page.
+    "internals/competitive_architecture.md",
 ]
 
 # -- Options for HTML output -------------------------------------------------
