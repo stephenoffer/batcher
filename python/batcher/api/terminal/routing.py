@@ -51,6 +51,23 @@ def resolve_distributed(
         has_gpus = topology.get("gpus", 0.0) > 0
         if has_gpus and plan is not None and _plan_has_gpu_stage(plan):
             return True
+        # Data already resident in THIS process never distributes on `auto`, at any size.
+        # The row-count threshold below asks "is there enough work to spread?", which is the
+        # wrong question for resident data: the work is not the problem, the *data movement*
+        # is. Distributing it ships every batch out of the driver and gathers the result
+        # back, and that costs far more than the compute it parallelizes — a 6M-row grouped
+        # SUM over an in-memory table measures 45 ms single-node vs 1031 ms distributed
+        # (23x) on a 128-CPU cluster. Distribution pays when the workers do the *reading*
+        # themselves (the same cluster turns a 4.94x loss into a 0.60x win on an S3-backed
+        # sf10 scan), which is exactly the file-backed case this leaves alone.
+        #
+        # This is not a rare shape: any process where something else has initialized Ray —
+        # a Daft or Ray Data comparison in the same script, a Ray-using library, an
+        # Anyscale workspace — flips `auto` to True and silently pays the 23x. A GPU stage
+        # still distributes (checked above): it must reach the cluster's accelerators, and
+        # that is a capability need, not a throughput bet.
+        if sources and all(getattr(s, "resident", False) for s in sources):
+            return False
         from batcher.config import active_config
 
         min_rows = active_config().distributed.distribute_min_rows
