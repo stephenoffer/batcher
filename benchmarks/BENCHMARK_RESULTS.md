@@ -1,5 +1,49 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## vs Databricks Reyden: Batcher LOSES its target workload by ~40-100x (2026-07-18)
+
+Reyden is the engine behind Databricks **Lakehouse//RT**, announced at DAIS 2026-06-16 (Beta,
+read-only, Unity Catalog required). It is a **real-time serving** engine, not an analytics
+engine, so TPC-H says nothing about it either way. Its published claims: **sub-100 ms at
+12,000 QPS**, up to 16x vs real-time serving layers, ~10 ms on small datasets
+([blog](https://www.databricks.com/blog/introducing-lakehousert-real-time-performance-unified-lakehouse)).
+
+Reyden cannot be run here (no Databricks account), so this is Batcher **measured** against
+Reyden **published**, which is a weak comparison and is labelled as such. But it is decisive
+enough that the direction is not in doubt.
+
+**Measured — serving-shaped workload, 16-core box, resident 6M-row table, point lookup:**
+
+| | Batcher measured | Reyden published |
+|---|---|---|
+| single-query p50 latency | **6.5 ms** (3.1 ms at 100k rows) | sub-100 ms |
+| single-query p99 latency | **14.5 ms** | — |
+| **throughput** | **145 QPS single-thread; 66-113 QPS concurrent** | **12,000 QPS** |
+
+**Batcher meets the latency bar and misses the concurrency bar by ~40-100x.** Worse, throughput
+*falls* as concurrency rises — 16 threads is **slower** than 1 (124 → 88 QPS, p50 7.6 → 178 ms).
+
+Three candidate causes were tested and two are **ruled out**, which is the useful part:
+
+- *Rayon oversubscription* (16 queries x 16 workers)? **No.** Pinning `parallelism=1` does not
+  fix it — QPS stays ~55-80 at every thread count.
+- *The GIL?* **No.** Separate *processes* only reach 113 QPS at 16-way (from 65 at 1-way).
+- What remains, and matches the numbers: a **fixed ~3-4 ms per-query control-plane cost** (SQL
+  parse → plan → optimize → IR), which caps a single stream at ~150-300 QPS *regardless of data
+  size* — a 10,000-row table still costs 4.2 ms p50 — plus, for large scans, **no index**: a
+  point lookup reads the whole column, so the 6M-row case is memory-bandwidth bound
+  (113 QPS x ~48 MB ≈ 5.4 GB/s).
+
+**This is an architectural gap, not a tuning gap.** Batcher is built to give one query all the
+cores; a serving engine must give thousands of concurrent queries one core each, and answer a
+point lookup from an index instead of a scan. Closing it needs a cheap prepared-plan path that
+skips parse/optimize per query, concurrent-query admission, and point-access structures — none
+of which exist today.
+
+**Do not claim Batcher competes with Reyden / Lakehouse//RT on serving workloads.** The honest
+positioning is that they are different classes: Batcher's wins below are analytics
+(scan/join/aggregate throughput), which is not what Reyden is for.
+
 ## The multi-node comparison was not apples-to-apples, in BOTH directions (2026-07-18)
 
 Chasing "beat Daft and Ray Data on equal terms" turned up two defects that had been quietly
