@@ -1,5 +1,107 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## Two kernels were single-threaded / allocation-bound; both are fixed (2026-07-18)
+
+16-core / 30 GB, release build, every number correctness-gated against `duckdb_arrow`
+(DuckDB reading the *same* Arrow tables — the comparison the Arrow-only invariant makes fair).
+
+**Where it stands after this session:**
+
+| suite | result |
+|---|---|
+| **TPC-H sf1** (22 comparable) | **22/22 beat** `duckdb_arrow`. Was 21/22 — q4 was the last loss. q21 (correlated subqueries) now runs |
+| **ClickBench** (43q) | **43/43 correct, 42/43 beat**. Only loss: **cb-q32 1.17x** — high-cardinality 2-key GROUP BY + top-N |
+| **operator mix** (11) | **10/11 beat DuckDB** (was 8/11); only **op-sort-limit 1.09x**. 8/11 beat Polars |
+| **JSON / semistructured** (5) | **5/5 beat both** — 0.08–0.28x vs DuckDB, 0.01–0.09x vs Polars |
+
+### 1. The streaming join's kernel ran on one core (TPC-H q4)
+
+The prior session fixed the *scheduling* around a non-shardable join — build side parallel,
+probe side parallel, don't shard a join with no per-morsel probe. What was left was the join
+itself: `radix_join_scalar`'s partition loop was a plain `for`, so a join whose build exceeds
+2^21 rows or isn't 1–2 `Int64` keys funnelled a fully-parallel build and probe into a
+**single-threaded** kernel. That was the documented ~55% of q4.
+
+The partitions are independent by construction (equal keys co-partition), so each is now
+joined on its own core and **the pieces are concatenated in partition order**, which
+reproduces the sequential appends exactly. That is the crux: this is *not* the
+`join_partitioned` swap that was tried and reverted (RETRACTED section below) — that one
+rebucketed by `rayon::current_num_threads()` and so emitted a different row order. Same
+rows, same order, so `restore_probe_order`'s semi/anti contract is untouched.
+
+| | before | after |
+|---|---|---|
+| q4 | 115.6 ms (**1.14x — the last loss**) | **43.0 ms (0.41x)** |
+| q3 | 110.3 ms (0.99x) | **66.3 ms (0.56x)** |
+
+### 2. The whole-partition window aggregate cost the same at 7 groups as at 1.5M
+
+`sum(x) OVER (PARTITION BY k)` cost ~140 ms **regardless of key cardinality and regardless
+of column count**, while the equivalent `GROUP BY` over the same keys cost 8–24 ms. Flat in
+both dimensions is the tell: neither the grouping nor the materialize was the bottleneck.
+
+Two per-row costs in `window_partition_agg`, both now gone:
+
+* the reduce loop re-matched on the **runtime `WindowFn` enum inside the row loop** — a
+  branch, per row, on a value constant for the whole call. It now takes its combiner as a
+  generic closure specialized once outside the loop, with a null-free fast path that skips
+  the validity check entirely;
+* the broadcast collected `Vec<Option<T>>` — **16 bytes/row** — and then converted it *again*
+  into a values buffer plus a null buffer. At 6M rows that intermediate alone is ~96 MB of
+  traffic. It now writes the values buffer directly (8 bytes/row), builds a null buffer only
+  when some group is actually empty, and fans the gather across cores above 2^17 rows.
+
+`cnt[g] == 0` doubles as the seen-flag and the AVG divisor, so no `Option` is needed at all.
+Every guarantee is kept where it was: i128-exact integer AVG, i64 SUM overflow raising
+`SumOverflow` (via a flag after the pass, since a closure cannot return early), and
+total-order float MIN/MAX so NaN stays greatest.
+
+| kernel, 6M rows / 16 cores | before | after |
+|---|---|---|
+| 7 groups | 139.2 ms | **36.8 ms** |
+| 10,000 groups | 145.2 ms | **37.4 ms** |
+| 1.5M groups | 714.8 ms | **533.7 ms** |
+
+End to end, `op-window-sum-partition` went **399.1 → 88.3 ms (1.37x loss → 0.92x win)**. Every
+window path benefits, including the bucket-parallel one — it runs this same kernel per bucket.
+
+### What is left, with the diagnosis already done
+
+* **`op-window-sum-partition` still loses to Polars (1.06x)** and sits at ~72 ms where the
+  kernel alone is ~37 ms. The remaining ~35 ms is structural, not kernel: the operator
+  `ops::materialize`s the whole relation into one batch and then groups it **single-threaded**,
+  while the morsel-parallel `GROUP BY` over the same keys costs 8.5 ms. The fix is to run this
+  shape as what it actually is — the **mergeable aggregate + a per-morsel broadcast**:
+  morsel-parallel `partial → combine → finalize` for the per-key value, then probe it per
+  morsel to append the column. That removes the full-relation materialize, parallelizes the
+  grouping, and is invariant #7 shaped, so it serves streaming and distributed unchanged.
+  The trap to design around is NULL keys: `GROUP BY` makes NULL a group, an equi-probe
+  matches nothing, so a naive "join against the aggregate" silently drops those rows.
+* **`op-sort-limit` 1.09x** and the two Polars losses (`op-join-agg` 1.23x,
+  `op-filter-project` 1.23x) are all ~2 ms absolute gaps on 6M rows — fixed overhead, not
+  algorithmic.
+* **`cb-q32` 1.17x** — high-cardinality two-key GROUP BY feeding a top-N.
+
+### A measurement trap worth knowing (it cost real time this session)
+
+`maturin develop` (no `--release`) leaves a **287 MB** `_native.abi3.so` where the release
+build is **46 MB**, and everything is then ~8x slower — a window query read 905 ms instead of
+96 ms. Nothing in the benchmark output says "debug". Before trusting any number:
+
+```
+ls -la python/batcher/_native.abi3.so   # 46 MB = release, ~287 MB = debug
+```
+
+This is the single-node twin of the stale-worker-wheel trap documented below.
+
+### `test_dist_hunt2_matrix.py` failures are resource pressure, not regressions
+
+Under a loaded box the distributed join tests fail with `ResourceError: no surviving worker
+to recover the join shuffle on` — the same unrecovered-shuffle bug tracked below. Verified
+not a regression by building **with and without** the join change and running the identical
+file: **1 failed / 21 passed both ways**. Run them on a quiet box, or they will libel whatever
+you changed last.
+
 ## The cluster was never broken — the workspace's dependency list was (2026-07-16)
 
 Every prior session recorded multi-node Ray as untestable here ("Ray Data unusable in THIS env both
