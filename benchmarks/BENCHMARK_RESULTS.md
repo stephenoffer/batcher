@@ -52,6 +52,38 @@ Daft returns `revenue = 1230113636.01` where Batcher and DuckDB both return
 `752448391.6111` — independently confirming the q6 wrong-answer this file recorded earlier,
 now with DuckDB as referee rather than Batcher's own say-so.
 
+### OPEN: the shuffle fan-out cost is superlinear in partition count
+
+Forcing the distributed path on the same in-memory 6M-row grouped SUM, varying only
+`num_partitions` on the 128-CPU cluster:
+
+| partitions | time |
+|---|---|
+| single-node (no distribution) | **248 ms** |
+| 16 (the default — driver core count) | 1,031 ms |
+| **128** (one per cluster CPU) | **93,189 ms** |
+
+**8x the partitions cost ~90x the time.** That is close to the 64x a `P²` shuffle-pair
+count predicts (16² = 256 → 128² = 16,384), which points at a per-pair fixed cost in the
+shuffle rather than anything about the data: ~5.7 ms per partition pair. This is worth
+chasing, because "one partition per cluster CPU" is the obvious way to size a distributed
+run and is exactly the setting that falls off the cliff — `BENCH_BATCHER_PARTITIONS=128`
+made each operator-mix case take ~8 minutes, which read as a hang and cost real time to
+diagnose. It also bounds the fan-out a PB-scale run can use, so it is a scaling ceiling,
+not only a benchmark annoyance.
+
+Note the interaction with the fix above: `auto` no longer picks this path for resident data
+at all, so a user only reaches it with an explicit `distributed=True`. The underlying cost
+is still there.
+
+### NOT MEASURED: Ray Data
+
+Ray Data could not be timed in this session and no number should be inferred. Its executor
+stalls with the autoscaling coordinator reporting empty allocations, because the cluster
+was saturated (0–16 of 128 CPUs free) by concurrent work rather than by Ray Data itself.
+That is an environment limitation, not a statement about Ray Data's speed — the
+50–450x figures elsewhere in this file predate it and were not re-verified here.
+
 ### Note on the single-node tables below
 
 They were already apples-to-apples, and that is worth stating explicitly rather than
