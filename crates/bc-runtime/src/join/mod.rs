@@ -146,6 +146,15 @@ impl IndexBuf {
         self.idx.len()
     }
 
+    /// Append another buffer's indices, preserving its NULL sentinels.
+    ///
+    /// Used to concatenate per-partition pieces **in partition order**, which is what makes
+    /// the parallel radix join emit byte-identical rows to the sequential one.
+    fn extend(&mut self, other: IndexBuf) {
+        self.idx.extend_from_slice(&other.idx);
+        self.any_null |= other.any_null;
+    }
+
     /// Sort the buffered indices ascending.
     ///
     /// Only meaningful for a side whose partner is all-NULL — a semi/anti join — where the
@@ -670,6 +679,27 @@ const RADIX_PART_ROWS: usize = 1 << 15;
 /// without the partition vectors themselves thrashing cache on the scatter.
 const RADIX_MAX_PARTS: usize = 1 << 12;
 
+/// Total rows (build + probe) below which joining the radix partitions concurrently costs
+/// more than it saves.
+///
+/// The per-partition join is already cache-resident by construction, so the only thing
+/// parallelism buys is core count; below this the rayon fan-out plus the per-partition
+/// `IndexBuf` allocations and the final concatenation dominate. Above it the partition loop
+/// is pure independent work and scales with cores.
+const RADIX_PARALLEL_MIN_ROWS: usize = 1 << 18;
+
+/// Whether [`radix_join_scalar`] should join its partitions concurrently.
+///
+/// Needs real work (`RADIX_PARALLEL_MIN_ROWS`), more than one partition to spread, and more
+/// than one core to spread them over. Nested inside an outer `par_iter` (the materializing
+/// executor's partitioned join) this simply finds no idle workers and runs inline, so it
+/// cannot oversubscribe.
+fn radix_parallel_worthwhile(build_rows: usize, probe_rows: usize, parts: usize) -> bool {
+    parts > 1
+        && build_rows.saturating_add(probe_rows) >= RADIX_PARALLEL_MIN_ROWS
+        && rayon::current_num_threads() > 1
+}
+
 /// Cache-radix hash join over a `Copy` key witness (the integer fast paths), left-driven
 /// join types only.
 ///
@@ -697,20 +727,43 @@ fn radix_join_scalar<O: Copy + std::hash::Hash + Eq + Send + Sync>(
         build_key, probe_key, build_rows, probe_rows, build_null, probe_null,
     );
 
-    // One table, reused per partition (each partition's build rows are disjoint).
-    let mut heads: HashTable<u32> = HashTable::with_capacity(RADIX_PART_ROWS);
     let mut left_out = IndexBuf::with_capacity(probe_rows);
     let mut right_out = IndexBuf::with_capacity(probe_rows);
-    for (b, probe) in build_parts.iter().zip(&probe_parts) {
-        join_partition_into(
-            b,
-            probe,
-            &state,
-            join_type,
-            &mut heads,
-            &mut left_out,
-            &mut right_out,
-        );
+
+    if radix_parallel_worthwhile(build_rows, probe_rows, build_parts.len()) {
+        // Partitions are independent (equal keys co-partition), so each can be joined on its
+        // own core. Concatenating the pieces **in partition order** reproduces the sequential
+        // loop's appends exactly — same rows, same order — so this is a scheduling change
+        // only, and the semi/anti row-order contract below is untouched.
+        let pieces: Vec<(IndexBuf, IndexBuf)> = build_parts
+            .par_iter()
+            .zip(probe_parts.par_iter())
+            .map(|(b, probe)| {
+                let mut heads: HashTable<u32> = HashTable::with_capacity(b.len());
+                let mut l = IndexBuf::with_capacity(probe.len());
+                let mut r = IndexBuf::with_capacity(probe.len());
+                join_partition_into(b, probe, &state, join_type, &mut heads, &mut l, &mut r);
+                (l, r)
+            })
+            .collect();
+        for (l, r) in pieces {
+            left_out.extend(l);
+            right_out.extend(r);
+        }
+    } else {
+        // One table, reused per partition (each partition's build rows are disjoint).
+        let mut heads: HashTable<u32> = HashTable::with_capacity(RADIX_PART_ROWS);
+        for (b, probe) in build_parts.iter().zip(&probe_parts) {
+            join_partition_into(
+                b,
+                probe,
+                &state,
+                join_type,
+                &mut heads,
+                &mut left_out,
+                &mut right_out,
+            );
+        }
     }
     emit_null_probe_unmatched(probe_null, join_type, &mut left_out, &mut right_out);
     restore_probe_order(join_type, &mut left_out);
@@ -1827,15 +1880,7 @@ mod hunt_tests {
             Some(2),
             None,
         ];
-        let rv: Vec<Option<i64>> = vec![
-            Some(2),
-            Some(2),
-            Some(3),
-            Some(4),
-            None,
-            Some(1),
-            Some(1),
-        ];
+        let rv: Vec<Option<i64>> = vec![Some(2), Some(2), Some(3), Some(4), None, Some(1), Some(1)];
         let left = vec![i64_col(&lv)];
         let right = vec![i64_col(&rv)];
         let swap = |t: JoinType| match t {
