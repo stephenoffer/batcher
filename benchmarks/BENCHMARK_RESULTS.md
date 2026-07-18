@@ -1,5 +1,64 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## The multi-node comparison was not apples-to-apples, in BOTH directions (2026-07-18)
+
+Chasing "beat Daft and Ray Data on equal terms" turned up two defects that had been quietly
+deciding the answer — one that flattered Batcher, one that crippled it. Both are fixed.
+
+**Daft was running LOCAL in the distributed tier.** Daft defaults to its native
+single-process runner, and nothing in the harness changed it. So `--tier multi` timed a
+**16-core Daft against a 128-CPU Batcher and Ray Data** and printed it as a fair fight. Every
+prior multi-tier Daft number in this file was measured that way and should be treated as
+suspect. `engines/daft.py` now selects the Ray runner on the same cluster.
+
+The first version of that fix *silently did nothing*: Daft moved `set_runner_ray` from
+`daft.context` to the top level in 0.7, and the call sat behind a bare `except`. It now
+raises instead — a silently-local Daft still produces numbers, and they are wrong in
+Batcher's favor, which is the worst failure mode a benchmark can have.
+
+**Batcher was distributing data that was already in its own process, and paying 23x for it.**
+`distributed="auto"` distributes once Ray is initialized and the input clears
+`distribute_min_rows` (1M). But that threshold asks "is there enough work to spread?", which
+is the wrong question for driver-resident data: the work is not the problem, the *data
+movement* is. Measured on the 128-CPU cluster, a 6M-row grouped SUM over an in-memory table:
+
+| in-memory 6M-row grouped SUM | time |
+|---|---|
+| single-node | **45 ms** |
+| distributed (auto's old choice) | **1031 ms — 23x slower** |
+
+`auto` now refuses to distribute when every source is `resident`, at any size. File-backed
+sources are untouched — that is where distribution pays, and the same cluster still turns a
+4.94x loss into a 0.60x win on an S3-backed sf10 scan. A GPU stage still distributes: that is
+a capability need, not a throughput bet.
+
+This is not an exotic shape. `auto` only distributes when Ray is *already* initialized, and
+anything can do that — a Daft or Ray Data comparison in the same script, any Ray-using
+library, an Anyscale workspace. **Merely benchmarking against Daft made Batcher 23x slower**,
+which is precisely how the harness came to hide it.
+
+### Distributed vs distributed, both on the same 8-node / 128-CPU cluster
+
+TPC-H **sf10 q6**, every engine reading the same S3 parquet, correctness-gated:
+
+| engine | mode | q6 | correct? |
+|---|---|---|---|
+| **batcher** | distributed, 128 partitions | **197.0 ms** | ✅ agrees with DuckDB exactly |
+| daft | distributed on the cluster (after the fix) | 424.9 ms | ❌ **wrong answer** |
+| duckdb_arrow | single-node, 16 cores | 313.0 ms | ✅ |
+
+**Batcher is 2.2x faster than Daft on equal hardware, and correct where Daft is not.**
+Daft returns `revenue = 1230113636.01` where Batcher and DuckDB both return
+`752448391.6111` — independently confirming the q6 wrong-answer this file recorded earlier,
+now with DuckDB as referee rather than Batcher's own say-so.
+
+### Note on the single-node tables below
+
+They were already apples-to-apples, and that is worth stating explicitly rather than
+assuming: the benchmark distributes Batcher only under `BENCH_BATCHER_DISTRIBUTED=1` (off by
+default), and `resolve_distributed` requires an ALREADY-initialized Ray, which nothing in a
+default benchmark process creates. Batcher used the same 16 cores as DuckDB and Polars.
+
 ## Two kernels were single-threaded / allocation-bound; both are fixed (2026-07-18)
 
 16-core / 30 GB, release build, every number correctness-gated against `duckdb_arrow`
