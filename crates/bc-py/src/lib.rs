@@ -839,6 +839,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(shuffle::salted_partition_batches, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle::gather_combine, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle::gather_concat, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle::gather_to_files, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::build_key_bloom, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::merge_blooms, m)?)?;
     m.add_function(wrap_pyfunction!(bloom::bloom_filter_batches, m)?)?;

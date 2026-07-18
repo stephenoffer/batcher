@@ -46,7 +46,7 @@ class ColumnFacts:
 
     Every *exact* field is `None` unless it is provably correct: they are populated only
     from a `Provenance.EXACT` bundle, with the extra NaN gate on `max`/`total_sum`/`mean`
-    (see `Facts.nan_safe`). The three *approximate* fields (`approx_ndv`, `quantiles`,
+    (see `Facts.nan_safe`). The four *approximate* fields (`approx_ndv`, `quantiles`,
     `mcv`, `avg_bytes`) carry any provenance and may only back an explicitly-named
     `approx_*` answer — never an exact one.
     """

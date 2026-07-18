@@ -243,6 +243,9 @@ mod tests {
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![1i64 << 62, 1i64 << 62]));
         let group_ids = [0u32, 0];
         let out = broadcast_partition_aggregate(WindowFn::Avg, &group_ids, 1, Some(&vals)).unwrap();
-        assert_eq!(f64s(&out), vec![4611686018427387904.0, 4611686018427387904.0]);
+        assert_eq!(
+            f64s(&out),
+            vec![4611686018427387904.0, 4611686018427387904.0]
+        );
     }
 }

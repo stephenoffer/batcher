@@ -54,6 +54,18 @@ pub(crate) fn cast_expr(
     {
         return parse_string_to_bool(arr, try_cast);
     }
+    // Float→string: DuckDB renders a NaN as the lowercase `nan` and a *negative* zero as
+    // `0.0`, where arrow's formatter emits `NaN` and `-0.0` — wrong non-null strings on any
+    // `CAST(<float> AS VARCHAR)`. Normalize just those two format-independent cases and keep
+    // arrow's shortest-round-trip string for every other value. (Arrow and DuckDB still differ
+    // on *scientific* notation — its threshold and its `e+NN` exponent form, e.g. `1e-5` vs
+    // `0.00001`, `1e+20` vs `1e20`; closing that needs a dedicated `%g`-style formatter and is
+    // left as a known gap.) Not JIT-compiled, so tier parity is intact.
+    if matches!(arr.data_type(), Float16 | Float32 | Float64)
+        && matches!(target, DataType::Utf8 | DataType::LargeUtf8)
+    {
+        return float_to_string(arr, target, &opts);
+    }
     // DuckDB trims leading/trailing whitespace before parsing a string into a
     // numeric or temporal value: `CAST('  12  ' AS BIGINT)` = 12, `' 3.14 '::DOUBLE`
     // = 3.14, `' 2024-01-05 '::DATE` = 2024-01-05. Arrow's kernel does not trim, so
@@ -65,15 +77,26 @@ pub(crate) fn cast_expr(
     // NOT trim there (`' true '::BOOLEAN` is NULL). Trimming only the outer ASCII
     // whitespace bytes never splits a UTF-8 codepoint. String parsing is never
     // JIT-compiled, so this interpreter-only path keeps tier parity intact.
-    if wants_trimmed_string_parse(arr.data_type(), target) {
-        if let Some(trimmed) = trim_string_array(arr) {
-            return Ok(cast_with_options(&trimmed, target, &opts)?);
-        }
-    }
     let int_target = matches!(
         target,
         Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
     );
+    if wants_trimmed_string_parse(arr.data_type(), target) {
+        if let Some(trimmed) = trim_string_array(arr) {
+            // DuckDB's `VARCHAR → <integer>` accepts a *fractional* or scientific value and
+            // rounds it half-away from zero (`'1.5'→2`, `'2.5'→3`, `'-2.5'→-3`, `'1e3'→1000`,
+            // `'12345.678'→12346`) — the same rounding it uses for `DECIMAL → <integer>`.
+            // Arrow's integer parser rejects any non-integer string, so before this strict
+            // `CAST` errored and `TRY_CAST` silently NULLed such a value. Route string→integer
+            // through [`parse_string_to_int`], which keeps a clean integer string exact (no
+            // f64 precision loss above 2^53) and only falls back to the rounded-double path for
+            // the strings the exact parser rejects. Not JIT-compiled, so tier parity is intact.
+            if int_target {
+                return parse_string_to_int(&trimmed, target, try_cast);
+            }
+            return Ok(cast_with_options(&trimmed, target, &opts)?);
+        }
+    }
     let float_src = matches!(arr.data_type(), Float16 | Float32 | Float64);
     // DuckDB's `DECIMAL → <integer>` rounds half-**away**-from-zero (`2.5 → 3`,
     // `-2.5 → -3`, `0.5 → 1`), where arrow's kernel truncates toward zero (`2.5 → 2`).
@@ -336,6 +359,104 @@ fn round_decimal_to_integral(arr: &ArrayRef) -> Option<ArrayRef> {
     }
 }
 
+/// Cast a trimmed `Utf8`/`LargeUtf8` array to an integer `target` with DuckDB's parse
+/// semantics: a clean integer string parses exactly, and a *fractional* or scientific string
+/// (`'1.5'`, `'1e3'`, `'12345.678'`) is read as a double and rounded half-away from zero
+/// (`f64::round`) — the same rule DuckDB uses for `DECIMAL → <integer>`. The exact integer
+/// parse is tried first and preferred, so an integer string wider than 2^53 stays exact rather
+/// than losing precision through the f64 fallback. A row that parses as neither (`'abc'`, `''`,
+/// `'inf'`, or a value out of the target's range) becomes NULL under `try_cast`, else errors
+/// the whole cast — matching DuckDB's `TRY_CAST` / `CAST`.
+fn parse_string_to_int(
+    trimmed: &ArrayRef,
+    target: &arrow::datatypes::DataType,
+    try_cast: bool,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::compute::{is_not_null, kernels::zip::zip};
+    // `safe` so a parse failure is a NULL to reason about, not an error to bail on.
+    let safe = CastOptions {
+        safe: true,
+        ..Default::default()
+    };
+    // Exact integer parse: non-null only where the string is a clean, in-range integer.
+    let exact = cast_with_options(trimmed, target, &safe)?;
+    // Float fallback for the rest: parse as f64, round half-away (`f64::round`), then to the
+    // integer type (which NULLs an out-of-range or non-finite value under `safe`).
+    let f = cast_with_options(trimmed, &arrow::datatypes::DataType::Float64, &safe)?;
+    let f = f
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("cast to Float64 yields Float64Array");
+    let rounded: Float64Array = f.iter().map(|o| o.map(f64::round)).collect();
+    let fallback = cast_with_options(&(Arc::new(rounded) as ArrayRef), target, &safe)?;
+    // Prefer the exact parse; use the rounded double only where the exact parse yielded NULL.
+    let has_exact = is_not_null(&exact)?;
+    let merged = zip(&has_exact, &exact, &fallback)?;
+    if try_cast {
+        return Ok(merged);
+    }
+    // Strict `CAST`: a row that was non-null on input but is NULL after both attempts is an
+    // unparseable / out-of-range value — error, don't silently drop it.
+    let src_present = is_not_null(trimmed)?;
+    let failed = arrow::compute::and(&src_present, &arrow::compute::not(&is_not_null(&merged)?)?)?;
+    if failed.true_count() > 0 {
+        return Err(ExprError::Arrow(ArrowError::CastError(format!(
+            "Could not cast string to {target}"
+        ))));
+    }
+    Ok(merged)
+}
+
+/// Cast a `Float16`/`Float32`/`Float64` array to a string `target`, normalizing the two cases
+/// where arrow's formatter disagrees with DuckDB: a NaN renders as `nan` (not `NaN`) and a
+/// negative zero renders as `0.0` (not `-0.0`). Every other value keeps arrow's
+/// shortest-round-trip string. Nulls pass through.
+fn float_to_string(
+    arr: &ArrayRef,
+    target: &arrow::datatypes::DataType,
+    opts: &CastOptions,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::{LargeStringArray, StringArray};
+    use arrow::datatypes::DataType;
+    let strs = cast_with_options(arr, target, opts)?;
+    let f = cast_with_options(arr, &DataType::Float64, opts)?;
+    let f = f
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("cast to Float64 yields Float64Array");
+    // Map arrow's string for row `i` to DuckDB's, given the row's float value.
+    let fix = |i: usize, s: &str| -> String {
+        let v = f.value(i);
+        if v.is_nan() {
+            "nan".to_string()
+        } else if v == 0.0 && v.is_sign_negative() {
+            "0.0".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    match target {
+        DataType::Utf8 => {
+            let a = strs.as_any().downcast_ref::<StringArray>().expect("Utf8");
+            let out: StringArray = (0..a.len())
+                .map(|i| (!a.is_null(i)).then(|| fix(i, a.value(i))))
+                .collect();
+            Ok(Arc::new(out) as ArrayRef)
+        }
+        DataType::LargeUtf8 => {
+            let a = strs
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeUtf8");
+            let out: LargeStringArray = (0..a.len())
+                .map(|i| (!a.is_null(i)).then(|| fix(i, a.value(i))))
+                .collect();
+            Ok(Arc::new(out) as ArrayRef)
+        }
+        _ => unreachable!("float_to_string only called for Utf8/LargeUtf8 target"),
+    }
+}
+
 #[cfg(test)]
 mod narrowing_float_tests {
     use super::*;
@@ -396,13 +517,13 @@ mod narrowing_float_tests {
         use arrow::array::{Decimal128Array, Int64Array};
         let src: ArrayRef = Arc::new(
             Decimal128Array::from(vec![
-                Some(25),   // 2.5
-                Some(35),   // 3.5
-                Some(-25),  // -2.5
-                Some(5),    // 0.5
-                Some(-5),   // -0.5
-                Some(24),   // 2.4
-                Some(26),   // 2.6
+                Some(25),  // 2.5
+                Some(35),  // 3.5
+                Some(-25), // -2.5
+                Some(5),   // 0.5
+                Some(-5),  // -0.5
+                Some(24),  // 2.4
+                Some(26),  // 2.6
                 None,
             ])
             .with_precision_and_scale(10, 1)
@@ -455,16 +576,7 @@ mod narrowing_float_tests {
             .collect();
         assert_eq!(
             got,
-            vec![
-                Some(12),
-                Some(-7),
-                Some(5),
-                Some(9),
-                None,
-                None,
-                None,
-                None
-            ]
+            vec![Some(12), Some(-7), Some(5), Some(9), None, None, None, None]
         );
         // Float target trims too.
         let fsrc: ArrayRef = Arc::new(StringArray::from(vec![Some(" 2.75 "), Some("  -0.5")]));
@@ -479,7 +591,10 @@ mod narrowing_float_tests {
             false,
         )
         .unwrap();
-        assert_eq!(ok.as_any().downcast_ref::<Int64Array>().unwrap().value(0), 42);
+        assert_eq!(
+            ok.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            42
+        );
     }
 
     /// String→Boolean matches DuckDB's exact set. Arrow's kernel trims whitespace, accepts
@@ -543,5 +658,163 @@ mod narrowing_float_tests {
         let ok: ArrayRef = Arc::new(StringArray::from(vec![Some("t")]));
         let ok = cast_expr(&ok, &DataType::Boolean, false).unwrap();
         assert!(ok.as_any().downcast_ref::<BooleanArray>().unwrap().value(0));
+    }
+}
+
+#[cfg(test)]
+mod string_to_int_tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::DataType;
+
+    fn strs(v: Vec<Option<&str>>) -> ArrayRef {
+        Arc::new(StringArray::from(v))
+    }
+    fn as_i64_opt(a: &ArrayRef) -> Vec<Option<i64>> {
+        let a = a.as_any().downcast_ref::<Int64Array>().expect("i64");
+        (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+            .collect()
+    }
+
+    /// DuckDB's `VARCHAR → <integer>` parses a fractional or scientific string and rounds it
+    /// half-away from zero (`'1.5'→2`, `'2.5'→3`, `'-2.5'→-3`, `'0.5'→1`, `'-0.5'→-1`,
+    /// `'2.4'→2`, `'1e3'→1000`, `'12345.678'→12346`), the same rule as `DECIMAL → <integer>`.
+    /// Arrow's integer parser rejects any non-integer string, so before the fix strict `CAST`
+    /// errored and `TRY_CAST` NULLed all of these. Nulls pass through.
+    #[test]
+    fn string_to_int_parses_fractional_and_scientific_half_away() {
+        let src = strs(vec![
+            Some("1.5"),
+            Some("2.5"),
+            Some("-2.5"),
+            Some("0.5"),
+            Some("-0.5"),
+            Some("2.4"),
+            Some("1e3"),
+            Some("12345.678"),
+            Some("1.5e0"),
+            None,
+        ]);
+        // try_cast and strict cast agree on the value where the string is parseable.
+        for try_cast in [true, false] {
+            let out = cast_expr(&src, &DataType::Int64, try_cast).unwrap();
+            assert_eq!(
+                as_i64_opt(&out),
+                vec![
+                    Some(2),
+                    Some(3),
+                    Some(-3),
+                    Some(1),
+                    Some(-1),
+                    Some(2),
+                    Some(1000),
+                    Some(12346),
+                    Some(2),
+                    None,
+                ],
+                "try_cast={try_cast}"
+            );
+        }
+    }
+
+    /// A clean integer string wider than 2^53 stays *exact* — the exact integer parser is
+    /// preferred over the f64 fallback, which would lose precision. (`9007199254740993` is the
+    /// first integer f64 cannot represent.)
+    #[test]
+    fn string_to_int_keeps_large_integers_exact() {
+        let big = (1i64 << 53) + 1; // 9_007_199_254_740_993
+        let src = strs(vec![Some("9007199254740993"), Some("9223372036854775807")]);
+        let out = cast_expr(&src, &DataType::Int64, false).unwrap();
+        assert_eq!(as_i64_opt(&out), vec![Some(big), Some(i64::MAX)]);
+    }
+
+    /// An unparseable, empty, non-finite, or out-of-range string is NULL under `TRY_CAST` and
+    /// an error under strict `CAST` — matching DuckDB (`'inf'::BIGINT` and `'abc'::BIGINT`
+    /// both error; `'1e19'::BIGINT` overflows). A clean value in the same batch still parses.
+    #[test]
+    fn string_to_int_rejects_unparseable_and_overflow() {
+        // try_cast: bad rows NULL, the good row parses.
+        let src = strs(vec![
+            Some("abc"),
+            Some(""),
+            Some("inf"),
+            Some("nan"),
+            Some("1e19"), // overflows i64
+            Some("42"),
+        ]);
+        let out = cast_expr(&src, &DataType::Int64, true).unwrap();
+        assert_eq!(
+            as_i64_opt(&out),
+            vec![None, None, None, None, None, Some(42)]
+        );
+        // strict cast errors on any unparseable/out-of-range value.
+        for bad in ["abc", "", "inf", "1e19"] {
+            assert!(
+                cast_expr(&strs(vec![Some(bad)]), &DataType::Int64, false).is_err(),
+                "strict CAST('{bad}' AS BIGINT) must error"
+            );
+        }
+        // A clean fractional string still parses under strict cast (no error).
+        let ok = cast_expr(&strs(vec![Some("7.5")]), &DataType::Int64, false).unwrap();
+        assert_eq!(as_i64_opt(&ok), vec![Some(8)]);
+    }
+
+    /// A narrower/unsigned target keeps DuckDB's range checking: `'300'` overflows `Int8`
+    /// (NULL/try, error/strict) while an in-range fractional value rounds and fits.
+    #[test]
+    fn string_to_narrow_int_range_checks() {
+        use arrow::array::Int8Array;
+        let src = strs(vec![Some("300"), Some("12.5"), Some("-5.5")]);
+        let out = cast_expr(&src, &DataType::Int8, true).unwrap();
+        let a = out.as_any().downcast_ref::<Int8Array>().unwrap();
+        let got: Vec<Option<i8>> = (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+            .collect();
+        assert_eq!(got, vec![None, Some(13), Some(-6)]);
+    }
+}
+
+#[cfg(test)]
+mod float_to_string_tests {
+    use super::*;
+    use arrow::array::{Float64Array, StringArray};
+    use arrow::datatypes::DataType;
+
+    /// DuckDB renders a float NaN as `nan` and a negative zero as `0.0`, where arrow's
+    /// formatter emits `NaN` and `-0.0`. Every ordinary value keeps arrow's (DuckDB-matching)
+    /// shortest-round-trip string, and nulls pass through.
+    #[test]
+    fn float_to_string_normalizes_nan_and_negative_zero() {
+        let src: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(f64::NAN),
+            Some(-0.0),
+            Some(0.0),
+            Some(0.1),
+            Some(-2.5),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(100000000.0),
+            None,
+        ]));
+        let out = cast_expr(&src, &DataType::Utf8, false).unwrap();
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        let got: Vec<Option<&str>> = (0..out.len())
+            .map(|i| (!out.is_null(i)).then(|| out.value(i)))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                Some("nan"),
+                Some("0.0"),
+                Some("0.0"),
+                Some("0.1"),
+                Some("-2.5"),
+                Some("inf"),
+                Some("-inf"),
+                Some("100000000.0"),
+                None,
+            ]
+        );
     }
 }

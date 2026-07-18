@@ -141,6 +141,29 @@ def _balance(splits: list[Split], workers: int) -> list[list[Split]]:
     return groups
 
 
+def _contiguous(splits: list[Split], workers: int) -> list[list[Split]]:
+    """Group splits into `workers` contiguous, source-ordered runs (order preserved).
+
+    Unlike `_balance` (which reorders splits largest-first for even load), group 0 holds the
+    source's first splits, group 1 the next, and so on — each a contiguous near-equal-count
+    run. Callers whose correctness needs the concatenation of per-partition results to
+    reproduce the source's global row order (distributed `LIMIT` / `with_row_index`) require
+    this: a `_balance` assignment puts non-adjacent splits in one partition, so a per-partition
+    prefix interleaves rows from different parts of the source.
+    """
+    groups: list[list[Split]] = [[] for _ in range(workers)]
+    if workers <= 0 or not splits:
+        return groups
+    target = max(1, -(-sum(s.row_count() or 1 for s in splits) // workers))  # ceil per group
+    w, load = 0, 0
+    for s in splits:
+        groups[w].append(s)
+        load += s.row_count() or 1
+        if load >= target and w < workers - 1:
+            w, load = w + 1, 0
+    return groups
+
+
 def _slice_rows_evenly(batches: list[pa.RecordBatch], workers: int) -> list[list[pa.RecordBatch]]:
     """Split an ordered batch list into `workers` groups of near-equal total row count.
 
@@ -258,6 +281,7 @@ def partition_descriptors(
     workers: int,
     projection: list[str] | None = None,
     predicate: dict | None = None,
+    preserve_order: bool = False,
 ) -> list[dict]:
     """Partition a source into `workers` in-memory descriptors — no shared filesystem.
 
@@ -271,6 +295,11 @@ def partition_descriptors(
     * **Non-splittable** (in-memory / iterator) sources are eagerly read and
       range-sliced into per-worker batch lists. Those batches are driver-resident
       already, so shipping them as args is bounded input movement (not shuffle).
+
+    `preserve_order` assigns splittable splits as contiguous source-ordered runs
+    (`_contiguous`) instead of load-balanced (`_balance`), so the partition-index-assembled
+    concatenation reproduces the source's global row order — required by the order-sensitive
+    `LIMIT` / `with_row_index` paths (the in-memory branch is already order-preserving).
 
     Read back with `read_partition_descriptor`.
     """
@@ -286,6 +315,8 @@ def partition_descriptors(
         # count was below the worker count (the common case for GPU/UDF inputs, which are
         # few, wide rows). Slices are zero-copy views, so this is bounded one-time input
         # movement (Ray task args), not shuffle, and matches the disk path's range split.
+        # `_slice_rows_evenly` cuts contiguous, source-ordered slices, so this branch already
+        # satisfies `preserve_order`.
         proj_schema = _projected_schema(source, projection)
         batches = list(iter_source(source, projection, predicate))
         groups = _slice_rows_evenly(batches, workers)
@@ -294,7 +325,8 @@ def partition_descriptors(
 
     schema = source.schema()
     descriptors: list[dict] = []
-    for group in _balance(splits, workers):
+    assign = _contiguous if preserve_order else _balance
+    for group in assign(splits, workers):
         if group:
             descriptors.append({"splits": group, "projection": projection, "predicate": predicate})
         else:

@@ -120,16 +120,36 @@ Aggregates fold a column *down* to one value; the `*_horizontal` functions fold
 columns (nulls treated as 0 / skipped), and `min_horizontal`/`max_horizontal` are the
 Polars-named row-wise `least`/`greatest`. `all_horizontal`/`any_horizontal` reduce
 many boolean columns into one, which is how you combine validation flags.
+`count_horizontal` counts the non-null values in each row and `product_horizontal`
+multiplies them (nulls treated as 1).
 
 ```python
 checks = bt.from_pydict({"a": [1, 2, 3], "b": [4, 6, 6], "c": [7, 8, 9]})
 out = checks.select(
     total=bt.sum_horizontal(bt.col("a"), bt.col("b"), bt.col("c")),
     smallest=bt.min_horizontal(bt.col("a"), bt.col("b"), bt.col("c")),
+    filled=bt.count_horizontal(bt.col("a"), bt.col("b"), bt.col("c")),
+    prod=bt.product_horizontal(bt.col("a"), bt.col("b"), bt.col("c")),
     all_even=bt.all_horizontal(bt.col("a") % 2 == 0, bt.col("b") % 2 == 0),
 )
 print(out.to_pydict())
-# {'total': [12, 16, 18], 'smallest': [1, 2, 3], 'all_even': [False, True, False]}
+# {'total': [12, 16, 18], 'smallest': [1, 2, 3], 'filled': [3, 3, 3], 'prod': [28, 96, 162], 'all_even': [False, True, False]}
+```
+
+When no named `*_horizontal` helper fits, `reduce_horizontal(fn, *exprs)` folds the
+columns left-to-right with your own binary combiner, and `fold_horizontal(acc, fn,
+*exprs)` does the same from an explicit seed. The combiner runs once at plan-build
+time on `Expr` operands — it never touches a row — so the fold still lowers to pure
+Rust:
+
+```python
+cols = [bt.col("a"), bt.col("b"), bt.col("c")]
+out = checks.select(
+    manual_sum=bt.reduce_horizontal(lambda x, y: x + y, *cols),
+    sum_sq=bt.fold_horizontal(bt.lit(0), lambda s, x: s + x * x, *cols),
+)
+print(out.to_pydict())
+# {'manual_sum': [12, 16, 18], 'sum_sq': [66, 104, 126]}
 ```
 
 ## Membership, ranges, and casts
@@ -217,7 +237,19 @@ More predicates and slicers round out the namespace: `ends_with` mirrors
 `starts_with` for a literal suffix, `split_part(delimiter, n)` returns the `n`-th
 1-based field of a split, `substring_index(delimiter, count)` keeps everything up
 to the `count`-th delimiter, and `normalize_whitespace` collapses each run of
-whitespace to one space and trims the ends.
+whitespace to one space and trims the ends. `zfill(width)` zero-pads fixed-width
+codes, and `contains_any([...])` tests a row against several literal substrings at
+once (an OR of `contains`).
+
+```python
+codes = bt.from_pydict({"id": ["7", "42"], "tag": ["cat-a", "dog-b"]})
+out = codes.select(
+    padded=bt.col("id").str.zfill(4),
+    flagged=bt.col("tag").str.contains_any(["cat", "fish"]),
+)
+print(out.to_pydict())
+# {'padded': ['0007', '0042'], 'flagged': [True, False]}
+```
 
 ```python
 paths = bt.from_pydict({"path": ["etc/app/conf", "usr/local/bin", "  a   b  "]})
@@ -326,7 +358,9 @@ Also available: `day`, `hour`, `minute`, `second`, `quarter`, `week`,
 `dayofweek`, `dayofyear`, `epoch`, `monthname`, `isodow`, `century`, `decade`,
 `millennium`, `last_day`, and `truncate(unit)`. `iso_year` gives the ISO 8601
 week-numbering year, and `is_leap_year` / `days_in_month` answer calendar
-questions per row.
+questions per row. `epoch` returns whole seconds since 1970; `epoch_ms()`,
+`epoch_us()`, and `epoch_ns()` give the same instant at millisecond, microsecond,
+and nanosecond resolution.
 
 ```python
 out = events.select(
@@ -402,8 +436,9 @@ print(out.to_pydict())
 
 Numeric lists support reductions: `sum`, `min`, `max`, `mean`, `median`, `std`,
 `var`, `product`, `n_unique`, `arg_min`, `arg_max`. Structural methods include
-`sort`, `reverse`, `unique`, `slice`, and `contains`. Element access is
-`get(i)` (negative indexes from the end), with `first()`/`last()` as shorthands.
+`sort`, `reverse`, `unique`, `slice`, `head(n)` (the leading `n` elements), and
+`contains`. Element access is `get(i)` (negative indexes from the end), with
+`first()`/`last()` as shorthands.
 
 ## Struct accessor: .struct
 
@@ -482,3 +517,159 @@ print(out.to_pydict())
 - [Aggregations](aggregations.md) and [Window functions](window-functions.md): where
   aggregate and windowed expressions are used.
 - [SQL](sql.md): the same column language, spelled as SQL.
+
+## Migrating from Polars / pandas
+
+Coming from another DataFrame library, the operation you know by its Polars or pandas
+name is usually available under that name too, delegating to Batcher's SQL-style
+primary. On `.str`: `to_lowercase`, `to_uppercase`, `to_titlecase`, `pad_start`,
+`pad_end`, `ljust`, `rjust`, `count_matches`, `extract`, `extract_all`, `replace_all`,
+`len_chars`, `len_bytes`, `strip_chars`, `strip_chars_start`, `strip_chars_end`, `head`,
+`tail`, and `slice`. On `.dt`: `weekday`, `ordinal_day`, `to_string`, `date`,
+`month_start`, `month_end`, and the sub-second `millisecond` / `microsecond` /
+`nanosecond`. On `.list`: `set_union`, `set_intersection`, `set_difference`. On an
+expression: `arcsin`/`arccos`/`arctan`/`arcsinh`/`arccosh`/`arctanh`, `clip_min` /
+`clip_max`, and `is_between`; plus top-level `bt.arctan2(y, x)`.
+
+The pandas spellings are there too — on `.str`: `strip`, `startswith`, `endswith`,
+`match`, `title`, and Python's `removeprefix` / `removesuffix`; on `.dt`: `day_name`,
+`month_name`, `daysinmonth`, `weekofyear`, `normalize`, and `floor(unit)`. On the
+`Dataset` itself: `fillna`, `dropna`, `isna`, `notna`, `astype`, `assign`, `groupby`,
+`merge`, `sort_values`, `nlargest`, `nsmallest`, `round`, `abs`, `clip`, `shape`,
+`size`, plus `nunique`, `select_dtypes`, `sample_frac`, and `drop_constant_columns`.
+
+```python
+migrate = bt.from_pydict({"name": ["  Ann  "], "code": ["7"]})
+out = migrate.select(
+    clean=bt.col("name").str.strip_chars().str.to_uppercase(),
+    padded=bt.col("code").str.rjust(4, "0"),
+)
+print(out.to_pydict())
+# {'clean': ['ANN'], 'padded': ['0007']}
+```
+
+## Feature engineering for data science
+
+The expression layer carries the transforms a model pipeline needs, so feature
+engineering runs in the engine rather than in pandas. Scaling and encoding —
+`zscore`, `minmax_scale`, `maxabs_scale`, `mean_center`, `label_encode`, and
+`hash_bucket` for a reproducible split key — each accept `partition_by=` to fit per
+group. Activations (`sigmoid`, `logit`, `relu`, `softplus`), share/ratio features
+(`pct_of_total`, `cumulative_pct`, `normalize_l1`, `rank_pct`, `safe_divide`), and the
+expanding statistics (`expanding_mean`, `expanding_var`, `expanding_std`) round it out.
+Value predicates `is_positive`, `is_negative`, `is_zero`, `is_even`, `is_odd`, and
+`is_outlier` read as filters.
+
+```python
+model = bt.from_pydict({"g": ["a", "a", "b", "b"], "v": [1.0, 3.0, 10.0, 20.0]})
+out = model.select(
+    z=bt.col("v").zscore(["g"]).round(4),
+    scaled=bt.col("v").minmax_scale(["g"]),
+    activated=bt.col("v").sigmoid().round(4),
+)
+print(out.to_pydict())
+# {'z': [-0.7071, 0.7071, -0.7071, 0.7071], 'scaled': [0.0, 1.0, 0.0, 1.0], 'activated': [0.7311, 0.9526, 1.0, 1.0]}
+```
+
+Calendar features come off `.dt`: `is_weekend` / `is_weekday`, `is_month_start` /
+`is_month_end`, `is_quarter_start` / `is_quarter_end`, `is_year_start` /
+`is_year_end`, plus `quarter_start`, `year_start`, `days_in_year`, and
+`week_of_month`, the period closes `quarter_end` and `year_end`, and the elapsed-time
+features `seconds_between`, `minutes_between`, `hours_between`, `days_between`, and
+`weeks_between`. Text features come off `.str`: `word_count`, `digit_count`,
+`contains_all`, `count_char`,
+`capitalize`, `remove_punctuation`, and the character-class checks `is_alpha`,
+`is_numeric`, `is_alnum`, `is_space`, `is_upper`, `is_lower`.
+
+```python
+import datetime as dt
+
+events = bt.from_pydict({"d": [dt.datetime(2024, 2, 3)], "note": ["Hi, there!"]})
+out = events.select(
+    weekend=bt.col("d").dt.is_weekend(),
+    week=bt.col("d").dt.week_of_month(),
+    words=bt.col("note").str.word_count(),
+    clean=bt.col("note").str.remove_punctuation(),
+)
+print(out.to_pydict())
+# {'weekend': [True], 'week': [1], 'words': [2], 'clean': ['Hi there']}
+```
+
+For column profiling, `bt.q1` / `bt.q3` / `bt.iqr` give the robust spread,
+`bt.value_range` the full spread, `bt.null_rate` / `bt.non_null_rate` completeness, and
+`bt.nunique_ratio` the cardinality ratio that separates identifiers from categoricals.
+
+```python
+prof = bt.from_pydict({"x": [1.0, None, 3.0, 4.0]})
+out = prof.agg(
+    spread=bt.iqr("x"),
+    rng=bt.value_range("x"),
+    missing=bt.null_rate("x"),
+    card=bt.nunique_ratio("x"),
+)
+print(out.to_pydict())
+# {'spread': [1.5], 'rng': [3.0], 'missing': [0.25], 'card': [0.75]}
+```
+
+## Curating an AI training corpus
+
+Filtering a pretraining corpus is a per-row scan, so it runs in the engine. The `.str`
+namespace carries the Gopher / C4-style quality heuristics: the character-class ratios
+`alpha_ratio`, `digit_ratio`, `uppercase_ratio`, `lowercase_ratio`,
+`punctuation_ratio`, `whitespace_ratio`, `non_ascii_ratio`, and `alnum_ratio`, plus the
+shape statistics `line_count`, `mean_line_length`, `avg_word_length`, `sentence_count`,
+`non_ascii_count`, `url_count`, and `email_count`. Thresholding a couple of these
+removes most boilerplate, link dumps, and machine-generated text.
+
+```python
+corpus = bt.from_pydict(
+    {"text": ["Real prose, with sentences and words.", "AAA 111 &&& ||| ###"]}
+)
+kept = corpus.filter(
+    (bt.col("text").str.alpha_ratio() > 0.6)
+    & (bt.col("text").str.avg_word_length().is_between(3, 10))
+)
+print(kept.to_pydict())
+# {'text': ['Real prose, with sentences and words.']}
+```
+
+Document shape adds `paragraph_count`, `is_single_line`, `ends_with_punctuation`,
+`has_repeated_punctuation`, `quote_count`, `paren_count`, `digit_to_word_ratio`, and the
+code detectors `code_fence_count` and `looks_like_code`.
+Further signals include `uppercase_word_count`, `long_word_count`,
+`symbol_to_word_ratio`, `hashtag_count`, `mention_count`, `phone_count`, and
+`has_phone`. Cleaning and PII scrubbing use `remove_urls`, `remove_emails`,
+`remove_phones`, the shape-preserving `mask_emails` / `mask_urls`, `remove_non_ascii`,
+`remove_digits`, and `remove_html_tags`; `truncate_chars` and `truncate_words` cap a row
+to a budget without cutting mid-word. The detection predicates `has_url`, `has_email`,
+`has_non_ascii`, `has_digits`, `has_html`, `is_ascii_only`, `is_blank`,
+`starts_with_bullet`, and `looks_like_json` read as filters. For context windows,
+`estimate_tokens` and `fits_token_budget` give a tokenizer-free size estimate.
+
+```python
+raw = bt.from_pydict({"text": ["Mail bob@x.com or see http://y.io for more"]})
+print(raw.select(clean=bt.col("text").str.remove_emails().str.remove_urls()).to_pydict())
+# {'clean': ['Mail  or see  for more']}
+```
+
+Counts and predicates round it out: `newline_count`, `tab_count`, `space_count`,
+`word_char_ratio`, `avg_sentence_length`, `is_short` / `is_long`, `is_question`,
+`is_exclamation`, `starts_with_capital`, `is_all_caps`, `has_currency`, and the
+whole-string `is_url` / `is_email`. Extraction gives `extract_urls`, `extract_emails`,
+`extract_numbers`, `extract_hashtags`, `extract_mentions`, `first_sentence`,
+`first_word`, and `last_word`; normalization gives `slugify`, `remove_bullets`,
+`remove_repeated_punctuation`, `remove_markdown_links`, `remove_code_blocks`,
+`remove_stopwords`, and `truncate_sentences`.
+
+Embedding columns also carry `dim`, `is_zero_vector`, `sum_squares`, `mean_pool`, and
+`max_pool`, alongside `magnitude`, `is_unit_norm` (assert normalization before a cosine
+search), `euclidean_distance`, and `angular_distance`. Preparing the training set itself
+uses `ds.shuffle(seed=)`, `ds.stratified_split(label, test_size)`,
+`ds.sample_per_group(by, n)`, `ds.class_balance(label)`, and `ds.class_weights(label)`.
+
+```python
+labelled = bt.from_pydict({"y": ["a"] * 6 + ["b"] * 2, "x": list(range(8))})
+train, test = labelled.stratified_split("y", 0.25, seed=5)
+print(labelled.class_weights("y").sort("y").to_pydict())
+# {'y': ['a', 'b'], 'weight': [0.6666666666666666, 2.0]}
+```

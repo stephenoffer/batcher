@@ -24,8 +24,13 @@ def total(facts: Facts, column: str) -> float | int | None:
     SQL's `SUM` over a relation with no non-null value is NULL, not 0 — so an empty relation
     is deliberately *not* answered here (a recorded total of 0 would be a wrong answer, not a
     conservative one). It falls through to execution, which returns NULL correctly.
+
+    "No non-null value" covers an **all-null column in a non-empty relation** just as much as
+    an empty relation — `average` right below already guards exactly that case. A source that
+    recorded `total_sum = 0` for such a column would otherwise answer 0 where SQL says NULL.
+    Only a *provable* zero non-null count declines; an unprovable one answers as before.
     """
-    if facts.rows == 0:
+    if facts.rows == 0 or non_null_count(facts, column) == 0:
         return None
     return facts.col(column).total_sum
 

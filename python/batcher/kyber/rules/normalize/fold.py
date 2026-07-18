@@ -14,11 +14,13 @@ disagree on (see `_cast_is_exact`).
 from __future__ import annotations
 
 import datetime as _dt
+import math
 
 import pyarrow as pa
 
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.plan.expr_ir import Binary, Cast, Expr, Lit, Not
+from batcher.plan.expr_ir.func_nodes import DateOffset
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.logical import LogicalPlan
 from batcher.plan.types import DTYPE_REGISTRY
@@ -75,6 +77,15 @@ def _fold(expr: Expr) -> Expr:
         folded = _fold_binary(expr.op, expr.left.value, expr.right.value)
         if folded is not None:
             return folded
+    if isinstance(expr, DateOffset) and isinstance(expr.input, Lit):
+        # SQL `date/timestamp ± interval N day/week` now lowers to a `DateOffset` (it
+        # supports both Date and Timestamp operands, unlike the old cast/add/cast chain).
+        # Fold it here so the bound still collapses to a single date/timestamp `Lit` for
+        # zone-map pruning / predicate pushdown / range selectivity (TPC-H date filters).
+        # Reuse the temporal rule's folder (naive-only, no month clamping) — one definition.
+        from batcher.kyber.rules.extra.temporal_extra import _fold_date_offset
+
+        return _fold_date_offset(expr)
     return expr
 
 
@@ -219,11 +230,24 @@ def _compare(op: str, a: object, b: object) -> bool:
 def _comparable(a: object, b: object) -> bool:
     # Only same-kind comparisons (both numeric / both str / both bool) match the
     # engine; mixing kinds either errors there or has surprising semantics.
+    if _is_nan(a) or _is_nan(b):
+        # NaN's comparison semantics diverge from Python's: `bc-expr` orders NaN as the
+        # *maximum* value (`NaN > x`, `NaN >= x`, `NaN == NaN` are all TRUE; `NaN < x` is
+        # FALSE), while Python makes every NaN comparison FALSE. Folding either way would
+        # not be bit-identical to the engine — so a NaN operand is never folded, and the
+        # engine evaluates the comparison itself. (Arithmetic is unaffected: NaN propagates
+        # identically in Python and Arrow, so `_fold_arith` still folds it.)
+        return False
     if _is_bool_val(a) and _is_bool_val(b):
         return True
     if isinstance(a, str) and isinstance(b, str):
         return True
     return _is_number(a) and _is_number(b)
+
+
+def _is_nan(x: object) -> bool:
+    """Whether `x` is a NaN float (whose comparison order differs from Python's)."""
+    return isinstance(x, float) and math.isnan(x)
 
 
 def _is_bool(expr: Expr) -> bool:

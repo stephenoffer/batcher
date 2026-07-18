@@ -121,8 +121,54 @@ def test_a_filter_preserves_the_partitioning_of_its_input():
     assert hash_partitioned_on(ds._plan) == ("k",)
 
 
-def test_a_superset_partitioning_satisfies_a_subset_requirement():
-    """A group-by on a superset of the join keys needs no second shuffle."""
-    have = PhysicalProperties(hash_partitioned_on=("k",))
-    assert satisfies(have, PhysicalProperties(hash_partitioned_on=("k",)))
-    assert not satisfies(have, PhysicalProperties(hash_partitioned_on=("k", "other")))
+def test_a_subset_partitioning_satisfies_a_superset_grouping():
+    """A group-by on a *superset* of the join keys needs no second shuffle.
+
+    Partitioning contains the opposite way from ordering: the *delivered* keys must be a
+    subset of the *required* grouping. Rows in one `hash(k)` bucket contain every `(k, other)`
+    group whole, so grouping by `(k, other)` is safe; the reverse is not.
+    """
+    delivered = PhysicalProperties(hash_partitioned_on=("k",))
+    assert satisfies(delivered, PhysicalProperties(hash_partitioned_on=("k",)))
+    assert satisfies(delivered, PhysicalProperties(hash_partitioned_on=("k", "other")))
+
+
+def test_a_superset_partitioning_does_not_satisfy_a_subset_grouping():
+    """The wrong-answer direction: `hash(k, other)` splits the `k` groups.
+
+    Two rows sharing `k` but differing in `other` hash to different buckets, so a reducer
+    that skipped the shuffle would emit a partial `k` group. This must be refused.
+    """
+    delivered = PhysicalProperties(hash_partitioned_on=("k", "other"))
+    assert not satisfies(delivered, PhysicalProperties(hash_partitioned_on=("k",)))
+
+
+def test_no_delivered_partitioning_satisfies_nothing_but_an_empty_requirement():
+    none_delivered = PhysicalProperties()
+    assert satisfies(none_delivered, PhysicalProperties())
+    assert not satisfies(none_delivered, PhysicalProperties(hash_partitioned_on=("k",)))
+
+
+# --- partitioning through a projection ---------------------------------------------
+
+
+def test_partitioning_survives_a_projection_under_its_output_name():
+    # A projection is map-only, so the bucket a row sits in never changes — but the key is
+    # renamed, exactly as `project_ordering` renames the ordering.
+    from batcher.kyber.properties import hash_partitioned_on
+
+    left = bt.from_pydict({"k": [1, 2], "a": [1, 2]})
+    right = bt.from_pydict({"k": [1], "b": [9]})
+    projected = left.join(right, on="k", how="inner").select(kk=col("k"))
+    assert hash_partitioned_on(projected._plan) == ("kk",)
+
+
+def test_a_projection_that_drops_the_key_unclaims_the_partitioning():
+    # The rows are still physically co-located, but the partitioning can no longer be *named*
+    # — and a partitioning is a set, so a partial rename must not be claimed.
+    from batcher.kyber.properties import hash_partitioned_on
+
+    left = bt.from_pydict({"k": [1, 2], "a": [1, 2]})
+    right = bt.from_pydict({"k": [1], "b": [9]})
+    projected = left.join(right, on="k", how="inner").select(aa=col("a"))
+    assert hash_partitioned_on(projected._plan) == ()

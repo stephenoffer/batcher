@@ -512,6 +512,56 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_column_predicate_does_not_drop_matching_rows() {
+        // Parquet stores an unsigned column (UInt32/UInt64) in a *signed* physical
+        // INT32/INT64 whose footer min/max are computed by unsigned order. A large value
+        // (3e9 in a UInt32 → -1_294_967_296 as i32) therefore reads back negative; taking
+        // the stat as signed makes `u >= 2e9` prune the whole group and silently drop the
+        // 3e9 row that actually matches — a violation of the superset-safe contract.
+        use arrow::array::{UInt32Array, UInt64Array};
+        let dir = std::env::temp_dir().join(format!("bcio_unsigned_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // UInt32 with a value above i32::MAX.
+        let p32 = dir.join("u32.parquet");
+        let schema32 = Arc::new(Schema::new(vec![Field::new("u", DataType::UInt32, false)]));
+        let u32b = RecordBatch::try_new(
+            schema32,
+            vec![Arc::new(UInt32Array::from(vec![10u32, 3_000_000_000u32]))],
+        )
+        .unwrap();
+        write_parquet(&p32, &[u32b], 1000);
+        let ge = r#"{"node":"cmp","col":"u","op":"ge","lit":2000000000}"#;
+        let out = read_parquet_filtered(p32.to_str().unwrap(), &[], None, 4096, ge).unwrap();
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "unsigned UInt32 group must be kept (3e9 >= 2e9)");
+        // A predicate the unsigned range truly excludes still prunes.
+        let gt = r#"{"node":"cmp","col":"u","op":"gt","lit":4000000000}"#;
+        let none = read_parquet_filtered(p32.to_str().unwrap(), &[], None, 4096, gt).unwrap();
+        assert_eq!(none.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+
+        // UInt64 with a value above i64::MAX.
+        let p64 = dir.join("u64.parquet");
+        let schema64 = Arc::new(Schema::new(vec![Field::new("u", DataType::UInt64, false)]));
+        let big = 10_000_000_000_000_000_000u64; // > i64::MAX
+        let u64b = RecordBatch::try_new(
+            schema64,
+            vec![Arc::new(UInt64Array::from(vec![5u64, big]))],
+        )
+        .unwrap();
+        write_parquet(&p64, &[u64b], 1000);
+        // `u >= 9e18` (< i64::MAX) must keep the group — `big` matches.
+        let ge64 = r#"{"node":"cmp","col":"u","op":"ge","lit":9000000000000000000}"#;
+        let out64 = read_parquet_filtered(p64.to_str().unwrap(), &[], None, 4096, ge64).unwrap();
+        assert_eq!(
+            out64.iter().map(|b| b.num_rows()).sum::<usize>(),
+            2,
+            "unsigned UInt64 group must be kept"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn projection_and_row_group_selection() {
         let dir = std::env::temp_dir().join(format!("bcio_proj_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -434,18 +434,14 @@ impl Codegen<'_, '_> {
             _ => unreachable!(),
         };
         let raw = if is_float {
-            // The interpreter compares floats with Arrow's `cmp` kernel, which uses
-            // `ArrowNativeTypeOp` — i.e. `f64::total_cmp` for ordering and raw-bit
-            // equality for `==`. That is a TOTAL order, not IEEE: `-0.0 < 0.0`,
-            // a negative NaN sorts below `-inf`, a positive NaN above `+inf`, and two
-            // NaNs are equal only when their bit patterns are identical. Plain IEEE
-            // `fcmp` (or the old "any NaN sorts greatest, all NaNs equal" shim) gets
-            // all of those wrong. `total_cmp` maps the bits to a monotonic i64 key
-            // (`bits ^ (((bits >> 63) as u64) >> 1)`) and does a signed integer
-            // compare; reproduce exactly that so the JIT is bit-for-bit identical to
-            // the interpreter on -0.0, every NaN sign/payload, and the infinities.
-            let lk = total_order_key(self.b, l);
-            let rk = total_order_key(self.b, r);
+            // The interpreter canonicalizes float operands (`bc_arrow::canon_f64`) and then
+            // compares with Arrow's `cmp` kernel, i.e. `f64::total_cmp`'s monotonic i64 key.
+            // Reproduce exactly that — canonicalize, then key, then a signed integer compare
+            // — so the JIT stays bit-for-bit identical to the interpreter on `-0.0`, every
+            // NaN sign/payload, and the infinities. Comparing the *raw* bits (as this did
+            // before) is what made `-0.0 != 0.0` and split NaN by payload.
+            let lk = canon_total_order_key(self.b, l);
+            let rk = canon_total_order_key(self.b, r);
             self.b.ins().icmp(cc, lk, rk)
         } else {
             self.b.ins().icmp(cc, l, r)
@@ -456,14 +452,41 @@ impl Codegen<'_, '_> {
     }
 }
 
-/// Reinterpret an `f64` value as the monotonic `i64` total-order key that
-/// [`f64::total_cmp`] uses: `bits ^ (((bits >> 63) as u64) >> 1)`. A signed integer
-/// compare of two keys is bit-for-bit identical to `a.total_cmp(&b)` (and key
-/// equality is bit equality, since the map is a bijection), so it matches the
-/// interpreter's Arrow float comparison on `-0.0`, every NaN sign/payload, and the
-/// infinities. Used by both the scalar and (lane-wise) the SIMD comparison paths.
-pub(crate) fn total_order_key(b: &mut FunctionBuilder, v: Value) -> Value {
+/// The `i64` key that ranks an `f64` the way the engine's float identity says.
+///
+/// Two steps, matching what the interpreter's comparison path does with the same two:
+///
+/// 1. **Canonicalize** (`bc_arrow::canon_f64`): fold `-0.0` into `0.0` and every NaN
+///    bit-pattern into one quiet NaN, so the two zeros are one value and all NaNs are one
+///    value — SQL's answer, and the one `GROUP BY`/`DISTINCT`/join keys already give.
+/// 2. **Key** it with the monotonic map [`f64::total_cmp`] uses
+///    (`bits ^ (((bits >> 63) as u64) >> 1)`), so a signed integer compare of two keys is
+///    `canon(a).total_cmp(&canon(b))` — which `bc_arrow::float_ident` proves equals
+///    `float_total_cmp(a, b)`.
+///
+/// Keying the *raw* bits (as this did before) is a different relation: it splits `-0.0`
+/// from `0.0`, ranks a negative NaN below `-inf`, and calls two NaNs equal only when their
+/// payloads match. Used by the scalar path; `simd::emit_cmp` reproduces it lane-wise.
+pub(crate) fn canon_total_order_key(b: &mut FunctionBuilder, v: Value) -> Value {
+    use cranelift_codegen::ir::condcodes::FloatCC;
+
     let bits = b.ins().bitcast(types::I64, MemFlags::new(), v);
+    let zero_f = b.ins().f64const(0.0);
+    // `Equal` is an *ordered* compare: true for `+0.0` and `-0.0`, false for NaN.
+    let is_zero = b.ins().fcmp(FloatCC::Equal, v, zero_f);
+    // A value is unordered with itself exactly when it is NaN — any sign, any payload.
+    let is_nan = b.ins().fcmp(FloatCC::Unordered, v, v);
+    let zero_bits = b.ins().iconst(types::I64, 0);
+    let nan_bits = b
+        .ins()
+        .iconst(types::I64, bc_arrow::CANONICAL_NAN_BITS_F64 as i64);
+    let bits = b.ins().select(is_zero, zero_bits, bits);
+    let bits = b.ins().select(is_nan, nan_bits, bits);
+    total_order_key_of_bits(b, bits)
+}
+
+/// The monotonic `i64` key [`f64::total_cmp`] uses, over already-canonical `f64` bits.
+pub(crate) fn total_order_key_of_bits(b: &mut FunctionBuilder, bits: Value) -> Value {
     // Arithmetic shift: all-ones when the sign bit is set, all-zeros otherwise.
     let sign = b.ins().sshr_imm(bits, 63);
     // Logical shift by 1: 0x7fff_ffff_ffff_ffff for negatives, 0 for non-negatives.

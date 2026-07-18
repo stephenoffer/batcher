@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import datetime as _dt
 
-from batcher.plan.expr_ir import Binary, Cast, Expr, lit
+from batcher.plan.expr_ir import Binary, Expr, lit
+from batcher.plan.expr_ir.func_nodes import DateOffset
 
 _AGG_FUNCS = {
     "sum": "sum",
@@ -25,6 +26,12 @@ _AGG_FUNCS = {
     # `mode() WITHIN GROUP (ORDER BY x)` is rewritten to `Mode(this=x)` up front
     # (see clauses._within_group_to_agg) so it reaches here as a plain aggregate.
     "mode": "mode",
+    # sqlglot parses `BOOL_AND`/`BOOL_OR` to LogicalAnd/LogicalOr. They map straight
+    # to the native mergeable aggregates, which ignore NULLs and yield NULL for a group
+    # with no non-null input — exactly DuckDB's semantics. (A `COUNT(*) FILTER`
+    # rewrite cannot reproduce that NULL result and silently answered TRUE/FALSE.)
+    "logicaland": "bool_and",
+    "logicalor": "bool_or",
 }
 
 # sqlglot DataType.Type names that fold a string literal into a temporal literal.
@@ -99,10 +106,14 @@ def _like_to_regex(pattern: str, escape: str | None = None) -> str:
 
     Literal characters are regex-escaped; `escape` (if given) quotes the next
     char as a literal. The result is anchored so it matches the whole string.
+
+    `(?s)` makes `.` match a newline too: SQL's `%`/`_` are "any character", with no
+    exception for `\\n`, and the native matcher (`bc_expr`'s `like_regex`) anchors the
+    same way. Without it `'a\\nb' LIKE 'a%b'` was false here and true in DuckDB.
     """
     import re
 
-    out = ["^"]
+    out = ["(?s)^"]
     i = 0
     while i < len(pattern):
         c = pattern[i]
@@ -121,7 +132,7 @@ def _like_to_regex(pattern: str, escape: str | None = None) -> str:
     return "".join(out)
 
 
-def regexp_flags_prefix(flag: str | None) -> str:
+def _regexp_flags_prefix(flag: str | None) -> str:
     """Translate a DuckDB regex option string into an inline `(?…)` flag prefix.
 
     DuckDB's ``regexp_*`` functions take an option string (e.g. ``'i'``); the Rust
@@ -223,11 +234,13 @@ def _fold_const_arith(node) -> Expr | None:
 
 
 def _apply_interval(date_expr: Expr, interval, *, subtract: bool) -> Expr:
-    """`date +/- INTERVAL n <unit>` for a DATE operand.
+    """`ts/date +/- INTERVAL n <unit>` for a DATE or TIMESTAMP operand.
 
-    DAY/WEEK use the day-count representation (Date32 = epoch days); MONTH/YEAR
-    use calendar arithmetic via the engine's `add_months`. Returns a DATE
-    (DuckDB promotes to timestamp, but the calendar value is the same).
+    DAY/WEEK add exact days and MONTH/YEAR add calendar months, both via the
+    type-preserving `offset_by` (`DateOffset`) node so the shift is applied
+    correctly whether the operand is a Date32 (epoch days) or a Timestamp
+    (microseconds). Returns the operand's own type (DuckDB promotes a DATE to
+    timestamp, but the calendar value is the same).
     """
     from sqlglot import expressions as exp
 
@@ -242,13 +255,13 @@ def _apply_interval(date_expr: Expr, interval, *, subtract: bool) -> Expr:
         n = -n
 
     if unit.startswith("DAY"):
-        return Cast(Cast(date_expr, "int64") + lit(n), "date")
+        return DateOffset(date_expr, 0, n, 0)
     if unit.startswith("WEEK"):
-        return Cast(Cast(date_expr, "int64") + lit(n * 7), "date")
+        return DateOffset(date_expr, 0, n * 7, 0)
     if unit.startswith("MONTH"):
-        return Binary("add_months", date_expr, lit(n))
+        return DateOffset(date_expr, n, 0, 0)
     if unit.startswith("YEAR"):
-        return Binary("add_months", date_expr, lit(n * 12))
+        return DateOffset(date_expr, n * 12, 0, 0)
     raise NotImplementedError(f"INTERVAL unit {unit} is not supported")
 
 
@@ -311,7 +324,10 @@ def _build_binops():
         exp.Sub: lambda a, b: a - b,
         exp.Mul: lambda a, b: a * b,
         exp.Div: lambda a, b: a / b,
-        exp.IntDiv: lambda a, b: a // b,  # SQL `//` integer floor division
+        # SQL `//` is integer division that truncates *toward zero* (DuckDB/C
+        # semantics), not Python's floor: `-7 // 3` is `-2`, not `-3`. The engine's
+        # `//` floors, so build it as a truncated true-division instead.
+        exp.IntDiv: lambda a, b: (a / b).trunc(),
         exp.Pow: lambda a, b: a**b,  # SQL `^` / power() / `**`
         exp.Mod: lambda a, b: a % b,
         exp.EQ: lambda a, b: a == b,

@@ -38,6 +38,10 @@ def _inline_named_windows(node) -> None:
             w.set("partition_by", [c.copy() for c in src.args["partition_by"]])
         if src.args.get("order"):
             w.set("order", src.args["order"].copy())
+        # The named window may also carry a frame (`WINDOW w AS (... ROWS ...)`);
+        # copy it too, else `OVER w` silently loses the frame and runs the default.
+        if src.args.get("spec") is not None and w.args.get("spec") is None:
+            w.set("spec", src.args["spec"].copy())
 
 
 def _window(ds: Dataset, projections) -> Dataset:
@@ -132,10 +136,17 @@ def _window_frame(win) -> tuple[int | None, int | None] | None:
         if spec.args.get("start") is not None or spec.args.get("end") is not None:
             raise NotImplementedError("only ROWS window frames are supported (not RANGE/GROUPS)")
         return None
-    return (
-        _frame_bound(spec.args.get("start"), spec.args.get("start_side")),
-        _frame_bound(spec.args.get("end"), spec.args.get("end_side")),
-    )
+    start = spec.args.get("start")
+    end = spec.args.get("end")
+    # A single-bound frame — ``ROWS N PRECEDING`` (no BETWEEN) — is shorthand for
+    # ``ROWS BETWEEN N PRECEDING AND CURRENT ROW``. sqlglot leaves ``end`` unset in
+    # that case; defaulting it to CURRENT ROW (0) avoids treating it as UNBOUNDED
+    # FOLLOWING (a silently wrong whole-tail sum).
+    if end is None and start is not None:
+        end_bound: int | None = 0
+    else:
+        end_bound = _frame_bound(end, spec.args.get("end_side"))
+    return (_frame_bound(start, spec.args.get("start_side")), end_bound)
 
 
 def _frame_bound(value, side) -> int | None:

@@ -35,6 +35,10 @@ _MIN_SAMPLES = 8
 # And even then, clamp the learned crossover to a band around the config default, so one bad
 # early fit can only nudge the threshold within a bounded range, never send it to an absurd value.
 _BAND = 8.0  # learned ∈ [default / _BAND, default * _BAND]
+# The x-spread a bucket needs, as a fraction of its magnitude, before a line is identifiable
+# from it. 1% of the largest observed input: enough that `n*sxx - sx*sx` is signal rather than
+# float noise, and easily cleared by any bucket that has genuinely seen different input sizes.
+_MIN_RELATIVE_SPREAD = 0.01
 
 
 def record_backend_timing(hub: MetadataHub | None, backend: str, rows: int, wall_ms: float) -> None:
@@ -67,7 +71,17 @@ def _fit(s: dict) -> tuple[float, float] | None:
     """`(intercept_ms, slope_ms_per_row)` from a backend's OLS sufficient statistics, or `None`
     when there aren't enough spread-out samples to identify a line."""
     n = int(s.get("n", 0))
-    if n < _MIN_SAMPLES or float(s.get("xmax", 0.0)) <= float(s.get("xmin", 0.0)):
+    xmin, xmax = float(s.get("xmin", 0.0)), float(s.get("xmax", 0.0))
+    if n < _MIN_SAMPLES or xmax <= xmin:
+        return None
+    # The spread must be **relative**, not merely non-zero. `denom = n*sxx - sx*sx` is the
+    # unstable textbook form: with runs clustered near one input size, `n*sxx` and `sx*sx` agree
+    # to ~14 significant digits and their difference is float noise. The `denom <= 0` guard below
+    # catches the negative half of that noise but not the small-positive half, so an *absolute*
+    # `xmax > xmin` let a garbage line through. Measured: 8 runs at ~10M rows spread over 3 rows,
+    # with ±0.5 ms of ordinary timing jitter on a 100 ms measurement, fit intercept 954,873 (true
+    # 100) and a sign-flipped slope — and that intercept is the whole numerator of the crossover.
+    if xmax - xmin < _MIN_RELATIVE_SPREAD * abs(xmax):
         return None
     sx, sy, sxx, sxy = s.get("sx", 0.0), s.get("sy", 0.0), s.get("sxx", 0.0), s.get("sxy", 0.0)
     denom = n * sxx - sx * sx

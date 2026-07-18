@@ -71,7 +71,8 @@ class WindowFrame:
       before it.
     - ``"range"`` — value-based peers; only peer bounds (current row / unbounded)
       are honored, e.g. ``WindowFrame(None, 0, "range")``. A numeric ``range``
-      offset falls back to the default running frame.
+      offset (value-based ``n PRECEDING``/``FOLLOWING``) is not supported and raises
+      — use ``"rows"`` for a physical-row frame.
     """
 
     start: int | None
@@ -83,6 +84,20 @@ class WindowFrame:
             raise PlanError(f"window frame units must be one of {_FRAME_UNITS}, got {self.units!r}")
         if self.start is not None and self.end is not None and self.start > self.end:
             raise PlanError(f"window frame start {self.start} is after end {self.end}")
+        # A numeric RANGE offset (`n PRECEDING`/`FOLLOWING`, i.e. a non-zero bound) is
+        # value-based — it selects peers whose ORDER BY *value* is within `n`, not `n`
+        # rows. The engine does not implement that typed order-key arithmetic and
+        # silently ran the default running frame instead, a wrong result vs SQL. Reject
+        # it (only peer bounds — CURRENT ROW / UNBOUNDED — are honored for `range`),
+        # matching the SQL translator, which already rejects `RANGE BETWEEN n …`.
+        if self.units == "range" and (
+            (self.start is not None and self.start != 0) or (self.end is not None and self.end != 0)
+        ):
+            raise PlanError(
+                "numeric RANGE window frame offsets are not supported; only peer "
+                "bounds (CURRENT ROW / UNBOUNDED) are honored for range units. Use "
+                "'rows' units for a physical-row frame."
+            )
 
     def to_ir(self) -> dict[str, Any]:
         return {

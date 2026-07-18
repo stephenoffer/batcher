@@ -42,10 +42,11 @@ _TABLE = pa.table(
     }
 )
 
-# Types the engine's MIN/MAX aggregate can execute (so the in-memory fallback runs);
-# Date32/Boolean min/max are executed only via the footer shortcut (see the dedicated
-# metadata-only test below), matching the engine's supported aggregate surface.
-_ORDERABLE = ["i", "f", "s", "k"]
+# Types the engine's MIN/MAX aggregate can execute (so the in-memory fallback runs). The
+# engine now reduces temporal (Date32) and Boolean columns too — previously it could only
+# answer those from the Parquet footer, a metadata-vs-engine disagreement — so `d`/`b` are
+# exercised through real execution here, not only the footer shortcut below.
+_ORDERABLE = ["i", "f", "s", "d", "b", "k"]
 _FOOTER_ORDERABLE = ["i", "f", "d", "b", "k"]
 _ALL_COLS = ["i", "f", "s", "d", "b", "allnull", "k"]
 

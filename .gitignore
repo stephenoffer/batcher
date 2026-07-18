@@ -30,3 +30,6 @@ docs/_static/diagrams/*.dot
 
 # Local benchmark env helper (Rust toolchain + venv activation)
 .envrc.bench
+
+# Local working notes, one-off comparison scripts, and their output
+scratchpad/

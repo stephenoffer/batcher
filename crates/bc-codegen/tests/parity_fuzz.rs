@@ -16,9 +16,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch,
-};
+use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use bc_arrow::SimdOverride;
 use bc_expr::{BinaryOp, CaseBranch, Expr, Literal, Math2Func, MathFunc};
@@ -86,14 +84,14 @@ fn nasty_f64() -> Vec<f64> {
         -0.5,
         2.0,
         3.0,
-        f64::NAN,              // 0x7ff8_0000_0000_0000
-        -f64::NAN,             // sign bit set — total-order-LESS than everything
+        f64::NAN,                              // 0x7ff8_0000_0000_0000
+        -f64::NAN, // sign bit set — the raw bit order ranks it below -inf, canon ranks it greatest
         f64::from_bits(0x7ff8_0000_0000_0001), // a different quiet-NaN payload
         f64::from_bits(0xfff8_0000_0000_0007), // negative NaN, another payload
         f64::INFINITY,
         f64::NEG_INFINITY,
-        f64::MIN_POSITIVE,     // smallest normal
-        f64::from_bits(1),     // smallest subnormal
+        f64::MIN_POSITIVE, // smallest normal
+        f64::from_bits(1), // smallest subnormal
         -f64::from_bits(1),
         f64::from_bits(0x000f_ffff_ffff_ffff), // largest subnormal
         f64::MAX,
@@ -521,17 +519,13 @@ fn compiled_expr_carries_no_state_across_batches() {
     let mut rng = Rng(0x5EED_1234_ABCD_0004);
     for _ in 0..80 {
         let expr = gen_num(&mut rng, 3, Nulls::Yes);
-        let batches: Vec<RecordBatch> = LENGTHS
-            .iter()
-            .map(|&n| make_batch(n, &mut rng))
-            .collect();
+        let batches: Vec<RecordBatch> = LENGTHS.iter().map(|&n| make_batch(n, &mut rng)).collect();
         let Ok(compiled) = bc_codegen::compile_expr(&expr, &batches[0]) else {
             continue;
         };
         // First pass: record each batch's result. Second pass: replay in the opposite
         // order. Same compiled artifact — the answers must be identical.
-        let first: Vec<Option<ArrayRef>> =
-            batches.iter().map(|b| compiled.eval(b).ok()).collect();
+        let first: Vec<Option<ArrayRef>> = batches.iter().map(|b| compiled.eval(b).ok()).collect();
         for (b, want) in batches.iter().zip(&first).rev() {
             let got = compiled.eval(b).ok();
             match (&got, want) {

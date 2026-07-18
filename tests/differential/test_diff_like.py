@@ -109,3 +109,61 @@ def test_like_empty_and_case_vs_duckdb(duck, t):
         "s ILIKE 'h%' ilike_h, s LIKE 'h%' like_h FROM t"
     )
     assert_same(out, expected)
+
+
+@pytest.mark.parametrize(
+    "pat",
+    [
+        # Ordered multi-segment patterns: the fast matcher searches each literal segment
+        # in order within the region the anchors leave free, instead of a full regex
+        # automaton. The prefix/suffix + interior-substring shapes must all agree with
+        # DuckDB (this is the TPC-H q13 `%special%requests%` family).
+        "%a%b%",
+        "a%b",
+        "a%b%c",
+        "%a%b",
+        "a%b%",
+        "%ll%o%",
+        "h%o",
+        "hello%world",
+        "%xx%",
+        "b%n%n%",
+        "a%%b",
+        "%a%.%",
+    ],
+)
+@pytest.mark.parametrize("op", ["LIKE", "NOT LIKE"])
+def test_sql_like_ordered_segments_vs_duckdb(duck, t, op, pat):
+    from conftest import assert_same
+
+    q = f"SELECT (s {op} '{pat}') AS v FROM t"
+    assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        # `%` and `_` are "any character" in SQL, with no exception for a newline, and
+        # every one of these shapes must agree with DuckDB on a string containing one.
+        # Regression: SQL `LIKE` desugared to a Python-built regex that omitted `(?s)`,
+        # so `.`/`.*` stopped at `\n` and `'a\nb' LIKE 'a%b'` was false here, true in
+        # DuckDB. The escape-free shapes now lower to the native matcher; the ESCAPE
+        # shape still desugars, and its regex carries `(?s)`.
+        "s LIKE 'a%b'",
+        "s LIKE 'a_b'",
+        "s LIKE '%a%b%'",
+        "s LIKE 'a%b%c'",
+        "s NOT LIKE 'a%b'",
+        "s ILIKE 'A%B'",
+        r"s LIKE 'a\%b' ESCAPE '\'",
+        r"s LIKE 'a%\_b' ESCAPE '\'",
+    ],
+)
+def test_like_matches_newline_like_duckdb(duck, pred):
+    """`%`/`_` span a newline — SQL says "any character", with no `\\n` exception."""
+    from conftest import assert_same
+
+    tbl = pa.table({"s": ["a\nb", "axb", "a\nb\nc", "ab", "a%b", "a_b", "plain", "A\nB", None]})
+    duck.register("nl", tbl)
+    q = f"SELECT ({pred}) AS v FROM nl"
+    assert_same(bt.sql(q, nl=tbl).collect(), duck.sql(q))

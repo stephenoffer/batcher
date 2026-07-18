@@ -1,8 +1,14 @@
 """Expression simplification — drop the algebraic identities a rewrite leaves behind.
 
 `x AND true → x`, `x OR false → x`, `x + 0 → x`, `x * 1 → x`, `NOT NOT x → x`, and the
-redundant `Cast(Cast(x, t), t)`. Only **identity-element** rewrites are applied, never
-annihilators (the engine's boolean ops are non-Kleene).
+redundant `Cast(Cast(x, t), t)`. Only **identity-element** rewrites are applied here;
+annihilators (`x AND false → false`, `x OR true → true`), absorption, and complementation
+live in `kyber/rules/extra/boolean_algebra.py`. Those *are* sound under the engine's boolean
+ops, which are **Kleene** (three-valued): `and_kleene`/`or_kleene` in
+`crates/bc-expr/src/eval/binary.rs` make `false` annihilate `AND` and `true` annihilate `OR`
+even against a NULL operand. (An earlier version of this note claimed the ops were
+*non-Kleene* — the opposite of the truth, and a trap for anyone tempted to "fix" the
+correct Kleene annihilators in that sibling module.)
 
 `+ 0` is the one that needs a type, and using an *integer* literal `0` is not enough to
 make it safe — that guards the wrong operand. IEEE-754 says `-0.0 + 0.0 = +0.0`, so for a

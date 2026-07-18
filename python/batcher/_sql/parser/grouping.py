@@ -8,7 +8,12 @@ their first argument.
 from __future__ import annotations
 
 from batcher._internal.errors import PlanError
-from batcher._sql.parser.core_utils import _alias_of, _positional, _unwrap_alias
+from batcher._sql.parser.core_utils import (
+    _alias_of,
+    _has_aggregate,
+    _positional,
+    _unwrap_alias,
+)
 from batcher._sql.parser.literals import _AGG_FUNCS
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import AggExpr, Expr, col
@@ -115,8 +120,9 @@ def _grouping_level_node(node, active: dict, every: dict):
 
     # GROUPING(x, y, ...) is a per-level constant: the integer whose bits mark which
     # of its arguments are rolled up (inactive) in this level, first argument the
-    # most-significant bit (DuckDB/SQL-standard). Replace it with that literal.
-    for gnode in list(m.find_all(exp.Grouping)):
+    # most-significant bit (DuckDB/SQL-standard). GROUPING_ID(...) is a spelling of the
+    # same bit-vector. Replace either with that literal.
+    for gnode in list(m.find_all(exp.Grouping, exp.GroupingId)):
         bits = 0
         for arg in gnode.expressions:
             bits = (bits << 1) | (0 if _grouping_key(arg) in active else 1)
@@ -209,7 +215,7 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
     # GROUPING(...) is the constant 0. (The grouping-sets path handles it per level.)
     scopes = [*projections, having.this] if having is not None else list(projections)
     for scope in scopes:
-        for g in list(scope.find_all(exp.Grouping)):
+        for g in list(scope.find_all(exp.Grouping, exp.GroupingId)):
             g.replace(exp.Paren(this=exp.Literal.number(0)))
 
     group_cols: list[str] = []
@@ -225,7 +231,20 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
         if a:
             select_aliases[a] = _unwrap_alias(p)
     if group is not None:
-        for i, g in enumerate(group.expressions):
+        group_items = list(group.expressions)
+        # GROUP BY ALL groups by every SELECT item that is not itself an aggregate
+        # (or a window function) — DuckDB/Postgres semantics. sqlglot flags it with
+        # `all=True` and an empty expression list; expand it to those items so the
+        # keys actually group the rows rather than collapsing to a grand total.
+        if group.args.get("all") and not group_items:
+            group_items = [
+                _unwrap_alias(p)
+                for p in projections
+                if not isinstance(_unwrap_alias(p), exp.Star)
+                and not _has_aggregate(p)
+                and not tr._is_window(p)
+            ]
+        for i, g in enumerate(group_items):
             # GROUP BY <n> refers to the n-th (1-based) SELECT item.
             if isinstance(g, exp.Literal) and not g.is_string:
                 g = _unwrap_alias(_positional(projections, g, "GROUP BY"))
@@ -235,9 +254,14 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
                 aliased = select_aliases[g.name]
                 if not (isinstance(aliased, exp.Column) and aliased.name == g.name):
                     g = aliased
+            # A key repeated in the GROUP BY (`GROUP BY region, region`, or `GROUP BY
+            # 1, region` where both name the same column) is redundant — DuckDB accepts
+            # it and groups once. Dedup so the engine does not raise on a duplicate
+            # output column (bare columns) or recompute the same derived key twice.
             if isinstance(g, exp.Column):
-                group_cols.append(g.name)
-            else:
+                if g.name not in group_cols:
+                    group_cols.append(g.name)
+            elif g.sql() not in group_expr_alias:
                 alias = f"__gk{i}"
                 group_exprs[alias] = tr._scalar(g)
                 group_expr_alias[g.sql()] = alias
@@ -290,6 +314,57 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
     # NB: `_agg_map` stays live so an ORDER BY over an aggregate can resolve;
     # the caller (`select`) clears it once ordering is done.
     return ds.select(**named)
+
+
+def _distinct_on(tr, ds: Dataset, projections, order, on_exprs) -> Dataset:
+    """`SELECT DISTINCT ON (keys) ... ORDER BY ...` — keep one row per key set.
+
+    Postgres/DuckDB semantics: for each set of rows sharing the ``DISTINCT ON`` key
+    expressions, keep the first row in ``ORDER BY`` order, then order the survivors by
+    the same ``ORDER BY``. Reuses ``Dataset.distinct(subset, keep="first", order_by=…)``
+    (a ``row_number()`` window under the hood) rather than a full-row dedup. The key and
+    sort expressions are materialized as internal ``__bc_`` columns first so they stay
+    resolvable even when absent from the SELECT list, and never leak through ``SELECT *``.
+    """
+    from sqlglot import expressions as exp
+
+    on_cols: list[str] = []
+    temp: dict[str, Expr] = {}
+    for i, e in enumerate(on_exprs):
+        name = f"__bc_don{i}"
+        temp[name] = tr._scalar(e)
+        on_cols.append(name)
+
+    order_spec: list[tuple[str, bool]] = []  # (column, descending) for the row choice
+    final_sort: list[tuple[str, bool, bool]] = []  # (column, descending, nulls_first)
+    if order is not None:
+        for j, o in enumerate(order.expressions):
+            target = o.this
+            if isinstance(target, exp.Literal) and not target.is_string:
+                target = _unwrap_alias(_positional(projections, target, "ORDER BY"))
+            name = f"__bc_dord{j}"
+            temp[name] = tr._scalar(target)
+            desc = bool(o.args.get("desc"))
+            order_spec.append((name, desc))
+            final_sort.append((name, desc, bool(o.args.get("nulls_first"))))
+
+    ds = ds.with_columns(**temp)
+    if order_spec:
+        ds = ds.distinct(on_cols, keep="first", order_by=order_spec)
+    else:
+        ds = ds.distinct(on_cols)
+
+    named = _projection_map(tr, ds, projections)
+    if not final_sort:
+        return ds.select(**named)
+    # Sort the survivors by the (materialized) ORDER BY keys, then drop the temporaries.
+    ds = ds.with_columns(**named)
+    ds = ds.sort(
+        *(col(k) for k, _, _ in final_sort),
+        descending=[d for _, d, _ in final_sort],
+        nulls_first=[nf for _, _, nf in final_sort],
+    )
+    return ds.select(*named.keys())
 
 
 def _register_agg(tr, node, preferred: str | None, used: set) -> None:

@@ -403,10 +403,11 @@ pub(super) fn canon_float_key(arr: &ArrayRef) -> ArrayRef {
 /// schema when every input batch is empty. Shared by the bounded distinct and mode
 /// paths, which need the same native-value run.
 /// `canon_value` folds a `Float64` *value* column to canonical float identity
-/// (`-0.0`==`0.0`, one NaN) as well. `n_unique` needs this — its in-memory path dedups
-/// the value through `assign_groups`, which canonicalizes floats — but `mode`/`histogram`
-/// must NOT (their in-memory finalizers compare the raw `RowConverter` encoding), so they
-/// pass `false`.
+/// (`-0.0`==`0.0`, one NaN) as well. `n_unique`, `mode`, and `histogram` all need this:
+/// each in-memory finalizer canonicalizes the value's float identity (`n_unique` via
+/// `assign_groups`; `mode`/`histogram` via `canonicalize_float_keys` in
+/// `bc_runtime::agg::median`), so the spilled path must fold identically or the same
+/// column yields a different mode/histogram/distinct-count under memory pressure.
 pub(super) fn flatten_native_value(
     parts: &[RecordBatch],
     group_keys: &[ProjectionItem],
@@ -595,9 +596,10 @@ pub(crate) fn bounded_group_mode(
         None => DataType::Null,
     };
 
-    // `canon_value = false`: the in-memory `finalize_mode` compares raw `RowConverter`
-    // encodings (no float canonicalization), so the spill path must match it exactly.
-    let (flat, schema) = flatten_native_value(parts, group_keys, value_expr, false)?;
+    // `canon_value = true`: the in-memory `finalize_mode` canonicalizes float leaves
+    // (`bc_runtime::agg::median::finalize_mode`), so the spill path must fold `-0.0`/`0.0`
+    // and every NaN identically — else `mode` over `[-0.0, -0.0, 0.0]` differs under spill.
+    let (flat, schema) = flatten_native_value(parts, group_keys, value_expr, true)?;
     let Some(schema) = schema else {
         return Ok((Vec::new(), new_empty_array(&value_type)));
     };
@@ -828,5 +830,40 @@ mod tests {
         let (gc, _qc) =
             bounded_group_quantile(&parts, &gk(), &vexpr(), 0.5, &dir, SpillCodec::None).unwrap();
         assert_eq!(gc[0].len(), 1, "all NaN keys must be one group");
+    }
+
+    /// `mode` over a `Float64` **value** column must fold `-0.0`/`0.0` to one value — the
+    /// in-memory `finalize_mode` canonicalizes float leaves. The spill path once passed
+    /// `canon_value = false`, so `mode([-0.0, -0.0, 0.0])` returned `-0.0` (a spurious
+    /// 2-vs-1 split) under memory pressure while the in-memory answer is `0.0` (count 3):
+    /// a silent spill-only wrong answer that violates single-node==spilled.
+    #[test]
+    fn mode_value_folds_signed_zero() {
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Float64, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 1])),
+                Arc::new(Float64Array::from(vec![-0.0, -0.0, 0.0])),
+            ],
+        )
+        .unwrap();
+        let gk = vec![ProjectionItem {
+            expr: bc_expr::Expr::Col { name: "k".into() },
+            alias: "k".into(),
+        }];
+        let dir = std::env::temp_dir().join(format!("bc_mode_negz_{}", std::process::id()));
+        let (_gc, mc) =
+            bounded_group_mode(&[batch], &gk, &vexpr(), &dir, SpillCodec::None).unwrap();
+        let mc = mc.as_any().downcast_ref::<Float64Array>().unwrap();
+        // Canonical representative of the single folded value is `+0.0`.
+        assert_eq!(
+            mc.value(0).to_bits(),
+            0.0_f64.to_bits(),
+            "mode folds signed zero"
+        );
     }
 }

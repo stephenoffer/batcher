@@ -359,6 +359,18 @@ class Unpivot(LogicalPlan):
                 f"unpivot output columns collide: {dups} — variable_name/value_name must "
                 "differ from each other and from every index column"
             )
+        # The melted `on` columns stack into one `value` column, so they must share a
+        # promotable type. Reject an unmergeable mix (e.g. Utf8 + Int64) here with a clear
+        # plan-time error — else native `concat` fails deep in execution with an opaque
+        # "cannot concatenate arrays of different data types". DuckDB rejects it at bind
+        # time too. Best-effort: only when the input schema (column types) is known.
+        schema = self.input.available_schema()
+        if schema is not None and self.available_schema() is None:
+            raise PlanError(
+                f"unpivot cannot merge `on` columns of incompatible types "
+                f"({[str(schema.field(c).type) for c in self.on]}); cast them to a "
+                "common type before unpivoting"
+            )
 
     def to_ir(self) -> dict[str, Any]:
         return {

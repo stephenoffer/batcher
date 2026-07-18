@@ -195,3 +195,101 @@ def test_disabling_the_cache_gives_the_same_results():
         first = bt.from_arrow(table).filter(bt.col("x") > 1).collect().to_pydict()
     second = bt.from_arrow(table).filter(bt.col("x") > 1).collect().to_pydict()
     assert first == second == {"x": [2, 3]}
+
+
+# --- the adaptive gate must be able to invalidate a memoized plan ------------------
+
+
+def test_adaptive_flip_ratio_invalidates_but_a_bare_tick_does_not():
+    """`record_adaptive_flip` writes only `{flips, total}` — both bookkeeping counters.
+
+    With neither compared, the key-set difference was empty and `any(())` was False, so the
+    write could *never* bump the generation: `learned_adaptive_helps` flipped False -> True and
+    a stale plan was served forever. Comparing the raw counters instead would bump on every
+    execution and defeat the memo. The *ratio* — the number the gate actually reads — is what
+    must decide.
+    """
+    from batcher.kyber.plan_cache import _materially_differs
+
+    # A run that ticks `total` without moving the flip ratio stays a cache hit.
+    assert not _materially_differs({"flips": 0, "total": 1}, {"flips": 0, "total": 2})
+    assert not _materially_differs({"flips": 3, "total": 10}, {"flips": 3, "total": 11})
+    # A run that moves the ratio (here, the first flip) must invalidate.
+    assert _materially_differs({"flips": 0, "total": 2}, {"flips": 1, "total": 3})
+    assert _materially_differs({"flips": 3, "total": 10}, {"flips": 4, "total": 11})
+
+
+def test_source_stats_are_part_of_the_plan_cache_key():
+    """Zone-map pruning folds a filter to FALSE from footer min/max carried in `source_stats`.
+
+    Keying only on the source *object* let two calls with different collected statistics
+    collide, serving the first call's pruned plan for the second — a wrong answer.
+    """
+    import batcher as bt
+    from batcher.config import active_config
+    from batcher.kyber import plan_cache
+    from batcher.plan.source_stats import SourceStatistics
+    from batcher.plan.stats import ColumnStat, Provenance
+
+    ds = bt.from_pydict({"x": [1, 2, 3]})
+    cfg, pk = active_config(), ds._plan.content_key()
+
+    def stats(lo, hi):
+        return [
+            SourceStatistics(
+                row_count=3,
+                exact_rows=True,
+                columns={"x": ColumnStat(min=lo, max=hi, provenance=Provenance.EXACT)},
+            )
+        ]
+
+    none_key = plan_cache.cache_key(pk, ds._sources, cfg, None)
+    low = plan_cache.cache_key(pk, ds._sources, cfg, None, source_stats=stats(1, 3))
+    high = plan_cache.cache_key(pk, ds._sources, cfg, None, source_stats=stats(100, 300))
+    assert none_key != low != high and none_key != high
+    # Identical statistics must still key identically, or the memo never hits.
+    assert low == plan_cache.cache_key(pk, ds._sources, cfg, None, source_stats=stats(1, 3))
+
+
+# --- learned accumulators must not flush the cache on every single run -------------
+
+
+def test_converged_ols_statistics_do_not_invalidate():
+    """`_fold_ols` writes monotonically-growing sufficient statistics every observation.
+
+    Comparing `sx`/`sy`/`sxx`/`sxy` raw made every join run look material and flushed the
+    whole plan cache — the "6 hits in 8 identical runs became 0" regression, fixed for `n`
+    but still live for the accumulators beside it. What a plan reads is the *fit*, which is a
+    function of the per-observation moments.
+    """
+    from batcher.kyber.plan_cache import _materially_differs
+
+    prior = {"n": 100, "sx": 1000.0, "sy": 2000.0, "sxx": 12000.0, "sxy": 21000.0,
+             "xmin": 1.0, "xmax": 50.0}  # fmt: skip
+    one_more = {"n": 101, "sx": 1010.0, "sy": 2020.0, "sxx": 12120.0, "sxy": 21210.0,
+                "xmin": 1.0, "xmax": 50.0}  # fmt: skip
+    assert not _materially_differs(prior, one_more)
+
+
+def test_a_shifted_ols_relationship_still_invalidates():
+    from batcher.kyber.plan_cache import _materially_differs
+
+    prior = {"n": 100, "sx": 1000.0, "sy": 2000.0, "sxx": 12000.0, "sxy": 21000.0,
+             "xmin": 1.0, "xmax": 50.0}  # fmt: skip
+    shifted = {"n": 101, "sx": 1010.0, "sy": 4000.0, "sxx": 12120.0, "sxy": 45000.0,
+               "xmin": 1.0, "xmax": 50.0}  # fmt: skip
+    assert _materially_differs(prior, shifted)
+    # A genuinely new x extreme changes the fit's applicable range, so it invalidates too.
+    extreme = dict(prior, n=101, xmax=500.0)
+    assert _materially_differs(prior, extreme)
+
+
+def test_bandit_arm_invalidates_on_its_mean_not_its_accumulator():
+    """`record_arm` grows `sum`/`sumsq` every run; `ucb1_best_arm` ranks by `sum/n`."""
+    from batcher.kyber.plan_cache import _materially_differs
+
+    prior = {"hash": {"n": 50, "sum": 500.0, "sumsq": 6000.0}}
+    stable = {"hash": {"n": 51, "sum": 510.0, "sumsq": 6120.0}}  # same ~10ms mean
+    doubled = {"hash": {"n": 51, "sum": 1020.0, "sumsq": 24000.0}}  # mean ~20ms
+    assert not _materially_differs(prior, stable)
+    assert _materially_differs(prior, doubled)

@@ -44,8 +44,8 @@ pub use distinct::{distinct_batch, distinct_dense};
 pub(crate) use group::assign_groups;
 use hll::{approx_distinct_state, finalize_approx_distinct, merge_approx_distinct};
 use median::{
-    finalize_histogram, finalize_median, finalize_mode, finalize_quantile, listagg_state,
-    median_state, merge_median,
+    finalize_histogram, finalize_list_agg, finalize_median, finalize_mode, finalize_quantile,
+    listagg_state, median_state, merge_median,
 };
 use qsketch::{approx_quantile_state, finalize_approx_quantile, merge_approx_quantile};
 use stats::{
@@ -377,9 +377,8 @@ fn widen_mean_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, RuntimeE
 /// result type is immaterial since the value is null. Runs before [`widen_mean_inputs`] so a
 /// `Null` `AVG` input becomes `Int64` here, then Float64 there.
 fn coerce_null_call_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, RuntimeError> {
-    let is_null = |a: &Option<ArrayRef>| {
-        matches!(a.as_ref().map(|x| x.data_type()), Some(DataType::Null))
-    };
+    let is_null =
+        |a: &Option<ArrayRef>| matches!(a.as_ref().map(|x| x.data_type()), Some(DataType::Null));
     if !calls.iter().any(|c| is_null(&c.values) || is_null(&c.key)) {
         return Ok(None);
     }
@@ -393,7 +392,13 @@ fn coerce_null_call_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, Ru
     };
     let out = calls
         .iter()
-        .map(|c| Ok(AggCall::with_key(c.func, coerce(&c.values)?, coerce(&c.key)?)))
+        .map(|c| {
+            Ok(AggCall::with_key(
+                c.func,
+                coerce(&c.values)?,
+                coerce(&c.key)?,
+            ))
+        })
         .collect::<Result<Vec<_>, RuntimeError>>()?;
     Ok(Some(out))
 }
@@ -640,8 +645,9 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
             AggFunc::CountDistinct => finalize_count_distinct(&state[0]),
             AggFunc::Median => finalize_median(&state[0])?,
             AggFunc::Quantile(permille) => finalize_quantile(&state[0], permille as f64 / 1000.0)?,
-            // array_agg: the collected per-group list IS the result.
-            AggFunc::ListAgg => state[0].clone(),
+            // array_agg: the collected per-group list IS the result, except a non-null
+            // *empty* list (an aggregate over zero rows) becomes NULL to match DuckDB.
+            AggFunc::ListAgg => finalize_list_agg(&state[0])?,
             AggFunc::ApproxCountDistinct => finalize_approx_distinct(&state[0]),
             AggFunc::ApproxQuantile(permille) => {
                 finalize_approx_quantile(&state[0], permille as f64 / 1000.0)

@@ -15,6 +15,7 @@ import pyarrow as pa
 import batcher as bt
 from batcher import col, count, lit
 from batcher.kyber.stats import StatsEstimator
+from batcher.kyber.stats import aggregate_columns as agg_cols
 from batcher.kyber.stats import columns as col_prop
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import Filter
@@ -79,7 +80,7 @@ def test_bool_agg_rejects_non_boolean_column():
     # An integer column's min/max must not be read as a boolean aggregate.
     stat = ColumnStat(min=0, max=5, null_count=0, provenance=Provenance.EXACT)
     child = RelStats(6, Provenance.EXACT, {"x": stat})
-    assert col_prop._derive_scalar_aggregate("bool_and", Col("x"), child) is None
+    assert agg_cols._derive_scalar_aggregate("bool_and", Col("x"), child) is None
 
 
 # --- count(col) of a non-null column --------------------------------------
@@ -94,7 +95,7 @@ def test_sum_empty_relation_not_derived():
     child = RelStats(
         0, Provenance.EXACT, {"v": ColumnStat(total_sum=0.0, provenance=Provenance.EXACT)}
     )
-    assert col_prop._derive_scalar_aggregate("sum", Col("v"), child) is None
+    assert agg_cols._derive_scalar_aggregate("sum", Col("v"), child) is None
 
 
 # --- grouped-aggregate group-key propagation ------------------------------

@@ -316,6 +316,72 @@ def test_reduce_join_paths_spilling_matches_direct(tmp_path, how):
     )
 
 
+@pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])
+@pytest.mark.parametrize("empty_side", ["left", "right"])
+def test_reduce_join_paths_spilling_empty_side(tmp_path, how, empty_side):
+    """A whole side with *no* rows must still null-extend the present side of an outer
+    join. The grace reducer infers each side's schema from its data, so an entirely-empty
+    side comes through untyped unless a fallback schema is passed — this pins the
+    `left_schema`/`right_schema` fallback that the flight bounded join reduce relies on
+    (its own reducer can OOM if it assembles the bucket, so it must reduce from disk)."""
+    import json
+
+    import batcher._native as nat
+
+    from batcher.config import active_config
+    from batcher.dist.executors.join import _join_reducer_ir
+    from batcher.dist.shuffle_io import write_ipc
+    from batcher.dist.spill_breakers import reduce_join_paths_spilling
+
+    left_b = pa.record_batch(
+        {"k": pa.array([1, 2, 3], type=pa.int64()), "v": pa.array([10, 20, 30], type=pa.int64())}
+    )
+    right_b = pa.record_batch(
+        {"k": pa.array([2, 3, 4], type=pa.int64()), "name": pa.array(["b", "c", "d"])}
+    )
+    joined = bt.from_arrow(pa.Table.from_batches([left_b])).join(
+        bt.from_arrow(pa.Table.from_batches([right_b])), on="k", how=how
+    )
+    join = _find_join(joined._plan)
+    join_ir = json.dumps(_join_reducer_ir(join))
+    cfg = active_config().engine_config_json()
+
+    left_schema, right_schema = left_b.schema, right_b.schema
+    if empty_side == "left":
+        left_files, right_files = [], [write_ipc([right_b], str(tmp_path / "r0.arrow"))]
+        left_rel, right_rel = [], [right_b]
+    else:
+        left_files, right_files = [write_ipc([left_b], str(tmp_path / "l0.arrow"))], []
+        left_rel, right_rel = [left_b], []
+
+    direct = nat.execute_plan(
+        join_ir,
+        [left_rel or [_empty(left_schema)], right_rel or [_empty(right_schema)]],
+        cfg,
+    )
+    graced = reduce_join_paths_spilling(
+        join_ir,
+        list(join.left_keys),
+        list(join.right_keys),
+        left_files,
+        right_files,
+        str(tmp_path),
+        4,
+        cfg,
+        left_schema,
+        right_schema,
+    )
+    schema = (direct or graced)[0].schema if (direct or graced) else None
+    norm = lambda t: sorted(repr(r) for r in t.to_pylist())  # noqa: E731
+    got = norm(pa.Table.from_batches(graced, schema)) if graced else []
+    exp = norm(pa.Table.from_batches(direct, schema)) if direct else []
+    assert got == exp
+
+
+def _empty(schema):
+    return pa.RecordBatch.from_pylist([], schema=schema)
+
+
 def _sort_dataset(n_batches=100, key_range=100000):
     rng = np.random.default_rng(2)
     batches = [

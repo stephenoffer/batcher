@@ -58,6 +58,9 @@ fold *down* a column). They mirror the Polars `*_horizontal` family.
 | Call | Meaning |
 | --- | --- |
 | `bt.sum_horizontal(*exprs)` | row-wise sum, nulls treated as 0 |
+| `bt.count_horizontal(*exprs)` | row-wise count of non-null values |
+| `bt.product_horizontal(*exprs)` | row-wise product, nulls treated as 1 |
+| `bt.reduce_horizontal(fn, *exprs)` / `bt.fold_horizontal(acc, fn, *exprs)` | fold columns row-wise with a binary `Expr` combiner (no seed / with seed) |
 | `bt.mean_horizontal(*exprs)` | row-wise mean, ignoring nulls |
 | `bt.min_horizontal(*exprs)` / `bt.max_horizontal(*exprs)` | row-wise min / max, ignoring nulls (the Polars-named `least` / `greatest`) |
 | `bt.all_horizontal(*exprs)` / `bt.any_horizontal(*exprs)` | row-wise boolean AND / OR across predicate columns |
@@ -132,7 +135,9 @@ print(out.to_pydict())
 `.abs()`, `.round(digits)`, `.pow(e)`, `.sqrt()`, `.floor()`, `.ceil()`, `.ln()`,
 `.log10()`, `.log2()`, `.exp()`, `.sin()`, `.cos()`, `.tan()`, `.asin()`, `.acos()`,
 `.atan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`, `.sign()`, `.trunc()`,
-`.cbrt()`, `.degrees()`, `.radians()`, `.factorial()` (→ Float64). Integer bitwise
+`.cbrt()`, `.degrees()`, `.radians()`, `.factorial()`, `.square()` (i.e. `x*x`),
+`.log1p()` / `.expm1()` (accurate near zero), and the inverse-hyperbolics
+`.asinh()` / `.acosh()` / `.atanh()` (→ Float64). Integer bitwise
 ops (distinct from the boolean `&`/`|`): `.bitwise_and(o)`, `.bitwise_or(o)`,
 `.bitwise_xor(o)`, `.bitwise_left_shift(o)`, `.bitwise_right_shift(o)`, and
 `.bit_count()` (the number of set bits, i.e. population count → Int64).
@@ -229,6 +234,7 @@ come up most have their own names:
 | `.rank(method="min", descending=False)` | `RANK()` / `DENSE_RANK()` / `ROW_NUMBER()` over `x` |
 | `.is_duplicated()` / `.is_unique()` | `count(1) OVER (PARTITION BY x)` vs 1 |
 | `.rolling_sum(k)` / `.rolling_mean(k)` / `.rolling_min(k)` / `.rolling_max(k)` / `.rolling_count(k)` | `agg(x) OVER (ROWS BETWEEN k-1 PRECEDING AND CURRENT ROW)` |
+| `.rolling_var(k, ddof=1)` / `.rolling_std(k, ddof=1)` | sample (or population, `ddof=0`) variance / stddev over the same trailing frame |
 
 All of them take `partition_by=` / `order_by=`, and `.fill_nan(v)` replaces IEEE NaN
 (which `.fill_null(v)` never touches, NaN being a value rather than a null).
@@ -255,9 +261,9 @@ Breadth lives on accessor namespaces rather than on the expression itself.
 
 | Namespace | Covers |
 | --- | --- |
-| `.str` | `upper`, `lower`, `trim(chars=None)`, `lstrip`/`rstrip(chars=None)`, `len`, `contains`, `starts_with`, `ends_with`, `like`, `ilike`, `substr`, `left`, `right`, `split`, `split_part(delim, n)`, `strip_html()` (markup → prose; drops `<script>`/`<style>` bodies and decodes entities), `chunk(size, overlap=0)` (RAG document splitter), `minhash(num_perm=128, ngram=5)` (fuzzy-dedup signature), `replace`, `regexp_replace`, `regexp_replace_all`, `regexp_extract`, `initcap`, `hex`, `base64`, `translate`, and more |
-| `.dt` | `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `dayofyear`, `dayname`, `monthname`, `epoch`, `iso_year`, `is_leap_year`, `days_in_month`, `truncate(unit)`, `strftime(fmt)`, `offset_by("1mo15d")`, `convert_timezone(from_tz, to_tz)` (DST-aware), and more |
-| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `normalize`, `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `first()`, `last()`, `slice`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `transform(element()-expr)`, `filter(element()-pred)`, `join(sep)`; vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)`, `jaccard(o)` (agreement rate; the MinHash/SimHash similarity estimate), `simhash(num_bits=64, seed=0)` (random-hyperplane LSH signature — the blocking key for a vector similarity join) |
+| `.str` | `upper`, `lower`, `trim(chars=None)`, `lstrip`/`rstrip(chars=None)`, `len`, `contains`, `starts_with`, `ends_with`, `like`, `ilike`, `substr`, `left`, `right`, `split`, `split_part(delim, n)`, `strip_html()` (markup → prose; drops `<script>`/`<style>` bodies and decodes entities), `chunk(size, overlap=0)` (RAG document splitter), `minhash(num_perm=128, ngram=5)` (fuzzy-dedup signature), `replace`, `regexp_replace`, `regexp_replace_all`, `regexp_extract`, `initcap`, `hex`, `base64`, `translate`, `zfill(width)` (zero-pad numeric strings), `contains_any([...])` (true if any literal substring is present), and more |
+| `.dt` | `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `dayofyear`, `dayname`, `monthname`, `epoch`, `epoch_ms()` / `epoch_us()` / `epoch_ns()` (integer epoch at ms/µs/ns resolution), `iso_year`, `is_leap_year`, `days_in_month`, `truncate(unit)`, `strftime(fmt)`, `offset_by("1mo15d")`, `convert_timezone(from_tz, to_tz)` (DST-aware), and more |
+| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `normalize`, `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `first()`, `last()`, `slice`, `head(n)`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `transform(element()-expr)`, `filter(element()-pred)`, `join(sep)`; vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)`, `jaccard(o)` (agreement rate; the MinHash/SimHash similarity estimate), `simhash(num_bits=64, seed=0)` (random-hyperplane LSH signature — the blocking key for a vector similarity join) |
 | `.struct` | `field(name)` |
 | `.json` | `extract_string(path)` |
 | `.map` | `get(key)`, `keys()`, `values()` — read a `Map`-typed column |
@@ -318,3 +324,175 @@ out = words.select(
 print(out.to_pydict())
 # {'upper': ['ANN', 'BOB'], 'n_tags': [2, 1]}
 ```
+
+## Compatibility spellings (Polars / pandas / SQL names)
+
+For migration, many operations carry a second, framework-familiar name alongside the
+SQL-style primary. These delegate to the primary spelling — same behavior, no new IR.
+
+Trig / clip / range on `Expr`: `.arcsin()`, `.arccos()`, `.arctan()`, `.arcsinh()`,
+`.arccosh()`, `.arctanh()` (NumPy/Polars names for `.asin()`…), `.clip_min(lo)` /
+`.clip_max(hi)` (Polars, for `.clip(...)`), and `.is_between(lo, hi, closed="both")`
+(Polars, for `.between(...)`). Top-level `bt.arctan2(y, x)` mirrors `bt.atan2`.
+
+On `.str`: `.to_lowercase()` / `.to_uppercase()` / `.to_titlecase()` (Polars, for
+`lower`/`upper`/`initcap`), `.pad_start(w, fill)` / `.pad_end(w, fill)` and pandas'
+`.ljust(w, fill)` / `.rjust(w, fill)` (for `lpad`/`rpad`), `.count_matches(pattern)`
+(for `regexp_count`), `.extract(pattern, group=1)` / `.extract_all(pattern)` /
+`.replace_all(pattern, value)` (for the `regexp_*` methods), `.len_chars()` /
+`.len_bytes()` (for `len`/`octet_length`), `.strip_chars(chars=None)` /
+`.strip_chars_start(...)` / `.strip_chars_end(...)` (for `trim`/`lstrip`/`rstrip`), and
+`.head(n)` / `.tail(n)` / `.slice(offset, length=None)` (for `left`/`right`/`substr`).
+
+On `.dt`: `.weekday()` (for `isodow`), `.ordinal_day()` (for `dayofyear`),
+`.to_string(fmt)` (for `strftime`), `.date()` / `.month_start()` (for `truncate(...)`),
+`.month_end()` (for `last_day`), and the sub-second components `.millisecond()` /
+`.microsecond()` / `.nanosecond()`.
+
+On `.list`: `.set_union(o)` / `.set_intersection(o)` / `.set_difference(o)` (Polars
+names for `union`/`intersect`/`difference`).
+
+pandas string spellings: `.strip(chars=None)` (for `trim`), `.startswith(p)` /
+`.endswith(p)` (for `starts_with`/`ends_with`), `.match(pattern)` (for
+`regexp_matches`), `.title()` (for `initcap`), plus Python's `.removeprefix(p)` /
+`.removesuffix(s)`. pandas datetime spellings: `.day_name()` / `.month_name()` (for
+`dayname`/`monthname`), `.daysinmonth()` (for `days_in_month`), `.weekofyear()` (for
+`week`), `.normalize()` and `.floor(unit)` (for `truncate`).
+
+## Data science toolkit
+
+Feature engineering, profiling, and text/calendar features as expressions, so a
+fit-and-apply transform is one pass over Arrow with no Python state — and, being
+ordinary window + arithmetic nodes, identical single-node and distributed.
+
+**Scaling and encoding** (each takes `partition_by=` to fit per group):
+`.zscore()` (standardize), `.minmax_scale()`, `.maxabs_scale()`, `.mean_center()`,
+`.label_encode()` (0-based codes by sorted value), and `.hash_bucket(n, seed=0)` for
+reproducible shard / split assignment.
+
+**Activations and shape**: `.sigmoid()`, `.logit()`, `.relu()`, `.softplus()`, and
+`.softmax()` (scores to a distribution summing to 1).
+
+**Comparison and de-duplication**: `.abs_diff(other)`, plus
+`.is_first_distinct(order_by)` / `.is_last_distinct(order_by)`, which mark one row per
+distinct value (the `order_by` is required so the pick is partition-independent).
+
+**Ratios and shares**: `.pct_of_total()`, `.cumulative_pct()` (the Pareto curve),
+`.normalize_l1()`, `.rank_pct()` (percentile rank), and `.safe_divide(other)`, which
+yields null rather than infinity when the divisor is zero.
+
+**Expanding (cumulative) statistics**: `.expanding_mean()`, `.expanding_var()`,
+`.expanding_std()` — the growing-frame counterparts of the `rolling_*` family.
+
+**Value predicates**: `.is_positive()`, `.is_negative()`, `.is_zero()`, `.is_even()`,
+`.is_odd()`, and `.is_outlier(threshold=3.0)` (the z-score rule, as a filterable
+predicate).
+
+**Calendar features** on `.dt`: `.is_weekend()` / `.is_weekday()`,
+`.is_month_start()` / `.is_month_end()`, `.is_quarter_start()` / `.is_quarter_end()`,
+`.is_year_start()` / `.is_year_end()`, `.quarter_start()`, `.year_start()`,
+`.days_in_year()`, and `.week_of_month()`.
+
+**Time deltas** on `.dt`: `.seconds_between(other)`, `.minutes_between(other)`,
+`.hours_between(other)`, `.days_between(other)`, and `.weeks_between(other)` measure
+elapsed fixed-width time between two timestamps; `.quarter_end()` and `.year_end()`
+complete the period boundaries.
+
+**Text features** on `.str`: `.word_count()`, `.digit_count()`, `.contains_all([...])`,
+`.count_char(sub)`, `.is_alpha()`,
+`.is_numeric()`, `.is_alnum()`, `.is_space()`, `.is_upper()`, `.is_lower()`,
+`.capitalize()`, and `.remove_punctuation()`.
+
+```python
+feats = bt.from_pydict({"g": ["a", "a", "b", "b"], "v": [1.0, 3.0, 10.0, 20.0]})
+out = feats.select(
+    z=bt.col("v").zscore(["g"]).round(4),
+    share=bt.col("v").pct_of_total(["g"]),
+    bucket=bt.col("g").hash_bucket(2),
+)
+print(out.to_pydict())
+# {'z': [-0.7071, 0.7071, -0.7071, 0.7071], 'share': [0.25, 0.75, 0.3333333333333333, 0.6666666666666666], 'bucket': [1, 1, 1, 1]}
+```
+
+Column-level profiling aggregates complete the toolkit: `bt.q1(x)` / `bt.q3(x)` /
+`bt.iqr(x)` (robust spread), `bt.value_range(x)`, `bt.null_rate(x)` /
+`bt.non_null_rate(x)` (completeness), and `bt.nunique_ratio(x)` (cardinality ratio —
+near 1 marks an identifier, near 0 a categorical).
+
+## AI data-pipeline toolkit
+
+Curating a training corpus, scrubbing PII, and budgeting context windows are all
+per-row scans, so they belong in the engine rather than a Python loop. These score a
+whole corpus in one vectorized pass.
+
+**Corpus quality heuristics** on `.str` — the character-class ratios and shape
+statistics that Gopher / C4 / RefinedWeb-style filters threshold on to drop boilerplate
+and machine-generated text: `.alpha_ratio()`, `.digit_ratio()`, `.uppercase_ratio()`,
+`.lowercase_ratio()`, `.punctuation_ratio()`, `.whitespace_ratio()`,
+`.non_ascii_ratio()`, `.alnum_ratio()`, plus `.non_ascii_count()`, `.line_count()`,
+`.mean_line_length()`, `.avg_word_length()`, `.sentence_count()`, `.url_count()`, and
+`.email_count()`.
+
+Document-shape signals: `.paragraph_count()`, `.is_single_line()`,
+`.ends_with_punctuation()` (catches truncated crawls),
+`.has_repeated_punctuation()`, `.quote_count()`, `.paren_count()`,
+`.digit_to_word_ratio()`, and the code detectors `.code_fence_count()` /
+`.looks_like_code()` (route code out of a prose corpus, or keep only code).
+
+More corpus signals: `.uppercase_word_count()` (shouting/headers),
+`.long_word_count(n)`, `.symbol_to_word_ratio()` (markup and ASCII art),
+`.hashtag_count()` / `.mention_count()` (social-media provenance), and
+`.phone_count()`.
+
+**Cleaning and PII scrubbing**: `.remove_urls()`, `.remove_emails()`,
+`.remove_phones()`, `.has_phone()`, and the shape-preserving `.mask_emails(token)` /
+`.mask_urls(token)` (preferred over deletion for training data),
+`.remove_non_ascii()`, `.remove_digits()`, `.remove_html_tags()`, and the budget guards
+`.truncate_chars(n)` / `.truncate_words(n)` (which never cut mid-word).
+
+**Detection predicates** for filtering: `.has_url()`, `.has_email()`,
+`.has_non_ascii()`, `.has_digits()`, `.has_html()`, `.is_ascii_only()`, `.is_blank()`,
+`.starts_with_bullet()`, and `.looks_like_json()` (a cheap shape check before decoding
+LLM structured output).
+
+Counts and shape predicates: `.newline_count()`, `.tab_count()`, `.space_count()`,
+`.word_char_ratio()`, `.avg_sentence_length()`, `.is_short(n)` / `.is_long(n)`,
+`.is_question()`, `.is_exclamation()`, `.starts_with_capital()`, `.is_all_caps()`,
+`.has_currency()`, `.is_url()`, and `.is_email()` (whole-string forms, stricter than
+`has_url`/`has_email`).
+
+Extraction into `List<Utf8>`: `.extract_urls()`, `.extract_emails()`,
+`.extract_numbers()`, `.extract_hashtags()`, `.extract_mentions()`, plus the scalar
+`.first_sentence()`, `.first_word()`, and `.last_word()`.
+
+Normalization for dedup keys and prose corpora: `.slugify()`, `.remove_bullets()`,
+`.remove_repeated_punctuation()`, `.remove_markdown_links()`, `.remove_code_blocks()`,
+`.remove_stopwords(words)`, and `.truncate_sentences(n)`.
+
+**Token budgeting**: `.estimate_tokens(chars_per_token=4.0)` and
+`.fits_token_budget(budget)` — the tokenizer-free estimate used to size context windows
+without paying to tokenize the corpus.
+
+Embedding sanity and pooling on `.list`: `.dim()` (the embedding dimension),
+`.is_zero_vector()` (the failed-encoder check), `.sum_squares()`, `.mean_pool()`, and
+`.max_pool()`.
+
+**Embedding helpers** on `.list`: `.magnitude()`, `.is_unit_norm(tol)` (assert the
+normalization invariant held), `.euclidean_distance(o)`, and `.angular_distance(o)` — a
+true metric, unlike `1 - cosine`, which nearest-neighbour indexes require.
+
+```python
+docs_ds = bt.from_pydict({"text": ["Real prose here, with sentences.", "AAA 111 &&& http://x.co"]})
+scored = docs_ds.select(
+    alpha=bt.col("text").str.alpha_ratio().round(3),
+    toks=bt.col("text").str.estimate_tokens(),
+    linky=bt.col("text").str.has_url(),
+)
+print(scored.to_pydict())
+# {'alpha': [0.813, 0.435], 'toks': [8, 6], 'linky': [False, True]}
+```
+
+At the dataset level, `ds.shuffle(seed=)`, `ds.stratified_split(label, test_size)`
+(preserves each class's proportion, value-hashed so it is identical distributed),
+`ds.sample_per_group(by, n)`, `ds.class_balance(label)`, and `ds.class_weights(label)`
+cover the train-set preparation steps.

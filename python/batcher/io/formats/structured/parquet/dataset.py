@@ -108,8 +108,15 @@ class PartitionDirSplit:
     def _typed_value(self) -> Any:
         if self.part_value == "__HIVE_DEFAULT_PARTITION__":
             return None
+        # `part_value` is the RAW directory-name segment, which the writer URL-encoded
+        # (`_hive_str`: `quote(value, safe="")`, so `x/y` → `x%2Fy`). The `pyarrow.dataset`
+        # read path URI-decodes segment values, so this worker-side path must too — else a
+        # distributed read returns the encoded value (`x%2Fy`) where a single-node read
+        # returns `x/y`, breaking the single-node == distributed invariant.
+        from urllib.parse import unquote
+
         target = self.dataset_schema.field(self.part_name).type
-        return pa.scalar(self.part_value, pa.string()).cast(target).as_py()
+        return pa.scalar(unquote(self.part_value), pa.string()).cast(target).as_py()
 
     def _table(self, projection: list[str] | None, predicate: dict | None) -> pa.Table:
         import pyarrow.dataset as pads

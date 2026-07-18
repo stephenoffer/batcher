@@ -13,7 +13,11 @@ from batcher.plan.logical import Aggregate, Join
 
 
 def _emp():
-    return bt.from_pydict({"dept_id": [1, 1, 2, 2, 3], "sal": [100, 200, 150, 300, 50]})
+    # 40 rows over 3 departments so a pushed pre-aggregate (group by dept_id, ndv 3) clears the
+    # ~13x reduction the cost guard now requires — the rewrite is only worth its hash table on a
+    # large fan-out per key. (A 5-row toy could not express any reduction the guard would accept.)
+    dept = [1, 2, 3] * 13 + [1]
+    return bt.from_pydict({"dept_id": dept, "sal": list(range(len(dept)))})
 
 
 def _dept():
@@ -45,7 +49,15 @@ def test_pushes_partial_aggregate_below_join():
 def test_no_fire_without_reduction():
     # ndv == row count → grouping does not shrink the side → not worth pushing.
     ds = _grouped_max()
-    assert eager_aggregation(ds._plan, _ctx(ds, ndv={"dept_id": 5.0})) is None
+    assert eager_aggregation(ds._plan, _ctx(ds, ndv={"dept_id": 40.0})) is None
+
+
+def test_no_fire_on_marginal_reduction():
+    # A near-unique key gives only a small reduction (here 40/10 = 4x): building the pre-aggregate's
+    # hash table costs more than the join input it shrinks, so the guard must decline. This is the
+    # `SUM(...) FROM lineitem JOIN orders` regression in miniature (l_orderkey, ~4 rows/key).
+    ds = _grouped_max()
+    assert eager_aggregation(ds._plan, _ctx(ds, ndv={"dept_id": 10.0})) is None
 
 
 def test_no_fire_without_stats():

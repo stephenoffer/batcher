@@ -34,7 +34,13 @@ def _dict_encoded():
 
 
 def _norm(t):
-    return sorted(tuple(r.values()) for r in t.to_pylist())
+    # None-safe, type-tolerant sort key: rows may carry NULLs alongside strings/ints,
+    # and `None < str` / `int < str` raise under the default comparison. Sort each cell by
+    # (is-null, type-name, repr) so a multiset of rows orders deterministically regardless
+    # of NULLs or mixed cell types.
+    rows = [tuple(r.values()) for r in t.to_pylist()]
+    key = lambda row: tuple((v is None, type(v).__name__, repr(v)) for v in row)  # noqa: E731
+    return sorted(rows, key=key)
 
 
 def test_dictionary_group_by_equals_plain():
@@ -55,3 +61,38 @@ def test_dictionary_decodes_to_value_type():
     assert out.schema.field("n").type == pa.int64()
     out_k = bt.from_arrow(_dict_encoded()).select("k").collect()
     assert out_k.schema.field("k").type == pa.string()
+
+
+def _dict_with_null_value():
+    # A dictionary whose VALUES array carries a null, referenced by several rows — the shape
+    # Parquet emits for a low-cardinality string column that contains NULLs. The null lives
+    # once in the value list but decodes to a null in every row that references it.
+    keys = pa.array([0, 1, 0, 1, 2], type=pa.int32())
+    values = pa.array(["a", None, "c"])
+    d = pa.DictionaryArray.from_arrays(keys, values)
+    return pa.table({"k": d, "n": [1, 2, 3, 4, 5]})
+
+
+def test_dictionary_with_null_value_group_by(duck):
+    # Regression: the FFI data-loss guard (meant only for UInt64->Int64 overflow) summed
+    # physical null counts across the dictionary's buffers, so decoding a null dictionary
+    # *value* — which replicates to N null rows — was mis-flagged as data loss and the whole
+    # batch was rejected with a bogus "value exceeds the Int64 range" error. It must instead
+    # decode and group like the plain column, matching DuckDB (NULL forms one group).
+    from conftest import assert_same
+
+    t = _dict_with_null_value()
+    plain = t.set_column(0, "k", t.column("k").combine_chunks().dictionary_decode())
+    duck.register("t", plain)
+
+    out = bt.from_arrow(t).group_by("k").agg(s=col("n").sum()).collect()
+    expected = duck.sql("SELECT k, SUM(n) AS s FROM t GROUP BY k")
+    assert_same(out, expected)
+
+
+def test_dictionary_with_null_value_equals_plain():
+    t = _dict_with_null_value()
+    plain = t.set_column(0, "k", t.column("k").combine_chunks().dictionary_decode())
+    enc = bt.from_arrow(t).select("k", "n").collect()
+    dec = bt.from_arrow(plain).select("k", "n").collect()
+    assert _norm(enc) == _norm(dec)

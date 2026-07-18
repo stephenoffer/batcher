@@ -319,11 +319,18 @@ def _distributed_map(
     sources: list[Source],
     workers: int,
     hub=None,
+    *,
+    preserve_order: bool = False,
 ) -> pa.Table:
     """Run a linear map/inference pipeline across Ray workers, one partition each.
 
     When a `hub` is supplied and the pipeline used a GPU actor pool, the measured
-    GPU utilization is recorded so the next run's `num_gpus` request can adapt."""
+    GPU utilization is recorded so the next run's `num_gpus` request can adapt.
+
+    `preserve_order` partitions the source into contiguous source-ordered runs so the
+    partition-index-assembled output reproduces the source's global row order. Callers that
+    slice or number that output (distributed `LIMIT`, `with_row_index`) require it; the
+    default load-balanced assignment is fine for every order-independent map/scan."""
     _ensure_ray(workers)
     plan0, sid = _relabel_single_source(plan)
     num_gpus, wants_pool, concurrency, accelerator_type = _map_resources(plan)
@@ -350,7 +357,9 @@ def _distributed_map(
     # of landing whole on worker 0.
     n_parts = workers if wants_pool else _adaptive_partition_count(sources[sid], plan, workers, hub)
     proj, pred = _scan_pushdown(plan0)
-    partitions = partition_descriptors(sources[sid], n_parts, projection=proj, predicate=pred)
+    partitions = partition_descriptors(
+        sources[sid], n_parts, projection=proj, predicate=pred, preserve_order=preserve_order
+    )
 
     opts = _gpu_options(num_gpus, accelerator_type)
     if wants_pool:

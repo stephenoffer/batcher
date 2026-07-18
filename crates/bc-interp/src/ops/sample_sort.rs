@@ -136,7 +136,25 @@ pub(crate) fn parallel_sort_batch(
         }
         _ => return Ok(None),
     };
-    let buckets = bc_runtime::shuffle::bucket_indices(&part_of, parts);
+    let mut buckets = bc_runtime::shuffle::bucket_indices(&part_of, parts);
+    let mut reverse = k0.descending;
+
+    // A LOW-CARDINALITY LEADING KEY cannot separate `parts` ranges: `ORDER BY flag, price`
+    // with three distinct flags piles every row into ~3 buckets, and each then pays a SERIAL
+    // multi-key lexsort of its share — measured ~11x DuckDB on a 6M-row two-key sort, worse
+    // than not parallelizing at all. When the routing comes out that skewed, re-route by the
+    // FULL COMPOSITE key: its encoded byte order *is* the multi-key order (each key's
+    // ASC/DESC and nulls placement are baked into the encoding), so the ranges stay globally
+    // ordered, every core gets an even share, and no final reverse is needed (the encoding
+    // already carries the leading key's direction).
+    let fair_share = batch.num_rows() / parts;
+    let max_bucket = buckets.iter().map(Vec::len).max().unwrap_or(0);
+    if keys.len() > 1 && max_bucket > fair_share.saturating_mul(3).max(1) {
+        if let Some(cp) = composite_part_of(&key_arrays, keys, parts)? {
+            buckets = bc_runtime::shuffle::bucket_indices(&cp, parts);
+            reverse = false;
+        }
+    }
 
     // Each range sorts independently: gather only its *key* columns (one or two narrow
     // arrays), sort those, then map the range-local permutation back through the range's
@@ -157,10 +175,68 @@ pub(crate) fn parallel_sort_batch(
 
     // Ranges are globally ordered relative to each other, so the sorted relation is simply
     // the ranges in key order.
-    if k0.descending {
+    if reverse {
         sorted.reverse();
     }
     Ok(Some(sorted))
+}
+
+/// Range-route every row by the **full composite sort key**, for when the leading key alone is
+/// too low-cardinality to separate `parts` balanced ranges.
+///
+/// All sort keys are encoded together through arrow's row format with each key's own
+/// `SortOptions`, so a byte-lexicographic compare of the encoding reproduces the multi-key
+/// ordering exactly — descending keys and nulls placement included. Boundaries are sampled from
+/// that encoding and each row is routed by how many boundaries it sorts after, so buckets come
+/// out in ascending composite order (the final sorted order — the caller must NOT reverse) and
+/// rows equal on the whole key always land together. `None` when there is too little data to
+/// sample, leaving the caller on its leading-key routing.
+fn composite_part_of(
+    key_arrays: &[ArrayRef],
+    keys: &[SortKey],
+    parts: usize,
+) -> Result<Option<Vec<u32>>, InterpError> {
+    use arrow::compute::SortOptions;
+    use arrow::row::{RowConverter, SortField};
+
+    let fields: Vec<SortField> = key_arrays
+        .iter()
+        .zip(keys)
+        .map(|(a, k)| {
+            SortField::new_with_options(
+                a.data_type().clone(),
+                SortOptions {
+                    descending: k.descending,
+                    nulls_first: k.nulls_first,
+                },
+            )
+        })
+        .collect();
+    let converter = RowConverter::new(fields)?;
+    let rows = converter.convert_columns(key_arrays)?;
+    let n = rows.num_rows();
+
+    let target = SAMPLE_TARGET.min(n).max(parts);
+    let stride = (n / target).max(1);
+    let mut sample: Vec<&[u8]> = (0..n).step_by(stride).map(|i| rows.row(i).data()).collect();
+    if sample.len() < parts {
+        return Ok(None);
+    }
+    sample.sort_unstable();
+    let m = sample.len();
+    let bounds: Vec<Vec<u8>> = (1..parts)
+        .map(|j| sample[(j * m / parts).min(m - 1)].to_vec())
+        .collect();
+
+    Ok(Some(
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let r = rows.row(i).data();
+                bounds.partition_point(|b| b.as_slice() <= r) as u32
+            })
+            .collect(),
+    ))
 }
 
 /// Sample `parts-1` ascending f64 quantile boundaries from a float key column. Returns
@@ -286,6 +362,52 @@ mod tests {
             .unwrap()
             .expect("sample-sort should engage");
         assert_eq!(want, concat_ranges(&batch.schema(), ranges));
+    }
+
+    /// A LOW-CARDINALITY leading key (three distinct flags over 200 K rows) cannot separate the
+    /// sample-sort's ranges by itself, so the router falls back to composite-key routing
+    /// ([`composite_part_of`]). That fallback must still produce exactly the serial oracle's
+    /// relation — for an ascending *and* a descending leading key, since the composite encoding
+    /// carries each key's direction itself instead of the leading-key path's final reverse.
+    #[test]
+    fn low_cardinality_leading_key_matches_serial() {
+        let n = 200_000usize;
+        let mut s: u64 = 7;
+        let (mut flags, mut price) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        for _ in 0..n {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            flags.push(Some(["A", "N", "R"][(s >> 33) as usize % 3]));
+            price.push(((s >> 20) % 100_000) as i64);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("p", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(flags)) as ArrayRef,
+                Arc::new(Int64Array::from(price)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        for lead_desc in [false, true] {
+            let keys = vec![
+                SortKey {
+                    expr: Expr::Col { name: "s".into() },
+                    descending: lead_desc,
+                    nulls_first: false,
+                },
+                SortKey {
+                    expr: Expr::Col { name: "p".into() },
+                    descending: true,
+                    nulls_first: false,
+                },
+            ];
+            assert_matches_serial(&batch, &keys);
+        }
     }
 
     fn big_str_batch(n: usize, nulls: bool) -> RecordBatch {

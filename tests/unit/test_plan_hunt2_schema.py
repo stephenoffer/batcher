@@ -67,6 +67,12 @@ def _cases():
         ("map.keys", C("mp").map.keys(), "mp"),
         ("map.values", C("mp").map.values(), "mp"),
         ("map.get", C("mp").map.get("k"), "mp"),
+        # construction (MakeStruct / Sequence) — the write-side counterpart of the
+        # read accessors above; previously inferred `null`.
+        ("struct_construct", bt.struct(x=C("li").list.len(), y=C("st").struct.field("b")), "li"),
+        ("named_struct", bt.named_struct("p", C("li").list.len()), "li"),
+        ("struct_nested", bt.struct(inner=bt.struct(a=C("li").list.len())), "li"),
+        ("sequence", bt.sequence(1, C("li").list.len()), "li"),
     ]
 
 

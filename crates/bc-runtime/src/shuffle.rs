@@ -516,7 +516,17 @@ pub fn range_partition_by_i64_key(
     if n_buckets == 1 {
         return Ok(vec![batch.clone()]);
     }
-    let part_of = range_part_of_i64(key_col, boundaries, n_buckets, nulls_first, descending)?;
+    let mut part_of = range_part_of_i64(key_col, boundaries, n_buckets, nulls_first, descending)?;
+    // More split points than `n_buckets-1` (boundaries sized for `workers` but fewer buckets
+    // requested) would let `partition_point` return an id == `n_buckets` and index
+    // `scatter_into_buckets` out of bounds — a panic on a data path. Clamp so an over-long
+    // boundary list degrades to fewer non-empty buckets, every row preserved and equal keys
+    // still co-located (the clamp is monotonic) — the same guard the f64
+    // [`range_partition_by_key_array`] applies.
+    let last = (n_buckets - 1) as u32;
+    for b in part_of.iter_mut() {
+        *b = (*b).min(last);
+    }
     scatter_into_buckets(batch, &part_of, n_buckets)
 }
 
@@ -573,7 +583,16 @@ pub fn range_partition_by_str_key(
         return Ok(vec![batch.clone()]);
     }
     let null_bucket = null_bucket_of(n_buckets, nulls_first, descending);
-    let part_of = str_part_of(key_col, boundaries, null_bucket)?;
+    let mut part_of = str_part_of(key_col, boundaries, null_bucket)?;
+    // More split points than `n_buckets-1` would let `partition_point` return an id ==
+    // `n_buckets` and index `scatter_into_buckets` out of bounds — a panic on a data path.
+    // Clamp so an over-long boundary list degrades to fewer non-empty buckets, every row
+    // preserved and equal keys still co-located, mirroring the f64
+    // [`range_partition_by_key_array`] guard.
+    let last = (n_buckets - 1) as u32;
+    for b in part_of.iter_mut() {
+        *b = (*b).min(last);
+    }
     scatter_into_buckets(batch, &part_of, n_buckets)
 }
 
@@ -1331,5 +1350,42 @@ mod tests {
             p_null[2], p_free[1],
             "key 42 must co-partition across both sides"
         );
+    }
+
+    /// Regression: the **i64** range partitioner must degrade gracefully — not panic — when
+    /// handed more split points than `n_buckets-1` (boundaries sized for `workers` but only
+    /// `n_buckets` requested), exactly like the f64 sibling. Before the clamp,
+    /// `range_part_of_i64` returned an id == `n_buckets` and indexed `scatter_into_buckets`
+    /// out of bounds. Every row must still be preserved (no loss, no dup).
+    #[test]
+    fn range_i64_more_boundaries_than_buckets_does_not_panic() {
+        let keys: Vec<i64> = vec![1, 3, 5, 7, 9];
+        let col = Arc::new(Int64Array::from(keys.clone())) as ArrayRef;
+        let batch = RecordBatch::try_from_iter(vec![("k", col.clone())]).unwrap();
+        // 3 buckets but 6 boundaries — the over-long-boundaries repro shape.
+        let parts = range_partition_by_i64_key(&batch, &col, &[2, 3, 4, 5, 6, 7], 3, true, false)
+            .expect("must not error");
+        assert_eq!(parts.len(), 3);
+        let total: usize = parts.iter().map(|p| p.num_rows()).sum();
+        assert_eq!(total, keys.len(), "no row may be lost or duplicated");
+    }
+
+    /// Regression: the **string** range partitioner had the same missing clamp as the i64
+    /// one — more boundaries than `n_buckets-1` panicked `scatter_into_buckets`. Degrade to
+    /// fewer non-empty buckets instead, preserving every row.
+    #[test]
+    fn range_str_more_boundaries_than_buckets_does_not_panic() {
+        use arrow::array::StringArray;
+        let col = Arc::new(StringArray::from(vec!["a", "c", "e", "g", "i"])) as ArrayRef;
+        let batch = RecordBatch::try_from_iter(vec![("k", col.clone())]).unwrap();
+        let b: Vec<String> = ["b", "c", "d", "e", "f", "g"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parts =
+            range_partition_by_str_key(&batch, &col, &b, 3, true, false).expect("must not error");
+        assert_eq!(parts.len(), 3);
+        let total: usize = parts.iter().map(|p| p.num_rows()).sum();
+        assert_eq!(total, 5, "no row may be lost or duplicated");
     }
 }

@@ -105,7 +105,7 @@ def expr_cost_factor(expr: Expr, jit_speedup: float = JIT_SPEEDUP) -> float:
         jit_speedup: How much cheaper the compiled tier is per row.
 
     Returns:
-        A multiplier in `[0.2, 200.0]`, equal to 1.0 for a simple compiled comparison.
+        A multiplier in `[0.2, 1000.0]`, equal to 1.0 for a simple compiled comparison.
 
     Examples:
         .. doctest::

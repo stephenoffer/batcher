@@ -18,11 +18,12 @@ executes or measures.
 
 from __future__ import annotations
 
+import itertools
 from typing import Any
 
 from batcher.config import Config
 from batcher.kyber.learning import QUANTILES_KEY, load_learned_stats
-from batcher.kyber.optimizer import Optimizer
+from batcher.kyber.optimizer import optimize_logical
 from batcher.kyber.stats import StatsEstimator
 from batcher.metadata.hub import MetadataHub
 from batcher.plan.logical import Aggregate, LogicalPlan, Project
@@ -59,8 +60,13 @@ def _root_stats(
     run — the difference between answering from metadata and falling back to
     execution.
     """
-    optimizer = Optimizer(config=config, sources=sources, hub=hub, source_stats=source_stats)
-    rewritten = optimizer.logical_rewrite(plan)
+    # `optimize_logical` is the *memoized* form of this exact call. Constructing a fresh
+    # `Optimizer` and calling `logical_rewrite` directly bypassed the plan cache entirely, so
+    # every `.count()`, `.is_empty()`, `.min()` — and every `Facts` construction, which the
+    # shortcut layer builds per accessor — paid a full optimizer run, join-order search
+    # included. That flatly contradicted `shortcuts.facts`'s own claim that "a namespace that
+    # answers thirty questions about a dataset pays for the plan analysis once".
+    rewritten = optimize_logical(plan, config, sources, hub, source_stats)
     learned = load_learned_stats(hub) if hub is not None else {}
     estimator = StatsEstimator(sources, learned, source_stats=source_stats, exact_first=True)
     return rewritten, estimator.estimate(rewritten)
@@ -389,6 +395,11 @@ def _value_at_quantile(q: float, probs: list[float], values: list[float]) -> flo
     quantile boundaries — the inverse of the estimator's `_fraction_below`. None if the
     boundaries are unusable."""
     if len(probs) != len(values) or len(values) < 2:
+        return None
+    # The bracketing search below assumes an **ascending** grid; a corrupted or mis-merged
+    # learned grid would otherwise fall through it and interpolate nonsense rather than
+    # decline. This function only backs the `approx_*` terminals, so declining is free.
+    if any(b < a for a, b in itertools.pairwise(probs)):
         return None
     q = max(0.0, min(1.0, q))
     if q <= probs[0]:

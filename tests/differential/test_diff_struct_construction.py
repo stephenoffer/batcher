@@ -10,6 +10,7 @@ import pytest
 
 import batcher as bt
 from batcher import col, named_struct, struct
+from batcher._internal.errors import PlanError
 
 pytestmark = pytest.mark.differential
 
@@ -43,3 +44,35 @@ def test_struct_field_roundtrip():
         .to_pydict()
     )
     assert out == {"x": [1, 2, 3], "y": [11, 21, 31]}
+
+
+def test_named_struct_rejects_duplicate_field_name():
+    # DuckDB rejects a duplicate struct entry name at bind time; `named_struct`
+    # previously built a `struct<x, x>` that only failed later (and unreadably) on
+    # `to_pydict`. It must raise a clear PlanError at construction instead.
+    with pytest.raises(PlanError, match="duplicate field name"):
+        named_struct("x", col("a"), "x", col("b"))
+
+
+def test_struct_null_field_matches_duckdb(duck):
+    tbl = pa.table(
+        {"a": pa.array([1, None, 3], pa.int64()), "b": pa.array([None, 20, 30], pa.int64())}
+    )
+    duck.register("t", tbl)
+    out = bt.from_arrow(tbl).select(s=struct(x=col("a"), y=col("b"))).collect().to_pydict()
+    expected = duck.sql("SELECT {'x': a, 'y': b} AS s FROM t").to_arrow_table().to_pydict()
+    assert out == expected
+
+
+def test_nested_struct_matches_duckdb(duck):
+    duck.register("t", _data())
+    out = (
+        bt.from_arrow(_data())
+        .select(s=struct(inner=struct(x=col("a")), y=col("b")))
+        .collect()
+        .to_pydict()
+    )
+    expected = (
+        duck.sql("SELECT {'inner': {'x': a}, 'y': b} AS s FROM t").to_arrow_table().to_pydict()
+    )
+    assert out == expected

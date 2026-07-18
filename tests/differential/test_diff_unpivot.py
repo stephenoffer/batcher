@@ -114,6 +114,22 @@ def test_unpivot_mixed_numeric_promotes(duck):
     )
 
 
+def test_unpivot_incompatible_types_raises_clean_plan_error():
+    """Melting columns with no common type (e.g. Utf8 + Int64) must raise a clean
+    plan-time PlanError, not an opaque native "cannot concatenate arrays of different
+    data types" RuntimeError at execution. DuckDB likewise rejects this at bind time
+    ("an explicit cast is required"). The natural ``unpivot(index=[...])`` that melts
+    every remaining column is exactly where a string + numeric mix shows up.
+    """
+    from batcher._internal.errors import PlanError
+
+    ds = bt.from_pydict({"id": [1, 2], "k": ["a", "b"], "v": [10, 20]})
+    with pytest.raises(PlanError, match="incompatible types"):
+        ds.unpivot(index=["id"])
+    with pytest.raises(PlanError, match="incompatible types"):
+        ds.unpivot(index=["id"], on=["k", "v"])
+
+
 def test_unpivot_name_collision_raises():
     """A `value_name`/`variable_name` that collides with an index column must raise —
     silently producing two same-named columns dropped one on the way out."""

@@ -24,30 +24,6 @@ from batcher.plan.expr_ir import lit
 from batcher.plan.schema import suggest_columns
 
 
-def _bool_agg_to_filter(node):
-    """`bool_and(x)` / `bool_or(x)` → a count-of-filtered-rows comparison.
-
-    `bool_and(x)` is true iff no row has `NOT x` → `COUNT(*) FILTER (WHERE NOT x) = 0`;
-    `bool_or(x)` is true iff some row has `x` → `COUNT(*) FILTER (WHERE x) > 0`. The
-    produced FILTER is lowered by `_filter_to_case` in the same pass.
-    """
-    from sqlglot import expressions as exp
-
-    if isinstance(node, exp.LogicalAnd):
-        filt = exp.Filter(
-            this=exp.Count(this=exp.Star()),
-            expression=exp.Where(this=exp.Not(this=node.this.copy())),
-        )
-        return exp.EQ(this=filt, expression=exp.Literal.number(0))
-    if isinstance(node, exp.LogicalOr):
-        filt = exp.Filter(
-            this=exp.Count(this=exp.Star()),
-            expression=exp.Where(this=node.this.copy()),
-        )
-        return exp.GT(this=filt, expression=exp.Literal.number(0))
-    return node
-
-
 def _filter_to_case(node):
     """`agg(arg) FILTER (WHERE c)` → `agg(CASE WHEN c THEN arg END)`.
 
@@ -77,10 +53,9 @@ def _filter_to_case(node):
 
 
 def _select(tr, node) -> Dataset:
-    # `bool_and`/`bool_or` → COUNT(*) FILTER comparisons; then
-    # `agg(...) FILTER (WHERE c)` ≡ `agg(CASE WHEN c THEN arg END)`. Both are
-    # AST rewrites done up front so the normal aggregate path handles them.
-    node = node.transform(_bool_agg_to_filter)
+    # `agg(...) FILTER (WHERE c)` ≡ `agg(CASE WHEN c THEN arg END)` — an AST rewrite
+    # done up front so the normal aggregate path handles it. (`bool_and`/`bool_or`
+    # map directly to the native NULL-aware aggregates; see literals._AGG_FUNCS.)
     node = node.transform(_filter_to_case)
     # `agg(...) WITHIN GROUP (ORDER BY x)` → the ordinary aggregate over `x`, so the
     # ordered column is not silently dropped (the fraction was being read as it).
@@ -128,15 +103,8 @@ def _select(tr, node) -> Dataset:
     # expression to appear in the SELECT list, so it is still resolvable after the
     # projection.)
     distinct = node.args.get("distinct")
-    if distinct is not None and distinct.args.get("on") is not None:
-        # DISTINCT ON (keys) keeps one row per key (chosen by ORDER BY), not a
-        # full-row dedup — silently running a plain DISTINCT would drop the wrong
-        # rows. Not yet supported; reject rather than mislead.
-        raise NotImplementedError(
-            "SELECT DISTINCT ON (...) is not supported; use GROUP BY or a window "
-            "function (row_number() ... QUALIFY) to keep one row per key"
-        )
-    deferred_order = order if distinct is not None else None
+    distinct_on = distinct.args.get("on") if distinct is not None else None
+    deferred_order = order if distinct is not None and distinct_on is None else None
     if deferred_order is not None:
         order = None
     has_agg = group is not None or any(_has_aggregate(p) for p in projections)
@@ -144,7 +112,15 @@ def _select(tr, node) -> Dataset:
     if has_agg or has_window:
         _reject_udf_in_agg_window(tr, node, projections)
 
-    if has_window and not has_agg:
+    if distinct_on is not None:
+        # DISTINCT ON keeps one row per key set (chosen by ORDER BY); agg/window rejected.
+        if has_agg or has_window:
+            raise NotImplementedError(
+                "SELECT DISTINCT ON (...) combined with GROUP BY / aggregates / window "
+                "functions is not supported; move the dedup into a subquery"
+            )
+        ds = tr._distinct_on(ds, projections, order, list(distinct_on.expressions))
+    elif has_window and not has_agg:
         ds = tr._window(ds, projections)
         # QUALIFY filters on the window-function results (named by their SELECT
         # alias) — applied after the window columns exist, before the projection
@@ -185,7 +161,7 @@ def _select(tr, node) -> Dataset:
             ds = ds.select(**named)
 
     # SELECT DISTINCT: dedup the projected rows, then sort what survives.
-    if distinct is not None:
+    if distinct is not None and distinct_on is None:
         ds = ds.distinct()
         if deferred_order is not None:
             ds = tr._order(ds, deferred_order, projections)

@@ -31,13 +31,30 @@ def _apply_subquery_predicates(tr, ds: Dataset, pred):
     """
     from sqlglot import expressions as exp
 
-    # Split a conjunction into its leaf predicates so each can be inspected.
-    if isinstance(pred, exp.And):
-        ds, left = _apply_subquery_predicates(tr, ds, pred.this)
-        ds, right = _apply_subquery_predicates(tr, ds, pred.expression)
-        if left is not None and right is not None:
-            return ds, exp.And(this=left, expression=right)
-        return ds, (left if left is not None else right)
+    from batcher._sql.parser.subquery_neq import _fuse_correlated_neq
+
+    # Flatten the top conjunction so leaves can be co-optimized (two correlated `<>`
+    # EXISTS over the same base table fuse into one group-by + join) before each
+    # remaining leaf is folded individually.
+    leaves = _split_and(pred)
+    handled: set[int] = set()
+    if len(leaves) >= 2:
+        ds, handled = _fuse_correlated_neq(tr, ds, leaves)
+
+    residual = None
+    for i, leaf in enumerate(leaves):
+        if i in handled:
+            continue
+        ds, r = _apply_single_predicate(tr, ds, leaf)
+        if r is not None:
+            residual = r if residual is None else exp.And(this=residual, expression=r)
+    return ds, residual
+
+
+def _apply_single_predicate(tr, ds: Dataset, pred):
+    """Fold one WHERE leaf: an IN/EXISTS subquery becomes a join (no residual);
+    anything else is returned unchanged as a residual for a normal ``filter``."""
+    from sqlglot import expressions as exp
 
     # A bare IN-subquery / EXISTS predicate becomes a join (no residual).
     if _is_in_subquery(pred):
@@ -204,6 +221,18 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
         non_empty = tr.statement(inner).limit(1).collect().num_rows > 0
         keep = non_empty if not negate else (not non_empty)
         return ds if keep else ds.filter(lit(False))
+
+    # A single correlated `<>` residual (`inner.c <> outer.c`) is not an equi-join and not
+    # local — it correlates on a value, not a key. It decorrelates to a per-key min/max
+    # bound test (`min(c) <> outer.c OR max(c) <> outer.c`), a group-by + join + filter that
+    # runs single-node, streaming, and distributed — no row id. Two such subqueries over the
+    # same base table fuse into one pass upstream in `_apply_subquery_predicates`. TPC-H q21
+    # is exactly this shape. See `subquery_neq`.
+    from batcher._sql.parser.subquery_neq import _decorrelate_neq_single, _parse_neq_exists
+
+    spec = _parse_neq_exists(tr, node)
+    if spec is not None:
+        return _decorrelate_neq_single(tr, ds, spec, negate)
 
     # Correlated → semi/anti join on the correlation keys, with the local
     # (non-correlated) predicates applied to the inner relation.

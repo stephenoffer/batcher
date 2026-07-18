@@ -135,6 +135,96 @@ UNORDERED_OPS: dict[str, tuple] = {
         None,
     ),
     "window_global": (lambda d: d.with_columns(rn=bt.row_number().over(order_by="k")), None),
+    # Estimation-layer shapes, run through every execution path × edge-case input so a
+    # spill/stream regression on any of them (not just the estimate) is caught.
+    "filter_between": (
+        lambda d: d.filter(bt.col("v").between(2, 6)),
+        "SELECT * FROM t WHERE v BETWEEN 2 AND 6",
+    ),
+    "filter_in": (
+        lambda d: d.filter(bt.col("k").is_in([1, 3, 5, 999])),
+        "SELECT * FROM t WHERE k IN (1, 3, 5, 999)",
+    ),
+    "filter_not_in": (
+        lambda d: d.filter(~bt.col("k").is_in([1, 3])),
+        "SELECT * FROM t WHERE k NOT IN (1, 3)",
+    ),
+    "filter_or_eq": (
+        lambda d: d.filter((bt.col("k") == 1) | (bt.col("k") == 5)),
+        "SELECT * FROM t WHERE k = 1 OR k = 5",
+    ),
+    "filter_col_eq_col": (
+        lambda d: d.filter(bt.col("k") == bt.col("v")),
+        "SELECT * FROM t WHERE k = v",
+    ),
+    "filter_coalesce": (
+        lambda d: d.filter(bt.col("k").fill_null(0) == 0),
+        "SELECT * FROM t WHERE coalesce(k, 0) = 0",
+    ),
+    "filter_out_of_range": (
+        lambda d: d.filter(bt.col("v") > 1000),
+        "SELECT * FROM t WHERE v > 1000",
+    ),
+    "join_semi": (
+        lambda d: d.join(bt.from_arrow(RIGHT), left_on="k", right_on="k", how="semi"),
+        None,
+    ),
+    "join_anti": (
+        lambda d: d.join(bt.from_arrow(RIGHT), left_on="k", right_on="k", how="anti"),
+        None,
+    ),
+    # More aggregate measures — `count` over a null-bearing column, the min/max the metadata
+    # shortcuts try to answer without executing, and a `sum`/`avg` over the NaN/-0.0 float.
+    "agg_count_nullable": (
+        lambda d: d.group_by("g").agg(n=bt.col("k").count()),
+        "SELECT g, count(k) AS n FROM t GROUP BY g",
+    ),
+    "agg_min_max": (
+        lambda d: d.group_by("g").agg(lo=bt.col("v").min(), hi=bt.col("v").max()),
+        "SELECT g, min(v) AS lo, max(v) AS hi FROM t GROUP BY g",
+    ),
+    "agg_mean": (
+        lambda d: d.group_by("g").agg(a=bt.col("v").mean()),
+        "SELECT g, avg(v) AS a FROM t GROUP BY g",
+    ),
+    "agg_float_measure": (
+        lambda d: d.group_by("g").agg(s=bt.col("f").sum()),
+        "SELECT g, sum(f) AS s FROM t GROUP BY g",
+    ),
+    # Predicate shapes the estimator now reads structurally.
+    "filter_is_not_null": (
+        lambda d: d.filter(bt.col("k").is_not_null()),
+        "SELECT * FROM t WHERE k IS NOT NULL",
+    ),
+    "filter_compound": (
+        lambda d: d.filter((bt.col("v") > 2) & ((bt.col("k") < 5) | bt.col("g").is_null())),
+        "SELECT * FROM t WHERE v > 2 AND (k < 5 OR g IS NULL)",
+    ),
+    "filter_negated_compound": (
+        lambda d: d.filter(~((bt.col("v") > 2) & (bt.col("k") < 5))),
+        "SELECT * FROM t WHERE NOT (v > 2 AND k < 5)",
+    ),
+    # Derived-column projections whose bounds the estimator now carries forward.
+    "project_coalesce": (
+        lambda d: d.select(c=bt.col("k").fill_null(-1)),
+        "SELECT coalesce(k, -1) AS c FROM t",
+    ),
+    "project_nullif": (
+        lambda d: d.select(c=bt.nullif(bt.col("v"), 5)),
+        "SELECT nullif(v, 5) AS c FROM t",
+    ),
+    "project_greatest": (
+        lambda d: d.select(c=bt.greatest(bt.col("k"), bt.col("v"))),
+        "SELECT greatest(k, v) AS c FROM t",
+    ),
+    "project_arith": (
+        lambda d: d.select(c=bt.col("v") * 2 - 3),
+        "SELECT v * 2 - 3 AS c FROM t",
+    ),
+    "window_max": (
+        lambda d: d.with_columns(m=bt.col("v").max().over(partition_by="g")),
+        None,
+    ),
 }
 
 

@@ -53,6 +53,8 @@ Each returns a new lazy Dataset.
 | `.sort(*by, descending=False, nulls_first=False)` | order rows |
 | `.limit(n, offset=0)` / `.head(n=5)` | take a prefix |
 | `.tail(n=5)` | take a suffix (executes a `count` first) |
+| `.gather_every(n, offset=0)` | keep every `n`-th row (downsample) |
+| `.reverse()` | reverse the row order |
 | `.distinct()` | drop duplicate rows |
 | `.union(*others, distinct=False)` | concatenate datasets |
 | `.intersect(other)` / `.except_(other)` | set operations |
@@ -183,8 +185,22 @@ schema wherever a column is expected. They produce a `Selector`.
 | `bt.all_horizontal(*exprs)` / `bt.any_horizontal(*exprs)` | row-wise boolean AND / OR across columns (Polars) |
 | `bt.hash_rows(*exprs, seed=0)` | deterministic 64-bit row digest (also `expr.hash(seed=0)`) |
 | `bt.count_if(condition)` | count rows where `condition` is true (aggregate) |
+| `bt.sum(x)` / `bt.mean(x)` / `bt.min(x)` / `bt.max(x)` / `bt.median(x)` / `bt.std(x)` / `bt.var(x)` / `bt.n_unique(x)` | the SQL-style column-aggregate shorthands for `col(x).<agg>()` |
+| `bt.product(x)` / `bt.mode(x)` / `bt.skewness(x)` / `bt.kurtosis(x)` | product / most-frequent value / 3rd / 4th standardized moment (aggregate) |
+| `bt.bool_and(x)` / `bt.bool_or(x)` | boolean AND / OR reduction of a group (aggregate) |
+| `bt.bit_and(x)` / `bt.bit_or(x)` / `bt.bit_xor(x)` | bitwise AND / OR / XOR reduction of integers (aggregate) |
+| `bt.array_agg(x)` | collect each group's values into a list (aggregate) |
+| `bt.quantile(x, q)` / `bt.approx_quantile(x, q)` / `bt.approx_median(x)` | exact / sketch-based quantile / median (aggregate) |
+| `bt.approx_n_unique(x)` / `bt.histogram(x)` | HyperLogLog distinct count / value→count map (aggregate) |
 | `bt.corr(x, y)` | Pearson correlation (aggregate) |
 | `bt.covar_pop(x, y)` / `bt.covar_samp(x, y)` | population / sample covariance (aggregate) |
+| `bt.regr_slope(y, x)` / `bt.regr_intercept(y, x)` / `bt.regr_r2(y, x)` | least-squares slope / intercept / R² of `y` on `x` (aggregate) |
+| `bt.regr_count(y, x)` / `bt.regr_avgx(y, x)` / `bt.regr_avgy(y, x)` | paired sample size and per-axis means (aggregate) |
+| `bt.regr_sxx(y, x)` / `bt.regr_syy(y, x)` / `bt.regr_sxy(y, x)` | regression sums of squares / cross-products (aggregate) |
+| `bt.var_pop(x)` / `bt.stddev_pop(x)` | population variance / standard deviation (aggregate; `var`/`std` are the sample forms) |
+| `bt.geometric_mean(x)` / `bt.harmonic_mean(x)` / `bt.rms(x)` | geometric / harmonic / quadratic (root-mean-square) mean (aggregate) |
+| `bt.cv(x)` / `bt.sem(x)` / `bt.midrange(x)` | coefficient of variation / standard error of the mean / midrange (aggregate) |
+| `bt.weighted_mean(value, weight)` | mean of `value` weighted by `weight` (aggregate) |
 | `bt.lag(expr, n=1)` / `bt.lead(expr, n=1)` | the value `n` rows before / after the current row (window) |
 | `bt.first_value(expr)` / `bt.last_value(expr)` | the first / last value of the ordered partition (window) |
 | `bt.nth_value(expr, n)` | the `n`-th value of the ordered partition (window) |

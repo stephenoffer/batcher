@@ -22,6 +22,7 @@ from batcher._native import ShuffleClient as _Client
 from batcher._native import flight_fetch as _fetch
 from batcher._native import gather_combine as _gather_combine
 from batcher._native import gather_concat as _gather_concat
+from batcher._native import gather_to_files as _gather_to_files
 
 if TYPE_CHECKING:
     from batcher.carbonite.transfer.tls import ShuffleTlsMaterial
@@ -209,6 +210,47 @@ class FlightShuffleServer:
             src,
             fan_in,
             finalize,
+            credits,
+            token,
+            shm,
+            replicas or [],
+        )
+
+    def gather_to_files(
+        self,
+        client: ShuffleClient,
+        sources: list[tuple[str, ShuffleTicket]],
+        spill_dir: str,
+        fan_in: int,
+        credits: int | None = None,
+        token: str | None = None,
+        shm: bool = False,
+        replicas: list[list[str]] | None = None,
+    ) -> tuple[list[str], list[int]]:
+        """Concurrently fetch every source's bucket and spill each to an IPC file under
+        `spill_dir`, returning `(paths, unreachable)`.
+
+        The bounded-memory sibling of `gather_concat`: it holds only `fan_in` in-flight
+        fetches at once and lands each on disk, so a reducer whose bucket exceeds RAM
+        stages it out of core for the spilling reduce (`combine_finalize_spilling`).
+        """
+        src = [(addr, str(ticket)) for addr, ticket in sources]
+        if credits is None:
+            return _gather_to_files(
+                self._srv,
+                client._client,
+                src,
+                spill_dir,
+                fan_in,
+                shm=shm,
+                replicas=replicas or [],
+            )
+        return _gather_to_files(
+            self._srv,
+            client._client,
+            src,
+            spill_dir,
+            fan_in,
             credits,
             token,
             shm,

@@ -108,9 +108,14 @@ fn key_rows(batch: &RecordBatch, key_indices: &[usize]) -> PyResult<arrow::row::
         .map(|&i| SortField::new(batch.column(i).data_type().clone()))
         .collect();
     let converter = RowConverter::new(fields).map_err(to_pyerr)?;
+    // Canonicalize float key columns to the engine's float identity BEFORE encoding, so a
+    // `-0.0` probe key matches a `0.0` build key (and every NaN matches one NaN) — exactly
+    // as the equi-join's own keys do (`bc_runtime::keys::canonicalize_float_keys`). Without
+    // this the bloom is built on `0.0`'s raw bytes and probed on `-0.0`'s, reports "absent",
+    // and *drops a probe row the join would have matched* — a silent distributed wrong answer.
     let cols: Vec<ArrayRef> = key_indices
         .iter()
-        .map(|&i| batch.column(i).clone())
+        .map(|&i| bc_arrow::canon_float_array(batch.column(i)))
         .collect();
     converter.convert_columns(&cols).map_err(to_pyerr)
 }

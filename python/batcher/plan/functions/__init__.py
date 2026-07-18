@@ -29,12 +29,16 @@ from batcher.plan.functions.conditional import iff, nanvl
 from batcher.plan.functions.horizontal import (
     all_horizontal,
     any_horizontal,
+    count_horizontal,
+    fold_horizontal,
     max_horizontal,
     mean_horizontal,
     min_horizontal,
+    product_horizontal,
+    reduce_horizontal,
     sum_horizontal,
 )
-from batcher.plan.functions.math import gcd, hypot, lcm, log, width_bucket
+from batcher.plan.functions.math import arctan2, gcd, hypot, lcm, log, width_bucket
 from batcher.plan.functions.security import aes_decrypt, aes_encrypt, hmac_sha256, mask
 from batcher.plan.functions.string import concat, concat_ws, format_string
 from batcher.plan.functions.temporal import (
@@ -51,9 +55,11 @@ __all__ = [
     "aes_encrypt",
     "all_horizontal",
     "any_horizontal",
+    "arctan2",
     "concat",
     "concat_ws",
     "corr",
+    "count_horizontal",
     "count_if",
     "covar_pop",
     "covar_samp",
@@ -63,6 +69,7 @@ __all__ = [
     "date_part",
     "date_sub",
     "element",
+    "fold_horizontal",
     "format_string",
     "gcd",
     "hmac_sha256",
@@ -81,6 +88,8 @@ __all__ = [
     "n_unique",
     "named_struct",
     "nanvl",
+    "product_horizontal",
+    "reduce_horizontal",
     "sequence",
     "std",
     "struct",

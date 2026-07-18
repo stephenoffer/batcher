@@ -99,7 +99,10 @@ def _samples(rows: list[dict]) -> list[tuple[float, float, float, float]]:
     """
     out: list[tuple[float, float, float, float]] = []
     for r in rows:
-        rout = float(r.get("n_actual", r.get("rows_out", 0)) or 0.0)
+        measured_out = r.get("n_actual")
+        if measured_out is None:
+            measured_out = r.get("rows_out")
+        rout = float(measured_out or 0.0)
         measured_in = r.get("n_input") or r.get("rows_in")
         if measured_in:
             rin = float(measured_in)
@@ -109,7 +112,13 @@ def _samples(rows: list[dict]) -> list[tuple[float, float, float, float]]:
         t = float(r.get("t_op_ms", 0.0))
         factor = float(r.get("expr_factor") or 1.0)
         if t > 0.0 and (rin > 0.0 or rout > 0.0) and factor > 0.0:
-            out.append((rin or rout, rout or rin, t, factor))
+            # A *measured* zero output is real — a fully-selective filter genuinely emitted
+            # no rows — so only an **absent** measurement falls back to the other side.
+            # Treating a real 0 as "unknown" substituted the input count, which for the
+            # output-basis families (`scan`/`project`/`union`, see `_basis`) fits a per-row
+            # coefficient against a basis orders of magnitude too large and understates it.
+            out_rows = rout if measured_out is not None else (rout or rin)
+            out.append((rin or rout, out_rows, t, factor))
     return out
 
 
@@ -254,7 +263,7 @@ def _measured_jit_speedup(
                 if (b := _basis(kind, rin, rout)) > 0.0
             ]
             if len(per_row) < min_samples:
-                break
+                continue  # this backend bucket is too thin; the `!= 2` check below declines
             residuals[backend] = median(per_row)
         if len(residuals) != 2 or min(residuals.values()) <= 0.0:
             continue
@@ -264,6 +273,13 @@ def _measured_jit_speedup(
     # `expr_factor` already divided the compiled bucket by the prior, so the residual
     # ratio *scales* the prior rather than replacing it. A compiled expression is never
     # slower than the same expression interpreted, hence the floor at 1.0.
+    #
+    # Deliberately NOT run through `_shrink`, unlike the absolute coefficients. Those fit an
+    # absolute value that must be blended toward the shipped default; this one is already
+    # *prior-relative* — the measurement is `prior x ratio`, so the prior is the anchor, and
+    # each ratio is itself a median over `min_samples` rows. Shrinking would anchor it twice
+    # and stop the loop learning a genuinely different engine, which is exactly the fixed-point
+    # failure `_shrink` was written to remove. `_clamp` still bounds how far it may travel.
     measured = defaults.jit_speedup * median(ratios)
     return _clamp(max(1.0, measured), defaults.jit_speedup, clamp)
 

@@ -83,9 +83,28 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             // materializing executor is the right tool, so give way to it.
             ctx.check_budget(held, "the streaming sort does not spill")?;
             let t = Instant::now();
-            let out = match ops::materialize(&batches) {
-                Ok(combined) => vec![ops::sort_batch(&combined, keys, *limit)?],
-                Err(_) => Vec::new(),
+            let out = match limit {
+                // Top-N: reduce each morsel to its local top-k in parallel and merge the narrow
+                // survivors — never concatenate or sort the whole input. `ops::parallel_top_n` is
+                // the mergeable top-N, result-identical to a full sort-then-slice (asserted by
+                // `parallel_top_n_matches_eager`), so this only changes throughput. The old path
+                // `materialize`d all N rows into one batch and ran a `LIMIT`-ed `lexsort` over
+                // every one of them — O(N) row-format encoding to keep k rows.
+                Some(k) if !batches.is_empty() => vec![ops::parallel_top_n(&batches, keys, *k)?],
+                // Full sort (no LIMIT), or the empty input: materialize, then try the parallel
+                // sample-sort (range-partition + per-range parallel sort for a large float / int
+                // / string key). It returns the ranges already in key order — their concatenation
+                // is the sorted relation — and is result-identical to the serial `sort_batch`
+                // oracle (`sample_sort` tests). It declines (`None`) for a small input, a top-N
+                // `LIMIT`, or an unsupported key, where the serial sort runs. Without this a large
+                // full sort ran arrow's single-threaded `lexsort` — ~16x DuckDB on a 6M-row sort.
+                _ => match ops::materialize(&batches) {
+                    Ok(combined) => match ops::parallel_sort_batch(&combined, keys, *limit)? {
+                        Some(sorted) => sorted,
+                        None => vec![ops::sort_batch(&combined, keys, *limit)?],
+                    },
+                    Err(_) => Vec::new(),
+                },
             };
             if let (Some(m), Some(id)) = (ctx.meter, id) {
                 // A sort genuinely does hold its input — it is a full breaker — so its peak is
@@ -96,7 +115,60 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             Ok(out)
         }
 
-        // Everything else — `Distinct`, `Window`, `Sample`, `AsofJoin`, `Union` — is run by the
+        // `DISTINCT` over all columns is a mergeable all-column group-by, so dedup it in
+        // parallel here rather than on the single-threaded oracle the deferred path below would
+        // use. Drain the input, and — exactly like the `Sort` breaker — give way to the spilling
+        // executor if the held input exceeds the envelope (that path dedups out of core); with no
+        // envelope (`budget == 0`, the common case) `check_budget` admits and the parallel dedup
+        // runs. Empty input defers so the oracle supplies the correctly-typed empty relation.
+        // Without this a 6M-row DISTINCT ran single-threaded — ~7x DuckDB.
+        RelOp::Distinct { input } => {
+            let t = Instant::now();
+            let batches = drain(build_with(input, ctx)?)?;
+            if batches.is_empty() {
+                return exec_deferred_breaker(plan, ctx);
+            }
+            let rows_in = crate::count_rows(&batches);
+            let held = crate::batch_bytes(&batches);
+            ctx.check_budget(held, "the streaming distinct does not spill")?;
+            let out = ops::parallel_distinct(&batches)?;
+            if let (Some(m), Some(id)) = (ctx.meter, id) {
+                m.breaker(id, rows_in, 0, held, &out, t.elapsed().as_nanos() as u64);
+            }
+            Ok(out)
+        }
+
+        // `UNION` (DISTINCT) is a concat of its branches followed by an all-column dedup — the
+        // same mergeable dedup as `Distinct`, so parallelize it here too rather than on the
+        // single-threaded oracle. Branches are coerced to the common supertype first (exactly as
+        // the oracle does), then deduped in parallel; over an envelope the spilling executor takes
+        // over (`check_budget`). `UNION ALL` (`distinct: false`) just streams the concat and stays
+        // on the deferred path below. Without this a large `UNION` ran single-threaded — ~6x DuckDB.
+        RelOp::Union {
+            inputs,
+            distinct: true,
+        } => {
+            let t = Instant::now();
+            let inner = Ctx::new(ctx.sources, ctx.cache, None, ctx.budget);
+            let mut all = Vec::new();
+            for inp in inputs {
+                all.extend(drain(build_with(inp, inner)?)?);
+            }
+            let all = crate::coerce_union_branches(all)?;
+            if all.is_empty() {
+                return exec_deferred_breaker(plan, ctx);
+            }
+            let rows_in = crate::count_rows(&all);
+            let held = crate::batch_bytes(&all);
+            ctx.check_budget(held, "the streaming union-distinct does not spill")?;
+            let out = ops::parallel_distinct(&all)?;
+            if let (Some(m), Some(id)) = (ctx.meter, id) {
+                m.breaker(id, rows_in, 0, held, &out, t.elapsed().as_nanos() as u64);
+            }
+            Ok(out)
+        }
+
+        // Everything else — `Window`, `Sample`, `AsofJoin`, `UNION ALL` — is run by the
         // sequential oracle over this subtree.
         //
         // That is a deliberate boundary, not an oversight. Each has a reason its streaming form

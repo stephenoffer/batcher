@@ -203,7 +203,9 @@ def _preagg_ctx(ds, ndv):
 def _fact_dim_sum():
     from batcher.kyber.rules.agg_pushdown import pre_aggregation_through_join
 
-    fact = bt.from_pydict({"k": [1, 1, 1, 2, 2, 3], "amt": [10, 20, 30, 40, 50, 60]})
+    # 30 rows over 3 keys → a pushed partial SUM (group by k, ndv 3) clears the ~10x reduction the
+    # cost guard requires; a near-unique key (small reduction) is correctly declined elsewhere.
+    fact = bt.from_pydict({"k": [1, 2, 3] * 10, "amt": list(range(30))})
     dim = (
         bt.from_pydict({"k": [1, 2, 3], "region": ["e", "w", "s"]})
         .group_by("k")

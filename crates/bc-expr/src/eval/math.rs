@@ -174,10 +174,17 @@ pub(crate) fn eval_extreme(
         // float) before comparing, so a valid int×float call returns a value instead of
         // erroring `Int64 >= Float64`. Matches DuckDB and the sibling `coalesce`.
         let (acc_c, b) = coerce_numeric(&acc, &b)?;
+        // Rank on the engine's float identity, not arrow's raw-bit total order: a
+        // *negative* NaN must rank greatest (not below -inf) and `-0.0`/`0.0` must
+        // compare equal, so `greatest`/`least` agree with `MIN`/`MAX`, `GROUP BY`,
+        // and scalar `=`. Compare canonicalized keys but select the *original*
+        // values, so a `-0.0`/`-NaN` in is the same value out.
+        let acc_k = bc_arrow::canon_float_array(&acc_c);
+        let b_k = bc_arrow::canon_float_array(&b);
         let cmp = if greatest {
-            cmp::gt_eq(&acc_c, &b)?
+            cmp::gt_eq(&acc_k, &b_k)?
         } else {
-            cmp::lt_eq(&acc_c, &b)?
+            cmp::lt_eq(&acc_k, &b_k)?
         };
         // Where both are non-null, pick the winner; null elsewhere. Then coalesce
         // with each side so a lone non-null still survives.

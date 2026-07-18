@@ -198,6 +198,17 @@ pub fn window_with(
     let canon = crate::keys::canonicalize_float_keys(partition_keys);
     let partition_keys: &[ArrayRef] = canon.as_deref().unwrap_or(partition_keys);
 
+    // Canonicalize float ORDER BY keys the same way, and for the same reason: the
+    // RowConverter-based order paths (`ordered_partitions_by_global_sort`, `encode_order_keys`
+    // → `rows_equal` → `peer_boundary`) rank raw bits, so without this `-0.0` and `0.0` are not
+    // *peers* — `RANK`/`DENSE_RANK` split them and every `RANGE`/`GROUPS` bound moves — and a
+    // *negative* NaN ranks below -inf instead of last, all disagreeing with the `GROUP BY`,
+    // `=`, and `MIN`/`MAX` the same column feeds. The order key is used only to order/peer/frame,
+    // never emitted (value functions reference their own argument), so folding its identity
+    // changes no output. Non-float keys are returned unchanged.
+    let canon_order = crate::keys::canonicalize_float_order_keys(order_keys);
+    let order_keys: &[(ArrayRef, SortOptions)] = canon_order.as_deref().unwrap_or(order_keys);
+
     let nthreads = rayon::current_num_threads();
     let frameless_agg = order_keys.is_empty()
         && funcs
@@ -431,6 +442,16 @@ fn ordered_partitions_by_global_sort(
     order_keys: &[(ArrayRef, SortOptions)],
     num_rows: usize,
 ) -> Result<Vec<Vec<usize>>, RuntimeError> {
+    // Fast path: exactly one non-null primitive-numeric partition key and one non-null
+    // primitive-numeric order key — the dominant window shape (`PARTITION BY id ORDER BY
+    // value`). Pack each into an order-preserving `u64` and sort `(part, ord, idx)` tuples
+    // directly: NO RowConverter encode at all, and every comparison is a register-resident
+    // tuple compare instead of a random-access row-byte compare. Multi-column, nullable, or
+    // non-numeric keys fall through to the general row-encoded path below.
+    if let Some(out) = try_ordered_partitions_packed(partition_keys, order_keys, num_rows) {
+        return Ok(out);
+    }
+
     // Sort columns: partition keys first (ascending — grouping is order-agnostic), then
     // the order keys with their own ASC/DESC + nulls placement, and finally the original
     // row index as the last ascending key. The index tie-break makes the sort a *total*
@@ -456,14 +477,34 @@ fn ordered_partitions_by_global_sort(
         enc_fields.push(SortField::new_with_options(arr.data_type().clone(), *opts));
         enc_arrays.push(arr.clone());
     }
-    let row_index: ArrayRef = Arc::new(Int64Array::from_iter_values(0..num_rows as i64));
-    enc_fields.push(SortField::new(row_index.data_type().clone()));
-    enc_arrays.push(row_index);
+    // Encode only the (partition ++ order) keys — NOT a row-index tie-break column. The
+    // original-row-order tie-break is applied directly in the comparator below (`a.cmp(&b)`
+    // on the inline indices), so encoding it into the row format would be pure overhead: it
+    // widened every row by ~9 bytes (slowing both the encode and every full-row compare) to
+    // recompute an order we already carry for free.
     let converter = RowConverter::new(enc_fields)?;
     let rows = converter.convert_columns(&enc_arrays)?;
-    let mut sorted: Vec<u32> = (0..num_rows as u32).collect();
-    // The row-index tie-break makes the key a total order, so an unstable sort is deterministic.
-    sorted.par_sort_unstable_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
+    // Sort `(prefix, row_index)` PAIRS, not bare indices. The prefix is the order-preserving
+    // leading 8 bytes of each encoded row (arrow's row format is byte-lexicographic, so
+    // `u64::from_be_bytes(first 8 bytes)` orders identically to the row's leading bytes). By
+    // carrying the key *inline* with its index, the comparator reads both prefixes straight
+    // from the two elements being compared (in-register, no indirection) — where sorting a
+    // bare index array instead chased `prefixes[a]`/`rows.row(a)` to random positions in a
+    // 10 MB buffer on every comparison, and those cache misses were the whole window cost.
+    // The full-row compare (the wider, random-access read) is kept only as the tie-break on
+    // equal prefixes — rare when the leading key is discriminating — so the total order and
+    // every downstream rank/peer result stay byte-for-byte identical. A final `a.cmp(&b)` on
+    // the inline original-row indices makes the order total (rows equal on partition+order
+    // keys fall back to input order), so the unstable sort is deterministic.
+    let mut keyed: Vec<(u64, u32)> = (0..num_rows)
+        .map(|i| (row_prefix(rows.row(i).data()), i as u32))
+        .collect();
+    keyed.par_sort_unstable_by(|&(pa, a), &(pb, b)| {
+        pa.cmp(&pb)
+            .then_with(|| rows.row(a as usize).cmp(&rows.row(b as usize)))
+            .then_with(|| a.cmp(&b))
+    });
+    let sorted: Vec<u32> = keyed.iter().map(|&(_, i)| i).collect();
     let sorted = &sorted[..];
 
     // No PARTITION BY: every row is one partition, already globally ordered by the sort.
@@ -496,6 +537,120 @@ fn ordered_partitions_by_global_sort(
         out.push(cur);
     }
     Ok(out)
+}
+
+/// Order-preserving `u64` for an `i64`: flip the sign bit so an unsigned compare reproduces
+/// the signed order (`i64::MIN` → 0, `i64::MAX` → `u64::MAX`).
+#[inline]
+fn i64_ordered(x: i64) -> u64 {
+    (x as u64) ^ (1u64 << 63)
+}
+
+/// Order-preserving `u64` for an `f64` (IEEE total order): non-negative floats set the sign
+/// bit, negatives invert every bit, so an unsigned compare reproduces `<` on the floats (and
+/// sorts `NaN` last, matching arrow's row encoding). Float keys are canonicalized upstream
+/// (`-0.0`→`0.0`, every NaN folded), so equal floats map to equal `u64`s here too.
+#[inline]
+fn f64_ordered(x: f64) -> u64 {
+    let b = x.to_bits();
+    if b & (1u64 << 63) == 0 {
+        b | (1u64 << 63)
+    } else {
+        !b
+    }
+}
+
+/// Pack a non-null `Int64`/`Float64` column into order-preserving `u64`s; `None` for any
+/// other type or a column with nulls (the general row-encoded path handles those). `value(i)`
+/// is used (not the raw buffer) so a sliced array's offset is honored.
+fn pack_ordered_u64(a: &ArrayRef) -> Option<Vec<u64>> {
+    if a.null_count() != 0 {
+        return None;
+    }
+    match a.data_type() {
+        DataType::Int64 => {
+            let v = a.as_primitive::<Int64Type>();
+            Some((0..v.len()).map(|i| i64_ordered(v.value(i))).collect())
+        }
+        DataType::Float64 => {
+            let v = a.as_primitive::<Float64Type>();
+            Some((0..v.len()).map(|i| f64_ordered(v.value(i))).collect())
+        }
+        _ => None,
+    }
+}
+
+/// Packed fast path for [`ordered_partitions_by_global_sort`]: at most one non-null numeric
+/// partition key plus one non-null numeric order key. Returns the same per-partition ordered
+/// index lists the general path does — partition keys group each partition's rows contiguously,
+/// the order key orders within, and the trailing original index makes the total order match the
+/// general path's `(partition, order, index)` tie-break exactly. `None` when not eligible.
+///
+/// Zero partition keys (`… OVER (ORDER BY x)`) is a single global partition: a constant
+/// partition component leaves the split below emitting one run, exactly as the general path's
+/// no-PARTITION-BY branch does. Covering it here keeps an unpartitioned window off the
+/// RowConverter path, which was ~7x DuckDB on a 6M-row `rank() OVER (ORDER BY …)`.
+fn try_ordered_partitions_packed(
+    partition_keys: &[ArrayRef],
+    order_keys: &[(ArrayRef, SortOptions)],
+    num_rows: usize,
+) -> Option<Vec<Vec<usize>>> {
+    use rayon::slice::ParallelSliceMut;
+    if partition_keys.len() > 1 || order_keys.len() != 1 {
+        return None;
+    }
+    // `None` = no PARTITION BY; every row shares the constant partition component below (kept
+    // as an `Option` rather than a materialized constant column to avoid an 8 B/row allocation).
+    let part: Option<Vec<u64>> = match partition_keys.first() {
+        Some(k) => Some(pack_ordered_u64(k)?),
+        None => None,
+    };
+    let (ord_arr, opts) = &order_keys[0];
+    let mut ord = pack_ordered_u64(ord_arr)?;
+    // DESC: invert the order-preserving key so an ascending unsigned sort yields descending.
+    // (`nulls_first` is irrelevant — this path requires non-null keys.)
+    if opts.descending {
+        for x in &mut ord {
+            *x = !*x;
+        }
+    }
+    // Sort (partition, order, original-index) tuples. The derived tuple `Ord` sorts by
+    // partition, then order, then index; the index makes it a total order, so the unstable
+    // sort is deterministic. `par_sort` is kept even though this runs per hash bucket inside
+    // `window_parallel`: buckets finish unevenly, so rayon work-stealing puts the freed cores
+    // onto the still-running buckets' sorts — measurably faster than a serial per-bucket sort.
+    let mut keyed: Vec<(u64, u64, u32)> = (0..num_rows)
+        .map(|i| (part.as_ref().map_or(0, |p| p[i]), ord[i], i as u32))
+        .collect();
+    keyed.par_sort_unstable();
+    // Split the sorted tuples into contiguous same-partition runs (partition key changed).
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    for (pos, &(p, _, idx)) in keyed.iter().enumerate() {
+        if pos > 0 && p != keyed[pos - 1].0 {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push(idx as usize);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Some(out)
+}
+
+/// The order-preserving leading 8 bytes of an encoded row, as a `u64`.
+///
+/// arrow's row format is byte-lexicographic, so the big-endian `u64` of a row's first 8 bytes
+/// orders identically to the row's leading bytes; carrying this inline with the row index
+/// (see the sort in [`ordered_partitions_by_global_sort`]) resolves almost every comparison
+/// in-register, without dereferencing the full (wider, randomly accessed) Rows buffer. Rows
+/// shorter than 8 bytes are zero-padded — correct, since a shorter row is lexicographically
+/// smaller and the full-row tie-break handles the pad-equal case.
+fn row_prefix(d: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = d.len().min(8);
+    buf[..n].copy_from_slice(&d[..n]);
+    u64::from_be_bytes(buf)
 }
 
 /// `row_number`: 1..n in order, unique per row. Scattered to original positions.
@@ -924,6 +1079,83 @@ mod tests {
         (0..x.len()).map(|i| x.value(i)).collect()
     }
 
+    /// Independent brute-force `rank` oracle (shares no sort code with production) over data
+    /// whose i64 partition keys collide in the 8-byte sort prefix — they differ only in their
+    /// lowest byte, which the big-endian prefix does not capture — and whose order keys are
+    /// heavily tied. Both are exactly the cases the prefix-accelerated global sort in
+    /// [`ordered_partitions_by_global_sort`] must resolve through its full-row + inline-index
+    /// tie-break; a prefix that silently mis-grouped or mis-ordered these would diverge here.
+    #[test]
+    fn rank_matches_bruteforce_on_prefix_collisions() {
+        let n = 500usize;
+        // (i % 6) picks a high-byte group; (i % 2) perturbs only the low byte, so rows in the
+        // same group share the leading prefix bytes but are distinct partitions.
+        let part_vals: Vec<i64> = (0..n as i64).map(|i| (i % 6) * 256 + (i % 2)).collect();
+        let ord_vals: Vec<i64> = (0..n as i64).map(|i| (i * 17) % 7).collect(); // many ties
+        let part = i64s(&part_vals);
+        let order = [asc(i64s(&ord_vals))];
+        let call = [WindowCall {
+            func: WindowFn::Rank,
+            values: None,
+            offset: 0,
+            frame: None,
+        }];
+        // Both the serial kernel (huge threshold) and the bucket-parallel path (threshold 1).
+        for threshold in [1usize, 1 << 20] {
+            let got =
+                window_with(std::slice::from_ref(&part), &order, &call, n, threshold).unwrap();
+            let got = ints(&got[0]);
+            for r in 0..n {
+                // rank = 1 + number of same-partition rows with a strictly smaller order key.
+                let expected = 1
+                    + (0..n)
+                        .filter(|&s| part_vals[s] == part_vals[r] && ord_vals[s] < ord_vals[r])
+                        .count() as i64;
+                assert_eq!(got[r], expected, "row {r} threshold {threshold}");
+            }
+        }
+    }
+
+    /// Independent brute-force oracle for the exact `win-rank` shape: an i64 PARTITION BY and
+    /// a **f64 ORDER BY DESC** with negative values and ties. This is the case the packed
+    /// numeric fast path ([`try_ordered_partitions_packed`]) handles via `f64_ordered` + the
+    /// descending-key inversion — the riskiest packing — so a wrong float total order or a
+    /// botched DESC would diverge from the hand-computed rank here.
+    #[test]
+    fn rank_matches_bruteforce_float_desc() {
+        let n = 400usize;
+        let part_vals: Vec<i64> = (0..n as i64).map(|i| i % 20).collect();
+        let ord_vals: Vec<f64> = (0..n).map(|i| ((i as f64 * 13.0) % 11.0) - 5.0).collect();
+        let part = i64s(&part_vals);
+        let ord: ArrayRef = Arc::new(Float64Array::from(ord_vals.clone()));
+        let order = [(
+            ord,
+            SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        )];
+        let call = [WindowCall {
+            func: WindowFn::Rank,
+            values: None,
+            offset: 0,
+            frame: None,
+        }];
+        for threshold in [1usize, 1 << 20] {
+            let out =
+                window_with(std::slice::from_ref(&part), &order, &call, n, threshold).unwrap();
+            let got = ints(&out[0]);
+            for r in 0..n {
+                // DESC rank = 1 + number of same-partition rows with a strictly GREATER key.
+                let expected = 1
+                    + (0..n)
+                        .filter(|&s| part_vals[s] == part_vals[r] && ord_vals[s] > ord_vals[r])
+                        .count() as i64;
+                assert_eq!(got[r], expected, "row {r} threshold {threshold}");
+            }
+        }
+    }
+
     /// The bucket-parallel path (`window_with` with a low row threshold) must produce
     /// exactly what the serial kernel does, for ordered windows across many partitions
     /// — ranking, running aggregate, and a positional (lag) function. Partitioning by
@@ -1061,6 +1293,43 @@ mod tests {
         let out = window(&[], &[asc(order)], &funcs, 3).unwrap();
         // sorted order: idx1(10)=1, idx2(20)=2, idx0(30)=3
         assert_eq!(ints(&out[0]), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn rank_treats_signed_zero_and_nan_on_engine_float_identity() {
+        // ORDER BY a float key must rank on the engine's float identity, not raw bits:
+        // `-0.0` and `0.0` are one value (peers → same RANK), and a *negative* NaN (what
+        // `0.0/0.0` yields on x86) ranks greatest (last), not below -inf. Order key
+        // [-0.0, 0.0, 1.0, -NaN]: sorted identity order is {-0.0,0.0} peers, then 1.0,
+        // then NaN → RANK 1,1,3,4 and DENSE_RANK 1,1,2,3. With the raw RowConverter the
+        // two zeros split (1,2,3,4) and the -NaN sorted first — disagreeing with GROUP BY.
+        let neg_nan = f64::from_bits(0xfff8_0000_0000_0000);
+        let order: ArrayRef = Arc::new(Float64Array::from(vec![-0.0, 0.0, 1.0, neg_nan]));
+        let funcs = [
+            WindowCall {
+                func: WindowFn::Rank,
+                values: None,
+                offset: 1,
+                frame: None,
+            },
+            WindowCall {
+                func: WindowFn::DenseRank,
+                values: None,
+                offset: 1,
+                frame: None,
+            },
+        ];
+        let out = window(&[], &[asc(order)], &funcs, 4).unwrap();
+        assert_eq!(
+            ints(&out[0]),
+            vec![1, 1, 3, 4],
+            "RANK: signed zeros are peers"
+        );
+        assert_eq!(
+            ints(&out[1]),
+            vec![1, 1, 2, 3],
+            "DENSE_RANK: one -NaN group last"
+        );
     }
 
     #[test]

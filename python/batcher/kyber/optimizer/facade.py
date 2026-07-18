@@ -141,11 +141,18 @@ class Optimizer:
         return phys, plan, ctx.notes.get("build_side_decisions", [])
 
     def logical_rewrite(self, logical: LogicalPlan) -> LogicalPlan:
-        """Run only the logical rewrite phases, returning the rewritten plan.
+        """Run every optimizer phase, returning the optimized **logical** plan.
 
-        The seam the metadata-answer layer uses to simplify a plan (combine
-        limits, drop redundant distincts, zone-map pruning) before estimating it
-        with an exact-first estimator of its own.
+        Named for what the caller wants (a rewritten `LogicalPlan`, not a `PhysicalPlan`),
+        not for a subset of phases: `_run` iterates *all* of `Phase`, so JOIN_REORDER and
+        SELECTION execute here too. The previous "only the logical rewrite phases" wording
+        was wrong and contradicted `optimize_logical`, which memoizes this exact call —
+        worth knowing, because the metadata-answer layer calls this per `.count()` and so
+        pays for join-order search, not just the pruning it is after.
+
+        The seam the metadata-answer layer uses to simplify a plan (combine limits, drop
+        redundant distincts, zone-map pruning) before estimating it with an exact-first
+        estimator of its own.
         """
         return self._run(logical, self._context())[0]
 
@@ -255,7 +262,7 @@ def optimize_full(
     if max_entries <= 0:
         return Optimizer(cfg, sources, hub, source_stats=source_stats).optimize_full(logical)
 
-    key = plan_cache.cache_key(logical.content_key(), sources, cfg, hub)
+    key = plan_cache.cache_key(logical.content_key(), sources, cfg, hub, source_stats=source_stats)
     cached = plan_cache.lookup(key)
     if cached is not None:
         phys, plan, decisions = cached
@@ -294,7 +301,9 @@ def optimize_logical(
     if max_entries <= 0:
         return Optimizer(cfg, sources, hub, source_stats=source_stats).logical_rewrite(logical)
 
-    key = plan_cache.cache_key(logical.content_key(), sources, cfg, hub, kind="logical")
+    key = plan_cache.cache_key(
+        logical.content_key(), sources, cfg, hub, kind="logical", source_stats=source_stats
+    )
     cached = plan_cache.lookup(key)
     if cached is not None:
         return cached

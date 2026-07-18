@@ -25,7 +25,7 @@ from batcher.kyber.stats import StatsEstimator
 from batcher.metadata.hub import MetadataHub
 from batcher.plan.bloom_index import BloomIndex
 from batcher.plan.expr_ir import Binary, Col, IsNotNull, IsNull, Lit, Not
-from batcher.plan.logical import Filter, LogicalPlan, Project
+from batcher.plan.logical import Filter, LogicalPlan, Project, Scan
 from batcher.plan.stats import ColumnStat, Provenance, RelStats
 
 __all__ = [
@@ -156,6 +156,15 @@ def _exact_surviving_count(predicate, child: RelStats) -> int | None:
     if _is_null_tautology(pred) is not None and child.rows_exact:
         # `col IS NULL OR col IS NOT NULL` keeps every row (always true).
         return int(child.rows)
+    if isinstance(pred, Binary) and pred.op == "and":
+        # `A AND B` keeps a subset of what `A` keeps, so a provably-empty conjunct makes the
+        # whole conjunction provably empty. This is the shape of every real lakehouse filter
+        # (`day = 42 AND region = 'us'`), which the bare-comparison parse below could not see
+        # at all — so a partition pruned to nothing still executed to discover it.
+        for side in (pred.left, pred.right):
+            if _exact_surviving_count(side, child) == 0:
+                return 0
+        return None
     parsed = _parse_comparison(pred)
     if parsed is not None:
         op, name, value = parsed
@@ -181,8 +190,17 @@ def _exact_predicate_count(filt: Filter, child: RelStats, sources: list) -> int 
     whole-column count matches exactly what the filter sees.
     """
     scan = filt.input
-    if type(scan).__name__ != "Scan" or getattr(scan, "predicate", None) is not None:
-        return None  # not a bare scan — a whole-source count may not match the input
+    # `isinstance`, not a name-string: a string compare silently accepts any unrelated class
+    # called `Scan` and breaks silently if the class is renamed. `source_id == 0` makes the
+    # single-source binding explicit rather than relying on the `len(sources) != 1` check below.
+    # `getattr` for the predicate stays deliberate: a pushdown adds that attribute, a bare
+    # `Scan` does not carry it at all, so a direct access raises rather than declining.
+    if (
+        not isinstance(scan, Scan)
+        or getattr(scan, "predicate", None) is not None
+        or scan.source_id != 0
+    ):
+        return None  # not a bare scan of the one source — a whole-source count may not match
     parsed = _parse_comparison(filt.predicate)
     if parsed is None or len(sources) != 1 or not child.rows_exact:
         return None
@@ -313,11 +331,3 @@ def _is_zero_float(value) -> bool:
     `kyber.shortcuts.bounds.orderable`, which applies the identical rule.
     """
     return isinstance(value, float) and value == 0.0
-
-
-def _exact_col(stats: RelStats, name: str) -> ColumnStat | None:
-    """`name`'s `ColumnStat` iff its whole bundle is `Provenance.EXACT`, else None."""
-    stat = stats.columns.get(name)
-    if stat is None or stat.provenance is not Provenance.EXACT:
-        return None
-    return stat

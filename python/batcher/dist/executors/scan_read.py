@@ -75,6 +75,30 @@ _NATIVE_RG_WINDOW = max(1, int(os.environ.get("BATCHER_NATIVE_RG_WINDOW", "8")))
 # and run at compute speed. Bounded LRU by total cached bytes — defaults to a fraction of
 # the node's RAM so it never crowds out the working set; `BATCHER_SCAN_CACHE_BYTES=0`
 # disables it. Lives on the worker process, so it persists exactly as long as the fleet.
+def _scan_cache_siblings() -> int:
+    """How many worker processes share this node's RAM with us — never below 1.
+
+    A Ray node runs about one worker process per CPU, and this cache is a module-level
+    constant *per process*. Sizing it against the node's whole RAM therefore promises each
+    of them the same bytes: on a 16-CPU / 32 GB worker the node-level budget came to
+    ~154 GB. The cap has to be this process's *share*, not the machine.
+    """
+    try:
+        import ray
+
+        if ray.is_initialized():
+            # The node's own CPU count, not the cluster's — the RAM being divided is local.
+            node_id = ray.get_runtime_context().get_node_id()
+            for node in ray.nodes():
+                if node.get("NodeID") == node_id:
+                    cpus = int(node.get("Resources", {}).get("CPU", 0))
+                    if cpus > 0:
+                        return cpus
+    except Exception:
+        pass
+    return max(1, os.cpu_count() or 1)
+
+
 def _default_scan_cache_cap() -> int:
     frac = max(0.0, float(os.environ.get("BATCHER_SCAN_CACHE_FRACTION", "0.3")))
     try:
@@ -83,7 +107,10 @@ def _default_scan_cache_cap() -> int:
         total = psutil.virtual_memory().total
     except Exception:
         total = 8 * 1024**3
-    return int(total * frac)
+    # `total` is the *node's* RAM but this cap is enforced per process, so divide it by the
+    # processes sharing the node. Without this the bound is real per process and meaningless
+    # per node — every worker independently fills to `frac * node_RAM` and the node OOMs.
+    return int(total * frac / _scan_cache_siblings())
 
 
 _SCAN_CACHE_CAP = int(os.environ.get("BATCHER_SCAN_CACHE_BYTES", str(_default_scan_cache_cap())))

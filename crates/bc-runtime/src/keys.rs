@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Float64Array};
+use arrow::compute::SortOptions;
 use arrow::datatypes::DataType;
 
 /// A fixed hash for null keys so every null row lands in one partition — and therefore one
@@ -194,6 +195,26 @@ pub(crate) fn canonicalize_float_keys(keys: &[ArrayRef]) -> Option<Vec<ArrayRef>
     Some(
         keys.iter()
             .map(|k| canon_array(k).unwrap_or_else(|| Arc::clone(k)))
+            .collect(),
+    )
+}
+
+/// Canonicalize the array component of each ORDER BY key `(array, options)`, folding
+/// `-0.0`/`0.0` and every NaN bit pattern exactly as [`canonicalize_float_keys`] does for
+/// grouping keys, while preserving each key's `SortOptions`. The order path ranks raw bits
+/// (`RowConverter` → `rows_equal` → `peer_boundary`), so without this `-0.0` and `0.0` are not
+/// peers and a negative NaN sorts below `-inf` — disagreeing with the `GROUP BY`/`=`/`MIN` the
+/// same column feeds. Returns `None` when no key contains a float leaf (the common case), so the
+/// caller keeps the originals allocation-free.
+pub(crate) fn canonicalize_float_order_keys(
+    keys: &[(ArrayRef, SortOptions)],
+) -> Option<Vec<(ArrayRef, SortOptions)>> {
+    if !keys.iter().any(|(k, _)| contains_float(k.data_type())) {
+        return None;
+    }
+    Some(
+        keys.iter()
+            .map(|(k, opts)| (canon_array(k).unwrap_or_else(|| Arc::clone(k)), *opts))
             .collect(),
     )
 }

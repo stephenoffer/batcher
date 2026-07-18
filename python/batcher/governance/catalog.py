@@ -283,11 +283,15 @@ class SecurityCatalog:
     def mask_for(self, table: str, column: str, principal: Principal) -> MaskFn | None:
         """The mask to read `table`.`column` through, or None to read it raw.
 
-        An explicit `mask_column` wins over any `mask_tag`; among tags, the first tag in
-        sorted order whose mask *applies to this principal* wins, so resolution is
-        deterministic regardless of the order tags were declared in. A column may carry
-        several sensitivity tags: being exempt from one tag's mask does not grant raw
-        access while another tag still masks it — the strictest applicable tag governs.
+        An explicit `mask_column` wins over any `mask_tag` *when it applies*; among tags,
+        the first tag in sorted order whose mask *applies to this principal* wins, so
+        resolution is deterministic regardless of the order tags were declared in. A
+        column may carry several policies (an explicit mask and/or several sensitivity
+        tags): being exempt from one policy's mask does not grant raw access while another
+        policy still masks it — the strictest applicable policy governs. In particular, an
+        exemption from the explicit mask falls through to any tag mask the principal is not
+        also exempt from, so a narrow explicit exemption cannot silently disable a broad
+        tag-based safety net.
 
         Examples:
             .. doctest::
@@ -311,8 +315,12 @@ class SecurityCatalog:
             The mask function, or None if unmasked or the principal is exempt.
         """
         explicit = self._masks.get((table, column))
-        if explicit is not None:
-            return None if principal.has_any_role(explicit.exempt_roles) else explicit.mask
+        if explicit is not None and not principal.has_any_role(explicit.exempt_roles):
+            return explicit.mask
+        # Either no explicit mask, or the principal is exempt from it. An exemption from
+        # the explicit mask does not grant raw access while a tag mask still applies —
+        # the same most-restrictive-wins contract that governs multiple tags. Fall
+        # through so a narrow explicit exemption cannot bypass a broad tag safety net.
         for tag in sorted(self._tags.get((table, column), ())):
             tag_mask = self._tag_masks.get(tag)
             if tag_mask is None:

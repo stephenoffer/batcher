@@ -201,3 +201,46 @@ def test_in_memory_range_pruned_from_learned_bounds(pq_path):
     # column bounds (learned per instance) rather than executed — and equals a full run.
     assert _count(ds.filter(bt.col("x") > 100)) == 0
     assert ds.filter(bt.col("x") > 100).count() == 0
+
+
+# --- a conjunction is provably empty when either conjunct is -----------------------
+
+
+def _child_with_bounds():
+    from batcher.plan.stats import ColumnStat, Provenance, RelStats
+
+    return RelStats(
+        100.0,
+        Provenance.EXACT,
+        {
+            "x": ColumnStat(min=1, max=4, null_count=0, provenance=Provenance.EXACT),
+            "y": ColumnStat(min=1, max=2, null_count=0, provenance=Provenance.EXACT),
+        },
+    )
+
+
+def test_conjunction_with_a_provably_empty_conjunct_counts_zero():
+    """`A AND B` keeps a subset of `A`, so an empty `A` makes the conjunction empty.
+
+    This is the shape of every real lakehouse filter (`day = 42 AND region = 'us'`), which
+    the bare-comparison parse could not see at all — a partition pruned to nothing still
+    executed to discover it.
+    """
+    from batcher.kyber.metadata_filter_count.answers import _exact_surviving_count
+    from batcher.plan.expr_ir import col, lit
+
+    child = _child_with_bounds()
+    # `x > 100` is provably empty (max is 4) — on either side, and nested.
+    assert _exact_surviving_count((col("x") > lit(100)) & (col("y") == lit(1)), child) == 0
+    assert _exact_surviving_count((col("y") == lit(1)) & (col("x") > lit(100)), child) == 0
+    nested = (col("y") == lit(1)) & ((col("y") == lit(2)) & (col("x") > lit(100)))
+    assert _exact_surviving_count(nested, child) == 0
+
+
+def test_conjunction_of_partial_overlaps_still_declines():
+    """Neither conjunct is provably empty, so the count needs a histogram — execute."""
+    from batcher.kyber.metadata_filter_count.answers import _exact_surviving_count
+    from batcher.plan.expr_ir import col, lit
+
+    child = _child_with_bounds()
+    assert _exact_surviving_count((col("x") > lit(2)) & (col("y") == lit(1)), child) is None

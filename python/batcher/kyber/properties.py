@@ -36,7 +36,7 @@ from batcher.plan.logical import (
     Join,
     Limit,
     LogicalPlan,
-    Sort,
+    Project,
 )
 from batcher.plan.stats import RelStats
 
@@ -67,10 +67,20 @@ class PhysicalProperties:
 def satisfies(have: PhysicalProperties, want: PhysicalProperties) -> bool:
     """Whether a relation delivering `have` already satisfies a requirement for `want`.
 
-    An ordering satisfies a requirement when it is a **prefix-extension** of it: rows sorted
-    by `(a, b)` are also sorted by `(a)`, so a stronger order satisfies a weaker one, never
-    the reverse. A partitioning satisfies a requirement when the required keys are a subset
-    of the delivered ones — equal values of a superset already share a partition.
+    **Ordering and partitioning contain in opposite directions** — the single most
+    error-prone thing here, so it is spelled out:
+
+    * An **ordering** satisfies a requirement when it is a *prefix-extension* of it: rows
+      sorted by `(a, b)` are also sorted by `(a)`, so a stronger (longer) order satisfies a
+      weaker one, never the reverse.
+    * A **partitioning** satisfies a grouping requirement when the delivered keys are a
+      *subset* of the required ones — the opposite containment. Rows partitioned by `hash(a)`
+      keep every `(a, b)` group whole (equal `(a, b)` implies equal `a`, hence one bucket), so
+      partitioning on `(a)` satisfies grouping by `(a, b)`. Partitioning on the *superset*
+      `hash(a, b)` does **not** satisfy grouping by `(a)`: two rows sharing `a` but differing
+      in `b` hash to different buckets, so the `a`-group straddles them and a reducer that
+      skipped the shuffle would emit a partial group — a wrong answer, not a slow one. An
+      empty delivered partitioning guarantees nothing and satisfies only an empty requirement.
 
     Args:
         have: The properties the relation delivers.
@@ -80,8 +90,9 @@ def satisfies(have: PhysicalProperties, want: PhysicalProperties) -> bool:
         True iff no extra sort or shuffle is needed.
     """
     ordered = have.ordering[: len(want.ordering)] == want.ordering
-    partitioned = not want.hash_partitioned_on or set(want.hash_partitioned_on) <= set(
-        have.hash_partitioned_on
+    partitioned = not want.hash_partitioned_on or (
+        bool(have.hash_partitioned_on)
+        and set(have.hash_partitioned_on) <= set(want.hash_partitioned_on)
     )
     return ordered and partitioned
 
@@ -143,6 +154,15 @@ def hash_partitioned_on(node: LogicalPlan) -> tuple[str, ...]:
     if isinstance(node, Join):
         # Only an inner/semi-style join guarantees it: an outer join's null-extended rows
         # carry a NULL key that did not come from the hash bucket its row now sits in.
+        #
+        # NOTE: extending this to `left`/`anti` looks sound on paper — a LEFT join
+        # null-extends the *right* columns, so every output row still carries a real left
+        # key — and it was tried. It is NOT safe to ship without first pinning the execution
+        # contract: `dist._join_sides_are_map_only` documents that each side is "shipped to
+        # every worker and re-run against that worker's partition", i.e. a *replicated* join,
+        # not a shuffle co-partitioned by the join key. This property is consumed to **skip a
+        # shuffle**, so an over-claim is a partial group and a wrong aggregate, not a slow
+        # one. Establish how the join actually partitions its output before widening this.
         if node.join_type in ("inner", "semi") and node.left_keys:
             return tuple(node.left_keys)
         return ()
@@ -151,7 +171,26 @@ def hash_partitioned_on(node: LogicalPlan) -> tuple[str, ...]:
         return tuple(keys) if len(keys) == len(node.group_keys) else ()
     if isinstance(node, Filter | Limit | Distinct):
         return hash_partitioned_on(node.input)  # row-shrinking: a row never changes bucket
+    if isinstance(node, Project):
+        # A projection is map-only — it never moves a row between buckets — so the
+        # partitioning survives, but *under the output names*: the same rename the ordering
+        # gets in `project_ordering`. Every partitioning key must be carried forward as a bare
+        # column; if one is dropped or computed the partitioning still physically holds but can
+        # no longer be *named*, so it is unclaimed (costing at most a needless shuffle).
+        return _rename_keys(hash_partitioned_on(node.input), node.items)
     return ()
+
+
+def _rename_keys(keys: tuple[str, ...], items: tuple) -> tuple[str, ...]:
+    """`keys` under a projection's output aliases, or `()` if any key is not carried through."""
+    if not keys:
+        return ()
+    renamed: dict[str, str] = {}
+    for item in items:
+        if isinstance(item.expr, Col) and item.expr.name not in renamed:
+            renamed[item.expr.name] = item.alias
+    out = [renamed.get(k) for k in keys]
+    return tuple(o for o in out if o is not None) if all(o is not None for o in out) else ()
 
 
 def delivered(node: LogicalPlan, stats: RelStats) -> PhysicalProperties:
@@ -168,30 +207,3 @@ def delivered(node: LogicalPlan, stats: RelStats) -> PhysicalProperties:
         ordering=stats.sorted_by,
         hash_partitioned_on=hash_partitioned_on(node),
     )
-
-
-def required_ordering(node: LogicalPlan) -> tuple[str, ...]:
-    """The ordering `node` requires of its input, or `()` when it does not care.
-
-    Only a `Sort` requires one. Everything else in this algebra is order-insensitive at the
-    operator level, which is precisely why an ordering a consumer does not require is work
-    that can be removed.
-    """
-    if isinstance(node, Sort) and node.limit is None:
-        return _canonical(node)
-    return ()
-
-
-def _canonical(sort: Sort) -> tuple[str, ...]:
-    """`sort`'s keys as a canonical ascending, nulls-last column prefix (empty if not).
-
-    A descending or nulls-first key, or a computed key, is not expressible in the canonical
-    form, so the prefix stops there — and an empty prefix simply means "cannot compare",
-    which makes every caller decline rather than guess.
-    """
-    out: list[str] = []
-    for key in sort.keys:
-        if not isinstance(key.expr, Col) or key.descending or key.nulls_first:
-            break
-        out.append(key.expr.name)
-    return tuple(out)

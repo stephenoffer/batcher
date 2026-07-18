@@ -77,3 +77,29 @@ def test_array_agg_keeps_nulls(duck):
     got = bt.from_arrow(tbl).group_by("g").agg(a=col("v").array_agg()).collect().to_pylist()
     exp = duck.sql("SELECT g, array_agg(v) a FROM t2 GROUP BY g").to_arrow_table().to_pylist()
     assert _as_sets(got) == _as_sets(exp)
+
+
+def test_array_agg_over_empty_input_is_null(duck):
+    # A global array_agg over ZERO rows is NULL in DuckDB, not an empty list `[]`.
+    # (Spark's collect_list returns []; our oracle is DuckDB.) This is the only way a
+    # non-null empty list can arise — a real GROUP BY group always has >=1 element.
+    tbl = pa.table({"v": pa.array([], type=pa.int64())})
+    duck.register("e", tbl)
+    got = bt.from_arrow(tbl).agg(a=col("v").array_agg()).collect().to_pylist()
+    exp = duck.sql("SELECT array_agg(v) a FROM e").to_arrow_table().to_pylist()
+    assert got == exp == [{"a": None}]
+
+
+def test_array_agg_over_filtered_to_empty_is_null(duck):
+    # array_agg over a group filtered down to zero rows is NULL, matching DuckDB.
+    tbl = pa.table({"v": pa.array([1, 2, 3], type=pa.int64())})
+    duck.register("f", tbl)
+    got = (
+        bt.from_arrow(tbl)
+        .filter(col("v") > 100)
+        .agg(a=col("v").array_agg())
+        .collect()
+        .to_pylist()
+    )
+    exp = duck.sql("SELECT array_agg(v) a FROM f WHERE v > 100").to_arrow_table().to_pylist()
+    assert got == exp == [{"a": None}]

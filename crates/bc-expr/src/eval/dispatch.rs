@@ -334,7 +334,7 @@ impl Expr {
 mod dict_tests {
     use super::*;
     use crate::{Literal, StrFunc};
-    use arrow::array::{DictionaryArray, StringArray};
+    use arrow::array::DictionaryArray;
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 
     /// A batch with one `Dictionary<Int32, Utf8>` column `s`, plus the same column decoded

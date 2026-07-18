@@ -93,7 +93,8 @@ fn rg_survives(rg: &RowGroupMetaData, pred: &Pred) -> bool {
     }
 }
 
-/// The `Statistics` for the *top-level* column `col`, if present as a flat leaf.
+/// The `Statistics` for the *top-level* column `col`, plus whether it is an *unsigned*
+/// integer, if present as a flat leaf.
 ///
 /// The pushed predicate only ever names a top-level column (`to_native_predicate` emits
 /// bare column names), so the match must be against the column's *full* path being the
@@ -102,20 +103,45 @@ fn rg_survives(rg: &RowGroupMetaData, pred: &Pred) -> bool {
 /// column's min/max was then used to prune, which silently dropped every matching row of
 /// a file that happened to carry a like-named struct field. A predicate on a genuinely
 /// nested column therefore finds no stats and (correctly, conservatively) keeps the group.
-fn col_stats<'a>(rg: &'a RowGroupMetaData, col: &str) -> Option<&'a Statistics> {
+///
+/// The unsigned flag is load-bearing: Parquet stores UINT_8/16/32/64 in a *signed*
+/// physical `INT32`/`INT64`, with its min/max computed by *unsigned* order. A large
+/// unsigned value (e.g. 3e9 in a `UInt32`) therefore surfaces as a negative `i32` stat, so
+/// interpreting it as signed silently prunes away the rows that actually match. The caller
+/// reinterprets the bits as unsigned when this is set.
+fn col_stats<'a>(rg: &'a RowGroupMetaData, col: &str) -> Option<(&'a Statistics, bool)> {
     (0..rg.num_columns()).find_map(|i| {
         let cc = rg.column(i);
         let parts = cc.column_path().parts();
-        (parts.len() == 1 && parts[0] == col)
-            .then(|| cc.statistics())
-            .flatten()
+        if parts.len() == 1 && parts[0] == col {
+            cc.statistics().map(|s| (s, is_unsigned_int(cc.column_descr())))
+        } else {
+            None
+        }
     })
+}
+
+/// Whether a column's logical/converted type is an *unsigned* integer, so its signed
+/// physical min/max stats must be read back as unsigned before comparison.
+fn is_unsigned_int(descr: &parquet::schema::types::ColumnDescriptor) -> bool {
+    use parquet::basic::{ConvertedType, LogicalType};
+    match descr.logical_type() {
+        Some(LogicalType::Integer { is_signed, .. }) => !is_signed,
+        // Pre-`LogicalType` files carry the same information in the deprecated converted type.
+        _ => matches!(
+            descr.converted_type(),
+            ConvertedType::UINT_8
+                | ConvertedType::UINT_16
+                | ConvertedType::UINT_32
+                | ConvertedType::UINT_64
+        ),
+    }
 }
 
 /// `IS [NOT] NULL` pruning: a group with a known null count can be skipped when it holds
 /// no nulls (`IS NULL`) or only nulls (`IS NOT NULL`); an unknown count keeps the group.
 fn isnull_survives(rg: &RowGroupMetaData, col: &str, negated: bool) -> bool {
-    let Some(stats) = col_stats(rg, col) else {
+    let Some((stats, _unsigned)) = col_stats(rg, col) else {
         return true;
     };
     let Some(nulls) = stats.null_count_opt() else {
@@ -129,19 +155,30 @@ fn isnull_survives(rg: &RowGroupMetaData, col: &str, negated: bool) -> bool {
 }
 
 fn cmp_survives(rg: &RowGroupMetaData, col: &str, op: CmpOp, lit: &Lit) -> bool {
-    let Some(stats) = col_stats(rg, col) else {
+    let Some((stats, unsigned)) = col_stats(rg, col) else {
         return true; // no stats for this column → cannot prune
     };
     match (stats, lit) {
-        // Exact integer arithmetic for integer columns vs an integer literal.
-        (Statistics::Int32(s), Lit::Int(v)) => range_survives(
-            s.min_opt().map(|x| *x as i64),
-            s.max_opt().map(|x| *x as i64),
-            *v,
-            op,
-        ),
+        // Exact integer arithmetic for integer columns vs an integer literal. Comparisons
+        // run in `i128` so an unsigned column's full range (up to `u64::MAX`) and a signed
+        // `i64` literal both fit losslessly. Unsigned stats are reinterpreted from their
+        // signed physical bits before widening (a large `UInt32` reads back as a negative
+        // `i32`; taking it as signed would prune away the matching rows).
+        (Statistics::Int32(s), Lit::Int(v)) => {
+            let (mn, mx) = if unsigned {
+                (i32_unsigned(s.min_opt()), i32_unsigned(s.max_opt()))
+            } else {
+                (s.min_opt().map(|x| *x as i128), s.max_opt().map(|x| *x as i128))
+            };
+            range_survives(mn, mx, *v as i128, op)
+        }
         (Statistics::Int64(s), Lit::Int(v)) => {
-            range_survives(s.min_opt().copied(), s.max_opt().copied(), *v, op)
+            let (mn, mx) = if unsigned {
+                (i64_unsigned(s.min_opt()), i64_unsigned(s.max_opt()))
+            } else {
+                (s.min_opt().map(|x| *x as i128), s.max_opt().map(|x| *x as i128))
+            };
+            range_survives(mn, mx, *v as i128, op)
         }
         // Float columns vs a float literal (the stored floats compare exactly).
         (Statistics::Float(s), Lit::Float(v)) => float_range_survives(
@@ -180,6 +217,16 @@ fn cmp_survives(rg: &RowGroupMetaData, col: &str, op: CmpOp, lit: &Lit) -> bool 
 /// Whether an integer is exactly representable as `f64` (no rounding at conversion).
 fn int_exact_in_f64(v: i64) -> bool {
     v.unsigned_abs() < (1u64 << 53)
+}
+
+/// Reinterpret a signed `i32` physical stat as its unsigned value, widened to `i128`.
+fn i32_unsigned(v: Option<&i32>) -> Option<i128> {
+    v.map(|x| *x as u32 as i128)
+}
+
+/// Reinterpret a signed `i64` physical stat as its unsigned value, widened to `i128`.
+fn i64_unsigned(v: Option<&i64>) -> Option<i128> {
+    v.map(|x| *x as u64 as i128)
 }
 
 /// `range_survives` for float bounds, but a NaN bound *keeps* the group (never prunes).

@@ -94,6 +94,28 @@ def test_date_trunc(duck, ts, unit):
 @pytest.mark.parametrize(
     "q",
     [
+        # TIMESTAMP ± INTERVAL DAY/WEEK must add exact days to the *microsecond*
+        # instant (keeping the time-of-day), not route the value through a Date32
+        # epoch-day cast. Regression: the DAY/WEEK branch cast the operand to int64
+        # and back to DATE, so a timestamp (µs since epoch) either crashed the
+        # Date32 cast or produced a garbage date. DuckDB keeps the time component.
+        "SELECT id, ev + INTERVAL 5 DAY r FROM ts ORDER BY id",
+        "SELECT id, ev - INTERVAL 10 DAY r FROM ts ORDER BY id",
+        "SELECT id, ev + INTERVAL 2 WEEK r FROM ts ORDER BY id",
+        "SELECT id, ev + INTERVAL 1 MONTH r FROM ts ORDER BY id",
+        "SELECT id, ev + INTERVAL 1 YEAR r FROM ts ORDER BY id",
+        "SELECT id, date_add(ev, INTERVAL 3 DAY) r FROM ts ORDER BY id",
+    ],
+)
+def test_timestamp_interval(duck, ts, q):
+    from conftest import assert_same
+
+    assert_same(bt.sql(q, ts=ts).collect(), duck.sql(q))
+
+
+@pytest.mark.parametrize(
+    "q",
+    [
         # MONTH/YEAR calendar arithmetic now works. Batcher keeps the DATE type
         # (consistent with day intervals); DuckDB promotes date+month/year to
         # TIMESTAMP, so the queries CAST back to DATE to compare the *values*

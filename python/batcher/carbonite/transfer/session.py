@@ -305,6 +305,41 @@ class ShuffleSession:
         self._observe_backpressure()
         return payload, unreachable
 
+    def gather_to_files(
+        self,
+        sources: list[tuple[str, ShuffleTicket]],
+        spill_dir: str,
+        *,
+        fan_in: int | None = None,
+        replicas: list[list[str]] | None = None,
+    ) -> tuple[list[str], list[int]]:
+        """Concurrently fetch every mapper's bucket and spill each to an IPC file under
+        `spill_dir`, returning `(paths, unreachable)`.
+
+        The out-of-core sibling of `gather_combine`: it never holds the assembled bucket
+        in RAM (only `fan_in` in-flight fetches), landing each on disk so the reducer can
+        run the spilling `combine_finalize_spilling` over the paths. Used when the
+        in-memory fold reported `MemoryBudgetExceededError`.
+        """
+        if fan_in is None:
+            from batcher.config import active_config
+
+            fan_in = max(1, active_config().flow_control.shuffle_fetch_fan_in)
+        fan_in = min(fan_in, max(1, len(sources)))
+        paths, unreachable = self._server.gather_to_files(
+            _process_client(),
+            sources,
+            spill_dir,
+            fan_in,
+            credits=self._window(),
+            token=self._token,
+            shm=self._shm,
+            replicas=replicas,
+        )
+        self._fetches += len(sources)
+        self._observe_backpressure()
+        return paths, unreachable
+
     def gather_concat(
         self,
         sources: list[tuple[str, ShuffleTicket]],

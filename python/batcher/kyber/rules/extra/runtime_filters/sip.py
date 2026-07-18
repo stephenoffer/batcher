@@ -157,10 +157,14 @@ def push_in_list_across_join_keys(node: Join, ctx: OptimizerContext) -> LogicalP
     if sides is None or not node.left_keys:
         return None
     new_left, new_right = node.left, node.right
+    # `_scan_rooted` for the same reason the null-key rule needs it: this inserts exactly the
+    # same kind of `Filter` on exactly the same operands, and on a side that is not scan-rooted
+    # there is no `Scan` for it to sink into — so it is pure per-row cost *and* it changes the
+    # operand's structural signature and provenance, which is what routed TPC-H q2 out-of-core.
     for lk, rk in _real_key_pairs(node):
-        if "right" in sides:
+        if "right" in sides and _scan_rooted(node.right):
             new_right = _add_conjuncts(new_right, _mirrored_in_list(node.left, lk, rk))
-        if "left" in sides:
+        if "left" in sides and _scan_rooted(node.left):
             new_left = _add_conjuncts(new_left, _mirrored_in_list(node.right, rk, lk))
     return _rebuild(node, new_left, new_right, ctx, "in_list")
 
@@ -287,8 +291,18 @@ def push_is_not_null_from_asof_on_key(node: AsofJoin, ctx: OptimizerContext) -> 
     by their Arrow row encoding, so a null `by` key *matches* a null `by` key — unlike the
     equi-join's SQL null semantics. Dropping null-`by` right rows would delete real matches.
     """
+    # Both oracles, exactly as the equi-join version asks them (see the join rule above):
+    # `_may_hold_null` reads the stats *here*, but a `Filter` between this join and the scan sets
+    # `null_count` to unknown, so it answers "maybe" for a column the source proves null-free.
+    # `_provably_true_at_source` asks down at the scan. Without it the tautological filter is added,
+    # sunk, deleted at the scan, and re-added on the next fixpoint iteration — the ping-pong that
+    # cost 16 iterations on TPC-H q3, 24 on q5 and 25 on q7 before the join version was guarded.
     if not _may_hold_null(ctx.estimator.estimate(node.right).column(node.right_on)):
         return None
+    if _provably_true_at_source(node.right, node.right_on, IsNotNull(Col(node.right_on)), ctx):
+        return None
+    if not _scan_rooted(node.right):
+        return None  # nothing to sink into; see `_scan_rooted`
     new_right = _add_conjuncts(node.right, [(node.right_on, IsNotNull(Col(node.right_on)))])
     if new_right is node.right:
         return None

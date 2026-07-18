@@ -112,7 +112,15 @@ def execute_with_udfs(
         return _run_whole_plan(plan, sources, projections, cfg)
     chain = linear_map_chain(plan)
     if chain is not None and stream_eligible(chain[1]):
-        return list(stream_linear_chain(chain[0], chain[1], sources, projections))
+        # Reconcile the streamed output to one union schema, exactly as the materializing
+        # path does per stage (`_execute_node`). A UDF whose output schema DRIFTS across
+        # batches (e.g. LLM structured outputs with varying fields) yields batches of
+        # differing schemas; without this the final `Table.from_batches` raises on the
+        # first drift, so the streaming path would crash on inputs the staged path handles.
+        # The chain's output is already fully listed here, so this adds no extra buffering.
+        return reconcile_batches(
+            list(stream_linear_chain(chain[0], chain[1], sources, projections))
+        )
     batches, _schema = _execute_node(plan, sources, projections, cfg)
     return batches
 
@@ -457,19 +465,14 @@ def _coerce_udf_result(result: object) -> list[pa.RecordBatch]:
     if isinstance(result, pa.RecordBatch):
         return [result]
     if isinstance(result, pa.Table):
+        # A 0-row Table yields *no* batches, which would drop the stage's output schema (the
+        # parent falls back to the input schema and a downstream ref to a UDF-added column
+        # fails). Keep one empty batch so the schema survives, like a 0-row RecordBatch does.
         batches = result.to_batches()
-        # A 0-row Table yields *no* batches, which would drop the stage's output schema
-        # (the parent then falls back to the input schema and a downstream reference to a
-        # UDF-added column fails). Keep a single empty batch so the schema survives — the
-        # same behavior a 0-row RecordBatch return already has.
         if batches:
             return batches
-        return [
-            pa.RecordBatch.from_arrays(
-                [pa.array([], type=field.type) for field in result.schema],
-                schema=result.schema,
-            )
-        ]
+        cols = [pa.array([], type=f.type) for f in result.schema]
+        return [pa.RecordBatch.from_arrays(cols, schema=result.schema)]
     if isinstance(result, dict):
         return [pa.RecordBatch.from_pydict(_tensorize_columns(result))]
     raise TypeError(

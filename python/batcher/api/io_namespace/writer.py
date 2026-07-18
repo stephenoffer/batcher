@@ -278,6 +278,22 @@ class Writer:
         # on a cluster would turn those into errors for users who never asked to
         # distribute. The batch path below resolves `"auto"` normally.
         if trigger is not None or any(not is_bounded(s) for s in self._ds._sources):
+            # A path (file/Delta) sink can only *append* micro-batches. In "complete"/"update"
+            # mode a streaming aggregate re-emits its full running result every micro-batch (the
+            # sink is meant to replace/upsert it — `MemoryStreamSink` does), so an append-only path
+            # sink writes each running snapshot as another part file and readback silently
+            # **duplicates** the result across files (`streaming != batch`). Reject it — Spark's
+            # rule: file sinks support append only — rather than produce wrong data.
+            if output_mode in ("complete", "update"):
+                from batcher._internal.errors import PlanError
+
+                raise PlanError(
+                    f"streaming write to a path sink ({path!r}) supports output_mode='append' "
+                    f"only, not {output_mode!r}: a file/Delta sink appends each micro-batch, so a "
+                    f"running {output_mode!r} aggregate would be duplicated across part files. Use "
+                    "output_mode='append', a memory sink (.write.memory(name, "
+                    "output_mode='complete')), or .write.foreach_batch(fn) for a custom upsert."
+                )
             if distributed is True:
                 drain = self._maybe_distributed_stream(
                     path, fmt, opts, trigger, checkpoint, num_workers, query_name, output_mode

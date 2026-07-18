@@ -435,12 +435,17 @@ mod tests {
     fn avg_byte_width_of_a_string_slice_tracks_only_its_rows() {
         // Variable-width columns must also measure only the sliced rows' value bytes.
         let big: ArrayRef = Arc::new(StringArray::from(
-            (0..10_000).map(|i| format!("value-{i}")).collect::<Vec<_>>(),
+            (0..10_000)
+                .map(|i| format!("value-{i}"))
+                .collect::<Vec<_>>(),
         ));
         let slice: ArrayRef = big.slice(0, 5);
         let w = ColumnStats::from_array(&slice).avg_byte_width();
         // ~7-char strings + 4-byte offsets ≈ 11-15 B/row, nowhere near the parent buffer.
-        assert!(w < 100.0, "sliced string avg_byte_width {w} inflated by parent buffer");
+        assert!(
+            w < 100.0,
+            "sliced string avg_byte_width {w} inflated by parent buffer"
+        );
     }
 
     #[test]

@@ -865,7 +865,9 @@ mod float_literal_tests {
     fn lit_float(json: &str) -> f64 {
         let e: Expr = serde_json::from_str(json).unwrap();
         match e {
-            Expr::Lit { value: Literal::Float(v) } => v,
+            Expr::Lit {
+                value: Literal::Float(v),
+            } => v,
             other => panic!("expected float literal, got {other:?}"),
         }
     }

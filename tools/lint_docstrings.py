@@ -22,7 +22,7 @@ import inspect
 import re
 import sys
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, NoReturn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -52,24 +52,42 @@ def _sections(doc: str) -> set[str]:
     return {m.group("name") for m in _SECTION.finditer(doc)}
 
 
-def _documented_params(doc: str) -> set[str]:
-    """Parameter names listed under ``Args:`` (one entry per ``name:`` line)."""
+def _args_lines(doc: str) -> list[tuple[int, str]]:
+    """The ``(indent, line)`` pairs making up the body of the ``Args:`` section.
+
+    Scoped to that section on purpose: an entry-shaped line is only an *argument* under
+    ``Args:``. Elsewhere the same shape is ordinary prose — most notably a doctest's
+    ``Traceback (most recent call last):`` header, which reads exactly like a typed
+    argument and would otherwise be reported as one.
+    """
     match = re.search(r"^([ \t]*)Args:[ \t]*$", doc, re.M)
     if not match:
-        return set()
-    body = doc[match.end() :]
+        return []
     base = len(match.group(1))
-    names: set[str] = set()
-    for line in body.split("\n"):
+    out: list[tuple[int, str]] = []
+    for line in doc[match.end() :].split("\n"):
         if not line.strip():
             continue
         indent = len(line) - len(line.lstrip())
         if indent <= base:  # dedented out of the Args block
             break
+        out.append((indent - base, line))
+    return out
+
+
+def _documented_params(doc: str) -> set[str]:
+    """Parameter names listed under ``Args:`` (one entry per ``name:`` line)."""
+    names: set[str] = set()
+    for offset, line in _args_lines(doc):
         entry = re.match(r"^\s*\*{0,2}(\w+)\s*(\([^)]*\))?\s*:", line)
-        if entry and indent == base + 4:
+        if entry and offset == 4:
             names.add(entry.group(1))
     return names
+
+
+def _has_typed_args(doc: str) -> bool:
+    """Whether any ``Args:`` entry smuggles a type in parentheses — ``value (int): ...``."""
+    return any(_TYPED_ARG.search(line) for _, line in _args_lines(doc))
 
 
 def _expected_params(obj: Any) -> list[str]:
@@ -86,6 +104,13 @@ def _expected_params(obj: Any) -> list[str]:
     return [n for n in sig.parameters if n not in {"self", "cls"} and not n.startswith("_")]
 
 
+#: Annotations denoting a callable that never returns at all (it always raises). It has no
+#: return value to document, so demanding a `Returns:` section from one is a category error.
+_NO_RETURN_ANNOTATIONS = frozenset(
+    {NoReturn, "NoReturn", "typing.NoReturn", "Never", "typing.Never"}
+)
+
+
 def _returns_a_value(obj: Any) -> bool:
     if inspect.isclass(obj):
         return False
@@ -95,6 +120,8 @@ def _returns_a_value(obj: Any) -> bool:
         return False
     ret = sig.return_annotation
     if ret is inspect.Signature.empty:
+        return False
+    if ret in _NO_RETURN_ANNOTATIONS:
         return False
     return ret not in (None, "None", type(None))
 
@@ -145,7 +172,7 @@ def check(obj: Any) -> list[str]:
         missing = [p for p in params if p not in _documented_params(doc)]
         if missing:
             broken.append(f"args-undocumented:{','.join(missing)}")
-    if _TYPED_ARG.search(doc):
+    if _has_typed_args(doc):
         broken.append("args-have-types")
 
     if _returns_a_value(obj) and not ({"Returns", "Yields"} & sections):

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import AggExpr, Col, Expr
 from batcher.plan.expr_ir.selectors import Selector
-from batcher.plan.logical import Aggregate, AggregateSpec, Projection
+from batcher.plan.logical import Aggregate, AggregateSpec, Project, Projection
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -65,7 +65,7 @@ class GroupBy:
         keys = [*self._keys, *self._named]
         return f"GroupBy(keys={keys!r})"
 
-    def agg(self, *aggs: AggExpr, **named: AggExpr) -> Dataset:
+    def agg(self, *aggs: AggExpr, **named: AggExpr | Expr) -> Dataset:
         """Compute aggregates per group, returning a new `Dataset`.
 
         Keyword args bind an output name to an aggregate (`col("x").sum()`,
@@ -73,6 +73,13 @@ class GroupBy:
         (``col("x").sum()``) that keeps its source column's name — use a keyword when
         you want a different output name. The result columns are the group keys
         followed by the aggregates, in the order given.
+
+        A keyword value may also be a whole **expression over aggregates** —
+        ``col("x").sum() / col("y").sum()``, ``col("v").max() - col("v").min()`` — not
+        just a single one. The engine still runs one mergeable aggregate pass; the
+        surrounding arithmetic is computed in a projection over the aggregated columns, so
+        the result is identical single-node and distributed. Aggregates cannot be nested
+        (``sum(x).mean()``).
 
         For the common case of reducing every value column the same way, prefer the
         shortcut methods (`sum`, `mean`, `count`, ...) over spelling out `agg`.
@@ -89,28 +96,77 @@ class GroupBy:
                 ... ).sort("dept").to_pydict()
                 {'dept': ['eng', 'sales'], 'total': [220, 90], 'n': [2, 1]}
 
+                >>> ds.group_by("dept").agg(
+                ...     avg=bt.col("salary").sum() / bt.count()
+                ... ).sort("dept").to_pydict()
+                {'dept': ['eng', 'sales'], 'avg': [110.0, 90.0]}
+
         Args:
             *aggs: Bare single-column aggregates (``col(name).<agg>()``) that keep
                 ``name`` as the output column.
-            **named: Output column name to aggregate expression.
+            **named: Output column name to an aggregate, or an expression over aggregates.
 
         Returns:
             A new lazy `Dataset` of the group keys followed by the aggregates.
 
         Raises:
-            PlanError: If no aggregate is given, or a value is not an aggregate
-                expression.
+            PlanError: If no aggregate is given, or a value neither is nor contains an
+                aggregate expression.
         """
         resolved = {**self._named_aggs(aggs), **named}
         if not resolved:
             raise PlanError("agg() requires at least one aggregate")
-        for alias, agg in resolved.items():
-            if not isinstance(agg, AggExpr):
+        return self._source._derive(self._lower_aggregates(resolved))
+
+    def _group_key_projections(self) -> tuple[Projection, ...]:
+        """The group-by output columns: positional keys by name, plus named key exprs."""
+        return tuple(Projection(k, Col(k)) for k in self._keys) + tuple(
+            Projection(alias, expr) for alias, expr in self._named.items()
+        )
+
+    def _lower_aggregates(self, resolved: dict[str, AggExpr | Expr]):
+        """Lower ``{alias: aggregate-or-expression-over-aggregates}`` to a logical plan.
+
+        A pure aggregate becomes one `AggregateSpec`. An expression *over* aggregates has
+        its aggregate leaves hoisted into hidden columns (deduplicated) and the surrounding
+        scalar expression re-evaluated in a following `Project`. When every output is a
+        bare aggregate the projection is skipped — the plan shape is exactly as before.
+        """
+        from batcher.plan.expr_ir.walk import (
+            AggregateLeafRegistry,
+            contains_aggregate,
+            split_aggregate_leaves,
+        )
+
+        registry = AggregateLeafRegistry()
+        pure_specs: list[AggregateSpec] = []
+        project_items: list[Projection] = []
+        has_composite = False
+        for alias, value in resolved.items():
+            if isinstance(value, AggExpr):
+                pure_specs.append(AggregateSpec(alias, value))
+                project_items.append(Projection(alias, Col(alias)))
+            elif isinstance(value, Expr) and contains_aggregate(value):
+                has_composite = True
+                project_items.append(Projection(alias, split_aggregate_leaves(value, registry)))
+            else:
                 raise PlanError(
-                    f"agg() value for {alias!r} must be an aggregate expression, "
-                    f"e.g. col('x').sum() or count()"
+                    f"agg() value for {alias!r} must be an aggregate expression or an "
+                    "expression over aggregates, e.g. col('x').sum() or "
+                    "col('x').sum() / col('y').sum()"
                 )
-        return self._finish(tuple(AggregateSpec(a, e) for a, e in resolved.items()))
+
+        group_keys = self._group_key_projections()
+        watermark = self._source._watermark
+        if not has_composite:
+            return Aggregate(self._source._plan, group_keys, tuple(pure_specs), watermark=watermark)
+
+        hidden = tuple(AggregateSpec(name, agg) for name, agg in registry.leaves())
+        agg_plan = Aggregate(
+            self._source._plan, group_keys, tuple(pure_specs) + hidden, watermark=watermark
+        )
+        passthrough = tuple(Projection(k.alias, Col(k.alias)) for k in group_keys)
+        return Project(agg_plan, passthrough + tuple(project_items))
 
     def len(self, name: str = "len") -> Dataset:
         """Count the rows in each group.
@@ -424,8 +480,10 @@ class GroupBy:
         return out
 
     def _finish(self, specs: tuple[AggregateSpec, ...]) -> Dataset:
-        group_keys = tuple(Projection(k, Col(k)) for k in self._keys) + tuple(
-            Projection(alias, expr) for alias, expr in self._named.items()
+        plan = Aggregate(
+            self._source._plan,
+            self._group_key_projections(),
+            specs,
+            watermark=self._source._watermark,
         )
-        plan = Aggregate(self._source._plan, group_keys, specs, watermark=self._source._watermark)
         return self._source._derive(plan)

@@ -42,6 +42,28 @@ def test_append_stateless_to_memory():
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("mode", ["complete", "update"])
+def test_complete_or_update_to_path_sink_is_rejected(tmp_path, mode):
+    """A path (file/Delta) sink appends micro-batches, so a running `complete`/`update`
+    aggregate would be duplicated across part files (`streaming != batch`). It must be
+    rejected at query construction, not silently write wrong data. (Regression: it used to
+    write each running snapshot as another `part-batch*` file, so readback duplicated the
+    result — `[('a',1),('a',4),('a',10),…]` instead of `[('a',10),('b',7),('c',4)]`.)"""
+    with pytest.raises(PlanError, match="append"):
+        (
+            _stream()
+            .group_by("k")
+            .agg(total=bt.col("v").sum())
+            .write(
+                str(tmp_path / "out"),
+                format="parquet",
+                trigger=bt.Trigger.available_now(),
+                output_mode=mode,
+            )
+        )
+
+
+@pytest.mark.integration
 def test_complete_aggregate_to_memory_matches_batch():
     q = (
         _stream()

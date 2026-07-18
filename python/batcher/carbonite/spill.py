@@ -98,11 +98,18 @@ class SpillTier(Enum):
 
 @dataclass(frozen=True, slots=True)
 class SpillHandle:
-    """An opaque reference to one spilled partition (tier + path + size)."""
+    """An opaque reference to one spilled partition (tier + path + sizes).
+
+    `nbytes` is the **compressed, on-disk** size (what the local-budget accounting charges).
+    `logical_nbytes` is the **uncompressed, in-memory** size of everything written — what a
+    reducer must budget against before reading the bucket back into RAM, since a compressible
+    bucket's on-disk size can be many times smaller than its resident footprint.
+    """
 
     tier: SpillTier
     path: str
     nbytes: int
+    logical_nbytes: int = 0
 
 
 def _fsspec_open(path: str, mode: str):
@@ -163,6 +170,11 @@ class _BucketWriter:
         self._path: str | None = None
         self._fh = None
         self._writer: pa.ipc.RecordBatchStreamWriter | None = None
+        # Bytes this writer has streamed to the LOCAL tier but not yet finalized. Counted
+        # live against the store's local budget so a *sibling* bucket opened later routes to
+        # the remote tier once the buckets already streaming have exhausted the local budget
+        # — the on-close accounting alone cannot see an open bucket's growth (see the store).
+        self._pending_bytes = 0
 
     def write(self, batch: pa.RecordBatch) -> None:
         if batch.num_rows == 0:
@@ -170,13 +182,20 @@ class _BucketWriter:
         if self._writer is None:
             self._open(batch.schema)
         self._writer.write_batch(batch)
+        if self._tier is SpillTier.LOCAL:
+            # Charge the batch's (uncompressed, in-memory) size to the store's live local
+            # usage as it lands, not just at close. A slight over-estimate vs the compressed
+            # on-disk size only makes overflow trigger a touch early — safe (never over-fills
+            # the disk), and result-invariant (the remote tier reads back identically).
+            self._pending_bytes += batch.nbytes
+            self._store._local_pending += batch.nbytes
 
     def _open(self, schema: pa.Schema) -> None:
         store = self._store
         overflow = (
             store._remote_uri is not None
             and store._local_budget is not None
-            and store._local_used >= store._local_budget
+            and store._local_used + store._local_pending >= store._local_budget
         )
         if overflow:
             self._tier = SpillTier.REMOTE
@@ -199,8 +218,19 @@ class _BucketWriter:
             return None
         self._writer.close()
         self._fh.close()
+        # The uncompressed (in-memory) size of everything written — captured before the LOCAL
+        # branch zeroes the pending estimate. The reducer budgets against this, not the
+        # compressed on-disk `nbytes` below (which for a compressible bucket can be far smaller
+        # and would let an over-large bucket skip re-spill recursion and OOM the finalize).
+        logical_nbytes = self._pending_bytes
+        if self._tier is SpillTier.LOCAL:
+            # This bucket is finalized: hand its bytes from the live "pending" estimate to
+            # the store's confirmed `_local_used` (`_on_closed` adds the real file size), so
+            # the two are never double-counted.
+            self._store._local_pending -= self._pending_bytes
+            self._pending_bytes = 0
         nbytes = self._store._on_closed(self._tier, self._path)
-        return SpillHandle(self._tier, self._path, nbytes)
+        return SpillHandle(self._tier, self._path, nbytes, logical_nbytes)
 
 
 class TieredSpillStore:
@@ -231,6 +261,13 @@ class TieredSpillStore:
         self._local_budget = _clamp_to_free_disk(local_dir, local_budget_bytes)
         self._compression = compression
         self._local_used = 0
+        # Bytes streamed to the local tier by writers that are still OPEN. The tier decision
+        # is made once, on a bucket's first write, from the local budget — but `_local_used`
+        # only grows when a bucket CLOSES, so with several buckets streaming at once (the
+        # partition phase's pattern) none of them ever observes the others' growth and the
+        # remote overflow tier never engages, letting the local disk fill past its budget.
+        # Tracking in-flight bytes here lets a later-opened bucket overflow correctly.
+        self._local_pending = 0
         self._local_paths: list[str] = []
 
     @property
@@ -298,3 +335,4 @@ class TieredSpillStore:
                 os.remove(path)
         self._local_paths.clear()
         self._local_used = 0
+        self._local_pending = 0

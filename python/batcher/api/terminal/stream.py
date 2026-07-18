@@ -28,7 +28,9 @@ from batcher.plan.logical import LogicalPlan
 __all__ = ["_iter_batches", "_iter_streaming"]
 
 
-def _event_micros(col: pa.Array | pa.ChunkedArray | pa.Scalar) -> pa.Array | pa.ChunkedArray | pa.Scalar:
+def _event_micros(
+    col: pa.Array | pa.ChunkedArray | pa.Scalar,
+) -> pa.Array | pa.ChunkedArray | pa.Scalar:
     """Event-time ticks as int64 **microseconds**, whatever the column's resolution.
 
     Watermarks, `within`, and `lateness` are all microseconds. Reading the raw int64
@@ -99,6 +101,31 @@ def _iter_batches(
         WatermarkStreamJoin,
         is_streamable,
     )
+
+    # `batch_size` is an *exact* output-granularity contract ("rebatch the output to
+    # this many rows"), which the per-path chunkers below cannot honor: slicing each
+    # engine batch/chunk independently flushes a short batch at every boundary (e.g. a
+    # sorted result yields 1000, 1000, 651, 1000, … rows). Run the natural-batch path
+    # and coalesce once at the boundary so every emitted batch is exactly `batch_size`
+    # rows except the final remainder — matching the engine's own `map_batches`
+    # rebatch. The inner call passes `None`, so the chunkers stay on their pass-through
+    # branch and this delegation cannot recurse.
+    if batch_size is not None:
+        if batch_size < 1:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(f"iter_batches(): batch_size must be >= 1, got {batch_size}")
+        raw = _iter_batches(
+            plan,
+            sources,
+            columns,
+            None,
+            distributed=distributed,
+            num_workers=num_workers,
+            transport=transport,
+        )
+        yield from _rebatch_exact(raw, batch_size)
+        return
 
     # A distributed breaker streams its result off the workers one bucket at a time,
     # bounding driver memory. A breaker-free pipeline already streams in bounded memory
@@ -264,6 +291,29 @@ def _iter_batches(
         table.to_batches() if batch_size is None else table.to_batches(max_chunksize=batch_size)
     )
     yield from batches
+
+
+def _rebatch_exact(batches: Iterator[pa.RecordBatch], batch_size: int) -> Iterator[pa.RecordBatch]:
+    """Re-chunk a batch stream so every emitted batch holds exactly `batch_size` rows.
+
+    `pyarrow`'s per-batch slicing / ``to_batches(max_chunksize=…)`` chunks each input
+    batch independently, so a stream of unevenly-sized engine batches leaks a short
+    batch at every boundary rather than at the end only. Buffering across boundaries and
+    cutting on the exact row count restores the "N rows per batch" contract: only the
+    final remainder is smaller. An empty input yields nothing (matching the unbatched
+    path, which emits no batch for an empty result).
+    """
+    acc: pa.Table | None = None
+    for b in batches:
+        if b.num_rows == 0:
+            continue
+        t = pa.Table.from_batches([b])
+        acc = t if acc is None else pa.concat_tables([acc, t])
+        while acc.num_rows >= batch_size:
+            yield acc.slice(0, batch_size).combine_chunks().to_batches()[0]
+            acc = acc.slice(batch_size)
+    if acc is not None and acc.num_rows > 0:
+        yield from acc.combine_chunks().to_batches()
 
 
 def _iter_streaming(

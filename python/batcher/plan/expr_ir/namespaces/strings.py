@@ -7,6 +7,9 @@ string→string transforms are generated from `_STR_TRANSFORMS` (data, not code)
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
+
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Cast, Expr
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
@@ -388,6 +391,2230 @@ class _StrNamespace:
                 {'r': ['ab***']}
         """
         return StrFunc("rpad", self._e, start=width, pattern=fill)
+
+    def zfill(self, width: int) -> StrFunc:
+        """Left-pad with ``'0'`` to ``width`` characters — the numeric-string spelling of ``lpad``.
+
+        A thin specialization of :meth:`lpad` with a ``'0'`` fill, matching the name
+        Python/pandas/Polars users reach for when zero-padding fixed-width codes or ids.
+        A string already ``width`` or longer is returned unchanged.
+
+        Args:
+            width: Target character width.
+
+        Returns:
+            A new Utf8 expression: the zero-padded string.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["7", "42", "100"]})
+                >>> ds.select(bt.col("s").str.zfill(4).alias("r")).to_pydict()
+                {'r': ['0007', '0042', '0100']}
+        """
+        return StrFunc("lpad", self._e, start=width, pattern="0")
+
+    def contains_any(self, patterns: Iterable[str]) -> Expr:
+        """True where the string contains *any* of the literal ``patterns`` (an OR of substrings).
+
+        Desugars to ``contains(p0) | contains(p1) | …`` over existing nodes, so it adds
+        no IR and follows the same three-valued logic — a null input yields null. Use it
+        as a fast keyword filter without writing a regex alternation.
+
+        Args:
+            patterns: Literal substrings to test for; matches if any is present.
+
+        Returns:
+            A new Boolean expression, true where at least one pattern is a substring.
+
+        Raises:
+            PlanError: If `patterns` is empty (no predicate to build).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["cat", "dog", "bird"]})
+                >>> ds.select(bt.col("s").str.contains_any(["ca", "ir"]).alias("r")).to_pydict()
+                {'r': [True, False, True]}
+        """
+        terms = [StrFunc("contains", self._e, pattern=p) for p in patterns]
+        if not terms:
+            raise PlanError("contains_any() requires at least one pattern")
+        result: Expr = terms[0]
+        for term in terms[1:]:
+            result = result | term
+        return result
+
+    # --- Polars/pandas-compatible spellings (delegate to the SQL-named methods) -----
+
+    def to_lowercase(self) -> StrFunc:
+        """Lowercase the string — the Polars ``to_lowercase`` spelling of :meth:`lower`.
+
+        Returns:
+            A new Utf8 expression with every letter lowercased.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["Hello"]})
+                >>> ds.select(r=bt.col("s").str.to_lowercase()).to_pydict()
+                {'r': ['hello']}
+        """
+        return self.lower()
+
+    def to_uppercase(self) -> StrFunc:
+        """Uppercase the string — the Polars ``to_uppercase`` spelling of :meth:`upper`.
+
+        Returns:
+            A new Utf8 expression with every letter uppercased.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["Hello"]})
+                >>> ds.select(r=bt.col("s").str.to_uppercase()).to_pydict()
+                {'r': ['HELLO']}
+        """
+        return self.upper()
+
+    def to_titlecase(self) -> StrFunc:
+        """Title-case the string — the Polars ``to_titlecase`` spelling of :meth:`initcap`.
+
+        Returns:
+            A new Utf8 expression with the first letter of each word uppercased.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello world"]})
+                >>> ds.select(r=bt.col("s").str.to_titlecase()).to_pydict()
+                {'r': ['Hello World']}
+        """
+        return self.initcap()
+
+    def pad_start(self, width: int, fill: str = " ") -> StrFunc:
+        """Left-pad to ``width`` — the Polars ``pad_start`` spelling of :meth:`lpad`.
+
+        Args:
+            width: Target character width.
+            fill: Pad character, defaulting to a space.
+
+        Returns:
+            A new Utf8 expression: the left-padded string.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ab"]})
+                >>> ds.select(r=bt.col("s").str.pad_start(5, "*")).to_pydict()
+                {'r': ['***ab']}
+        """
+        return self.lpad(width, fill)
+
+    def pad_end(self, width: int, fill: str = " ") -> StrFunc:
+        """Right-pad to ``width`` — the Polars ``pad_end`` spelling of :meth:`rpad`.
+
+        Args:
+            width: Target character width.
+            fill: Pad character, defaulting to a space.
+
+        Returns:
+            A new Utf8 expression: the right-padded string.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ab"]})
+                >>> ds.select(r=bt.col("s").str.pad_end(5, "*")).to_pydict()
+                {'r': ['ab***']}
+        """
+        return self.rpad(width, fill)
+
+    def count_matches(self, pattern: str) -> StrFunc:
+        """Count regex matches — the Polars ``count_matches`` spelling of :meth:`regexp_count`.
+
+        Args:
+            pattern: The regular expression to count.
+
+        Returns:
+            An Int64 expression of the number of matches per row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1b2c3"]})
+                >>> ds.select(r=bt.col("s").str.count_matches("[0-9]")).to_pydict()
+                {'r': [3]}
+        """
+        return self.regexp_count(pattern)
+
+    def extract(self, pattern: str, group: int = 1) -> StrFunc:
+        """Extract a regex capture group — Polars' ``extract`` (see :meth:`regexp_extract`).
+
+        Args:
+            pattern: The regular expression with capture groups.
+            group: The 1-based capture group to return (``0`` is the whole match).
+
+        Returns:
+            A Utf8 expression of the captured text, or null if no match.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1"]})
+                >>> ds.select(r=bt.col("s").str.extract(r"([a-z])([0-9])", 2)).to_pydict()
+                {'r': ['1']}
+        """
+        return self.regexp_extract(pattern, group)
+
+    def extract_all(self, pattern: str) -> StrFunc:
+        """All regex matches as a list — Polars' ``extract_all`` (see :meth:`regexp_extract_all`).
+
+        Args:
+            pattern: The regular expression to find all matches of.
+
+        Returns:
+            A ``List<Utf8>`` expression of every match per row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1b2"]})
+                >>> ds.select(r=bt.col("s").str.extract_all("[0-9]")).to_pydict()
+                {'r': [['1', '2']]}
+        """
+        return self.regexp_extract_all(pattern)
+
+    def replace_all(self, pattern: str, value: str) -> StrFunc:
+        """Replace every regex match — Polars' ``replace_all`` (see :meth:`regexp_replace_all`).
+
+        Args:
+            pattern: The regular expression to replace.
+            value: The replacement text.
+
+        Returns:
+            A Utf8 expression with every match replaced.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1b2"]})
+                >>> ds.select(r=bt.col("s").str.replace_all("[0-9]", "#")).to_pydict()
+                {'r': ['a#b#']}
+        """
+        return self.regexp_replace_all(pattern, value)
+
+    def len_chars(self) -> StrFunc:
+        """Character length — the Polars ``len_chars`` spelling of :meth:`len`.
+
+        Returns:
+            An Int64 expression of the number of characters per row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["café"]})
+                >>> ds.select(r=bt.col("s").str.len_chars()).to_pydict()
+                {'r': [4]}
+        """
+        return self.len()
+
+    def len_bytes(self) -> StrFunc:
+        """UTF-8 byte length — the Polars ``len_bytes`` spelling of :meth:`octet_length`.
+
+        Returns:
+            An Int64 expression of the number of UTF-8 bytes per row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["café"]})
+                >>> ds.select(r=bt.col("s").str.len_bytes()).to_pydict()
+                {'r': [5]}
+        """
+        return self.octet_length()
+
+    def strip_chars(self, chars: str | None = None) -> StrFunc:
+        """Trim from both ends — the Polars ``strip_chars`` spelling of :meth:`trim`.
+
+        Args:
+            chars: The set of characters to strip; whitespace when ``None``.
+
+        Returns:
+            A Utf8 expression with the leading and trailing characters removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["  ab  "]})
+                >>> ds.select(r=bt.col("s").str.strip_chars()).to_pydict()
+                {'r': ['ab']}
+        """
+        return self.trim(chars)
+
+    def strip_chars_start(self, chars: str | None = None) -> StrFunc:
+        """Trim from the left — the Polars ``strip_chars_start`` spelling of :meth:`lstrip`.
+
+        Args:
+            chars: The set of characters to strip; whitespace when ``None``.
+
+        Returns:
+            A Utf8 expression with the leading characters removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["  ab  "]})
+                >>> ds.select(r=bt.col("s").str.strip_chars_start()).to_pydict()
+                {'r': ['ab  ']}
+        """
+        return self.lstrip(chars)
+
+    def strip_chars_end(self, chars: str | None = None) -> StrFunc:
+        """Trim from the right — the Polars ``strip_chars_end`` spelling of :meth:`rstrip`.
+
+        Args:
+            chars: The set of characters to strip; whitespace when ``None``.
+
+        Returns:
+            A Utf8 expression with the trailing characters removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["  ab  "]})
+                >>> ds.select(r=bt.col("s").str.strip_chars_end()).to_pydict()
+                {'r': ['  ab']}
+        """
+        return self.rstrip(chars)
+
+    def head(self, n: int) -> StrFunc:
+        """First ``n`` characters — the Polars ``str.head`` spelling of :meth:`left`.
+
+        Args:
+            n: How many leading characters to keep.
+
+        Returns:
+            A Utf8 expression of the first ``n`` characters.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello"]})
+                >>> ds.select(r=bt.col("s").str.head(3)).to_pydict()
+                {'r': ['hel']}
+        """
+        return self.left(n)
+
+    def tail(self, n: int) -> StrFunc:
+        """Last ``n`` characters — the Polars ``str.tail`` spelling of :meth:`right`.
+
+        Args:
+            n: How many trailing characters to keep.
+
+        Returns:
+            A Utf8 expression of the last ``n`` characters.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello"]})
+                >>> ds.select(r=bt.col("s").str.tail(3)).to_pydict()
+                {'r': ['llo']}
+        """
+        return self.right(n)
+
+    def slice(self, offset: int, length: int | None = None) -> StrFunc:
+        """0-based substring — the Polars ``str.slice`` spelling over :meth:`substr` (1-based).
+
+        Args:
+            offset: 0-based start index.
+            length: Number of characters; to the end when ``None``.
+
+        Returns:
+            A Utf8 expression of the selected substring.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello"]})
+                >>> ds.select(r=bt.col("s").str.slice(1, 3)).to_pydict()
+                {'r': ['ell']}
+        """
+        return self.substr(offset + 1, length)
+
+    def ljust(self, width: int, fill: str = " ") -> StrFunc:
+        """Left-justify to ``width`` (pad right) — pandas' ``str.ljust`` (see :meth:`rpad`).
+
+        Args:
+            width: Target character width.
+            fill: Pad character, defaulting to a space.
+
+        Returns:
+            A Utf8 expression: the right-padded string.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ab"]})
+                >>> ds.select(r=bt.col("s").str.ljust(5, "*")).to_pydict()
+                {'r': ['ab***']}
+        """
+        return self.rpad(width, fill)
+
+    def rjust(self, width: int, fill: str = " ") -> StrFunc:
+        """Right-justify to ``width`` (pad left) — pandas' ``str.rjust`` (see :meth:`lpad`).
+
+        Args:
+            width: Target character width.
+            fill: Pad character, defaulting to a space.
+
+        Returns:
+            A Utf8 expression: the left-padded string.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ab"]})
+                >>> ds.select(r=bt.col("s").str.rjust(5, "*")).to_pydict()
+                {'r': ['***ab']}
+        """
+        return self.lpad(width, fill)
+
+    # --- text features (the cheap signals a text model or data check consumes) ------
+
+    def word_count(self) -> StrFunc:
+        """Count whitespace-separated words (→ Int64); an all-blank string counts 0.
+
+        Returns:
+            An Int64 expression of the number of words per row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello big  world", "hi"]})
+                >>> ds.select(r=bt.col("s").str.word_count()).to_pydict()
+                {'r': [3, 1]}
+        """
+        return self.regexp_count(r"\S+")
+
+    def digit_count(self) -> StrFunc:
+        """Count the digit characters in the string (→ Int64).
+
+        Returns:
+            An Int64 expression of the number of digits per row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1b23", "xyz"]})
+                >>> ds.select(r=bt.col("s").str.digit_count()).to_pydict()
+                {'r': [3, 0]}
+        """
+        return self.regexp_count("[0-9]")
+
+    def is_alpha(self) -> Expr:
+        """True where the string is non-empty and all letters (pandas ``str.isalpha``).
+
+        Returns:
+            A Boolean expression, true for all-alphabetic strings.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc", "ab1"]})
+                >>> ds.select(r=bt.col("s").str.is_alpha()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches("^[A-Za-z]+$")
+
+    def is_numeric(self) -> Expr:
+        """True where the string is non-empty and all digits (pandas ``str.isnumeric``).
+
+        Returns:
+            A Boolean expression, true for all-digit strings.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["123", "12a"]})
+                >>> ds.select(r=bt.col("s").str.is_numeric()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches("^[0-9]+$")
+
+    def is_alnum(self) -> Expr:
+        """True where the string is non-empty and all letters or digits (pandas ``str.isalnum``).
+
+        Returns:
+            A Boolean expression, true for all-alphanumeric strings.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ab12", "ab 12"]})
+                >>> ds.select(r=bt.col("s").str.is_alnum()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches("^[A-Za-z0-9]+$")
+
+    def is_space(self) -> Expr:
+        """True where the string is non-empty and all whitespace (pandas ``str.isspace``).
+
+        Returns:
+            A Boolean expression, true for all-whitespace strings.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["   ", " a "]})
+                >>> ds.select(r=bt.col("s").str.is_space()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"^\s+$")
+
+    def is_upper(self) -> Expr:
+        """True where the string equals its uppercase form (pandas ``str.isupper``).
+
+        Returns:
+            A Boolean expression, true for uppercase strings.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ABC", "Abc"]})
+                >>> ds.select(r=bt.col("s").str.is_upper()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self._e == self.upper()
+
+    def is_lower(self) -> Expr:
+        """True where the string equals its lowercase form (pandas ``str.islower``).
+
+        Returns:
+            A Boolean expression, true for lowercase strings.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc", "Abc"]})
+                >>> ds.select(r=bt.col("s").str.is_lower()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self._e == self.lower()
+
+    def capitalize(self) -> Expr:
+        """Uppercase the first character and lowercase the rest (pandas ``str.capitalize``).
+
+        Unlike :meth:`initcap`, which title-cases *every* word, this only touches the
+        first character of the whole string.
+
+        Returns:
+            A Utf8 expression of the capitalized string.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hELLO wORLD"]})
+                >>> ds.select(r=bt.col("s").str.capitalize()).to_pydict()
+                {'r': ['Hello world']}
+        """
+        from batcher.plan.functions.string import concat
+
+        return concat(self.left(1).str.upper(), self.substr(2).str.lower())
+
+    def remove_punctuation(self) -> StrFunc:
+        """Drop every character that is not a word character or whitespace.
+
+        The usual first step of text normalization, before tokenizing or hashing.
+
+        Returns:
+            A Utf8 expression with punctuation removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a,b! c."]})
+                >>> ds.select(r=bt.col("s").str.remove_punctuation()).to_pydict()
+                {'r': ['ab c']}
+        """
+        return self.regexp_replace_all(r"[^\w\s]", "")
+
+    def contains_all(self, patterns: Iterable[str]) -> Expr:
+        """True where the string contains *every* one of the literal `patterns`.
+
+        The conjunctive counterpart to :meth:`contains_any` — an AND of substring tests,
+        for "must mention all of these terms" filters.
+
+        Args:
+            patterns: Literal substrings that must all be present.
+
+        Returns:
+            A Boolean expression, true only when every pattern is a substring.
+
+        Raises:
+            PlanError: If `patterns` is empty.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["cat dog", "cat"]})
+                >>> ds.select(r=bt.col("s").str.contains_all(["cat", "dog"])).to_pydict()
+                {'r': [True, False]}
+        """
+        terms = [StrFunc("contains", self._e, pattern=p) for p in patterns]
+        if not terms:
+            raise PlanError("contains_all() requires at least one pattern")
+        result: Expr = terms[0]
+        for term in terms[1:]:
+            result = result & term
+        return result
+
+    def count_char(self, char: str) -> StrFunc:
+        """Count occurrences of a literal substring (→ Int64).
+
+        The literal is regex-escaped, so punctuation is matched exactly rather than
+        interpreted — the difference between counting ``"."`` and counting every
+        character.
+
+        Args:
+            char: The literal substring to count.
+
+        Returns:
+            An Int64 expression of the number of occurrences.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a.b.c", "abc"]})
+                >>> ds.select(r=bt.col("s").str.count_char(".")).to_pydict()
+                {'r': [2, 0]}
+        """
+        return self.regexp_count(re.escape(char))
+
+    # --- LLM training-data quality heuristics ---------------------------------------
+    # The character-class ratios and shape statistics that Gopher / C4 / RefinedWeb-style
+    # filters threshold on to drop boilerplate, markup dumps, and machine-generated text
+    # from a pretraining corpus. Each is one regex count over the row, so a whole corpus
+    # is scored in a single vectorized pass rather than a Python loop.
+
+    def _char_ratio(self, pattern: str) -> Expr:
+        """Fraction of characters matching `pattern`; null for an empty string."""
+        from batcher.plan.expr_ir.constructors import lit, nullif
+
+        return self.regexp_count(pattern) / nullif(self.len(), lit(0))
+
+    def alpha_ratio(self) -> Expr:
+        """Fraction of characters that are ASCII letters — the core text-density signal.
+
+        Pretraining filters drop rows below roughly 0.6-0.7, which removes tables, logs,
+        and ID dumps. A ratio in ``[0, 1]``; an empty string yields null rather than
+        dividing by zero.
+
+        Returns:
+            A Float64 expression of the ratio.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["Hello 123"]})
+                >>> ds.select(r=bt.col("s").str.alpha_ratio().round(3)).to_pydict()
+                {'r': [0.556]}
+        """
+        return self._char_ratio(r"[A-Za-z]")
+
+    def digit_ratio(self) -> Expr:
+        """Fraction of characters that are digits — high values mark tables and logs.
+
+        A ratio in ``[0, 1]``; an empty string yields null rather than dividing by zero.
+
+        Returns:
+            A Float64 expression of the ratio.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["Hello 123"]})
+                >>> ds.select(r=bt.col("s").str.digit_ratio().round(3)).to_pydict()
+                {'r': [0.333]}
+        """
+        return self._char_ratio(r"[0-9]")
+
+    def uppercase_ratio(self) -> Expr:
+        """Fraction of characters that are uppercase letters — high values mark shouting or headers.
+
+        A ratio in ``[0, 1]``; an empty string yields null rather than dividing by zero.
+
+        Returns:
+            A Float64 expression of the ratio.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ABc de"]})
+                >>> ds.select(r=bt.col("s").str.uppercase_ratio().round(3)).to_pydict()
+                {'r': [0.333]}
+        """
+        return self._char_ratio(r"[A-Z]")
+
+    def lowercase_ratio(self) -> Expr:
+        """Fraction of characters that are lowercase letters.
+
+        A ratio in ``[0, 1]``; an empty string yields null rather than dividing by zero.
+
+        Returns:
+            A Float64 expression of the ratio.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ABc de"]})
+                >>> ds.select(r=bt.col("s").str.lowercase_ratio().round(3)).to_pydict()
+                {'r': [0.5]}
+        """
+        return self._char_ratio(r"[a-z]")
+
+    def punctuation_ratio(self) -> Expr:
+        """Fraction of characters that are punctuation or symbols.
+
+        A ratio in ``[0, 1]``; an empty string yields null rather than dividing by zero.
+
+        Returns:
+            A Float64 expression of the ratio.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hi!! ok"]})
+                >>> ds.select(r=bt.col("s").str.punctuation_ratio().round(3)).to_pydict()
+                {'r': [0.286]}
+        """
+        return self._char_ratio(r"[^\w\s]")
+
+    def whitespace_ratio(self) -> Expr:
+        """Fraction of characters that are whitespace — high values mark broken layout.
+
+        A ratio in ``[0, 1]``; an empty string yields null rather than dividing by zero.
+
+        Returns:
+            A Float64 expression of the ratio.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a b c"]})
+                >>> ds.select(r=bt.col("s").str.whitespace_ratio().round(3)).to_pydict()
+                {'r': [0.4]}
+        """
+        return self._char_ratio(r"\s")
+
+    def non_ascii_ratio(self) -> Expr:
+        """Fraction of characters outside ASCII — a language and mojibake signal.
+
+        A ratio in ``[0, 1]``; an empty string yields null rather than dividing by zero.
+
+        Returns:
+            A Float64 expression of the ratio.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["café x"]})
+                >>> ds.select(r=bt.col("s").str.non_ascii_ratio().round(3)).to_pydict()
+                {'r': [0.167]}
+        """
+        return self._char_ratio(r"[^\x00-\x7F]")
+
+    def alnum_ratio(self) -> Expr:
+        """Fraction of characters that are letters or digits.
+
+        A ratio in ``[0, 1]``; an empty string yields null rather than dividing by zero.
+
+        Returns:
+            A Float64 expression of the ratio.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ab!12"]})
+                >>> ds.select(r=bt.col("s").str.alnum_ratio().round(3)).to_pydict()
+                {'r': [0.8]}
+        """
+        return self._char_ratio(r"[A-Za-z0-9]")
+
+    def non_ascii_count(self) -> StrFunc:
+        """Count characters outside the ASCII range (→ Int64).
+
+        Returns:
+            An Int64 expression of the non-ASCII character count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["caf\u00e9 na\u00efve"]})
+                >>> ds.select(r=bt.col("s").str.non_ascii_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count(r"[^\x00-\x7F]")
+
+    def line_count(self) -> Expr:
+        r"""Number of lines, counting newline separators plus one (→ Int64).
+
+        Returns:
+            An Int64 expression of the line count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a\nb\nc"]})
+                >>> ds.select(r=bt.col("s").str.line_count()).to_pydict()
+                {'r': [3]}
+        """
+        return self.regexp_count("\n") + 1
+
+    def mean_line_length(self) -> Expr:
+        r"""Average characters per line — short means mark navigation and link dumps.
+
+        Returns:
+            A Float64 expression of the mean line length.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ab\ncdef"]})
+                >>> ds.select(r=bt.col("s").str.mean_line_length().round(2)).to_pydict()
+                {'r': [3.5]}
+        """
+        return self.len() / self.line_count()
+
+    def avg_word_length(self) -> Expr:
+        """Average letters per whitespace-separated word — a tokenizer-free text-shape signal.
+
+        Gopher-style filters drop rows outside roughly 3-10, which catches both
+        character-spam and concatenated-identifier dumps.
+
+        Returns:
+            A Float64 expression of the mean word length.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["alpha beta"]})
+                >>> ds.select(r=bt.col("s").str.avg_word_length().round(2)).to_pydict()
+                {'r': [4.5]}
+        """
+        from batcher.plan.expr_ir.constructors import lit, nullif
+
+        return self.regexp_count("[A-Za-z]") / nullif(self.word_count(), lit(0))
+
+    def url_count(self) -> StrFunc:
+        """Count HTTP(S) URLs in the string (→ Int64) — a boilerplate/link-dump signal.
+
+        Returns:
+            An Int64 expression of the URL count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["see http://a.com and https://b.io"]})
+                >>> ds.select(r=bt.col("s").str.url_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count(r"https?://\S+")
+
+    def email_count(self) -> StrFunc:
+        """Count email addresses in the string (→ Int64) — a PII and scrape-noise signal.
+
+        Returns:
+            An Int64 expression of the email count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a@b.com and c@d.org"]})
+                >>> ds.select(r=bt.col("s").str.email_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count(r"[\w.+-]+@[\w-]+\.[\w.]+")
+
+    # --- corpus cleaning and detection ----------------------------------------------
+
+    _URL_RE = r"https?://\S+"
+    _EMAIL_RE = r"[\w.+-]+@[\w-]+\.[\w.]+"
+    _NON_ASCII_RE = r"[^\x00-\x7F]"
+
+    def remove_urls(self) -> StrFunc:
+        """Strip HTTP(S) URLs from the text — the first step of web-corpus cleaning.
+
+        Returns:
+            A Utf8 expression with URLs removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["see http://a.com now"]})
+                >>> ds.select(r=bt.col("s").str.remove_urls()).to_pydict()
+                {'r': ['see  now']}
+        """
+        return self.regexp_replace_all(self._URL_RE, "")
+
+    def remove_emails(self) -> StrFunc:
+        """Strip email addresses from the text — a cheap PII scrub before training.
+
+        Returns:
+            A Utf8 expression with email addresses removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["mail me a@b.com"]})
+                >>> ds.select(r=bt.col("s").str.remove_emails()).to_pydict()
+                {'r': ['mail me ']}
+        """
+        return self.regexp_replace_all(self._EMAIL_RE, "")
+
+    def remove_non_ascii(self) -> StrFunc:
+        """Drop every character outside ASCII — the blunt mojibake/emoji scrub.
+
+        Returns:
+            A Utf8 expression containing only ASCII characters.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["café x"]})
+                >>> ds.select(r=bt.col("s").str.remove_non_ascii()).to_pydict()
+                {'r': ['caf x']}
+        """
+        return self.regexp_replace_all(self._NON_ASCII_RE, "")
+
+    def remove_digits(self) -> StrFunc:
+        """Drop every digit character — used to normalize IDs out of near-duplicate keys.
+
+        Returns:
+            A Utf8 expression with digits removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc 123"]})
+                >>> ds.select(r=bt.col("s").str.remove_digits()).to_pydict()
+                {'r': ['abc ']}
+        """
+        return self.regexp_replace_all("[0-9]", "")
+
+    def truncate_chars(self, n: int) -> StrFunc:
+        """Keep at most the first `n` characters — a hard context-window guard.
+
+        Args:
+            n: Maximum characters to keep.
+
+        Returns:
+            A Utf8 expression truncated to `n` characters.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abcdefgh"]})
+                >>> ds.select(r=bt.col("s").str.truncate_chars(3)).to_pydict()
+                {'r': ['abc']}
+        """
+        return self.left(n)
+
+    def truncate_words(self, n: int) -> StrFunc:
+        """Keep at most the first `n` whitespace-separated words, without splitting one.
+
+        Prompt and chunk builders need a budget that never cuts mid-token; this trims on
+        a word boundary instead.
+
+        Args:
+            n: Maximum words to keep (must be >= 1).
+
+        Returns:
+            A Utf8 expression truncated to `n` words.
+
+        Raises:
+            PlanError: If `n` < 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["one two three four"]})
+                >>> ds.select(r=bt.col("s").str.truncate_words(2)).to_pydict()
+                {'r': ['one two']}
+        """
+        if n < 1:
+            raise PlanError(f"truncate_words(): n must be >= 1, got {n}")
+        return self.regexp_extract(r"^(?:\S+\s+){0," + str(n - 1) + r"}\S+", 0)
+
+    def has_url(self) -> StrFunc:
+        """True where the text contains an HTTP(S) URL.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["see http://a.com", "plain"]})
+                >>> ds.select(r=bt.col("s").str.has_url()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(self._URL_RE)
+
+    def has_email(self) -> StrFunc:
+        """True where the text contains an email address — a PII pre-filter.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a@b.com", "plain"]})
+                >>> ds.select(r=bt.col("s").str.has_email()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(self._EMAIL_RE)
+
+    def has_non_ascii(self) -> StrFunc:
+        """True where the text contains any character outside ASCII.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["café", "plain"]})
+                >>> ds.select(r=bt.col("s").str.has_non_ascii()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(self._NON_ASCII_RE)
+
+    def has_digits(self) -> StrFunc:
+        """True where the text contains at least one digit.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1", "ab"]})
+                >>> ds.select(r=bt.col("s").str.has_digits()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches("[0-9]")
+
+    def is_blank(self) -> StrFunc:
+        """True where the text is empty or only whitespace — the empty-document filter.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["   ", "a"]})
+                >>> ds.select(r=bt.col("s").str.is_blank()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"^\s*$")
+
+    def looks_like_json(self) -> StrFunc:
+        """True where the text is shaped like a JSON object or array (a cheap pre-check).
+
+        Tests only the outer delimiters, so it is a fast filter to run before the real
+        parse — the shape check an LLM structured-output pipeline needs before decoding.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ['{"a": 1}', "not json"]})
+                >>> ds.select(r=bt.col("s").str.looks_like_json()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"^\s*[\{\[].*[\}\]]\s*$")
+
+    def estimate_tokens(self, chars_per_token: float = 4.0) -> Expr:
+        """Approximate LLM token count as ``len / chars_per_token`` (→ Int64).
+
+        The standard tokenizer-free estimate (~4 characters per token for English GPT-style
+        vocabularies). Use it to budget context windows or batch by cost without paying to
+        run a real tokenizer over the corpus.
+
+        Args:
+            chars_per_token: Characters per token to assume.
+
+        Returns:
+            An Int64 expression of the estimated token count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abcdefgh"]})
+                >>> ds.select(r=bt.col("s").str.estimate_tokens()).to_pydict()
+                {'r': [2]}
+        """
+        from batcher.plan.expr_ir.core import Lit
+
+        return (self.len() / Lit(chars_per_token)).cast("int64")
+
+    def fits_token_budget(self, budget: int, chars_per_token: float = 4.0) -> Expr:
+        """True where :meth:`estimate_tokens` is within `budget` — the context-window filter.
+
+        Args:
+            budget: The maximum estimated tokens allowed.
+            chars_per_token: Characters per token to assume.
+
+        Returns:
+            A Boolean expression, true for rows that fit.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abcd", "abcdefghijkl"]})
+                >>> ds.select(r=bt.col("s").str.fits_token_budget(2)).to_pydict()
+                {'r': [True, False]}
+        """
+        from batcher.plan.expr_ir.core import Lit
+
+        return self.estimate_tokens(chars_per_token) <= Lit(budget)
+
+    def sentence_count(self) -> StrFunc:
+        """Count sentence-ending punctuation marks (→ Int64) — a document-shape signal.
+
+        Returns:
+            An Int64 expression of the sentence count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["One. Two! Three?"]})
+                >>> ds.select(r=bt.col("s").str.sentence_count()).to_pydict()
+                {'r': [3]}
+        """
+        return self.regexp_count(r"[.!?]")
+
+    def has_html(self) -> StrFunc:
+        """True where the text still contains HTML tags — the un-stripped-markup check.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["<p>hi</p>", "plain"]})
+                >>> ds.select(r=bt.col("s").str.has_html()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches("<[^>]+>")
+
+    def remove_html_tags(self) -> StrFunc:
+        """Delete HTML tags, keeping their text content.
+
+        The blunt tag-stripper; :meth:`strip_html` is the smarter one that also drops
+        ``<script>``/``<style>`` bodies and decodes entities.
+
+        Returns:
+            A Utf8 expression with tags removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["<p>hi</p> there"]})
+                >>> ds.select(r=bt.col("s").str.remove_html_tags()).to_pydict()
+                {'r': ['hi there']}
+        """
+        return self.regexp_replace_all("<[^>]+>", "")
+
+    def is_ascii_only(self) -> Expr:
+        """True where every character is ASCII — the inverse of :meth:`has_non_ascii`.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["plain", "café"]})
+                >>> ds.select(r=bt.col("s").str.is_ascii_only()).to_pydict()
+                {'r': [True, False]}
+        """
+        return ~self.has_non_ascii()
+
+    def starts_with_bullet(self) -> StrFunc:
+        """True where the line opens with a list bullet (``-``, ``*``, or ``+``).
+
+        Gopher-style filters drop documents whose lines are mostly bullets, which is how
+        navigation menus and link lists are removed from a corpus.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["- item", "prose"]})
+                >>> ds.select(r=bt.col("s").str.starts_with_bullet()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"^\s*[-*+]\s")
+
+    _PHONE_RE = r"\d{3}[-.\s]\d{3}[-.\s]\d{4}"
+
+    def has_phone(self) -> StrFunc:
+        """True where the text contains a phone-number-shaped run of digits.
+
+        A PII pre-filter, matching the common ``NNN-NNN-NNNN`` grouping.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["call 555-123-4567", "no digits"]})
+                >>> ds.select(r=bt.col("s").str.has_phone()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(self._PHONE_RE)
+
+    def phone_count(self) -> StrFunc:
+        """Count phone-number-shaped runs of digits (→ Int64).
+
+        Returns:
+            An Int64 expression of the match count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["555-123-4567 and 555.987.6543"]})
+                >>> ds.select(r=bt.col("s").str.phone_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count(self._PHONE_RE)
+
+    def remove_phones(self) -> StrFunc:
+        """Strip phone-number-shaped digit runs — a PII scrub alongside `remove_emails`.
+
+        Returns:
+            A Utf8 expression with phone numbers removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["Call 555-123-4567 now"]})
+                >>> ds.select(r=bt.col("s").str.remove_phones()).to_pydict()
+                {'r': ['Call  now']}
+        """
+        return self.regexp_replace_all(self._PHONE_RE, "")
+
+    def mask_emails(self, replacement: str = "[EMAIL]") -> StrFunc:
+        """Replace email addresses with a placeholder token, keeping the sentence shape.
+
+        Preferred over deletion for training data: the model still sees that an address
+        was there, without memorizing it.
+
+        Args:
+            replacement: The token to substitute for each address.
+
+        Returns:
+            A Utf8 expression with addresses masked.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["mail a@b.com now"]})
+                >>> ds.select(r=bt.col("s").str.mask_emails()).to_pydict()
+                {'r': ['mail [EMAIL] now']}
+        """
+        return self.regexp_replace_all(self._EMAIL_RE, replacement)
+
+    def mask_urls(self, replacement: str = "[URL]") -> StrFunc:
+        """Replace HTTP(S) URLs with a placeholder token, keeping the sentence shape.
+
+        Args:
+            replacement: The token to substitute for each URL.
+
+        Returns:
+            A Utf8 expression with URLs masked.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["see http://a.com now"]})
+                >>> ds.select(r=bt.col("s").str.mask_urls()).to_pydict()
+                {'r': ['see [URL] now']}
+        """
+        return self.regexp_replace_all(self._URL_RE, replacement)
+
+    def uppercase_word_count(self) -> StrFunc:
+        """Count all-caps words of two or more letters (→ Int64) — a shouting/header signal.
+
+        Returns:
+            An Int64 expression of the all-caps word count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["HELLO WORLD ok"]})
+                >>> ds.select(r=bt.col("s").str.uppercase_word_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count(r"\b[A-Z]{2,}\b")
+
+    def long_word_count(self, min_length: int = 5) -> StrFunc:
+        """Count words of at least `min_length` characters (→ Int64).
+
+        Args:
+            min_length: The minimum word length to count.
+
+        Returns:
+            An Int64 expression of the long-word count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["HELLO WORLD ok"]})
+                >>> ds.select(r=bt.col("s").str.long_word_count(5)).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count(r"\b\w{" + str(min_length) + r",}\b")
+
+    def hashtag_count(self) -> StrFunc:
+        """Count ``#hashtag`` tokens (→ Int64) — a social-media provenance signal.
+
+        Returns:
+            An Int64 expression of the hashtag count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["#a and #b"]})
+                >>> ds.select(r=bt.col("s").str.hashtag_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count(r"#\w+")
+
+    def mention_count(self) -> StrFunc:
+        """Count ``@mention`` tokens (→ Int64) — a social-media provenance signal.
+
+        Returns:
+            An Int64 expression of the mention count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["@a and @b"]})
+                >>> ds.select(r=bt.col("s").str.mention_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count(r"@\w+")
+
+    def symbol_to_word_ratio(self) -> Expr:
+        """Punctuation characters per word — high values mark markup and ASCII art.
+
+        A Gopher-style filter threshold; an empty string yields null rather than dividing
+        by zero.
+
+        Returns:
+            A Float64 expression of the symbol-to-word ratio.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hi there!!"]})
+                >>> ds.select(r=bt.col("s").str.symbol_to_word_ratio()).to_pydict()
+                {'r': [1.0]}
+        """
+        from batcher.plan.expr_ir.constructors import lit, nullif
+
+        return self.regexp_count(r"[^\w\s]") / nullif(self.word_count(), lit(0))
+
+    def paragraph_count(self) -> Expr:
+        r"""Count paragraphs, separated by a blank line (→ Int64).
+
+        Returns:
+            An Int64 expression of the paragraph count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["one\n\ntwo"]})
+                >>> ds.select(r=bt.col("s").str.paragraph_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count(r"\n\s*\n") + 1
+
+    def code_fence_count(self) -> StrFunc:
+        """Count Markdown code fences (→ Int64) — a code-content signal.
+
+        Returns:
+            An Int64 expression of the fence count (two per fenced block).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["text ```x``` end"]})
+                >>> ds.select(r=bt.col("s").str.code_fence_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count("```")
+
+    def looks_like_code(self) -> StrFunc:
+        """True where the text shows source-code punctuation or keywords — a coarse filter.
+
+        Matches braces, semicolons, or a ``def``/``if (`` opener. Useful to route code out
+        of a prose corpus (or to keep only code for a code model).
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["if (x) { y; }", "plain prose"]})
+                >>> ds.select(r=bt.col("s").str.looks_like_code()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"[{};]|\bdef\b|\bif\s*\(")
+
+    def has_repeated_punctuation(self) -> StrFunc:
+        """True where three or more sentence marks run together, as in ``"Wow!!!"``.
+
+        A low-quality/emphatic-text signal used when filtering scraped corpora.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["Wow!!! really", "calm."]})
+                >>> ds.select(r=bt.col("s").str.has_repeated_punctuation()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"[!?.]{3,}")
+
+    def is_single_line(self) -> Expr:
+        r"""True where the text contains no newline — a title/snippet check.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["one line", "two\nlines"]})
+                >>> ds.select(r=bt.col("s").str.is_single_line()).to_pydict()
+                {'r': [True, False]}
+        """
+        return ~self.regexp_matches("\n")
+
+    def ends_with_punctuation(self) -> StrFunc:
+        """True where the text ends in ``.``, ``!``, or ``?`` — a truncation check.
+
+        A document that stops mid-sentence is usually a bad crawl or a cut-off chunk.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["complete.", "cut off mid"]})
+                >>> ds.select(r=bt.col("s").str.ends_with_punctuation()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"[.!?]\s*$")
+
+    def quote_count(self) -> StrFunc:
+        """Count double-quote characters (→ Int64) — a dialogue/citation signal.
+
+        Returns:
+            An Int64 expression of the quote count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ['say "hi" now']})
+                >>> ds.select(r=bt.col("s").str.quote_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count('"')
+
+    def paren_count(self) -> StrFunc:
+        """Count parenthesis characters (→ Int64) — a citation/code density signal.
+
+        Returns:
+            An Int64 expression of the parenthesis count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a (b) c"]})
+                >>> ds.select(r=bt.col("s").str.paren_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count(r"[()]")
+
+    def digit_to_word_ratio(self) -> Expr:
+        """Digit characters per word — high values mark tables, logs, and ID dumps.
+
+        An empty string yields null rather than dividing by zero.
+
+        Returns:
+            A Float64 expression of the digit-to-word ratio.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a 1 2"]})
+                >>> ds.select(r=bt.col("s").str.digit_to_word_ratio().round(3)).to_pydict()
+                {'r': [0.667]}
+        """
+        from batcher.plan.expr_ir.constructors import lit, nullif
+
+        return self.regexp_count("[0-9]") / nullif(self.word_count(), lit(0))
+
+    def newline_count(self) -> StrFunc:
+        r"""Count newline characters (→ Int64).
+
+        Returns:
+            An Int64 expression of the newline count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a\nb\nc"]})
+                >>> ds.select(r=bt.col("s").str.newline_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count("\n")
+
+    def tab_count(self) -> StrFunc:
+        r"""Count tab characters (→ Int64) — a pasted-table signal.
+
+        Returns:
+            An Int64 expression of the tab count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a\tb"]})
+                >>> ds.select(r=bt.col("s").str.tab_count()).to_pydict()
+                {'r': [1]}
+        """
+        return self.regexp_count("\t")
+
+    def space_count(self) -> StrFunc:
+        """Count space characters (→ Int64).
+
+        Returns:
+            An Int64 expression of the space count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a b c"]})
+                >>> ds.select(r=bt.col("s").str.space_count()).to_pydict()
+                {'r': [2]}
+        """
+        return self.regexp_count(" ")
+
+    def is_short(self, max_chars: int) -> Expr:
+        """True where the text is at most `max_chars` long — the stub-document filter.
+
+        Args:
+            max_chars: The inclusive maximum length.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hi", "a longer document"]})
+                >>> ds.select(r=bt.col("s").str.is_short(5)).to_pydict()
+                {'r': [True, False]}
+        """
+        from batcher.plan.expr_ir.core import Lit
+
+        return self.len() <= Lit(max_chars)
+
+    def is_long(self, min_chars: int) -> Expr:
+        """True where the text is at least `min_chars` long.
+
+        Args:
+            min_chars: The inclusive minimum length.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hi", "a longer document"]})
+                >>> ds.select(r=bt.col("s").str.is_long(5)).to_pydict()
+                {'r': [False, True]}
+        """
+        from batcher.plan.expr_ir.core import Lit
+
+        return self.len() >= Lit(min_chars)
+
+    def is_question(self) -> StrFunc:
+        """True where the text ends in a question mark.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["why?", "because."]})
+                >>> ds.select(r=bt.col("s").str.is_question()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"\?\s*$")
+
+    def is_exclamation(self) -> StrFunc:
+        """True where the text ends in an exclamation mark.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["wow!", "ok."]})
+                >>> ds.select(r=bt.col("s").str.is_exclamation()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"!\s*$")
+
+    def starts_with_capital(self) -> StrFunc:
+        """True where the text begins with an uppercase letter — a prose-shape signal.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["Hello", "hello"]})
+                >>> ds.select(r=bt.col("s").str.starts_with_capital()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches("^[A-Z]")
+
+    def is_all_caps(self) -> Expr:
+        """True where the text has letters and none of them are lowercase.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["LOUD TEXT", "Normal text"]})
+                >>> ds.select(r=bt.col("s").str.is_all_caps()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches("[A-Z]") & ~self.regexp_matches("[a-z]")
+
+    def word_char_ratio(self) -> Expr:
+        """Word characters per total character — the inverse of markup/symbol density.
+
+        An empty string yields null rather than dividing by zero.
+
+        Returns:
+            A Float64 expression of the ratio.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["ab!!"]})
+                >>> ds.select(r=bt.col("s").str.word_char_ratio()).to_pydict()
+                {'r': [0.5]}
+        """
+        return self._char_ratio(r"\w")
+
+    def extract_urls(self) -> StrFunc:
+        """Every HTTP(S) URL in the text, as a ``List<Utf8>`` — link harvesting.
+
+        Returns:
+            A List expression of the URLs found.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a http://x.co b"]})
+                >>> ds.select(r=bt.col("s").str.extract_urls()).to_pydict()
+                {'r': [['http://x.co']]}
+        """
+        return self.regexp_extract_all(self._URL_RE)
+
+    def extract_emails(self) -> StrFunc:
+        """Every email address in the text, as a ``List<Utf8>`` — PII auditing.
+
+        Returns:
+            A List expression of the addresses found.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a@b.com and c@d.org"]})
+                >>> ds.select(r=bt.col("s").str.extract_emails()).to_pydict()
+                {'r': [['a@b.com', 'c@d.org']]}
+        """
+        return self.regexp_extract_all(self._EMAIL_RE)
+
+    def extract_numbers(self) -> StrFunc:
+        """Every run of digits in the text, as a ``List<Utf8>``.
+
+        Returns:
+            A List expression of the digit runs found.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a 42 b 7"]})
+                >>> ds.select(r=bt.col("s").str.extract_numbers()).to_pydict()
+                {'r': [['42', '7']]}
+        """
+        return self.regexp_extract_all("[0-9]+")
+
+    def extract_hashtags(self) -> StrFunc:
+        """Every ``#hashtag`` in the text, as a ``List<Utf8>``.
+
+        Returns:
+            A List expression of the hashtags found.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["#a and #b"]})
+                >>> ds.select(r=bt.col("s").str.extract_hashtags()).to_pydict()
+                {'r': [['#a', '#b']]}
+        """
+        return self.regexp_extract_all(r"#\w+")
+
+    def extract_mentions(self) -> StrFunc:
+        """Every ``@mention`` in the text, as a ``List<Utf8>``.
+
+        Returns:
+            A List expression of the mentions found.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["@a and @b"]})
+                >>> ds.select(r=bt.col("s").str.extract_mentions()).to_pydict()
+                {'r': [['@a', '@b']]}
+        """
+        return self.regexp_extract_all(r"@\w+")
+
+    def first_sentence(self) -> StrFunc:
+        """The text up to and including the first sentence mark — a snippet/summary field.
+
+        Returns:
+            A Utf8 expression of the first sentence, empty if there is no sentence mark.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["One. Two."]})
+                >>> ds.select(r=bt.col("s").str.first_sentence()).to_pydict()
+                {'r': ['One.']}
+        """
+        return self.regexp_extract(r"^[^.!?]*[.!?]", 0)
+
+    def first_word(self) -> StrFunc:
+        """The first whitespace-separated token.
+
+        Returns:
+            A Utf8 expression of the first word.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello big world"]})
+                >>> ds.select(r=bt.col("s").str.first_word()).to_pydict()
+                {'r': ['hello']}
+        """
+        return self.regexp_extract(r"^\S+", 0)
+
+    def slugify(self) -> StrFunc:
+        """Lowercase and hyphenate into a URL/identifier-safe slug.
+
+        Runs of non-alphanumeric characters collapse to a single ``-`` and the ends are
+        trimmed — the canonical form for a document id or a dedup key.
+
+        Returns:
+            A Utf8 expression of the slug.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["Hello, World!"]})
+                >>> ds.select(r=bt.col("s").str.slugify()).to_pydict()
+                {'r': ['hello-world']}
+        """
+        return self.lower().str.regexp_replace_all(r"[^a-z0-9]+", "-").str.trim("-")
+
+    def remove_bullets(self) -> StrFunc:
+        """Strip a leading list bullet (``-``, ``*``, or ``+``) and its spacing.
+
+        Returns:
+            A Utf8 expression without the leading bullet.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["- item one"]})
+                >>> ds.select(r=bt.col("s").str.remove_bullets()).to_pydict()
+                {'r': ['item one']}
+        """
+        return self.regexp_replace_all(r"^\s*[-*+]\s+", "")
+
+    def remove_repeated_punctuation(self) -> StrFunc:
+        """Collapse runs of sentence marks to one, turning ``"Wow!!!"`` into ``"Wow!"``.
+
+        Returns:
+            A Utf8 expression with punctuation runs collapsed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["Wow!!! ok"]})
+                >>> ds.select(r=bt.col("s").str.remove_repeated_punctuation()).to_pydict()
+                {'r': ['Wow! ok']}
+        """
+        return self.regexp_replace_all(r"([!?.])[!?.]+", r"\1")
+
+    def remove_markdown_links(self) -> StrFunc:
+        """Reduce ``[text](url)`` to just ``text``, dropping the target.
+
+        Keeps the prose while removing the link noise that would otherwise inflate the
+        symbol ratio of a Markdown corpus.
+
+        Returns:
+            A Utf8 expression with link targets removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["see [text](http://x) here"]})
+                >>> ds.select(r=bt.col("s").str.remove_markdown_links()).to_pydict()
+                {'r': ['see text here']}
+        """
+        return self.regexp_replace_all(r"\[([^\]]*)\]\([^)]*\)", r"\1")
+
+    def remove_code_blocks(self) -> StrFunc:
+        """Delete fenced ``` code blocks, keeping the surrounding prose.
+
+        Returns:
+            A Utf8 expression with fenced blocks removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["text ```py q``` end"]})
+                >>> ds.select(r=bt.col("s").str.remove_code_blocks()).to_pydict()
+                {'r': ['text  end']}
+        """
+        return self.regexp_replace_all(r"```[^`]*```", "")
+
+    def remove_stopwords(self, words: Iterable[str]) -> StrFunc:
+        """Delete whole-word occurrences of `words`, matching either case of the first letter.
+
+        The engine's regex engine has no inline case-insensitive flag, so each word is
+        expanded to its lowercase and capitalized forms.
+
+        Args:
+            words: The stopwords to remove.
+
+        Returns:
+            A Utf8 expression with the stopwords removed.
+
+        Raises:
+            PlanError: If `words` is empty.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["The cat is here"]})
+                >>> ds.select(r=bt.col("s").str.remove_stopwords(["the", "is"])).to_pydict()
+                {'r': [' cat  here']}
+        """
+        forms = [w for word in words for w in (re.escape(word), re.escape(word.capitalize()))]
+        if not forms:
+            raise PlanError("remove_stopwords() requires at least one word")
+        return self.regexp_replace_all(r"\b(?:" + "|".join(forms) + r")\b", "")
+
+    def truncate_sentences(self, n: int) -> StrFunc:
+        """Keep at most the first `n` sentences, cutting on a sentence mark.
+
+        The summary/snippet budget that never leaves a half sentence behind.
+
+        Args:
+            n: Maximum sentences to keep (must be >= 1).
+
+        Returns:
+            A Utf8 expression truncated to `n` sentences.
+
+        Raises:
+            PlanError: If `n` < 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["One. Two! Three?"]})
+                >>> ds.select(r=bt.col("s").str.truncate_sentences(2)).to_pydict()
+                {'r': ['One. Two!']}
+        """
+        if n < 1:
+            raise PlanError(f"truncate_sentences(): n must be >= 1, got {n}")
+        return self.regexp_extract(r"^(?:[^.!?]*[.!?]){1," + str(n) + r"}", 0)
+
+    def avg_sentence_length(self) -> Expr:
+        """Words per sentence — very long or very short values mark non-prose.
+
+        An empty string yields null rather than dividing by zero.
+
+        Returns:
+            A Float64 expression of the mean sentence length in words.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["One two. Three four."]})
+                >>> ds.select(r=bt.col("s").str.avg_sentence_length()).to_pydict()
+                {'r': [2.0]}
+        """
+        from batcher.plan.expr_ir.constructors import lit, nullif
+
+        return self.word_count() / nullif(self.sentence_count(), lit(0))
+
+    def has_currency(self) -> StrFunc:
+        """True where the text contains a currency symbol — a price/commerce signal.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["costs $5", "free"]})
+                >>> ds.select(r=bt.col("s").str.has_currency()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"[$€£¥]")
+
+    def last_word(self) -> StrFunc:
+        """The last whitespace-separated token.
+
+        Returns:
+            A Utf8 expression of the final word.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello big world"]})
+                >>> ds.select(r=bt.col("s").str.last_word()).to_pydict()
+                {'r': ['world']}
+        """
+        return self.regexp_extract(r"\S+$", 0)
+
+    def is_url(self) -> StrFunc:
+        """True where the whole string is a single HTTP(S) URL.
+
+        Stricter than :meth:`has_url` — it rejects prose that merely mentions a link,
+        which is what a link-only-row filter needs.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["http://a.co", "see http://a.co"]})
+                >>> ds.select(r=bt.col("s").str.is_url()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"^https?://\S+$")
+
+    def is_email(self) -> StrFunc:
+        """True where the whole string is a single email address.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a@b.com", "mail a@b.com"]})
+                >>> ds.select(r=bt.col("s").str.is_email()).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(r"^[\w.+-]+@[\w-]+\.[\w.]+$")
+
+    # --- pandas-compatible string spellings -----------------------------------------
+
+    def strip(self, chars: str | None = None) -> StrFunc:
+        """Trim from both ends — the pandas ``str.strip`` spelling of :meth:`trim`.
+
+        Args:
+            chars: The set of characters to strip; whitespace when ``None``.
+
+        Returns:
+            A Utf8 expression with leading and trailing characters removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["  ab  "]})
+                >>> ds.select(r=bt.col("s").str.strip()).to_pydict()
+                {'r': ['ab']}
+        """
+        return self.trim(chars)
+
+    def startswith(self, pattern: str) -> StrFunc:
+        """True where the string starts with `pattern` — the pandas ``str.startswith``.
+
+        Args:
+            pattern: The literal prefix to test for.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc", "xbc"]})
+                >>> ds.select(r=bt.col("s").str.startswith("a")).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.starts_with(pattern)
+
+    def endswith(self, pattern: str) -> StrFunc:
+        """True where the string ends with `pattern` — the pandas ``str.endswith``.
+
+        Args:
+            pattern: The literal suffix to test for.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["abc", "abx"]})
+                >>> ds.select(r=bt.col("s").str.endswith("c")).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.ends_with(pattern)
+
+    def match(self, pattern: str) -> StrFunc:
+        """True where the regex `pattern` matches — the pandas ``str.match``.
+
+        Args:
+            pattern: The regular expression to test.
+
+        Returns:
+            A Boolean expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a1", "ab"]})
+                >>> ds.select(r=bt.col("s").str.match("[a-z][0-9]")).to_pydict()
+                {'r': [True, False]}
+        """
+        return self.regexp_matches(pattern)
+
+    def title(self) -> StrFunc:
+        """Title-case each word — the pandas ``str.title`` spelling of :meth:`initcap`.
+
+        Returns:
+            A Utf8 expression with each word's first letter uppercased.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["hello world"]})
+                >>> ds.select(r=bt.col("s").str.title()).to_pydict()
+                {'r': ['Hello World']}
+        """
+        return self.initcap()
+
+    def removeprefix(self, prefix: str) -> StrFunc:
+        """Drop `prefix` from the start if present, else leave the string unchanged.
+
+        Mirrors Python's ``str.removeprefix``; the literal is regex-escaped, so it is
+        matched exactly.
+
+        Args:
+            prefix: The literal prefix to remove.
+
+        Returns:
+            A Utf8 expression with the prefix removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["id_7", "7"]})
+                >>> ds.select(r=bt.col("s").str.removeprefix("id_")).to_pydict()
+                {'r': ['7', '7']}
+        """
+        return self.regexp_replace("^" + re.escape(prefix), "")
+
+    def removesuffix(self, suffix: str) -> StrFunc:
+        """Drop `suffix` from the end if present, else leave the string unchanged.
+
+        Mirrors Python's ``str.removesuffix``; the literal is regex-escaped.
+
+        Args:
+            suffix: The literal suffix to remove.
+
+        Returns:
+            A Utf8 expression with the suffix removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["7_id", "7"]})
+                >>> ds.select(r=bt.col("s").str.removesuffix("_id")).to_pydict()
+                {'r': ['7', '7']}
+        """
+        return self.regexp_replace(re.escape(suffix) + "$", "")
 
     def position(self, pattern: str) -> StrFunc:
         """Find the 1-based index of ``pattern`` in the string, or 0 if absent.

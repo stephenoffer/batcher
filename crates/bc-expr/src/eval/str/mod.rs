@@ -11,6 +11,7 @@ use crate::{ExprError, StrFunc};
 mod chunk;
 mod html;
 mod json;
+mod like;
 mod minhash;
 mod regex_cache;
 
@@ -23,6 +24,18 @@ pub(crate) fn eval_str(
     start: Option<i64>,
     length: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
+    // Byte-oriented functions (`octet_length`, `bit_length`, `hex`, `md5`, `sha*`,
+    // `base64`, `crc32`, `xxhash64`, `hash64`) are defined on the *raw bytes* of a BLOB
+    // and MUST NOT route through the Utf8 cast below — that cast nulls any row whose
+    // bytes are not valid UTF-8, so e.g. `hex(BLOB '\xDE\xAD\xBE\xEF')` silently became
+    // NULL instead of `'DEADBEEF'`, and `md5`/`sha256`/`base64`/`octet_length` likewise
+    // dropped every non-UTF-8 row. DuckDB's `hex(BLOB)`/`md5(BLOB)`/… operate on the
+    // bytes regardless of textual validity; do the same here.
+    if matches!(arr.data_type(), DataType::Binary | DataType::LargeBinary) {
+        if let Some(out) = eval_bytes(func, arr)? {
+            return Ok(out);
+        }
+    }
     // A `Binary`-typed column (how ClickBench's `hits` string columns arrive — a
     // `BYTE_ARRAY` with no UTF-8 logical annotation) is coerced to `Utf8` so string
     // functions apply, matching DuckDB's VARCHAR treatment. `Binary -> Utf8` validates
@@ -54,15 +67,15 @@ pub(crate) fn eval_str(
         ),
         StrFunc::Contains => {
             let pat = require_pattern(pattern, func)?;
-            Arc::new(map_bool(s, |v| v.contains(pat)))
+            Arc::new(like::LikeMatcher::contains(pat).eval(s))
         }
         StrFunc::StartsWith => {
             let pat = require_pattern(pattern, func)?;
-            Arc::new(map_bool(s, |v| v.starts_with(pat)))
+            Arc::new(like::LikeMatcher::starts_with(pat).eval(s))
         }
         StrFunc::EndsWith => {
             let pat = require_pattern(pattern, func)?;
-            Arc::new(map_bool(s, |v| v.ends_with(pat)))
+            Arc::new(like::LikeMatcher::ends_with(pat).eval(s))
         }
         StrFunc::Substr => {
             // SQL semantics: 1-based start; `length` optional (to end of string).
@@ -183,8 +196,16 @@ pub(crate) fn eval_str(
         }
         StrFunc::Like | StrFunc::Ilike => {
             let pat = require_pattern(pattern, func)?;
-            let re = like_regex(pat, matches!(func, StrFunc::Ilike))?;
-            Arc::new(map_bool(s, |v| re.is_match(v)))
+            // Case-sensitive `LIKE` with no `_` desugars to an ordered substring scan (the fast
+            // path); `_` (single-char wildcard) and `ILIKE` (Unicode case-folding) keep the
+            // cached anchored regex, which the matcher wraps so both go through one `eval`.
+            let ci = matches!(func, StrFunc::Ilike);
+            let matcher = if ci || pat.contains('_') {
+                like::LikeMatcher::Regex(like_regex(pat, ci)?)
+            } else {
+                like::LikeMatcher::classify(pat)
+            };
+            Arc::new(matcher.eval(s))
         }
         StrFunc::RegexpReplace => {
             let re = compile_regex(pattern, func)?;
@@ -615,10 +636,119 @@ fn initcap(v: &str) -> String {
     out
 }
 
+/// Byte-oriented string functions applied directly to a `Binary`/`LargeBinary` column,
+/// bypassing the Utf8 cast that nulls non-UTF-8 rows. Returns `Some(array)` for the
+/// functions defined over raw bytes (matching DuckDB's `hex`/`md5`/`sha*`/`base64`/
+/// `octet_length` over a BLOB), and `None` for a text-oriented function so the caller
+/// falls back to the Utf8 path.
+fn eval_bytes(func: StrFunc, arr: &ArrayRef) -> Result<Option<ArrayRef>, ExprError> {
+    use arrow::array::{BinaryArray, LargeBinaryArray};
+    // Iterate the rows as `Option<&[u8]>` for either binary offset width.
+    let bytes: Vec<Option<&[u8]>> = match arr.data_type() {
+        DataType::Binary => arr
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("binary")
+            .iter()
+            .collect(),
+        DataType::LargeBinary => arr
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("large binary")
+            .iter()
+            .collect(),
+        _ => return Ok(None),
+    };
+    let out: ArrayRef = match func {
+        StrFunc::OctetLength => Arc::new(
+            bytes
+                .iter()
+                .map(|o| o.map(|v| v.len() as i64))
+                .collect::<Int64Array>(),
+        ),
+        StrFunc::BitLength => Arc::new(
+            bytes
+                .iter()
+                .map(|o| o.map(|v| (v.len() as i64) * 8))
+                .collect::<Int64Array>(),
+        ),
+        StrFunc::Hex => Arc::new(
+            bytes
+                .iter()
+                .map(|o| o.map(hex_upper))
+                .collect::<StringArray>(),
+        ),
+        StrFunc::Md5 => {
+            use md5::{Digest, Md5};
+            Arc::new(
+                bytes
+                    .iter()
+                    .map(|o| o.map(|v| hex_lower(Md5::digest(v).as_slice())))
+                    .collect::<StringArray>(),
+            )
+        }
+        StrFunc::Sha1 => {
+            use sha1::{Digest, Sha1};
+            Arc::new(
+                bytes
+                    .iter()
+                    .map(|o| o.map(|v| hex_lower(Sha1::digest(v).as_slice())))
+                    .collect::<StringArray>(),
+            )
+        }
+        StrFunc::Sha256 => {
+            use sha2::{Digest, Sha256};
+            Arc::new(
+                bytes
+                    .iter()
+                    .map(|o| o.map(|v| hex_lower(Sha256::digest(v).as_slice())))
+                    .collect::<StringArray>(),
+            )
+        }
+        StrFunc::Base64 => {
+            use base64::Engine as _;
+            Arc::new(
+                bytes
+                    .iter()
+                    .map(|o| o.map(|v| base64::engine::general_purpose::STANDARD.encode(v)))
+                    .collect::<StringArray>(),
+            )
+        }
+        StrFunc::Crc32 => Arc::new(
+            bytes
+                .iter()
+                .map(|o| o.map(|v| crc32fast::hash(v) as i64))
+                .collect::<Int64Array>(),
+        ),
+        StrFunc::XxHash64 => Arc::new(
+            bytes
+                .iter()
+                .map(|o| o.map(|v| xxhash64(v) as i64))
+                .collect::<Int64Array>(),
+        ),
+        StrFunc::Hash64 => Arc::new(
+            bytes
+                .iter()
+                .map(|o| o.map(|v| fnv1a64(v) as i64))
+                .collect::<Int64Array>(),
+        ),
+        // Text-oriented function — defer to the Utf8 path.
+        _ => return Ok(None),
+    };
+    Ok(Some(out))
+}
+
 /// Uppercase hexadecimal of the UTF-8 bytes (DuckDB `hex`).
 fn hex_encode(v: &str) -> String {
-    let mut out = String::with_capacity(v.len() * 2);
-    for b in v.as_bytes() {
+    hex_upper(v.as_bytes())
+}
+
+/// Uppercase hexadecimal of arbitrary bytes — DuckDB `hex(BLOB)`, which operates on
+/// the raw bytes regardless of UTF-8 validity (the byte-oriented sibling of
+/// [`hex_encode`]).
+fn hex_upper(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         out.push(
             char::from_digit((b >> 4) as u32, 16)
                 .unwrap_or('0')
@@ -1063,6 +1193,55 @@ mod tests {
         assert_eq!(got.value(0), 5);
         assert_eq!(got.value(1), 0);
         assert!(got.is_null(2));
+    }
+
+    /// Byte-oriented functions over a `Binary` column with **non-UTF-8** bytes operate on
+    /// the raw bytes (DuckDB `hex`/`md5`/`sha256`/`base64`/`octet_length` over a BLOB),
+    /// instead of routing through the Utf8 cast that nulled every non-textual row.
+    /// Regression: `hex(BLOB '\xDE\xAD\xBE\xEF')` used to return NULL, not `'DEADBEEF'`.
+    #[test]
+    fn byte_functions_over_non_utf8_binary_use_the_raw_bytes() {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, StringArray};
+        use md5::{Digest, Md5};
+        use sha2::Sha256;
+        use std::sync::Arc;
+
+        // `\xDE\xAD\xBE\xEF` is not valid UTF-8 (a stray continuation byte at index 2).
+        let raw = &[0xDEu8, 0xAD, 0xBE, 0xEF];
+        let bin: ArrayRef = Arc::new(BinaryArray::from_opt_vec(vec![
+            Some(raw.as_ref()),
+            Some(b""),
+            None,
+        ]));
+
+        let str_of = |f: StrFunc| {
+            let out = eval_str(f, &bin, None, None, None, None).unwrap();
+            let a = out.as_any().downcast_ref::<StringArray>().unwrap();
+            (a.value(0).to_string(), a.value(1).to_string(), a.is_null(2))
+        };
+        let int_of = |f: StrFunc| {
+            let out = eval_str(f, &bin, None, None, None, None).unwrap();
+            let a = out.as_any().downcast_ref::<Int64Array>().unwrap();
+            (a.value(0), a.value(1), a.is_null(2))
+        };
+
+        assert_eq!(int_of(StrFunc::OctetLength), (4, 0, true));
+        assert_eq!(int_of(StrFunc::BitLength), (32, 0, true));
+        assert_eq!(
+            str_of(StrFunc::Hex),
+            ("DEADBEEF".to_string(), String::new(), true)
+        );
+        assert_eq!(
+            str_of(StrFunc::Md5).0,
+            hex_lower(Md5::digest(raw).as_slice())
+        );
+        assert_eq!(
+            str_of(StrFunc::Sha256).0,
+            hex_lower(Sha256::digest(raw).as_slice())
+        );
+        // base64 of the four raw bytes.
+        assert_eq!(str_of(StrFunc::Base64).0, "3q2+7w==");
     }
 
     #[test]

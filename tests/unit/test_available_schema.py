@@ -87,3 +87,45 @@ def test_common_cases_take_the_fast_path():
     assert "select_arith_add" in fired
     assert "agg_sum_mean_count" in fired
     assert "with_columns" in fired
+
+
+# The list-accessor numeric reductions, with the exact Arrow type the engine returns.
+# These MUST be inferred (not declined): an uninferable projection routes `Dataset.schema`
+# through the zero-row execution fallback, which collapses *every* output column — the
+# list column and its plain passthrough neighbours included — to `null`. So a single
+# uninferred `list.sum` makes `Dataset.schema` lie about the whole relation, not just the
+# reduced column.
+_LIST_REDUCTIONS = {
+    "sum": "double",
+    "mean": "double",
+    "median": "double",
+    "product": "double",
+    "std": "double",
+    "var": "double",
+    "l2_norm": "double",
+    "min": "int64",  # preserves the (int) element type
+    "max": "int64",
+}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fn", sorted(_LIST_REDUCTIONS))
+def test_list_reduction_schema_is_inferred_not_null_collapsed(fn):
+    ds = bt.from_pydict({"arr": [[1, 2, 3], [4, 5, 6]], "k": [7, 8]})
+    plan_ds = ds.with_columns(r=getattr(bt.col("arr").list, fn)())
+
+    inferred = plan_ds._plan.available_schema()
+    assert inferred is not None, (
+        f"list.{fn} inference declined → Dataset.schema falls back to the zero-row "
+        "execution, which collapses the whole schema to null"
+    )
+    inferred_types = {f.name: str(f.type) for f in inferred.arrow}
+    # The reduced column has the engine's real type ...
+    assert inferred_types["r"] == _LIST_REDUCTIONS[fn]
+    # ... and the passthrough neighbours are NOT null-collapsed.
+    assert inferred_types["arr"] == "list<item: int64>"
+    assert inferred_types["k"] == "int64"
+
+    # And the inference is faithful to a real (non-empty) execution.
+    actual = {f.name: str(f.type) for f in plan_ds.collect().schema}
+    assert inferred_types == actual, f"list.{fn}: inferred {inferred_types} vs engine {actual}"

@@ -1257,6 +1257,33 @@ class Dataset:
             return self._derive(Distinct(self._plan))
         return build_distinct(self, subset, keep, order_by)
 
+    def unique(
+        self,
+        subset: list[str] | None = None,
+        *,
+        keep: str = "any",
+        order_by: str | list[str] | list[tuple[str, bool]] | None = None,
+    ) -> Dataset:
+        """Remove duplicate rows — the Polars ``unique`` spelling of :meth:`distinct`.
+
+        Args:
+            subset: Columns defining the key; ``None`` deduplicates over all columns.
+            keep: Which row to keep per key — ``"any"``, ``"first"``, or ``"last"``.
+            order_by: The order defining first/last (required for those `keep` modes).
+
+        Returns:
+            A new `Dataset` with duplicate rows removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 1, 2, 2, 3]})
+                >>> ds.unique().sort("x").to_pydict()
+                {'x': [1, 2, 3]}
+        """
+        return self.distinct(subset, keep=keep, order_by=order_by)
+
     def repartition(
         self,
         num_files: int | None = None,
@@ -2081,6 +2108,910 @@ class Dataset:
             return self
         idx = "__bc_tail_idx"
         return self.with_row_index(idx).filter(Col(idx) >= total - n).drop(idx)
+
+    def gather_every(self, n: int, offset: int = 0) -> Dataset:
+        """Keep every `n`-th row, starting at `offset` — Polars ``gather_every``.
+
+        A lazy downsample: rows ``offset, offset + n, offset + 2n, …`` in current order
+        (put a `sort` first for a defined order). Composes a row index with a filter, so
+        it stays streaming and adds no operator.
+
+        Args:
+            n: Keep one row out of every `n` (must be >= 1).
+            offset: The 0-based index of the first row kept.
+
+        Returns:
+            A new `Dataset` with every `n`-th row.
+
+        Raises:
+            PlanError: If `n` < 1 or `offset` < 0.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [10, 20, 30, 40, 50]}).gather_every(2).to_pydict()
+                {'x': [10, 30, 50]}
+        """
+        if n < 1:
+            raise PlanError(f"gather_every(): n must be >= 1, got {n}")
+        if offset < 0:
+            raise PlanError(f"gather_every(): offset must be non-negative, got {offset}")
+        idx = "__bc_gather_idx"
+        keep = (Col(idx) >= offset) & ((Col(idx) - offset) % n == 0)
+        return self.with_row_index(idx).filter(keep).drop(idx)
+
+    def reverse(self) -> Dataset:
+        """Reverse the row order — Polars ``reverse``.
+
+        Materializes a row index and sorts on it descending, so the last row becomes the
+        first. A pipeline breaker (like any sort).
+
+        Returns:
+            A new `Dataset` with the rows in reverse order.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3]}).reverse().to_pydict()
+                {'x': [3, 2, 1]}
+        """
+        idx = "__bc_reverse_idx"
+        return self.with_row_index(idx).sort(idx, descending=True).drop(idx)
+
+    def bottom_k(self, k: int, by: str | list[str]) -> Dataset:
+        """The `k` rows with the smallest `by` — the Polars ``bottom_k`` spelling of ``top_k``.
+
+        The ascending-order companion to :meth:`top_k`; equivalent to
+        ``top_k(k, by, descending=False)``.
+
+        Args:
+            k: How many rows to keep.
+            by: The column(s) to rank by, ascending.
+
+        Returns:
+            A new `Dataset` of the `k` rows with the smallest `by` values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [5, 3, 8, 1]}).bottom_k(2, "x").sort("x").to_pydict()
+                {'x': [1, 3]}
+        """
+        return self.top_k(k, by, descending=False)
+
+    def slice(self, offset: int, length: int | None = None) -> Dataset:
+        """Rows ``[offset, offset + length)`` — the Polars ``slice`` spelling of ``limit``.
+
+        Args:
+            offset: 0-based index of the first row kept.
+            length: How many rows to keep; to the end when ``None``.
+
+        Returns:
+            A new `Dataset` of the selected row range.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3, 4, 5]}).slice(1, 2).to_pydict()
+                {'x': [2, 3]}
+        """
+        if length is None:
+            length = self.count()
+        return self.limit(length, offset)
+
+    def melt(
+        self,
+        *,
+        index: list[str] | None = None,
+        on: list[str] | None = None,
+        variable_name: str = "variable",
+        value_name: str = "value",
+    ) -> Dataset:
+        """Reshape wide → long — the pandas ``melt`` spelling of :meth:`unpivot`.
+
+        Args:
+            index: Columns to keep as identifiers (repeated per melted column).
+            on: Columns to melt; all non-`index` columns when ``None``.
+            variable_name: Name of the output column holding the melted column names.
+            value_name: Name of the output column holding the melted values.
+
+        Returns:
+            A new long-format `Dataset`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1], "a": [10], "b": [20]})
+                >>> ds.melt(index=["id"]).sort("variable").to_pydict()
+                {'id': [1, 1], 'variable': ['a', 'b'], 'value': [10, 20]}
+        """
+        return self.unpivot(index=index, on=on, variable_name=variable_name, value_name=value_name)
+
+    # --- pandas-compatible spellings ------------------------------------------------
+    # A data scientist arriving from pandas finds the operation under the name they
+    # already type. Each delegates to the Batcher primary — same plan, same semantics.
+
+    def fillna(self, value: Any | dict[str, Any]) -> Dataset:
+        """Replace nulls with `value` — the pandas ``fillna`` spelling of :meth:`fill_null`.
+
+        Args:
+            value: A scalar for every column, or a ``{column: value}`` mapping.
+
+        Returns:
+            A new `Dataset` with nulls replaced.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, None, 3]}).fillna(0).to_pydict()
+                {'x': [1, 0, 3]}
+        """
+        return self.fill_null(value)
+
+    def dropna(self, subset: list[str] | None = None) -> Dataset:
+        """Drop rows containing nulls — the pandas ``dropna`` spelling of :meth:`drop_nulls`.
+
+        Args:
+            subset: Only consider these columns; all columns when ``None``.
+
+        Returns:
+            A new `Dataset` without the null-bearing rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, None, 3]}).dropna().to_pydict()
+                {'x': [1, 3]}
+        """
+        return self.drop_nulls(subset)
+
+    def isna(self) -> Dataset:
+        """A same-shaped dataset of null indicators — the pandas ``isna`` null mask.
+
+        Every column becomes a boolean column, true where the original was null. The
+        quickest way to profile or visualize missingness.
+
+        Returns:
+            A new `Dataset` of booleans, one column per input column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, None]}).isna().to_pydict()
+                {'x': [False, True]}
+        """
+        return self.select(**{name: Col(name).is_null() for name in self.columns})
+
+    def notna(self) -> Dataset:
+        """A same-shaped dataset of presence indicators — the pandas ``notna`` mask.
+
+        Returns:
+            A new `Dataset` of booleans, true where the original value is present.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, None]}).notna().to_pydict()
+                {'x': [True, False]}
+        """
+        return self.select(**{name: Col(name).is_not_null() for name in self.columns})
+
+    def astype(self, dtypes: str | dict[str, str]) -> Dataset:
+        """Cast columns — the pandas ``astype`` spelling of :meth:`cast`.
+
+        Args:
+            dtypes: One Arrow type name for every column, or a ``{column: type}`` map.
+
+        Returns:
+            A new `Dataset` with the columns cast.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2]}).astype({"x": "float64"}).to_pydict()
+                {'x': [1.0, 2.0]}
+        """
+        return self.cast(dtypes)
+
+    def assign(self, **named: Expr | int | float | bool | str) -> Dataset:
+        """Add or replace columns — the pandas ``assign`` spelling of :meth:`with_columns`.
+
+        Args:
+            named: Output column name to the expression (or constant) computing it.
+
+        Returns:
+            A new `Dataset` with the columns added or replaced.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2]}).assign(y=bt.col("x") * 10).to_pydict()
+                {'x': [1, 2], 'y': [10, 20]}
+        """
+        return self.with_columns(**named)
+
+    def groupby(self, *keys: str, **named: Expr) -> GroupBy:
+        """Start an aggregation — the pandas ``groupby`` spelling of :meth:`group_by`.
+
+        Args:
+            keys: Column names to group by.
+            named: Derived grouping keys, as ``name=expression``.
+
+        Returns:
+            A `GroupBy` to finalize with ``.agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a"], "x": [1, 2]})
+                >>> ds.groupby("g").agg(t=bt.col("x").sum()).to_pydict()
+                {'g': ['a'], 't': [3]}
+        """
+        return self.group_by(*keys, **named)
+
+    def merge(
+        self,
+        other: Dataset,
+        on: str | list[str] | None = None,
+        *,
+        left_on: str | list[str] | None = None,
+        right_on: str | list[str] | None = None,
+        how: str = "inner",
+        suffix: str = "_right",
+    ) -> Dataset:
+        """Join two datasets — the pandas ``merge`` spelling of :meth:`join`.
+
+        Args:
+            other: The right-hand dataset.
+            on: Shared key column name(s).
+            left_on: Left key column(s) when the names differ.
+            right_on: Right key column(s) when the names differ.
+            how: Join type — inner, left, right, full, outer, semi, or anti.
+            suffix: Appended to right-hand columns whose names collide.
+
+        Returns:
+            A new joined `Dataset`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> a = bt.from_pydict({"k": [1], "x": ["a"]})
+                >>> b = bt.from_pydict({"k": [1], "y": ["b"]})
+                >>> a.merge(b, on="k").to_pydict()
+                {'k': [1], 'x': ['a'], 'y': ['b']}
+        """
+        return self.join(other, on, left_on=left_on, right_on=right_on, how=how, suffix=suffix)
+
+    def sort_values(self, by: str | list[str], *, ascending: bool | list[bool] = True) -> Dataset:
+        """Order rows — the pandas ``sort_values`` spelling of :meth:`sort`.
+
+        Args:
+            by: Column name(s) to order by.
+            ascending: Sort ascending (pandas' sense); the inverse of `sort`'s
+                ``descending``.
+
+        Returns:
+            A new ordered `Dataset`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [3, 1, 2]}).sort_values("x").to_pydict()
+                {'x': [1, 2, 3]}
+        """
+        keys = [by] if isinstance(by, str) else list(by)
+        desc = [not a for a in ascending] if isinstance(ascending, list) else not ascending
+        return self.sort(*keys, descending=desc)
+
+    def nlargest(self, n: int, columns: str | list[str]) -> Dataset:
+        """The `n` rows with the largest `columns` — the pandas ``nlargest`` of :meth:`top_k`.
+
+        Args:
+            n: How many rows to keep.
+            columns: The column(s) to rank by, descending.
+
+        Returns:
+            A new `Dataset` of the `n` largest rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [5, 3, 8]}).nlargest(2, "x").sort("x").to_pydict()
+                {'x': [5, 8]}
+        """
+        return self.top_k(n, columns)
+
+    def nsmallest(self, n: int, columns: str | list[str]) -> Dataset:
+        """The `n` rows with the smallest `columns` — the pandas ``nsmallest``.
+
+        Args:
+            n: How many rows to keep.
+            columns: The column(s) to rank by, ascending.
+
+        Returns:
+            A new `Dataset` of the `n` smallest rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [5, 3, 8]}).nsmallest(2, "x").sort("x").to_pydict()
+                {'x': [3, 5]}
+        """
+        return self.bottom_k(n, columns)
+
+    def round(self, decimals: int = 0) -> Dataset:
+        """Round every numeric column to `decimals` places — the pandas ``round``.
+
+        Non-numeric columns pass through untouched (the numeric selector picks the
+        columns).
+
+        Args:
+            decimals: How many decimal places to keep.
+
+        Returns:
+            A new `Dataset` with the numeric columns rounded.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1.234], "s": ["a"]}).round(1).to_pydict()
+                {'x': [1.2], 's': ['a']}
+        """
+        from batcher.plan.expr_ir.selectors import numeric
+
+        return self.with_columns(numeric().round(decimals))
+
+    def abs(self) -> Dataset:
+        """Absolute value of every numeric column — the pandas ``abs``.
+
+        Returns:
+            A new `Dataset` with the numeric columns made non-negative.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [-1.5], "s": ["a"]}).abs().to_pydict()
+                {'x': [1.5], 's': ['a']}
+        """
+        from batcher.plan.expr_ir.selectors import numeric
+
+        return self.with_columns(numeric().abs())
+
+    def clip(self, lower: float | None = None, upper: float | None = None) -> Dataset:
+        """Clamp every numeric column into ``[lower, upper]`` — the pandas ``clip``.
+
+        Args:
+            lower: Lower bound; omit for no lower clamp.
+            upper: Upper bound; omit for no upper clamp.
+
+        Returns:
+            A new `Dataset` with the numeric columns clamped.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [-5, 5, 50]}).clip(0, 10).to_pydict()
+                {'x': [0, 5, 10]}
+        """
+        from batcher.plan.expr_ir.selectors import numeric
+
+        return self.with_columns(numeric().clip(lower, upper))
+
+    def nunique(self) -> Dataset:
+        """Distinct value count per column, as a single row (pandas ``nunique``).
+
+        The companion to :meth:`null_count` for a first look at a table: which columns
+        are keys, which are low-cardinality categoricals.
+
+        Returns:
+            A one-row `Dataset` with the same column names, holding distinct counts.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"a": [1, 1, 2], "b": [1, 2, 3]}).nunique().to_pydict()
+                {'a': [2], 'b': [3]}
+        """
+        return self.agg(**{name: Col(name).n_unique() for name in self.columns})
+
+    def select_dtypes(self, include: str) -> Dataset:
+        """Keep only the columns of a dtype family (pandas ``select_dtypes``).
+
+        Args:
+            include: One of ``"numeric"``, ``"integer"``, ``"floating"``, ``"string"``,
+                ``"boolean"``, or ``"temporal"``.
+
+        Returns:
+            A new `Dataset` with only the matching columns.
+
+        Raises:
+            PlanError: If `include` is not a known dtype family.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1], "s": ["x"]})
+                >>> ds.select_dtypes("numeric").columns
+                ['a']
+        """
+        from batcher.plan.expr_ir import selectors
+
+        families = {
+            "numeric": selectors.numeric,
+            "integer": selectors.integer,
+            "floating": selectors.floating,
+            "string": selectors.string,
+            "boolean": selectors.boolean,
+            "temporal": selectors.temporal,
+        }
+        factory = families.get(include)
+        if factory is None:
+            raise PlanError(
+                f"select_dtypes(): unknown family {include!r}; expected one of {sorted(families)}"
+            )
+        return self.select(factory())
+
+    def sample_frac(self, frac: float, *, seed: int | None = None) -> Dataset:
+        """Sample a fraction of the rows — the pandas ``sample(frac=…)`` spelling.
+
+        Args:
+            frac: The fraction of rows to keep, in ``[0, 1]``.
+            seed: Seed making the sample reproducible.
+
+        Returns:
+            A new `Dataset` holding roughly `frac` of the rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": list(range(100))})
+                >>> 0 < ds.sample_frac(0.5, seed=1).count() < 100
+                True
+        """
+        return self.sample(fraction=frac, seed=seed)
+
+    def drop_constant_columns(self) -> Dataset:
+        """Drop every column holding a single distinct value — the zero-variance filter.
+
+        Constant columns carry no signal for a model and no information for a report.
+        This inspects the data (it executes a distinct-count pass) and then builds the
+        lazy projection that keeps the rest.
+
+        Returns:
+            A new `Dataset` without the constant columns.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"same": [1, 1, 1], "varies": [1, 2, 3]})
+                >>> ds.drop_constant_columns().columns
+                ['varies']
+        """
+        counts = self.nunique().to_pydict()
+        constant = [name for name, values in counts.items() if values[0] <= 1]
+        return self.drop(*constant) if constant else self
+
+    def crosstab(self, index: str, columns: str) -> Dataset:
+        """Contingency table of two categorical columns — the pandas ``crosstab``.
+
+        Counts co-occurrences of `index` and `columns` and pivots them wide: one row per
+        `index` value, one column per `columns` value. Combinations that never occur are
+        null.
+
+        Args:
+            index: The column whose values become the rows.
+            columns: The column whose values become the output columns.
+
+        Returns:
+            A new wide `Dataset` of co-occurrence counts.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": ["x", "x", "y"], "b": ["p", "q", "p"]})
+                >>> ds.crosstab("a", "b").sort("a").to_pydict()
+                {'a': ['x', 'y'], 'p': [1, 1], 'q': [1, None]}
+        """
+        from batcher.plan.expr_ir.constructors import count
+
+        counted = self.group_by(index, columns).agg(__bc_n=count())
+        return counted.pivot(index=[index], on=columns, values="__bc_n", aggregate="sum")
+
+    def get_dummies(self, column: str, *, prefix: str | None = None) -> Dataset:
+        """One-hot encode a categorical column — the pandas ``get_dummies``.
+
+        Adds one 0/1 indicator column per distinct value, named ``{prefix}_{value}``.
+        The distinct values are read from the data (an eager pass), then the indicators
+        are built as an ordinary lazy projection.
+
+        Args:
+            column: The categorical column to encode.
+            prefix: Prefix for the generated column names; the column name by default.
+
+        Returns:
+            A new `Dataset` with the indicator columns appended.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": ["x", "y"]})
+                >>> ds.get_dummies("a").to_pydict()
+                {'a': ['x', 'y'], 'a_x': [1, 0], 'a_y': [0, 1]}
+        """
+        from batcher.plan.expr_ir.core import Lit
+
+        values = self.select(column).distinct().to_pydict()[column]
+        present = sorted(v for v in values if v is not None)
+        tag = column if prefix is None else prefix
+        return self.with_columns(
+            **{f"{tag}_{value}": (Col(column) == Lit(value)).cast("int64") for value in present}
+        )
+
+    # --- AI / ML pipeline helpers ---------------------------------------------------
+
+    def shuffle(self, *, seed: int = 0) -> Dataset:
+        """Randomly reorder the rows, reproducibly for a given `seed`.
+
+        Training-set order matters: a corpus grouped by source teaches the model the
+        grouping. This sorts on a seeded random key, so the permutation is identical
+        across runs and across single-node, parallel, and distributed execution.
+
+        Args:
+            seed: Seed selecting the permutation.
+
+        Returns:
+            A new `Dataset` with the rows reordered.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 3, 4, 5]}).shuffle(seed=7).to_pydict()
+                {'x': [1, 2, 5, 3, 4]}
+        """
+        key = "__bc_shuffle_key"
+        return self.with_random(key, seed=seed).sort(key).drop(key)
+
+    def sample_per_group(
+        self, by: str | list[str], n: int, *, order_by: str | None = None
+    ) -> Dataset:
+        """Keep at most `n` rows from each group — a balanced/capped sample.
+
+        Caps over-represented classes or sources without dropping rare ones, which is how
+        a skewed corpus is balanced before training.
+
+        Args:
+            by: The column(s) defining a group.
+            n: Maximum rows to keep per group.
+            order_by: Which rows to prefer; the first column of `by` order when omitted.
+
+        Returns:
+            A new `Dataset` with at most `n` rows per group.
+
+        Raises:
+            PlanError: If `n` < 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"y": ["a", "a", "a", "b"], "x": [1, 2, 3, 4]})
+                >>> ds.sample_per_group("y", 2, order_by="x").to_pydict()
+                {'y': ['a', 'a', 'b'], 'x': [1, 2, 4]}
+        """
+        from batcher.plan.expr_ir.nodes import row_number
+
+        if n < 1:
+            raise PlanError(f"sample_per_group(): n must be >= 1, got {n}")
+        keys = [by] if isinstance(by, str) else list(by)
+        order = order_by if order_by is not None else keys[0]
+        rank = "__bc_group_rank"
+        ranked = self.with_columns(**{rank: row_number().over(partition_by=keys, order_by=[order])})
+        return ranked.filter(Col(rank) <= n).drop(rank)
+
+    def stratified_split(
+        self, by: str | list[str], test_size: float = 0.25, *, seed: int = 0
+    ) -> tuple[Dataset, Dataset]:
+        """Split into train/test keeping each group's proportion — a stratified split.
+
+        A plain random split can starve a rare class. This ranks rows *within* each group
+        by a stable hash of their own values, so each group contributes the same
+        `test_size` fraction. Being value-hashed rather than position-based, the split is
+        identical single-node, parallel, and distributed.
+
+        Args:
+            by: The column(s) whose proportions the split preserves (the label).
+            test_size: Fraction of each group routed to the test side.
+            seed: Seed for the row hash, selecting a different split.
+
+        Returns:
+            A ``(train, test)`` pair of disjoint `Dataset` objects covering every row.
+
+        Raises:
+            PlanError: If `test_size` is not in ``[0, 1]``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"y": ["a"] * 8 + ["b"] * 4, "x": list(range(12))})
+                >>> train, test = ds.stratified_split("y", 0.25, seed=5)
+                >>> test.group_by("y").agg(n=bt.count()).sort("y").to_pydict()
+                {'y': ['a', 'b'], 'n': [2, 1]}
+        """
+        from batcher.plan.expr_ir import hash_rows
+
+        if not 0.0 <= test_size <= 1.0:
+            raise PlanError(f"stratified_split(): test_size must be in [0, 1], got {test_size}")
+        keys = [by] if isinstance(by, str) else list(by)
+        digest_col, pct = "__bc_stratify_hash", "__bc_stratify_pct"
+        digest = hash_rows(*[Col(name) for name in self.columns], seed=seed)
+        scored = self.with_columns(**{digest_col: digest}).with_columns(
+            **{pct: Col(digest_col).rank_pct(keys)}
+        )
+        test = scored.filter(Col(pct) < test_size).drop(digest_col, pct)
+        train = scored.filter(Col(pct) >= test_size).drop(digest_col, pct)
+        return train, test
+
+    def train_val_test_split(
+        self, by: str | list[str], val_size: float = 0.15, test_size: float = 0.15, *, seed: int = 0
+    ) -> tuple[Dataset, Dataset, Dataset]:
+        """Three-way stratified split into train / validation / test.
+
+        Applies :meth:`stratified_split` twice, so every class keeps its proportion in all
+        three parts and the parts stay disjoint and complete. Value-hashed, so the split
+        is identical single-node and distributed.
+
+        Args:
+            by: The column(s) whose proportions each part preserves (the label).
+            val_size: Fraction of the whole routed to validation.
+            test_size: Fraction of the whole routed to test.
+            seed: Seed for the row hash.
+
+        Returns:
+            A ``(train, val, test)`` triple of disjoint `Dataset` objects.
+
+        Raises:
+            PlanError: If `val_size` + `test_size` is not below 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"y": ["a"] * 8 + ["b"] * 4, "x": list(range(12))})
+                >>> train, val, test = ds.train_val_test_split("y", 0.25, 0.25, seed=1)
+                >>> train.count() + val.count() + test.count()
+                12
+        """
+        if val_size + test_size >= 1.0:
+            raise PlanError(
+                "train_val_test_split(): val_size + test_size must be < 1, got "
+                f"{val_size} + {test_size}"
+            )
+        rest, test = self.stratified_split(by, test_size, seed=seed)
+        # Rescale: `val_size` is a fraction of the whole, but `rest` is what remains.
+        val_of_rest = val_size / (1.0 - test_size)
+        train, val = rest.stratified_split(by, val_of_rest, seed=seed + 1)
+        return train, val, test
+
+    def balance_classes(self, label: str, *, order_by: str | None = None) -> Dataset:
+        """Downsample every class to the size of the rarest — a balanced training set.
+
+        The simplest fix for a skewed target when weighting is not an option. Inspects the
+        class counts (an eager pass), then keeps that many rows from each class.
+
+        Args:
+            label: The categorical column to balance.
+            order_by: Which rows to prefer within a class; the label order when omitted.
+
+        Returns:
+            A new `Dataset` holding an equal number of rows per class.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"y": ["a"] * 8 + ["b"] * 4, "x": list(range(12))})
+                >>> ds.balance_classes("y", order_by="x").group_by("y").agg(
+                ...     n=bt.count()
+                ... ).sort("y").to_pydict()
+                {'y': ['a', 'b'], 'n': [4, 4]}
+        """
+        from batcher.plan.expr_ir import count as count_star
+
+        counts = self.group_by(label).agg(__bc_n=count_star()).to_pydict()["__bc_n"]
+        smallest = min(counts) if counts else 0
+        return self.sample_per_group(label, smallest, order_by=order_by)
+
+    def filter_by_length(
+        self, column: str, min_chars: int = 1, max_chars: int | None = None
+    ) -> Dataset:
+        """Keep rows whose text length falls in ``[min_chars, max_chars]``.
+
+        The first filter of a corpus pipeline: drop stubs and runaway documents before
+        anything expensive touches them.
+
+        Args:
+            column: The text column to measure.
+            min_chars: Inclusive minimum length.
+            max_chars: Inclusive maximum length; unbounded when ``None``.
+
+        Returns:
+            A new `Dataset` with the out-of-range rows removed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": ["hi", "a longer document"]})
+                >>> ds.filter_by_length("t", 5).to_pydict()
+                {'t': ['a longer document']}
+        """
+        length = Col(column).str.len()
+        kept = self.filter(length >= min_chars)
+        return kept if max_chars is None else kept.filter(length <= max_chars)
+
+    def filter_by_token_budget(
+        self, column: str, budget: int, *, chars_per_token: float = 4.0
+    ) -> Dataset:
+        """Keep rows whose estimated token count fits `budget` — the context-window filter.
+
+        Uses the tokenizer-free estimate, so a corpus is sized without paying to tokenize
+        it. Pair with `truncate_words` when you would rather trim than drop.
+
+        Args:
+            column: The text column to measure.
+            budget: Maximum estimated tokens per row.
+            chars_per_token: Characters per token to assume.
+
+        Returns:
+            A new `Dataset` holding only the rows that fit.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": ["abcd", "abcdefghijklmnop"]})
+                >>> ds.filter_by_token_budget("t", 2).to_pydict()
+                {'t': ['abcd']}
+        """
+        return self.filter(
+            Col(column).str.fits_token_budget(budget, chars_per_token=chars_per_token)
+        )
+
+    def drop_empty(self, column: str) -> Dataset:
+        """Drop rows where the text column is null, empty, or only whitespace.
+
+        Args:
+            column: The text column to check.
+
+        Returns:
+            A new `Dataset` without the blank rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": ["hi", "   ", None]})
+                >>> ds.drop_empty("t").to_pydict()
+                {'t': ['hi']}
+        """
+        text = Col(column)
+        return self.filter(text.is_not_null() & ~text.str.is_blank())
+
+    def class_balance(self, label: str) -> Dataset:
+        """The fraction of rows in each class — the label distribution.
+
+        The first thing to check before training: whether the target is skewed enough to
+        need weighting or resampling.
+
+        Args:
+            label: The categorical column to summarize.
+
+        Returns:
+            A `Dataset` of one row per class, with a ``fraction`` column summing to 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"y": ["a", "a", "a", "b"]})
+                >>> ds.class_balance("y").sort("y").to_pydict()
+                {'y': ['a', 'b'], 'fraction': [0.75, 0.25]}
+        """
+        from batcher.plan.expr_ir import count, lit
+
+        total = float(self.count())
+        counts = self.group_by(label).agg(__bc_n=count())
+        return counts.select(label, fraction=Col("__bc_n") / lit(total))
+
+    def class_weights(self, label: str) -> Dataset:
+        """Inverse-frequency weight per class — ``n_rows / (n_classes * n_in_class)``.
+
+        The scikit-learn ``class_weight="balanced"`` formula: rare classes get a weight
+        above 1, common ones below, so a weighted loss treats them equally. Join the
+        result back on `label` to attach a per-row sample weight.
+
+        Args:
+            label: The categorical column to weight.
+
+        Returns:
+            A `Dataset` of one row per class, with a ``weight`` column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"y": ["a", "a", "a", "b"]})
+                >>> ds.class_weights("y").sort("y").to_pydict()
+                {'y': ['a', 'b'], 'weight': [0.6666666666666666, 2.0]}
+        """
+        from batcher.plan.expr_ir import count, lit
+
+        total = float(self.count())
+        counts = self.group_by(label).agg(__bc_n=count())
+        n_classes = float(counts.count())
+        return counts.select(label, weight=lit(total) / (lit(n_classes) * Col("__bc_n")))
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """The ``(rows, columns)`` of the dataset — the pandas ``shape``.
+
+        Eager in the row count (it executes a `count`, often answered from metadata).
+
+        Returns:
+            A ``(row_count, column_count)`` tuple.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2], "y": [3, 4]}).shape
+                (2, 2)
+        """
+        return (self.count(), len(self.columns))
+
+    @property
+    def size(self) -> int:
+        """The total number of cells (``rows * columns``) — the pandas ``size``.
+
+        Returns:
+            The cell count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2], "y": [3, 4]}).size
+                4
+        """
+        rows, cols = self.shape
+        return rows * cols
 
     def join(
         self,

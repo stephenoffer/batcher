@@ -29,10 +29,19 @@ pub(crate) fn arg_extreme_pick(
     num_groups: usize,
     is_max: bool,
 ) -> Result<Vec<ArrayRef>, RuntimeError> {
-    let kconv = RowConverter::new(vec![SortField::new(keys.data_type().clone())])?;
-    let krows = kconv.convert_columns(std::slice::from_ref(keys))?;
-    let vconv = RowConverter::new(vec![SortField::new(values.data_type().clone())])?;
-    let vrows = vconv.convert_columns(std::slice::from_ref(values))?;
+    // Rank on the engine's float identity, not arrow's raw-bit row order: a *negative*
+    // NaN key must rank greatest (not below -inf) so `arg_max(v, -NaN)` can win, and the
+    // value tie-break must not split `-0.0` from `0.0`. Canonicalize the key/value copies
+    // fed to the RowConverter, but `take` the *original* rows below (a `-0.0`/`-NaN` in,
+    // the same value out) — matching `list.arg_max`, `MIN`/`MAX`, and `GROUP BY`.
+    let keys_c = crate::keys::canonicalize_float_keys(std::slice::from_ref(keys));
+    let keys_k = keys_c.as_ref().map_or(keys, |v| &v[0]);
+    let values_c = crate::keys::canonicalize_float_keys(std::slice::from_ref(values));
+    let values_k = values_c.as_ref().map_or(values, |v| &v[0]);
+    let kconv = RowConverter::new(vec![SortField::new(keys_k.data_type().clone())])?;
+    let krows = kconv.convert_columns(std::slice::from_ref(keys_k))?;
+    let vconv = RowConverter::new(vec![SortField::new(values_k.data_type().clone())])?;
+    let vrows = vconv.convert_columns(std::slice::from_ref(values_k))?;
 
     let mut best: Vec<Option<usize>> = vec![None; num_groups];
     for (i, &g) in group_ids.iter().enumerate() {
@@ -129,6 +138,41 @@ mod tests {
         let k2: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
         let r = arg_extreme_pick(&k2, &v2, &[0u32, 0], 1, true).unwrap();
         assert!(r[1].is_null(0), "all-null-value group must yield null");
+    }
+
+    #[test]
+    fn arg_extreme_ranks_float_key_on_engine_identity() {
+        use arrow::array::Float64Array;
+        use arrow::datatypes::Float64Type;
+        // A *negative* NaN key (what `0.0/0.0` yields on x86) must rank as the engine's
+        // greatest float, so `arg_max(v, -NaN)` returns that row's value — like `MAX(k)`,
+        // `GROUP BY k`, and `list.arg_max`. With the raw RowConverter it ranked below -inf
+        // and never won. Also: `-0.0` and `0.0` are one key, so a value tie-break must not
+        // split them.
+        let neg_nan = f64::from_bits(0xfff8_0000_0000_0000);
+        let keys: ArrayRef = Arc::new(Float64Array::from(vec![1.0, neg_nan, 2.0]));
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
+        let gids = [0u32, 0, 0];
+        let amax = arg_extreme_pick(&keys, &vals, &gids, 1, true).unwrap();
+        assert_eq!(
+            amax[1].as_primitive::<Int64Type>().value(0),
+            20,
+            "arg_max must select the -NaN-keyed row (NaN ranks greatest)"
+        );
+        let amin = arg_extreme_pick(&keys, &vals, &gids, 1, false).unwrap();
+        assert_eq!(
+            amin[1].as_primitive::<Int64Type>().value(0),
+            10,
+            "arg_min must select the smallest finite key, never the NaN"
+        );
+
+        // A `-0.0`/`0.0` value tie-break on an equal key: both are one value, so the
+        // smaller-value tiebreak treats them as equal and is stable, not a spurious split.
+        let keys2: ArrayRef = Arc::new(Int64Array::from(vec![7, 7]));
+        let vals2: ArrayRef = Arc::new(Float64Array::from(vec![-0.0, 0.0]));
+        let r = arg_extreme_pick(&keys2, &vals2, &[0u32, 0], 1, true).unwrap();
+        let picked = r[1].as_primitive::<Float64Type>().value(0);
+        assert_eq!(picked, 0.0, "signed zeros are one value on the tie-break");
     }
 
     #[test]

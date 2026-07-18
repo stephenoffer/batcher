@@ -123,13 +123,27 @@ def _predicate_status(expr: Expr, stats: RelStats) -> bool | None:
             return _comparison_status(expr, stats)
         return None
     if isinstance(expr, Not):
-        inner = _predicate_status(expr.input, stats)
-        return None if inner is None else (not inner)
+        return _not(_predicate_status(expr.input, stats))
     if isinstance(expr, IsNull):
         return _is_null_status(expr.input, stats, negate=False)
     if isinstance(expr, IsNotNull):
         return _is_null_status(expr.input, stats, negate=True)
     return None
+
+
+def _not(inner: bool | None) -> bool | None:
+    """Negate the tri-state. Sound in one direction only.
+
+    The two states are not mirror images, so `not inner` is wrong. `_TRUE` is proven
+    from bounds *and* a zero null count (see `_decide`), so every row evaluates the
+    inner predicate to TRUE and negating gives FALSE for every row → `_FALSE`.
+
+    `_FALSE` only proves no row *passes*; those rows are FALSE **or NULL**. Negating a
+    NULL yields NULL, which a filter still drops — so `NOT (always-empty)` is not
+    provably always-true, and claiming `_TRUE` would drop the filter and wrongly keep
+    the NULL rows. Decline instead: that costs a scan, never a row.
+    """
+    return _FALSE if inner is _TRUE else None
 
 
 def _and(left: bool | None, right: bool | None) -> bool | None:

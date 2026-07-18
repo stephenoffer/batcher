@@ -64,7 +64,7 @@ def _encode(stats: SourceStatistics) -> dict[str, Any]:
 
 def _encode_column(col: ColumnStat) -> dict[str, Any]:
     out: dict[str, Any] = {"provenance": col.provenance.name}
-    for field in ("min", "max", "null_count", "ndv", "total_sum"):
+    for field in ("min", "max", "null_count", "ndv", "total_sum", "mean"):
         value = getattr(col, field)
         if isinstance(value, _JSON_SCALARS):
             out[field] = value
@@ -73,7 +73,20 @@ def _encode_column(col: ColumnStat) -> dict[str, Any]:
 
         out["bloom"] = base64.b64encode(col.bloom).decode("ascii")
     # Drop a bare provenance with no usable values.
-    return out if len(out) > 1 else {}
+    if len(out) == 1:
+        return {}
+    # Per-field provenance sub-tags. `ndv` and `null_count` each carry their OWN trust
+    # tag, which the bundle's cannot express: a sketch distinct count rides beside exact
+    # bounds (`ndv_provenance` weaker), and an exact null count rides beside byte-truncated
+    # bounds (`null_count_provenance` stronger). Dropping them makes `ndv_is_exact` /
+    # `null_count_is_exact` fall back to the *bundle* tag on reload — silently promoting a
+    # sketch to EXACT (a wrong `count_distinct`) or demoting an exact count to a rescan. So
+    # they must round-trip alongside the bundle provenance the values were stored with.
+    for field in ("ndv_provenance", "null_count_provenance"):
+        sub = getattr(col, field)
+        if sub is not None:
+            out[field] = sub.name
+    return out
 
 
 def _decode(blob: dict[str, Any]) -> SourceStatistics | None:
@@ -99,12 +112,17 @@ def _decode_column(blob: dict[str, Any]) -> ColumnStat:
         import base64
 
         bloom = base64.b64decode(bloom_b64)
+    ndv_prov = blob.get("ndv_provenance")
+    null_prov = blob.get("null_count_provenance")
     return ColumnStat(
         min=blob.get("min"),
         max=blob.get("max"),
         null_count=blob.get("null_count"),
         ndv=blob.get("ndv"),
         total_sum=blob.get("total_sum"),
+        mean=blob.get("mean"),
         provenance=prov,
         bloom=bloom,
+        ndv_provenance=Provenance[ndv_prov] if isinstance(ndv_prov, str) else None,
+        null_count_provenance=Provenance[null_prov] if isinstance(null_prov, str) else None,
     )

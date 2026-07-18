@@ -54,3 +54,35 @@ def test_unsupported_option_raises_not_silent(t):
     # An option we cannot map bit-identically must raise, never silently drop.
     with pytest.raises(NotImplementedError):
         bt.sql("SELECT regexp_matches(s, 'a.c', 'm') AS v FROM t", **t).collect()
+
+
+@pytest.mark.differential
+@pytest.mark.parametrize(
+    "q",
+    [
+        # 'i' — case-insensitive: without the fix the options arg was dropped, so
+        # `regexp_replace(s, 'abc', 'X', 'i')` matched case-sensitively (wrong).
+        "SELECT s, regexp_replace(s, 'abc', 'X', 'i') AS v FROM rt",
+        # 's' — '.' matches newline.
+        "SELECT s, regexp_replace(s, 'a.c', 'X', 'is') AS v FROM rt",
+        # 'g' — global (replace every match), not just the first.
+        "SELECT s, regexp_replace(s, 'a', 'X', 'g') AS v FROM rt",
+        # 'ig' — case-insensitive AND global together.
+        "SELECT s, regexp_replace(s, 'abc', 'X', 'ig') AS v FROM rt",
+        # no options — DuckDB default is first-match-only.
+        "SELECT s, regexp_replace(s, 'a', 'X') AS v FROM rt",
+    ],
+)
+def test_regexp_replace_options(duck, q):
+    tbl = pa.table({"s": pa.array(["ABC", "abc", "abcabc", "aa", "a\nc", ""], pa.string())})
+    duck.register("rt", tbl)
+    assert_same(bt.sql(q, rt=bt.from_arrow(tbl)).collect(), duck.sql(q))
+
+
+@pytest.mark.differential
+def test_regexp_replace_unsupported_option_raises(duck):
+    tbl = pa.table({"s": ["abc"]})
+    duck.register("rt", tbl)
+    q = "SELECT regexp_replace(s, 'a', 'X', 'm') AS v FROM rt"
+    with pytest.raises(NotImplementedError):
+        bt.sql(q, rt=bt.from_arrow(tbl)).collect()

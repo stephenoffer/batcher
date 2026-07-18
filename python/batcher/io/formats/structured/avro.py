@@ -25,7 +25,7 @@ from batcher.io.formats.base import SINKS, SOURCES
 
 __all__ = ["AvroSink", "AvroSource"]
 
-# Avro primitive type → Arrow type (logical types fall back to their base).
+# Avro primitive type → Arrow type (logical types are handled by `_AVRO_LOGICAL_TO_ARROW`).
 _AVRO_TO_ARROW: dict[str, pa.DataType] = {
     "null": pa.null(),
     "boolean": pa.bool_(),
@@ -35,6 +35,22 @@ _AVRO_TO_ARROW: dict[str, pa.DataType] = {
     "double": pa.float64(),
     "bytes": pa.binary(),
     "string": pa.string(),
+}
+
+# Avro logicalType → Arrow type, kept in lockstep with what the native `arrow-avro`
+# reader decodes (verified against it): the reader emits the Arrow *logical* type, so the
+# advertised schema must too. Mapping these to the underlying int/long instead — as the
+# base map alone would — makes `schema()` disagree with the decoded batches AND makes the
+# `fastavro` fallback fail, since it cannot coerce the datetime/date/time values fastavro
+# yields into an int column. `decimal` is handled separately (it needs precision/scale).
+_AVRO_LOGICAL_TO_ARROW: dict[str, pa.DataType] = {
+    "date": pa.date32(),
+    "time-millis": pa.time32("ms"),
+    "time-micros": pa.time64("us"),
+    "timestamp-millis": pa.timestamp("ms", tz="+00:00"),
+    "timestamp-micros": pa.timestamp("us", tz="+00:00"),
+    "local-timestamp-millis": pa.timestamp("ms"),
+    "local-timestamp-micros": pa.timestamp("us"),
 }
 
 
@@ -62,18 +78,43 @@ def _require_fastavro() -> Any:
 
 
 def _arrow_type(avro_type: Any) -> pa.DataType:
-    """Map one Avro field type (possibly a union) to an Arrow type."""
+    """Map one Avro field type (possibly a union or logical type) to an Arrow type."""
     if isinstance(avro_type, list):  # union: pick the first non-null branch
         branches = [t for t in avro_type if t != "null"]
         return _arrow_type(branches[0]) if branches else pa.null()
-    if isinstance(avro_type, dict):  # logical/complex type: use its base
+    if isinstance(avro_type, dict):  # logical/complex type
+        logical = avro_type.get("logicalType")
+        if logical == "decimal":
+            return pa.decimal128(avro_type.get("precision", 38), avro_type.get("scale", 0))
+        if logical in _AVRO_LOGICAL_TO_ARROW:
+            return _AVRO_LOGICAL_TO_ARROW[logical]
         return _AVRO_TO_ARROW.get(avro_type.get("type", "string"), pa.string())
     return _AVRO_TO_ARROW.get(avro_type, pa.string())
 
 
+def _avro_field_nullable(avro_type: Any) -> bool:
+    """True iff the Avro field type is a union that admits ``"null"`` (a nullable field).
+
+    A non-union Avro field cannot be null, so it maps to a non-nullable Arrow field —
+    matching what the native `arrow-avro` reader produces, so `schema()` equals the
+    decoded batches for a nullable/non-nullable field alike.
+    """
+    return isinstance(avro_type, list) and "null" in avro_type
+
+
 def _avro_schema_to_arrow(avro_schema: dict[str, Any]) -> pa.Schema:
-    """Translate an Avro record schema into an Arrow schema."""
-    return pa.schema([(f["name"], _arrow_type(f["type"])) for f in avro_schema.get("fields", [])])
+    """Translate an Avro record schema into an Arrow schema.
+
+    Logical types (date/time/timestamp/decimal) map to their Arrow logical type — not the
+    underlying int/long — and a field's nullability follows its Avro union, so the schema
+    matches the batches the native reader decodes and the `fastavro` fallback assembles.
+    """
+    return pa.schema(
+        [
+            pa.field(f["name"], _arrow_type(f["type"]), nullable=_avro_field_nullable(f["type"]))
+            for f in avro_schema.get("fields", [])
+        ]
+    )
 
 
 @SOURCES.register("avro")

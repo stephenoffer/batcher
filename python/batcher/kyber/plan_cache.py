@@ -86,7 +86,12 @@ def store(key: str | None, result: Any, sources: list | None, max_entries: int) 
 
 
 def cache_key(
-    plan_key: str, sources: list | None, config: Config, hub: Any, kind: str = "full"
+    plan_key: str,
+    sources: list | None,
+    config: Config,
+    hub: Any,
+    kind: str = "full",
+    source_stats: list | None = None,
 ) -> str | None:
     """A key identifying this exact optimization, or `None` when it must not be cached.
 
@@ -104,8 +109,8 @@ def cache_key(
     source_ids = _source_keys(sources)
     if source_ids is None:
         return None
-    # Injectivity: the first five fields are all `|`-free (a fixed `kind`, two hex digests,
-    # two integers), so a `|`-split recovers them and everything after the fifth `|` is the
+    # Injectivity: the first seven fields are all `|`-free (a fixed `kind`, three hex digests,
+    # three integers), so a `|`-split recovers them and everything after the seventh `|` is the
     # source component. That component is `repr(source_ids)` — unambiguous for a list of
     # strings even when a source identity (a file path) contains `|` or `,`, which a naive
     # delimiter-join would let collide two different source sets onto one key.
@@ -116,9 +121,52 @@ def cache_key(
             _config_key(config),
             str(id(hub)),
             str(learning.generation()),
+            _calibration_epoch(hub),
+            _source_stats_key(source_stats),
             repr(source_ids),
         )
     )
+
+
+def _calibration_epoch(hub: Any) -> str:
+    """Which cost-coefficient refit a plan was chosen under, or `"-"` without a hub.
+
+    `learning.generation()` above covers everything written through `record_write`, but the
+    **cost calibration** and **CPU-share** refits do not go through it — they read
+    `hub.op_stats_by_kind()` directly and re-fit every `_RECALIBRATE_AFTER` feedback rows. So
+    a plan (and the `ResourceBounds`/cpu shares annotated onto it) stayed frozen at whatever
+    coefficients were in force when it was first memoized, however much the engine's measured
+    per-row costs had since moved — the very staleness this module exists to prevent, entering
+    by a door the generation counter does not watch.
+
+    Keyed by the refit *epoch* rather than the raw version, so it changes exactly when a refit
+    can change the coefficients and not once per recorded operator — which would miss on every
+    single execution and defeat the memo entirely.
+    """
+    version = getattr(hub, "version", None)
+    if version is None:
+        return "-"
+    from batcher.kyber.calibration import _RECALIBRATE_AFTER
+
+    return str(int(version) // _RECALIBRATE_AFTER)
+
+
+def _source_stats_key(source_stats: list | None) -> str:
+    """A digest of the collected `SourceStatistics`, or `"-"` when none were supplied.
+
+    The source *identity* is not enough. Zone-map pruning folds a filter to `FALSE` from a
+    source's footer `min`/`max`, and those bounds arrive in `source_stats` — collected at
+    plan-build time, not derived from the source object. The same source list can therefore
+    be optimized twice with *different* statistics (a footer re-collected after an append; a
+    caller that passes them on one path and `None` on another), and without this field the
+    second call would be served the first call's pruned plan — the very wrong-answer this
+    module's `_source_keys` docstring warns about, entering by the other door.
+
+    Folded in as a hex digest so it stays `|`-free and the key's injectivity argument holds.
+    """
+    if not source_stats:
+        return "-"
+    return hashlib.blake2b(repr(tuple(source_stats)).encode(), digest_size=8).hexdigest()
 
 
 # The optimizer config is stable for the life of an active `Config`, but its `repr` (the
@@ -169,7 +217,39 @@ def _source_keys(sources: list | None) -> list[str] | None:
 # a 100% "change" — but no plan reads them as a value; they weight the averages beside them.
 # Comparing them would make every write look material and defeat the memo entirely (measured:
 # 6 hits in 8 identical runs became 0).
-_BOOKKEEPING_FIELDS = frozenset({"n_obs", "n", "total", "flips"})
+# The OLS sufficient statistics (`sx`/`sy`/`sxx`/`sxy`, from `learned_tuning._fold_ols`) and
+# the bandit arm accumulators (`sum`/`sumsq`, from `record_arm`) belong here for the same
+# reason `n` does: every one of them grows monotonically with each observation, so comparing
+# them raw made *every* join run look material and flushed the whole plan cache — the exact
+# "6 hits in 8 identical runs became 0" regression this list was created to fix, still live
+# for the accumulators sitting beside the counter that was fixed. What a plan actually reads
+# is their per-observation quotient, compared via `_DERIVED_RATIOS` below. (`xmin`/`xmax` stay
+# compared directly: they are bounds, not accumulators, and move only on a genuinely new
+# extreme — which does change the fit's applicable range.)
+_BOOKKEEPING_FIELDS = frozenset(
+    {"n_obs", "n", "total", "flips", "sx", "sy", "sxx", "sxy", "sum", "sumsq"}
+)
+
+# Pairs whose *ratio* is a decision even though both fields are bookkeeping. `flips/total` is
+# the adaptive gate: `learned_tuning.record_adaptive_flip` writes **only** those two counters,
+# so with both listed above the key-set comparison below sees an empty set, `any(())` is False,
+# and the write can never bump the generation — `learned_adaptive_helps` flips False -> True and
+# a memoized plan is served forever, which is precisely the staleness routing every write
+# through one place was meant to prevent. Comparing the raw counters instead would bump on
+# every execution (`total` 1 -> 2 is a 100% "change") and defeat the memo, so the ratio — the
+# number a plan actually reads — is what gets compared.
+_DERIVED_RATIOS: tuple[tuple[str, str], ...] = (
+    ("flips", "total"),  # the adaptive gate's flip fraction
+    ("sum", "n"),  # a bandit arm's mean reward — what `ucb1_best_arm` ranks by
+    ("sumsq", "n"),  # its second moment, which the UCB confidence width reads
+    # The OLS fit's per-observation moments. `_fit`'s intercept and slope are functions of
+    # exactly these, so when none of them has moved materially neither has the crossover the
+    # plan was chosen under — and when one has, the plan is genuinely stale.
+    ("sx", "n"),
+    ("sy", "n"),
+    ("sxx", "n"),
+    ("sxy", "n"),
+)
 
 
 def record_write(hub: Any, namespace: str, key: str, value: object) -> None:
@@ -193,6 +273,33 @@ def record_write(hub: Any, namespace: str, key: str, value: object) -> None:
     hub.put_keyed_param(namespace, key, value)
 
 
+def _ratio_differs(prior: dict, value: dict) -> bool:
+    """Whether a `_DERIVED_RATIOS` pair moved enough to change the decision it encodes.
+
+    Both fields of such a pair are bookkeeping counters, so neither is compared on its own;
+    their quotient is the value a plan reads. A run that ticks `total` without moving the
+    ratio stays a cache hit, while a run that moves it materially invalidates.
+    """
+    for numerator, denominator in _DERIVED_RATIOS:
+        if not all(f in prior and f in value for f in (numerator, denominator)):
+            continue
+        if learning.is_material_change(
+            _ratio(prior[numerator], prior[denominator]),
+            _ratio(value[numerator], value[denominator]),
+        ):
+            return True
+    return False
+
+
+def _ratio(numerator: object, denominator: object) -> float:
+    """`numerator / denominator` as a float, or 0.0 for a zero/unusable denominator."""
+    try:
+        den = float(denominator)  # type: ignore[arg-type]
+        return float(numerator) / den if den else 0.0  # type: ignore[arg-type]
+    except (TypeError, ValueError):  # pragma: no cover - non-numeric bookkeeping
+        return 0.0
+
+
 def _materially_differs(prior: object, value: object) -> bool:
     """Whether `value` differs from `prior` by enough to change a plan decision."""
     if prior is None or type(prior) is not type(value):
@@ -200,6 +307,8 @@ def _materially_differs(prior: object, value: object) -> bool:
     if isinstance(value, dict):
         keys = {k for k in value if k not in _BOOKKEEPING_FIELDS}
         if keys != {k for k in prior if k not in _BOOKKEEPING_FIELDS}:
+            return True
+        if _ratio_differs(prior, value):
             return True
         return any(_materially_differs(prior[k], value[k]) for k in keys)
     if isinstance(value, bool):

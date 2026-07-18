@@ -302,7 +302,7 @@ fn stream_merge_group(
 ///
 /// A `Null`-typed (all-null) key is coerced to a constant column so arrow's `RowConverter`
 /// can encode it — the same substitution the in-memory sort applies (see
-/// [`super::coerce_null_sort_key`]) — so the spilling merge orders rows identically to the
+/// [`super::normalize_sort_key`]) — so the spilling merge orders rows identically to the
 /// serial oracle. Both the converter's [`SortField`]s (built from these arrays' types) and
 /// the per-batch row conversion go through here, so they stay aligned.
 fn eval_sort_keys(batch: &RecordBatch, keys: &[SortKey]) -> Result<Vec<ArrayRef>, InterpError> {
@@ -310,7 +310,7 @@ fn eval_sort_keys(batch: &RecordBatch, keys: &[SortKey]) -> Result<Vec<ArrayRef>
         .map(|k| {
             k.expr
                 .eval(batch)
-                .map(super::coerce_null_sort_key)
+                .map(super::normalize_sort_key)
                 .map_err(InterpError::from)
         })
         .collect()

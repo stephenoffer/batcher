@@ -88,14 +88,26 @@ def _constant_value(stats: RelStats, name: str):
     """`name`'s single value when it is *proven* a non-null constant, else None.
 
     Requires EXACT ``min == max`` and a zero ``null_count`` (a NULL makes it "one value *plus*
-    NULLs"). A float ``±0.0`` is refused: ``-0.0 == 0.0`` proves no single representation.
+    NULLs").
+
+    **Floats are refused outright.** A columnar footer omits NaN from its min/max statistics
+    (the Parquet spec drops it; so does the KLL sketch), so a float column holding a NaN *and*
+    one other value records ``min == max == that value`` and looks constant when it is not.
+    Folding ``max(f)`` of such a column to that value then returns it instead of the NaN that
+    SQL's total order — the one our own ``ORDER BY`` uses — makes the true maximum: a wrong
+    *result*, not merely a wrong estimate. Signed zero (``-0.0 == 0.0``) is the same hazard in
+    miniature. The sibling `global_min_max_from_exact_bounds` refuses floats for exactly this
+    reason; sharing the gate keeps a constant-column fold and a bound fold from disagreeing on
+    when a float bound may be trusted. (A NaN-aware in-memory source records the NaN in its
+    bounds, so ``min != max`` there and the fold already declines — the refusal only costs the
+    rare genuinely-constant float column a fold, never a correct one.)
     """
     stat = stats.column(name)
     if stat.provenance is not Provenance.EXACT or stat.null_count != 0:
         return None
     if stat.min is None or stat.min != stat.max:
         return None
-    if isinstance(stat.min, float) and stat.min == 0.0:
+    if isinstance(stat.min, float):
         return None
     return stat.min
 

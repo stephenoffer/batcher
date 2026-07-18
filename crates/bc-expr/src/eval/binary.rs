@@ -9,9 +9,15 @@ use arrow::array::{
 use arrow::compute::cast;
 use arrow::compute::kernels::{boolean, cmp, numeric};
 use arrow::datatypes::DataType;
+use bc_arrow::canon_float_array;
 
 use crate::eval::date::add_months;
 use crate::{BinaryOp, Expr, ExprError, Literal};
+
+/// Whether comparing this type's values raw would disagree with the engine's float identity.
+fn is_float_dtype(dt: &DataType) -> bool {
+    matches!(dt, DataType::Float32 | DataType::Float64)
+}
 
 /// Fast path for `<dictionary column> <cmp> <literal>` (in either operand order): compare the
 /// **dictionary values** — one entry per *distinct* value — and gather one bit per row through
@@ -124,6 +130,16 @@ pub(crate) fn try_scalar_binary(
         _ => (arr, lit_arr),
     };
 
+    // Canonicalize both float operands for the comparison arms, exactly as the array path
+    // does — this path must be bit-identical to it (see `canon_floats_for_cmp`). Arithmetic
+    // is untouched: `-0.0 + x` and NaN propagation stay IEEE.
+    let (arr, lit_arr) =
+        if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) && is_float_dtype(arr.data_type()) {
+            (canon_float_array(&arr), canon_float_array(&lit_arr))
+        } else {
+            (arr, lit_arr)
+        };
+
     let scalar = Scalar::new(lit_arr);
     let arr_dyn: &dyn Array = arr.as_ref();
     let arr_datum: &dyn Datum = &arr_dyn;
@@ -158,6 +174,30 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
     // SQL-style implicit numeric promotion: mixed Int64/Float64 operands are
     // promoted to Float64 so `qty * price` (int × float) works as expected.
     let (l, r) = coerce_numeric(l, r)?;
+    // DuckDB `DATE - DATE` is the integer count of days between the two dates, not an
+    // interval. Arrow's `sub` over two `Date32` (days-since-epoch) arrays produces a
+    // `Duration` — neither the type nor the value SQL wants — so subtract the day ordinals
+    // directly to `Int64`, preserving nulls.
+    if matches!(op, Sub)
+        && matches!(l.data_type(), arrow::datatypes::DataType::Date32)
+        && matches!(r.data_type(), arrow::datatypes::DataType::Date32)
+    {
+        return date32_diff_days(&l, &r);
+    }
+    // `DATE ± <integer days>` shifts the date by that many days (DuckDB `DATE - 5`,
+    // `DATE + n`). Arrow's `sub`/`add` reject `Date32 - Int64`, so compute the new day
+    // ordinal directly (`int + date` is commutative). Any other combination falls through
+    // to the numeric kernels / the existing error.
+    {
+        use arrow::datatypes::DataType::{Date32, Int64};
+        match (op, l.data_type(), r.data_type()) {
+            (Add, Date32, Int64) | (Sub, Date32, Int64) => {
+                return date32_offset_days(&l, &r, matches!(op, Sub));
+            }
+            (Add, Int64, Date32) => return date32_offset_days(&r, &l, false),
+            _ => {}
+        }
+    }
     // Comparison kernels (`cmp::eq` …) require *identical* decimal precision AND scale;
     // arithmetic kernels align scales themselves. Two decimal columns of differing scale
     // (`Decimal128(10,1)` vs `Decimal128(10,2)`, e.g. `1.0 = 1.00`) would otherwise raise
@@ -165,7 +205,9 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
     // by widening to a common scale. Align here only for the comparison arms, so `*`/`+`
     // keep their own scale-propagation rules untouched.
     let (l, r) = if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
-        align_decimals_for_cmp(&l, &r)?
+        let (l, r) = align_decimals_for_cmp(&l, &r)?;
+        // Float identity is the engine's, not the raw bits' — see `canon_floats_for_cmp`.
+        (canon_float_array(&l), canon_float_array(&r))
     } else {
         (l, r)
     };
@@ -225,9 +267,7 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
         }
         // Integer bitwise ops. Operands are coerced/cast to Int64.
         BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight => {
-            use arrow::compute::kernels::bitwise::{
-                bitwise_and, bitwise_or, bitwise_shift_left, bitwise_xor,
-            };
+            use arrow::compute::kernels::bitwise::{bitwise_and, bitwise_or, bitwise_xor};
             let (li, ri) = (cast(l, &DataType::Int64)?, cast(r, &DataType::Int64)?);
             let (la, ra) = (
                 li.as_any().downcast_ref::<Int64Array>().unwrap(),
@@ -237,7 +277,13 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
                 BitAnd => Arc::new(bitwise_and(la, ra)?),
                 BitOr => Arc::new(bitwise_or(la, ra)?),
                 BitXor => Arc::new(bitwise_xor(la, ra)?),
-                ShiftLeft => Arc::new(bitwise_shift_left(la, ra)?),
+                // Arrow's `<<` masks the shift amount to its low 6 bits
+                // (`wrapping_shl`), so `1 << 64` silently became `1 << 0 = 1` and a
+                // *negative* amount wrapped into an in-range shift. Mirror the
+                // `ShiftRight` out-of-range convention (an amount outside `0..64`
+                // yields 0), so the two directions agree; in range, the wrapping
+                // shift matches the engine's wrapping integer arithmetic and the JIT.
+                ShiftLeft => Arc::new(arithmetic_shift_left(la, ra)),
                 // Arrow's `>>` masks the shift amount to its low 6 bits
                 // (`wrapping_shr`), so a negative or ≥ 64 amount wraps to an in-range
                 // shift — `-7 >> -1` returned `-1`. DuckDB defines an out-of-range
@@ -250,6 +296,85 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
         AddMonths => add_months(l, r)?,
     };
     Ok(out)
+}
+
+/// Left shift with an out-of-range amount yielding 0 (arrow's `wrapping_shl` would
+/// instead mask the amount to its low 6 bits, so `1 << 64` returned `1` and `x << -1`
+/// wrapped to `x << 63`). An amount in `0..64` shifts normally, wrapping the overflowed
+/// high bits out — the engine's wrapping integer-arithmetic convention (`add`/`sub`/`mul`
+/// and the JIT wrap too). Nulls on either side propagate. This mirrors
+/// [`arithmetic_shift_right`]'s out-of-range → 0 rule so the two shift directions agree;
+/// DuckDB instead raises on an out-of-range or overflowing left shift, a deliberate
+/// difference (the engine wraps rather than errors, per CLAUDE.md #6).
+/// `l - r` for two `Date32` (days-since-epoch) columns, as the `Int64` count of days between
+/// them (DuckDB `DATE - DATE`), preserving nulls. Arrow's arithmetic kernel would instead
+/// yield a `Duration`, so this is special-cased in [`eval_binary`].
+fn date32_diff_days(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
+    use arrow::array::Date32Array;
+    let a = l
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("checked Date32 in eval_binary");
+    let b = r
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("checked Date32 in eval_binary");
+    let out: Int64Array = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| match (x, y) {
+            (Some(x), Some(y)) => Some(i64::from(x) - i64::from(y)),
+            _ => None,
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `date ± days` for a `Date32` column and an `Int64` day count, producing a `Date32`
+/// (DuckDB `DATE + n` / `DATE - n`), preserving nulls. `subtract` chooses the direction.
+/// The day ordinal is computed in i64 and truncated to i32 (arrow's `Date32` range).
+fn date32_offset_days(
+    dates: &ArrayRef,
+    days: &ArrayRef,
+    subtract: bool,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::Date32Array;
+    let d = dates
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("checked Date32 in eval_binary");
+    let n = cast(days, &DataType::Int64)?;
+    let n = n
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("cast to Int64");
+    let out: Date32Array = (0..d.len())
+        .map(|i| {
+            if d.is_null(i) || n.is_null(i) {
+                return None;
+            }
+            let base = i64::from(d.value(i));
+            let shifted = if subtract {
+                base - n.value(i)
+            } else {
+                base + n.value(i)
+            };
+            Some(shifted as i32)
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+fn arithmetic_shift_left(values: &Int64Array, amounts: &Int64Array) -> Int64Array {
+    (0..values.len())
+        .map(|i| {
+            if values.is_null(i) || amounts.is_null(i) {
+                return None;
+            }
+            let (v, s) = (values.value(i), amounts.value(i));
+            Some(if (0..64).contains(&s) { v << s } else { 0 })
+        })
+        .collect()
 }
 
 /// Arithmetic right shift with DuckDB out-of-range semantics: an amount outside
@@ -327,10 +452,7 @@ fn int_div_or_mod(is_div: bool, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, 
 /// capped at Decimal128's 38 digits. Non-decimal or already-identical operands (and any
 /// pair that isn't two `Decimal128`s — e.g. Decimal256 or a mixed width) pass through
 /// unchanged, deferring to the existing path.
-fn align_decimals_for_cmp(
-    l: &ArrayRef,
-    r: &ArrayRef,
-) -> Result<(ArrayRef, ArrayRef), ExprError> {
+fn align_decimals_for_cmp(l: &ArrayRef, r: &ArrayRef) -> Result<(ArrayRef, ArrayRef), ExprError> {
     use DataType::Decimal128;
     if let (Decimal128(p1, s1), Decimal128(p2, s2)) = (l.data_type(), r.data_type()) {
         if (p1, s1) == (p2, s2) {
@@ -382,6 +504,20 @@ pub(crate) fn coerce_numeric(
         (Utf8 | LargeUtf8, Date32 | Date64 | Timestamp(..)) => {
             Ok((cast(l, r.data_type())?, r.clone()))
         }
+        // Two timestamps that differ in timezone (one tz-aware, one naive) — the shape
+        // `tz_aware_col <op> naive_literal` produces: a Delta/event-time column is
+        // `Timestamp(us, Some("UTC"))` while a bare `lit(datetime)` is `Timestamp(us, None)`.
+        // The comparison kernels demand identical types, so this raised "Invalid comparison
+        // operation: Timestamp(Microsecond, Some(...)) > Timestamp(Microsecond, None)" — a hard
+        // crash on a common query. A tz-aware timestamp's stored values are UTC instants, so we
+        // **strip the zone** (cast the aware side to the naive side's `Timestamp(unit, None)`) and
+        // compare the raw instants: the naive literal is thereby read as that same UTC instant —
+        // exactly how DuckDB compares a naive literal against a `TIMESTAMPTZ` in its (UTC) session
+        // zone. Stripping the zone is a metadata drop that needs no timezone database, so it works
+        // for a *named* zone (`"UTC"`) too — casting *to* a named zone would fail on an arrow build
+        // without the `chrono-tz` feature. Casting to the naive side's type unifies the unit as well.
+        (Timestamp(_, Some(_)), Timestamp(_, None)) => Ok((cast(l, r.data_type())?, r.clone())),
+        (Timestamp(_, None), Timestamp(_, Some(_))) => Ok((l.clone(), cast(r, l.data_type())?)),
         // A Utf8 string literal compared to a Binary-typed column — the shape ClickBench's
         // `hits` produces, since its string columns arrive as `Binary` (no UTF-8 logical
         // annotation) while a SQL literal like `''` is `Utf8`. Cast the Utf8 side to the
@@ -392,6 +528,18 @@ pub(crate) fn coerce_numeric(
         (Utf8 | LargeUtf8, Binary) => Ok((cast(l, &Binary)?, r.clone())),
         (LargeBinary, Utf8 | LargeUtf8) => Ok((l.clone(), cast(r, &LargeBinary)?)),
         (Utf8 | LargeUtf8, LargeBinary) => Ok((cast(l, &LargeBinary)?, r.clone())),
+        // Two string columns of differing offset width (`Utf8` vs `LargeUtf8`), or two
+        // binary columns of differing width (`Binary` vs `LargeBinary`). The comparison
+        // kernels demand *identical* types, so a bare `largeutf8_col = 'x'` (the literal
+        // is `Utf8`) raised "Invalid comparison operation" on a reachable data path, where
+        // DuckDB treats both as one VARCHAR / BLOB domain and compares them. Widen the
+        // narrower side to the wider one (`i32 → i64` offsets — always lossless), matching
+        // DuckDB. Arithmetic never reaches here (strings/binaries don't arithmetic-coerce),
+        // and `||` casts both to `Utf8` itself, so this only affects the comparison arms.
+        (Utf8, LargeUtf8) => Ok((cast(l, &LargeUtf8)?, r.clone())),
+        (LargeUtf8, Utf8) => Ok((l.clone(), cast(r, &LargeUtf8)?)),
+        (Binary, LargeBinary) => Ok((cast(l, &LargeBinary)?, r.clone())),
+        (LargeBinary, Binary) => Ok((l.clone(), cast(r, &LargeBinary)?)),
         _ => Ok((l.clone(), r.clone())),
     }
 }
@@ -475,6 +623,34 @@ mod arith_semantics_tests {
                 .unwrap()
             ),
             vec![Some(1)]
+        );
+    }
+
+    /// Left shift by a negative or ≥ 64 amount yields 0, not the masked value arrow's
+    /// `wrapping_shl` produced (`1 << 64` gave `1`, `1 << -1` gave `1 << 63`). In range,
+    /// the shift wraps the overflowed high bits out (the engine's wrapping-arithmetic
+    /// convention), consistent with `ShiftRight`'s out-of-range → 0 rule.
+    #[test]
+    fn left_shift_out_of_range_is_zero() {
+        let v = i64arr(vec![Some(1), Some(1), Some(1), Some(1), Some(5), Some(3)]);
+        let s = i64arr(vec![Some(64), Some(-1), Some(0), Some(3), Some(100), None]);
+        assert_eq!(
+            as_i64(&eval_binary(BinaryOp::ShiftLeft, &v, &s).unwrap()),
+            // 64 → 0, -1 → 0, 0 → 1, 3 → 8, 100 → 0, null → null
+            vec![Some(0), Some(0), Some(1), Some(8), Some(0), None]
+        );
+        // In-range shift that overflows the sign bit wraps (does not error), matching the
+        // engine's wrapping integer arithmetic.
+        assert_eq!(
+            as_i64(
+                &eval_binary(
+                    BinaryOp::ShiftLeft,
+                    &i64arr(vec![Some(1)]),
+                    &i64arr(vec![Some(63)])
+                )
+                .unwrap()
+            ),
+            vec![Some(1i64 << 63)] // i64::MIN
         );
     }
 
@@ -651,6 +827,45 @@ mod scalar_path_tests {
         assert!(got.is_null(2));
     }
 
+    /// Two string columns of different offset width (`LargeUtf8` vs `Utf8`) — the shape a
+    /// `largeutf8_col = 'lit'` produces, since a SQL string literal is `Utf8` — must compare
+    /// by widening to a common type, not raise "Invalid comparison operation". Same for two
+    /// binary columns of different width (`Binary` vs `LargeBinary`). DuckDB compares both.
+    #[test]
+    fn mixed_width_string_and_binary_columns_compare() {
+        use arrow::array::{
+            BinaryArray, BooleanArray, LargeBinaryArray, LargeStringArray, StringArray,
+        };
+        // LargeUtf8 column vs Utf8 literal, both operand orders.
+        let lutf8: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("a"), Some("b"), None]));
+        let utf8: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), Some("a"), Some("a")]));
+        for (l, r) in [(&lutf8, &utf8), (&utf8, &lutf8)] {
+            let out = eval_binary(BinaryOp::Eq, l, r).expect("mixed-width string compares");
+            let got = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert!(got.value(0)); // "a" == "a"
+            assert!(!got.value(1)); // "b" != "a" (or "a" != "b")
+            assert!(got.is_null(2)); // NULL compares null
+        }
+        // Binary vs LargeBinary, both operand orders.
+        let bin: ArrayRef = Arc::new(BinaryArray::from_opt_vec(vec![
+            Some(b"a".as_ref()),
+            Some(b"b"),
+            None,
+        ]));
+        let lbin: ArrayRef = Arc::new(LargeBinaryArray::from_opt_vec(vec![
+            Some(b"a".as_ref()),
+            Some(b"a"),
+            Some(b"a"),
+        ]));
+        for (l, r) in [(&bin, &lbin), (&lbin, &bin)] {
+            let out = eval_binary(BinaryOp::Ne, l, r).expect("mixed-width binary compares");
+            let got = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert!(!got.value(0)); // "a" == "a" → Ne false
+            assert!(got.value(1)); // "b" != "a" → Ne true
+            assert!(got.is_null(2)); // NULL → null
+        }
+    }
+
     /// A `Timestamp`/`Date32` column compared to a `Utf8` date-string literal coerces by
     /// parsing the literal to the column's temporal type (ClickBench's `EventDate >= '…'`).
     #[test]
@@ -664,6 +879,74 @@ mod scalar_path_tests {
         assert_eq!(got.value(0), false); // 06-30 >= 07-01 → false
         assert_eq!(got.value(1), true); // 07-01 >= 07-01 → true
         assert_eq!(got.value(2), true); // 07-02 >= 07-01 → true
+    }
+
+    /// `DATE - DATE` is the integer count of days between them (DuckDB), not an interval.
+    #[test]
+    fn date_minus_date_is_int64_day_count() {
+        use arrow::array::{Date32Array, Int64Array};
+        // 2023-05-15 is day 19492; 2023-05-10 is 19487 → difference 5. Nulls propagate.
+        let a: ArrayRef = Arc::new(Date32Array::from(vec![Some(19492), Some(19487), None]));
+        let b: ArrayRef = Arc::new(Date32Array::from(vec![Some(19487), Some(19492), Some(1)]));
+        let out = eval_binary(BinaryOp::Sub, &a, &b).unwrap();
+        let got = out
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 day count");
+        assert_eq!(got.value(0), 5);
+        assert_eq!(got.value(1), -5);
+        assert!(got.is_null(2));
+    }
+
+    /// `DATE ± <integer days>` shifts the date (DuckDB `DATE - 5`), staying a `Date32`.
+    #[test]
+    fn date_plus_minus_int_shifts_by_days() {
+        use arrow::array::{Date32Array, Int64Array};
+        let d: ArrayRef = Arc::new(Date32Array::from(vec![Some(19492), None]));
+        let n: ArrayRef = Arc::new(Int64Array::from(vec![Some(5), Some(3)]));
+        // date - 5 → 19487; null propagates.
+        let sub = eval_binary(BinaryOp::Sub, &d, &n).unwrap();
+        let sub = sub.as_any().downcast_ref::<Date32Array>().expect("Date32");
+        assert_eq!(sub.value(0), 19487);
+        assert!(sub.is_null(1));
+        // date + 5 → 19497.
+        let add = eval_binary(BinaryOp::Add, &d, &n).unwrap();
+        assert_eq!(
+            add.as_any().downcast_ref::<Date32Array>().unwrap().value(0),
+            19497
+        );
+        // int + date is commutative → Date32.
+        let radd = eval_binary(BinaryOp::Add, &n, &d).unwrap();
+        assert_eq!(
+            radd.as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(0),
+            19497
+        );
+    }
+
+    /// A tz-aware `Timestamp` column compared to a tz-naive `Timestamp` literal (the shape
+    /// `utc_col > lit(naive_datetime)` produces) must compare the instants directly — no crash,
+    /// and no value shift: the naive literal is read as the same UTC instant, matching DuckDB.
+    #[test]
+    fn tz_aware_timestamp_column_vs_naive_literal_compares() {
+        use arrow::array::{BooleanArray, TimestampMicrosecondArray};
+        let us = 1_000_000i64;
+        let (jan1, mar1, jun1) = (1_609_459_200 * us, 1_614_556_800 * us, 1_622_505_600 * us);
+        // UTC-aware column; naive literal at 2021-03-01.
+        let aware: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(vec![jan1, jun1]).with_timezone("+00:00"));
+        let naive: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![mar1, mar1]));
+        let out = eval_binary(BinaryOp::Gt, &aware, &naive).unwrap();
+        let got = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(!got.value(0), "2021-01-01 > 2021-03-01 must be false");
+        assert!(got.value(1), "2021-06-01 > 2021-03-01 must be true");
+        // Reversed operand order coerces the same way (naive on the left).
+        let out2 = eval_binary(BinaryOp::Lt, &naive, &aware).unwrap();
+        let got2 = out2.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(!got2.value(0)); // 2021-03-01 < 2021-01-01 → false
+        assert!(got2.value(1)); // 2021-03-01 < 2021-06-01 → true
     }
 }
 

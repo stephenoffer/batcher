@@ -126,6 +126,8 @@ def reduce_join_paths_spilling(
     work_dir: str,
     n_buckets: int,
     engine_config: str,
+    left_schema: pa.Schema | None = None,
+    right_schema: pa.Schema | None = None,
 ) -> list[pa.RecordBatch]:
     """Reduce a co-partitioned shuffle join in bounded memory from on-disk buckets.
 
@@ -136,17 +138,25 @@ def reduce_join_paths_spilling(
     sub-bucket on both sides, so the union of the per-sub-bucket joins is exactly the
     full join (a still-large pair spills again inside the native join). The alternative —
     reading every path into one Python list before the join — peaks at the whole bucket.
+
+    `left_schema`/`right_schema` are optional fallbacks for a side that produced **no**
+    rows at all (so no schema can be inferred from its data): an outer join must still
+    null-extend the present side against a schema-bearing empty, and without the fallback
+    that side comes through untyped and the null-extension is lost. When a side has data,
+    its inferred schema wins and the fallback is unused.
     """
     nat = engine()
     from batcher.dist.shuffle_io import read_ipc
 
     n = _fd_safe(n_buckets)
-    left_sub, left_schema = _spill_paths_to_subbuckets(
+    left_sub, left_data_schema = _spill_paths_to_subbuckets(
         nat, left_paths, left_keys, n, work_dir, "rl"
     )
-    right_sub, right_schema = _spill_paths_to_subbuckets(
+    right_sub, right_data_schema = _spill_paths_to_subbuckets(
         nat, right_paths, right_keys, n, work_dir, "rr"
     )
+    left_schema = left_data_schema or left_schema
+    right_schema = right_data_schema or right_schema
     out: list[pa.RecordBatch] = []
     for i in range(n):
         if left_sub[i] is None and right_sub[i] is None:

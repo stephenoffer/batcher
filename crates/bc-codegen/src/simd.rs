@@ -35,7 +35,7 @@
 //! converted to consecutive `0`/`1` bits in the Arrow bitmask only at the store site
 //! (in `compile_simd`).
 
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{types, InstBuilder, MemFlags, Type, Value};
 use cranelift_frontend::FunctionBuilder;
 
@@ -281,12 +281,12 @@ impl SimdCodegen<'_, '_> {
     }
 
     /// Vector comparison producing an `I64xL` canonical mask (all-ones for true).
-    /// Mirrors the scalar [`Codegen::emit_cmp`](crate::emit::Codegen) lane-wise: the
-    /// interpreter compares floats with Arrow's `cmp` kernel, i.e. `f64::total_cmp`
-    /// (a TOTAL order — `-0.0 < 0.0`, negative NaN below `-inf`, positive NaN above
-    /// `+inf`) plus raw-bit equality. We reproduce that exactly by mapping each lane's
-    /// bits to `total_cmp`'s monotonic i64 key and doing a signed integer compare, so
-    /// the vector path is bit-for-bit identical to the interpreter — not bare IEEE.
+    /// Mirrors the scalar [`emit::canon_total_order_key`](crate::emit::canon_total_order_key)
+    /// lane-wise: the interpreter canonicalizes float operands (`bc_arrow::canon_f64` — the
+    /// two zeros are one value, all NaNs are one value and greatest) and then compares with
+    /// Arrow's `cmp` kernel, i.e. `f64::total_cmp`'s monotonic i64 key. We reproduce both
+    /// steps per lane, so the vector path is bit-for-bit identical to the interpreter and to
+    /// the scalar JIT — not bare IEEE, and not the raw-bit order that split `-0.0` from `0.0`.
     fn emit_cmp(&mut self, op: bc_expr::BinaryOp, l: Value, r: Value, is_float: bool) -> Value {
         use bc_expr::BinaryOp::*;
         let cc = match op {
@@ -299,21 +299,48 @@ impl SimdCodegen<'_, '_> {
             _ => unreachable!("emit_cmp only handles comparisons"),
         };
         if is_float {
-            // Lane-wise `bits ^ (((bits >> 63) as u64) >> 1)` — the same monotonic key
-            // `f64::total_cmp` uses (see `emit::total_order_key`), then a signed
-            // integer compare on the i64 lanes.
             let ity = vec_ty(ScalarTy::I64, self.lanes);
-            let lb = self.b.ins().bitcast(ity, MemFlags::new(), l);
-            let rb = self.b.ins().bitcast(ity, MemFlags::new(), r);
-            let ls = self.b.ins().sshr_imm(lb, 63);
-            let rs = self.b.ins().sshr_imm(rb, 63);
-            let lm = self.b.ins().ushr_imm(ls, 1);
-            let rm = self.b.ins().ushr_imm(rs, 1);
-            let lk = self.b.ins().bxor(lb, lm);
-            let rk = self.b.ins().bxor(rb, rm);
+            let lk = self.canon_total_order_key(l, ity);
+            let rk = self.canon_total_order_key(r, ity);
             self.b.ins().icmp(cc, lk, rk)
         } else {
             self.b.ins().icmp(cc, l, r)
         }
+    }
+
+    /// Per-lane [`emit::canon_total_order_key`](crate::emit::canon_total_order_key):
+    /// canonicalize the float (`-0.0` -> `0.0`, every NaN -> one quiet NaN), then map to
+    /// `f64::total_cmp`'s monotonic i64 key. `ity` is the `I64xL` vector type.
+    ///
+    /// A vector `fcmp` yields an all-ones/all-zeros **lane mask** rather than the scalar
+    /// path's 0/1 boolean, so the two selects are `bitselect`s over that mask.
+    fn canon_total_order_key(&mut self, v: Value, ity: Type) -> Value {
+        let fty = vec_ty(ScalarTy::F64, self.lanes);
+        let bits = self.b.ins().bitcast(ity, MemFlags::new(), v);
+
+        let zero_f = self.b.ins().f64const(0.0);
+        let zero_v = self.b.ins().splat(fty, zero_f);
+        // `Equal` is an *ordered* compare: true for `+0.0` and `-0.0`, false for NaN.
+        let is_zero = self.b.ins().fcmp(FloatCC::Equal, v, zero_v);
+        let is_zero = self.b.ins().bitcast(ity, MemFlags::new(), is_zero);
+        // A lane is unordered with itself exactly when it is NaN — any sign, any payload.
+        let is_nan = self.b.ins().fcmp(FloatCC::Unordered, v, v);
+        let is_nan = self.b.ins().bitcast(ity, MemFlags::new(), is_nan);
+
+        let zero_i = self.b.ins().iconst(types::I64, 0);
+        let zero_bits = self.b.ins().splat(ity, zero_i);
+        let nan_i = self
+            .b
+            .ins()
+            .iconst(types::I64, bc_arrow::CANONICAL_NAN_BITS_F64 as i64);
+        let nan_bits = self.b.ins().splat(ity, nan_i);
+
+        let bits = self.b.ins().bitselect(is_zero, zero_bits, bits);
+        let bits = self.b.ins().bitselect(is_nan, nan_bits, bits);
+
+        // `bits ^ (((bits >> 63) as u64) >> 1)`, lane-wise.
+        let sign = self.b.ins().sshr_imm(bits, 63);
+        let mask = self.b.ins().ushr_imm(sign, 1);
+        self.b.ins().bxor(bits, mask)
     }
 }

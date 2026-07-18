@@ -63,3 +63,26 @@ def test_array_agg(duck, t, sql):
     got = bt.sql(sql, t=t).collect().to_pylist()
     exp = duck.sql(sql).to_arrow_table().to_pylist()
     assert _as_sets(got, ",") == _as_sets(exp, ",")
+
+
+def test_string_agg_over_empty_is_null(duck):
+    # string_agg over zero rows is NULL in DuckDB, not the empty string "". It lowers to
+    # array_agg (empty -> NULL) + list-join, and join(NULL) is NULL, so the fix flows
+    # through. Previously Batcher returned "".
+    empty = pa.table({"name": pa.array([], type=pa.string())})
+    duck.register("e", empty)
+    sql = "SELECT string_agg(name, ',') s FROM e"
+    got = bt.sql(sql, e=empty).collect().to_pylist()
+    exp = duck.sql(sql).to_arrow_table().to_pylist()
+    assert got == exp == [{"s": None}]
+
+
+def test_string_agg_null_separator_is_null(duck, t):
+    # An explicit NULL separator makes the whole aggregate NULL in DuckDB (concatenating
+    # through a NULL delimiter is NULL). A SQL NULL parses to `exp.Null`, not `exp.Literal`,
+    # so Batcher previously fell through to the ',' default and wrongly joined the values.
+    sql = "SELECT g, string_agg(name, NULL) s FROM t GROUP BY g ORDER BY g"
+    got = bt.sql(sql, t=t).collect().to_pylist()
+    exp = duck.sql(sql).to_arrow_table().to_pylist()
+    assert got == exp
+    assert all(r["s"] is None for r in got)

@@ -169,13 +169,14 @@ class DeltaSource:
         """The table's add-action stats as a pyarrow table (delta-rs returns arro3)."""
         return self._snapshot().add_actions()
 
-    @staticmethod
-    def _pa_filter(predicate: dict | None) -> Any:
+    def _pa_filter(self, predicate: dict | None) -> Any:
         if predicate is None:
             return None
         from batcher.io.predicate import to_pyarrow_expression
 
-        return to_pyarrow_expression(predicate)
+        # Pass the table schema so a temporal literal is typed to its column — without it,
+        # a filter on a timezone-aware timestamp column raises rather than prunes.
+        return to_pyarrow_expression(predicate, self._snapshot().schema())
 
     def _has_deletion_vectors(self) -> bool:
         """Whether the table uses deletion vectors (delta-rs's pyarrow reader raises)."""
@@ -351,7 +352,9 @@ def read_fragment(
     if predicate is not None:
         from batcher.io.predicate import to_pyarrow_expression
 
-        flt = to_pyarrow_expression(predicate)
+        # Type temporal literals to the file's own columns (tz-aware timestamp columns
+        # cannot be compared against a tz-naive literal).
+        flt = to_pyarrow_expression(predicate, schema)
 
     if mask is None:
         return fragment.to_table(schema=schema, columns=projection, filter=flt)

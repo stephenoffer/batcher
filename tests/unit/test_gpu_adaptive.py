@@ -146,3 +146,48 @@ def test_record_cpu_crossover_is_a_noop_without_a_gpu(monkeypatch):
     q = ds.group_by("k").agg(s=bt.col("v").sum())
     gpu_backend.record_cpu_crossover(q._plan, q._sources, hub, wall_ms=5.0)
     assert hub.get_keyed_param(_NS, "cpu") is None  # nothing recorded on a CPU-only cluster
+
+
+# --- the OLS fit needs a *relative* spread, not merely a non-zero one ---------------
+
+
+def _stats(base, spread, n=8, slope=1e-5, icept=100.0, noise=0.0):
+    import random
+
+    random.seed(0)
+    xs = [base + spread * i / (n - 1) for i in range(n)]
+    ys = [icept + slope * x + random.uniform(-noise, noise) for x in xs]
+    return {
+        "n": n,
+        "sx": sum(xs),
+        "sy": sum(ys),
+        "sxx": sum(x * x for x in xs),
+        "sxy": sum(x * y for x, y in zip(xs, ys, strict=True)),
+        "xmin": min(xs),
+        "xmax": max(xs),
+    }
+
+
+def test_tightly_clustered_samples_cannot_identify_a_line():
+    """`n*sxx - sx*sx` is the unstable form; clustered x makes the difference float noise.
+
+    Eight runs at ~10M rows spread over 3 rows, with ±0.5ms of ordinary jitter on a 100ms
+    measurement, previously fit an intercept of 954,873 (true 100) and a sign-flipped slope —
+    and that intercept is the whole numerator of the learned crossover. The absolute
+    `xmax > xmin` gate passed it; a relative one must not.
+    """
+    from batcher.kyber.gpu.adaptive import _fit
+
+    assert _fit(_stats(1e7, 3, noise=0.5)) is None
+    assert _fit(_stats(1e8, 10, noise=1.0)) is None
+    assert _fit(_stats(1e7, 3)) is None  # even noiseless, 3 rows of spread identifies nothing
+
+
+def test_genuinely_spread_samples_still_fit_exactly():
+    from batcher.kyber.gpu.adaptive import _fit
+
+    fit = _fit(_stats(1e6, 7e6))
+    assert fit is not None
+    intercept, slope = fit
+    assert intercept == pytest.approx(100.0)
+    assert slope == pytest.approx(1e-5)

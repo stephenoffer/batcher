@@ -578,9 +578,16 @@ def range(start: int, stop: int, step: int = 1, *, name: str = "value") -> Datas
 
     Returns:
         A one-column lazy `Dataset` of the integer range.
+
+    Raises:
+        PlanError: If `step` is zero.
     """
     import builtins
 
+    if step == 0:
+        from batcher._internal.errors import PlanError
+
+        raise PlanError("range(): step must be non-zero")
     values = list(builtins.range(start, stop, step))
     return from_arrow(pa.table({name: pa.array(values, pa.int64())}))
 

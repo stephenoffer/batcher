@@ -160,11 +160,14 @@ a string. Batcher does not paper over it:
 from_api = bt.from_pydict({"customer_id": ["10", "20"], "region": ["us", "eu"]})
 
 try:
-    orders.join(from_api, on="customer_id").count()
-except RuntimeError as err:
+    orders.join(from_api, on="customer_id")
+except Exception as err:
     print(type(err).__name__)
-# RuntimeError
+# PlanError
 ```
+
+Note the failure lands on `join` itself, not on a later `count()`: the key types are
+checked when the plan is built, so you hear about it before any data is read.
 
 A loud failure, which is the correct one. A silent cast would either match nothing (and
 you would ship a report full of NULLs) or match by string coercion and give `010` and `10`

@@ -138,3 +138,27 @@ def duck():
     con = duckdb.connect()
     yield con
     con.close()
+
+
+def duck_materialize(con, name: str, table) -> None:
+    """Register `table` as `name` by **copying it into DuckDB's own storage**.
+
+    Use this instead of `con.register(name, table)` whenever the query compares a FLOAT
+    column that may hold a NaN. Registering hands DuckDB an Arrow scan, and DuckDB pushes
+    the filter *into* that scan, where it is evaluated with **IEEE** semantics — every
+    comparison with NaN false. Its own executor instead ranks NaN above every number
+    (`SELECT 'nan'::DOUBLE > 1` is `true`, and so is `'nan' = 'nan'`), which is its
+    documented behavior and what Batcher matches. So on `WHERE f > 1` over `[1.5, NaN]` the
+    same DuckDB answers `[1.5]` through a registered Arrow table and `[1.5, NaN]` through a
+    real one — measured on duckdb 1.5.4.
+
+    That makes a registered Arrow table an unreliable oracle for exactly the values these
+    tests exist to pin. Copying to a real table removes the Arrow scan, so the comparison
+    runs in DuckDB's executor and the oracle states DuckDB's actual semantics.
+
+    (Signed zero is unaffected — both paths agree `-0.0 = 0.0` — so the ordinary
+    `register` is fine for a float column without NaN.)
+    """
+    con.register(f"_arrow_{name}", table)
+    con.execute(f'CREATE TABLE "{name}" AS SELECT * FROM "_arrow_{name}"')
+    con.unregister(f"_arrow_{name}")

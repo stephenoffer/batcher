@@ -17,12 +17,18 @@ from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["InMemorySource"]
 
-# Overflow-safe narrow → wide numeric widenings the engine normalizes to at the FFI
-# boundary anyway (Int8/16/32, UInt8/16/32 → Int64; Float16/32 → Float64). Doing it once
-# here — instead of the Rust boundary re-casting on *every* query — turns a per-query
-# O(rows) `cast` (arrow's int16→int64 cast is ~47 ms / 10 M rows) into a one-time cost.
-# UInt64 (can overflow Int64), dictionaries, and everything else are left to the Rust
-# `normalize_batch`, which stays the correctness backstop (a no-op on already-wide cols).
+# Overflow-safe narrow → canonical widenings the engine normalizes to at the FFI
+# boundary anyway (Int8/16/32, UInt8/16/32 → Int64; Float16/32 → Float64; LargeUtf8 →
+# Utf8). Doing it once here — instead of the Rust boundary re-casting on *every* query —
+# turns a per-query O(rows) `cast` (arrow's int16→int64 cast is ~47 ms / 10 M rows) into a
+# one-time cost. `LargeUtf8 → Utf8` is here because the engine's string kernels (compare,
+# `contains`, `upper`, join keys) accept only `Utf8`, so an un-normalized `LargeUtf8`
+# column crashes them ("expected a Utf8 argument, got LargeUtf8") where the identical
+# `Utf8` column succeeds — DuckDB treats both as `VARCHAR`. UInt64 (can overflow Int64),
+# dictionaries, and everything else are left to the Rust `normalize_batch`, which stays the
+# correctness backstop (a no-op on already-wide cols). `_widen_narrow_type` applies this leaf
+# mapping recursively, so a narrow numeric buried in a struct/list/map is widened here too —
+# matching the Rust boundary, which likewise recurses into nested children.
 _WIDEN_NARROW: dict[pa.DataType, pa.DataType] = {
     pa.int8(): pa.int64(),
     pa.int16(): pa.int64(),
@@ -32,12 +38,53 @@ _WIDEN_NARROW: dict[pa.DataType, pa.DataType] = {
     pa.uint32(): pa.int64(),
     pa.float16(): pa.float64(),
     pa.float32(): pa.float64(),
+    pa.large_utf8(): pa.utf8(),
 }
 
 
 def _widen_schema(schema: pa.Schema, targets: dict[str, pa.DataType]) -> pa.Schema:
     """`schema` with each `targets` column retyped to its widened type (metadata only)."""
     return pa.schema([f.with_type(targets[f.name]) if f.name in targets else f for f in schema])
+
+
+def _widen_narrow_type(dt: pa.DataType) -> pa.DataType | None:
+    """`dt`'s widened form if the boundary narrow-widens it (recursing nested types), else None.
+
+    Applies the leaf `_WIDEN_NARROW` mapping at every nesting depth, so a narrow numeric (or
+    ``LargeUtf8``) buried in a ``struct``/``list``/``map`` widens exactly as a top-level one
+    does — matching what the Rust ``normalize_batch`` produces. ``UInt64`` and dictionaries are
+    left to the Rust boundary (as at the top level), so a nested one is passed through here.
+    """
+    flat = _WIDEN_NARROW.get(dt)
+    if flat is not None:
+        return flat
+    if pa.types.is_struct(dt):
+        widened = [(f, _widen_narrow_type(f.type)) for f in dt]
+        if not any(w is not None for _, w in widened):
+            return None
+        return pa.struct([f.with_type(w) if w is not None else f for f, w in widened])
+    if pa.types.is_list(dt) or pa.types.is_large_list(dt):
+        vf = dt.value_field
+        wt = _widen_narrow_type(vf.type)
+        if wt is None:
+            return None
+        make = pa.large_list if pa.types.is_large_list(dt) else pa.list_
+        return make(vf.with_type(wt))
+    if pa.types.is_fixed_size_list(dt):
+        vf = dt.value_field
+        wt = _widen_narrow_type(vf.type)
+        return pa.list_(vf.with_type(wt), dt.list_size) if wt is not None else None
+    if pa.types.is_map(dt):
+        kt = _widen_narrow_type(dt.key_type)
+        it = _widen_narrow_type(dt.item_type)
+        if kt is None and it is None:
+            return None
+        return pa.map_(
+            dt.key_field.with_type(kt or dt.key_type),
+            dt.item_field.with_type(it or dt.item_type),
+            dt.keys_sorted,
+        )
+    return None
 
 
 class InMemorySource:
@@ -104,7 +151,9 @@ class InMemorySource:
             self._targets: dict[str, pa.DataType] = {}
             self._schema = src_schema
         else:
-            self._targets = {f.name: t for f in src_schema if (t := _WIDEN_NARROW.get(f.type))}
+            self._targets = {
+                f.name: t for f in src_schema if (t := _widen_narrow_type(f.type)) is not None
+            }
             self._schema = _widen_schema(src_schema, self._targets) if self._targets else src_schema
         self._cache: dict[tuple[int, str], pa.Array] = {}
         self._stats: object | None = None

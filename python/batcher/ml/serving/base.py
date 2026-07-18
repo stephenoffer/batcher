@@ -63,12 +63,17 @@ class ServingClient(Protocol):
 
 
 def _column_to_numpy(column: pa.Array) -> np.ndarray:
-    """A batch column as NumPy — tensor columns keep their ``(N, *shape)`` form."""
-    from batcher.io.formats.ml.tensor import is_tensor_column
+    """A batch column as NumPy — tensor columns keep their ``(N, *shape)`` form.
 
-    if is_tensor_column(column):
-        return column.to_numpy_ndarray()
-    return column.to_numpy(zero_copy_only=False)
+    Delegates to the one converter (`ml.converters`) so serving inputs are shaped
+    identically to the training/loader path: a `FixedShapeTensor` **and** a numeric
+    ``FixedSizeList<T, W>`` feature/embedding column both restore to their full
+    ``(N, W...)`` array (null-safe), rather than a serving model silently receiving an
+    opaque per-row object array for the fixed-size-list case.
+    """
+    from batcher.ml.converters import _column_to_numpy as _convert
+
+    return _convert(column)
 
 
 def _array_from_numpy(values: np.ndarray) -> pa.Array:

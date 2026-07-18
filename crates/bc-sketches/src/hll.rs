@@ -124,6 +124,7 @@ impl HyperLogLog {
             DT::UInt16 => prim!(UInt16Array, |v: u16| v as u64),
             DT::UInt32 => prim!(UInt32Array, |v: u32| v as u64),
             DT::UInt64 => prim!(UInt64Array, |v: u64| v),
+            DT::Float16 => prim!(Float16Array, |v| canon_float_bits(f64::from(v))),
             DT::Float32 => prim!(Float32Array, |v: f32| canon_float_bits(v as f64)),
             DT::Float64 => prim!(Float64Array, |v: f64| canon_float_bits(v)),
             DT::Date32 => prim!(Date32Array, |v: i32| v as i64),
@@ -475,6 +476,29 @@ mod tests {
         // Small cardinality → HLL is exact (linear counting), so this must be exactly 3.
         let est = hll.estimate().round();
         assert_eq!(est, 3.0, "signed-zero/NaN not folded: estimate {est}");
+    }
+
+    #[test]
+    fn add_array_folds_signed_zero_and_nan_for_float16() {
+        use arrow::array::Float64Array;
+        use arrow::compute::cast;
+        use arrow::datatypes::DataType;
+        // Float16 must fold `-0.0`≡`0.0` and every NaN to one distinct identity, the
+        // same as Float32/Float64 and the exact distinct / GROUP BY path. Before the
+        // fix Float16 fell through to the row-format fallback, which does not fold
+        // signed zero, so {-0.0, 0.0, NaN, NaN', 1.5} over-counted to 4 instead of 3.
+        let src: ArrayRef = Arc::new(Float64Array::from(vec![
+            -0.0,
+            0.0,
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            1.5,
+        ]));
+        let f16 = cast(&src, &DataType::Float16).expect("cast to f16");
+        let mut hll = HyperLogLog::new(14);
+        hll.add_array(&f16);
+        let est = hll.estimate().round();
+        assert_eq!(est, 3.0, "f16 signed-zero/NaN not folded: estimate {est}");
     }
 
     #[test]

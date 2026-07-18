@@ -56,7 +56,7 @@ def test_natural_join_without_shared_columns_raises(ab):
 @pytest.mark.parametrize(
     ("query", "message"),
     [
-        ("SELECT DISTINCT ON (g) g, va FROM a ORDER BY va", "DISTINCT ON"),
+        # NB: SELECT DISTINCT ON is now supported (see test_diff_distinct_on.py).
         ("SELECT * FROM a PIVOT (SUM(va) FOR g IN ('x', 'y'))", "PIVOT"),
         (
             "SELECT * FROM (SELECT 1 AS x, 2 AS y) UNPIVOT (val FOR col IN (x, y))",

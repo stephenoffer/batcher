@@ -18,8 +18,8 @@ from batcher._sql.parser.literals import (
     _fold_const_arith,
     _like_to_regex,
     _literal,
+    _regexp_flags_prefix,
     _temporal_literal,
-    regexp_flags_prefix,
 )
 from batcher._sql.parser.scalar_funcs import (
     _date_diff,
@@ -56,6 +56,13 @@ def _scalar(tr, node) -> Expr:
             # separator (DuckDB default ',').
             if isinstance(node, exp.GroupConcat):
                 sep = node.args.get("separator")
+                if isinstance(sep, exp.Null):
+                    # DuckDB: an explicit NULL separator makes the whole aggregate NULL
+                    # (concatenating through a NULL delimiter is NULL). A plain `exp.Literal`
+                    # check misses this — a SQL NULL parses to `exp.Null`, not `exp.Literal`,
+                    # so it used to fall through to the default ',' and wrongly join the values.
+                    joined = ListJoin(col(entry[0]), ",")
+                    return nullif(joined, joined)  # a string-typed NULL for every group
                 sep = sep.name if isinstance(sep, exp.Literal) else ","
                 return ListJoin(col(entry[0]), sep)
             return col(entry[0])
@@ -98,6 +105,13 @@ def _scalar(tr, node) -> Expr:
     if isinstance(node, exp.Is) and isinstance(node.expression, exp.Null):
         # x IS NULL  (x IS NOT NULL parses as Not(Is(...)), handled above)
         return tr._scalar(node.this).is_null()
+    if isinstance(node, exp.Is) and isinstance(node.expression, exp.Boolean):
+        # x IS TRUE / x IS FALSE — a total (never-NULL) test: a NULL operand is
+        # neither true nor false. `IS NOT TRUE` / `IS NOT FALSE` parse as
+        # Not(Is(...)) and are handled by the `exp.Not` branch above.
+        inner = tr._scalar(node.this)
+        want = inner if bool(node.expression.this) else ~inner
+        return coalesce(want, lit(False))
     if isinstance(node, exp.Subquery):
         return _scalar_subquery(tr, node.this)
     if isinstance(node, (exp.Select, exp.Union)):
@@ -161,7 +175,7 @@ def _scalar(tr, node) -> Expr:
         is_str_lit = isinstance(flag_node, exp.Literal) and flag_node.is_string
         if flag_node is not None and not is_str_lit:
             raise NotImplementedError("regexp_matches options must be a constant string")
-        prefix = regexp_flags_prefix(flag_node.this if is_str_lit else None)
+        prefix = _regexp_flags_prefix(flag_node.this if is_str_lit else None)
         return tr._scalar(node.this).str.regexp_matches(prefix + pat.this)
     if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
         return json_extract(tr, node)
@@ -391,12 +405,24 @@ def _like(tr, node, case_insensitive: bool = False, escape: str | None = None) -
         target = target.str.lower()
         pattern = pattern.lower()
 
-    # Simple patterns (no escape, no `_`, `%` only at the ends) use the fast
-    # starts_with/ends_with/contains kernels; anything richer compiles to a
-    # regex (handles `_`, interior `%`, and ESCAPE).
+    # Boundary-only `%` with no `_`/ESCAPE lowers to the anchored
+    # starts_with/ends_with/contains kernels — leanest, and the shape Kyber's
+    # `like_prefix_to_range` can further turn into a zone-map-prunable range.
+    #
+    # Anything richer goes to the native `like`, whose Rust matcher classifies the
+    # pattern *once per morsel* into the cheapest shape (prefix/suffix/ordered
+    # `memmem` segment scan) and falls back to a cached anchored regex only for `_`.
+    # It must not be spelled as `regexp_matches(_like_to_regex(...))`: that runs a
+    # regex automaton per row for `%a%b%`, which measured ~7x DuckDB on TPC-H q13's
+    # `o_comment NOT LIKE '%special%requests%'` (76ms vs 11ms) — and, lacking `(?s)`,
+    # also made `%` stop at a newline, which SQL says it must not.
+    #
+    # ESCAPE keeps the Python-desugared regex: the native matcher has no escape char.
     simple = escape is None and "_" not in pattern and "%" not in pattern.strip("%")
     if simple:
         result = _like_simple(target, pattern)
+    elif escape is None:
+        result = target.str.like(pattern)
     else:
         result = target.str.regexp_matches(_like_to_regex(pattern, escape))
 

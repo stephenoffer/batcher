@@ -93,10 +93,6 @@ _UCB_SCALE_FLOOR = 0.25
 # band a learned threshold is clamped to around its default.
 _MIN_SAMPLES = 8
 _BAND = 8.0
-# Floor on the EWMA step of a per-signature scalar (join sides, partition rows, group
-# reduction). See `OptimizerConfig.learned_scalar_alpha_floor`: at the old 0.5 the newest
-# run always carried half the weight, so these priors had a ~2-observation memory and one
-# anomalous run swung them by half.
 
 
 # Reusable primitive 1 — a deterministic UCB1 bandit over a fixed arm set.
@@ -365,8 +361,12 @@ def learned_sort_merge_min_rows(hub: MetadataHub | None, default: float) -> floa
 
 # Decision family — per-signature priors (build sides, partitions, pre-aggregation).
 def _smooth(prior: float, observed: float, n_obs: int) -> float:
-    """A running mean while evidence is thin, decaying into an EWMA. See
-    `OptimizerConfig.learned_scalar_alpha_floor`."""
+    """A running mean while evidence is thin, decaying into an EWMA.
+
+    Step `max(OptimizerConfig.learned_scalar_alpha_floor, 1/(n_obs+1))`. The floor is *not*
+    the static blend weight used elsewhere: at that 0.5 the newest run always carried half the
+    weight, giving these priors a ~2-observation memory one anomalous run swung by half.
+    """
     floor = active_config().optimizer.learned_scalar_alpha_floor
     alpha = max(floor, 1.0 / (n_obs + 1))
     return alpha * observed + (1.0 - alpha) * prior

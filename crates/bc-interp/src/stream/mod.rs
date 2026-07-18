@@ -76,6 +76,11 @@ use pipeline::{limit_stream, scan_stream};
 pub(crate) struct Ctx<'a> {
     sources: &'a [Vec<RecordBatch>],
     cache: &'a BuildCache,
+    /// Workers available to a stage that is allowed to fan out. **1 inside a sharded worker**:
+    /// its pipeline is already one of `workers` running in a rayon loop, and spawning there would
+    /// nest rayon and duplicate work. Only the un-sharded (`fallback`) path passes the real count,
+    /// which is exactly where a stage can still be serial and would like not to be.
+    workers: usize,
     /// `None` when the caller did not ask for metrics — the counters are not free (an atomic add
     /// and a clock read per morsel), and a query nobody is measuring should not pay for them.
     meter: Option<&'a Meter>,
@@ -98,11 +103,23 @@ impl<'a> Ctx<'a> {
         meter: Option<&'a Meter>,
         budget: usize,
     ) -> Self {
+        Self::with_workers(sources, cache, meter, budget, 1)
+    }
+
+    /// [`Ctx::new`], for a caller that is *not* itself inside a rayon worker and so may fan out.
+    pub(crate) fn with_workers(
+        sources: &'a [Vec<RecordBatch>],
+        cache: &'a BuildCache,
+        meter: Option<&'a Meter>,
+        budget: usize,
+        workers: usize,
+    ) -> Self {
         Self {
             sources,
             cache,
             meter,
             budget,
+            workers,
         }
     }
 
@@ -144,6 +161,14 @@ pub(crate) struct JoinBuild {
     probe: Option<BroadcastProbe>,
 }
 
+impl JoinBuild {
+    /// Whether this join can be probed one morsel at a time. `false` means every worker that
+    /// probes it would re-join the whole build side, so the driver must not shard through it.
+    pub(crate) fn has_morsel_probe(&self) -> bool {
+        self.probe.is_some()
+    }
+}
+
 /// Prepared build sides, keyed by the identity of their `HashJoin` node.
 ///
 /// The key is the node's address. The plan is borrowed for the whole execution and never moves,
@@ -151,18 +176,20 @@ pub(crate) struct JoinBuild {
 /// the same plan, which a structural key would conflate.
 pub(crate) type BuildCache = HashMap<usize, Arc<JoinBuild>>;
 
-/// Execute (and hash) every hash-join build side in `plan`, once.
+/// Execute (and hash) every hash-join build side in `plan`, once, across `workers`.
 ///
-/// The build sides are themselves run on the streaming path, so preparing them never materializes
-/// their subtrees either.
+/// Each build side is run on the streaming path too, so preparing it never materializes its
+/// subtree either — and it is *sharded* like any other streamed relation, because a build side is
+/// not always the small one (see `collect_builds`).
 pub(crate) fn prebuild_joins(
     plan: &RelOp,
     sources: &[Vec<RecordBatch>],
     meter: Option<&Meter>,
     budget: usize,
+    workers: usize,
 ) -> Result<Arc<BuildCache>, InterpError> {
     let mut cache = BuildCache::new();
-    collect_builds(plan, sources, &mut cache, meter, budget)?;
+    collect_builds(plan, sources, &mut cache, meter, budget, workers)?;
     Ok(Arc::new(cache))
 }
 
@@ -172,32 +199,43 @@ fn collect_builds(
     cache: &mut BuildCache,
     meter: Option<&Meter>,
     budget: usize,
+    workers: usize,
 ) -> Result<(), InterpError> {
-    // Children first. A join's build side may itself contain joins, and draining it below runs
-    // the streaming path over that subtree — which consults this cache. Post-order guarantees
-    // the inner joins are prepared before an outer one asks to probe through them.
-    for child in plan.children() {
-        collect_builds(child, sources, cache, meter, budget)?;
-    }
     if let RelOp::HashJoin {
+        left,
         right,
         right_keys,
         join_type,
         ..
     } = plan
     {
-        let ctx = Ctx::new(sources, cache, meter, budget);
-        let batches = drain(build_with(right, ctx)?)?;
+        // Only the probe spine draws on *this* cache. The build side is executed below as one
+        // self-contained unit, which prepares whatever joins it holds itself, so descending into
+        // it here would build them twice.
+        collect_builds(left, sources, cache, meter, budget, workers)?;
+        // Shard the build side across the workers, exactly as the probe side is sharded. This
+        // was the streaming executor's worst asymmetry: the probe ran on every core while the
+        // build — the *whole* other relation — ran on one. It is hashed into a table either way,
+        // so single-threading it bought no memory and cost the entire build serially. TPC-H q4
+        // (`orders SEMI lineitem`) is the shape that exposes it: a semi join's build is always
+        // the right input (it is not commutative, so Kyber cannot swap it), so the 3.8M-row side
+        // is built and probed by 57k rows — 279 ms streaming vs 45 ms materializing. Recursion
+        // terminates because each build subtree is strictly smaller than the plan.
+        let batches = parallel::run(right, sources, workers, meter, budget)?;
         if let Ok(side) = ops::materialize(&batches) {
             let probe = make_probe(&side, right_keys, *join_type)?;
             cache.insert(node_key(plan), Arc::new(JoinBuild { side, probe }));
         }
+        return Ok(());
+    }
+    for child in plan.children() {
+        collect_builds(child, sources, cache, meter, budget, workers)?;
     }
     Ok(())
 }
 
 /// Identity of a plan node — its address in the (borrowed, immobile) plan tree.
-fn node_key(plan: &RelOp) -> usize {
+pub(crate) fn node_key(plan: &RelOp) -> usize {
     plan as *const RelOp as usize
 }
 
@@ -253,7 +291,7 @@ pub fn execute_streaming(
     sources: &[Vec<RecordBatch>],
     budget: usize,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    let cache = prebuild_joins(plan, sources, None, budget)?;
+    let cache = prebuild_joins(plan, sources, None, budget, 1)?;
     let ctx = Ctx::new(sources, &cache, None, budget);
     let out: Vec<RecordBatch> = build_with(plan, ctx)?.collect::<Result<_, _>>()?;
     Ok(strip_empties(out))
@@ -267,7 +305,7 @@ pub fn execute_streaming_metered(
     budget: usize,
 ) -> Result<(Vec<RecordBatch>, crate::ExecMetrics), InterpError> {
     let m = Meter::new(plan, 1);
-    let cache = prebuild_joins(plan, sources, Some(&m), budget)?;
+    let cache = prebuild_joins(plan, sources, Some(&m), budget, 1)?;
     let ctx = Ctx::new(sources, &cache, Some(&m), budget);
     let out: Vec<RecordBatch> = build_with(plan, ctx)?.collect::<Result<_, _>>()?;
     Ok((strip_empties(out), m.finish()))
@@ -452,7 +490,25 @@ fn build_join<'a>(
     let build_rows = prepared.side.num_rows() as u64;
 
     let Some(table) = prepared.probe.as_ref() else {
-        // `Right`/`Full`, or a key shape the per-morsel probe cannot serve.
+        // `Right`/`Full`, a build past the cache-radix cliff, or a key shape the per-morsel probe
+        // cannot serve. `spine_is_shardable` refuses to shard through such a join, so reaching
+        // here means the *whole plan* took the un-sharded path — which is right (sharding would
+        // re-join the entire build in every worker) but leaves the probe side serial. It is the
+        // one relation still on one core in TPC-H q4 (`orders SEMI lineitem`: 1.5M orders scanned
+        // and filtered to 57k). Run it across the workers instead; we are not inside a rayon loop
+        // here, exactly because this join stopped the sharding.
+        if ctx.workers > 1 {
+            let batches = parallel::run(left, ctx.sources, ctx.workers, ctx.meter, ctx.budget)?;
+            return materialized_join_from(
+                Box::new(batches.into_iter().map(Ok)),
+                left_keys,
+                right_keys,
+                join_type,
+                output,
+                strategy,
+                std::slice::from_ref(&prepared.side),
+            );
+        }
         let probe = build_with(left, ctx)?;
         return materialized_join_from(
             probe,
@@ -546,6 +602,15 @@ fn materialized_join_from<'a>(
         // A side with no batches at all (not even a schema) — the oracle yields nothing.
         return Ok(Box::new(std::iter::empty()));
     };
+    // `ops::join_batches`, NOT the parallel `par::join_partitioned` — even though this arm has
+    // already materialized both sides and running it on one core is a real cost (it is ~55% of
+    // TPC-H q4). `join_partitioned` buckets by `rayon::current_num_threads()` where
+    // `join_batches`'s radix buckets by `radix_parts(build_rows)`, so it emits the same rows in a
+    // **different order** — and this executor's contract is the same rows in the *same order* as
+    // `crate::execute` (a `LIMIT` over a semi join would otherwise return different rows on
+    // different executors). Swapping it in measured q3 120→34.5 ms and q4 169→120 ms and was
+    // reverted for exactly that: `a_semi_join_with_a_huge_build_matches_the_oracle` fails on it.
+    // Making this parallel means making it *order-preserving*, not just parallel.
     let out = ops::join_batches(
         &probe_side,
         &build_side,

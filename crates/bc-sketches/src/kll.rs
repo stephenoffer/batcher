@@ -352,10 +352,14 @@ impl KllSketch {
         if level_count == 0 {
             return None;
         }
-        let mut compactors = Vec::with_capacity(level_count);
+        // Never trust the length fields for the reservation: each level costs at
+        // least an 8-byte length prefix, and each value 8 bytes, so cap both by the
+        // bytes that actually remain. A corrupt/foreign blob claiming a huge count
+        // then hits the short-read `None` path instead of `capacity overflow`.
+        let mut compactors = Vec::with_capacity(level_count.min(c.remaining() / 8));
         for _ in 0..level_count {
             let len = c.u64()? as usize;
-            let mut level = Vec::with_capacity(len);
+            let mut level = Vec::with_capacity(len.min(c.remaining() / 8));
             for _ in 0..len {
                 let v = c.f64()?;
                 // `add` filters NaN, so a well-formed sketch never stores one; the
@@ -416,6 +420,12 @@ impl<'a> Cursor<'a> {
 
     fn is_done(&self) -> bool {
         self.pos == self.bytes.len()
+    }
+
+    /// Bytes not yet consumed. Used to bound `Vec::with_capacity` against an
+    /// untrusted length field so a crafted blob cannot request a giant allocation.
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
     }
 }
 
@@ -598,6 +608,34 @@ mod tests {
         b.extend_from_slice(&2u64.to_le_bytes()); // level 0 len
         b.extend_from_slice(&f64::NAN.to_le_bytes());
         b.extend_from_slice(&1.5f64.to_le_bytes());
+        assert!(KllSketch::from_bytes(&b).is_none());
+    }
+
+    #[test]
+    fn from_bytes_rejects_absurd_level_count_without_panic() {
+        // A crafted/corrupt blob with a valid header but an enormous `level_count`
+        // must be rejected with `None`, not abort the process by pre-allocating a
+        // `Vec` of that many levels (`Vec::with_capacity(huge)` → capacity overflow).
+        let mut b = Vec::new();
+        b.extend_from_slice(&8u64.to_le_bytes()); // k
+        b.extend_from_slice(&0u64.to_le_bytes()); // n
+        b.extend_from_slice(&f64::INFINITY.to_le_bytes()); // min
+        b.extend_from_slice(&f64::NEG_INFINITY.to_le_bytes()); // max
+        b.extend_from_slice(&u64::MAX.to_le_bytes()); // level_count = absurd
+        assert!(KllSketch::from_bytes(&b).is_none());
+    }
+
+    #[test]
+    fn from_bytes_rejects_absurd_level_len_without_panic() {
+        // Same hazard one layer down: a valid level_count but an enormous per-level
+        // `len` must be rejected, not pre-allocate `len` f64s and blow the allocator.
+        let mut b = Vec::new();
+        b.extend_from_slice(&8u64.to_le_bytes()); // k
+        b.extend_from_slice(&2u64.to_le_bytes()); // n
+        b.extend_from_slice(&1.0f64.to_le_bytes()); // min
+        b.extend_from_slice(&2.0f64.to_le_bytes()); // max
+        b.extend_from_slice(&1u64.to_le_bytes()); // level_count = 1
+        b.extend_from_slice(&u64::MAX.to_le_bytes()); // level 0 len = absurd
         assert!(KllSketch::from_bytes(&b).is_none());
     }
 

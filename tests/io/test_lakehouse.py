@@ -305,6 +305,7 @@ def test_delta_multi_shard_commit_loses_no_data(tmp_path) -> None:
     staged shard. The old design buffered shards in per-sink memory, so a worker's data
     never reached the driver's committing sink and the distributed write wrote nothing.
     """
+    pytest.importorskip("deltalake")
     from batcher.io.manifest import WriteManifest
 
     path = str(tmp_path / "delta_shards")
@@ -325,6 +326,7 @@ def test_delta_multi_shard_commit_loses_no_data(tmp_path) -> None:
 
 def test_delta_partitioned_multi_shard_commit(tmp_path) -> None:
     """A partitioned multi-shard commit lays out Hive dirs and keeps every row."""
+    pytest.importorskip("deltalake")
     from batcher.io.manifest import WriteManifest
 
     path = str(tmp_path / "delta_part")

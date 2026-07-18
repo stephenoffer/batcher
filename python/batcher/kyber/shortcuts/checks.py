@@ -217,8 +217,12 @@ def contains(facts: Facts, column: str, value: Any) -> bool | None:
         return None
     if _refuted_by_bounds(col, value) or _refuted_by_bloom(col, value):
         return False
-    if col.has_bounds and col.min == col.max and col.min == value:
-        return True  # a constant column: the one value it holds is this one
+    # A constant column holds exactly one value — but only if it holds any *row* at all.
+    # A source can declare bounds alongside a zero row count (a stale manifest, a partition
+    # whose files were deleted), and an empty relation contains nothing. Requiring a proven
+    # non-zero row count turns that `True` into a `None`, which sends the caller to execution.
+    if col.has_bounds and col.min == col.max and col.min == value and facts.rows:
+        return True  # a non-empty constant column: the one value it holds is this one
     return None
 
 

@@ -49,6 +49,18 @@ def translate_ast(
     return _Translator(registry, functions or {}).statement(ast)
 
 
+def _table_ref_count(root, name: str) -> int:
+    """How many times `name` is referenced as a table anywhere under `root`.
+
+    Counts `FROM name` / `JOIN name` occurrences, including those inside a scalar subquery or a
+    later CTE. A CTE's own `WITH name AS (…)` header is an alias, not an `exp.Table`, so it is
+    not counted — only real references are.
+    """
+    from sqlglot import expressions as exp
+
+    return sum(1 for t in root.find_all(exp.Table) if t.name == name)
+
+
 def _align_setop_columns(left: Dataset, right: Dataset) -> Dataset:
     """Rename `right`'s columns to `left`'s positionally, for a set operation.
 
@@ -83,6 +95,30 @@ class _Translator:
         self._scalar_sub_n = 0
         self._udf_n = 0
 
+    def _cte_dataset(self, root, cte) -> Dataset:
+        """The `Dataset` a CTE binds to — *materialized* when it is referenced more than once.
+
+        A CTE is otherwise a lazy plan, so every `FROM cte` inlines it and **re-executes** the
+        whole subtree. TPC-H q15 references its `revenue` CTE twice — once in the join, once in
+        `(SELECT max(total_revenue) FROM revenue)` — and so scanned, filtered and grouped 6M
+        lineitem rows twice: **46.9 ms, against 7.6 ms** computing it once. This is what DuckDB
+        does with a multiply-referenced CTE.
+
+        It also forecloses a real hazard rather than one we hit: re-executing a *float* aggregate
+        can legitimately differ in the last ULP between evaluations (different scheduling ⇒
+        different summation order, and float addition is not associative), and q15 compares two
+        evaluations of that sum for **equality**. Batcher happened to agree with DuckDB either
+        way; Daft, which inlines, returns **0 rows instead of 1 on 3 runs in 4** on this exact
+        query. One evaluation makes both references read identical bytes, so the question cannot
+        arise.
+
+        Referenced once ⇒ left lazy, so predicate/projection pushdown still reaches into it.
+        """
+        ds = self.statement(cte.this)
+        if _table_ref_count(root, cte.alias) > 1:
+            return from_arrow(ds.collect())
+        return ds
+
     # --- statement ---------------------------------------------------------
     def statement(self, node) -> Dataset:
         """Translate a top-level statement: a SELECT or a set operation."""
@@ -94,7 +130,7 @@ class _Translator:
         with_ = node.args.get("with") or node.args.get("with_")
         if with_ is not None:
             for cte in with_.expressions:
-                self._registry[cte.alias] = self.statement(cte.this)
+                self._registry[cte.alias] = self._cte_dataset(node, cte)
             # Strip the WITH so the body translates as an ordinary statement.
             node = node.copy()
             node.set("with", None)
@@ -213,6 +249,9 @@ class _Translator:
 
     def _aggregate(self, ds: Dataset, projections, group, having) -> Dataset:
         return grouping._aggregate(self, ds, projections, group, having)
+
+    def _distinct_on(self, ds: Dataset, projections, order, on_exprs) -> Dataset:
+        return grouping._distinct_on(self, ds, projections, order, on_exprs)
 
     # --- window functions (windowing.py) -----------------------------------
     def _is_window(self, p) -> bool:

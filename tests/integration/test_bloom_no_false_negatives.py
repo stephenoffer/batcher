@@ -120,6 +120,37 @@ def test_probing_across_type_domains_reports_a_false_absence():
 
 
 @pytest.mark.integration
+def test_join_key_bloom_matches_signed_zero_and_nan():
+    """The distributed-join key bloom (`build_key_bloom` on the small side, probed by
+    `bloom_filter_batches` on the large side to drop non-matching rows *before* the shuffle)
+    must fold float keys to the engine's identity, exactly as the equi-join's own keys do.
+
+    An equi-join matches `-0.0` to `0.0` and every NaN to one NaN. If the bloom is built on
+    `0.0`'s raw bytes and probed on `-0.0`'s, it reports "absent" and drops a probe row the
+    join *would* have matched — a silent distributed wrong answer. This pins the fold.
+    """
+    import struct
+
+    def f64(bits: int) -> float:
+        return struct.unpack("<d", struct.pack("<Q", bits))[0]
+
+    neg_nan = f64(0xFFF8000000000000)
+    pos_nan = f64(0x7FF8000000000000)
+    build = pa.record_batch([pa.array([0.0, 1.5, pos_nan], pa.float64())], names=["k"])
+    probe = pa.record_batch(
+        [pa.array([-0.0, neg_nan, 1.5, 9.9], pa.float64())], names=["k"]
+    )
+    bloom = nat.build_key_bloom([build], [0], 8)
+    kept = nat.bloom_filter_batches([probe], [0], bloom)
+    survivors = pa.Table.from_batches(kept).column("k").to_pylist() if kept else []
+    # -0.0 matches 0.0; neg_nan matches the pos NaN in the build side; 1.5 matches; 9.9 not.
+    assert any(s == 0.0 for s in survivors), "-0.0 must survive (matches 0.0)"
+    assert any(s != s for s in survivors), "a negative NaN must survive (matches NaN)"
+    assert 1.5 in survivors
+    assert 9.9 not in survivors, "a genuinely absent key must still be dropped"
+
+
+@pytest.mark.integration
 def test_the_pruning_rule_refuses_a_cross_domain_probe():
     from batcher.kyber.rules.zonemap_pruning import _same_bloom_domain
     from batcher.plan.stats import ColumnStat

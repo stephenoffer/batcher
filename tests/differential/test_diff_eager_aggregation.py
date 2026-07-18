@@ -25,6 +25,17 @@ def _ctx(ds, ndv):
     return OptimizerContext(config=active_config(), sources=ds._sources, hub=None, estimator=est)
 
 
+def _tile(table: pa.Table, n: int = 8) -> pa.Table:
+    """Replicate a fixture ``n`` times so the pushed side has ~``n``x more rows per key.
+
+    The pushdown's cost guard fires only on a large row reduction (a low-cardinality grouping,
+    the shape where pre-aggregating actually pays); a handful of toy rows never clears it. Tiling
+    keeps every key, fan-out ratio, and unmatched-row edge case intact — it only scales the counts,
+    which DuckDB recomputes from the same registered table, so the correctness comparison is exact.
+    """
+    return pa.concat_tables([table] * n)
+
+
 def _pushed(ds, ndv):
     """Apply eager_aggregation; assert it fired; return the rewritten Dataset."""
     out = eager_aggregation(ds._plan, _ctx(ds, ndv))
@@ -35,7 +46,7 @@ def _pushed(ds, ndv):
 def test_max_grouped_by_right_column(duck):
     from conftest import assert_same
 
-    emp = pa.table({"dept_id": [1, 1, 2, 2, 3], "sal": [100, 200, 150, 300, 50]})
+    emp = _tile(pa.table({"dept_id": [1, 1, 2, 2, 3], "sal": [100, 200, 150, 300, 50]}))
     dept = pa.table({"dept_id": [1, 2, 3], "name": ["eng", "sales", "ops"]})
     duck.register("emp", emp)
     duck.register("dept", dept)
@@ -57,7 +68,7 @@ def test_min_max_under_fan_out(duck):
     (a sum would be multiplied — which is why the rule excludes it)."""
     from conftest import assert_same
 
-    fact = pa.table({"k": [1, 1, 2, 3], "v": [10, 40, 20, 5]})
+    fact = _tile(pa.table({"k": [1, 1, 2, 3], "v": [10, 40, 20, 5]}))
     dim = pa.table({"k": [1, 1, 2, 2, 3], "g": ["a", "a", "b", "b", "c"]})  # fan-out on k
     duck.register("fact", fact)
     duck.register("dim", dim)
@@ -77,12 +88,14 @@ def test_min_max_under_fan_out(duck):
 def test_grouped_by_left_column(duck):
     from conftest import assert_same
 
-    fact = pa.table(
-        {
-            "k": [1, 1, 2, 2, 1, 2],
-            "cat": ["x", "x", "y", "y", "x", "y"],
-            "v": [3, 9, 4, 1, 5, 2],
-        }
+    fact = _tile(
+        pa.table(
+            {
+                "k": [1, 1, 2, 2, 1, 2],
+                "cat": ["x", "x", "y", "y", "x", "y"],
+                "v": [3, 9, 4, 1, 5, 2],
+            }
+        )
     )
     dim = pa.table({"k": [1, 2], "d": [100, 200]})
     duck.register("f2", fact)
@@ -110,7 +123,7 @@ def test_measure_pushdown_left_join_count(duck):
     from conftest import assert_same
 
     cust = pa.table({"ck": [1, 2, 3, 4], "name": ["a", "b", "c", "d"]})
-    orders = pa.table({"ok": [10, 11, 12, 13, 14], "ck": [1, 1, 1, 3, 3]})
+    orders = _tile(pa.table({"ok": [10, 11, 12, 13, 14], "ck": [1, 1, 1, 3, 3]}))
     duck.register("cust", cust)
     duck.register("ord", orders)
     # cust 2 and 4 have no orders → COUNT(ok) must be 0 for them.
@@ -133,7 +146,7 @@ def test_measure_pushdown_inner_sum_min_fan_out(duck):
     from conftest import assert_same
 
     left = pa.table({"k": [1, 1, 2, 3], "g": ["p", "p", "q", "q"]})
-    right = pa.table({"k": [1, 1, 2, 2, 2], "v": [10, 20, 5, 7, 9]})
+    right = _tile(pa.table({"k": [1, 1, 2, 2, 2], "v": [10, 20, 5, 7, 9]}))
     duck.register("lf", left)
     duck.register("rt", right)
     ds = (
@@ -155,12 +168,14 @@ def test_measure_pushdown_left_side_computed_expr(duck):
     merging must match DuckDB, including duplicate join keys (fan-out)."""
     from conftest import assert_same
 
-    line = pa.table(
-        {
-            "ok": [1, 1, 2, 2, 3],
-            "price": [100.0, 200.0, 50.0, 70.0, 30.0],
-            "disc": [0.1, 0.0, 0.2, 0.0, 0.5],
-        }
+    line = _tile(
+        pa.table(
+            {
+                "ok": [1, 1, 2, 2, 3],
+                "price": [100.0, 200.0, 50.0, 70.0, 30.0],
+                "disc": [0.1, 0.0, 0.2, 0.0, 0.5],
+            }
+        )
     )
     order = pa.table({"ok": [1, 2, 3], "prio": ["hi", "lo", "hi"]})
     duck.register("li", line)

@@ -110,3 +110,14 @@ def test_nth_value_explicit_rows_frame(duck, t):
         "SELECT i, nth_value(v, 2) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) "
         "AS nv FROM t",
     )
+
+
+@pytest.mark.parametrize("fn", ["first_value", "last_value"])
+def test_value_single_bound_frame(duck, t, fn):
+    # `ROWS 1 PRECEDING` == `ROWS BETWEEN 1 PRECEDING AND CURRENT ROW`; the end must
+    # default to CURRENT ROW, not UNBOUNDED FOLLOWING.
+    _same(
+        duck,
+        t,
+        f"SELECT i, {fn}(v) OVER (PARTITION BY g ORDER BY i ROWS 1 PRECEDING) AS x FROM t",
+    )

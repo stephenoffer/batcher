@@ -396,7 +396,13 @@ def _reduce_agg_bucket(store, handle, gk, aj, nat, key_idx, n_keys, out, depth):
     (N13: skew degrades gracefully instead of OOMing the reduce).
     """
     bucket_max = active_config().memory.spill_bucket_max_bytes
-    if n_keys == 0 or handle.nbytes <= bucket_max or depth >= _MAX_SPILL_RECURSION:
+    # Budget against the bucket's *uncompressed* (in-memory) size — reading it back
+    # decompresses into RAM. `handle.nbytes` is the on-disk compressed size, which for a
+    # compressible bucket (many repeated group keys/values) can be far smaller than the
+    # resident footprint, so using it would let an over-large bucket skip re-spill recursion
+    # and OOM `combine_finalize`. `logical_nbytes` is the size `combine_finalize` actually pays.
+    resident = handle.logical_nbytes or handle.nbytes
+    if n_keys == 0 or resident <= bucket_max or depth >= _MAX_SPILL_RECURSION:
         partials = store.read(handle)
         if partials:
             out.append(nat.combine_finalize(gk, aj, partials))

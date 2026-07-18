@@ -307,7 +307,17 @@ def _execute_adaptive(
     # predicates, and reordering joins over the whole plan first makes every breaker
     # subtree self-contained — the per-stage loop then only refines cost-based choices
     # with measured cardinalities. Holds for single-node and distributed alike.
-    plan = kyber.optimize_logical(plan, sources=srcs, hub=hub)
+    #
+    # But a `map_batches` operator is opaque to the IR (`to_ir` raises by design), and this
+    # whole-plan optimize lowers to IR to run the rule engine — so skip it for a UDF plan
+    # (the one-shot path never lowers one whole either; `_run_stage` dispatches every
+    # map-carrying stage to `core.execute_with_udfs`, which walks it operator-by-operator).
+    # Each self-contained relational stage is still optimized on its own by `run_relational`,
+    # so the result matches the non-adaptive run instead of raising `NotImplementedError`.
+    from batcher import core
+
+    if not core.has_map_batches(plan):
+        plan = kyber.optimize_logical(plan, sources=srcs, hub=hub)
     decisions: list = []
     stages = 0
     intermediates: list = []  # partitioned-on-disk/Flight sources, cleaned up at the end

@@ -234,7 +234,11 @@ def _apply_node_rules(
                 if seen is not None and seen is node:
                     continue  # this rule already proved itself a no-op on this exact node
             rewritten = r.node_fn(node, ctx)
-            if rewritten is None:
+            # `None` is the documented "no change" signal, but a rule may equivalently hand
+            # back the very node it was given. That is definitionally a no-op too, and without
+            # memoizing it the rule is re-run against the same node on every fixpoint
+            # iteration, forever — the exact cost this memo exists to remove.
+            if rewritten is None or rewritten is node:
                 if noop is not None:
                     noop[key] = node  # strong ref: pins the id against reuse
                 continue

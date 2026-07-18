@@ -24,9 +24,12 @@
 //! query fast. Ticket minting and epoch/plan fencing stay in Python: Rust only sees
 //! opaque ticket strings.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow::error::ArrowError;
+use arrow::ipc::writer::StreamWriter;
 use arrow_pyarrow::PyArrowType;
 use bc_interp::InterpError;
 use bc_transport::{classify, FetchFault, ShuffleTicket, TransportError};
@@ -465,6 +468,75 @@ pub(crate) fn combine_finalize_spilling(
         })
         .map_err(to_pyerr)?;
     Ok(PyArrowType(out))
+}
+
+/// Write one source's fetched batches to a fresh Arrow-IPC stream file under `dir`.
+fn write_gather_file(
+    dir: &std::path::Path,
+    seq: usize,
+    batches: &[RecordBatch],
+) -> Result<PathBuf, InterpError> {
+    let path = dir.join(format!("gather-{seq}.arrow"));
+    let file = std::fs::File::create(&path).map_err(ArrowError::from)?;
+    let mut w = StreamWriter::try_new(file, &batches[0].schema()).map_err(InterpError::from)?;
+    for b in batches {
+        w.write(b).map_err(InterpError::from)?;
+    }
+    w.finish().map_err(InterpError::from)?;
+    Ok(path)
+}
+
+/// Concurrently gather every source's bucket and **spill each to its own Arrow-IPC file** under
+/// `dir`, returning the file paths (not the rows). The bounded-memory sibling of
+/// [`gather_concat`]: where that returns the whole assembled bucket in RAM, this holds only
+/// `fan_in` in-flight fetches at once and lands each on disk, so a reducer whose bucket exceeds
+/// RAM stages it out of core. The caller then runs the spilling reduce over these paths
+/// (`combine_finalize_spilling`), keeping the flight aggregate reduce bounded end to end.
+///
+/// Returns `(paths, unreachable)`; a non-empty `unreachable` leaves the set partial (the driver
+/// recomputes + retries), matching the other gathers. `replicas[i]` lists fallback addresses.
+#[pyfunction]
+#[pyo3(signature = (server, client, sources, dir, fan_in, credits=bc_transport::DEFAULT_CREDITS, token=None, shm=false, replicas=Vec::new()))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gather_to_files(
+    py: Python<'_>,
+    server: &FlightShuffleServer,
+    client: &ShuffleClient,
+    sources: Vec<(String, String)>,
+    dir: String,
+    fan_in: usize,
+    credits: u32,
+    token: Option<String>,
+    shm: bool,
+    replicas: Vec<Vec<String>>,
+) -> PyResult<(Vec<String>, Vec<usize>)> {
+    let sources = parse_sources(sources)?;
+    let pool = client.pool.clone();
+    let dir = PathBuf::from(dir);
+
+    let out: Result<(Vec<String>, Vec<usize>), GatherErr> = py.allow_threads(|| {
+        shared_runtime().block_on(async {
+            let mut paths: Vec<String> = Vec::new();
+            let mut seq: usize = 0;
+            let stage = |batches: Vec<RecordBatch>| -> Result<(), InterpError> {
+                if batches.is_empty() {
+                    return Ok(());
+                }
+                let path = write_gather_file(&dir, seq, &batches)?;
+                seq += 1;
+                paths.push(path.to_string_lossy().into_owned());
+                Ok(())
+            };
+            let unreachable = drive(
+                server, pool, &sources, &replicas, credits, fan_in, token, shm, stage,
+            )
+            .await?;
+            Ok((paths, unreachable))
+        })
+    });
+
+    let (paths, unreachable) = out.map_err(GatherErr::into_pyerr)?;
+    Ok((paths, unreachable))
 }
 
 /// Parse the `(addr, ticket_string)` sources into `(addr, ShuffleTicket)`.

@@ -140,7 +140,13 @@ def _scalar_function(tr, node):
             raise NotImplementedError("position() requires a string literal pattern")
         return tr._scalar(node.this).str.position(pat.this)
     if name == "Pad":
-        width = int(node.args["expression"].this)
+        # A negative width (`lpad(s, -1, '*')`) parses as a `Neg` wrapping the
+        # literal, so `int(node.args["expression"].this)` raised a TypeError on the
+        # `Neg` node. `_int_literal` folds the sign; the engine's `.lpad`/`.rpad`
+        # clamp a non-positive width to the empty string, matching DuckDB.
+        width = _int_literal(node.args["expression"])
+        if width is None:
+            raise NotImplementedError("lpad()/rpad(): width must be an integer literal")
         fill_node = node.args.get("fill_pattern")
         fill = fill_node.this if fill_node is not None else " "
         base = tr._scalar(node.this).str
@@ -217,9 +223,16 @@ def _raw_value(node):
 
 
 def _regexp_replace(tr, node) -> Expr:
-    """`regexp_replace(s, pattern, replacement)` — replace the first match (DuckDB
-    default; constant pattern/replacement)."""
+    """`regexp_replace(s, pattern, replacement[, options])` — replace the first match, or
+    every match with the ``'g'`` option (DuckDB default is first-only; constant args).
+
+    The ``options`` string is honoured, not dropped: ``'g'`` selects the global
+    (replace-all) variant, and ``'i'``/``'s'``/``'c'`` map to an inline regex flag prefix
+    (`_regexp_flags_prefix`). Previously the whole options arg was ignored, so
+    ``regexp_replace(s, 'abc', 'X', 'i')`` matched case-sensitively (wrong vs DuckDB)."""
     from sqlglot import expressions as exp
+
+    from batcher._sql.parser.literals import _regexp_flags_prefix
 
     pat = node.expression
     repl = node.args.get("replacement")
@@ -227,7 +240,21 @@ def _regexp_replace(tr, node) -> Expr:
         raise NotImplementedError("regexp_replace requires a constant string pattern")
     if not (isinstance(repl, exp.Literal) and repl.is_string):
         raise NotImplementedError("regexp_replace requires a constant string replacement")
-    return tr._scalar(node.this).str.regexp_replace(pat.this, repl.this)
+    mods = node.args.get("modifiers")
+    global_replace = False
+    prefix = ""
+    if mods is not None:
+        if not (isinstance(mods, exp.Literal) and mods.is_string):
+            raise NotImplementedError("regexp_replace options must be a constant string")
+        flags = mods.this
+        global_replace = "g" in flags
+        # 'g' controls all-vs-first here (not a regex flag); the rest map to the inline
+        # prefix, which raises on any option it can't reproduce bit-identically.
+        prefix = _regexp_flags_prefix(flags.replace("g", ""))
+    s = tr._scalar(node.this)
+    if global_replace:
+        return s.str.regexp_replace_all(prefix + pat.this, repl.this)
+    return s.str.regexp_replace(prefix + pat.this, repl.this)
 
 
 def _date_diff(tr, node) -> Expr:
@@ -238,5 +265,8 @@ def _date_diff(tr, node) -> Expr:
     if unit.startswith("DAY"):
         return days
     if unit.startswith("WEEK"):
-        return days / lit(7)
+        # DuckDB's week difference is the whole number of 7-day spans, truncated
+        # *toward zero* (so `-6` days is `0`, not `-1`), returned as an integer —
+        # not the fractional `days / 7` this used to yield.
+        return Cast((days / lit(7)).trunc(), "int64")
     raise NotImplementedError(f"date_diff unit {unit} not supported (only DAY/WEEK)")

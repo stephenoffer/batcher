@@ -621,3 +621,58 @@ fn deferred_breakers_yield_over_budget_instead_of_oom() {
         );
     }
 }
+
+/// A semi/anti join whose **build side is the big one** — the shape the streaming executor flips,
+/// building the small left and streaming the right past it while marking (`semi_by_marking_left`).
+///
+/// It only engages once the build is past `RADIX_MIN_BUILD_ROWS_BROADCAST` (~2.1M rows), which is
+/// why no other test here reaches it: the rest are deliberately small. TPC-H q4
+/// (`orders SEMI lineitem`) is this shape. The flip is only sound because a semi join emits no
+/// build column and only asks whether a key exists — so the answer, *and the row order*, must be
+/// exactly what building the right produces. Nulls on both sides and duplicate keys on both sides
+/// are the cases that separate SEMI from ANTI (`NOT EXISTS` is true for a null-keyed left row).
+#[test]
+fn a_semi_join_with_a_huge_build_matches_the_oracle() {
+    // Left: small, with null keys, duplicate keys, and keys absent from the right.
+    let n_left = 5_000usize;
+    let l_k: ArrayRef = Arc::new(Int64Array::from(
+        (0..n_left)
+            .map(|i| match i % 7 {
+                0 => None,                   // null key: SEMI drops it, ANTI keeps it
+                1 => Some(-(i as i64) - 1),  // never on the right
+                _ => Some((i % 600) as i64), // duplicated, and present on the right
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let l_v: ArrayRef = Arc::new(Int64Array::from(
+        (0..n_left).map(|i| Some(i as i64)).collect::<Vec<_>>(),
+    ));
+    let left = vec![RecordBatch::try_from_iter(vec![("k", l_k), ("v", l_v)]).unwrap()];
+
+    // Right: > 2.1M rows so the per-morsel probe declines and the flip engages; keys 0..500 only,
+    // so left keys in 500..600 are genuinely unmatched. Nulls match nothing.
+    let n_right = 2_200_000usize;
+    let r_k: ArrayRef = Arc::new(Int64Array::from(
+        (0..n_right)
+            .map(|i| {
+                if i % 13 == 0 {
+                    None
+                } else {
+                    Some((i % 500) as i64)
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let right = vec![RecordBatch::try_from_iter(vec![("k", r_k)]).unwrap()];
+
+    for jt in ["semi", "anti"] {
+        let json = format!(
+            r#"{{"op":"hash_join","left":{SCAN},"right":{{"op":"scan","source_id":1}},
+                "left_keys":["k"],"right_keys":["k"],"join_type":"{jt}",
+                "output":[{{"side":"left","name":"k","alias":"k"}},
+                          {{"side":"left","name":"v","alias":"v"}}],
+                "strategy":"hash"}}"#
+        );
+        assert_ordered(&json, &[left.clone(), right.clone()]);
+    }
+}

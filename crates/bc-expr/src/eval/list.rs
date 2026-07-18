@@ -523,14 +523,17 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         let child = list.values();
         // DuckDB `list_sort` is ascending, NULLS LAST. arrow-rs `sort_to_indices` defaults
         // to NULLS FIRST, so pass explicit options — otherwise nulls sorted to the front and
-        // disagreed with DuckDB. NaN sorts as the greatest value (before the trailing nulls),
-        // which arrow's float order already does.
+        // disagreed with DuckDB. NaN must sort as the greatest value (before the trailing
+        // nulls): arrow's raw-bit order does that for a *positive* NaN but ranks a *negative*
+        // NaN below -inf, so sort the **canonical** key (every NaN → one quiet NaN, `-0.0` →
+        // `0.0`) to match the engine's float identity, then gather the *original* elements.
+        let child_key = bc_arrow::canon_float_array(child);
         let opts = SortOptions {
             descending: false,
             nulls_first: false,
         };
         return rebuild_list(list, |s, e| {
-            let slice = child.slice(s, e - s);
+            let slice = child_key.slice(s, e - s);
             match sort_to_indices(&slice, Some(opts), None) {
                 Ok(local) => local.values().iter().map(|&l| s as u32 + l).collect(),
                 Err(_) => (s..e).map(|k| k as u32).collect(),
@@ -945,18 +948,11 @@ mod tests {
         assert!(c.as_any().downcast_ref::<BooleanArray>().unwrap().value(0));
         let pos = lists(&[Some(vec![0.0])]);
         let p = eval_list_position(&pos, &Literal::Float(-0.0)).unwrap();
-        assert_eq!(
-            p.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
-            1
-        );
+        assert_eq!(p.as_any().downcast_ref::<Int64Array>().unwrap().value(0), 1);
         // NaN matches NaN (DuckDB `list_contains([NaN], 'nan')` is true).
         let nanl = lists(&[Some(vec![1.0, f64::NAN])]);
         let cn = eval_list_contains(&nanl, &Literal::Float(f64::NAN)).unwrap();
-        assert!(cn
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap()
-            .value(0));
+        assert!(cn.as_any().downcast_ref::<BooleanArray>().unwrap().value(0));
     }
 
     #[test]

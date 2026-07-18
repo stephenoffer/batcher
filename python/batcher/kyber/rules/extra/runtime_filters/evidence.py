@@ -154,6 +154,11 @@ def _real_key_pairs(node: Join) -> list[tuple[str, str]]:
     A cartesian pseudo-key is the same non-null constant on both sides: it matches
     unconditionally, so it carries no sideways information and a filter on it is pure cost.
     """
+    # Guard the arity before `strict=True`. Every SIP caller checks only `not left_keys`, so a
+    # mismatched-arity join would raise straight out of the rule into the driver; the sibling
+    # `rules.joins.runtime_join_filter` guards the same call. Well-formed plans are unaffected.
+    if len(node.left_keys) != len(node.right_keys):
+        return []
     return [
         (lk, rk)
         for lk, rk in zip(node.left_keys, node.right_keys, strict=True)
@@ -384,14 +389,29 @@ def _value_set(side: LogicalPlan, col: str) -> frozenset | None:
 
     The intersection of every membership constraint found on the way down — a sound *upper*
     bound on the column's actual values, so a row outside it cannot exist.
+
+    An **ambiguous float member (`NaN`, `±0.0`) forfeits the whole set**. The engine keys
+    Float64 `IN` membership on `f64::to_bits` (`bc-expr/src/eval/in_list.rs`), so `-0.0` does
+    not match `0.0` and `NaN` matches nothing — but `bc_runtime::keys` canonicalizes both on
+    the *join key* path. A set derived here and mirrored onto the opposite join input would
+    then drop rows the join itself matches: a **wrong answer**, not a slow query. `_eq_value`
+    already refuses these for the `col = v` spelling; the `InList` spelling reached here
+    unfiltered, so the two spellings of one constraint disagreed — which this module's own
+    docstring names as how a family like this starts returning wrong answers.
+
+    A `NULL` member is instead simply dropped: `col IN (…, NULL)` is null-rejecting, so NULL
+    is never a value a surviving row holds, and removing it keeps the bound sound (and keeps
+    `col IN (NULL)` correctly proving the empty set).
     """
     best: set | None = None
     for conj in _conjuncts_on(side, col):
         values = _membership_values(conj, col)
         if values is None:
             continue
+        if any(ambiguous_float_bound(v) for v in values):
+            return None  # unbounded: no proof, hence no rewrite
         try:
-            found = set(values)
+            found = {v for v in values if v is not None}
         except TypeError:
             continue  # an unhashable literal — not a value set we can reason about
         best = found if best is None else (best & found)
@@ -446,6 +466,10 @@ def _out_of_range(stat: ColumnStat, value: object) -> bool:
 
 def _all_refuted(values: frozenset | None, other: ColumnStat) -> bool:
     """Whether the other side's bloom proves *every* candidate value absent."""
-    if not values or other.bloom is None:
+    # `values is None` means unbounded (no proof). An *empty* frozenset is the opposite: the
+    # side's membership conjuncts intersect to nothing, so it can hold no key value at all —
+    # a stronger proof than "every candidate is refuted". `not values` conflated the two and
+    # threw the stronger one away; `all(())` is correctly True.
+    if values is None or other.bloom is None:
         return False
     return all(_bloom_refutes(other, v) for v in values)

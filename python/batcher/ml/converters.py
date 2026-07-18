@@ -228,8 +228,13 @@ def to_tf_dataset(
     first = next(_gen(), None)
     if first is None:
         return tf.data.Dataset.from_tensor_slices({})
+    # The row axis is dynamic (``None``); every trailing axis is fixed by the column's
+    # per-row shape. A feature/embedding column (`(n, W)`) or an image/tensor column
+    # (`(n, H, W, C)`) must keep those inner dims, or `from_generator` rejects the yielded
+    # element with "shape (n, W) where an element of shape (None,) was expected" — a hard
+    # failure on exactly the multi-dimensional columns tf.data is used for.
     sig = {
-        name: tf.TensorSpec(shape=(None,), dtype=tf.dtypes.as_dtype(arr.dtype))
+        name: tf.TensorSpec(shape=(None, *arr.shape[1:]), dtype=tf.dtypes.as_dtype(arr.dtype))
         for name, arr in first.items()
     }
     return tf.data.Dataset.from_generator(_gen, output_signature=sig)

@@ -17,6 +17,8 @@ correctness.
 
 from __future__ import annotations
 
+import datetime
+
 from batcher.plan.expr_ir import Binary, Case, Cast, Col, Expr, Lit, Math2Expr, MathExpr, Not
 
 __all__ = ["JIT_SPEEDUP", "jit_compilable"]
@@ -122,7 +124,13 @@ def _kind_inner(expr: Expr) -> str | None:
             return _I64
         if isinstance(value, float):
             return _F64
-        return _TEMPORAL  # date / datetime literal
+        # Only an actual date/datetime is the temporal operand the JIT accepts. Falling
+        # through to `_TEMPORAL` for *everything* else priced a NULL literal (and `Decimal`,
+        # `bytes`, …) as compiled — a fast path that does not exist, which is precisely the
+        # direction this module's contract says it must never err in.
+        if isinstance(value, (datetime.date, datetime.datetime)):
+            return _TEMPORAL
+        return None
     if isinstance(expr, Not):
         return _BOOL if _kind_inner(expr.input) == _BOOL else None
     if isinstance(expr, Cast):

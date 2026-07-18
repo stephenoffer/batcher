@@ -23,6 +23,12 @@ pub use arrow::error::ArrowError;
 mod hardware;
 pub use hardware::{HardwareProfile, SimdOverride};
 
+pub mod float_ident;
+pub use float_ident::{
+    canon_f32, canon_f32_bits, canon_f64, canon_f64_bits, canon_float_array, float_total_cmp,
+    CANONICAL_NAN_BITS_F32, CANONICAL_NAN_BITS_F64,
+};
+
 /// A unit of data flow between operators: an Arrow `RecordBatch`.
 ///
 /// Named `Morsel` to match the scheduler vocabulary — the engine processes data

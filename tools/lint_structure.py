@@ -122,6 +122,7 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # binds as a unit, so splitting them would scatter one namespace across files.
     "python/batcher/plan/expr_ir/namespaces/strings.py": "one bound .str accessor; per-method runnable examples push it over",
     "python/batcher/plan/expr_ir/namespaces/collections.py": "one bound .list accessor; per-method runnable examples push it over",
+    "python/batcher/plan/expr_ir/namespaces/temporal.py": "one bound .dt accessor; per-method runnable examples push it over",
     # The session/constructor surface (from_*, read, sql, range, …) is one façade;
     # every public constructor now carries a runnable `.. doctest::` example, which is
     # what pushes it over — the bodies stay thin.

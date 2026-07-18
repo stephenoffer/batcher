@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, RecordBatch};
+use arrow::array::{make_array, Array, ArrayRef, RecordBatch};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow_pyarrow::PyArrowType;
 use bc_ir::{AggregateItem, ProjectionItem};
 use pyo3::exceptions::PyRuntimeError;
@@ -69,13 +69,81 @@ pub(crate) fn widen_to(dt: &DataType) -> Option<DataType> {
 /// RFC `rfc-streaming-executor.md` Proposal 3: separate the plan's *logical* type (value
 /// type) from the morsel's *physical* encoding (dictionary), so the encoding is an internal
 /// optimization the schema does not see. Until then, decode at the boundary.
+///
+/// Normalization **recurses into nested types**: a `struct<a: int32>` normalizes to
+/// `struct<a: int64>`, a `list<float32>` to `list<float64>`, and a `Dictionary` whose value
+/// type is itself nested is decoded and then normalized. Without this, a narrow numeric buried
+/// in a struct/list keeps its narrow width, and later arithmetic on `struct.field("a")` wraps
+/// (an `int32` `2_000_000_000 + 2_000_000_000` silently becomes `-294967296`) where the same
+/// value as a top-level column widens to `int64` and gives `4_000_000_000`. The Python type
+/// inference (`plan/types/lattice.py::widen`) mirrors this recursion so `Dataset.schema` and
+/// the engine agree on the nested widths.
 fn normalize_to(dt: &DataType) -> Option<DataType> {
+    use DataType::*;
     match dt {
-        DataType::Dictionary(_, value) => {
-            Some(widen_to(value).unwrap_or_else(|| value.as_ref().clone()))
-        }
+        Dictionary(_, value) => Some(normalize_to(value).unwrap_or_else(|| value.as_ref().clone())),
+        // The engine's string kernels (compare, `contains`, `upper`, join keys) accept only
+        // `Utf8`; a `LargeUtf8` column would crash them ("expected a Utf8 argument, got
+        // LargeUtf8") where the identical `Utf8` column succeeds. Normalize it to `Utf8` here so
+        // every operator sees one string type — the same rationale as numeric widening. Values
+        // are identical; the only difference is 32- vs 64-bit offset buffers, and a single morsel
+        // (≤16,384 rows) cannot exceed the 32-bit offset range. (If a batch ever did, `cast`
+        // errors and `normalize_batch` falls back to passing the column through unchanged.)
+        LargeUtf8 => Some(Utf8),
+        Struct(fields) => normalize_fields(fields).map(Struct),
+        List(field) => normalize_field(field).map(|f| List(Arc::new(f))),
+        LargeList(field) => normalize_field(field).map(|f| LargeList(Arc::new(f))),
+        FixedSizeList(field, n) => normalize_field(field).map(|f| FixedSizeList(Arc::new(f), *n)),
+        Map(field, sorted) => normalize_field(field).map(|f| Map(Arc::new(f), *sorted)),
         other => widen_to(other),
     }
+}
+
+/// The normalized form of `field` (recursing its data type), or `None` if unchanged.
+fn normalize_field(field: &Field) -> Option<Field> {
+    normalize_to(field.data_type()).map(|t| Field::new(field.name(), t, field.is_nullable()))
+}
+
+/// Recurse [`normalize_to`] over a struct's fields, returning the rebuilt `Fields` only if at
+/// least one child changed (so an all-wide struct passes through with no reallocation).
+fn normalize_fields(fields: &Fields) -> Option<Fields> {
+    let mut changed = false;
+    let out: Vec<Arc<Field>> = fields
+        .iter()
+        .map(|f| match normalize_field(f) {
+            Some(nf) => {
+                changed = true;
+                Arc::new(nf)
+            }
+            None => f.clone(),
+        })
+        .collect();
+    changed.then(|| out.into())
+}
+
+/// Total null count across an array **and every nested child**, so a data-loss check sees a null
+/// introduced deep inside a struct/list (e.g. a `UInt64` above `i64::MAX` cast to `Int64`), not
+/// only at the top level where `Array::null_count` looks.
+///
+/// A `Dictionary` is measured by its **logical** (row-level) null count and *not* recursed into:
+/// its value buffer holds one entry per *distinct* value, so a single null value is shared by
+/// every row that references it. Decoding replicates that null across all those rows, so a raw
+/// physical sum of `keys.null_count() + values.null_count()` under-counts the input relative to
+/// the decoded output and would flag a value-preserving decode as data loss. `logical_null_count`
+/// counts null *rows* (null key or key pointing at a null value), which is exactly the granularity
+/// the decoded column reports — so a genuine overflow buried in the dictionary's values (a
+/// `Dictionary<_, UInt64>` above `i64::MAX`) still trips the guard, while a null-valued string
+/// dictionary passes through unchanged.
+fn deep_null_count(arr: &ArrayRef) -> usize {
+    if matches!(arr.data_type(), DataType::Dictionary(_, _)) {
+        return arr.logical_null_count();
+    }
+    let data = arr.to_data();
+    let mut total = arr.null_count();
+    for child in data.child_data() {
+        total += deep_null_count(&make_array(child.clone()));
+    }
+    total
 }
 
 /// Upcast narrow numeric columns of one batch to Int64/Float64 and decode any
@@ -100,8 +168,10 @@ pub(crate) fn normalize_batch(batch: &RecordBatch) -> PyResult<RecordBatch> {
             Some(target) => match cast(col, &target) {
                 Ok(arr) => {
                     // A lossless widening never introduces a null. The one cast that can
-                    // (UInt64 → Int64 overflow) would corrupt data silently — refuse it.
-                    if arr.null_count() > col.null_count() {
+                    // (UInt64 → Int64 overflow, at any nesting depth) would corrupt data
+                    // silently — refuse it. Count nulls deeply so an overflow buried in a
+                    // struct/list child is caught, not only a top-level one.
+                    if deep_null_count(&arr) > deep_null_count(col) {
                         return Err(PyRuntimeError::new_err(format!(
                             "column {:?}: {} value exceeds the Int64 range the engine \
                              normalizes to (a value above i64::MAX cannot be represented \
@@ -224,4 +294,164 @@ pub(crate) fn narrow_output(
             RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap_or(batch)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{
+        DictionaryArray, Float32Array, Int32Array, Int64Array, LargeStringArray, ListArray,
+        StringArray, StructArray, UInt64Array,
+    };
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::Int8Type;
+
+    fn batch_of(name: &str, arr: arrow::array::ArrayRef) -> RecordBatch {
+        let field = Field::new(name, arr.data_type().clone(), true);
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr]).unwrap()
+    }
+
+    #[test]
+    fn large_utf8_normalizes_to_utf8_value_preserving() {
+        let arr = Arc::new(LargeStringArray::from(vec![Some("a"), None, Some("bb")]));
+        let out = normalize_batch(&batch_of("s", arr)).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Utf8);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("column normalized to Utf8");
+        assert_eq!(col.value(0), "a");
+        assert!(col.is_null(1));
+        assert_eq!(col.value(2), "bb");
+    }
+
+    #[test]
+    fn dictionary_of_large_utf8_decodes_to_utf8() {
+        // A dictionary whose value type is LargeUtf8 must decode to Utf8, not LargeUtf8,
+        // so downstream string kernels (which accept only Utf8) never see the large form.
+        let values = Arc::new(LargeStringArray::from(vec!["x", "y"]));
+        let keys = Int32Array::from(vec![0, 1, 0])
+            .iter()
+            .map(|k| k.map(|v| v as i8))
+            .collect::<arrow::array::PrimitiveArray<Int8Type>>();
+        let dict = DictionaryArray::new(keys, values);
+        let out = normalize_batch(&batch_of("d", Arc::new(dict))).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Utf8);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("dictionary decoded to Utf8");
+        assert_eq!(col.value(0), "x");
+        assert_eq!(col.value(1), "y");
+        assert_eq!(col.value(2), "x");
+    }
+
+    #[test]
+    fn dictionary_with_null_values_decodes_not_rejected() {
+        // A dictionary whose VALUES array contains a null, referenced by several rows, must
+        // decode to a plain column with a null in each of those rows — not be rejected by the
+        // UInt64-overflow data-loss guard. Physically the dict has one null value; decoding
+        // replicates it to two null rows, so a raw physical null-count comparison false-flags
+        // this value-preserving decode as data loss (the bug: `deep_null_count` double-counting).
+        let values = Arc::new(StringArray::from(vec![Some("a"), None]));
+        let keys = Int32Array::from(vec![0, 1, 0, 1])
+            .iter()
+            .map(|k| k.map(|v| v as i8))
+            .collect::<arrow::array::PrimitiveArray<Int8Type>>();
+        let dict = DictionaryArray::new(keys, values);
+        let out = normalize_batch(&batch_of("d", Arc::new(dict)))
+            .expect("dictionary with a null value must decode, not error");
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Utf8);
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("decoded to Utf8");
+        assert_eq!(col.value(0), "a");
+        assert!(col.is_null(1));
+        assert_eq!(col.value(2), "a");
+        assert!(col.is_null(3));
+    }
+
+    #[test]
+    fn dictionary_of_uint64_overflow_is_still_rejected() {
+        // The guard must still fire when a dictionary's VALUES genuinely overflow Int64: the
+        // logical-null path must not blind it to real data loss inside a dictionary.
+        let values = Arc::new(UInt64Array::from(vec![1u64, u64::MAX]));
+        let keys = Int32Array::from(vec![0, 1])
+            .iter()
+            .map(|k| k.map(|v| v as i8))
+            .collect::<arrow::array::PrimitiveArray<Int8Type>>();
+        let dict = DictionaryArray::new(keys, values);
+        assert!(normalize_batch(&batch_of("d", Arc::new(dict))).is_err());
+    }
+
+    #[test]
+    fn narrow_int_still_widens_to_int64() {
+        let arr = Arc::new(Int32Array::from(vec![1, -2, 3]));
+        let out = normalize_batch(&batch_of("i", arr)).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn uint64_above_i64_max_is_rejected_not_corrupted() {
+        let arr = Arc::new(UInt64Array::from(vec![1u64, u64::MAX]));
+        assert!(normalize_batch(&batch_of("u", arr)).is_err());
+    }
+
+    #[test]
+    fn struct_of_narrow_int_widens_child_to_int64() {
+        // A narrow int inside a struct must widen, or `struct.field("a") + struct.field("a")`
+        // on `2_000_000_000` wraps (int32 overflow) instead of giving `4_000_000_000`.
+        let a = Arc::new(Int32Array::from(vec![2_000_000_000, -2])) as arrow::array::ArrayRef;
+        let field = Arc::new(Field::new("a", DataType::Int32, true));
+        let s = StructArray::from(vec![(field, a)]);
+        let out = normalize_batch(&batch_of("s", Arc::new(s))).unwrap();
+        assert_eq!(
+            out.schema().field(0).data_type(),
+            &DataType::Struct(vec![Field::new("a", DataType::Int64, true)].into())
+        );
+    }
+
+    #[test]
+    fn list_of_narrow_float_widens_child_to_float64() {
+        let values = Arc::new(Float32Array::from(vec![1.0f32, 2.0, 3.0]));
+        let offsets = OffsetBuffer::new(vec![0, 2, 3].into());
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let list = ListArray::new(field, offsets, values, None);
+        let out = normalize_batch(&batch_of("l", Arc::new(list))).unwrap();
+        assert_eq!(
+            out.schema().field(0).data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Float64, true)))
+        );
+    }
+
+    #[test]
+    fn nested_uint64_overflow_is_rejected_not_corrupted() {
+        // The deep null-count check must catch a UInt64 above i64::MAX buried in a struct,
+        // exactly as it does for a top-level column.
+        let a = Arc::new(UInt64Array::from(vec![1u64, u64::MAX])) as arrow::array::ArrayRef;
+        let field = Arc::new(Field::new("a", DataType::UInt64, true));
+        let s = StructArray::from(vec![(field, a)]);
+        assert!(normalize_batch(&batch_of("s", Arc::new(s))).is_err());
+    }
+
+    #[test]
+    fn struct_of_wide_types_passes_through_unchanged() {
+        // An all-wide struct must not be reallocated (the fast path).
+        let a = Arc::new(Int64Array::from(vec![1i64, 2])) as arrow::array::ArrayRef;
+        let field = Arc::new(Field::new("a", DataType::Int64, true));
+        let s = StructArray::from(vec![(field, a)]);
+        assert!(normalize_to(&DataType::Struct(
+            vec![Field::new("a", DataType::Int64, true)].into()
+        ))
+        .is_none());
+        let out = normalize_batch(&batch_of("s", Arc::new(s))).unwrap();
+        assert_eq!(
+            out.schema().field(0).data_type(),
+            &DataType::Struct(vec![Field::new("a", DataType::Int64, true)].into())
+        );
+    }
 }

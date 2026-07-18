@@ -75,7 +75,11 @@ def duplicate_count(facts: Facts, column: str) -> int | None:
     non_null = non_null_count(facts, column)
     if ndv is None or non_null is None:
         return None
-    return non_null - ndv
+    # A count of removed rows cannot be negative. The two inputs are separately EXACT-gated
+    # (`ndv_is_exact` vs `null_count_is_exact`) and come from independent producers, so a
+    # disagreeing pair could otherwise report a negative "duplicates" — a value no execution
+    # can produce. Clamping only ever suppresses that impossible answer.
+    return max(0, non_null - ndv)
 
 
 def is_key(facts: Facts, column: str) -> bool | None:

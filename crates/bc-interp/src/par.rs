@@ -661,6 +661,16 @@ fn exec(
             // materializing path. The partials are exactly those the unfused parallel path
             // builds (same per-morsel partial-then-combine), so the result is identical
             // within the float tolerance the parallel path already carries.
+            // Fuse a join directly beneath the aggregate (optionally through a Filter/Project
+            // chain) so the join output is folded into partials in one pass, never materialized.
+            // Declines (`None`) to the operator-at-a-time path for any shape it cannot stream.
+            if opts.fuse_linear {
+                if let Some(out) = try_fused_join_aggregate(
+                    input, op_id, group_keys, aggregates, sources, opts, m, ids,
+                )? {
+                    return Ok(out);
+                }
+            }
             if opts.fuse_linear && is_fusable(input) && !needs_parts_for_spill(aggregates) {
                 return exec_agg_fused(input, op_id, group_keys, aggregates, sources, opts, m, ids);
             }
@@ -2092,6 +2102,174 @@ fn needs_parts_for_spill(aggregates: &[AggregateItem]) -> bool {
     })
 }
 
+/// Fused HashJoin → (Filter/Project)* → Aggregate: build the broadcast probe table once, then
+/// thread each probe morsel through the join, the linear chain, and straight into a partial
+/// aggregate — the join's output (on TPC-H `lineitem ⋈ orders` it is 6M rows / ~200 MB) is
+/// never materialized, and the separate group-by pass over it is gone. DuckDB and Polars win
+/// this shape precisely because they fuse it; this is the same fusion, on the same mergeable
+/// partials the unfused path builds (same probe, same `gather_join_output_with`, same
+/// per-morsel `partial`-then-`combine`), so the `seq == par` oracle sees an identical relation.
+///
+/// Returns `None` — fall through to the operator-at-a-time path, which is correct for every
+/// shape — when the base is not an inner hash join, the probe is empty, or the build side is
+/// too large / unhashable for a broadcast probe (the partitioned shuffle join is right there).
+/// A value-list aggregate (median/quantile/mode/…) also declines: it needs the raw rows for its
+/// out-of-core spill. Gated on `fuse_linear`, like the sibling fusions.
+#[allow(clippy::too_many_arguments)]
+fn try_fused_join_aggregate(
+    input: &RelOp,
+    op_id: u32,
+    group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
+    sources: &[Vec<RecordBatch>],
+    opts: &ExecOptions,
+    m: &mut ExecMetrics,
+    ids: &mut IdGen,
+) -> Result<Option<Vec<RecordBatch>>, InterpError> {
+    if needs_parts_for_spill(aggregates) {
+        return Ok(None);
+    }
+    // Peel the linear Filter/Project chain (outermost first); the base must be an inner join.
+    let mut chain: Vec<&RelOp> = Vec::new();
+    let mut node = input;
+    while is_fusable(node) {
+        chain.push(node);
+        node = fusable_input(node).expect("a fusable op has an input");
+    }
+    let RelOp::HashJoin {
+        left,
+        right,
+        left_keys,
+        right_keys,
+        join_type,
+        output,
+        ..
+    } = node
+    else {
+        return Ok(None);
+    };
+    if !matches!(join_type, bc_ir::JoinType::Inner) {
+        return Ok(None);
+    }
+
+    // Pre-order ids (matching `exec`): chain ops, the join, then the probe & build subtrees.
+    let chain_ids: Vec<u32> = chain.iter().map(|_| ids.next()).collect();
+    let join_id = ids.next();
+    let mut sm = ExecMetrics::default();
+    let mut pid = IdGen::at(ids.peek());
+    let probe_batches = exec(left, sources, opts, &mut sm, &mut pid)?;
+    if probe_batches.is_empty() {
+        return Ok(None); // empty probe: the ordinary path builds the empty relation. ids untouched.
+    }
+    let mut bid = IdGen::at(pid.peek());
+    let build_batches = exec(right, sources, opts, &mut sm, &mut bid)?;
+    let next_id = bid.peek();
+
+    // Broadcast the (small) build side; decline to the partitioned path when it is not small.
+    let build = ops::materialize(&build_batches)?;
+    let tuning = &opts.tuning;
+    let probe_rows: usize = probe_batches.iter().map(|b| b.num_rows()).sum();
+    let Some(table) = bc_runtime::join::BroadcastProbe::new(
+        &ops::columns_by_name(&build, right_keys)?,
+        ops::map_join_type(*join_type),
+        probe_rows,
+        tuning.bloom_fp_rate,
+        tuning.bloom_min_build_rows,
+    ) else {
+        return Ok(None);
+    };
+    let first_keys = ops::columns_by_name(&probe_batches[0], left_keys)?;
+    if !table.accepts(&first_keys) {
+        return Ok(None);
+    }
+
+    // Committed: advance ids and fold `sm`'s subtree metrics in exactly once.
+    *ids = IdGen::at(next_id);
+    m.ops.extend(std::mem::take(&mut sm.ops));
+
+    // Compile the chain stages and the aggregate against the (empty) post-join / post-chain
+    // schema — identical to the shape every morsel produces below.
+    let join_schema = ops::join_output_schema(&probe_batches[0], &build, output)?;
+    let mut sample = RecordBatch::new_empty(Arc::clone(&join_schema));
+    let mut stages: Vec<FusedStage> = Vec::with_capacity(chain.len());
+    for (id, op) in chain_ids.iter().zip(chain.iter()).rev() {
+        let stage = compile_stage(*id, op, Some(&sample));
+        sample = stage.apply(&sample)?;
+        stages.push(stage);
+    }
+    let agg_jit = ops::compile_agg(group_keys, aggregates, &sample);
+
+    let t0 = Stopwatch::start();
+    // One pass: probe → gather join output → linear chain → fold into a partial. The join
+    // output for a morsel lives only until it is folded, so peak memory is the build side
+    // (columns + hash table) plus one morsel's join output and its partial — never the whole
+    // join. Runs across cores; the partials merge associatively, so this equals the serial fold.
+    let partials: Vec<agg::Partial> = probe_batches
+        .par_iter()
+        .map(|morsel| {
+            let keys = ops::columns_by_name(morsel, left_keys)?;
+            let idx = table
+                .probe(&keys)
+                .ok_or_else(|| InterpError::UnknownJoinColumn(left_keys.join(", ")))?;
+            let mut cur = ops::gather_join_output_with(
+                morsel,
+                &build,
+                &idx,
+                output,
+                Arc::clone(&join_schema),
+            )?;
+            for stage in &stages {
+                cur = stage.apply(&cur)?;
+            }
+            ops::eval_partial_jit(&cur, group_keys, aggregates, &agg_jit)
+        })
+        .collect::<Result<Vec<_>, InterpError>>()?;
+
+    // Combine the partials — the same in-memory / grace-spill path as the unfused aggregate.
+    let funcs = ops::agg_funcs(aggregates);
+    let state_bytes = partial_state_bytes(&partials);
+    let (group_columns, agg_cols) = match admit(opts, op_id, state_bytes) {
+        Admit::Spill => {
+            let global = opts.agg_spill.as_ref().expect("spill implies an envelope");
+            let sp =
+                &global.with_budget(opts.op_budget(op_id).unwrap_or(global.memory_budget_bytes));
+            let p = grace_partitions(&partials, sp.memory_budget_bytes);
+            let mut store =
+                DiskSpillStore::with_codec(sp.dir.join(format!("agg-{p}p")), p, sp.codec)?;
+            let res =
+                combine_finalize_spilling(partials, &funcs, &mut store, sp.memory_budget_bytes)?;
+            (res.group_columns, res.agg_columns)
+        }
+        Admit::InMemory(_reservation) => {
+            let merged =
+                agg::combine_with(&partials, &funcs, opts.tuning.radix_parallel_threshold)?;
+            let agg_cols = agg::finalize(&funcs, &merged)?;
+            (merged.group_columns, agg_cols)
+        }
+    };
+    let out = vec![ops::build_agg_batch(
+        group_keys,
+        aggregates,
+        &group_columns,
+        &agg_cols,
+    )?];
+    push_breaker(
+        m,
+        op_id,
+        "aggregate",
+        probe_rows as u64,
+        count_rows(&build_batches),
+        batch_bytes(&build_batches)
+            + bc_runtime::join::estimate_build_bytes(build.num_rows()) as u64,
+        &out,
+        t0,
+        false,
+        "fused-join-agg",
+    );
+    let _ = (join_id, join_type);
+    Ok(Some(out))
+}
+
 /// Fused Filter/Project → Aggregate: build each morsel's partial state directly from the
 /// linear chain's per-morsel output, without ever collecting the transformed relation.
 /// The chain is numbered and metered exactly as the recursive `exec` would (so adaptive
@@ -2513,6 +2691,123 @@ mod tests {
     /// A plan with no media decode — the common case for the `auto_width` cap tests.
     fn no_media_plan() -> RelOp {
         RelOp::Scan { source_id: 0 }
+    }
+
+    /// The fused join→aggregate must produce exactly what the sequential oracle produces —
+    /// over unique keys, a 1:N build (duplicate keys), null keys (never match), and an all-miss
+    /// join (empty output → the degenerate aggregate) — and must actually *fire* (not silently
+    /// fall back), else the test asserts nothing.
+    #[test]
+    fn fused_join_aggregate_matches_the_oracle() {
+        use bc_expr::Expr;
+        fn b2(c0: &str, v0: Vec<Option<i64>>, c1: &str, v1: Vec<Option<i64>>) -> RecordBatch {
+            RecordBatch::try_from_iter(vec![
+                (c0, Arc::new(Int64Array::from(v0)) as ArrayRef),
+                (c1, Arc::new(Int64Array::from(v1)) as ArrayRef),
+            ])
+            .unwrap()
+        }
+        // Aggregate(group by g, SUM(v)) over HashJoin(probe(pk,v) ⋈ build(bk,g)).
+        let plan = RelOp::Aggregate {
+            input: Box::new(RelOp::HashJoin {
+                left: Box::new(RelOp::Scan { source_id: 0 }),
+                right: Box::new(RelOp::Scan { source_id: 1 }),
+                left_keys: vec!["pk".into()],
+                right_keys: vec!["bk".into()],
+                join_type: bc_ir::JoinType::Inner,
+                output: vec![
+                    bc_ir::JoinOutputCol {
+                        side: bc_ir::JoinSide::Left,
+                        name: "v".into(),
+                        alias: "v".into(),
+                    },
+                    bc_ir::JoinOutputCol {
+                        side: bc_ir::JoinSide::Right,
+                        name: "g".into(),
+                        alias: "g".into(),
+                    },
+                ],
+                strategy: bc_ir::JoinStrategy::Hash,
+            }),
+            group_keys: vec![ProjectionItem {
+                expr: Expr::Col { name: "g".into() },
+                alias: "g".into(),
+            }],
+            aggregates: vec![AggregateItem {
+                func: AggFunc::Sum,
+                input: Some(Expr::Col { name: "v".into() }),
+                input2: None,
+                alias: "s".into(),
+                param: None,
+            }],
+        };
+        let norm = |bs: &[RecordBatch]| -> Vec<(Option<i64>, Option<i64>)> {
+            let mut rows = Vec::new();
+            for b in bs {
+                let g = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let s = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    rows.push((
+                        (!g.is_null(i)).then(|| g.value(i)),
+                        (!s.is_null(i)).then(|| s.value(i)),
+                    ));
+                }
+            }
+            rows.sort();
+            rows
+        };
+        let cases: Vec<(
+            Vec<Option<i64>>,
+            Vec<Option<i64>>,
+            Vec<Option<i64>>,
+            Vec<Option<i64>>,
+        )> = vec![
+            (
+                (0..200).map(|i| Some(i % 10)).collect(),
+                (0..200).map(Some).collect(),
+                (0..10).map(Some).collect(),
+                (0..10).map(|i| Some(i % 3)).collect(),
+            ),
+            (
+                vec![Some(1), Some(2), Some(1), Some(2)],
+                vec![Some(10), Some(20), Some(30), Some(40)],
+                vec![Some(1), Some(1), Some(2)], // 1:N — key 1 appears twice on the build
+                vec![Some(5), Some(6), Some(7)],
+            ),
+            (
+                vec![None, Some(1), Some(2), None],
+                vec![Some(10), Some(11), Some(12), Some(13)],
+                vec![None, Some(1)], // a null build key never matches
+                vec![Some(0), Some(1)],
+            ),
+            (
+                vec![Some(99), Some(98)],
+                vec![Some(1), Some(2)],
+                vec![Some(1), Some(2)],
+                vec![Some(0), Some(1)], // all miss → empty join → degenerate aggregate
+            ),
+        ];
+        let mut fired = false;
+        for (pk, v, bk, g) in cases {
+            let sources = vec![vec![b2("pk", pk, "v", v)], vec![b2("bk", bk, "g", g)]];
+            let opts = ExecOptions {
+                fuse_linear: true,
+                morsel_rows: 8,
+                ..ExecOptions::default()
+            };
+            let (fused, mt) = execute_parallel_with_metrics(&plan, &sources, &opts).unwrap();
+            let oracle = execute(&plan, &sources).unwrap();
+            assert_eq!(
+                norm(&fused),
+                norm(&oracle),
+                "fused join-agg diverged from the oracle"
+            );
+            fired |= mt.ops.iter().any(|o| o.backend == "fused-join-agg");
+        }
+        assert!(
+            fired,
+            "the fused join-aggregate path never fired — the test proved nothing"
+        );
     }
 
     /// A byte-heavy source (few rows, large blobs) must lift the worker cap: counting

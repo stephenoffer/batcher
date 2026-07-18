@@ -146,6 +146,19 @@ impl IndexBuf {
         self.idx.len()
     }
 
+    /// Sort the buffered indices ascending.
+    ///
+    /// Only meaningful for a side whose partner is all-NULL — a semi/anti join — where the
+    /// pairing carries nothing to preserve and the row order is the *only* information in the
+    /// output. Asserted, so it cannot be reached for a join whose pairs matter.
+    fn sort_ascending(&mut self) {
+        debug_assert!(
+            !self.any_null,
+            "sorting a side whose partner carries real indices would break the pairing"
+        );
+        self.idx.sort_unstable();
+    }
+
     /// The Arrow column. No null buffer is built unless a NULL was actually pushed.
     pub(crate) fn finish(self) -> UInt32Array {
         if !self.any_null {
@@ -700,6 +713,7 @@ fn radix_join_scalar<O: Copy + std::hash::Hash + Eq + Send + Sync>(
         );
     }
     emit_null_probe_unmatched(probe_null, join_type, &mut left_out, &mut right_out);
+    restore_probe_order(join_type, &mut left_out);
 
     JoinIndices::from_bufs(left_out, right_out)
 }
@@ -847,6 +861,24 @@ fn join_partition_into<O: Copy + std::hash::Hash + Eq>(
                 }
             }
         }
+    }
+}
+
+/// Put a semi/anti join's output back in **probe-row order**.
+///
+/// A semi/anti join emits a *subset of the probe side* and no build column, so its row order is
+/// the only information in the result — and the flat path emits it in probe-row order, because it
+/// scans the probe in order. The radix path instead emits partition by partition (and
+/// `emit_null_probe_unmatched` appends the null-key rows last), so without this the *same query*
+/// answers in a different order once the build crosses `RADIX_MIN_BUILD_ROWS` — `SELECT … WHERE
+/// EXISTS (…) LIMIT 10` would return different rows for a bigger build side, which is a data-size
+/// dependency no user can see coming.
+///
+/// Cheap by construction: the output holds at most one index per probe row, and only the semi/anti
+/// shapes reach it (an inner/outer join's pairs must keep their emitted order).
+fn restore_probe_order(join_type: JoinType, left_out: &mut IndexBuf) {
+    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+        left_out.sort_ascending();
     }
 }
 
@@ -1674,6 +1706,172 @@ mod tests {
             let h2 = hash_join_indices(&some, &empty, jt).unwrap();
             let s2 = sort_merge_join_indices(&some, &empty, jt).unwrap();
             assert_eq!(sorted_pairs(&h2), sorted_pairs(&s2), "empty-right {jt:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod hunt_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::{Array, Int64Array};
+
+    fn i64_col(v: &[Option<i64>]) -> ArrayRef {
+        Arc::new(Int64Array::from(v.to_vec()))
+    }
+
+    /// Reconstruct the join output of a single-i64 join as a sorted multiset of *value*
+    /// pairs, so two strategies that pick different rows in a duplicate group still compare
+    /// equal iff they emit the same logical relation.
+    fn vpairs1(
+        idx: &JoinIndices,
+        left: &[Option<i64>],
+        right: &[Option<i64>],
+    ) -> Vec<(Option<i64>, Option<i64>)> {
+        let mut out: Vec<_> = (0..idx.left.len())
+            .map(|k| {
+                let l = idx
+                    .left
+                    .is_valid(k)
+                    .then(|| left[idx.left.value(k) as usize])
+                    .flatten();
+                let r = idx
+                    .right
+                    .is_valid(k)
+                    .then(|| right[idx.right.value(k) as usize])
+                    .flatten();
+                (l, r)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn vpairs2(
+        idx: &JoinIndices,
+        la: &[Option<i64>],
+        lb: &[Option<i64>],
+        ra: &[Option<i64>],
+        rb: &[Option<i64>],
+    ) -> Vec<((Option<i64>, Option<i64>), (Option<i64>, Option<i64>))> {
+        let mut out: Vec<_> = (0..idx.left.len())
+            .map(|k| {
+                let l = if idx.left.is_valid(k) {
+                    let i = idx.left.value(k) as usize;
+                    (la[i], lb[i])
+                } else {
+                    (None, None)
+                };
+                let r = if idx.right.is_valid(k) {
+                    let i = idx.right.value(k) as usize;
+                    (ra[i], rb[i])
+                } else {
+                    (None, None)
+                };
+                (l, r)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The TWO-column i64 key at RADIX scale (build past `RADIX_MIN_BUILD_ROWS`) must agree
+    /// with the independent sort-merge strategy for every left-driven join type — the tuple
+    /// radix path is only ever exercised on tiny inputs elsewhere.
+    #[test]
+    fn two_col_radix_at_scale_matches_sort_merge() {
+        let build_rows = RADIX_MIN_BUILD_ROWS + 5_000;
+        let ra: Vec<Option<i64>> = (0..build_rows as i64)
+            .map(|k| Some(if k % 40 == 0 { 3 } else { k % 5000 }))
+            .collect();
+        let rb: Vec<Option<i64>> = (0..build_rows as i64).map(|k| Some(k % 7)).collect();
+        let la: Vec<Option<i64>> = (0..25_000i64)
+            .map(|i| match i % 6 {
+                0 => None,
+                _ => Some((i * 3) % 5000),
+            })
+            .collect();
+        let lb: Vec<Option<i64>> = (0..25_000i64).map(|i| Some(i % 7)).collect();
+        let left = vec![i64_col(&la), i64_col(&lb)];
+        let right = vec![i64_col(&ra), i64_col(&rb)];
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            let h = hash_join_indices(&left, &right, jt).unwrap(); // tuple radix path
+            let s = sort_merge_join_indices(&left, &right, jt).unwrap(); // independent
+            assert_eq!(
+                vpairs2(&h, &la, &lb, &ra, &rb),
+                vpairs2(&s, &la, &lb, &ra, &rb),
+                "two-col radix != sort-merge for {jt:?}"
+            );
+        }
+    }
+
+    /// Build-side symmetry: Kyber may build either side. `hash_join(L, R, t)` must produce the
+    /// same value relation as `hash_join(R, L, swap(t))` with the two index columns swapped,
+    /// for every join type. An asymmetry here means the optimizer's build-side choice silently
+    /// changes the answer.
+    #[test]
+    fn build_side_symmetry_all_join_types() {
+        let lv: Vec<Option<i64>> = vec![
+            Some(1),
+            Some(2),
+            Some(2),
+            None,
+            Some(3),
+            Some(5),
+            Some(2),
+            None,
+        ];
+        let rv: Vec<Option<i64>> = vec![
+            Some(2),
+            Some(2),
+            Some(3),
+            Some(4),
+            None,
+            Some(1),
+            Some(1),
+        ];
+        let left = vec![i64_col(&lv)];
+        let right = vec![i64_col(&rv)];
+        let swap = |t: JoinType| match t {
+            JoinType::Left => JoinType::Right,
+            JoinType::Right => JoinType::Left,
+            other => other,
+        };
+        // Semi/Anti are inherently one-sided (left-only output), so symmetry is defined only
+        // for the two-sided flavors.
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+        ] {
+            let direct = hash_join_indices(&left, &right, jt).unwrap();
+            let flipped = hash_join_indices(&right, &left, swap(jt)).unwrap();
+            // `flipped` has (left=right-rows, right=left-rows); swap the reconstruction args.
+            let a = vpairs1(&direct, &lv, &rv);
+            let mut b: Vec<_> = (0..flipped.left.len())
+                .map(|k| {
+                    let r = flipped
+                        .left
+                        .is_valid(k)
+                        .then(|| rv[flipped.left.value(k) as usize])
+                        .flatten();
+                    let l = flipped
+                        .right
+                        .is_valid(k)
+                        .then(|| lv[flipped.right.value(k) as usize])
+                        .flatten();
+                    (l, r)
+                })
+                .collect();
+            b.sort();
+            assert_eq!(a, b, "build-side asymmetry for {jt:?}");
         }
     }
 }

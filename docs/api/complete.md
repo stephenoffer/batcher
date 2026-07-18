@@ -111,6 +111,7 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    greatest
    least
    atan2
+   arctan2
    hypot
    gcd
    lcm
@@ -149,8 +150,12 @@ column. The vertical counterparts are the aggregates below.
    max_horizontal
    sum_horizontal
    mean_horizontal
+   count_horizontal
+   product_horizontal
    all_horizontal
    any_horizontal
+   reduce_horizontal
+   fold_horizontal
 ```
 
 ## Aggregate and window functions
@@ -172,10 +177,54 @@ value functions are window-only: bind them with `.over(partition_by=…, order_b
    std
    var
    n_unique
+   product
+   mode
+   skewness
+   kurtosis
+   bool_and
+   bool_or
+   bit_and
+   bit_or
+   bit_xor
+   array_agg
+   quantile
+   approx_quantile
+   approx_median
+   approx_n_unique
+   histogram
    count_if
    corr
    covar_pop
    covar_samp
+   regr_slope
+   regr_intercept
+   regr_r2
+   regr_count
+   regr_avgx
+   regr_avgy
+   regr_sxx
+   regr_syy
+   regr_sxy
+   var_pop
+   stddev_pop
+   geometric_mean
+   harmonic_mean
+   rms
+   cv
+   sem
+   midrange
+   weighted_mean
+   q1
+   q3
+   iqr
+   value_range
+   null_rate
+   non_null_rate
+   nunique_ratio
+   first
+   last
+   arg_min
+   arg_max
    row_number
    rank
    dense_rank

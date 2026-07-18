@@ -96,3 +96,51 @@ def test_left_join_residual_on_preserved_side_rejected(cust_orders):
     )
     with pytest.raises(NotImplementedError):
         bt.sql(query, customer=customer, orders=orders).collect()
+
+
+# --- residuals over a column present on BOTH sides --------------------------
+#
+# `ON a.k = b.k AND a.v < b.v` compares a column that exists on both inputs. The two
+# `v`s must stay distinct across the join (the right one takes the `_right` suffix);
+# collapsing them would compare `v` with itself — always-false for `<`, always-true for
+# `=` — and silently return the wrong rows. This shape once raised
+# `NotImplementedError`; these pin the semantics now that it is supported.
+
+
+@pytest.fixture
+def both_sides_v(duck):
+    """`v` on both sides, with the residual true / false / equal / null across the rows."""
+    a = pa.table({"k": [1, 2, 3, 4, 5], "v": [10, 20, 5, 99, None]})
+    b = pa.table({"k": [1, 2, 3, 4, 5], "v": [15, 20, 7, 1, 50]})
+    duck.register("a", a)
+    duck.register("b", b)
+    return a, b
+
+
+@pytest.mark.parametrize("op", ["<", "<=", ">", ">=", "=", "<>"])
+def test_inner_join_residual_on_column_present_on_both_sides(duck, both_sides_v, op):
+    """Every comparison must discriminate the two sides, not fold to a self-comparison."""
+    from conftest import assert_same
+
+    a, b = both_sides_v
+    query = f"SELECT a.k AS k, a.v AS av, b.v AS bv FROM a JOIN b ON a.k = b.k AND a.v {op} b.v"
+    out = bt.sql(query, a=a, b=b).collect()
+    assert_same(out, duck.sql(query))
+
+
+def test_inner_join_residual_both_sides_null_row_is_dropped(duck, both_sides_v):
+    """The `k=5` row has a NULL `a.v`: `NULL < 50` is NULL, so the join must drop it."""
+    from conftest import assert_same
+
+    a, b = both_sides_v
+    query = "SELECT a.k AS k FROM a JOIN b ON a.k = b.k AND a.v < b.v"
+    out = bt.sql(query, a=a, b=b).collect()
+    assert_same(out, duck.sql(query))
+
+
+def test_left_join_residual_across_both_sides_rejected(both_sides_v):
+    """The same residual on a LEFT join references the preserved side — refuse, don't mis-answer."""
+    a, b = both_sides_v
+    query = "SELECT a.k AS k, b.v AS bv FROM a LEFT JOIN b ON a.k = b.k AND a.v < b.v"
+    with pytest.raises(NotImplementedError):
+        bt.sql(query, a=a, b=b).collect()

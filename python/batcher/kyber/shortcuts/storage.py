@@ -103,7 +103,9 @@ def partition_keys(stats: SourceStats) -> tuple[str, ...]:
     A key only one side is partitioned by cannot prune the query, so the intersection (as a
     prefix, since partition order is what directory layout encodes) is the honest answer.
     """
-    declared = [tuple(getattr(stat, "partition_keys", ()) or ()) for stat in stats if stat]
+    declared = [
+        tuple(getattr(stat, "partition_keys", ()) or ()) for stat in stats if stat is not None
+    ]
     if not declared or len(declared) != len(stats):
         return ()
     return _common_prefix(declared)
@@ -120,7 +122,7 @@ def sorted_by(stats: SourceStats) -> tuple[str, ...]:
     The same prefix-intersection rule as `partition_keys`: an ordering only one input
     maintains is not an ordering of the scan.
     """
-    declared = [tuple(getattr(stat, "sorted_by", ()) or ()) for stat in stats if stat]
+    declared = [tuple(getattr(stat, "sorted_by", ()) or ()) for stat in stats if stat is not None]
     if not declared or len(declared) != len(stats):
         return ()
     return _common_prefix(declared)

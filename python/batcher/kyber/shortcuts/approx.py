@@ -89,6 +89,8 @@ def approx_top_k(facts: Facts, column: str, k: int = 10) -> list[tuple[str, floa
     value and its rendering cannot disagree). A skewed join key or a hot partition shows up
     here without a `GROUP BY`.
     """
+    if k < 1:
+        return None  # "the top zero values" is a caller error, not an empty measurement
     mcv = facts.col(column).mcv
     if not mcv:
         return None
@@ -122,8 +124,20 @@ def approx_column_bytes(facts: Facts, column: str) -> float | None:
 
 
 def approx_row_bytes(facts: Facts) -> float:
-    """The approximate width of one row, in bytes — the sum over every column."""
-    return sum(_value_width(facts, name) or 0.0 for name in facts.columns)
+    """The approximate width of one row, in bytes — the sum over every column.
+
+    A column whose width is *unknown* (neither measured nor typed) contributes the documented
+    `_ASSUMED_VARIABLE_WIDTH_BYTES`, not zero. Zero would silently shrink the number that
+    `approx_memory_bytes` hands to a spill threshold or a broadcast decision — an
+    under-estimate of memory, the one direction that turns a sizing hint into an OOM. Assuming
+    a width is the conservative reading of "nothing has measured this yet"; `_value_width`
+    keeps returning `None` so `approx_column_bytes` can still say "unknown" for one column.
+    """
+    total = 0.0
+    for name in facts.columns:
+        width = _value_width(facts, name)
+        total += _ASSUMED_VARIABLE_WIDTH_BYTES if width is None else width
+    return total
 
 
 def approx_memory_bytes(facts: Facts) -> float:

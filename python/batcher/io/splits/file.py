@@ -234,13 +234,24 @@ class LineRangeSplit:
 
         import pyarrow.json as pajson
 
+        schema = self.schema()
         buf = self._aligned_bytes()
         if not buf.strip():
-            from batcher.io.formats.base import SOURCES
-
-            empty = SOURCES.get(self.format_name)(self.path).schema().empty_table()
+            empty = schema.empty_table()
             return empty.select(projection) if projection is not None else empty
-        table = pajson.read_json(io.BytesIO(buf))
+        # Force each range to the file's declared schema. `pyarrow.json.read_json`
+        # infers types independently per call, so without this an all-integer range
+        # of a column parses as int64 while a range that holds a float parses it as
+        # double, and a field absent from one range is missing from that range's
+        # schema entirely — the ranges of one file disagree with each other and with
+        # the source schema, so their batches cannot concatenate. Pinning the
+        # explicit schema (unioned over the whole file) makes every range parse to
+        # the same schema the source advertises; `ignore` keeps a truly-unexpected
+        # field from re-introducing per-range drift. Mirrors `CSVRangeSplit`.
+        parse = pajson.ParseOptions(
+            explicit_schema=schema, unexpected_field_behavior="ignore"
+        )
+        table = pajson.read_json(io.BytesIO(buf), parse_options=parse)
         return table.select(projection) if projection is not None else table
 
     def schema(self) -> pa.Schema:

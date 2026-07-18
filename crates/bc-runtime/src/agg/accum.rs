@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Decimal128Array, Float64Array, Int64Array,
-    LargeBinaryArray, LargeStringArray, StringArray,
+    LargeBinaryArray, LargeStringArray, StringArray, UInt32Array,
 };
-use arrow::compute::concat;
+use arrow::compute::{concat, take};
 use arrow::datatypes::{DataType, Decimal128Type, Float64Type, Int64Type};
 
 use super::{accumulate, arg_extreme_state, covar_state, AggCall, AggFunc, Partial};
@@ -306,11 +306,61 @@ pub(crate) fn minmax_acc(
         // column type Boolean". A metadata shortcut that can answer what the engine cannot
         // is not a shortcut; it is a second, disagreeing implementation.
         DataType::Boolean => bool_acc(values, group_ids, num_groups, is_min, func),
+        // Temporal min/max. Date/Time/Timestamp/Duration are stored as integers whose
+        // natural (chronological) order IS their integer order — a later instant has a larger
+        // underlying value in the same unit, and a tz-aware Timestamp's i64 is the UTC instant,
+        // so comparison is correct regardless of the display zone. We compare on the cast-to-i64
+        // representation but `take` the *winner from the original typed array*, so the result
+        // keeps the exact unit and timezone (a cast of the reduced integer back could not).
+        //
+        // Without this arm `min`/`max` over a Date/Timestamp column raised "not supported for
+        // column type Date32" while the Parquet footer answered the same query from metadata —
+        // the very metadata-vs-engine disagreement the Boolean arm above was added to close.
+        DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _)
+        | DataType::Duration(_) => temporal_minmax(values, group_ids, num_groups, is_min),
         other => Err(RuntimeError::UnsupportedAggregate {
             func: func.name().to_string(),
             dtype: other.to_string(),
         }),
     }
+}
+
+/// Per-group min/max over a temporal column via its underlying `i64` order, returning the
+/// winning rows `take`n from the original array (so unit/timezone are preserved exactly).
+/// Null-skipping; an empty/all-null group yields null. Associative — the partial state is
+/// itself a temporal column, so merging re-enters this same reducer.
+fn temporal_minmax(
+    values: &ArrayRef,
+    group_ids: &[u32],
+    num_groups: usize,
+    is_min: bool,
+) -> Result<ArrayRef, RuntimeError> {
+    let ints = arrow::compute::cast(values, &DataType::Int64)?;
+    let arr = ints.as_primitive::<Int64Type>();
+    let mut cur = vec![0i64; num_groups];
+    let mut best = vec![0u32; num_groups];
+    let mut valid = vec![false; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        if arr.is_valid(i) {
+            let (g, v) = (g as usize, arr.value(i));
+            if !valid[g] || (is_min && v < cur[g]) || (!is_min && v > cur[g]) {
+                cur[g] = v;
+                best[g] = i as u32;
+                valid[g] = true;
+            }
+        }
+    }
+    // A null index makes `take` emit null, so empty/all-null groups become null.
+    let idx: UInt32Array = best
+        .into_iter()
+        .zip(valid)
+        .map(|(i, ok)| ok.then_some(i))
+        .collect();
+    Ok(take(values.as_ref(), &idx, None)?)
 }
 
 /// Per-group byte-lexicographic min/max over a string/binary column. Stores each group's
@@ -547,6 +597,97 @@ mod tests {
         let lbmax = minmax_acc(&lb, &g, 2, false, AggFunc::Max).unwrap();
         let lbmax = lbmax.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert_eq!(lbmax.value(0), b"ab");
+    }
+
+    #[test]
+    fn temporal_minmax_over_date_and_timestamp() {
+        use arrow::array::{Date32Array, TimestampMicrosecondArray};
+        // Date32 (days since epoch), two groups, a null skipped.
+        let g = [0u32, 0, 1, 0];
+        let dates: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(19_723), // 2024-01-03
+            Some(19_721), // 2024-01-01
+            Some(19_725), // 2024-01-05 (group 1)
+            None,
+        ]));
+        let min = minmax_acc(&dates, &g, 2, true, AggFunc::Min).unwrap();
+        let max = minmax_acc(&dates, &g, 2, false, AggFunc::Max).unwrap();
+        // Type preserved (not cast to Int64).
+        assert_eq!(min.data_type(), &DataType::Date32);
+        let min = min.as_any().downcast_ref::<Date32Array>().unwrap();
+        let max = max.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(min.value(0), 19_721);
+        assert_eq!(max.value(0), 19_723);
+        assert_eq!(min.value(1), 19_725);
+
+        // Timestamp with a timezone: the underlying i64 (UTC instant) drives the order, and the
+        // timezone is carried through by `take`ing the original array.
+        let tz_ty = DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            Some("+05:00".into()),
+        );
+        let ts: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![30i64, 10, 99, 20])
+                .with_timezone_opt(Some("+05:00")),
+        );
+        let tmin = minmax_acc(&ts, &[0u32, 0, 0, 0], 1, true, AggFunc::Min).unwrap();
+        assert_eq!(tmin.data_type(), &tz_ty);
+        let tmin = tmin
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(tmin.value(0), 10);
+    }
+
+    #[test]
+    fn temporal_minmax_is_mergeable_across_partitions() {
+        use crate::agg::{combine, finalize, group_aggregate, AggCall};
+        use arrow::array::Date32Array;
+        // The mergeable-algebra invariant: combine_finalize(partition(partial(x))) == single-node.
+        let keys = |k: Vec<&str>| -> ArrayRef { Arc::new(StringArray::from(k)) };
+        let dates = |d: Vec<Option<i32>>| -> ArrayRef { Arc::new(Date32Array::from(d)) };
+        let funcs = [AggFunc::Min, AggFunc::Max];
+        let call = |v: &ArrayRef| {
+            vec![
+                AggCall::new(AggFunc::Min, Some(v.clone())),
+                AggCall::new(AggFunc::Max, Some(v.clone())),
+            ]
+        };
+
+        // Whole input, single node.
+        let k_all = keys(vec!["a", "a", "b", "a", "b"]);
+        let v_all = dates(vec![Some(5), None, Some(9), Some(2), Some(7)]);
+        let whole = group_aggregate(std::slice::from_ref(&k_all), &call(&v_all), 5).unwrap();
+
+        // Split into two partitions, partial each, combine, finalize.
+        let (k1, v1) = (
+            keys(vec!["a", "a", "b"]),
+            dates(vec![Some(5), None, Some(9)]),
+        );
+        let (k2, v2) = (keys(vec!["a", "b"]), dates(vec![Some(2), Some(7)]));
+        let p1 = crate::agg::partial(std::slice::from_ref(&k1), &call(&v1), 3).unwrap();
+        let p2 = crate::agg::partial(std::slice::from_ref(&k2), &call(&v2), 2).unwrap();
+        let merged = combine(&[p1, p2], &funcs).unwrap();
+        let dist_cols = finalize(&funcs, &merged).unwrap();
+
+        // Align both by group key and compare min/max per group.
+        let by_key =
+            |gk: &ArrayRef, aggs: &[ArrayRef]| -> std::collections::HashMap<String, (i32, i32)> {
+                let k = gk.as_string::<i32>();
+                let mn = aggs[0].as_any().downcast_ref::<Date32Array>().unwrap();
+                let mx = aggs[1].as_any().downcast_ref::<Date32Array>().unwrap();
+                (0..k.len())
+                    .map(|i| (k.value(i).to_string(), (mn.value(i), mx.value(i))))
+                    .collect()
+            };
+        let single = by_key(&whole.group_columns[0], &whole.agg_columns);
+        let dist = by_key(&merged.group_columns[0], &dist_cols);
+        assert_eq!(
+            single, dist,
+            "temporal min/max must be partition-independent"
+        );
+        assert_eq!(single["a"], (2, 5));
+        assert_eq!(single["b"], (7, 9));
     }
 
     #[test]

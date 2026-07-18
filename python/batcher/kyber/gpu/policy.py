@@ -116,8 +116,12 @@ def decide_gpu_backend(
     from batcher.kyber.gpu.adaptive import learned_gpu_min_rows
 
     learned_min = learned_gpu_min_rows(hub)
-    min_rows = learned_min or dc.gpu_min_rows
-    learned = "learned " if learned_min else ""
+    # `is None`, not truthiness: `learned_gpu_min_rows` clamps to `[default/8, default*8]`, so a
+    # legitimately-configured small `gpu_min_rows` (the config invites retuning) can learn a 0 —
+    # which `or` discarded, silently reverting to the default *and* dropping the "learned "
+    # prefix so `explain()` misreported which threshold was actually used.
+    min_rows = dc.gpu_min_rows if learned_min is None else learned_min
+    learned = "learned " if learned_min is not None else ""
     if not force and rows < min_rows:
         return GpuDecision(
             False, False, f"{rows} rows < {learned}min_rows={min_rows}: CPU wins on overhead", rows
@@ -171,14 +175,27 @@ def decide_gpu_map_params(
     if num_gpus <= 0.0:  # user left it unset → decide the packing fraction
         frac = model_memory_gb / (gpu_gb * cap)
         if frac <= 1.0:
-            out_gpus = next((q for q in _PACK_QUANTA if q >= frac), 1.0)
+            # No `next()` default: this branch is guarded by `frac <= 1.0` and `_PACK_QUANTA`
+            # ends at 1.0, so a quantum always matches. A default here would disguise that.
+            out_gpus = next(q for q in _PACK_QUANTA if q >= frac)
         else:
             out_gpus = float(math.ceil(frac))
 
     out_bs = batch_size
     if batch_size is None:  # seed the throughput controller from the VRAM headroom
-        per_gpu = out_gpus if out_gpus >= 1.0 else 1.0  # a packed fraction still sees one device
-        headroom_gb = max(gpu_gb * per_gpu * cap - model_memory_gb, gpu_gb * 0.05)
+        # Budget against this actor's *share*, not the whole device. A packed fraction does
+        # see one device, but `_PACK_QUANTA` exists precisely so several actors co-locate on
+        # it (0.25 → four per GPU), and each one sizing its activations against the full VRAM
+        # means they all claim it at once: at the shipped defaults a 3 GB model packs two per
+        # 12 GB device and each seeds 65,536 rows, demanding 2 x (3 + 4.3) = 14.6 GB — a
+        # guaranteed OOM at exactly the packing factor the fraction was chosen for. Scaling by
+        # `out_gpus` gives 2 x (3 + 2.1) = 10.2 GB, which fits.
+        #
+        # No fabricated floor either: `gpu_gb * 0.05` invented 5% of a *whole* device (0.6 GB,
+        # ~9k rows of activations) for a stage that by construction has no room for it. The
+        # `max(..., 1)` clamp below already guarantees a legal batch size, which is all the
+        # floor was there for.
+        headroom_gb = max(gpu_gb * out_gpus * cap - model_memory_gb, 0.0)
         act = max(dc.gpu_activation_bytes_per_row, 1)
         out_bs = int(min(max(headroom_gb * 1e9 / act, 1), 65_536))
     return GpuMapParams(

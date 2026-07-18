@@ -36,7 +36,9 @@ use rayon::prelude::*;
 
 use bc_runtime::agg;
 
-use super::{build_with, combine_and_finalize, fold_partial, strip_empties, Ctx, Meter};
+use super::{
+    build_with, combine_and_finalize, fold_partial, strip_empties, BuildCache, Ctx, Meter,
+};
 use crate::ops;
 use crate::{ExecMetrics, InterpError};
 
@@ -70,7 +72,7 @@ pub fn execute_streaming_parallel_metered(
     Ok((out, m.finish()))
 }
 
-fn run(
+pub(super) fn run(
     plan: &RelOp,
     sources: &[Vec<RecordBatch>],
     workers: usize,
@@ -95,9 +97,23 @@ fn run(
             });
         }
         let t = std::time::Instant::now();
-        let out = match ops::materialize(&rows) {
-            Ok(combined) => vec![ops::sort_batch(&combined, keys, *limit)?],
-            Err(_) => Vec::new(),
+        // Top-N: the mergeable `parallel_top_n` reduces each morsel to its local top-k and merges
+        // the survivors — no concatenation of the whole input, no `LIMIT`-ed `lexsort` over every
+        // row (result-identical to a full sort-then-slice; see `parallel_top_n_matches_eager`).
+        // The unlimited sort still materializes + sorts. Mirrors the sequential breaker.
+        let out = match limit {
+            Some(k) if !rows.is_empty() => vec![ops::parallel_top_n(&rows, keys, *k)?],
+            // Full sort: try the parallel sample-sort (range-partition + per-range parallel sort),
+            // result-identical to the serial `sort_batch` oracle and used unchanged from `par.rs`.
+            // It declines for small/limit/unsupported keys, where the serial sort runs. Without it
+            // a large full sort ran arrow's single-threaded `lexsort` (~16x DuckDB at 6M rows).
+            _ => match ops::materialize(&rows) {
+                Ok(combined) => match ops::parallel_sort_batch(&combined, keys, *limit)? {
+                    Some(sorted) => sorted,
+                    None => vec![ops::sort_batch(&combined, keys, *limit)?],
+                },
+                Err(_) => Vec::new(),
+            },
         };
         if let Some(m) = meter {
             m.breaker(
@@ -112,21 +128,40 @@ fn run(
         return Ok(out);
     }
 
-    let Some(driving) = shardable_source(plan) else {
-        return fallback(plan, sources, meter, budget);
+    // (1) The build sides, once. Executed on the streaming path themselves, so building them
+    // never materializes their subtree either. Note they are built from the **unsharded**
+    // `sources`, which is what lets a worker probe the whole build relation with its shard.
+    //
+    // Prepared *before* the shardability decision, because that decision depends on what the
+    // preparation produced: a join is only worth sharding if its build got a per-morsel probe.
+    let cache = super::prebuild_joins(plan, sources, meter, budget, workers)?;
+
+    let Some(driving) = shardable_source(plan, &cache) else {
+        // Not shardable as a whole — but a *row-wise root* over a child that is must not drag the
+        // whole query onto one core. `Project(Aggregate(…))`, `Project(Filter(Aggregate(…)))` and
+        // `Project(Sort(…))` are the shapes: the expensive child is parallelizable, and only the
+        // projection/filter sitting on its (already reduced) output made `spine_is_shardable`
+        // refuse the plan. Run the child in parallel and apply the row-wise op to its result —
+        // exactly what the `Sort` arm above already does for `ORDER BY`.
+        //
+        // This is why TPC-H q15/q17/q20 were the last queries losing to DuckDB: q15's CTE reaches
+        // the executor as `Project(Filter(Aggregate))` on a join's *build* side, so its 6M-row
+        // lineitem aggregate — 26.8 ms sharded, and faster than DuckDB's on its own — ran serial
+        // and cost ~5x that.
+        return match plan {
+            RelOp::Project { .. } | RelOp::Filter { .. } => {
+                peel_row_wise(plan, sources, workers, meter, budget, &cache)
+            }
+            _ => fallback_with(plan, sources, meter, budget, &cache, workers),
+        };
     };
     let driving_rows: usize = sources
         .get(driving)
         .map(|b| b.iter().map(|x| x.num_rows()).sum())
         .unwrap_or(0);
     if workers == 1 || driving_rows < MIN_ROWS_TO_SHARD {
-        return fallback(plan, sources, meter, budget);
+        return fallback_with(plan, sources, meter, budget, &cache, workers);
     }
-
-    // (1) The build sides, once. Executed on the streaming path themselves, so building them
-    // never materializes their subtree either. Note they are built from the **unsharded**
-    // `sources`, which is what lets a worker probe the whole build relation with its shard.
-    let cache = super::prebuild_joins(plan, sources, meter, budget)?;
 
     // (2) Contiguous shards of the driving scan, in row order — each materialized as the
     // `sources` view its worker will scan. Built *before* the parallel loop so they outlive the
@@ -210,14 +245,62 @@ fn run(
 
 /// The plan cannot be sharded: run it on the sequential streaming path. Still bounded-memory,
 /// just single-threaded — never a fall back to materializing.
-fn fallback(
+/// Run a row-wise root's child in parallel, then apply the root to the child's result.
+///
+/// Only reached when the plan as a whole is un-shardable, so the child is the expensive half and
+/// this op runs on what the child already reduced (an aggregate's groups, a sort's rows) — small
+/// by the time it gets here, which is why applying it on the driver is not the thing to
+/// parallelize. Row-wise ops commute with the child's sharding: `Project`/`Filter` are per-row, so
+/// applying them after the child's workers combine is what applying them inside each worker would
+/// have produced.
+fn peel_row_wise(
+    plan: &RelOp,
+    sources: &[Vec<RecordBatch>],
+    workers: usize,
+    meter: Option<&Meter>,
+    budget: usize,
+    cache: &BuildCache,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    // `run` only routes the two row-wise roots here; anything else keeps the old behaviour.
+    let input = match plan {
+        RelOp::Project { input, .. } | RelOp::Filter { input, .. } => input,
+        _ => return fallback_with(plan, sources, meter, budget, cache, workers),
+    };
+    let id = meter.map(|m| m.id(plan));
+    let rows = run(input, sources, workers, meter, budget)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for b in &rows {
+        let t = std::time::Instant::now();
+        let done = match plan {
+            RelOp::Project { exprs, .. } => ops::project_batch(b, exprs)?,
+            RelOp::Filter { predicate, .. } => ops::filter_batch(b, predicate)?,
+            _ => unreachable!("guarded above"),
+        };
+        if let (Some(m), Some(id)) = (meter, id) {
+            m.morsel(
+                id,
+                b.num_rows() as u64,
+                &done,
+                t.elapsed().as_nanos() as u64,
+            );
+        }
+        out.push(done);
+    }
+    Ok(strip_empties(out))
+}
+
+fn fallback_with(
     plan: &RelOp,
     sources: &[Vec<RecordBatch>],
     meter: Option<&Meter>,
     budget: usize,
+    cache: &BuildCache,
+    workers: usize,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    let cache = super::prebuild_joins(plan, sources, meter, budget)?;
-    let ctx = Ctx::new(sources, &cache, meter, budget);
+    // This path is *not* inside a rayon loop, so its stages may still fan out — which matters
+    // because the plan reached it precisely by being un-shardable, and everything in it would
+    // otherwise be serial.
+    let ctx = Ctx::with_workers(sources, cache, meter, budget, workers);
     let out: Vec<RecordBatch> = build_with(plan, ctx)?.collect::<Result<_, _>>()?;
     Ok(strip_empties(out))
 }
@@ -282,7 +365,7 @@ fn shard(batches: &[RecordBatch], workers: usize) -> Vec<Vec<RecordBatch>> {
 ///
 /// Anything else falls back to the sequential streaming path — still bounded-memory, just
 /// single-threaded. Declining is always safe; guessing is not.
-fn shardable_source(plan: &RelOp) -> Option<usize> {
+fn shardable_source(plan: &RelOp, cache: &BuildCache) -> Option<usize> {
     // An `Aggregate` is a breaker, and a breaker that sees only a shard computes the wrong
     // answer — *unless* it is the root, where each worker's `Partial` is combined rather than
     // finalized. So the root aggregate is allowed and checked through to its input; an aggregate
@@ -291,7 +374,7 @@ fn shardable_source(plan: &RelOp) -> Option<usize> {
         RelOp::Aggregate { input, .. } => input,
         other => other,
     };
-    if !spine_is_shardable(spine) {
+    if !spine_is_shardable(spine, cache) {
         return None;
     }
     let driving = leftmost_scan(spine)?;
@@ -310,14 +393,27 @@ fn shardable_source(plan: &RelOp) -> Option<usize> {
 /// `Distinct`, `Window`, `Union`, …) would see one shard and answer for one shard, and `Limit` /
 /// `RowId` are positional in the same way — a per-shard limit, or a row counter restarting at
 /// zero in every worker. A new `RelOp` variant is un-shardable until someone proves otherwise.
-fn spine_is_shardable(plan: &RelOp) -> bool {
+///
+/// A hash join qualifies **only when its build got a per-morsel probe**. That is not a
+/// correctness condition — `materialized_join_from` answers either way — it is the difference
+/// between sharding and duplicating: without a probe table that arm joins the *whole* build
+/// against the worker's shard, so every worker rebuilds the same hash table. TPC-H q4
+/// (`orders SEMI lineitem`) hashed its 3.8M-row build 16 times over to probe 3.5k rows each.
+/// Sharding a join we cannot probe per morsel multiplies the build by the worker count; running
+/// it once on the sequential streaming path is strictly less work.
+fn spine_is_shardable(plan: &RelOp, cache: &BuildCache) -> bool {
     match plan {
         RelOp::Scan { .. } => true,
         RelOp::Filter { input, .. }
         | RelOp::Project { input, .. }
         | RelOp::Unnest { input, .. }
-        | RelOp::Unpivot { input, .. } => spine_is_shardable(input),
-        RelOp::HashJoin { left, .. } => spine_is_shardable(left),
+        | RelOp::Unpivot { input, .. } => spine_is_shardable(input, cache),
+        RelOp::HashJoin { left, .. } => {
+            let probe_driven = cache
+                .get(&super::node_key(plan))
+                .is_some_and(|b| b.has_morsel_probe());
+            probe_driven && spine_is_shardable(left, cache)
+        }
         _ => false,
     }
 }

@@ -48,6 +48,51 @@ pub(crate) fn listagg_state(
     bucket_values_into_list(&Int64Array::from(groups), values, num_groups)
 }
 
+/// Finalize `array_agg`/`list_agg`: a **non-null empty** per-group list means that group
+/// saw zero input rows, and DuckDB yields NULL there — not `[]`.
+///
+/// This is only reachable for a global aggregate over empty input (`array_agg(x)` /
+/// `string_agg(x, sep)` over zero rows): a real `GROUP BY` group exists because ≥1 row
+/// mapped to it, so its list always has ≥1 element (nulls are kept, so even an all-null
+/// group is `[null, …]`, not `[]`). Without this, `array_agg` over an empty relation
+/// returned `[]` and `string_agg` returned `""`, both of which DuckDB reports as NULL.
+///
+/// Fast path: if no row is a non-null empty list (the overwhelmingly common case) the
+/// state is returned unchanged (a zero-copy `Arc` bump).
+pub(crate) fn finalize_list_agg(state: &ArrayRef) -> Result<ArrayRef, RuntimeError> {
+    use arrow::array::ListArray;
+    use arrow::buffer::NullBuffer;
+
+    let list = state.as_list::<i32>();
+    let offsets = list.value_offsets();
+    // A zero-length row is either already null or an empty-input group; both must be NULL.
+    let has_empty = (0..list.len()).any(|r| offsets[r + 1] == offsets[r] && !list.is_null(r));
+    if !has_empty {
+        return Ok(state.clone());
+    }
+    // Validity = "the list has at least one element". Empty rows (existing-null or
+    // empty-input) flip to null; offsets/values are untouched (an empty row spans no child).
+    let valid: NullBuffer = (0..list.len())
+        .map(|r| offsets[r + 1] > offsets[r])
+        .collect();
+    let field = match list.data_type() {
+        DataType::List(f) => f.clone(),
+        other => {
+            return Err(RuntimeError::UnsupportedAggregate {
+                func: "list_agg".to_string(),
+                dtype: other.to_string(),
+            })
+        }
+    };
+    let rebuilt = ListArray::try_new(
+        field,
+        list.offsets().clone(),
+        list.values().clone(),
+        Some(valid),
+    )?;
+    Ok(Arc::new(rebuilt))
+}
+
 /// Merge per-group value lists across partitions (flatten to `(group, value)`,
 /// re-bucket — no dedup, unlike COUNT(DISTINCT)).
 pub(crate) fn merge_median(
@@ -156,13 +201,14 @@ fn group_values_f64(vals: &ArrayRef, func: &str) -> Result<Vec<f64>, RuntimeErro
 /// (`total_cmp`, so NaN orders deterministically). For an even count the lower-middle is
 /// the max of the now-lesser partition, exactly the sorted `v[n/2-1]`.
 fn quickselect_median(v: &mut [f64]) -> f64 {
+    use crate::keys::float_total_cmp;
     let n = v.len();
-    let (lo, mid, _) = v.select_nth_unstable_by(n / 2, f64::total_cmp);
+    let (lo, mid, _) = v.select_nth_unstable_by(n / 2, |a, b| float_total_cmp(*a, *b));
     if n % 2 == 1 {
         *mid
     } else {
         let lower = lo.iter().copied().fold(f64::NEG_INFINITY, |a, b| {
-            if a.total_cmp(&b).is_lt() {
+            if float_total_cmp(a, b).is_lt() {
                 b
             } else {
                 a
@@ -176,25 +222,23 @@ fn quickselect_median(v: &mut [f64]) -> f64 {
 /// `floor(q·(n-1))`-th smallest; the next rank (when `q` falls between two) is the min of
 /// the resulting greater partition. Matches the sort-then-interpolate result.
 fn quickselect_quantile(v: &mut [f64], q: f64) -> f64 {
+    use crate::keys::float_total_cmp;
     let n = v.len();
     let pos = q.clamp(0.0, 1.0) * (n - 1) as f64;
     let lo_i = pos.floor() as usize;
     let frac = pos - lo_i as f64;
-    let (_, lo_ref, greater) = v.select_nth_unstable_by(lo_i, f64::total_cmp);
+    let (_, lo_ref, greater) = v.select_nth_unstable_by(lo_i, |a, b| float_total_cmp(*a, *b));
     let lo_val = *lo_ref;
     let hi_val = if frac == 0.0 || greater.is_empty() {
         lo_val
     } else {
-        greater.iter().copied().fold(
-            f64::INFINITY,
-            |a, b| {
-                if b.total_cmp(&a).is_lt() {
-                    b
-                } else {
-                    a
-                }
-            },
-        )
+        greater.iter().copied().fold(f64::INFINITY, |a, b| {
+            if float_total_cmp(b, a).is_lt() {
+                b
+            } else {
+                a
+            }
+        })
     };
     lo_val + (hi_val - lo_val) * frac
 }
@@ -363,7 +407,11 @@ mod tests {
         let modes = finalize_mode(&state).unwrap();
         let m = modes.as_primitive::<Float64Type>();
         // Canonical `+0.0` (bits 0), NOT `-0.0` (bits 0x8000…): the two zeros are one value.
-        assert_eq!(m.value(0).to_bits(), 0.0f64.to_bits(), "mode must fold -0.0 into +0.0");
+        assert_eq!(
+            m.value(0).to_bits(),
+            0.0f64.to_bits(),
+            "mode must fold -0.0 into +0.0"
+        );
 
         // Two differing NaN bit patterns are one value → mode is that (canonical) NaN, not a tie.
         let nans: ArrayRef = Arc::new(Float64Array::from(vec![
@@ -460,6 +508,35 @@ mod tests {
     }
 
     #[test]
+    fn finalize_list_agg_empty_group_becomes_null() {
+        use arrow::array::ListArray;
+        // group 0: one row (value 7) → [7]; group 1: ZERO rows → empty list.
+        // The empty list is only reachable when a group saw no input rows (here, a group
+        // that never received a value, mirroring a global aggregate over empty input).
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(7)]));
+        let group_ids = [0u32];
+        let state = listagg_state(&values, &group_ids, 2).unwrap();
+        let raw = state.as_any().downcast_ref::<ListArray>().unwrap();
+        // Before finalize: the empty group is a non-null empty list.
+        assert!(raw.is_valid(1));
+        assert_eq!(raw.value_length(1), 0);
+
+        let out = finalize_list_agg(&state).unwrap();
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(list.is_valid(0));
+        assert_eq!(list.value_length(0), 1); // [7] kept
+        assert!(list.is_null(1)); // empty group → NULL (DuckDB), not []
+
+        // A non-empty group (even all-null) is never touched: [null] stays [null], not null.
+        let vals2: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>]));
+        let st2 = listagg_state(&vals2, &[0u32], 1).unwrap();
+        let out2 = finalize_list_agg(&st2).unwrap();
+        let l2 = out2.as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(l2.is_valid(0)); // [null] is a non-null one-element list
+        assert_eq!(l2.value_length(0), 1);
+    }
+
+    #[test]
     fn quickselect_matches_sorted_oracle() {
         // quickselect median/quantile must equal sorting then indexing, for odd/even
         // counts, negatives, and duplicates — across many random vectors and quantiles.
@@ -510,5 +587,22 @@ mod tests {
         assert_eq!(med.len(), 1);
         let q = finalize_quantile(&state, 0.9).unwrap();
         assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn median_ranks_negative_nan_greatest_like_group_by() {
+        // A *negative* NaN (what `0.0/0.0` yields on x86) must rank as the engine's
+        // greatest float, not below -inf. With the old `f64::total_cmp` it sat at the
+        // bottom and shifted the selected rank: median of [1, 2, 3, -NaN] wrongly
+        // became 2.0 (mid of a list that put -NaN first). The engine's total order puts
+        // every NaN last, so the sorted order is [1, 2, 3, NaN] and the lower-middle of
+        // four is (2+3)/2 = 2.5 — matching DuckDB and `MAX`.
+        let neg_nan = f64::from_bits(0xfff8_0000_0000_0000);
+        assert!(neg_nan.is_nan() && neg_nan.is_sign_negative());
+        let mut v = vec![1.0, 2.0, 3.0, neg_nan];
+        assert_eq!(super::quickselect_median(&mut v), 2.5);
+        // The 3rd-of-4 quantile (q=2/3) brackets ranks 2 and 3 → value 3.0, never the NaN.
+        let mut v2 = vec![1.0, 2.0, 3.0, neg_nan];
+        assert_eq!(super::quickselect_quantile(&mut v2, 2.0 / 3.0), 3.0);
     }
 }

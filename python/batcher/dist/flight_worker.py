@@ -44,6 +44,30 @@ __all__ = [
 _DEFAULT_PLAN_ID = 1
 _current_plan_id = _DEFAULT_PLAN_ID
 _RESULT_STAGE = 100  # ticket stage for a stage's *finalized* result (kept on the actor)
+# Sub-buckets a memory-bounded join reduce re-partitions each staged side into on disk, so
+# it joins one sub-bucket pair at a time rather than the whole bucket. Matches the
+# single-node spilling join's default fan-out (`execute_spilling_join`).
+_JOIN_REDUCE_SUBBUCKETS = 16
+
+
+def _reduce_spill_opts(engine_config: str) -> tuple[int, str | None, str | None]:
+    """`(memory_budget_bytes, spill_dir, spill_compression)` from a worker's engine config.
+
+    A positive budget routes the flight aggregate reduce through its memory-bounded path
+    (`_bounded_reduce`): stage each mapper's partial to disk, then merge in memory if the
+    bucket fits the budget or grace-partition out of core if not — so a high-cardinality
+    bucket never assembles whole in RAM. `(0, ...)` means unbounded (the in-memory fold).
+    """
+    if not engine_config:
+        return (0, None, None)
+    import json
+
+    cfg = json.loads(engine_config)
+    return (
+        int(cfg.get("memory_budget_bytes", 0) or 0),
+        cfg.get("spill_dir"),
+        cfg.get("spill_compression"),
+    )
 
 
 def new_plan_id() -> int:
@@ -330,12 +354,59 @@ try:
                 (addr, _ticket(0, src, reducer_id, epochs.get(src, 0)))
                 for src, addr in enumerate(mapper_addrs)
             ]
+            budget, _sdir, _codec = _reduce_spill_opts(self._engine_config)
+            if budget > 0:
+                # Bounded reduce: never assemble the whole bucket in RAM (a high-cardinality
+                # bucket would OOM the in-memory fold). Stage each mapper's partial to disk
+                # (fan-in-bounded) and merge in memory when it fits the envelope, else
+                # grace-partition out of core — the flight arm of "spill, never crash".
+                return self._bounded_reduce(gk, aj, sources, replicas)
             payload, unreachable = self.session.gather_combine(
                 gk, aj, sources, finalize=True, replicas=replicas
             )
             if unreachable:
                 return ("retry", unreachable)
             return ("ok", payload)
+
+        def _bounded_reduce(self, gk, aj, sources, replicas):
+            """Memory-bounded aggregate reduce: spill each mapper's partial to disk (never
+            holding the whole assembled bucket), then merge in memory if it fits the budget
+            or grace-partition out of core if not. Result-identical to `gather_combine`."""
+            import os
+            import shutil
+            import tempfile
+
+            from batcher.dist.shuffle_io import read_ipc
+
+            nat = engine()
+            budget, sdir, codec = _reduce_spill_opts(self._engine_config)
+            work = tempfile.mkdtemp(prefix="bc_flight_reduce_", dir=sdir or None)
+            try:
+                paths, unreachable = self.session.gather_to_files(sources, work, replicas=replicas)
+                if unreachable:
+                    return ("retry", unreachable)
+                if not paths:
+                    return ("ok", None)
+                # On-disk IPC is uncompressed here, so its size ≈ the in-memory partials: when
+                # the whole bucket fits the envelope, fold it in memory (bounded, one file at a
+                # time); otherwise grace-partition the merge out of core.
+                on_disk = sum(os.path.getsize(p) for p in paths if os.path.exists(p))
+                if on_disk <= budget:
+                    running = None
+                    for p in paths:
+                        batch = read_ipc(p)
+                        if not batch:
+                            continue
+                        merged = batch if running is None else [running, *batch]
+                        running = nat.combine(gk, aj, merged)
+                    result = (
+                        nat.combine_finalize(gk, aj, [running]) if running is not None else None
+                    )
+                else:
+                    result = nat.combine_finalize_spilling(gk, aj, paths, budget, work, codec)
+                return ("ok", result if (result is not None and result.num_rows) else None)
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
 
         def reduce_fetch_publish(
             self, gk, aj, mapper_addrs, reducer_id, epochs=None, replicas=None
@@ -465,6 +536,24 @@ try:
                 (addr, _ticket(1, src, reducer_id, epochs.get(src, 0)))
                 for src, addr in enumerate(addrs)
             ]
+            budget, _sdir, _codec = _reduce_spill_opts(self._engine_config)
+            if budget > 0:
+                # Bounded join reduce: never assemble both whole sides in RAM. A skewed or
+                # high-cardinality bucket would OOM the in-memory gather + build (the flight
+                # arm of the sf10 q5 worker death). Stage each side to disk (fan-in bounded)
+                # and join co-partitioned sub-bucket pairs one at a time — symmetric with the
+                # aggregate reduce's `_bounded_reduce`, the flight arm of "spill, never crash".
+                return self._bounded_reduce_join(
+                    join_ir,
+                    left_sources,
+                    right_sources,
+                    left_schema,
+                    right_schema,
+                    gk,
+                    aj,
+                    finalize,
+                    replicas,
+                )
             # The two sides are independent streams from the same peers, so fetch them at
             # the same time rather than draining the left before dialing the right. Each
             # `gather_concat` drops the GIL and blocks on the shared Rust runtime, so two
@@ -501,6 +590,92 @@ try:
                 return ("ok", [out] if out is not None else [])
             joined = nat.execute_plan(join_ir, relations, self._engine_config)
             return ("ok", joined)
+
+        def _bounded_reduce_join(
+            self,
+            join_ir,
+            left_sources,
+            right_sources,
+            left_schema,
+            right_schema,
+            gk,
+            aj,
+            finalize,
+            replicas,
+        ):
+            """Memory-bounded join reduce: stage each mapper's left and right bucket to disk
+            (never holding the whole assembled bucket), then join co-partitioned sub-bucket
+            pairs one pair at a time. Peak memory is one sub-bucket pair, not the whole
+            (possibly skewed) bucket — result-identical to `gather_concat` + `execute_plan`.
+
+            The join analogue of `_bounded_reduce`: it wires the two out-of-core primitives
+            that already exist — `session.gather_to_files` (never assembles the bucket in RAM)
+            and `reduce_join_paths_spilling` (re-partitions on disk, joins one pair at a
+            time) — which the flight join path had left unconnected, so its reducer built the
+            whole bucket in RAM regardless of the memory envelope."""
+            import functools
+            import json
+            import os
+            import shutil
+            import tempfile
+
+            from batcher.dist.spill_breakers.join import reduce_join_paths_spilling
+
+            nat = engine()
+            _budget, sdir, _codec = _reduce_spill_opts(self._engine_config)
+            spec = json.loads(join_ir)
+            left_keys = list(spec.get("left_keys", []))
+            right_keys = list(spec.get("right_keys", []))
+            work = tempfile.mkdtemp(prefix="bc_flight_joinreduce_", dir=sdir or None)
+            try:
+                # Stage the two sides concurrently, each into its own subdir so the two
+                # `gather_to_files` waves cannot collide on a ticket-named file, and each
+                # dropping the GIL on the shared Rust runtime so the transfers overlap.
+                left_dir = os.path.join(work, "L")
+                right_dir = os.path.join(work, "R")
+                os.mkdir(left_dir)
+                os.mkdir(right_dir)
+                l_gather = functools.partial(
+                    self.session.gather_to_files, spill_dir=left_dir, replicas=replicas
+                )
+                r_gather = functools.partial(
+                    self.session.gather_to_files, spill_dir=right_dir, replicas=replicas
+                )
+                with futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    l_fut = pool.submit(l_gather, left_sources)
+                    r_fut = pool.submit(r_gather, right_sources)
+                    left_paths, lost_left = l_fut.result()
+                    right_paths, lost_right = r_fut.result()
+                unreachable = sorted(set(lost_left) | set(lost_right))
+                if unreachable:
+                    return ("retry", unreachable)
+                if not left_paths and not right_paths:
+                    return ("ok", None)
+                joined = reduce_join_paths_spilling(
+                    join_ir,
+                    left_keys,
+                    right_keys,
+                    left_paths,
+                    right_paths,
+                    work,
+                    _JOIN_REDUCE_SUBBUCKETS,
+                    self._engine_config,
+                    left_schema,
+                    right_schema,
+                )
+                if gk is not None:
+                    # Fused post-join aggregate: fold the bounded join output into partial
+                    # state (finalize only when each group is whole in this bucket), so only
+                    # the small aggregate — never the join output — leaves the worker.
+                    # Bit-identical to `execute_plan_aggregated` (join → partial → finalize?).
+                    if not joined:
+                        return ("ok", [])
+                    partial = nat.partial_aggregate(gk, aj, joined)
+                    out = nat.combine_finalize(gk, aj, [partial]) if finalize else partial
+                    return ("ok", [out] if out is not None else [])
+                return ("ok", joined)
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
 
         def reduce_join_publish(
             self,

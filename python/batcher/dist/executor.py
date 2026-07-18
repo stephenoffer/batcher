@@ -423,11 +423,13 @@ def _fusable_join_aggregate(agg: Aggregate) -> bool:
     partitioned_on = hash_partitioned_on(j)
     if not partitioned_on:
         return False  # nothing guaranteed (an outer join, or no equi-key): must re-shuffle
-    # The group keys must *cover* the partitioning, so no group straddles two buckets — the
-    # containment `satisfies` checks, with the group keys as what is on hand.
+    # The group keys must *cover* the partitioning, so no group straddles two buckets: the
+    # delivered partitioning must be a subset of the required grouping (see `satisfies` — the
+    # containment runs the opposite way from ordering). Arguments in the natural
+    # (delivered, required) order.
     return satisfies(
-        PhysicalProperties(hash_partitioned_on=group_cols),
         PhysicalProperties(hash_partitioned_on=partitioned_on),
+        PhysicalProperties(hash_partitioned_on=group_cols),
     )
 
 
@@ -701,10 +703,14 @@ def _dispatch(
     #
     # This is exact, not a sample: the global first `k + n` rows are a prefix of the
     # source, so every one of them lies in some partition's own first `k + n` rows; and
-    # `_distributed_map` assembles partition results **by index** (`gather_map_results`
-    # is index-addressed), so their concatenation is the source's row order and
-    # `slice(k, n)` selects precisely the rows the single-node engine returns. Only
-    # `workers x (k + n)` rows ever reach the driver, never the whole source.
+    # `_distributed_map` (with `preserve_order`) assembles partition results **by index**
+    # over contiguous, source-ordered split runs, so their concatenation is the source's
+    # row order and `slice(k, n)` selects precisely the rows the single-node engine returns.
+    # `preserve_order` is required: the default load-balanced (`_balance`) split assignment
+    # puts non-adjacent splits in one partition, so a partition's own first `k + n` rows
+    # interleave rows from different parts of the source and the slice returns a different
+    # row set than single-node. Only `workers x (k + n)` rows ever reach the driver, never
+    # the whole source.
     #
     # `hub=None`: the per-worker plan is truncated, so its row count must not be learned
     # as the source's cardinality. A `map_batches` prefix returned above, so the pipeline
@@ -719,16 +725,19 @@ def _dispatch(
                 from batcher.dist.executors.map import _distributed_map
 
                 per_worker = Limit(input=base, n=offset + n, offset=0)
-                table = _distributed_map(per_worker, sources, workers, None)
+                table = _distributed_map(per_worker, sources, workers, None, preserve_order=True)
                 table = table.slice(offset, n)
                 return table if not above else _apply_above(above, table)
 
     # `with_row_index` — a single global counter, so a per-partition run would restart it at
     # zero on every worker. Instead run the (row-wise) input distributed and number the rows
-    # on the driver: `_distributed_map` assembles partitions BY INDEX, so their concatenation
-    # is the source's own row order and the counter lands on exactly the rows single-node
-    # numbers. `with_random` (position-keyed hash) and `tail` (row index + filter) both lower
-    # to `RowId`, so all three distribute through this one path.
+    # on the driver: `_distributed_map` (with `preserve_order`) assembles partitions BY INDEX
+    # over contiguous, source-ordered split runs, so their concatenation is the source's own
+    # row order and the counter lands on exactly the rows single-node numbers. Without
+    # `preserve_order` the default `_balance` split assignment scrambles that order, so row
+    # `i` of the source gets a different index than single-node. `with_random` (position-keyed
+    # hash) and `tail` (row index + filter) both lower to `RowId`, so all three distribute
+    # through this one path.
     rowid_split = _split_at(plan, RowId)
     if rowid_split is not None:
         above, rowid = rowid_split
@@ -737,7 +746,7 @@ def _dispatch(
             if sid < len(sources) and _is_splittable_source(sources[sid]):
                 from batcher.dist.executors.map import _distributed_map
 
-                table = _distributed_map(rowid.input, sources, workers, None)
+                table = _distributed_map(rowid.input, sources, workers, None, preserve_order=True)
                 index = pa.array(
                     range(rowid.offset, rowid.offset + table.num_rows), type=pa.int64()
                 )

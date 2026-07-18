@@ -95,9 +95,7 @@ absent**, and the moment it could see, it was wrong.
 
 ## Open
 
-| # | Sev | Defect | Where |
-|---|-----|--------|-------|
-| B26 | **S1** | **The engine's scalar float comparisons follow arrow-rs's total order, not IEEE — so `WHERE` returns wrong rows, and disagrees with DuckDB.** arrow-rs's `cmp::{eq,lt,gt,…}` kernels compare floats via `ArrowNativeTypeOp`, which is `f64::total_cmp`: `-0.0 < 0.0`, NaN ranks above every number, and equality is *bit* equality. DuckDB (and Arrow C++/pyarrow, Polars, Postgres) use IEEE for comparison predicates, reserving the total order for `ORDER BY`/`GROUP BY`/`DISTINCT`/join keys — which is what `bc_runtime::keys` is for. Measured over `f = [-0.0, 0.0, NaN, 1.0]`: `WHERE f = 0.0` → batcher `[0.0]`, duckdb `[-0.0, 0.0]` (**silently drops a row**); `WHERE f < 0.0` → batcher `[-0.0]`, duckdb `[]` (**returns a row that does not match**); `WHERE f > 1.0` → batcher `[NaN]`, duckdb `[]`; `WHERE f >= 0.0` → batcher `[0.0, NaN, 1.0]`, duckdb `[-0.0, 0.0, 1.0]`. The interpreter and the JIT agree with *each other* (`bc-codegen`'s `total_order_key` was written to match the interpreter), so no parity test catches it — only the DuckDB oracle does, and no differential test covered a float comparison against a NaN or a signed zero. Fixing it means moving the comparison arms of `eval_binary`/`try_scalar_binary` to IEEE **and** the JIT's `fcmp` and SIMD lane compares with them, in one commit. Not attempted here: those three files were under concurrent edit, and this is a result-changing correctness decision that deserves its own differential sweep rather than a drive-by. B20/B22 are conservative guards *around* it — when it is fixed, they can be lifted. | `crates/bc-expr/src/eval/binary.rs`, `crates/bc-codegen/src/{emit,simd}.rs` |
+*(none — B26 closed in wave 22 below.)*
 
 ---
 
@@ -517,3 +515,624 @@ Yield holding at ~10/wave. All-Python control-plane fixes this wave (no rebuild 
 | B228 | S2 | `SUM`/`MIN`/`MAX`/`AVG` over an **all-null (Arrow `Null`-typed) column** errored `aggregate 'sum' is not supported for column type Null` on both the grouped and global paths, where DuckDB returns NULL. An entirely-null column (e.g. `SELECT NULL AS x`, or a `from_pydict` all-`None` column) carries Arrow's `Null` type, which the typed accumulator kernels reject. Added `coerce_null_call_inputs` (the aggregate-side sibling of B215's `coerce_null_sort_key`) substituting an all-null `Int64` column at the aggregate input boundary, before `widen_mean_inputs`. | `crates/bc-runtime/src/agg/mod.rs` (`coerce_null_call_inputs`) | `tests/differential/test_diff_agg_null_dtype.py` |
 | B229 | S1 | `COUNT(x)` over the same all-null `Null`-typed column returned the **group/row size** instead of 0 — count must ignore nulls, and every value is null. Fixed by the same `coerce_null_call_inputs` (an all-null `Int64` column counts 0 non-nulls). | same | same (`test_grouped_count_of_all_null_column_is_zero`) |
 | B230 | S2 | `ds.intersect(other)` / `ds.except_(other)` (DISTINCT and ALL) **crashed** with `AssertionError: expected a single-source subplan` whenever routed out-of-core — an explicit `collect(spill=True)`, or a large set op tripping the spill estimate under a tight `max_memory_bytes` on the default streaming executor. INTERSECT/EXCEPT lower to `Aggregate(bool_or) over Union(left, right)` — a two-source aggregate input — but `dist/spill.py` assumed a single-source, map-only input (`_relabel_single_source` asserts). Added a `_single_source(plan.input)` decline guard to the `Aggregate` and `Distinct` branches so a multi-source input falls back to the in-memory mergeable engine (mirroring `supports_spilling_join`); the set-op semantics themselves were already correct. | `python/batcher/dist/spill.py` (`spill_collect`) | `tests/differential/test_diff_setops_edges.py` |
+
+---
+
+## Wave 19 — SQL regex flags, HLL float identity, UDF empty-input schema (2026-07-14)
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B231 | S1 | SQL `LIKE` with consecutive boundary `%` matched an interior `%` **literally**: `_like_simple` peeled only a single leading/trailing `%`, so `'abc' LIKE '%%c'` returned `false` vs DuckDB `true` (also `'a%%'`, `'%%abc'`, `'%%%'` under LIKE/ILIKE/NOT LIKE). Now strips all boundary `%` (the `simple`-guard already proves the core is a pure literal). | `python/batcher/_sql/parser/scalar.py` (`_like_simple`) | `tests/differential/test_diff_like.py` |
+| B232 | S1 | SQL `regexp_matches(s, pattern, options)` silently **dropped the options arg** — `regexp_matches('ABC','abc','i')` returned `false` vs DuckDB `true` (case-insensitive ignored); same for `'s'` (dot-matches-newline). Now maps DuckDB `i`/`s`→ inline `(?…)` regex prefix (verified bit-identical), `c`→ no-op, and raises `NotImplementedError` for options it can't reproduce (`m`/`n`/`l`/`g`) rather than returning a wrong answer. | `python/batcher/_sql/parser/literals.py` (`_regexp_flags_prefix`) | `tests/differential/test_diff_regexp_flags.py` |
+| B233 | S1 | SQL `regexp_replace(s, pat, repl, options)` **dropped the options arg** the same way — `regexp_replace(s, 'abc', 'X', 'i')` matched case-sensitively (wrong vs DuckDB). Rewrote `_regexp_replace` to honour options: `g`→ the global `regexp_replace_all` variant, `i`/`s`/`c`→ the inline flag prefix (`_regexp_flags_prefix`), unsupported flags raise. | `python/batcher/_sql/parser/scalar_funcs.py` (`_regexp_replace`) | `tests/differential/test_diff_regexp_flags.py` (`test_regexp_replace_options`) |
+| B234 | S3 | The HyperLogLog float fast path (`add_array_fast`) hashed raw `to_bits()`, so `-0.0`/`0.0` and distinct NaN payloads counted as **separate** distinct values: a Float column `{-0.0, 0.0, NaN, NaN', 1.5}` estimated 5 distinct where the exact answer is 3. This over-counts the `ndv` feeding Kyber's join ordering / group sizing and the `approx_n_unique` surface (the B103/B117/B224 float-identity class, at the one sketch path it wasn't applied). Added `canon_float_bits` (`-0.0/0.0→+0.0`, any NaN→canonical) before hashing. | `crates/bc-sketches/src/hll.rs` | Rust `hll::tests::add_array_folds_signed_zero_and_nan_like_exact_distinct` |
+| B235 | S2 | A schema-changing `map_batches` fn returning a `pa.Table` (a documented allowed return type) **crashed downstream on empty input**: a 0-row Table's `to_batches()` returns `[]`, so the stage reported the *input* schema instead of the fn's output schema (the identical fn returning a `RecordBatch` worked). Now keeps one empty batch carrying the Table's schema. | `python/batcher/core/udf/execute.py` (`_coerce_udf_result`) | `tests/integration/test_map_batches.py` |
+| B236 | S2 | Per-row `map`/`flat_map` **lost the declared output schema on empty input**: `_to_table`'s empty fallback used the input schema, dropping declared `output_columns`, so a downstream reference to a callback-added column crashed only when a batch was empty. Threaded `output_columns` into the row adapters, emitting declared columns as 0-row null-typed arrays when the output schema differs. | `python/batcher/api/dataset/callbacks.py`, `api/dataset/ml.py` | same |
+
+**Deferred (reproduced + pinned, not counted — fix lives in a concurrent-session-owned file):** `WHERE i NOT BETWEEN a AND b` (and `NOT IN`) over a column with nulls wrongly **keeps** NULL-predicate rows when the zone-map optimizer proves the inner predicate empty — `kyber/rules/zonemap_pruning.py::_predicate_status` folds `Not(_FALSE)`→`_TRUE` (unsound: a NULL row negates to NULL and must stay dropped). Verified fix is `_FALSE if inner is _TRUE else None`. The Rust data plane is correct (`iter_batches` returns the right answer; only optimizer-pruned `collect`/`count` are wrong). `zonemap_pruning.py` is owned by the concurrent session — left untouched per the layering rule; guarded by strict-`xfail` in `tests/differential/test_diff_filter_null_predicate.py` so it flips to a hard failure the moment the owner fixes it.
+
+---
+
+## Wave 20 — interval-timestamp arithmetic, collecting-agg NULL, string_agg NULL sep, LargeUtf8 boundary (2026-07-14)
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B237 | S1 | SQL `TIMESTAMP ± INTERVAL n DAY`/`WEEK` **crashed** (`Cast error: Can't cast value … to type Int32`): `_apply_interval` implemented DAY/WEEK as an epoch-day round-trip `Cast(Cast(operand,int64)±n, date)` that assumes a Date32 operand, so on a µs Timestamp the Date32 cast overflowed. `SELECT ts + INTERVAL 5 DAY` raised where DuckDB returns the shifted timestamp with time-of-day preserved. Now routes all four units through the type-aware `DateOffset` node (handles Date and Timestamp). To keep the ubiquitous `date '…' - interval '90' day` bound folding to a single `Lit` (for zone-map pruning / pushdown), the normalize constant-folder now also folds a `DateOffset` over a literal (reusing `temporal_extra._fold_date_offset`). | `python/batcher/_sql/parser/literals.py` (`_apply_interval`), `python/batcher/kyber/rules/normalize/fold.py` | `tests/differential/test_diff_sql_dates.py`, `tests/differential/test_diff_cast_constant_fold.py` |
+| B238 | S4 | `unpivot` of columns with **no common promotable type** (e.g. a string + a numeric) crashed deep in the engine with an opaque `RuntimeError: It is not possible to concatenate arrays of different data types (Utf8, Int64)`, where DuckDB rejects it cleanly at bind time. Distinct from B143 (numeric int+float, which promotes) and B145 (name collision) — the non-promotable case B143 still let fall through to `concat`. Now raises a clear `PlanError` at plan-build when the input schema is known. | `python/batcher/plan/logical/relational.py` (`Unpivot.__post_init__`) | `tests/differential/test_diff_unpivot.py` |
+| B239 | S2 | `array_agg(v)`/`list_agg(v)` over **zero input rows** returned `[]` instead of NULL, and `string_agg` over an empty relation returned `""` instead of NULL (it lowers to array_agg + list-join): `SELECT array_agg(v) FROM t WHERE false` gave `[]` where DuckDB gives NULL. A non-null empty per-group list now finalizes to NULL (safe: a real GROUP BY group always has ≥1 element, so this only fires for a global/filtered-to-empty aggregate); existing-null and all-null `[null,…]` rows untouched. | `crates/bc-runtime/src/agg/median.rs` (`finalize_list_agg`) | `tests/differential/test_diff_array_agg.py`, `tests/differential/test_diff_sql_string_agg.py` |
+| B240 | S2 | SQL `string_agg(x, NULL)` **ignored the NULL separator** and joined the values with the default `','` (a SQL `NULL` parses to `exp.Null`, not `exp.Literal`, so it fell through the `isinstance(sep, exp.Literal)` check): `string_agg(v, NULL)` returned `'a,b,c'` where DuckDB returns NULL (concatenating through a NULL delimiter is NULL). Now returns a string-typed NULL (`nullif(join, join)`) for an explicit `exp.Null` separator. | `python/batcher/_sql/parser/scalar.py` (GroupConcat branch) | `tests/differential/test_diff_sql_string_agg.py` (`test_string_agg_null_separator_is_null`) |
+| B241 | S2 | A `LargeUtf8` (`large_string`) column was **not normalized** at the FFI boundary, so the engine's string kernels crashed where the identical `Utf8` column worked (DuckDB treats both as `VARCHAR`): `filter(col('s') == 'a')` → "Invalid comparison operation: LargeUtf8 == Utf8", `str.contains`/`str.upper` → "expected a Utf8 argument", and a `LargeUtf8`-vs-`Utf8` join key → `PlanError("join key type mismatch")`. Two-sided fix mirroring narrow-numeric normalization: `normalize_to` maps `LargeUtf8 → Utf8` and recurses the `Dictionary` value type; the Python planner's `_WIDEN_NARROW` adds `large_utf8 → utf8` (the join key-type check runs pre-boundary). | `crates/bc-py/src/normalize.rs`, `python/batcher/io/source/inmemory.py` | `tests/differential/test_diff_large_utf8_boundary.py` |
+
+**Deferred (cross-area, spans `plan/` + FFI):** FFI narrow-type normalization was **top-level only** — a `struct<a: int32>` kept `int32` inside and `struct.field('a') + struct.field('a')` with `a = 2e9` silently **wrapped** to `-294967296`. *(Resolved in wave 21 — see B244.)*
+
+---
+
+## Wave 21 — BLOB byte-functions, integer left-shift, nested narrow-type normalization (2026-07-14)
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B242 | S1 | Byte-oriented functions over a **non-UTF-8 BLOB** returned NULL/0 (silent data loss): `eval_str` cast every `Binary`/`LargeBinary` column to `Utf8` first, and Arrow's `Binary→Utf8` cast nulls rows whose bytes aren't valid UTF-8. So on `\xDE\xAD\xBE\xEF`: `hex`→NULL (not `'DEADBEEF'`), `octet_length`→0 (not 4), `md5`/`sha1`/`sha256`/`base64`→NULL — where DuckDB defines all of these on the raw bytes. Added an `eval_bytes` byte-input dispatch reading the raw bytes directly for `octet_length`/`bit_length`/`hex`/`md5`/`sha1`/`sha256`/`base64`/`crc32`/`xxhash64`; valid-UTF-8 blobs are byte-identical to before. | `crates/bc-expr/src/eval/str/mod.rs` (`eval_bytes`) | `tests/differential/test_diff_blob_functions.py` |
+| B243 | S3 | Integer **left shift** silently masked the shift amount (Arrow's `wrapping_shl` masks to the low 6 bits), so `1 << 64` returned `1` and `x << -1` wrapped to `x << 63` — while right shift already yielded 0 for an out-of-range amount (ledger B32), so the two directions disagreed. `arithmetic_shift_left` now mirrors the right-shift convention (OOR amount → 0; in-range wraps overflow out, matching the interpreter's wrapping arithmetic). The JIT declines bit/shift ops and falls back to the interpreter, so tier parity is intact. | `crates/bc-expr/src/eval/binary.rs` (`arithmetic_shift_left`) | same |
+| B244 | S1 | FFI narrow-type normalization was **top-level only**, so a narrow numeric inside a `struct`/`list`/`map` kept its narrow width and later arithmetic **wrapped**: `struct<a: int32>` with `a = 2_000_000_000` gave `field('a')+field('a') = -294967296` instead of `4_000_000_000` (and the same for `list<int32>` elements). Fixed on both sides consistently: `normalize_to` recurses into Struct/List/LargeList/FixedSizeList/Map (Dictionary already did), widening narrow numerics at every depth with one `arrow::compute::cast`, and the UInt64-overflow guard is generalized to a `deep_null_count`; the Python inference mirror `widen()` and the source-schema pre-widening recurse identically so the declared schema matches. | `crates/bc-py/src/normalize.rs`, `python/batcher/plan/types/lattice.py`, `python/batcher/io/source/inmemory.py` | `tests/differential/test_diff_nested_narrow_normalize.py` |
+
+*(Wave 21 also implemented SQL `DISTINCT ON` — previously a clean `NotImplementedError`. That is a feature addition, not a bug fix, so it is not numbered here; it is covered by `tests/differential/test_diff_distinct_on.py`.)*
+
+---
+
+## Wave 22 — float identity: the comparison/ORDER BY sweep that closes B26 (2026-07-16)
+
+A single-area hunt aimed at the ledger's one **Open** entry. B26 sat open across four waves
+because it was correctly judged too big for a drive-by; this wave did the differential sweep
+it asked for — and found the prescription itself was wrong.
+
+**B26's premise was wrong, and following it would have made things worse.** B26 said DuckDB
+uses **IEEE** for comparison predicates and that the fix was to move the comparison arms to
+IEEE. Measured against DuckDB 1.5.4, that is not what DuckDB does:
+
+| | IEEE | DuckDB (native table) | arrow-rs `total_cmp` (what the engine did) |
+|---|---|---|---|
+| `-0.0 = 0.0` | true | **true** | false |
+| `NaN = NaN` | false | **true** | only if bits match |
+| `NaN > 1` | false | **true** | true (positive NaN only) |
+| `-NaN > 1` | false | **true** | **false** — ranks below `-inf` |
+
+DuckDB is a **total order with the two zeros folded**: all NaN are one value, greater than
+every number; `-0.0` and `0.0` are one value. Moving to IEEE would have fixed signed zero and
+*broken* NaN. The engine was not "using a total order where it should use IEEE" — it was
+using the **raw-bit** total order where it should use the **canonical** one, which is the
+order its own `GROUP BY` / `DISTINCT` / join keys already used (`bc_runtime::keys`). Only
+signed zero was wrong in the way B26 described; NaN was wrong in a way B26 did not see.
+
+**Why the oracle hid it.** `duck.register(arrow_table)` lets DuckDB push the filter *into*
+the Arrow scan, where it is evaluated with **IEEE** semantics — contradicting DuckDB's own
+executor on NaN. The same DuckDB answers `WHERE f > 1` over `[1.5, NaN]` as `[1.5]` through a
+registered Arrow table and `[1.5, NaN]` through a real one. Every differential test registers
+Arrow tables, so the oracle itself was unreliable for exactly these values. `conftest.duck_materialize`
+now copies into DuckDB storage for float/NaN tests, and documents why.
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B26 | **S1** | **Scalar float comparison used the raw-bit total order, so one column meant two different things depending on which operator read it.** `WHERE f = 0.0` **dropped** the `-0.0` row while `GROUP BY f` folded the two zeros into one group; `WHERE f < 0` **returned** `-0.0`; a *negative* NaN ranked below `-inf` while a positive one ranked above `+inf`; two NaNs of differing payload compared unequal. The engine's own `test_diff_shuffle_key_identity.py::test_float_key_identity_is_the_same_across_every_operator` asserted the invariant and was **failing** — scalar `=` was the lone violator of a contract the other four paths kept. Fixed by canonicalizing both operands (`bc_arrow::canon_f64`: `-0.0`→`0.0`, every NaN→one quiet NaN) before the comparison kernel, in the interpreter and the JIT (scalar **and** SIMD lane compares) in one commit, preserving invariant #6. Arithmetic is untouched — `-0.0 * 1.0` keeps its sign and `1/-0.0` is still `-inf`. The canonicalization is a no-op scan with no allocation on a column holding neither `-0.0` nor NaN, so ordinary float data pays nothing. | `crates/bc-arrow/src/float_ident.rs` (new — the ONE definition), `crates/bc-expr/src/eval/binary.rs`, `crates/bc-codegen/src/{emit,simd}.rs` | `tests/differential/test_diff_float_comparison_identity.py` (41 cases), `bc_arrow::float_ident` unit tests, `bc-codegen::float_comparison_canonical_order_signed_zero_and_nan_signs` |
+| B245 | S1 | **`ORDER BY` ranked a *negative* NaN first**, contradicting DuckDB (all NaN sort last, whatever the sign), the engine's own `MIN`/`MAX`/`list.max` (which use `float_total_cmp` and rank it greatest), and — after B26 — its own `=`/`<`. So `ORDER BY x DESC LIMIT 1` and `max(x)` disagreed on the same column. Sorting `[1.5, -NaN, NaN, -3.0]` gave `[-NaN, -3.0, 1.5, NaN]` vs DuckDB's `[-3.0, 1.5, NaN, -NaN]`. **Not exotic — this is what ordinary arithmetic produces:** on x86 `0.0/0.0` and `sqrt(-1)` both yield a *negative* NaN (`0xfff8…`), measured through Batcher's own `col('a')/col('b')`, so `SELECT x/y AS r FROM t ORDER BY r` reaches it with no unusual input at all. Fixed at the one seam every sort path already shares: `coerce_null_sort_key` (which existed to normalize an all-`Null` key at "every sort-key eval site so the serial, parallel, top-N, and spilling merge paths all agree") now also canonicalizes a float key, and is renamed `normalize_sort_key`. Only the *key* is canonicalized and the sort then gathers the original rows, so a `-NaN`/`-0.0` in is still a `-NaN`/`-0.0` out — the order is corrected without rewriting the user's data. | `crates/bc-interp/src/ops/mod.rs` (`normalize_sort_key`) | `tests/differential/test_diff_float_comparison_identity.py::test_sort_order_matches_comparison` |
+| B246 | **S1** | **Serial ≠ parallel on a negative NaN** — a violation of the hard interpreter-oracle invariant (#6/#7), not merely a DuckDB disagreement. The parallel sample-sort routes buckets through `shuffle::range_part_of_f64`, which puts **every** NaN (either sign) in the *highest* bucket, while the serial path's raw `lexsort` ranked a `-NaN` *lowest*. Same input, same plan, two different orders depending on whether the sort went parallel — and the distributed range-sort (`dist.rs` → `shuffle.rs:550`) splits the same way. Fixed by the same `normalize_sort_key` seam: the canonical key makes the serial order agree with the routing the parallel/distributed paths already used. | `crates/bc-interp/src/ops/{mod.rs,sample_sort.rs}` | same file (the serial oracle is what the parallel path is checked against) |
+
+**Structural note.** `canon_f64`/`canon_f32` existed *three times* (`bc-runtime::keys` twice,
+`bc-sketches::hll` once) before this wave. The definition now lives once in
+`bc-arrow::float_ident` — the lowest crate `bc-expr`, `bc-runtime`, `bc-codegen`, and
+`bc-sketches` all see — precisely so a fourth copy cannot drift. `bc_arrow::float_ident`
+carries the property test that the two formulations the engine uses (the interpreter's
+`float_total_cmp` and the JIT's canon-then-`total_cmp` key) are the same relation.
+
+**B20/B22 kept.** Those conservative guards (zone-map pruning and the cached filter-count
+declining on a NaN/zero float bound) were written as workarounds *around* B26 and the ledger
+noted they could be lifted once it landed. They are left in place: they are sound under the
+new semantics too, they cost a scan rather than a row, and lifting them is a separate
+optimization with its own risk — not a correctness follow-on.
+
+### Wave 22 follow-up — the rest of the float-identity surface (mapped; closed in Wave 23)
+
+Closing B26/B245/B246 meant auditing **every** path that orders or ranks a float. Most already
+canonicalize (`bc_runtime::keys::canonicalize_float_keys` covers hash/sort-merge/ASOF joins,
+shuffle, grouping, grace-spill routing, HLL, and window PARTITION BY; `float_total_cmp` covers
+`MIN`/`MAX`, the window running/sliding extremes, and the `list.*` extremes). The paths below
+still rank **raw** bits and therefore disagree with the engine's own float identity — the same
+class as B26, each reachable the same way (a `-NaN` from `0.0/0.0`, or a `-0.0`). Recorded here
+with exact locations so the next wave can take them without re-deriving the map. **None is a
+regression from this wave** — all predate it; B26's fix is what makes them visibly inconsistent
+rather than uniformly wrong.
+
+Ordered by severity:
+
+| Area | Where | Symptom |
+|---|---|---|
+| **Window ORDER BY / peers / frames** | `bc-runtime/src/window.rs:450-466` (`ordered_partitions_by_global_sort`), `:632-641` (`encode_order_keys` → `rows_equal` → `peer_boundary`) | `order_keys` go into the `RowConverter` **raw** (only `partition_keys` were canonicalized at `:198`). `-0.0` and `0.0` are not **peers**, so `RANK`/`DENSE_RANK` differ and every `RANGE`/`GROUPS` frame bound moves — while `GROUP BY` calls them one group. |
+| **`arg_min`/`arg_max`** | `bc-runtime/src/agg/argextreme.rs:32-35,48-53` | Raw `RowConverter` on the key: `arg_max(v, -NaN)` never wins, and the value tie-break splits `-0.0`/`0.0`. Directly contradicts `list.arg_max` (`bc-expr/src/eval/list.rs:694-701`), where exactly this was already fixed. |
+| **Exact `median`/`quantile`** | `bc-runtime/src/agg/median.rs:205,210,228,236` | `select_nth_unstable_by(f64::total_cmp)` — a `-NaN` sits at the bottom and shifts the selected rank. Its own oracle test (`:555`) uses `total_cmp` too, so it **validates the wrong relation**. The sibling `list.median` already uses `float_total_cmp`. |
+| **`GREATEST`/`LEAST`** | `bc-expr/src/eval/math.rs:178,180` (`eval_extreme`) | Raw `cmp::gt_eq`/`lt_eq`, no canonicalization: `greatest(1.0, -NaN)` → `1.0`, though the engine's own docs claim `greatest` ranks NaN greatest. `binary.rs` (same crate) now canonicalizes; `math.rs` does not. |
+| **`list_sort`** | `bc-expr/src/eval/list.rs:522-538` | Raw `sort_to_indices` per slice. The comment at `:526` asserts "NaN sorts as the greatest value … which arrow's float order already does" — **false for a negative NaN**. |
+| **Spilling `mode`/`histogram`** | `bc-interp/src/ops/quantile_spill/mod.rs:598-599,408,771,798`, `histogram.rs:40-41` | Pass `canon_value = false`, justified by "the in-memory path compares the raw `RowConverter` encoding". That justification is **stale**: `agg/median.rs:260,317` now canonicalize, so the spilled result differs from the in-memory one under memory pressure. |
+| **Approx vs exact quantile** | `bc-sketches/src/kll.rs:114,366`, `tdigest.rs:84` | The sketches silently **drop** NaN; exact `quantile` ranks it. `approx_quantile` and `quantile` therefore disagree on a NaN-bearing column. A decision, not obviously a bug — but it should be a decision, and documented. |
+| **Bloom membership** | `bc-py/src/bloom.rs:106-110` | `RowConverter` over raw key columns, so a float key here cannot match the canonicalized join side. |
+
+**Remaining duplication.** `canon_f64` is still restated in `bc-runtime/src/keys.rs:34`,
+`bc-expr/src/eval/list.rs:111-124`, `bc-interp/src/ops/quantile_spill/mod.rs:378`, and
+`bc-sketches/src/hll.rs:238`. Every one of those crates depends on `bc-arrow`, so all four can
+now import `bc_arrow::float_ident` — this wave added the single definition and moved `bc-expr`'s
+comparison path onto it, but did not chase the rest. `keys::canonicalize_float_keys` being
+`pub(crate)` is what kept `bc-interp` from reusing the array-level canonicalizer; `bc-arrow`'s
+`canon_float_array` is the public replacement.
+
+---
+
+## Wave 23 — closing the wave-22 float-identity map, + a remap param-drop (2026-07-17)
+
+The wave-22 follow-up above **mapped** every remaining path that ranked *raw* float bits
+instead of the engine's canonical identity, with exact locations. This wave took that map and
+closed it: seven paths where the same float column meant two different things depending on
+which operator read it — a `-0.0` split from `0.0`, or a *negative* NaN (what `0.0/0.0` yields
+on x86) ranked below `-inf` instead of last — now all route through the one identity
+(`bc_arrow::float_ident` / `bc_runtime::keys`). Each was verified against **DuckDB executing
+the same query** (materialized, not `register`ed — the oracle caveat from Wave 22 holds), and
+DuckDB confirmed the target values (`greatest`→NaN, `median([1,2,3,-NaN])`→2.5,
+`arg_max(v,-NaN)`→the NaN row, `least` never NaN). Numbering continues from B246.
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B247 | S1 | `GREATEST`/`LEAST` compared with raw `cmp::gt_eq`/`lt_eq`, so `greatest(1.0, -NaN)`→`1.0` where DuckDB (and the engine's own `MAX`) rank NaN greatest → NaN, and `-0.0`/`0.0` split. Now canonicalizes both operands (`bc_arrow::canon_float_array`) before the compare and selects the *original* value, so a `-0.0`/`-NaN` in is the same out. | `crates/bc-expr/src/eval/math.rs` (`eval_extreme`) | `tests/differential/test_diff_float_identity_followup.py::test_greatest_least_rank_nan_like_duckdb` |
+| B248 | S1 | `arg_min`/`arg_max` row-encoded the key/value **raw**, so `arg_max(v, -NaN)` never won (NaN ranked below `-inf`) and the value tie-break split `-0.0`/`0.0`. Now canonicalizes the key/value copies fed to the `RowConverter` (via `keys::canonicalize_float_keys`) but `take`s the original rows. | `crates/bc-runtime/src/agg/argextreme.rs` | rust `arg_extreme_ranks_float_key_on_engine_identity` + `test_diff_float_identity_followup.py::test_arg_max_with_negative_nan_key_matches_duckdb` |
+| B249 | S1 | Exact `median`/`quantile` quickselect used `f64::total_cmp`, which ranks a `-NaN` *below* `-inf` and so shifted the selected rank: `median([1,2,3,-NaN])` returned `1.5` where DuckDB returns `2.5`. Now uses `keys::float_total_cmp` (all NaN greatest). | `crates/bc-runtime/src/agg/median.rs` | rust `median_ranks_negative_nan_greatest_like_group_by` + `test_diff_float_identity_followup.py::test_median_over_negative_nan_matches_duckdb` |
+| B250 | S1 | Window `ORDER BY` keys went into the `RowConverter` **raw** (only `PARTITION BY` was canonicalized), so `-0.0` and `0.0` were not *peers* — `RANK`/`DENSE_RANK` split them and every `RANGE`/`GROUPS` frame bound moved — and a `-NaN` sorted first instead of last, all disagreeing with the `GROUP BY`/`=`/`MAX` the same column feeds. Now canonicalized at the single `window_with` entry (new `keys::canonicalize_float_order_keys`, preserving each key's `SortOptions`), covering the serial, parallel, and distributed paths. | `crates/bc-runtime/src/window.rs`, `keys.rs` | rust `window::tests::rank_treats_signed_zero_and_nan_on_engine_float_identity` |
+| B251 | S1 | `list_sort` sorted each slice with raw `sort_to_indices`; the comment claimed "NaN sorts greatest, which arrow's order already does" — **false for a negative NaN**, which ranked below `-inf`. Now sorts the canonical key (`canon_float_array`) and gathers the original elements. | `crates/bc-expr/src/eval/list.rs` | (covered by the list edge suite; NaN order pinned by the canonical-key path) |
+| B252 | S1 | Spilled `mode`/`histogram` passed `canon_value = false` on a justification that had gone **stale**: the in-memory `finalize_mode`/`finalize_histogram` canonicalize float leaves, so `mode([-0.0,-0.0,0.0])` returned `-0.0` (a spurious 2-vs-1 split) under memory pressure and `0.0` in memory — a silent spill≠in-memory divergence (invariant #7). Both spill paths now fold identically. | `crates/bc-interp/src/ops/quantile_spill/{mod,histogram}.rs` | rust `quantile_spill::tests::mode_value_folds_signed_zero` |
+| B253 | **S1** | The distributed-join **key bloom** (`build_key_bloom` on the small side, probed by `bloom_filter_batches` on the large side to drop non-matching rows *before* the shuffle) row-encoded float keys **raw**. So a `-0.0` probe key was built/probed as different bytes from a `0.0` build key → reported "absent" → the probe row was **dropped**, losing a join match the equi-join (which folds `-0.0`/NaN) *would* have made. A silent distributed wrong answer. Now `key_rows` canonicalizes float key columns (`canon_float_array`) on both build and probe. | `crates/bc-py/src/bloom.rs` (`key_rows`) | `tests/integration/test_bloom_no_false_negatives.py::test_join_key_bloom_matches_signed_zero_and_nan` |
+| B254 | S1 | `remap_columns` — the column-renaming rewrite that pushes a predicate below a join — rebuilt an `AudioFunc` as `AudioFunc(fn, input)`, **dropping the `rate` scalar**: an `audio.resample(16000)` nested in a pushed-down predicate silently reset to the default rate (wrong-rate waveform). The parallel `transform_expr_up` rebuild already carried `rate`; only this arm dropped it. Now passes `expr.rate` through. | `python/batcher/plan/expr_ir/walk.py` | `tests/unit/test_remap_preserves_scalar_params.py` |
+
+**Not a bug — checked and cleared.** `referenced_columns(WindowExpr)` returns `set()` and
+`WindowExpr` is absent from the `transform_expr_up` child table — the "node treated as a leaf"
+shape — but a `WindowExpr` is hoisted into a relational `Window` node by `hoist_windows` at
+plan-**build** time (`api/dataset/_window.py`), leaving a `Col` behind, so it never survives to
+the optimizer's pruning/rewrite passes. The gap is latent, not reachable; no fix made (avoids a
+change in the concurrent window refactor's path).
+
+**Approx-vs-exact quantile (wave-22 map) left as a documented decision, not a fix:** the KLL /
+t-digest sketches drop NaN while exact `quantile` ranks it. That is a sketch-semantics choice
+(NaN has no meaningful approximate rank), not the same-column-two-meanings defect the others
+are; it stays flagged for an explicit decision rather than silently changed.
+
+### Wave 23 parallel sweep — `bc-sketches` robustness + Float16 identity (2026-07-17)
+
+Area-scoped hunt over `bc-sketches` (mergeable HLL / KLL / t-digest, whose blobs cross the
+shuffle/spill boundary and whose estimates feed Kyber's cardinality/cost model). All 103 crate
+tests green after; each entry reproduced by a test that fails without the fix.
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B255 | S2 | `KllSketch::from_bytes` / `TDigest::from_bytes` are documented to return `None` on malformed input, but pre-allocated a `Vec` sized from an **untrusted** length field before reading any values: a blob with a valid header and a huge `level_count`/`len` panicked with `capacity overflow` (or attempted a multi-TB allocation → allocator abort) instead of returning `None`. These blobs arrive from other processes on the shuffle/spill/persist path, so a corrupt or hostile blob **crashed the worker**. Now every reservation is capped by the bytes that can actually remain (`len.min(cursor.remaining()/stride)`), so an oversized length falls through to the existing short-read `None` path; valid blobs are unaffected. | `crates/bc-sketches/src/{kll,tdigest}.rs` | rust `from_bytes_rejects_absurd_{level_count,level_len,centroid_count}_without_panic` |
+| B256 | S1 | `HyperLogLog::add_array_fast` had `Float32`/`Float64` arms (both folding `-0.0`/`0.0` and every NaN via `canon_float_bits`) but **no `Float16` arm**, so a half-precision column fell through to the `RowConverter` fallback, which does *not* fold signed zero. A `Float16` column `{-0.0, 0.0, NaN, NaN', 1.5}` estimated **4** distinct values where the exact `DISTINCT`/`GROUP BY` path (and the sibling KLL, which casts `Float16`→`f64`) yield **3** — inflating the optimizer's ndv/cardinality estimate for any `Float16` column. Now `Float16` canonicalizes identically to the wider floats. | `crates/bc-sketches/src/hll.rs` | rust `add_array_folds_signed_zero_and_nan_for_float16` |
+
+Area-scoped hunt over `bc-expr` cast/binary/map (the scalar oracle):
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B257 | S1 | `coerce_numeric` widened `Utf8↔Binary` and `LargeUtf8↔LargeBinary` for the comparison kernels, but had **no arm for two string (or two binary) types of differing offset width**. Every SQL string literal is `Utf8`, so `largeutf8_col = 'x'` raised `Invalid comparison operation: LargeUtf8 == Utf8` on a reachable path (the kernels demand identical types) where DuckDB treats all of these as one `VARCHAR`/`BLOB` domain and compares them. Same for `Binary` vs `LargeBinary`. Now widens the narrower side to the wider (`Utf8→LargeUtf8`, `Binary→LargeBinary` — a lossless `i32→i64` offset widening). | `crates/bc-expr/src/eval/binary.rs` (`coerce_numeric`) | rust `mixed_width_string_and_binary_columns_compare` + `tests/differential/test_diff_large_utf8_boundary.py::test_large_utf8_column_compared_to_string_literal` |
+
+**Unverified suspicions carried forward** (reported by the sweeps, not reproduced, left for a
+later wave): a t-digest `merge` that may leave `self.buffer` unflushed (self-heals on every read
+path — no demonstrated double-count); a KLL `compress` that can leave a lower level briefly
+over-capacity (weights still sum to `n` — a shape nit, not a wrong quantile); `align_decimals_for_cmp`
+clamping common precision to 38 (a pathological `Decimal128(38,0)` vs `(10,5)` pair *might*
+spuriously error, no reachable input found); and `coerce_numeric` still lacking an `Int64` vs
+`Decimal256` / mixed-decimal-width arm (plausibly unreachable given FFI normalization).
+
+Area-scoped hunt over `bc-io` (native Parquet reader + predicate pushdown):
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B258 | **S1** | **Unsigned-integer predicate pushdown silently dropped matching rows.** A Parquet `UInt32` column stores its footer min/max in a *signed* `INT32` physical slot computed by *unsigned* order, so a max of `3_000_000_000` reads back as `-1_294_967_296`. `cmp_survives` took that stat as a signed `i64`, so `WHERE u >= 2000000000` evaluated `max(-1.29e9) >= 2e9` → false → **the whole row-group was pruned and the matching row silently dropped** (0 rows where 2 were correct) — a violation of the superset-safe pruning contract. Same for `UInt64` values above `i64::MAX`. Now `col_stats` reports the unsigned logical type (`LogicalType::Integer{is_signed:false}`, `ConvertedType::UINT_*` fallback) and the integer arms reinterpret the physical bits as unsigned and compare in `i128` (both the full unsigned range and a signed `i64` literal fit losslessly); signed columns unchanged. | `crates/bc-io/src/predicate.rs` (`cmp_survives`, `col_stats`) | rust `unsigned_column_predicate_does_not_drop_matching_rows` |
+
+Area-scoped hunt over the Python `io/` split (distributed-read) paths — both entries are the
+recurring **split path diverges from the whole-source path** signature, invisible to whole-source
+round-trip tests:
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B259 | S1 | **NDJSON byte-range splits inferred schema per-range.** `JSONSource.splits(target_size=…)` fanned a file into byte ranges, each parsed by `pyarrow.json.read_json` with an **independently inferred** schema. A file whose early rows have integer `{"v":N}` and later rows `{"v":N.5}` has whole-file schema `double`, but a range covering only the integer rows parsed `v` as `int64` → `Table.from_batches` raised `Schema … was different: int64 vs double`, and a field present in only some rows vanished from the ranges lacking it. (The sibling `CSVRangeSplit` already pinned `column_types`; NDJSON was the one text-range format that didn't.) Now every range read pins `ParseOptions(explicit_schema=self.schema(), unexpected_field_behavior="ignore")`. | `python/batcher/io/splits/file.py` (`LineRangeSplit._table`) | `tests/io/test_io_hunt10_range_split_partition_decode.py::{test_json_range_splits_share_the_file_schema,test_json_range_split_missing_field_keeps_null_column}` |
+| B260 | **S1** | **Hive partition values not URL-decoded on the distributed split path.** `PartitionDirSplit` recovered a partition value from the raw `col=val` directory basename but never URL-decoded it, while the single-node `pyarrow.dataset`-backed `read()` does. The writer URL-encodes (`quote(v, safe="")`), so partition values `["x/y","a=b","hello world","p%q"]` came back as `["x%2Fy","a%3Db","hello%20world","p%25q"]` from `splits()` but correctly decoded from `read()` — **the distributed read produced different data than the single-node read of the same directory** (invariant: single-node == distributed). Now `unquote`s before typing (the `__HIVE_DEFAULT_PARTITION__`→None sentinel still short-circuits first). | `python/batcher/io/formats/structured/parquet/dataset.py` (`PartitionDirSplit._typed_value`) | `tests/io/test_io_hunt10_range_split_partition_decode.py::test_partition_dir_splits_url_decode_like_the_dataset_read` |
+
+Area-scoped hunt over the SQL front-end (`_sql/parser/`) — all vs DuckDB, no regression across
+the 644 existing SQL differential tests:
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B261 | S1 | `date_diff('week', a, b)` returned a **fraction** (`days/7` as float) where DuckDB returns whole weeks as an integer truncated toward zero: `date_diff('week', DATE '2021-06-15', DATE '2021-06-20')` (5 days) gave `0.714…` instead of `0`, and negatives floored instead of truncating. Now `Cast((days/7).trunc(), "int64")`. | `python/batcher/_sql/parser/scalar_funcs.py` (`_date_diff`) | `tests/differential/test_diff_sql_bug_hunt2.py::test_date_diff_week_is_truncated_integer` |
+| B262 | S1 | SQL `//` integer division **floored and returned a float**: `-7 // 3` gave `-3.0` where DuckDB truncates toward zero → `-2`. Wrong for every negative-with-remainder case. Now `(a/b).trunc()` (same float pathway, correct truncation direction). | `python/batcher/_sql/parser/literals.py` (`_build_binops`, `exp.IntDiv`) | `tests/differential/test_diff_sql_bug_hunt2.py::test_integer_division_truncates_toward_zero` |
+| B263 | S2 | `x IS TRUE` / `IS FALSE` / `IS NOT TRUE` / `IS NOT FALSE` raised `NotImplementedError: unsupported SQL expression: Is` on valid SQL — only `IS NULL` was handled. Now `exp.Is` with a `Boolean` RHS builds the total three-valued test (`coalesce(inner, False)` for `IS TRUE`, `coalesce(~inner, False)` for `IS FALSE`; the `IS NOT …` forms route through the existing `Not` branch). | `python/batcher/_sql/parser/scalar.py` (`_scalar`) | `tests/differential/test_diff_sql_bug_hunt2.py::{test_is_true_false_projection,test_is_true_false_in_where}` |
+
+**Clean audits (no bug — recorded so the surface isn't re-swept blindly):** `bc-resource` (memory
+accounting: reserve/release/shrink/cooperative-spill all balance, no under/overflow), `bc-udf`
+(`Rebatcher` row-preservation, PID `BatchSizeController` convergence, `FnOperator` schema
+enforcement), and the `bc-ir` JSON wire contract (every `op` tag / field / enum value — incl. the
+new `forward_fill`/`backward_fill` and `children()`/`node_count()`/`contains_media_decode()` —
+matches Python `to_ir()`) were each read in full and probed at their edges; all correct. Also
+clean on manual/DuckDB probing this session: `bc-codegen` int div/mod fallback gating, `governance`
+masks (`Nullify`'s `nullif(x,x)` correctly nulls NaN post-B26), `bc-transport` credit accounting,
+`iff`/`nanvl` literal semantics, and every `dt` accessor (`isodow`/`week`/`isoyear`/`is_leap_year`/…
+match DuckDB and the calendar over ISO and century-leap boundaries). And a full **seq==par**
+differential sweep over `bc-interp/src/ops/` (distinct incl. the dense/float fast paths, `union
+distinct`, limit+offset, top-N boundary ties, `sample` fractional & fixed-n partition-independence,
+all six `HashJoin` types with NULL keys + duplicates, `unpivot`, sliced-`List`/`FixedSizeList`
+unnest) — every operator agreed. The `ml` tensor/loader path is also verified beyond B265 below:
+`_column_to_numpy` fixed-size-list null alignment across sliced/chunked/empty arrays, the
+fixed-shape-tensor extension path, the Feistel `streaming_sampler` bijection for non-power-of-two
+`n`, and worker striding (`elastic_shard`/`rank_index_batches` give identical batches — no dropped
+or duplicated training rows).
+
+### Wave 23 parallel sweep — `ml` tensor/loader layer
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B265 | S2 | **`to_tf_dataset` crashed on every multi-dimensional column.** The generator's TF `output_signature` pinned *every* column to `tf.TensorSpec(shape=(None,))` (rank-1) regardless of real rank, so any non-scalar-per-row column — exactly what the loader exists to serve — failed at iteration with `InvalidArgumentError: generator yielded an element of shape (2,3) where an element of shape (None,) was expected`: a `FixedSizeList<f64,3>` embedding → `(n,3)` crash, a fixed-shape-tensor image → `(n,H,W,C)` crash. Now each spec is `shape=(None, *arr.shape[1:])` (dynamic batch axis, fixed inner axes); a genuinely 1-D column keeps `(None,)`, so the fix is backward-compatible. (The path had zero coverage because TensorFlow was absent from the test env.) | `python/batcher/ml/converters.py` (`to_tf_dataset`) | `tests/integration/test_ml_converters.py::{test_to_tf_dataset_feature_column_keeps_inner_shape,test_to_tf_dataset_image_tensor_column_keeps_shape,test_to_tf_dataset_plain_numeric_unchanged}` |
+
+**Semantic-decision item surfaced (not a fix — DuckDB vs Polars contract):** `unpivot` **keeps** rows
+whose melted value is NULL (arrow `concat` preserves them), matching pandas `melt` / Polars `unpivot`
+and the public docstring ("SQL `UNPIVOT` / pandas `melt` / Polars `unpivot`"); DuckDB's default
+`UNPIVOT` **drops** them (`(1,a,10),(1,b,NULL),(2,a,NULL),(2,b,20)` → DuckDB emits 2 rows, Batcher 4).
+The existing differential test uses only non-null data, so intent is unpinned. Resolving it wants an
+`include_nulls` flag on the `Unpivot` IR node + planner support — a cross-layer decision, flagged for
+a maintainer rather than silently changed. `crates/bc-interp/src/ops/reshape.rs` (`unpivot_batch`).
+
+### Wave 23 parallel sweep — Kyber optimizer (result-preservation)
+
+Adversarial opt==unopt + vs-DuckDB sweep across the rule families (pushdown/pull-up, boolean &
+three-valued simplification, constant folding, IN-list refinement, transitive inference, join
+elimination, union/limit/distinct, outer-join strengthening, window/sort pushdown). The
+always-firing rules held; one latent unsoundness in the aggregate-through-join family.
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B264 | S1 | **Non-idempotent aggregate-through-join pushdown drops a LEFT-join `COUNT`'s zero.** For the TPC-H Q13 shape (`customer LEFT JOIN orders GROUP BY nation, COUNT(o.okey)`) the rule lowers the LEFT-join `COUNT` to `SUM(coalesce(__pm, 0))` — the `coalesce` maps a fully-unmatched group's NULL partial to `0`. But the rewrite is **not idempotent**: on a second application the outer aggregate is already a `SUM` (not `COUNT`), so `coalesce` is not re-added and a fully-unmatched group flips `0 → NULL`. The sibling additive rules instead built an invalid join output (duplicate `__pre_0`/`__eag_0` → `PlanError`) or looped to the fixpoint cap. Correctness rested entirely on the cost gate (`_reduces_enough`) declining the second push — *a cost **estimate**, not a soundness property* (the "a green gate is not a green light" failure mode). Fixed with a structural idempotency guard `_already_grouped_by` in all three rules, so idempotency no longer depends on the cost model; the production single-fire path (measure side is a raw scan) is unchanged. | `python/batcher/kyber/rules/agg_pushdown.py` (`pre_aggregate_join_measures`, `eager_aggregation`, `pre_aggregation_through_join`) | `tests/unit/test_agg_pushdown_idempotent.py::{test_pre_aggregate_join_measures_idempotent,…}` + `tests/differential/test_diff_agg_pushdown_leftjoin_count.py::test_left_join_count_fully_unmatched_group` |
+
+**Companion doc-defect fix (no B-number — a comment, not test-pinnable):** `kyber/rules/normalize/simplify.py`
+asserted "the engine's boolean ops are **non-Kleene**" — the exact opposite of the truth
+(`and_kleene`/`or_kleene` in `crates/bc-expr/src/eval/binary.rs`) and a direct contradiction of its
+sibling `rules/extra/boolean_algebra.py` ("proven under the engine's three-valued (Kleene) logic"),
+which safely applies the `false`/`true` annihilators. The wrong note was a trap — it invited a
+maintainer to "fix" the correct Kleene annihilators. Corrected to state the ops are Kleene and point
+to where annihilators live. (Also carried forward unfixed: `dedup_in_list` uses `dict.fromkeys`,
+which would collapse `1`/`1.0`/`True` — latent, but `InList` is homogeneously typed so no divergence
+was reproducible.)
+
+**Flagged robustness item (not fixed — design decision, like [[B89]]/[[B90]]):** `RelOp::from_json`
+(`crates/bc-ir/src/lib.rs`) deliberately calls `de.disable_recursion_limit()` so deep plans parse,
+and `node_count()`/`contains_media_decode()` recurse unbounded too. A plan deeper than the native
+stack (measured: depth-1000 is fine on an 8 MB main/FFI stack but **stack-overflows / SIGABRTs** on
+a 2 MB rayon-worker stack) crashes uncatchably where it previously returned a graceful `Err`. In
+practice the parse runs at the FFI boundary (large stack), so the risk is latent; a proper fix is a
+bounded depth check in `bc-py`/`bc-interp` (where the thread + stack are chosen), not a revert of
+the deep-plan feature. Recorded for a deliberate decision rather than a drive-by change.
+
+### Wave 23 parallel sweep — SQL window-frame translation (depth pass)
+
+A deeper SQL sweep (subqueries, CTEs, correlated queries, window framing). B90 (SQL
+`last_value`/`nth_value` running frame) was found **already fixed** in-tree and covered by
+`test_diff_sqlwin_value_frame.py`. Two *new* silent wrong-answer bugs in frame translation:
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B266 | S1 | **A single-bound window frame was treated as `UNBOUNDED FOLLOWING` instead of `CURRENT ROW`.** `ROWS N PRECEDING` (no `BETWEEN`) is SQL shorthand for `ROWS BETWEEN N PRECEDING AND CURRENT ROW`, but sqlglot leaves the end bound unset and the translator mapped unset-end → `None` = UNBOUNDED FOLLOWING. So `sum(v) OVER (ORDER BY i ROWS 2 PRECEDING)` over `[10,20,30,40,50]` gave `[150,150,150,140,120]` (summed the whole tail) vs DuckDB `[10,30,60,90,120]`. Now a frame with a start but no end defaults the end to CURRENT ROW (offset 0). | `python/batcher/_sql/parser/windowing.py` (`_window_frame`) | `tests/differential/test_diff_sql_window_frame.py::{test_window_single_bound_frame_defaults_to_current_row,test_named_window_single_bound_frame}` + `test_diff_sqlwin_value_frame.py::test_value_single_bound_frame` |
+| B267 | S1 | **A named window (`WINDOW w AS (…)`) silently dropped its frame.** `_inline_named_windows` copied `PARTITION BY` and `ORDER BY` onto each `OVER w` reference but **not the frame `spec`**, so `sum(x) OVER w` with `w AS (ORDER BY t ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)` fell back to the default running frame — `[10,30,60,100,150]` (cumulative) vs DuckDB's trailing-2 `[10,30,50,70,90]`. Now the inliner also copies `spec` when the reference has none. | `python/batcher/_sql/parser/windowing.py` (`_inline_named_windows`) | `tests/differential/test_diff_sql_window_frame.py::test_named_window_carries_its_frame` |
+
+**Clean/robust (SQL depth):** three-valued `NOT IN`/`IN` with NULLs (literal-list & subquery),
+correlated `EXISTS`/`NOT EXISTS`/scalar subqueries with duplicate & NULL keys (decorrelation neither
+duplicates nor drops rows), CTEs (chained, multi-reference, +aggregation, UNION-in-CTE), `DISTINCT
+ON`, aliased `QUALIFY`, multiple window specs — all match DuckDB. Feature gaps that raise cleanly
+(not wrong answers, left as-is): `> ANY`/`ALL (subquery)`, `QUALIFY` on a non-selected window fn,
+correlated non-equi `IN`, and explicit `RANGE …` on value functions.
+
+**Clean audit — `bc-codegen` JIT parity (deep pass):** the load-bearing interpreter⇄JIT
+bit-for-bit invariant (#6) holds. No input found where the Cranelift JIT diverges from the
+`bc_expr` interpreter on an op `analyze` accepts — audited the freshly-rewritten float
+canonicalization (B26/B61: scalar + SIMD `canon_total_order_key` vs `canon_float_array`, over
+`±0.0`/every NaN sign+payload/inf at 2/4/8 lanes), `f64→i64` cast decline, `i64→f64` round-to-even
+above 2^53, int div/mod gating (`0`/`-1` excluded, `i64::MIN` allowed), `abs` saturation, CASE
+type-promotion + null-mask, Kleene AND/OR, and adversarial Date32/Timestamp `i32/i64::MIN/MAX`
+probes the main fuzzer's schema can't reach. Companion hygiene fix (not a numbered bug): the B26
+working-tree test `float_comparison_canonical_order_signed_zero_and_nan_signs` left `pnan2`
+(a differing-payload positive NaN) unused — a `-D warnings` gate-blocker — now exercised as a
+`pnan2` vs `pnan` pair (differing-payload NaNs fold equal), so the test both compiles clean and
+covers one more canonicalization case. `crates/bc-codegen/src/lib.rs`.
+
+### Wave 23 parallel sweep — distributed execution (single-node == distributed)
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B268 | **S1** | **Distributed `LIMIT` and `with_row_index` scrambled source row order.** For a splittable source with more splits than partitions (the everyday "more row-groups than workers" shape), `partition_descriptors` assigned splits with `_balance` (largest-first, for even load), so one partition held **non-adjacent** source splits (worker 0 = row-groups `[0, 4]`). Both dispatcher paths then assumed the partition-index-assembled concatenation reproduced source row order and sliced/numbered it on the driver — so `limit(1500)` returned ids `{0..999, 4000..4499}` instead of `{0..1499}` (a *different row set* than single-node), and `with_row_index` mis-numbered 6000 of 8000 rows. Fixed by adding `_contiguous()` (splits assigned as contiguous source-ordered runs) and a `preserve_order` flag threaded `_distributed_map` → `partition_descriptors`, set `True` only at the two order-sensitive call sites; load-balanced assignment is unchanged for every order-independent operator (aggregate/join/sort/distinct). | `python/batcher/dist/executor.py`, `dist/executors/map.py`, `dist/executors/partition_io/_sources.py` | `tests/integration/test_dist_hunt_limit_order.py` (5 cases; fail before / pass after — verified) |
+
+### Wave 23 parallel sweep — aggregate semantics (non-float, non-window)
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B269 | S2 | **`min`/`max` over a temporal column errored in the engine while the Parquet footer answered it** — the "a metadata shortcut answers what the engine cannot" anti-pattern (same shape as B23 for Booleans). `min(d)` over a `date32` (or `Timestamp`/`Time64`/`Duration`) column raised `RuntimeError: aggregate min is not supported for column type Date32`, while a Parquet scan of the same rows answered it from footer stats — and DuckDB returns the per-group min date. The metadata test had even routed *around* it (`d` kept out of `_ORDERABLE` but in `_FOOTER_ORDERABLE`, commented "executed only via the footer shortcut"). Fixed with a temporal arm + `temporal_minmax` helper in `minmax_acc`: compares on the cast-to-`i64` chronological order (monotonic; a tz-aware timestamp's `i64` is the UTC instant) but `take`s the winning rows from the *original* typed array so unit/timezone are preserved; null-skipping; the partial state is itself temporal so `merge_state` re-enters the arm (mergeable/associative). Routed-around gap closed (`d`/`b` added to `_ORDERABLE`). | `crates/bc-runtime/src/agg/accum.rs` (`minmax_acc`, `temporal_minmax`) | rust `agg::accum::tests::{temporal_minmax_over_date_and_timestamp,temporal_minmax_is_mergeable_across_partitions}` + `tests/differential/test_diff_agg_temporal_minmax.py` |
+
+**Clean/robust (aggregate depth):** `bit_and`/`bit_or`/`bit_xor` (negatives, i64 edges, nulls),
+`bool_and`/`bool_or`, `product`, `count`/`count_distinct`/`approx_count_distinct` (int & string),
+`sum`/`avg` over decimals, `array_agg`/`string_agg` (NULL keep/skip, custom/empty separators,
+all-null & empty groups) — all match DuckDB across single/distributed/spill, and `Dataset.schema`
+matched the engine's output dtype for every combination tested. Flagged (not fixed): `product` over
+`bool`/`string` returns `double` via a silent cast where DuckDB rejects (footgun on invalid input,
+not a wrong answer); `array_agg` element order isn't preserved across the distributed shuffle
+(DuckDB also leaves `array_agg` order unspecified without an in-aggregate `ORDER BY`); `sum(bigint)`
+errors on i64 overflow where DuckDB promotes to HUGEINT (documented-intentional).
+
+### Wave 23 parallel sweep — governance (policy enforcement / data disclosure)
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B270 | **S1 (security — raw PII leak)** | `SecurityCatalog.mask_for` returned early on an explicit `mask_column`, yielding `None` (**raw access**) whenever the principal was exempt from *that explicit mask* — even when the same column carried a sensitivity **tag** whose `mask_tag` the principal was **not** exempt from. So a narrow analyst-exemption on `ssn` silently disabled the broad `pii` tag mask, and the analyst read raw `ssn` end-to-end. This violated the same "being exempt from one policy must not grant raw access while another still masks it" contract already pinned for tag-vs-tag — it just wasn't enforced for explicit-vs-tag. Fixed so the explicit mask is returned only when it *applies* (principal not exempt); otherwise resolution **falls through** to any tag mask the principal is not also exempt from ("explicit wins" preserved for the non-exempt case; strictest applicable policy governs when exempt from the explicit one). | `python/batcher/governance/catalog.py` (`mask_for`) | `tests/unit/test_governance_hunt4_explicit_exempt.py` (4 cases incl. end-to-end: raw "alpha"/"bravo" never appear) |
+
+**Clean (governance depth):** `visible_columns` wildcard/multi-role union + deny-by-default,
+`_require_attr` / `AttributeIn([])` fail-closed (`lit(False)` → no rows), and the tag-vs-tag
+composition all hold. Flagged (not a leak): `mask_for` picks the alphabetically-first applicable
+tag mask, not a semantically "strictest" one — but the column is still masked (arbitrary `MaskFn`s
+have no orderable strictness), so it's a doc nuance, not a disclosure.
+
+### Wave 23 parallel sweep — IO schema evolution + accessor audit
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B271 | S2 | **Nested-type schema evolution crashed instead of merging losslessly.** The reconciliation lattice widens *flat* columns across files (`int32`→`int64`) but treated **any** nested-type difference as an irreconcilable conflict and raised `SchemaError` — even when a clean lossless common type exists — so a multi-file `schema_mode="union"` read crashed on routine evolution shapes DuckDB `union_by_name` reads fine: `list<int32>` vs `list<int64>` (→ `list<int64>`), `struct<a>` vs `struct<a,b>` (→ union, `b` null where absent), `struct<a:int32>` vs `struct<a:int64>` (→ inner widen). Fixed with a recursive `_common_supertype` that delegates scalars to the neutral `promote` lattice and extends structurally through `list`/`large_list`/`fixed_size_list`, `struct` (field-union first-seen, one-sided fields nullable), and `map`; genuine conflicts (int vs string, mismatched list kinds) still raise. | `python/batcher/io/schema/evolution.py` (`_promote`, `_common_supertype`) | `tests/io/test_io_hunt11_nested_schema_evolution.py` (5 cases incl. end-to-end vs DuckDB + a genuine-conflict-still-raises negative) |
+
+**Clean audit — expression accessors (`.str`/`.list`/`.struct`/`.json`/`.map`/`.dt`):** several hundred
+differential edge cases (unicode pad/trim, negative/out-of-range `substr`/`slice`/`split_part`/
+`list.get`, empty/regex-special `replace`, `overlay`, JSON nested/array/negative/huge-int/escaped
+paths, `map.get` narrow-int & large-utf8 keys, list set-ops/HOFs with nulls & floats, `offset_by`
+end-of-month, `convert_timezone` across DST, `strptime`/`strftime`) — no bug; the earlier waves'
+coverage holds. Documented **intentional** DuckDB divergences (match Polars/Python, not bugs):
+`.str.upper`/`lower` do full 1:many Unicode case mapping (`upper('ß')`→`'SS'`); `.str.to_datetime`
+and JSON `extract_*` are lenient (NULL where DuckDB raises); `.dt.offset_by` preserves `Date` type;
+`.str.zfill` is `lpad(s,w,'0')` (no sign-aware padding). **Unverified lattice gaps** (belong in
+`plan/types/lattice.py`, DuckDB unifies where Batcher raises): `timestamp[ms]` vs `[us]`,
+`dictionary<string>` vs `string`, `string` vs `large_string` — **now fixed as B272 below**.
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B272 | S2 | **Three lossless scalar unifications wrongly raised in multi-file schema evolution** (the flagged follow-ups to B271, confirmed vs DuckDB `union_by_name` which unifies all three): `string` vs `large_string` (same logical type, wider offsets → `large_string`), `dictionary<T>` vs `T` (dictionary is an *encoding* of `T`, not a distinct type → decode to `T` — the routine Parquet mix of dict and plain pages across files), and `timestamp[ms]` vs `timestamp[us]` (same instant type, different resolution → the finer unit). Each raised `SchemaError` where DuckDB reads fine. Fixed in the io-local `_common_supertype` (not the shared lattice, to avoid perturbing scalar promotion elsewhere): unwrap dictionaries and recurse, widen string/binary to the large variant, and widen a same-timezone timestamp to the finer unit — while a *differing* timezone stays a genuine conflict (raises). | `python/batcher/io/schema/evolution.py` (`_common_supertype`) | `tests/io/test_io_hunt11_nested_schema_evolution.py::{test_read_string_and_large_string_unify,test_read_dictionary_and_plain_string_unify,test_read_timestamp_unit_widens_to_finer}` |
+
+### Wave 23 parallel sweep — Carbonite spill (resource robustness)
+
+The spill **correctness** invariant (spilled == in-memory == DuckDB) was validated extensively
+and holds (GROUP BY on float/bool/string/decimal/timestamp/composite keys, all agg types, all join
+types, window, count-distinct, multi-key sort × every descending/nulls_first, recursive re-spill,
+all codecs, local + `memory://` remote tiers) — no wrong-result bug. One resource-accounting defect:
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B273 | S2 | **Remote-overflow spill budget ignored in-flight (still-open) bucket bytes.** A bucket's tier (LOCAL vs REMOTE-overflow) is chosen on its first write from `_local_used`, but `_local_used` only grew when a bucket **closed** — while the partition phase holds one writer **per bucket open simultaneously** and interleaves writes. So no still-open bucket ever saw the others' growth: 8 concurrently-open buckets with `local_budget_bytes=1` and a `remote_uri` set **all stayed LOCAL** and wrote 1.3 MB to local disk, never overflowing — defeating the documented "overflow to object storage before the local disk fills" guarantee, so on a small-scratch-disk node the query fills the disk and hard-fails instead of spilling remote. Fixed by tracking `_local_pending` (bytes streamed to still-open LOCAL writers, charged per `write()` via `batch.nbytes`, handed to `_local_used` on close with no double-count); the `_open` tier test now reads `_local_used + _local_pending`, so each newly-opened bucket sees prior in-flight bytes and overflows once the running total crosses the budget. Result-invariant (remote reads back identically). | `python/batcher/carbonite/spill.py` (`TieredSpillStore`, `_BucketWriter`) | `tests/unit/test_carbonite_spill_store.py::test_concurrent_open_writers_overflow_on_live_budget` |
+
+**Flagged (out of scope, not fixed):** `dist/spill.py::_reduce_agg_bucket` compares `SpillHandle.nbytes`
+(the *compressed* on-disk size) against an in-memory `spill_bucket_max_bytes`, so a highly-compressible
+over-large bucket can skip re-spill recursion and OOM `combine_finalize` — a robustness gap in `dist/`.
+
+### Wave 23 parallel sweep — SQL grouping / aggregation structure
+
+Four bugs in the GROUP BY / grouping-set surface, all vs DuckDB (18 differential cases; the full
+4202-test differential suite stays green).
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B274 | S1 | **`BOOL_AND`/`BOOL_OR` returned wrong values on all-null / empty groups.** They were AST-rewritten to `COUNT(*) FILTER (WHERE NOT x) = 0` / `COUNT(*) FILTER (WHERE x) > 0`, which cannot express SQL's "no non-null input → NULL": an all-NULL (or empty) group counts 0 filtered rows and answered `TRUE`/`FALSE` where DuckDB returns `NULL`. Fixed by deleting the `_bool_agg_to_filter` rewrite and mapping sqlglot `LogicalAnd`/`LogicalOr` to the native NULL-aware `bool_and`/`bool_or` aggregates (explicit `... FILTER (WHERE c)` still lowers via the existing `_filter_to_case`). | `python/batcher/_sql/parser/clauses.py`, `literals.py` | `tests/differential/test_diff_sql_grouping_struct.py::test_bool_and_or_null_semantics` |
+| B275 | S2 | **`GROUP BY ALL` did not group** — it collapsed to a grand total (grouped by nothing) and then raised `PlanError: projection 'region' references unknown column(s)`. Now, when sqlglot flags `all=True` with empty group expressions, the keys expand to every non-aggregate, non-window SELECT item (DuckDB/Postgres semantics). | `python/batcher/_sql/parser/grouping.py` (`_aggregate`) | `tests/differential/test_diff_sql_grouping_struct.py::test_group_by_all` |
+| B276 | S2 | **`GROUPING_ID(...)` raised `NotImplementedError`** — it is the bit-vector spelling of `GROUPING` (identical in DuckDB) but only `exp.Grouping` was collected. Now `find_all(exp.Grouping, exp.GroupingId)` at both the per-grouping-level and plain-GROUP-BY sites. | `python/batcher/_sql/parser/grouping.py` | `tests/differential/test_diff_sql_grouping_struct.py::test_grouping_id` |
+| B277 | S3 | **Duplicate GROUP BY keys errored** (`GROUP BY region, region` or `GROUP BY 1, region` → `PlanError: duplicate output column`), where DuckDB accepts and groups once. Now dedups repeated bare-column keys by name and derived-expression keys by SQL text. | `python/batcher/_sql/parser/grouping.py` (`_aggregate`) | `tests/differential/test_diff_sql_grouping_struct.py::test_duplicate_group_keys` |
+
+Gaps (clean `NotImplementedError`, by design): `SUM`/`AVG`/`array_agg`/`string_agg(DISTINCT …)`,
+`ORDER BY` inside `array_agg`/`string_agg`, and `EVERY`/`SOME` (parse to `Anonymous`, unwired).
+
+### Wave 23 parallel sweep — adaptive / metadata (the "moat")
+
+Adaptive on-vs-off equivalence (multi-join/filter/group-by/sort/limit/distinct/window/union with
+NULLs/dupes/empties) and the learned-stats poisoning gates (B33 class — ndv-from-partial-scan
+guarded by `saw_whole`) were fuzzed and **hold**. One optimizer rule produced a wrong result:
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B278 | **S1** | **A Kyber rule folded `MAX(float)` to a NaN-dropping footer constant.** The Parquet spec and the KLL sketch **omit NaN from min/max statistics**, so a float column `[nan, -3.0]` records `min == max == -3.0` in its footer. `_constant_value` trusted that footer equality and reported the column as a proven constant `-3.0`, so `min_max_of_constant_column` folded `max(c)` → `Lit(-3.0)` — but DuckDB, and Batcher's own `MAX` kernel and `ORDER BY c DESC`, all return `nan` (SQL ranks NaN greatest). An optimizer rule thus produced a result disagreeing with the engine itself, on global, grouped, and `.max()` paths (`min(c)` was safe — a dropped NaN is never the minimum). Root cause: `_constant_value` guarded only signed-zero float bounds and missed the hidden-NaN case, drifting out of sync with its sibling `global_min_max_from_exact_bounds` which already refuses **all** floats. Fixed by refusing all floats in `_constant_value` (integer/temporal/string constant folding unchanged; a NaN-aware in-memory source records the NaN so `min != max` and never mis-folds). It slipped past the existing metadata==execution test because that test's float column contains `-0.0`, which tripped the *signed-zero* guard and masked the missing NaN guard. | `python/batcher/kyber/rules/extra/agg_rules.py` (`_constant_value`) | `tests/differential/test_diff_agg_rules.py::{test_grouped_max_of_nan_hidden_constant_float_not_folded,test_global_max_of_nan_hidden_constant_float_not_folded}` |
+
+Latent (not fixed): `answer_learned_quantile` reads a bare column key against a now source-qualified
+store, so it's effectively dead (always falls back to streaming) — perf-only, not a wrong answer.
+
+### Wave 23 follow-up — spill recursion budget (compressed vs resident size)
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B279 | S2 | **The out-of-core aggregate's grace-recursion budget compared the *compressed* on-disk bucket size against an *in-memory* budget** (the item flagged under B273). `_reduce_agg_bucket` decides whether to re-partition an over-large bucket via `handle.nbytes <= spill_bucket_max_bytes`, but `SpillHandle.nbytes` is the compressed file size while reading the bucket back **decompresses** it into RAM. A highly-compressible bucket (many repeated group keys/values — exactly the skew that produces an over-large bucket) could sit far under budget on disk yet not fit in memory, skipping re-spill recursion and **OOMing `combine_finalize`** — the very failure the recursion exists to prevent. Fixed by carrying the uncompressed size onto the handle: the writer already tracks it (`_pending_bytes` via `batch.nbytes`, used for B273's overflow accounting) but discarded it on close; now `SpillHandle.logical_nbytes` captures it (before the LOCAL branch zeroes the pending estimate) and the recursion check budgets against `logical_nbytes`. | `python/batcher/carbonite/spill.py` (`SpillHandle`, `_BucketWriter.close`), `python/batcher/dist/spill.py` (`_reduce_agg_bucket`) | `tests/unit/test_carbonite_spill_store.py::{test_spill_handle_reports_uncompressed_logical_size,test_spill_handle_logical_size_accumulates_across_batches}` |
+
+### Wave 23 parallel sweep — UDF / map_batches streaming
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B280 | S2 | **The streaming `map_batches` path crashed on UDF schema drift while the materializing path handled it** — violating its own "the result is identical to the staged materialization" contract. A linear `Scan → map_batches → …` chain with a `num_gpus > 0` stage routes through `stream_linear_chain`; when a UDF's output schema **drifts across batches** (the documented "LLM structured outputs with varying fields" case — a column added on only some batches), the streaming branch yielded the differently-shaped batches straight to `pa.Table.from_batches`, which derives the schema from `batches[0]` and raised `ArrowInvalid: Schema at index 1 was different`. The identical pipeline on the materializing path (`num_gpus=0`) succeeded because `_execute_node` wraps each stage in `reconcile_batches` (missing columns → typed nulls) — the streaming branch simply returned `list(stream_linear_chain(...))` unreconciled. Fixed by wrapping the streamed output in the already-imported `reconcile_batches` (no extra buffering — the chain output is already listed). | `python/batcher/core/udf/execute.py` (`execute_with_udfs`) | `tests/integration/test_map_batches.py::test_stream_path_reconciles_schema_drift_matches_materializing` |
+
+Flagged (not a correctness bug, not fixed): on the streaming path `batch_size` is a *max* not an exact
+size (`_apply_udf_stream` splits oversized batches but never merges undersized ones, unlike the
+materializing `_rechunk`), so a UDF requiring exact-size batches would see different batching between
+the two paths — harmless for the common row-independent UDF.
+
+### Wave 23 parallel sweep — streaming complete/update mode to a path sink
+
+Extensive single-node streaming audit (streaming==batch across filter/aggregate/distinct/limit/
+top-N, event-time windows, out-of-order+lateness, checkpoint state round-trip, and exactly-once
+across a restart) confirmed **correct**. One silent `streaming != batch` defect:
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B281 | **S1** | **A `complete`/`update`-mode streaming aggregate written to a file/Delta *path* sink silently duplicated the running result across micro-batches.** In `complete` mode the aggregate re-emits its full running result each micro-batch (the sink is meant to replace/upsert — `MemoryStreamSink` does, via `_replace`), but `FileStreamSink`/`DeltaStreamSink` are append-only, so each micro-batch's running snapshot became another `part-batch*` file: readback gave `[('a',1),('a',4),('a',10),('b',2),('b',2),('b',7),('c',4),('c',4)]` where the batch/`collect` result is `[('a',10),('b',7),('c',4)]` — a silent wrong answer through a fully-documented public API. Fixed by rejecting `output_mode` in {`complete`,`update`} for a path sink at query construction (Spark's rule: file sinks support append only), before both the single-node and distributed drain branches — turning silent wrong data into a fail-fast `PlanError` that points to `output_mode='append'`, a memory sink, or `foreach_batch` for a custom upsert. | `python/batcher/api/io_namespace/writer.py` (the streaming-write branch) | `tests/integration/test_streaming_query.py::test_complete_or_update_to_path_sink_is_rejected` (complete + update) |
+
+Flagged (unverified, event-time timing): `_emit_finalize` (`core/streaming_query.py`) flushes still-open
+windows on a user `stop()` of a *continuous* windowed-append query without checkpoint-committing them,
+so a stop-then-restart could re-emit them — ambiguous vs. the correct `available_now`/`once` drain
+behavior, so not changed on a guess.
+
+### Wave 23 parallel sweep — lakehouse / Delta
+
+Broad lakehouse audit (overwrite/append/replace_where, count/version consistency, partition
+round-trips incl. special chars, EXACT stats provenance, multi-shard distributed commit, file
+skipping — all confirmed **no rows lost**). One crash on a pushed predicate:
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B282 | S2 | **A pushed timestamp predicate crashed reads of a tz-aware Delta timestamp column.** A Delta `timestamp` is stored UTC-normalized, so an event-time column is almost always `timestamp[us, tz=UTC]`. When Kyber pushed `WHERE ts OP <ts-literal>` to the scan, the reader built a **tz-naive** `timestamp[us]` scalar and handed it to `dataset.to_batches(filter=…)` → pyarrow `ArrowInvalid: Cannot compare timestamp with timezone to timestamp without timezone` and the **read crashed** (single-node, distributed `read_fragment`, and — worst — the fused `count(*) WHERE ts …` path where the pushed predicate is the *only* filter, no engine re-check to fall back on). Fixed by making `to_pyarrow_expression` schema-aware: a temporal literal is rebuilt as the same instant in the column's own unit+timezone (tz-aware column → UTC-aware scalar; naive → unchanged), threading the Delta schema through `DeltaSource._pa_filter`/`read_fragment`; every non-Delta caller passes `schema=None` and is byte-identical. | `python/batcher/io/predicate.py` (`_pa_literal`/`to_pyarrow_expression`), `io/formats/lakehouse/delta/source.py` | `tests/io/test_delta_tz_timestamp_pushdown.py::{test_pushed_predicate_on_utc_timestamp_column,test_pushed_predicate_on_utc_timestamp_split}` |
+
+Flagged broader issue (same tz class, deeper layers — see B283 next): a full non-count
+`read.delta(...).filter(col("t") > lit(naive_dt)).collect()` also fails in `plan/expr_ir/core.py`
+(naive vs aware datetime subtraction) and the Rust comparison kernel (`Timestamp(us,UTC) > Timestamp(us,None)`).
+Flagged: `DeltaMaintenance.vacuum` truncates fractional `retention_hours` (low impact); deletion-vector
+polarity unverifiable (delta-rs 1.6.2 `delete()` is copy-on-write, no DV produced in this env).
+
+### Wave 23 follow-up — tz-aware timestamp comparison (the deeper layer of B282)
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B283 | **S2** | **Comparing a tz-aware timestamp column to a tz-naive datetime literal crashed the engine** — `col("ts") > lit(datetime(...))` where `ts` is `timestamp[us, "UTC"]` (Delta / event-time columns, and any `pa.timestamp(unit, tz)` input). Two faults compounded: (1) `coerce_numeric` had **no arm** for two timestamps differing in timezone, so the comparison kernel raised `Invalid comparison operation: Timestamp(us, Some(...)) > Timestamp(us, None)`; and (2) the arrow build lacked the **`chrono-tz`** feature, so a *named* zone (`"UTC"`, which is exactly what pyarrow/Delta produce) could not be parsed at all — `Invalid timezone "UTC": only offset based timezones supported`, crashing even a plain `collect()` of such a column and any tz-touching op. Fixed by (1) coercing a tz-aware↔naive timestamp comparison by **stripping the zone** (cast the aware side to `Timestamp(unit, None)`) and comparing the raw UTC instants — the naive literal read as that same UTC instant, matching DuckDB's `TIMESTAMPTZ` vs naive-`TIMESTAMP` rule (verified across `UTC`/`+00:00`/`America/New_York` × 6 operators); and (2) enabling arrow's `chrono-tz` feature so named IANA zones are supported engine-wide (all 595 bc-{expr,runtime,interp} unit tests + 53 date/datetime differential tests stay green). Completes B282's io-layer fix (which handled only the pushdown path). | `crates/bc-expr/src/eval/binary.rs` (`coerce_numeric`), `Cargo.toml` (arrow `chrono-tz` feature) | rust `tz_aware_timestamp_column_vs_naive_literal_compares` + `tests/differential/test_diff_tz_timestamp_compare.py` (19 cases) |
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B284 | S2 | **A tz-aware datetime *literal* crashed the IR lowering** (the sibling of B283 on the literal side). `Lit.to_ir` computed epoch micros as `v - datetime(1970, 1, 1)` — a **naive** epoch — so a tz-aware `lit(datetime(..., tzinfo=UTC))` raised Python's `TypeError: can't subtract offset-naive and offset-aware datetimes`, crashing `col("ts") > lit(aware_dt)` for both a tz-aware and a tz-naive column *before the plan even reached the engine*. Fixed by subtracting a *matching* epoch — a UTC-aware `datetime(1970,1,1, tzinfo=utc)` for an aware literal — so the micros land on the true UTC instant (then lowered as a naive `Timestamp(us)` literal that B283's coercion compares correctly against a tz-aware column). Verified vs DuckDB for aware-column-vs-aware-literal and naive-column-vs-aware-literal. | `python/batcher/plan/expr_ir/core.py` (`Lit.to_ir` datetime branch) | `tests/differential/test_diff_tz_timestamp_compare.py::test_tz_aware_column_vs_aware_literal_matches_duckdb` |
+
+### Wave 23 parallel sweep — SQL scalar functions + expr-walk completeness + date arithmetic
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B285 | S2 | **`lpad`/`rpad` crashed on a negative pad width** (`SELECT lpad('hi', -1, '*')`) — a negative width parses as a `Neg` node, and `int(node.this)` raised `TypeError: int() argument must be ... not 'Literal'`. DuckDB clamps a non-positive width to `''` (and the engine's `.lpad`/`.rpad` already do). Fixed to extract via `_int_literal` (sign-folding), matching the sibling `Substring`/`Repeat`/`Left`/`Right` handlers. | `python/batcher/_sql/parser/scalar_funcs.py` (`Pad`) | `tests/differential/test_diff_sql_scalar_pad.py::test_pad_width_edges` |
+| B286 | S1 | **`DATE - DATE` returned a `duration[s]` interval instead of the integer day count** (arrow's `sub` kernel default over two `Date32`). DuckDB returns integer `5` for `DATE '2023-05-15' - DATE '2023-05-10'`; Batcher returned `timedelta(days=5)` with the public schema lying `date32`. Fixed by special-casing `Date32 - Date32` in `eval_binary` to subtract the day ordinals to `Int64`, and the schema inference to report `int64`. | `crates/bc-expr/src/eval/binary.rs` (`date32_diff_days`), `python/batcher/plan/types/infer.py` | rust `date_minus_date_is_int64_day_count` + `tests/differential/test_diff_date_arithmetic.py` |
+| B287 | S2 | **`DATE ± <integer days>` crashed** (`Invalid date arithmetic operation: Date32 - Int64`) where DuckDB shifts the date (`DATE '2023-05-15' - 5` → `2023-05-10`). Arrow's `add`/`sub` reject `Date32 ± Int64`. Fixed by computing the shifted day ordinal directly (`Date32 ± Int64 → Date32`, and commutative `Int64 + Date32`), with the schema inference keeping the date type. (Batcher accepts an `Int64` day count where DuckDB requires `INTEGER` — all ints normalize to Int64 at the FFI boundary — but the value matches wherever DuckDB accepts the operation.) | `crates/bc-expr/src/eval/binary.rs` (`date32_offset_days`), `python/batcher/plan/types/infer.py` | rust `date_plus_minus_int_shifts_by_days` + `tests/differential/test_diff_date_arithmetic.py` |
+| B288 | S1 | **`Case` and `MakeStruct` were invisible to the aggregate-leaf splitter.** `contains_aggregate`/`split_aggregate_leaves` discover children via `child_fields()` (dataclass field metadata), but `Case` (`branches`/`otherwise`) and `MakeStruct` (`fields`) declare their Expr-bearing fields as plain annotations with a hand-written `to_ir`, so they were treated as childless **leaves**. An `AggExpr` inside a `CASE` or `struct(...)` was therefore invisible: `group_by().agg()` wrongly **rejected** a valid expression-over-aggregates (`PlanError`), or the un-hoisted aggregate leaf survived into the projection and **crashed** at `referenced_columns`/`to_ir`. Both `SELECT struct{…sum(x)…}` and `CASE WHEN sum(x) > k THEN … GROUP BY g` (valid DuckDB) were broken. Fixed with explicit `Case`/`MakeStruct` arms mirroring the other walkers. (Exhaustive cross-check of all 50 `Expr` subclasses against `referenced_columns`/`remap_columns`/`transform_expr_up` found no other omission.) | `python/batcher/plan/expr_ir/walk.py` (`contains_aggregate`, `split_aggregate_leaves`) | `tests/unit/test_agg_split_irregular_nodes.py` (6 cases) |
+
+### Wave 23 parallel sweep — metadata persistence
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B289 | S1 (latent) | **The learned-stats serializer dropped a column's per-field provenance sub-tags, inverting the exactness gate on reload.** A `ColumnStat` carries a bundle `provenance` plus `ndv_provenance` / `null_count_provenance` sub-tags — the mechanism that lets a *sketch* (HLL) distinct count ride beside *exact* min/max bounds (a Parquet footer's shape). `save_source_stats`/`load_source_stats` persisted only the bundle tag and **dropped both sub-tags** (and `mean`). So a column with `provenance=EXACT, ndv_provenance=SKETCH` (`ndv_is_exact=False`) came back with the sub-tag `None` → the gate fell back to the EXACT bundle tag → `ndv_is_exact` flipped **False→True**, meaning an approximate sketched distinct count would answer an exact `count_distinct`/`n_unique` with a **wrong number**; symmetrically an exact null count beside weak bounds was demoted to a rescan. Fixed by round-tripping `ndv_provenance`/`null_count_provenance` (by enum name, `None` when absent to preserve bundle-fallback) and `mean`. **Latent today** (the only current `save_source_stats` caller writes a SKETCH bundle provenance, so the flip isn't reached end-to-end yet) but a wrong-answer-in-waiting the moment a footer-style column is persisted — recorded like [[B24]] (caught before it shipped). | `python/batcher/metadata/source_stats_store.py` (`_encode_column`/`_decode_column`) | `tests/unit/test_source_stats_store_provenance.py` (3 cases) |
+
+Clean (config/_internal/metadata): env coercion (`int|None`/`float|None`/`bool|str` — B86 class stays
+fixed), Registry, hardware detection, native accessor, `MetadataHub` incremental views / keyed cache /
+`signed_appends` cursor, and profile precedence all reviewed sound. (Non-correctness losses in the same
+serializer — `bounds_include_nan`/`row_group_count` not persisted — are *conservative*: a reloaded source
+falls back to execution, never a wrong answer; left as-is.)
+
+### Wave 23 parallel sweep — CAST string<->int, float->string
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B290 | S1 | **`VARCHAR → <integer>` rejected any fractional or scientific string** — data loss on the safe-ingest path. DuckDB parses and rounds half-away (`'1.5'→2`, `'2.5'→3`, `'-2.5'→-3`, `'1e3'→1000`, `'12345.678'→12346`), but arrow's integer parser rejects a non-integer string, so strict `CAST` **errored** and `TRY_CAST` silently returned **NULL** on every one. Fixed with `parse_string_to_int`: exact integer parse first (keeps integers wider than 2^53 exact), then f64-parse-and-round-half-away for the rest, with arrow's range check; strict still errors and try NULLs a genuinely unparseable/out-of-range/non-finite value (`'abc'`, `''`, `'inf'`, `'1e19'`), matching DuckDB. | `crates/bc-expr/src/eval/cast.rs` (`parse_string_to_int`) | rust `string_to_int_tests::*` (4) + `tests/differential/test_diff_cast_string_int_float.py::test_string_to_int_parses_fractional_and_scientific` |
+| B291 | S3 | **`<float> → VARCHAR` rendered `NaN` and `-0.0`** where DuckDB renders `nan` and `0.0`. Fixed by intercepting float→Utf8 and normalizing exactly those two format-independent cases (arrow's shortest-round-trip string kept for every other value; nulls pass through). (`-0.0`→`0.0` matches DuckDB's *literal* path — DuckDB is internally inconsistent, keeping the sign for an arrow-scanned `-0.0` — so it is pinned directly, not via the ambiguous oracle. The remaining scientific-notation exponent-format divergence (`1e+20` vs `1e20`, and a different scientific threshold) needs a dedicated `%g` formatter and is left as a documented gap.) | `crates/bc-expr/src/eval/cast.rs` (`float_to_string`) | rust `float_to_string_tests::float_to_string_normalizes_nan_and_negative_zero` + `tests/differential/test_diff_cast_string_int_float.py` |
+
+### Wave 23 parallel sweep — shuffle / transport
+
+Hash partitioning (float canon applied, null routing co-partitions both join sides, deterministic
+dispatch), salted partitioning, bc-transport credit accounting (in-flight ≤ window, no dropped
+grants), and serialization round-trip (shm footer validation, zero-row symmetry, dict/nested/codecs)
+were all reviewed **sound**. One latent panic:
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B292 | S2 | **`range_partition_by_i64_key` / `range_partition_by_str_key` panic (task crash) when handed more boundaries than `n_buckets`** — `partition_point` returns an id up to `boundaries.len()`, which when `>= n_buckets` indexes `scatter_into_buckets`'s histogram out of bounds (`index out of bounds: the len is 4 but the index is 5`), killing the reducer/sort task. The f64 sibling `range_partition_by_key_array` was clamped for exactly this (B58); the i64 and string scatter variants — same contract, same `partition_point` routing, same `scatter_into_buckets` — never got the clamp. Fixed with the identical monotonic `b.min(n_buckets-1)` clamp (degrades to fewer non-empty buckets, every row preserved, equal keys still co-located). Latent today (the sample-sort caller passes exactly `parts-1` boundaries) but a crash the moment these `pub` fns are wired to the worker-sized-boundary path their f64 sibling already guards against. | `crates/bc-runtime/src/shuffle.rs` (`range_partition_by_{i64,str}_key`) | rust `shuffle::tests::range_{i64,str}_more_boundaries_than_buckets_does_not_panic` |
+
+**Flagged structural risk (not fixed — needs a design decision):** hash partitioning uses `ahash`
+with fixed seeds, scoped "within a process" by the code. `ahash` is not guaranteed identical across
+CPUs with vs without AES-NI, so a **heterogeneous** cluster could route equal keys to different
+reducers (join misses / split groups). Not reproducible on one host; a cross-node-deterministic hash
+(non-`ahash`) for the routing path would be the fix.
+
+### Wave 23 parallel sweep — Avro logical types
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B293 | S2 | **The Avro→Arrow schema mapper flattened every logical type and forced nullability — so `ds.schema` lied and the `fastavro` fallback crashed.** `_avro_schema_to_arrow` mapped Avro logical types (`date`, `time-millis/micros`, `timestamp-millis/micros`, `decimal`) to their underlying `int`/`long` and made every field nullable, while the actual native `arrow-avro` reader decodes proper Arrow logical types with correct nullability. So for any Avro file with a date/timestamp/decimal column (common): (1) `AvroSource.schema()`/`ds.schema` reported e.g. `int64` for a `timestamp[ms,tz]` column and `int32` for a `date32` — a lying public schema that can mislead the optimizer and users; and (2) the row-by-row `fastavro` fallback (taken when the native reader is unavailable or hits an unsupported feature) **crashed** with `ArrowInvalid: Could not convert datetime … to int64`. Fixed with `_AVRO_LOGICAL_TO_ARROW` (date/time/timestamp/local-timestamp), `decimal`→`pa.decimal128(precision, scale)`, and union-derived nullability; `schema()` now `.equals` the native-decoded schema and the fallback matches value-for-value. | `python/batcher/io/formats/structured/avro.py` (`_arrow_type`/`_avro_schema_to_arrow`) | `tests/io/test_io_hunt12_avro_logical_types.py` |
+
+Clean/flagged (io read): CSV embedded-newline / ORC / Arrow-IPC / JSON int64-overflow-to-double, null-vs-missing-key,
+nested widening all match pyarrow. Reported as a **sample-vs-scan design decision** (not forced): CSV `_read_schema`
+infers from the first ~1 MB block while `_read_file` reads the whole file, so a column whose type changes across the
+block boundary makes `schema()` disagree with `read()` and can crash / lose data on the range-split path — but full-file
+inference is deliberately avoided for perf and DuckDB samples similarly, so it wants a design call.
+
+### Wave 23 parallel sweep — ML serving conversion
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B294 | S2 | **Third instance of the B85 fixed-size-list→tensor bug — in the serving/predict path.** `serving/base._column_to_numpy` (the input conversion for `serving_udf`, the Triton/TorchServe/HTTP inference adapter) special-cased only the `FixedShapeTensor` extension type and fell through to `to_numpy(zero_copy_only=False)` for a numeric `FixedSizeList<T,W>` — yielding a `dtype=object` array of shape `(N,)` (per-row object arrays) instead of the promised `(N, W)` float matrix. A vectorized serving model (binary transport, `f @ W`, `.astype(float)`) then got wrong-shaped, wrong-dtype input and errored/misbehaved — while the training/loader path (`ml/converters`, `ml/loader/tensors`) converted the *same* column correctly. Fixed by delegating to the single correct `ml.converters._column_to_numpy` (null-safe offset slice → `(N,W)`, a null row → NaN never dropped), removing the near-duplicate helper (DRY). | `python/batcher/ml/serving/base.py` (`_column_to_numpy`) | `tests/unit/test_ml_hunt5_serving.py` (3 cases) |
+
+Clean (ML depth): `InferencePool`/`_DynamicBatcher` rebatching preserves rows+alignment across 200
+randomized configs and the OOM-retry split/concat; `batch_format` numpy/pandas/torch round-trips
+preserve rows/order; `loader` rank-index orderings are byte-identical across world size/padding/resume;
+`gpu` autocast is a correct CPU no-op; `llm/generate`+`embed` raise on length mismatch (never misalign).
+
+### Wave 23 parallel sweep — plan/logical IR + schema inference
+
+Every `RelOp` `to_ir()` tag/field was cross-checked against `bc_ir::RelOp` serde (`deny_unknown_fields`)
+and found consistent (Scan/Filter/Project/Aggregate/Sort/Limit/Distinct/Union/HashJoin/AsofJoin/Window/
+Unnest/RowId/Unpivot/Sample); schema inference was fuzzed (inferred vs `collect()`) across all
+aggregate/window/dt/str/list/struct/map expressions and set ops — clean. One schema lie:
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B295 | S3 | **`Dataset.schema` collapsed *every* column to `null` for a projection containing a list-accessor numeric reduction.** `_listfunc_type` returned `None` for `list.sum`/`mean`/`median`/`product`/`std`/`var`/`l2_norm`/`min`/`max`/`normalize`/`flatten`, so `available_schema()` returned `None` for the whole node and `Dataset.schema` fell back to a **zero-row execution** — which (see the flagged Rust root cause) collapses a zero-row projection's *entire* output schema to Arrow `null`, not just the reduced column but its plain passthrough neighbours too. So `with_columns(s=col("arr").list.sum()).schema` reported `arr: null, k: null, s: null` where the truth is `list<int64>, int64, double`. Fixed by inferring the reductions directly (verified vs real execution: `sum/mean/median/product/std/var/l2_norm`→Float64; `min/max`→element type incl. str/bool; `normalize`→List<Float64>; `flatten`→one list level unwrapped), so the broken fallback is never reached. | `python/batcher/plan/types/infer.py` (`_listfunc_type`, `_LIST_*`) | `tests/unit/test_available_schema.py::test_list_reduction_schema_is_inferred_not_null_collapsed` (9 reductions) |
+
+**Flagged Rust root cause (confirmed, deferred — needs a focused engine fix):** a zero-row (`Limit(_, 0)`)
+projection returns an **all-`Null`-typed schema for the whole relation** when it evaluates certain
+kernels — NOT list-specific: `decimal / decimal` over zero rows likewise returns `d:null, e:null, k:null,
+r:null` (true `decimal128(5,2), …, double`), while `col("k")+1` over zero rows is correct. The interpreter
+appears to emit no typed empty batch for those kernels, so the reconstructed empty-result schema
+degenerates to `Null` per column — poisoning any `limit(0)`-based schema probe (`_schema`'s documented
+fallback) for a genuinely-uninferable expression (decimal `div`, etc.). Location: the empty-input
+projection path in `bc-interp`/`bc-runtime`. B295 routes the common (list) case around it.
+
+### Wave 23 parallel sweep — Dataset API (iter_batches contract)
+
+The relational surface (joins inner/left/right/full/semi/anti + multi-key/null/suffix/self/cross,
+set ops incl. INTERSECT/EXCEPT ALL, pivot/unpivot/explode, group_by over expressions & aggregates,
+all window functions, sort null ordering) matched DuckDB/Polars. One contract violation:
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B296 | S3 | **`iter_batches(batch_size=N)` leaked short batches mid-stream, violating its exact-size contract.** The per-path chunkers used `batch.slice(off, N)` / `to_batches(max_chunksize=N)`, which chunk each engine batch/chunk *independently* rather than coalescing across boundaries — so `ds.sort("v").iter_batches(1000)` yielded `[1000, 1000, 651, 1000, 1000, 496, …]` (a short batch at every underlying-batch boundary) where the documented contract ("rebatch the output to this many rows"), the Rust `map_batches(batch_size=)` path, Ray Data, and Polars all yield exact `[1000, 1000, …, <remainder>]`. Row data/order were always correct — only batch granularity was wrong, which matters for fixed-size ML/GPU model batches (`to_torch_dataloader`). Fixed with a coalescing `_rebatch_exact()` delegated at the top of `_iter_batches` (runs the natural-batch path then coalesces once — correcting the streaming, materializing, and distributed sub-paths together), plus a `PlanError` guard for `batch_size < 1`. | `python/batcher/api/terminal/stream.py` (`_iter_batches`, `_rebatch_exact`) | `tests/integration/test_iter_batches_size.py` (4 cases) |
+
+Design differences (not bugs): `explode` of a null/empty list yields no rows (matches DuckDB `UNNEST`,
+differs from Polars); `union` requires identical column *order* (stricter than Polars `concat`, clear
+`PlanError`); a `right` join names the key after the left key (value correct).
+
+### Wave 23 parallel sweep — Kyber NORMALIZE phase (NaN float identity)
+
+OPT==UNOPT fuzzed across join elimination/reorder/semijoin/build-side, set-ops, conditional/string/
+temporal folding, and predicate/range inference (tens of thousands of cases each) — robust. The
+float/NaN corner of NORMALIZE yielded two result-changing bugs (the float-identity theme, in the optimizer):
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B297 | **S1** | **`or_to_in_and_range` dropped NaN rows.** For `filter(g == 0.0 OR g == NaN OR g == 2.0)` on a float column holding NaN, the rule adds `g >= min(vs) AND g <= max(vs)` as a sargable envelope — but the engine's `g = NaN` matches the NaN rows while `NaN >= lo` is FALSE, so they vanish (opt `[0.0, 2.0]` vs unopt/DuckDB `[0.0, nan, 2.0, nan]`). Worse, Python's `min([nan, …])` can return `nan`, making the bound `g >= NaN` — which drops **every** row (whole filter → empty). Fixed by refusing to derive a range bound when any disjunct value is NaN (the original `OR` still selects correctly). | `python/batcher/kyber/rules/normalize/ranges.py` (`_flat_or_equalities`/`_bad_range_literal`) | `tests/differential/test_diff_nan_fold_range.py::{test_or_to_in_range_keeps_nan_disjunct,test_or_to_in_range_leading_nan}` |
+| B298 | **S1** | **`constant_folding` folded a NaN comparison with Python semantics.** For `filter(f > -0.0 AND f == NaN)`, `constant_propagation` substitutes `f → NaN` into `f > -0.0`, then `constant_folding` evaluates `NaN > -0.0` with Python's operator (`False`), which `and_false_annihilator`/`filter_false_to_empty` collapse to an empty relation (opt `[]` vs unopt/DuckDB `[nan]`). But `bc-expr` ranks NaN as the **maximum** (`NaN > x` TRUE, `NaN == NaN` TRUE) — the opposite of Python — so the fold is not bit-identical to the engine. Fixed: `_comparable` returns False when either operand is NaN, leaving NaN comparisons for the engine (arithmetic untouched — NaN propagates identically). | `python/batcher/kyber/rules/normalize/fold.py` (`_comparable`/`_is_nan`) | `tests/differential/test_diff_nan_fold_range.py::test_constant_fold_nan_comparison_via_propagation` |
+
+**Clean audit — Rust join primitives (deep).** No bug found across hash / sort-merge / cache-radix
+(seq + parallel) / broadcast / asof / bloom, with build-side symmetry (`hash_join(L,R,t)` multiset ==
+`hash_join(R,L,swap(t))` for every join type) and the float-key canonicalization verified applied at
+every entry point. Two regression tests added (`join::hunt_tests::{two_col_radix_at_scale_matches_sort_merge,
+build_side_symmetry_all_join_types}`) — the two-`Int64` radix path at >65 K rows and build-side symmetry
+were previously only pinned on ≤8-row inputs. Flagged (not a wrong-multiset bug): the parallel-radix
+semi/anti path doesn't `restore_probe_order` like its sequential sibling, so a >1 M-row *broadcast*
+semi/anti emits rows in partition order — identical multiset, and broadcast output is already unordered.
+Absent features (not bugs): mark join, asof `nearest`/tolerance.
+
+### Wave 23 parallel sweep — adaptive re-optimization + UDF
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B299 | S2 | **`adaptive=True` crashed any `map_batches` + pipeline-breaker query that works with `adaptive=False`.** `_execute_adaptive` pre-optimizes the whole plan once via `kyber.optimize_logical`, whose rule driver calls `plan.to_ir()` — and `MapBatches.to_ir()` raises by design (a Python UDF is opaque to the engine IR). So `ds.map_batches(fn).join(other, on="k").collect(adaptive=True)` raised `NotImplementedError: map_batches is executed in Python, not lowered to the engine IR`, where `adaptive=False` returns the correct rows. `adaptive="auto"` masks it below 20M rows, but **at scale (auto turns adaptive on ≥20M input rows) this batch-inference-plus-join workload — a core target of the engine — crashes in production**. The non-adaptive path routes such a plan to `core.execute_with_udfs` (operator-by-operator, never lowering the whole plan), and the adaptive path's per-stage `_run_stage` already dispatches map-carrying stages to that same executor — only the upfront global `optimize_logical` was unguarded. Fixed by skipping the whole-plan optimize when `core.has_map_batches(plan)` (each relational stage is still optimized on its own by `run_relational`, so the result is identical — verified adaptive on==off for map→join, map→join→agg, map→agg→join, agg→map→join, and vs DuckDB). | `python/batcher/api/adaptive.py` (`_execute_adaptive`) | `tests/differential/test_diff_adaptive_map_batches.py` (5 cases) |
+
+Clean (adaptive/orchestration depth): adaptive on==off across joins/aggregates/sorts/limits/unions/
+distinct/multi-stage at scale (order preserved); metadata scalar shortcuts (`min/max/n_unique/null_count/
+has_nulls`) correctly decline over joins/filters/limits and match execution on signed-zero/NaN/bool/string/
+>2^53-int edges; `metadata_aggregate_table`/`metadata_count`/`is_empty` match DuckDB incl. `!=`/`NOT IN`
+null semantics; `iter_batches == collect` across all operators incl. outer/semi/anti + spill; ndv-learning
+never labels an HLL estimate EXACT. (Pre-existing, not introduced: `adaptive.py` is 596 lines, over the
+500 `lint-structure` limit and not allowlisted — a branch-level debt to split, untouched here.)
+
+### Wave 23 parallel sweep — window frames (i64 framed sum)
+
+| # | Sev | Defect | Where | Test |
+|---|-----|--------|-------|------|
+| B300 | S2 | **A framed `MIN`/`MAX` over i64 spuriously aborted with `SumOverflow`.** `framed_i64` accumulated the running window sum **unconditionally for every function** (`sum.checked_add(v).ok_or(SumOverflow)?`), but for a windowed `MIN(x)`/`MAX(x)` the sum is never read — so a frame whose in-frame values happen to sum past `i64::MAX` (e.g. `[2^62, 2^62, 2^62]` under `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`) crashed the whole query where DuckDB returns the minimum/maximum. The float path `framed_f64` already guarded this with a `need_sum` flag; the i64 path was the inconsistent one. Fixed by gating both the enter-loop `checked_add` and the leave-loop `sum -=` behind `need_sum = matches!(func, Sum | Avg)`; `MIN`/`MAX`/`AVG`/`SUM` values unchanged and a genuine `SUM` overflow still errors. | `crates/bc-runtime/src/window_frame.rs` (`framed_i64`) | rust `window_frame::tests::framed_i64_minmax_does_not_spuriously_overflow_on_sum` |
+
+**Clean audit — window frames + quantile sketches (deep).** `median.rs` (quickselect vs sorted oracle,
+negative-NaN ranking, continuous interpolation), `kll`/`tdigest`/`ddsketch` (merge==single, round-trip
+incl. NaN/absurd-length rejection, monotone rank within error bound), `window_partition_agg` (i128-exact
+avg, checked SUM, total-order NaN min/max), and `stats.rs` all sound. Added a GROUPS-frame independent
+oracle test (`groups_frame_matches_naive_oracle`) — the RANGE/GROUPS bound resolution is correct.
+
+**Clean audit — governance lineage / audit / policy (deep).** All 18 `LogicalPlan` node types are
+modeled in `lineage.py` (only `MapBatches` hits the safe over-approximating catch-all; `Aggregate` unions
+both inputs; `Union` is positional but node-enforced identical columns); `audit.py` events match the single
+`_govern_scan` traversal (denied/masked/row_filters/visible, incl. the B270 explicit-exempt→tag path);
+`policy.py`/`filters.py` are fail-closed + conjunctive (`AttributeIn([])`→`Lit(False)`, missing attr →
+`PlanError`); no-role principals deny-all; a row filter over a masked column reads the raw value (catalog
+authority) while masking output, and a filter over a non-granted column restricts without exposing it.
+55 governance tests pass. Corroborates B87/B120/B152–154/B270.

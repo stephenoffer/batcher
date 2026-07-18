@@ -20,6 +20,7 @@ from `contains` is definitive — the predicate cannot match and the scan is pru
 
 from __future__ import annotations
 
+import functools
 import struct
 
 __all__ = ["BloomIndex", "canonical_bytes"]
@@ -69,8 +70,16 @@ class BloomIndex:
         self._words = words
 
     @classmethod
+    @functools.lru_cache(maxsize=128)
     def from_bytes(cls, data: bytes) -> BloomIndex | None:
-        """Parse the `BloomFilter::to_bytes` wire format, or None if malformed."""
+        """Parse the `BloomFilter::to_bytes` wire format, or None if malformed.
+
+        **Memoized on the wire bytes.** Parsing unpacks the entire bitmap into a Python list —
+        O(num_bits) — and the callers probe *per value*: an `IN`-list member at a time, inside
+        the PUSHDOWN fixpoint loop (up to 32 members x every key pair x every iteration). For a
+        1 Mbit bloom that rebuilt a 16k-element list thousands of times per plan. The input is
+        immutable `bytes` and this class is a read-only view, so the cache is a pure win.
+        """
         if data is None or len(data) < 12:
             return None
         num_bits = struct.unpack_from("<Q", data, 0)[0]

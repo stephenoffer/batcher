@@ -52,7 +52,7 @@ def _literal(ir: dict[str, Any]) -> Any:
     return value
 
 
-def _pa_literal(ir: dict[str, Any]) -> Any:
+def _pa_literal(ir: dict[str, Any], col_type: Any | None = None) -> Any:
     """A pyarrow scalar for a literal IR, typed for temporal kinds.
 
     A bare ``date``/``timestamp`` literal is an epoch offset (days / micros); handed to
@@ -61,6 +61,14 @@ def _pa_literal(ir: dict[str, Any]) -> Any:
     int16)``). Building an explicitly-typed ``date32``/``timestamp[us]`` scalar makes the
     column-vs-literal comparison type-check and enables row-group/page pruning on date
     columns (the common TPC-H shipdate/orderdate filters).
+
+    When the column's own type is known (`col_type`), a ``timestamp`` literal is built to
+    match it exactly. This is what a timezone-aware column needs: pyarrow refuses to
+    compare a ``timestamp[us, tz=UTC]`` column against a tz-naive ``timestamp[us]`` scalar
+    (``Cannot compare timestamp with timezone to timestamp without timezone``), which
+    crashed a pushed filter on any UTC-normalized lakehouse timestamp column — the norm for
+    event-time data. The literal's raw value is UTC micros, so the same instant is
+    expressed in the column's unit and zone.
     """
     import pyarrow as pa
 
@@ -68,10 +76,27 @@ def _pa_literal(ir: dict[str, Any]) -> Any:
     if kind == "date":
         return pa.scalar(value, pa.date32())
     if kind == "timestamp":
+        if col_type is not None and pa.types.is_timestamp(col_type):
+            return _timestamp_scalar(value, col_type, pa)
         return pa.scalar(value, pa.timestamp("us"))
     if kind == "time":
         return pa.scalar(value, pa.time64("us"))
     return value
+
+
+def _timestamp_scalar(micros: int, col_type: Any, pa: Any) -> Any:
+    """A timestamp scalar for `micros` (UTC epoch micros) in `col_type`'s unit and zone.
+
+    Building the scalar from a Python ``datetime`` lets pyarrow convert the unit; a tz-aware
+    column gets a UTC-aware datetime (same instant), a tz-naive column a naive one, so the
+    comparison type-checks either way.
+    """
+    import datetime as _dt
+
+    moment = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc) + _dt.timedelta(microseconds=micros)
+    if col_type.tz is None:
+        moment = moment.replace(tzinfo=None)
+    return pa.scalar(moment, col_type)
 
 
 def _col_and_literal(left: dict[str, Any], right: dict[str, Any]) -> tuple[str, Any, bool] | None:
@@ -84,27 +109,47 @@ def _col_and_literal(left: dict[str, Any], right: dict[str, Any]) -> tuple[str, 
 
 
 def _col_and_pa_literal(
-    left: dict[str, Any], right: dict[str, Any]
+    left: dict[str, Any], right: dict[str, Any], schema: Any | None = None
 ) -> tuple[str, Any, bool] | None:
-    """Like :func:`_col_and_literal`, but the value is a typed pyarrow scalar."""
+    """Like :func:`_col_and_literal`, but the value is a typed pyarrow scalar.
+
+    `schema` (when known) types a temporal literal to its column's own type, so a filter
+    on a timezone-aware timestamp column type-checks instead of raising.
+    """
     if left.get("e") == "col" and right.get("e") == "lit":
-        return left["name"], _pa_literal(right), False
+        return left["name"], _pa_literal(right, _field_type(schema, left["name"])), False
     if left.get("e") == "lit" and right.get("e") == "col":
-        return right["name"], _pa_literal(left), True
+        return right["name"], _pa_literal(left, _field_type(schema, right["name"])), True
     return None
 
 
-def to_pyarrow_expression(ir: dict[str, Any]) -> Any | None:
+def _field_type(schema: Any | None, name: str) -> Any | None:
+    """The Arrow type of column `name` in `schema`, or None if unknown."""
+    if schema is None:
+        return None
+    try:
+        return schema.field(name).type
+    except Exception:
+        return None
+
+
+def to_pyarrow_expression(ir: dict[str, Any], schema: Any | None = None) -> Any | None:
     """Translate the pushable subset of `ir` to a `pyarrow.dataset.Expression`.
+
+    `schema` is the scanned table's Arrow schema, when the caller has it. It lets a
+    temporal literal be typed to its column — the tz-aware timestamp columns common in
+    lakehouse tables cannot be compared against a tz-naive literal, so without it a pushed
+    filter on such a column raises rather than prunes. Omitting it keeps the prior
+    behavior (a tz-naive ``timestamp[us]`` literal).
 
     Returns ``None`` if the predicate is not (fully) pushable.
     """
     import pyarrow.dataset as ds
 
-    return _to_pa(ir, ds)
+    return _to_pa(ir, ds, schema)
 
 
-def _to_pa(ir: dict[str, Any], ds: Any) -> Any | None:
+def _to_pa(ir: dict[str, Any], ds: Any, schema: Any | None = None) -> Any | None:
     e = ir.get("e")
     if e == "is_null":
         inner = ir["input"]
@@ -116,13 +161,13 @@ def _to_pa(ir: dict[str, Any], ds: Any) -> Any | None:
         return None
     op = ir["op"]
     if op in ("and", "or"):
-        left = _to_pa(ir["left"], ds)
-        right = _to_pa(ir["right"], ds)
+        left = _to_pa(ir["left"], ds, schema)
+        right = _to_pa(ir["right"], ds, schema)
         if left is None or right is None:
             return None
         return (left & right) if op == "and" else (left | right)
     if op in _CMP:
-        parsed = _col_and_pa_literal(ir["left"], ir["right"])
+        parsed = _col_and_pa_literal(ir["left"], ir["right"], schema)
         if parsed is None:
             return None
         col, value, flipped = parsed

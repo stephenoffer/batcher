@@ -223,6 +223,37 @@ def test_min_max_of_non_constant_column_is_untouched(duck, t):
     assert_same(ds.collect(), duck.sql("SELECT g, min(x) AS lo, max(x) AS hi FROM t GROUP BY g"))
 
 
+# `f` holds a NaN and one other value. A Parquet footer omits NaN from its min/max
+# statistics, so it records `min == max == -3.0` — the column *looks* constant, but it is
+# not (SQL's total order ranks the NaN the greatest value). `_constant_value` used to trust
+# that footer equality and fold `max(f)` to `-3.0`, so `.collect()` returned `-3.0` where the
+# engine (and DuckDB) return NaN — a wrong *result* from an optimizer rule, not a mere
+# estimate. `min(f)` is unaffected: a dropped NaN can never have been the minimum.
+_NAN_CONST = pa.table({"g": ["a", "a"], "f": pa.array([float("nan"), -3.0], pa.float64())})
+
+
+@pytest.fixture
+def nanconst(pq_dir, duck):
+    path = str(pq_dir / "nanconst.parquet")
+    pq.write_table(_NAN_CONST, path)
+    duck.register("nanconst", _NAN_CONST)
+    return bt.read.parquet(path)
+
+
+def test_grouped_max_of_nan_hidden_constant_float_not_folded(duck, nanconst):
+    # The footer's spurious `min == max` must not fold `max(f)` to a non-NaN constant.
+    ds = nanconst.group_by("g").agg(hi=col("f").max(), lo=col("f").min())
+    assert "max" in _aggs(ds)  # NOT folded — the column is not really constant
+    assert_same(
+        ds.collect(), duck.sql("SELECT g, max(f) AS hi, min(f) AS lo FROM nanconst GROUP BY g")
+    )
+
+
+def test_global_max_of_nan_hidden_constant_float_not_folded(duck, nanconst):
+    ds = nanconst.group_by().agg(hi=col("f").max(), lo=col("f").min())
+    assert_same(ds.collect(), duck.sql("SELECT max(f) AS hi, min(f) AS lo FROM nanconst"))
+
+
 def test_constant_column_folds_over_empty_input(duck, empty):
     # Grouped: no rows either way. Global SUM/MIN over 0 rows is NULL — never 0, never 7.
     assert_same(

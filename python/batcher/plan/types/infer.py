@@ -62,13 +62,20 @@ _STR_FLOAT = frozenset({"json_extract_float"})
 _DATE_STR = frozenset({"dayname", "monthname"})
 _DATE_BOOL = frozenset({"is_leap_year"})
 _DATE_TS = frozenset({"last_day"})
-# `list` accessor (`ListFunc`) output types that do NOT depend on the element's
-# numeric width. `len`/`n_unique`/`arg_max`/`arg_min` count or index → Int64;
-# `reverse`/`sort`/`unique` return a list of the same element type. The numeric
-# reductions (`sum`/`min`/`max`/`mean`/`std`/…) are intentionally omitted — their
-# result width is decided in the engine, so they fall back to ``None``.
+# `list` accessor (`ListFunc`) output types. `len`/`n_unique`/`arg_max`/`arg_min`
+# count or index → Int64; `reverse`/`sort`/`unique` return a list of the same element
+# type. The floating reductions (`sum`/`mean`/`median`/`product`/`std`/`var`/`l2_norm`)
+# are unconditionally Float64 in the engine, whatever the element width (verified: an
+# Int list's `sum`/`mean`/… all come back as `double`); `min`/`max` preserve the
+# element type; `normalize` rescales to a `List<Float64>`; `flatten` unwraps one list
+# level. Inferring these (rather than returning ``None``) matters for more than a tidy
+# schema: an uninferable projection sends `Dataset.schema` down the zero-row execution
+# fallback, and the engine collapses a zero-row projection's whole schema to `Null` — so
+# a single uninferred `list.sum` would make *every* output column (its passthrough
+# neighbours included) report `null`.
 _LIST_INT = frozenset({"len", "n_unique", "arg_max", "arg_min"})
 _LIST_SAME = frozenset({"reverse", "sort", "unique"})
+_LIST_FLOAT_REDUCE = frozenset({"sum", "mean", "median", "product", "std", "var", "l2_norm"})
 
 _STR_STR = frozenset(
     {
@@ -151,7 +158,16 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         Strptime,
         StructField,
     )
-    from batcher.plan.expr_ir.nodes import Case, Col, Greatest, HashRows, Least, NullIf
+    from batcher.plan.expr_ir.nodes import (
+        Case,
+        Col,
+        Greatest,
+        HashRows,
+        Least,
+        MakeStruct,
+        NullIf,
+        Sequence,
+    )
 
     if isinstance(expr, Col):
         return schema.field(expr.name).type if schema.has(expr.name) else None
@@ -215,7 +231,27 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return _struct_field_type(infer_type(expr.input, schema), expr.field)
     if isinstance(expr, MapFunc):
         return _mapfunc_type(expr.fn, infer_type(expr.input, schema))
+    if isinstance(expr, Sequence):
+        return pa.list_(pa.int64())  # `sequence` always yields a List<Int64> series
+    if isinstance(expr, MakeStruct):
+        return _make_struct_type(expr.fields, schema)
     return None
+
+
+def _make_struct_type(fields: list[tuple[str, Expr]], schema: SchemaRef) -> pa.DataType | None:
+    """Struct type of a `MakeStruct`: one field per named sub-expression.
+
+    Mirrors `eval_make_struct` (each field nullable). Uncertain in any field →
+    ``None`` (the sound fallback), so a partially-known struct never mislabels a
+    subfield's type.
+    """
+    arrow_fields: list[pa.Field] = []
+    for name, value in fields:
+        field_t = infer_type(value, schema)
+        if field_t is None:
+            return None
+        arrow_fields.append(pa.field(name, field_t, nullable=True))
+    return pa.struct(arrow_fields)
 
 
 def _list_operand(expr: object) -> Expr:
@@ -239,7 +275,18 @@ def _listfunc_type(fn: str, input_t: pa.DataType | None) -> pa.DataType | None:
         return pa.int64()
     if fn in _LIST_SAME:
         return _as_list_type(input_t)
-    return None  # numeric reductions: engine decides the width → fall back
+    if fn in _LIST_FLOAT_REDUCE:
+        return pa.float64()  # always double, whatever the element width
+    if fn in ("min", "max"):
+        # Preserve the element type (already widened at the scan leaf).
+        return _list_element_type(input_t)
+    if fn == "normalize":
+        # Rescale each element to unit L2 norm → a list of Float64.
+        return pa.list_(pa.float64()) if _list_element_type(input_t) is not None else None
+    if fn == "flatten":
+        # `List<List<T>>` → `List<T>`: the flattened output IS the (list) element type.
+        return _as_list_type(_list_element_type(input_t))
+    return None  # any remaining reduction the engine decides → fall back
 
 
 def _struct_field_type(struct_t: pa.DataType | None, field: str) -> pa.DataType | None:
@@ -291,6 +338,18 @@ def _binary_type(expr: object, schema: SchemaRef) -> pa.DataType | None:
         right = infer_type(expr.right, schema)  # type: ignore[attr-defined]
         if left is None or right is None:
             return None
+        # DATE - DATE is the integer count of days between the two dates (matching the engine
+        # and DuckDB), not a date or an interval — so the public schema must say Int64, not
+        # date32. Every other date arithmetic (date ± int) keeps the date type below.
+        if op == "sub" and pa.types.is_date(left) and pa.types.is_date(right):
+            return pa.int64()
+        # DATE ± <integer days> shifts the date and keeps the date type (`int + date` is
+        # commutative). Matches the engine and DuckDB (`DATE - 5` → a DATE).
+        if op in ("add", "sub"):
+            if pa.types.is_date(left) and pa.types.is_integer(right):
+                return left
+            if op == "add" and pa.types.is_integer(left) and pa.types.is_date(right):
+                return right
         dec = _decimal_arith_type(op, left, right)
         if dec is not None:
             return dec

@@ -409,6 +409,10 @@ fn framed_i64(
     let mut out_f = vec![None::<f64>; num_rows];
     let is_min = func == WindowFn::Min;
     let need_extreme = matches!(func, WindowFn::Min | WindowFn::Max);
+    // Only SUM/AVG accumulate the running window sum; a MIN/MAX/COUNT query must not,
+    // or a window whose values sum past i64::MAX would spuriously error (`checked_add`
+    // → SumOverflow) on a query where the sum is never read.
+    let need_sum = matches!(func, WindowFn::Sum | WindowFn::Avg);
     for part in ordered {
         let len = part.len();
         let peers = peer_groups(frame, part, order_rows);
@@ -424,7 +428,9 @@ fn framed_i64(
                     let v = arr.value(row);
                     // `checked_add` so an i64 framed SUM that overflows errors instead of
                     // wrapping (matching the non-framed running/whole-partition SUM paths).
-                    sum = sum.checked_add(v).ok_or(RuntimeError::SumOverflow)?;
+                    if need_sum {
+                        sum = sum.checked_add(v).ok_or(RuntimeError::SumOverflow)?;
+                    }
                     cnt += 1;
                     if need_extreme {
                         while let Some(&back) = dq.back() {
@@ -442,7 +448,9 @@ fn framed_i64(
             }
             while cur_a < a {
                 if cur_a < cur_b && arr.is_valid(part[cur_a]) {
-                    sum -= arr.value(part[cur_a]);
+                    if need_sum {
+                        sum -= arr.value(part[cur_a]);
+                    }
                     cnt -= 1;
                 }
                 cur_a += 1;
@@ -1053,6 +1061,27 @@ mod tests {
         assert!(matches!(r, Err(RuntimeError::SumOverflow)));
     }
 
+    /// A framed `MIN`/`MAX` over i64 must NOT error just because the window's values
+    /// happen to sum past `i64::MAX` — the sum is irrelevant to the extremes. Before the
+    /// fix, `framed_i64` accumulated the running window sum unconditionally (with
+    /// `checked_add` → `SumOverflow`), so `min(x) OVER (… ROWS …)` aborted the query on
+    /// large-magnitude input where DuckDB returns the minimum.
+    #[test]
+    fn framed_i64_minmax_does_not_spuriously_overflow_on_sum() {
+        let big = 1i64 << 62; // three of these sum to 3·2^62 >> i64::MAX
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![big, big, big]));
+        let ordered = vec![vec![0usize, 1, 2]];
+        let frame = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::Preceding(2),
+            end: FrameBound::CurrentRow,
+        };
+        let mn = framed_aggregate(WindowFn::Min, &ordered, &values, frame, None, 3).unwrap();
+        assert_eq!(mn.as_primitive::<Int64Type>().values(), &[big, big, big]);
+        let mx = framed_aggregate(WindowFn::Max, &ordered, &values, frame, None, 3).unwrap();
+        assert_eq!(mx.as_primitive::<Int64Type>().values(), &[big, big, big]);
+    }
+
     /// The O(n) sliding kernel must match a naive O(n·w) recompute for every frame
     /// shape — including nulls, empty frames, and multiple partitions.
     #[test]
@@ -1207,6 +1236,150 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Independent GROUPS-frame oracle: a row is in `pos`'s frame iff its peer-group
+    /// index lies in `[g+start_off, g+end_off]` (clamped to `[0, G-1]`), computed by
+    /// group membership rather than the position-range formula the kernel uses — so a
+    /// bug in `frame_bounds`' RANGE/GROUPS resolution is caught, not mirrored.
+    fn naive_groups(
+        func: WindowFn,
+        part: &[usize],
+        group_of: &[usize],
+        num_groups: usize,
+        raw: &[Option<i64>],
+        start: FrameBound,
+        end: FrameBound,
+    ) -> Vec<Option<f64>> {
+        let g_lo = |g: i64| -> i64 {
+            match start {
+                FrameBound::UnboundedPreceding => i64::MIN,
+                FrameBound::Preceding(k) => g - k as i64,
+                FrameBound::CurrentRow => g,
+                FrameBound::Following(k) => g + k as i64,
+                FrameBound::UnboundedFollowing => i64::MAX,
+            }
+        };
+        let g_hi = |g: i64| -> i64 {
+            match end {
+                FrameBound::UnboundedPreceding => i64::MIN,
+                FrameBound::Preceding(k) => g - k as i64,
+                FrameBound::CurrentRow => g,
+                FrameBound::Following(k) => g + k as i64,
+                FrameBound::UnboundedFollowing => i64::MAX,
+            }
+        };
+        let _ = num_groups;
+        let mut out = vec![None; raw.len()];
+        for (pos, &row) in part.iter().enumerate() {
+            let g = group_of[pos] as i64;
+            // Unclamped bounds: a group index (always in `[0, G-1]`) qualifies iff it
+            // falls in `[g_lo, g_hi]`. A `g_hi < 0` (or `g_lo > G-1`) therefore excludes
+            // every group — an empty frame — rather than clamping into a spurious group.
+            let (lo, hi) = (g_lo(g), g_hi(g));
+            let vals: Vec<i64> = (0..part.len())
+                .filter(|&j| {
+                    let gj = group_of[j] as i64;
+                    lo <= gj && gj <= hi
+                })
+                .filter_map(|j| raw[part[j]])
+                .collect();
+            out[row] = match func {
+                WindowFn::Count => Some(vals.len() as f64),
+                _ if vals.is_empty() => None,
+                WindowFn::Sum => Some(vals.iter().sum::<i64>() as f64),
+                WindowFn::Avg => Some(vals.iter().sum::<i64>() as f64 / vals.len() as f64),
+                WindowFn::Min => Some(*vals.iter().min().unwrap() as f64),
+                WindowFn::Max => Some(*vals.iter().max().unwrap() as f64),
+                _ => None,
+            };
+        }
+        out
+    }
+
+    /// The GROUPS sliding kernel (sum/avg/min/max/count) must match the independent
+    /// group-membership oracle across every frame shape — including Following bounds,
+    /// nulls, and multi-group partitions the existing single-frame tests never exercise.
+    #[test]
+    fn groups_frame_matches_naive_oracle() {
+        use arrow::row::{RowConverter, SortField};
+        // Order key with ties → peer groups {0,1},{2},{3,4,5},{6}. G = 4.
+        let key_vals = [10i64, 10, 20, 30, 30, 30, 40];
+        let keys: ArrayRef = Arc::new(Int64Array::from(key_vals.to_vec()));
+        let conv = RowConverter::new(vec![SortField::new(keys.data_type().clone())]).unwrap();
+        let rows = conv.convert_columns(std::slice::from_ref(&keys)).unwrap();
+        let raw: Vec<Option<i64>> =
+            vec![Some(1), None, Some(3), Some(4), None, Some(6), Some(7)];
+        let values: ArrayRef = Arc::new(Int64Array::from(raw.clone()));
+        let part: Vec<usize> = (0..7).collect();
+        let ordered = vec![part.clone()];
+        let n = raw.len();
+
+        // Group index per position (peers are contiguous once sorted).
+        let mut group_of = vec![0usize; n];
+        let mut g = 0usize;
+        for pos in 1..n {
+            if key_vals[pos] != key_vals[pos - 1] {
+                g += 1;
+            }
+            group_of[pos] = g;
+        }
+        let num_groups = g + 1;
+
+        let bounds = [
+            FrameBound::UnboundedPreceding,
+            FrameBound::Preceding(2),
+            FrameBound::Preceding(1),
+            FrameBound::CurrentRow,
+            FrameBound::Following(1),
+            FrameBound::Following(2),
+            FrameBound::UnboundedFollowing,
+        ];
+        // Offset ordering of a bound, for the valid-frame constraint `start <= end`
+        // (a SQL frame requires the start bound to be at or before the end bound).
+        let rank = |b: FrameBound| -> i64 {
+            match b {
+                FrameBound::UnboundedPreceding => i64::MIN,
+                FrameBound::Preceding(k) => -(k as i64),
+                FrameBound::CurrentRow => 0,
+                FrameBound::Following(k) => k as i64,
+                FrameBound::UnboundedFollowing => i64::MAX,
+            }
+        };
+        for &start in &bounds {
+            for &end in &bounds {
+                // A valid SQL frame: start at/before end, end is not UNBOUNDED PRECEDING,
+                // start is not UNBOUNDED FOLLOWING.
+                if rank(start) > rank(end)
+                    || end == FrameBound::UnboundedPreceding
+                    || start == FrameBound::UnboundedFollowing
+                {
+                    continue;
+                }
+                let frame = Frame {
+                    unit: FrameUnit::Groups,
+                    start,
+                    end,
+                };
+                for func in [
+                    WindowFn::Sum,
+                    WindowFn::Avg,
+                    WindowFn::Min,
+                    WindowFn::Max,
+                    WindowFn::Count,
+                ] {
+                    let got = framed_aggregate(func, &ordered, &values, frame, Some(&rows), n)
+                        .unwrap();
+                    let want =
+                        naive_groups(func, &part, &group_of, num_groups, &raw, start, end);
+                    assert_eq!(
+                        fmt(&got),
+                        want,
+                        "func={func:?} start={start:?} end={end:?}"
+                    );
+                }
+            }
+        }
     }
 
     fn fmt(arr: &ArrayRef) -> Vec<Option<f64>> {
