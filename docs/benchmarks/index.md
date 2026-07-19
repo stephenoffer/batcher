@@ -7,10 +7,12 @@ records a time. A fast wrong answer is a bug, not a win. A benchmark that disagr
 `FAILED` and produces no number at all.
 
 :::{important}
-That gate is not decoration. It has caught real bugs in other engines: on TPC-H q6, Daft
-and Polars each compute the wrong revenue (they mishandle `interval '1' year`), and the
-harness refuses to time them, so neither is quietly credited with a win. Read every table on
-this site knowing that a missing number means a wrong answer, not a slow one.
+That gate is not decoration. It has caught real bugs in other engines: on TPC-H q6, **Daft and
+Polars each return 75,207,768.19 where the official TPC-H answer is 123,141,078.23** — they
+fold the predicate bound `0.06 + 0.01` in IEEE double, getting `0.06999999999999999`, and so
+drop every `l_discount = 0.07` row. Batcher returns the official answer exactly. The harness
+refuses to time a wrong result, so neither engine is quietly credited with a win. Read every
+table on this site knowing that a missing number means a wrong answer, not a slow one.
 :::
 
 ::::{grid} 1 3 3 3
@@ -52,9 +54,13 @@ DuckDB remains excellent. We publish both.
 | Training ingest (`iter_torch_batches`) | Ray Data | **3.0× faster** |
 | Batch inference (ResNet-50) | Ray Data | **2.05× faster** |
 | Parquet read → aggregate | Ray Data | **20.8× faster** |
+| TPC-H, all 22 queries | DuckDB on the same Arrow | **won 22 of 22** (1.03–7.1×) |
+| TPC-H sf10 q6, cluster vs cluster | Daft (both distributed) | **2.4× faster**, and Daft's answer is wrong |
+| ClickBench, 43 queries | DuckDB on the same Arrow | **won 42 of 43**, 43/43 correct |
+| Semi-structured JSON, 5 queries | DuckDB / Polars | **3.6–12× / 11–100× faster** |
 | Group-by, filter, top-N | DuckDB | **1.3–5× faster** |
 | Sort → top-N, window functions | Polars | **5–50× faster** |
-| Join-heavy TPC-H | DuckDB | **~1.4× slower** (see below) |
+| Join-heavy TPC-H | DuckDB on its **native store** | **~1.4× slower** (see below) |
 
 :::{note}
 Those rows were not measured on the same machine. The DuckDB and Polars comparisons ran on

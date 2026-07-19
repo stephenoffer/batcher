@@ -1,8 +1,13 @@
 # TPC-H
 
-TPC-H is the benchmark Batcher currently *loses*, and it is the most useful page on this
-site for understanding where the engine stands. All 22 queries, scale factor 1
-(`lineitem` = 6,001,215 rows), single node, 16 cores, 30 GB.
+TPC-H is the page that shows both sides of the engine, which makes it the most useful one
+here. **Against DuckDB reading the same Arrow, Batcher wins all 22 queries.** Against DuckDB
+on its own compressed store — where DuckDB never pays an ingest and decompresses as it scans —
+DuckDB still wins 15 of 22. Both numbers are below, because only publishing the first would be
+marketing and only publishing the second would be false modesty.
+
+All 22 queries, scale factor 1 (`lineitem` = 6,001,215 rows), single node, 16 cores, 30 GB,
+release build, measured 2026-07-18.
 
 ## Correctness first
 
@@ -19,54 +24,96 @@ The gate earns its keep on other engines, too:
 | Engine | Correctness on the suite |
 |---|---|
 | DuckDB | Reference. |
-| **Batcher** | **Matches DuckDB on all 22.** |
-| Daft | **q6 is wrong** (mishandles `interval '1' year`: 75.2M against the correct 123.1M); cannot parse `SUBSTRING(x FROM a FOR b)` in q22. |
-| Polars | **q6 is wrong**; its SQL frontend errors on most of the suite (multi-table `FROM`, `EXISTS`, non-equi joins). |
+| **Batcher** | **Matches DuckDB on all 22**, and matches the *official* TPC-H answer on q6. |
+| Daft | **q6 is wrong** (returns 75.2M against the official 123,141,078.2283); cannot parse `SUBSTRING(x FROM a FOR b)` in q22. |
+| Polars | **q6 is wrong** (same 75.2M); its SQL frontend errors on most of the suite (multi-table `FROM`, `EXISTS`, non-equi joins). |
+
+:::{dropdown} What Daft and Polars actually get wrong on q6 — it is not `interval '1' year`
+The predicate is `l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01`. In IEEE double,
+`0.06 + 0.01` is `0.06999999999999999` — a hair *under* `0.07` — so an engine that folds the
+bound in floating point drops every `l_discount = 0.07` row and loses about 39% of the
+revenue. TPC-H defines `l_discount` as `DECIMAL`, so the 0.07 rows belong in the answer.
+
+Ground truth was computed independently in PyArrow over the identical input and equals the
+official sf1 answer, `123141078.2283`. Batcher returns exactly that. This page previously
+attributed the error to `interval '1' year`, which was wrong.
+:::
 
 ## Where the suite stands
 
-:::{warning}
-**DuckDB is faster on 16 of the 21 comparable queries**, with a geometric mean of about
-**1.36× in DuckDB's favor**. **Daft is 2–12× faster on the join-heavy queries** and roughly
-2× faster on a per-batch Python UDF. Batcher wins the five scan-and-aggregate-dominated
-queries and loses the multi-join ones. That is the whole story, and it is consistent across
-every other benchmark we run.
-:::
+**Against DuckDB reading the same Arrow (a like-for-like *execution* comparison), Batcher
+wins all 22 queries**, by 1.03×–7.1×. That is the comparison Batcher's Arrow-only contract
+makes fair, and q21 now runs — correlated subqueries are supported, so all 22 are comparable.
 
-**q21 is not comparable.** It raises `NotImplementedError`, because correlated subqueries are
-not supported yet. It raises rather than returning a wrong answer, which is the behavior we
-want from an unsupported feature.
+:::{warning}
+**Against DuckDB on its own native compressed store, DuckDB is faster on 15 of 22**, geometric
+mean **≈1.40× in DuckDB's favor** (≈1.29× excluding q17, an 8× outlier). That is not a
+like-for-like execution comparison — DuckDB decompresses its own format on the fly and never
+pays an Arrow ingest — but it is the number a user gets from `duckdb` at a prompt, so we
+publish it. Batcher wins the scan-and-aggregate-dominated queries (q15 0.46×, q12 0.74×,
+q11 0.80×, q1/q9 0.88×) and loses the join- and subquery-heavy ones (q17 7.9×, q20 2.8×,
+q3 2.6×, q21 2.4×).
+:::
 
 :::{dropdown} Per-query ratios vs DuckDB
 The ratio is `batcher / duckdb`, so below 1.0 means Batcher is faster.
 
-| Query | vs DuckDB |
-|---|---:|
-| q14 | **0.71×** |
-| q1 | **0.80×** |
-| q6 | **0.82×** |
-| q12 | **0.86×** |
-| q16 | **0.99×** |
-| q7 | 2.15× |
-| q8 | 2.30× |
-| q17 | 2.46× |
-| q5 | 2.99× |
+All 22 queries, measured 2026-07-18 on a release build, correctness-gated. The ratio is
+`batcher / duckdb`, so **below 1.0 means Batcher is faster**.
+
+| Query | vs DuckDB-on-Arrow<br>(same input) | vs native DuckDB<br>(its own store) |
+|---|---:|---:|
+| q1  | **0.51×** | **0.88×** |
+| q2  | **0.42×** | 1.64× |
+| q3  | **0.59×** | 2.57× |
+| q4  | **0.50×** | 1.77× |
+| q5  | **0.24×** | 1.63× |
+| q6  | **0.27×** | **0.92×** |
+| q7  | **0.35×** | 1.32× |
+| q8  | **0.35×** | 1.72× |
+| q9  | **0.27×** | **0.88×** |
+| q10 | **0.43×** | 1.05× |
+| q11 | **0.15×** | **0.80×** |
+| q12 | **0.38×** | **0.74×** |
+| q13 | **0.81×** | 1.17× |
+| q14 | **0.40×** | 1.14× |
+| q15 | **0.14×** | **0.46×** |
+| q16 | **0.64×** | 1.54× |
+| q17 | **0.91×** | 7.91× |
+| q18 | **0.43×** | **0.91×** |
+| q19 | **0.91×** | 1.52× |
+| q20 | **0.77×** | 2.81× |
+| q21 | **0.53×** | 2.38× |
+| q22 | **0.78×** | 2.08× |
+| **total** | **22 of 22 won** | 7 of 22 won, geomean 1.40× |
 :::
 
-:::{dropdown} Per-query ratios vs Daft
-The ratio is `batcher / daft`, so above 1 means Daft is faster.
+:::{dropdown} Per-query ratios vs Daft (re-measured 2026-07-18)
+Both single-node on the same 16 cores and the same Arrow input. Ratio is `batcher / daft`,
+so **below 1.0 means Batcher is faster**.
 
-| Query | vs Daft |
-|---|---:|
-| q7 | 12× |
-| q5 | 9.6× |
-| q20 | 8.6× |
-| q17 | 6.7× |
-| q9 | 5.9× |
-| q3 | 3.8× (was 7.7×) |
+| Batcher faster | | Daft faster | |
+|---|---:|---|---:|
+| q12 | **0.14×** | q20 | 2.03× |
+| q11 | **0.18×** | q3 | 1.55× |
+| q10 | **0.26×** | q4 | 1.51× |
+| q15 | **0.43×** | q17 | 1.35× |
+| q2 | **0.53×** | q5 | 1.13× |
+| q8 | **0.55×** | q16 | 1.07× |
+| q1 | **0.58×** | q19 | 1.06× |
+| q14 | **0.60×** | | |
+| q9 | **0.63×** | | |
+| q7 | **0.64×** | | |
+| q13 | **0.99×** | | |
 
-Batcher ties Daft on global aggregation, group-by, and single-stage expression ETL, and it
-wins top-N and sort-limit by 8–10× (a fused top-N heap against a full sort).
+**Batcher is faster on 11 of the 18 queries Daft answers correctly**, and the spread is wider
+in Batcher's favour (up to 7×) than against it (up to 2×). Daft additionally **cannot
+complete four**: q6 is wrong (above), q18 returns an unaliased column, q21 fails to bind a
+correlated subquery, and q22 cannot parse `SUBSTRING(x FROM a FOR b)`.
+
+Earlier revisions of this page reported Daft 4–12× ahead on the join-heavy queries. That gap
+is gone: the parallel radix join and the whole-partition window kernel landed since, taking
+q3 from 3.8× behind to 1.55× and q4 to 1.51×.
 :::
 
 ## Why
@@ -83,15 +130,22 @@ engine's kernels on the same 16 cores:
 
 The kernels win. The queries built out of them lose. Two things account for it:
 
-1. **Single-node parallelism reaches only about 1.7–3.8× on 16 cores**, where DuckDB and
-   Daft use effectively all of them. The shuffle path is the visible culprit: `key_indices`
-   and `partition_by_keys` run serially over the 6M-row probe side before the per-bucket
-   join, and the parallel broadcast join rebuilds its build-side hash table in every probe
-   chunk instead of building once and sharing it.
+1. **Single-node parallelism plateaus after about 8 cores.** Measured on q3 with the plan
+   built once: 171 ms at 1 core → 43 ms at 8 → 42.8 ms at 16, a 4.0× speedup from 16 cores
+   (~25% parallel efficiency). Narrowed by operator, `GROUP BY` alone scales **19.2×** and
+   the join alone only **5.9×**, so the join is the ceiling, not the aggregate.
 2. **Batcher does roughly 2× more CPU work per query.**
 
-Neither is a tuning knob. Both are tracked as open levers in
-`benchmarks/BENCHMARK_RESULTS.md`.
+One documented cause of (1) is now fixed: the radix join's partition loop ran on a single
+core, so a join too large to broadcast funnelled a fully-parallel build and probe into a
+serial kernel. Joining the partitions concurrently — concatenating them in partition order,
+which reproduces the sequential output exactly — took TPC-H q4 from 115.6 ms to 43.0 ms and
+q3 from 110.3 ms to 66.3 ms. What remains is an unexplained roughly-constant serial section
+inside the join; three plausible causes (serial hash-table build, fixed per-query overhead,
+memory-bandwidth-bound output gather) were each tested and **ruled out**, so the next step is
+a real profiler on `bc-interp`'s join path rather than more black-box timing.
+
+Both are tracked as open levers in `benchmarks/BENCHMARK_RESULTS.md`.
 
 ## What did move
 
