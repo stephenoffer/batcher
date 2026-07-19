@@ -41,8 +41,10 @@ Hardware, correctness gating, and the commands to reproduce every number.
 ## The short version
 
 Batcher's advantage is widest exactly where the modern workload lives: AI, multimodal, and
-last-mile training ingest. It is narrowest on classical single-node join-heavy SQL, where
-DuckDB remains excellent. We publish both.
+last-mile training ingest. On classical analytics it now sweeps every suite we run against
+DuckDB reading the same Arrow — **22 of 22** TPC-H, **42 of 43** ClickBench, **5 of 5** JSON.
+The one place DuckDB still leads is its own compressed store on join-heavy SQL, where it never
+pays an ingest and decompresses as it scans. We publish both, and label which is which.
 
 | Workload | Compared with | Result |
 |---|---|---|
