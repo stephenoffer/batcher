@@ -1,5 +1,144 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## Operator mix: 11/11 vs DuckDB, 7/7 vs PyArrow, 9/11 vs Polars (2026-07-18)
+
+Re-measured on a release build, correctness-gated, 16 cores. Two rows moved since the last
+publish: **sort→top-N flipped to a win** (1.09x loss → 0.99x), and **PyArrow no longer beats
+Batcher on either group-by** (was 1.5x ahead, now 2.0x behind).
+
+| operator | vs DuckDB | vs Polars | vs PyArrow |
+|---|---:|---:|---:|
+| filter → count | **265x** | **41x** | **1225x** |
+| global sum | **33x** | **12x** | **25x** |
+| group-by sum (1 key) | **5.0x** | **2.6x** | **2.0x** |
+| group-by sum (2 keys) | **4.3x** | **2.7x** | **2.0x** |
+| filter → project | **3.8x** | 0.8x | **14x** |
+| window running sum | **2.6x** | **6.3x** | n/a |
+| window lag | **1.9x** | **25x** | n/a |
+| window rank | **1.4x** | **6.7x** | n/a |
+| join → group-by | **1.4x** | 0.9x | **3.6x** |
+| window whole-partition sum | **1.1x** | 1.0x | n/a |
+| sort → top-N | **1.0x** | **33x** | **180x** |
+
+### The two Polars losses are the control plane, not the kernels
+
+`op-filter-project` decomposes cleanly, and the answer is not what it looks like:
+
+| | time |
+|---|---:|
+| batcher filter+project | 12.05 ms |
+| batcher **passthrough** (no filter, no project) | **5.82 ms** |
+| polars **passthrough** | **0.14 ms** |
+| polars filter+project | 9.36 ms |
+
+Subtracting each engine's own passthrough baseline, **Batcher's filter kernel is FASTER than
+Polars'** — 5.67 ms of work against 7.79 ms. Batcher loses on the ~5.8 ms it pays before any
+work happens. And `collect()` is *not* copying: the output shares the input's buffers
+(verified by comparing buffer addresses), so this is not a materialization cost.
+
+Under `cProfile`, per query: **~8.6 ms native execution, ~2.1 ms SQL parse + AST translation
+(sqlglot, pure Python), ~1 ms other control plane.** Batcher's engine time alone (8.6 ms)
+already beats Polars' whole query (9.36 ms).
+
+### OPEN: `Dataset.sql()` can never hit the prepared-statement cache
+
+`Session._run` has a plan cache that skips the sqlglot parse and AST translation for a
+repeated query — but it is gated on `cacheable = not tables`, and **`Dataset.sql()` always
+passes `{table_name: self}`** (`api/dataset/frame.py:1126`). So the primary SQL entry point
+re-parses and re-translates on every single call: 120 consecutive identical queries produced
+120 `sqlglot.parse_one` calls.
+
+Fixing it is worth ~2.1 ms on every repeated `ds.sql(...)`, which matters most for the
+dashboard/serving shapes where the same text runs constantly — and it is 2.1 ms of the 3-4 ms
+per-query floor that the Reyden section below identifies as an architectural gap.
+
+The reason it is *not* simply switched on: the cached value is a lazy `Dataset` built over a
+specific input, so the key must include a stable identity of each bound table or one query's
+plan will be served for another's data. `api/executors.py:138` already solves exactly this for
+the result cache (`plan_signature` + `id(source)` + `source.identity()`, with the sources
+pinned so the `id` cannot be recycled) and is the pattern to copy. Note that this alone does
+**not** flip either Polars loss — `filter→project` needs 2.7 ms and `join→group-by` needs
+9.8 ms — so it is a latency fix, not a benchmark fix.
+
+## Hardware saturation: three fixes, and what the CPU target can actually be (2026-07-18)
+
+Measured on a 16-logical-core box under a **15-core cgroup quota**, 30 GiB cgroup memory cap,
+no GPU. Utilization is process CPU-seconds / wall / cores, sampled from `/proc/self/stat`.
+
+### The default executor ran on rayon's *global* pool
+
+`par.rs` carries an explicit warning — never use the global pool, because a Ray worker builds it
+before CPU affinity lands and it is then stuck at **one thread**. `execute_streaming_parallel`,
+the default executor for "the overwhelming majority" of queries, called `run()` directly and so
+did exactly that. Two consequences, one measurable here and one only on a Ray worker:
+
+| `EngineConfig.parallelism` | cores used, before | cores used, after |
+|---|---|---|
+| 1 | **8.97** | 1.00 |
+| 2 | 9.56 | 1.99 |
+| 15 | 8.64 | 8.35 |
+
+So the knob was a **silent no-op** on the default path (the materializing executor obeys it
+exactly: 1.00 / 1.94 / 10.82), and on a Ray worker the default path inherits the one-thread
+throttle. Fixed by installing a width-sized scoped pool at both streaming entry points, plus
+`ExecOptions::workers()` resolving "all cores" from `available_parallelism` rather than from
+`rayon::current_num_threads` — the latter *is* the broken global pool's width, so sizing the
+shard count from it reproduced the bug one level up.
+
+### The join was 89% serial, and it was not the hash table
+
+Phase breakdown of a 20M-row self-join (4.04 s): hash build + radix partition + partition-join
+loop = **326 ms, already parallel**. Serial: the order-preserving index concat (576 ms) and
+`gather_join_output`'s `for col in output` loop of single-threaded arrow `take` (**2,125 ms**).
+Output *materialization* dominated, not the join.
+
+Parallelizing the gather (across columns, and chunk-wise within a column) on the 20M self-join:
+
+| | before | after |
+|---|---|---|
+| wall | 7.85 s | **3.14 s** |
+| CPU | 11.1% | **23.6%** |
+
+Chunking is restricted to flat types: `concat` over dictionary chunks may unify them into an
+encoding a single `take` would never produce, so dictionaries/nested types keep the single-shot
+gather. `a_chunked_gather_equals_the_single_shot_gather` pins the identity exactly (not as a
+multiset — order is what a `LIMIT` above the join depends on).
+
+### A GPU-less host paid ~1.5 s on its first query to prove it had no GPU
+
+The post-collect crossover probe reaches `gpu_available()`, which did `import torch` (~2 s) to
+call `torch.cuda.is_available()`. Same box, same moment, A/B:
+
+| | first query | torch loaded |
+|---|---|---|
+| before | 1.83 s | yes |
+| after | **0.34 s** | no |
+
+`gpu_devices_absent()` answers the cheap *negative* from device nodes in ~0.5 ms. It keys on
+numbered nodes (`/dev/nvidia[0-9]*`), not `/dev/nvidiactl` — a GPU-less machine built from a
+GPU-capable cloud image has the control node and no device, which is precisely this fleet.
+It returns "ask properly" on non-Linux, so it can never be a false negative on Apple Metal.
+
+### Two traps that made earlier readings of this worthless
+
+1. **A contended box.** Load average hit 25 on 15 cores (a concurrent `rustc` plus other
+   agents). Under it, DuckDB "scaled" from 6.94 s at 1 thread to 13.42 s at 8 — nonsense that
+   would have been read as an engine property. Check `uptime` before believing any number here;
+   `cpu_contention()` now reports `load_per_core` so the insight panel can say so itself.
+2. **First-query warmup.** A one-off ~2-3.6 s control-plane cost lands entirely on whichever
+   shape runs first in a process, and reads as *that shape* having terrible CPU utilization.
+   Warm the process, then warm each shape, before measuring.
+
+### The >90% CPU target is not reachable on memory-bound shapes — by anyone
+
+On the same 20M self-join, **DuckDB reads ~15.3% CPU** and Batcher 12.3% (pre-fix), while a
+BLAS matmul control on the same box and same probe reads **87%**. These joins are DRAM-bandwidth
+bound, not core bound; the cores are stalled on memory, and no engine saturates them. Treat
+">90% CPU" as the target for compute-dense work (decode, expression-heavy projection, sort:
+**85.4%** measured here) and judge relational shapes against the *binding* resource instead.
+The honest generalization of the goal is "saturate whichever resource is binding, and be able
+to say which one it is" — which is what the contention/underuse insight rules are for.
+
 ## vs Databricks Reyden: Batcher LOSES its target workload by ~40-100x (2026-07-18)
 
 Reyden is the engine behind Databricks **Lakehouse//RT**, announced at DAIS 2026-06-16 (Beta,
