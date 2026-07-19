@@ -577,6 +577,20 @@ fn top_k_indices(
     k: usize,
 ) -> Result<arrow::array::UInt32Array, InterpError> {
     use arrow::array::UInt32Array;
+    // PERF (open): this is O(n) only where `sort_indices_of` has a specialized single-key
+    // path — the string permutation builder or the integer/temporal radix. A **float**,
+    // decimal or boolean key has neither, so this full-`lexsort`s every morsel to keep `k`
+    // rows. Measured on 6M rows: `ORDER BY <f64> DESC LIMIT 100` takes **26.3 ms against
+    // DuckDB's 8.7 ms (3.0x)**, while the *three*-key form of the same query takes 18 ms
+    // because it reaches the O(n) quickselect below. Fewer sort keys costing more is the tell.
+    //
+    // The obvious fix — fall through to that quickselect when no specialized path applies —
+    // was tried and **reverted: it changes the answer.** With `-0.0` and `0.0` both present
+    // the quickselect surfaced the `0.0` row where the stable sort surfaces the earlier
+    // `-0.0` row, so its comparator does not fold signed zero the way this path does.
+    // `parallel_top_n_float_key_matches_eager` pins that. A real fix has to canonicalize the
+    // float key identity (as `bc_runtime::keys` does for grouping) before comparing, not just
+    // swap the selection algorithm.
     if keys.len() == 1 {
         let full = sort_indices(batch, keys, None)?;
         let take = k.min(full.len());
@@ -802,7 +816,7 @@ pub(crate) fn window_batch_with(
             func: map_window_func(f.func),
             values,
             offset: f.offset,
-            frame: map_frame(f.frame),
+            frame: map_frame(f.frame)?,
         });
     }
 
@@ -887,26 +901,36 @@ fn map_window_func(f: WindowFn) -> window::WindowFn {
 
 /// Map an IR window frame to the runtime frame. `ROWS` and `GROUPS` frames are
 /// honored directly. A `RANGE` frame is honored only for peer bounds (CURRENT ROW /
-/// UNBOUNDED); a numeric `RANGE` offset is value-based (typed order-key arithmetic
-/// we don't implement), so it falls back to `None` — the default peer-`RANGE`
-/// running aggregate the runtime already provides.
-fn map_frame(frame: Option<WindowFrame>) -> Option<window_frame::Frame> {
-    let f = frame?;
+/// UNBOUNDED).
+///
+/// A numeric `RANGE` offset is *value*-based — the frame covers rows whose ORDER BY
+/// value lies within `n` of the current row's, which needs typed order-key arithmetic
+/// the runtime does not implement. It is rejected rather than approximated: silently
+/// substituting the peer-`RANGE` running aggregate returns a *wrong answer* for any
+/// frame that is not already peer-shaped, and a wrong answer is worse than an error.
+///
+/// The Python control plane rejects this shape first (`plan/logical/window.py` raises
+/// `PlanError`, and the SQL parser raises `NotImplementedError`), so this is the
+/// data-plane half of that contract — reachable only via directly-constructed IR.
+fn map_frame(frame: Option<WindowFrame>) -> Result<Option<window_frame::Frame>, InterpError> {
+    let Some(f) = frame else {
+        return Ok(None);
+    };
     let unit = match f.units {
         FrameUnits::Rows => window_frame::FrameUnit::Rows,
         FrameUnits::Groups => window_frame::FrameUnit::Groups,
         FrameUnits::Range => {
             if is_numeric_offset(f.start) || is_numeric_offset(f.end) {
-                return None;
+                return Err(InterpError::ValueBasedRangeFrame);
             }
             window_frame::FrameUnit::Range
         }
     };
-    Some(window_frame::Frame {
+    Ok(Some(window_frame::Frame {
         unit,
         start: map_bound(f.start),
         end: map_bound(f.end),
-    })
+    }))
 }
 
 /// Whether a frame bound carries a numeric `n` offset (`<n> PRECEDING/FOLLOWING`).
@@ -1234,6 +1258,84 @@ mod sort_tests {
         }
     }
 
+    /// A **float** single sort key must agree with the eager stable oracle too.
+    ///
+    /// Guards the tie order of the one shape with no O(n) single-key path: a float key gets
+    /// neither the string permutation builder nor the radix, so `top_k_indices` full-sorts the
+    /// morsel and slices `k`. That is *slow* (see the perf note on `top_k_indices`) and the
+    /// obvious fix — route it through the multi-key quickselect, which is O(n) — **changes the
+    /// answer**: with `-0.0` and `0.0` present the quickselect surfaced the `0.0` row where the
+    /// stable sort surfaces the earlier `-0.0` row. This test caught that, and exists so the
+    /// next attempt catches it too. Covers heavy ties, both zeros, NaN and nulls, ascending and
+    /// descending, nulls first and last.
+    #[test]
+    fn parallel_top_n_float_key_matches_eager() {
+        let n = 40_000usize;
+        // Heavy ties, both zeros, NaN, and nulls — every case the fast paths refuse.
+        let key: Vec<Option<f64>> = (0..n)
+            .map(|i| match i % 101 {
+                0 => None,
+                1 => Some(f64::NAN),
+                2 => Some(-0.0),
+                3 => Some(0.0),
+                _ => Some(((i * 13) % 200) as f64),
+            })
+            .collect();
+        let payload: Vec<i64> = (0..n as i64).collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "k",
+                Arc::new(arrow::array::Float64Array::from(key)) as ArrayRef,
+            ),
+            ("p", Arc::new(Int64Array::from(payload)) as ArrayRef),
+        ])
+        .unwrap();
+        let parts: Vec<RecordBatch> = [0usize, 7000, 16384, 23000, 32768, n]
+            .windows(2)
+            .map(|w| batch.slice(w[0], w[1] - w[0]))
+            .collect();
+
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                let keys = vec![SortKey {
+                    expr: Expr::Col { name: "k".into() },
+                    descending,
+                    nulls_first,
+                }];
+                for k in [5usize, 100, 20_000] {
+                    let locals: Vec<RecordBatch> = parts
+                        .iter()
+                        .map(|b| sort_batch(b, &keys, Some(k)).unwrap())
+                        .collect();
+                    let merged = materialize(&locals).unwrap();
+                    let eager = sort_batch(&merged, &keys, Some(k)).unwrap();
+                    let late = parallel_top_n(&parts, &keys, k).unwrap();
+
+                    assert_eq!(late.num_rows(), eager.num_rows(), "k={k} desc={descending}");
+                    // The payload identifies the exact rows, so a tie-order divergence shows here.
+                    let ci = eager.schema().index_of("p").unwrap();
+                    let le = late
+                        .column(ci)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    let ea = eager
+                        .column(ci)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    for r in 0..ea.len() {
+                        assert_eq!(
+                            le.value(r),
+                            ea.value(r),
+                            "row {r} k={k} desc={descending} nf={nulls_first}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Parallel sample-sort must match the serial sort in the **key-column sequence**
     /// (identical regardless of tie order — fully-tied rows carry identical key values)
     /// and in the **full-row multiset**.
@@ -1485,5 +1587,74 @@ mod sort_tests {
         let out = sort_batch(&batch, &only_null, None).expect("sole null key must not error");
         let p = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(p.values(), &[10, 11, 12, 13, 14], "input order preserved");
+    }
+}
+
+#[cfg(test)]
+mod window_frame_tests {
+    use super::*;
+    use bc_ir::{FrameBound, FrameUnits, WindowFrame};
+
+    fn frame(units: FrameUnits, start: FrameBound, end: FrameBound) -> Option<WindowFrame> {
+        Some(WindowFrame { units, start, end })
+    }
+
+    /// A value-based `RANGE` offset must be rejected, not approximated. Before this
+    /// was an error it silently mapped to `None` — the peer-`RANGE` running aggregate
+    /// — which is a *different frame* and therefore a wrong answer for any input whose
+    /// order key is not already peer-shaped.
+    #[test]
+    fn numeric_range_offset_is_rejected_not_downgraded() {
+        for (start, end) in [
+            (FrameBound::Preceding { n: 2 }, FrameBound::CurrentRow),
+            (FrameBound::CurrentRow, FrameBound::Following { n: 3 }),
+            (
+                FrameBound::Preceding { n: 1 },
+                FrameBound::Following { n: 1 },
+            ),
+        ] {
+            let got = map_frame(frame(FrameUnits::Range, start, end));
+            assert!(
+                matches!(got, Err(InterpError::ValueBasedRangeFrame)),
+                "RANGE {start:?}..{end:?} must error, got {got:?}"
+            );
+        }
+    }
+
+    /// Peer-shaped `RANGE` bounds are exactly representable, so they still map.
+    #[test]
+    fn peer_range_bounds_still_map() {
+        let got = map_frame(frame(
+            FrameUnits::Range,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+        ))
+        .expect("peer RANGE must not error")
+        .expect("peer RANGE must produce a frame");
+        assert_eq!(got.unit, window_frame::FrameUnit::Range);
+    }
+
+    /// `ROWS` and `GROUPS` count positions, so a numeric offset is exact for both and
+    /// must keep working — the rejection is specific to value-based `RANGE`.
+    #[test]
+    fn rows_and_groups_offsets_are_unaffected() {
+        for units in [FrameUnits::Rows, FrameUnits::Groups] {
+            let got = map_frame(frame(
+                units,
+                FrameBound::Preceding { n: 2 },
+                FrameBound::Following { n: 1 },
+            ))
+            .expect("numeric offset is exact for rows/groups")
+            .expect("must produce a frame");
+            assert!(matches!(got.start, window_frame::FrameBound::Preceding(2)));
+        }
+    }
+
+    /// No frame at all stays `None` (the default running frame), and that is not an error.
+    #[test]
+    fn absent_frame_is_none() {
+        assert!(map_frame(None)
+            .expect("absent frame is not an error")
+            .is_none());
     }
 }
