@@ -65,23 +65,25 @@ comparison. Cells are **how many times faster Batcher is** (higher = Batcher fas
 value means the competitor is faster, shown as e.g. `0.5× (2× slower)`). Every row is
 correctness-gated against DuckDB:
 
-| operator | vs DuckDB | vs Polars | vs PyArrow² | vs Ray Data² | vs Spark² |
+| operator | vs DuckDB | vs Polars | vs PyArrow | vs Ray Data² | vs Spark² |
 |-------------------------|:--------:|:--------:|:----------:|:-----------:|:--------:|
-| filter → count          | **100×** | **25×**  | **320×**  | **430×**    | **125×** |
-| global sum              | **33×**  | **14×**  | **7×**    | **2700×**   | **197×** |
-| group-by sum (1 key)    | **4.3×** | **2.6×** | 0.7× (1.5× slower) | **306×** | **28×** |
-| filter → project        | **4.3×** | 0.8× (1.2× slower) | **23×** | **22×** | **20×** |
-| group-by sum (2 keys)   | **3.8×** | **2.5×** | 0.7× (1.5× slower) | **191×** | **21×** |
-| window running `sum()`  | **2.8×** | **6.3×** | n/a¹      | n/a¹        | **17×** |
-| window `lag()`          | **1.8×** | **25×**  | n/a¹      | n/a¹        | **13×** |
-| window `rank()`         | **1.7×** | **7.1×** | n/a¹      | n/a¹        | **19×** |
-| window whole-partition `sum()` | **1.1×** | 0.9× (1.1× slower) | n/a¹ | n/a¹ | — |
-| join → group-by         | **1.1×** | 0.8× (1.2× slower) | **7×** | **135×** | **25×** |
-| sort → top-N (`LIMIT`)  | 0.9× (1.1× slower) | **33×** | **345×** | **477×** | **24×** |
+| filter → count          | **265×** | **41×**  | **1225×** | **430×**    | **125×** |
+| global sum              | **33×**  | **12×**  | **25×**   | **2700×**   | **197×** |
+| group-by sum (1 key)    | **5.0×** | **2.6×** | **2.0×**  | **306×**    | **28×**  |
+| group-by sum (2 keys)   | **4.3×** | **2.7×** | **2.0×**  | **191×**    | **21×**  |
+| filter → project        | **3.8×** | 0.8× (1.3× slower) | **14×** | **22×** | **20×** |
+| window running `sum()`  | **2.6×** | **6.3×** | n/a¹      | n/a¹        | **17×**  |
+| window `lag()`          | **1.9×** | **25×**  | n/a¹      | n/a¹        | **13×**  |
+| window `rank()`         | **1.4×** | **6.7×** | n/a¹      | n/a¹        | **19×**  |
+| join → group-by         | **1.4×** | 0.9× (1.1× slower) | **3.6×** | **135×** | **25×** |
+| window whole-partition `sum()` | **1.1×** | 1.0× (tie) | n/a¹ | n/a¹  | —        |
+| sort → top-N (`LIMIT`)  | **1.0×** | **33×**  | **180×**  | **477×**    | **24×**  |
 
-¹ PyArrow (Acero) and Ray Data have no window functions. ² The DuckDB and Polars columns were
-re-measured 2026-07-18 on a release build; the PyArrow/Ray Data/Spark columns are from the
-dated runs in [`benchmarks/BENCHMARK_RESULTS.md`](benchmarks/BENCHMARK_RESULTS.md).
+**Batcher wins all 11 against DuckDB, all 7 against PyArrow, and 9 of 11 against Polars.**
+
+¹ PyArrow (Acero) and Ray Data have no window functions. ² The DuckDB, Polars and PyArrow
+columns were re-measured 2026-07-18 on a release build; the Ray Data and Spark columns are from
+the dated runs in [`benchmarks/BENCHMARK_RESULTS.md`](benchmarks/BENCHMARK_RESULTS.md).
 
 **Three full suites, not just an operator mix.** Every engine reads the identical zero-copy
 Arrow input, so these compare *execution*, not storage formats:
