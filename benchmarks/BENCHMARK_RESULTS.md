@@ -1,5 +1,73 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## Float top-N was 3x DuckDB — fixed to 1.6x, and a latent tie bug fixed with it (2026-07-18)
+
+Chasing `op-sort-limit` (the last operator at ~1.0x vs DuckDB) turned up that a **single
+float sort key** was the slow shape: `ORDER BY <f64> DESC LIMIT 100` over 6M rows measured
+**26 ms against DuckDB's 8.7 ms (3.0x)**, while the *three*-key form of the same query ran in
+18 ms. Per key type on the same data: int64 **0.90x (a win)**, low-cardinality int64 4.25x,
+float64 **3.01x**. Fewer sort keys costing more, and int beating float, were the tells.
+
+**Cause.** A `LIMIT k` sort fuses to `Sort {limit: Some(k)}` and runs through `parallel_top_n`,
+which calls `top_k_indices` per morsel (~13k rows each). For a single key that took the radix
+*full sort* of the whole morsel to keep 100 rows. Integer radix is cheap (a few cache-friendly
+LSD passes); the **float** radix runs 8 passes scattering by a random key byte, ~8x an O(n)
+selection and cache-thrashing. Float now falls through to the same O(n) quickselect the
+multi-key path uses; int/temporal keeps the radix, strings keep the stable builder.
+
+**A latent correctness bug fell out of it.** `parallel_top_n`'s final merge broke ties by
+*candidate-array position* (`0..total`), not the survivor's original `(morsel, row)`. Those
+agree only when each morsel returns its rows in ascending-row order — true of the old radix
+full sort, **false of the unstable quickselect**. So routing float to the quickselect surfaced
+a *different tied row* at the same rank than the stable oracle keeps — a data-size-dependent
+wrong answer. It was latent for multi-key top-N too, hidden because a distinct second sort key
+removes the ties. Fixed by tie-breaking on `(morsel_of, row_of)`. `parallel_top_n_float_key_matches_eager`
+(float key, `-0.0`/`0.0`, NaN, heavy ties, every asc/desc × nulls-first) fails against either
+bug and passes now.
+
+| single sort key, 6M rows, LIMIT 100 | before | after |
+|---|---:|---:|
+| `ORDER BY <f64> DESC` vs DuckDB | 3.03x | **1.57x** |
+
+`op-sort-limit` (the benchmark's 3-key mixed form) sits at **1.00x** vs DuckDB. Top-100 rows
+match DuckDB exactly for both the single- and three-key forms; 270 differential+unit tests and
+the seq==par stream oracle stay green.
+
+## Kyber now plans against detected hardware, not fixed constants (2026-07-18)
+
+The optimizer was hardware-blind: `_internal/hardware.py` had **zero importers under `kyber/`**,
+so the same plan was produced on a 4-core laptop and a 128-core server and was tuned for neither.
+A neutral `HardwareProfile` (in `plan/resource.py`) now carries the real numbers into
+`OptimizerContext` — detected from this machine single-node, from the cluster's **binding
+(weakest) worker** when distributed (`dist…scaling.cluster_hardware_profile`) so a plan is valid
+on every node it may land on. The plan cache keys on it, so a driver's plan is never replayed on
+differently-sized workers.
+
+Nothing physical stays hardcoded. Every constant that stood in for a hardware quantity now
+resolves from a probe, with the fixed value kept only as the fallback when the probe cannot read
+the machine (non-Linux), and an explicit config value always overriding:
+
+| Decision | Was (fixed) | Now (detected) | Detected here |
+|---|---|---|---|
+| Broadcast-vs-shuffle join | 4 MiB, any cache | `0.25 × L3` (`resolved_broadcast_max_bytes`) | 16 MiB L3 → 4 MiB (unchanged); 1 MiB ARM → 256 KiB; 256 MiB EPYC → 64 MiB |
+| Engine width / shard / pin | `available_parallelism` (16, ignores quota) | `usable_cores` (cgroup-quota aware) | 15, matching the CFS quota |
+| Kyber GPU routing | 12 GB ("a T4") | smallest visible device VRAM | A100 → 60 GB not 12 |
+| Shuffle backpressure ceiling | 256 MiB × 32 = 8 GiB in flight | ≤ 10% of detected RAM | 16 GiB node: 8 → 1.6 GiB |
+| Spill partition count | data-rows only | `max(rows-fanout, usable_cores)` | fills the machine on the OOC phase |
+
+Dimensionless *policy* ratios (what share of L3 a broadcast may occupy, of RAM the shuffle may
+buffer) stay named, overridable constants — those are tuning choices, not hardware facts, and the
+L3 fraction is set so a 16 MiB-L3 machine reproduces the old 4 MiB default exactly, making the
+switch to detection a no-op on that class and an adaptation everywhere else. A separate bug fell
+out: the broadcast (cache) threshold and the PACK/SPREAD placement (network) decision shared one
+knob, so an L3-sized broadcast would have silently moved a network choice; they are now
+`broadcast_max_bytes` and `locality_max_bytes`.
+
+Verified: 4534 differential vs DuckDB (broadcast/shuffle are result-identical, so a threshold
+change can only affect speed, never answers), 4444 unit, 5/5 layer contracts, ruff/clippy clean.
+The cluster path is unit-tested against a mocked topology; a live multi-node benchmark is the
+open follow-up (no cluster available here).
+
 ## Control plane: `ds.sql()` 2.1x, and the join now scales 6.3x on 16 cores (2026-07-18)
 
 ### `Dataset.sql()` could never hit the prepared-statement cache
