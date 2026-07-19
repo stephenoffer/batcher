@@ -99,11 +99,18 @@ queries**, with a geometric mean of about **1.36× in DuckDB's favor**. This is 
 loss on the site and it is not going to be argued away by the operator table above it.
 :::
 
+Re-measured 2026-07-18 on a release build, against DuckDB's **native compressed store**:
+
 | | Queries |
 |---|---|
-| Batcher faster | q1 (0.80×), q6 (0.82×), q12 (0.86×), q14 (0.71×), q16 (0.99×) |
-| Batcher slower | most of the rest; worst are q5 (2.99×), q17 (2.46×), q8 (2.30×), q7 (2.15×) |
-| Not comparable | q21 raises `NotImplementedError`: correlated subqueries are unsupported |
+| Batcher faster | q15 (0.46×), q12 (0.74×), q11 (0.80×), q1 (0.88×), q9 (0.88×), q18 (0.91×), q6 (0.92×) |
+| Batcher slower | the other 15; worst are q17 (7.91×), q20 (2.81×), q3 (2.57×), q21 (2.38×) |
+| Not comparable | none — **all 22 run**. Correlated subqueries are now supported, so q21 is measured |
+
+Against **DuckDB reading the same Arrow**, the result inverts: Batcher wins **all 22**, by
+1.1×–6.9×. That is the like-for-like execution comparison; the table above is what a user gets
+from `duckdb` at a prompt, where DuckDB also decompresses its own format as it scans and never
+pays an Arrow ingest. Both are published, on [the TPC-H page](tpch.md).
 
 The pattern is clean. Batcher wins the scan-and-aggregate queries and loses the multi-join
 ones. Given the kernel numbers above, the cause is not the aggregation or the filter. It is

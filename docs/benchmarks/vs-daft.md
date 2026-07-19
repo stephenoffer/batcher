@@ -6,7 +6,7 @@ result is genuinely mixed: Batcher takes multimodal ingest and top-N by large ma
 on aggregation and single-stage expression ETL, and loses join-heavy SQL by 2–12×.
 
 :::{important}
-Daft computes TPC-H **q6 wrong**: it mishandles `interval '1' year` and returns 75.2M where
+Daft computes TPC-H **q6 wrong**: it folds `0.06 + 0.01` in IEEE double to `0.06999999999999999`, dropping every `l_discount = 0.07` row, and returns 75.2M where
 the correct revenue is 123.1M. The harness declines to time a query whose result does not
 match the oracle, so Daft gets no number on q6 rather than a fast one. Every timing on this
 page passed that gate first.
@@ -137,7 +137,7 @@ other data-movement bugs, produced the table above. The superseded section is ke
 
 ## Correctness
 
-Daft computes TPC-H **q6 wrong**. It mishandles `interval '1' year` and returns 75.2M where
+Daft computes TPC-H **q6 wrong**. It folds `0.06 + 0.01` in IEEE double to `0.06999999999999999`, dropping every `l_discount = 0.07` row, and returns 75.2M where
 the correct revenue is 123.1M. It also cannot parse the `SUBSTRING(x FROM a FOR b)` in q22.
 The harness declines to time a query whose result does not match, so Daft gets no number on
 q6 rather than a fast one.

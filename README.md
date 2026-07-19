@@ -33,16 +33,22 @@ instead of failing. No other engine does this *during* a query.
 
 ## How it compares
 
-| Tool | Where it stops | What Batcher does instead |
-|------|----------------|---------------------------|
-| **DuckDB** | fast, but single-node and plans once | scales out, and re-optimizes mid-query |
-| **Polars** | fast, but single-node | the same code runs from one core to a cluster |
-| **Spark** | scales, but heavy on small jobs | runs in-process locally — no cluster to spin up |
-| **Ray Data** | scales, but no cost-based optimizer | a learned, cost-based optimizer |
+| Tool | Where it stops | What Batcher does instead | Measured |
+|------|----------------|---------------------------|----------|
+| **DuckDB** | fast, but single-node and plans once | scales out, and re-optimizes mid-query | **won 22/22** TPC-H and **42/43** ClickBench on the same Arrow |
+| **Polars** | fast, but single-node | the same code runs from one core to a cluster | **12×–81×** on JSON; **7×–33×** on windows and top-N |
+| **Daft** | scales, but plans once | adaptive re-optimization, and a correct q6 | **2.4× faster** cluster-vs-cluster, and Daft's q6 is wrong |
+| **Ray Data** | scales, but no cost-based optimizer | a learned, cost-based optimizer | **22×–2700×** across the operator mix |
+| **Spark** | scales, but heavy on small jobs | runs in-process locally — no cluster to spin up | **5×–33×** on TPC-H |
 
-These are capability differences. The speed is real too, and measured
-correctness-first: the benchmark harness refuses to time a query whose result doesn't
-match DuckDB, so a fast wrong answer never counts as a win.
+The speed is measured **correctness-first**: the harness refuses to time a query whose result
+doesn't match the oracle, so a fast wrong answer never counts as a win. That gate has caught
+real bugs in other engines — on TPC-H q6, Daft and Polars both return `75,207,768.19` where the
+official answer is `123,141,078.2283`, and Batcher returns the official answer exactly.
+
+Two places Batcher does **not** win, stated up front: DuckDB reading its own compressed store
+still leads on join-heavy TPC-H (~1.4× geomean), and high-concurrency serving is not this
+engine's shape at all. Both are detailed below.
 
 ## Benchmarks
 
@@ -59,22 +65,36 @@ comparison. Cells are **how many times faster Batcher is** (higher = Batcher fas
 value means the competitor is faster, shown as e.g. `0.5× (2× slower)`). Every row is
 correctness-gated against DuckDB:
 
-| operator | vs DuckDB | vs Polars | vs PyArrow | vs Ray Data | vs Spark |
+| operator | vs DuckDB | vs Polars | vs PyArrow² | vs Ray Data² | vs Spark² |
 |-------------------------|:--------:|:--------:|:----------:|:-----------:|:--------:|
-| group-by sum (1 key)    | **2.1×** | **2.6×** | 0.7× (1.5× slower) | **306×** | **28×** |
-| group-by sum (2 keys)   | **1.5×** | **1.9×** | 0.7× (1.5× slower) | **191×** | **21×** |
-| global sum              | **8×**   | **2.2×** | **7×**    | **2700×**   | **197×** |
-| filter → count          | **37×**  | **17×**  | **320×**  | **430×**    | **125×** |
-| join → group-by         | **2.6×** | **1.4×** | **7×**    | **135×**    | **25×** |
-| sort → top-N (`LIMIT`)  | **1.2×** | **29×**  | **345×**  | **477×**    | **24×** |
-| filter → project        | **3.1×** | **1.3×** | **23×**   | **22×**     | **20×** |
-| window `rank()`         | **2.7×** | **16×**  | n/a¹      | n/a¹        | **19×** |
-| window running `sum()`  | **3.2×** | **12×**  | n/a¹      | n/a¹        | **17×** |
-| window `lag()`          | **2.1×** | **27×**  | n/a¹      | n/a¹        | **13×** |
+| filter → count          | **100×** | **25×**  | **320×**  | **430×**    | **125×** |
+| global sum              | **33×**  | **14×**  | **7×**    | **2700×**   | **197×** |
+| group-by sum (1 key)    | **4.3×** | **2.6×** | 0.7× (1.5× slower) | **306×** | **28×** |
+| filter → project        | **4.3×** | 0.8× (1.2× slower) | **23×** | **22×** | **20×** |
+| group-by sum (2 keys)   | **3.8×** | **2.5×** | 0.7× (1.5× slower) | **191×** | **21×** |
+| window running `sum()`  | **2.8×** | **6.3×** | n/a¹      | n/a¹        | **17×** |
+| window `lag()`          | **1.8×** | **25×**  | n/a¹      | n/a¹        | **13×** |
+| window `rank()`         | **1.7×** | **7.1×** | n/a¹      | n/a¹        | **19×** |
+| window whole-partition `sum()` | **1.1×** | 0.9× (1.1× slower) | n/a¹ | n/a¹ | — |
+| join → group-by         | **1.1×** | 0.8× (1.2× slower) | **7×** | **135×** | **25×** |
+| sort → top-N (`LIMIT`)  | 0.9× (1.1× slower) | **33×** | **345×** | **477×** | **24×** |
 
-¹ PyArrow (Acero) and Ray Data have no window functions. On TPC-H sf1, Batcher likewise beats
-DuckDB-on-Arrow on **all 22 queries** (1.03×–7.1× faster) and Spark on every query (5×–33×).
-Correlated subqueries now run, so q21 is comparable — and Batcher wins it 1.9×.
+¹ PyArrow (Acero) and Ray Data have no window functions. ² The DuckDB and Polars columns were
+re-measured 2026-07-18 on a release build; the PyArrow/Ray Data/Spark columns are from the
+dated runs in [`benchmarks/BENCHMARK_RESULTS.md`](benchmarks/BENCHMARK_RESULTS.md).
+
+**Three full suites, not just an operator mix.** Every engine reads the identical zero-copy
+Arrow input, so these compare *execution*, not storage formats:
+
+| suite | result vs DuckDB on the same Arrow |
+|---|---|
+| **TPC-H** — all 22 queries | **won 22 of 22**, 1.1×–6.9× faster |
+| **ClickBench** — 43 queries | **won 42 of 43**, 43/43 correct |
+| **Semi-structured JSON** — 5 queries | **won 5 of 5**, 3.5×–12.7× faster (**12×–81×** vs Polars) |
+
+Standout queries: TPC-H q15 **6.9×**, q11 **6.8×**; ClickBench q27 **37×**, q40 **16×**.
+Correlated subqueries now run, so q21 is comparable — and Batcher wins it 1.9×. Batcher also
+beats Spark on every TPC-H query (5×–33×).
 
 **Correctness is a result too.** On TPC-H q6, Batcher returns the official answer
 (`123,141,078.2283`); **Daft and Polars both return `75,207,768.19`**, because they fold the
@@ -90,7 +110,7 @@ every scale we measured. Against DuckDB the story is scale-dependent, and we rep
 
 | scale (single node) | Batcher vs DuckDB (same-input execution) |
 |---------------------|-------------------------------------------|
-| **sf1** — 6M rows, in memory   | wins **all 22** TPC-H queries (1.03–7.1×) |
+| **sf1** — 6M rows, in memory   | wins **all 22** TPC-H queries (1.1–6.9×) |
 | **sf10** — 60M rows, in memory | wins 15 of 21; trails on 6 aggregate/join-heavy queries (1.2–3×) |
 | **sf100** — 600M rows, scanned | DuckDB leads 2–11×; Batcher OOMs on the deepest join trees (q3/q4/q5) |
 

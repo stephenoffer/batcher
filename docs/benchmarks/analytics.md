@@ -121,7 +121,7 @@ TPC-H scale factor 1:
 | Join-heavy queries | **Daft, 2–12×** |
 | Per-batch Python UDFs | **Daft, ~2×** |
 
-Daft computes TPC-H q6 incorrectly (it mishandles `interval '1' year`, returning 75.2M
+Daft computes TPC-H q6 incorrectly (it folds `0.06 + 0.01` in IEEE double to `0.06999999999999999`, dropping every `l_discount = 0.07` row and returning 75.2M
 instead of 123.1M) and cannot parse the `SUBSTRING(x FROM a FOR b)` in q22. So the gap to
 Daft is purely speed, never correctness.
 

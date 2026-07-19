@@ -16,7 +16,7 @@ differential-tested against DuckDB, and the Tier-0 interpreter is the oracle tha
 parallel executor and the JIT must agree with bit-for-bit.
 
 It also means the benchmark occasionally reports on *other* engines' correctness. On TPC-H
-q6, both Daft and Polars return the wrong revenue, having mishandled `interval '1' year`.
+q6, both Daft and Polars return the wrong revenue, having folded `0.06 + 0.01` in IEEE double to `0.06999999999999999`, which drops every `l_discount = 0.07` row.
 The harness declines to time them rather than crediting a fast wrong answer.
 
 ## Hardware

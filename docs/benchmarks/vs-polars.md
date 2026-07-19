@@ -6,7 +6,7 @@ high-cardinality hash paths and the exact quantiles, some of them by 2–3×. Ne
 uniformly ahead, so which one is faster depends entirely on the shape of your query.
 
 :::{important}
-Polars' TPC-H q6 returns the **wrong revenue**, mishandling `interval '1' year`, and the
+Polars' TPC-H q6 returns the **wrong revenue**, folding the bound `0.06 + 0.01` to `0.06999999999999999` in IEEE double, which drops every `l_discount = 0.07` row, and the
 harness declines to time a query whose result does not match the oracle. So Polars has no
 number on q6 rather than a fast one. That gate runs before every timing on this page, in
 both directions.
@@ -89,7 +89,7 @@ Polars cannot parse most of the TPC-H suite through its SQL frontend (multi-tabl
 `EXISTS`, non-equi joins), so its column in our results is mostly `ERR`. That says something
 about its SQL surface and nothing about its speed, and we report it that way.
 
-Where it does parse q6, it computes the **wrong revenue**, mishandling `interval '1' year`.
+Where it does parse q6, it computes the **wrong revenue**, folding the bound `0.06 + 0.01` to `0.06999999999999999` in IEEE double, which drops every `l_discount = 0.07` row.
 A wrong answer gets no timing, so Polars gets no number there rather than a fast one.
 Batcher matches DuckDB on all 22 queries.
 

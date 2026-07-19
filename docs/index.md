@@ -316,29 +316,63 @@ streaming keeps the device fed. The CPU decode of the next morsel runs while the
 the current one is still in flight, which took a two-stage ResNet-50 pipeline from 942 to
 **2,504 img/s** and utilization from ~30% to **81%**.
 
-### Analytics and I/O
+### Analytics: three full benchmark suites, measured 2026-07-18
 
-Single node, 16 cores, TPC-H at scale 1. Ratios are `batcher / competitor`, so below 1.0 means
-Batcher is faster:
+Every engine reads the **identical zero-copy Arrow input**, so this is a like-for-like
+comparison of execution, not of storage formats. Single node, 16 cores, release build.
 
-| operator | vs DuckDB | vs Polars |
-|---|---:|---:|
-| filter → count | **0.20×** | **0.07×** |
-| global sum | **0.19×** | **0.27×** |
-| group-by sum | **0.76×** | **0.44×** |
-| sort → top-N | 1.06× | **0.02×** |
-| window `rank()` | 1.66× | **0.22×** |
+| suite | vs DuckDB on the same Arrow |
+|---|---|
+| **TPC-H** — all 22 queries | **won 22 of 22**, 1.1×–6.9× faster |
+| **ClickBench** — 43 queries | **won 42 of 43**, and 43/43 correct |
+| **Semi-structured JSON** — 5 queries | **won 5 of 5**, 3.5×–12.7× faster |
+
+Against Polars the JSON suite is **12×–81× faster**, and Polars' SQL front-end cannot express
+most of TPC-H at all (multi-table `FROM`, `EXISTS`, non-equi joins).
+
+Standout single queries, all correctness-gated: TPC-H q15 **6.9×**, q11 **6.8×**, q5 **4.3×**;
+ClickBench q27 **37×**, q40 **16×**, q37 **12×**.
+
+:::{note}
+Seven ClickBench queries return in ~0.2 ms because Kyber answers them from **metadata**
+(footer statistics and sketches) instead of scanning — a real capability, and the reason the
+ratios there reach three digits. They are excluded from the ranges above so the headline
+reflects execution, not planning.
+:::
 
 Reading data is where the gap to Ray Data is structural rather than incidental: Parquet read →
 sum is **20.8×**, CSV **14.3×**, `count()` roughly **1,400×** (it comes from metadata, not a scan).
 
+### Cluster against cluster
+
+The mergeable algebra means the *same* operators run distributed. On an 8-node / 128-CPU
+cluster, with **both engines distributed** and reading the same S3 parquet — TPC-H sf10 q6:
+
+| engine | time | correct? |
+|---|---:|---|
+| **Batcher** | **224 ms** | ✅ |
+| Daft | 536 ms | ❌ wrong answer |
+| DuckDB (single-node, its best) | 457 ms | ✅ |
+
+**2.4× faster than Daft on equal hardware, and correct where Daft is not.**
+
 ### Where Batcher loses
 
-On join-heavy TPC-H, DuckDB is still ahead. It wins 16 of 21 comparable queries, a geometric
-mean of **~1.4× in its favor**, and Daft leads on per-batch Python UDFs by ~2×. The cause is understood
-(single-node parallelism reaches ~1.7–3.8× on 16 cores; more CPU work per query) and is a
-runtime-efficiency effort, not a tuning knob. Correctness is not in question: Batcher matches
-DuckDB on all 22 queries.
+Two places, both stated plainly.
+
+**DuckDB on its own native store** still wins 15 of 22 TPC-H queries (geometric mean ~1.4× its
+way). That is not the same comparison as the table above: DuckDB decompresses its own format as
+it scans and never pays an Arrow ingest. It is, however, what a user gets from `duckdb` at a
+prompt, so we publish it. The cause is understood — single-node parallelism plateaus after ~8
+cores (4.0× from 16 on q3), with the join as the ceiling, not the aggregate.
+
+**High-concurrency serving** is not Batcher's shape at all. Against a serving engine such as
+Databricks' Reyden, Batcher meets the latency bar (p50 ~6.5 ms) but sustains ~145 queries/sec
+where a serving tier does thousands: every query goes through full planning, and a point lookup
+scans rather than using an index. Use a serving database for that workload.
+
+Correctness is not in question in either case: Batcher matches DuckDB on all 22 TPC-H queries
+and returns the official answer on q6, where Daft and Polars do not.
 
 **[Full benchmarks, methodology, and reproduction commands →](benchmarks/index.md)**
 
@@ -374,6 +408,7 @@ user-guide/index
 ml/index
 configuration/index
 migration/index
+agents/index
 ```
 
 ```{toctree}

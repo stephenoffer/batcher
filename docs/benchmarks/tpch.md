@@ -42,7 +42,7 @@ attributed the error to `interval '1' year`, which was wrong.
 ## Where the suite stands
 
 **Against DuckDB reading the same Arrow (a like-for-like *execution* comparison), Batcher
-wins all 22 queries**, by 1.03×–7.1×. That is the comparison Batcher's Arrow-only contract
+wins all 22 queries**, by 1.1×–6.9×. That is the comparison Batcher's Arrow-only contract
 makes fair, and q21 now runs — correlated subqueries are supported, so all 22 are comparable.
 
 :::{warning}
@@ -56,8 +56,6 @@ q3 2.6×, q21 2.4×).
 :::
 
 :::{dropdown} Per-query ratios vs DuckDB
-The ratio is `batcher / duckdb`, so below 1.0 means Batcher is faster.
-
 All 22 queries, measured 2026-07-18 on a release build, correctness-gated. The ratio is
 `batcher / duckdb`, so **below 1.0 means Batcher is faster**.
 
