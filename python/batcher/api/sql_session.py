@@ -79,13 +79,26 @@ class Session:
         self._tables: dict[str, Dataset] = {}
         self._functions: dict[str, _RegisteredFunction] = {}
         self._dialect = dialect
-        # Prepared-statement cache: (dialect, query) -> (catalog generation, Dataset).
-        # A repeated SELECT against an unchanged catalog skips the sqlglot parse + AST
-        # translation. The generation bumps on every catalog mutation (register / drop /
-        # create / clear / register_function), invalidating stale entries — so a plan
-        # never outlives the tables or functions it was built against. It is a one-slot
-        # list, not an int, because `_with_dialect` views share it by reference.
-        self._plan_cache: dict[tuple[str, str], tuple[int, Dataset]] = {}
+        # Prepared-statement cache: (dialect, query, bound names) ->
+        # (catalog generation, bound objects, Dataset).
+        #
+        # A repeated SELECT skips the sqlglot parse + AST translation, which measures
+        # ~2.1 ms — the dominant fixed cost of a small query. Two things make a hit safe:
+        # the generation bumps on every catalog mutation (register / drop / create /
+        # clear / register_function), so a plan never outlives the tables or functions it
+        # was built against; and for a query with *per-call* bindings (`ds.sql(...)`,
+        # `bt.sql(q, a=ds1)`) the entry stores the bound objects and a hit requires each
+        # to be the **identical object** (`is`). Structural equality would not do: two
+        # different in-memory Datasets can share a plan shape, and serving one's plan for
+        # the other's data is a wrong answer, not a slow one.
+        #
+        # Storing the bound objects pins them alive, so the cache is capped and evicts
+        # oldest-first rather than growing with every dataset a caller queries.
+        # `_generation` is a one-slot list, not an int, because `_with_dialect` views
+        # share it by reference.
+        self._plan_cache: dict[
+            tuple[str, str, tuple[str, ...]], tuple[int, tuple[object, ...], Dataset]
+        ] = {}
         self._generation: list[int] = [0]
 
     def __repr__(self) -> str:
@@ -382,15 +395,22 @@ class Session:
         """Parse and dispatch `query` (tables passed as a dict to allow any name)."""
         # Prepared-statement fast path: re-running the same query text against an
         # unchanged catalog reuses its built plan, skipping the sqlglot parse + AST
-        # translation. Only for plain (SELECT-shaped) queries with no per-call table
-        # bindings — CREATE/DROP mutate the catalog and are never cached, and a
-        # `tables` override changes what the names resolve to.
-        cacheable = not tables
-        key = (self._dialect, query)
-        if cacheable:
-            hit = self._plan_cache.get(key)
-            if hit is not None and hit[0] == self._generation[0]:
-                return hit[1]
+        # translation (~2.1 ms). Per-call bindings are cached too — `ds.sql(...)` always
+        # passes one, and it is the most-repeated SQL entry point there is — but only
+        # when every bound object is the identical object the plan was built over.
+        # CREATE/DROP/DML mutate the catalog and are never cached (they bump the
+        # generation, which invalidates everything anyway).
+        names = tuple(sorted(tables))
+        bound = tuple(tables[n] for n in names)
+        key = (self._dialect, query, names)
+        hit = self._plan_cache.get(key)
+        if (
+            hit is not None
+            and hit[0] == self._generation[0]
+            and len(hit[1]) == len(bound)
+            and all(a is b for a, b in zip(hit[1], bound, strict=True))
+        ):
+            return hit[2]
 
         import sqlglot
         from sqlglot import expressions as exp
@@ -403,9 +423,23 @@ class Session:
         if isinstance(ast, (exp.Insert, exp.Delete, exp.Update)):
             return self._dml(ast, tables)
         ds = self._translate(ast, tables)
-        if cacheable:
-            self._plan_cache[key] = (self._generation[0], ds)
+        self._remember(key, bound, ds)
         return ds
+
+    # How many prepared plans to keep. Entries pin their bound datasets alive, so this is
+    # a memory bound, not just a lookup bound: a caller that queries a stream of distinct
+    # datasets would otherwise retain every one of them.
+    _PLAN_CACHE_MAX = 256
+
+    def _remember(
+        self, key: tuple[str, str, tuple[str, ...]], bound: tuple[object, ...], ds: Dataset
+    ) -> None:
+        """Store a built plan, evicting oldest-first past `_PLAN_CACHE_MAX`."""
+        cache = self._plan_cache
+        if len(cache) >= self._PLAN_CACHE_MAX and key not in cache:
+            for stale in list(cache)[: len(cache) - self._PLAN_CACHE_MAX + 1]:
+                del cache[stale]
+        cache[key] = (self._generation[0], bound, ds)
 
     def _translate(self, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Dataset:
         from batcher._sql import translate_ast

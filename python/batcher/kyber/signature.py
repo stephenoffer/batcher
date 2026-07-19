@@ -32,10 +32,28 @@ from batcher.plan.logical import (
 __all__ = ["plan_signature"]
 
 
+# Instance-`__dict__` cache slot, matching the `_memoize_noarg` convention plan nodes
+# already use for `to_ir` / `available_schema` (see `plan/logical/base.py`).
+_SIG_SLOT = "_c_plan_signature"
+
+
 def plan_signature(node: LogicalPlan) -> str:
-    """A stable short hash of a node's structure (literal values normalized)."""
+    """A stable short hash of a node's structure (literal values normalized).
+
+    Memoized on the node. Plan nodes are immutable, so the signature is a pure function
+    of the node — but it JSON-encodes and hashes the *whole subtree*, and the conductor
+    asks for it several times per query (result-cache key, learned-stats lookup, feedback
+    recording). Measured on a small query that was ~4 encodes per query, making
+    `json.iterencode` as expensive as the entire native execution. The write goes through
+    `__dict__` to bypass the frozen `__setattr__`, exactly as `_memoize_noarg` does.
+    """
+    cached = node.__dict__.get(_SIG_SLOT)
+    if cached is not None:
+        return cached
     payload = json.dumps(_struct(node), sort_keys=True, default=str)
-    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+    sig = hashlib.sha1(payload.encode()).hexdigest()[:16]
+    node.__dict__[_SIG_SLOT] = sig
+    return sig
 
 
 def _struct(node: LogicalPlan):
