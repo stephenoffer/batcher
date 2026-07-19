@@ -1,5 +1,56 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## Control plane: `ds.sql()` 2.1x, and the join now scales 6.3x on 16 cores (2026-07-18)
+
+### `Dataset.sql()` could never hit the prepared-statement cache
+
+`Session._run` gates its plan cache on `cacheable = not tables`; `Dataset.sql()` always
+passes `{table_name: self}`. So the **primary SQL entry point re-parsed and re-translated on
+every call** — 120 identical queries produced 120 `sqlglot.parse_one` calls. Per-call bindings
+are now cached, keyed on the bound objects' **identity** (two distinct datasets can share a
+schema, row count and plan shape, so structural equality would serve one query's plan for
+another's data).
+
+Measured A/B in one process, identical query text vs text varied to force a miss:
+
+| | per query |
+|---|---:|
+| cache MISS (parse + translate every call) | 2.16 ms |
+| **cache HIT** | **1.05 ms** |
+
+Plus `plan_signature` — which JSON-encodes and SHA1s the whole plan subtree, and was called
+~4x per query — is now memoized on the node. In the profile `json.iterencode` had been *tied
+with `execute_plan_metered`* as the single largest cost: Python spending as much hashing the
+plan as Rust spent executing it.
+
+**SQL control-plane floor: ~3.4 ms → 0.67 ms.**
+
+⚠️ **This does not move the benchmark suite.** `engines/batcher.py` uses `session.sql()` with
+pre-registered tables and no per-call bindings, so it was already hitting the old cache. This
+is a user-facing latency fix for `ds.sql()`. Do not report it as a benchmark result.
+
+### Join parallel scaling, re-measured after the radix-join fix
+
+6M ⋈ 1.5M on `l_orderkey`, plan built per run, best of 4:
+
+| shape | p=1 | p=16 | scaling |
+|---|---:|---:|---:|
+| join → full output (6M rows) | 709 ms | 106 ms | **6.66x** |
+| join → group-by agg (5 rows) | 694 ms | 96 ms | **7.22x** |
+| join → `limit 10` | 130 ms | 34 ms | 3.84x |
+
+Up from the **5.9x** this file recorded for a join before the radix partition loop was
+parallelized. Output materialization is **not** the limiter — the full-output and
+aggregate-output shapes scale the same. By Amdahl ~8% of the work is still serial; finding it
+needs a profiler with call-tree structure, since name-aggregated flamegraphs here are swamped
+by interpreter startup.
+
+⚠️ **Measurement trap, hit while producing the table above.** Timing `p=1` and `p=16` inside
+one warmed process gave `p=1 = 308 ms` and a scaling of **2.94x**; separate processes give
+`p=1 = 646-703 ms` and **6.30x / 6.38x**, stable and order-independent. The warm-process
+figure is the wrong one — learned stats and the plan cache make a later `p=1` run look faster
+than a cold one. Measure parallel scaling in **separate processes**, one setting each.
+
 ## Operator mix: 11/11 vs DuckDB, 7/7 vs PyArrow, 8/11 vs Polars (2026-07-18)
 
 Re-measured on a release build, correctness-gated, 16 cores. Two rows moved since the last
