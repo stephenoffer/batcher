@@ -1,6 +1,6 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
-## Operator mix: 11/11 vs DuckDB, 7/7 vs PyArrow, 9/11 vs Polars (2026-07-18)
+## Operator mix: 11/11 vs DuckDB, 7/7 vs PyArrow, 8/11 vs Polars (2026-07-18)
 
 Re-measured on a release build, correctness-gated, 16 cores. Two rows moved since the last
 publish: **sort→top-N flipped to a win** (1.09x loss → 0.99x), and **PyArrow no longer beats

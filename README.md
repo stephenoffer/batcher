@@ -76,10 +76,10 @@ correctness-gated against DuckDB:
 | window `lag()`          | **1.9×** | **25×**  | n/a¹      | n/a¹        | **13×**  |
 | window `rank()`         | **1.4×** | **6.7×** | n/a¹      | n/a¹        | **19×**  |
 | join → group-by         | **1.4×** | 0.9× (1.1× slower) | **3.6×** | **135×** | **25×** |
-| window whole-partition `sum()` | **1.1×** | 1.0× (tie) | n/a¹ | n/a¹  | —        |
+| window whole-partition `sum()` | **1.1×** | 1.0× (1.02× slower) | n/a¹ | n/a¹  | —        |
 | sort → top-N (`LIMIT`)  | **1.0×** | **33×**  | **180×**  | **477×**    | **24×**  |
 
-**Batcher wins all 11 against DuckDB, all 7 against PyArrow, and 9 of 11 against Polars.**
+**Batcher wins all 11 against DuckDB, all 7 against PyArrow, and 8 of 11 against Polars.**
 
 ¹ PyArrow (Acero) and Ray Data have no window functions. ² The DuckDB, Polars and PyArrow
 columns were re-measured 2026-07-18 on a release build; the Ray Data and Spark columns are from
