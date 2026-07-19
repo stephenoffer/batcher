@@ -87,14 +87,27 @@ TPC-H **sf10 q6**, every engine reading the same S3 parquet, correctness-gated:
 
 | engine | mode | q6 | correct? |
 |---|---|---|---|
-| **batcher** | distributed, 128 partitions | **197.0 ms** | ✅ agrees with DuckDB exactly |
-| daft | distributed on the cluster (after the fix) | 424.9 ms | ❌ **wrong answer** |
-| duckdb_arrow | single-node, 16 cores | 313.0 ms | ✅ |
+| **batcher** | distributed, 64 partitions | **224.5 ms** | ✅ agrees with DuckDB exactly |
+| daft | distributed on the cluster (after the fix) | 535.8 ms | ❌ **wrong answer** |
+| duckdb_arrow | single-node, 16 cores | 457.3 ms | ✅ |
 
-**Batcher is 2.2x faster than Daft on equal hardware, and correct where Daft is not.**
-Daft returns `revenue = 1230113636.01` where Batcher and DuckDB both return
-`752448391.6111` — independently confirming the q6 wrong-answer this file recorded earlier,
-now with DuckDB as referee rather than Batcher's own say-so.
+**Batcher is 2.4x faster than Daft on equal hardware, 2.0x faster than DuckDB-on-Arrow, and
+correct where Daft is not.** Daft returns `revenue = 752448391.6111`; Batcher and DuckDB both
+return `1230113636.0101` — independently confirming the q6 wrong answer this file recorded
+earlier, with DuckDB as referee rather than Batcher's own say-so.
+
+Daft's error is the `l_discount` bound, not `interval '1' year` as previously recorded: it
+drops the `l_discount = 0.07` rows, because `0.06 + 0.01` in IEEE double is
+`0.06999999999999999`, a hair under `0.07`. Ground truth was computed independently in
+PyArrow over the same input and equals the official TPC-H sf1 answer, `123141078.2283`
+(sf1) — Batcher matches it exactly; Polars makes the same mistake Daft does.
+
+⚠️ **These labels were wrong until 2026-07-18.** `harness.py` built its mismatch line as
+`f"{engine} != {ref_engine}"` while the message body read `"<ref> vs <other>"` — names and
+values in **opposite order**, so every correctness failure the suite ever printed attributed
+each value to the wrong engine. It read `batcher != daft: 752448391 vs 1230113636`, which
+says Batcher computes the wrong number. It does not. Fixed; re-verified by measuring both
+engines directly outside the harness.
 
 ### OPEN: the shuffle fan-out cost is superlinear in partition count
 
