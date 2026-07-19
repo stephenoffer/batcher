@@ -577,37 +577,60 @@ fn top_k_indices(
     k: usize,
 ) -> Result<arrow::array::UInt32Array, InterpError> {
     use arrow::array::UInt32Array;
-    // PERF (open): this is O(n) only where `sort_indices_of` has a specialized single-key
-    // path — the string permutation builder or the integer/temporal radix. A **float**,
-    // decimal or boolean key has neither, so this full-`lexsort`s every morsel to keep `k`
-    // rows. Measured on 6M rows: `ORDER BY <f64> DESC LIMIT 100` takes **26.3 ms against
-    // DuckDB's 8.7 ms (3.0x)**, while the *three*-key form of the same query takes 18 ms
-    // because it reaches the O(n) quickselect below. Fewer sort keys costing more is the tell.
+    // A single key takes the O(n) specialized full sort ONLY where `sort_indices_of` has one:
+    // the string permutation builder or the integer/temporal radix. Both are linear, so
+    // sorting the whole morsel to keep `k` costs no more than selecting `k`.
     //
-    // The obvious fix — fall through to that quickselect when no specialized path applies —
-    // was tried and **reverted: it changes the answer.** With `-0.0` and `0.0` both present
-    // the quickselect surfaced the `0.0` row where the stable sort surfaces the earlier
-    // `-0.0` row, so its comparator does not fold signed zero the way this path does.
-    // `parallel_top_n_float_key_matches_eager` pins that. A real fix has to canonicalize the
-    // float key identity (as `bc_runtime::keys` does for grouping) before comparing, not just
-    // swap the selection algorithm.
+    // A float, decimal or boolean key has no specialized path. It used to full-`lexsort` every
+    // morsel to keep `k` rows — an O(n log n) sort. Measured on 6M rows: `ORDER BY <f64> DESC
+    // LIMIT 100` took **26.3 ms against DuckDB's 8.7 ms (3.0x)**, while the *three*-key form of
+    // the same query ran in 18 ms because it reached the O(n) quickselect below. Fewer sort
+    // keys costing more was the tell. So those keys now fall through to that same quickselect,
+    // which is O(n) for any type and (with the fixed `parallel_top_n` tie-break) selects
+    // exactly the stable sort's top-k — proven for a float key with `-0.0`/`0.0`, NaN and
+    // heavy ties by `parallel_top_n_float_key_matches_eager`.
     if keys.len() == 1 {
-        let full = sort_indices(batch, keys, None)?;
-        let take = k.min(full.len());
-        return Ok(UInt32Array::from_iter_values(
-            full.values().iter().take(take).copied(),
-        ));
+        let v = normalize_sort_key(keys[0].expr.eval(batch)?);
+        let opts = SortOptions {
+            descending: keys[0].descending,
+            nulls_first: keys[0].nulls_first,
+        };
+        // The string builder and the integer/temporal radix are stable *full* sorts, and for
+        // top-k that only pays when the full sort is genuinely as cheap as selecting k. Integer
+        // radix is (a few cache-friendly LSD passes over a compact key, measured a win vs
+        // DuckDB). A **float** key is not: its radix runs 8 LSD passes scattering by a random
+        // key byte, so sorting a whole morsel to keep 100 rows costs ~8x an O(n) selection and
+        // thrashes cache. So exclude float here and let it fall to the quickselect below —
+        // which the fixed `parallel_top_n` tie-break makes result-identical to this full sort
+        // (`parallel_top_n_float_key_matches_eager`).
+        let is_float = matches!(
+            v.data_type(),
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        );
+        let full = str_sort::stable_sort_indices_str(&v, opts).or_else(|| {
+            (!is_float)
+                .then(|| radix_sort::radix_sort_indices(&v, opts))
+                .flatten()
+        });
+        if let Some(full) = full {
+            let take = k.min(full.len());
+            return Ok(UInt32Array::from_iter_values(
+                full.values().iter().take(take).copied(),
+            ));
+        }
     }
-    // Multi-key top-k: an O(n) `select_nth_unstable_by` (quickselect) over a total-order
-    // row comparator — each ORDER BY key in turn, then the row index. This selects the k
-    // best rows while touching each value directly, avoiding the arrow row-format encode of
-    // *every* row that `lexsort_to_indices(Some(k))` pays regardless of k (that encode was the
-    // dominant, k-independent cost of a multi-key top-N — a `LIMIT 10` cost the same as
-    // `LIMIT 10000`). Because the comparator is a strict total order (the trailing `row index`
-    // tie-break breaks every remaining tie), the selected set is exactly the eager
-    // `(keys, row_index)` sort's top-k — the deterministic order `parallel_top_n`'s global
-    // merge then re-sorts against, so the within-morsel order here is immaterial. Covered by
-    // `parallel_top_n_matches_eager` (heavy ties, nulls, descending) against the eager oracle.
+    // General top-k (multi-key, or a single key with no radix/string fast path): an O(n)
+    // `select_nth_unstable_by` (quickselect) over a total-order row comparator — each ORDER BY
+    // key in turn, then the row index. This selects the k best rows while touching each value
+    // directly, avoiding the arrow row-format encode of *every* row that
+    // `lexsort_to_indices(Some(k))` pays regardless of k (that encode was the dominant,
+    // k-independent cost — a `LIMIT 10` cost the same as `LIMIT 10000`). Because the comparator
+    // is a strict total order (the trailing `row index` tie-break breaks every remaining tie),
+    // the selected *set* is exactly the eager `(keys, row_index)` sort's top-k. The within-morsel
+    // *order* of that set is unstable, which is immaterial because `parallel_top_n` re-sorts the
+    // survivors globally and breaks ties by original `(morsel, row)` — never by this order.
+    // Covered by `parallel_top_n_matches_eager` (int key) and
+    // `parallel_top_n_float_key_matches_eager` (float key with -0.0/NaN/heavy ties).
     use arrow::array::make_comparator;
     use std::cmp::Ordering;
     let n = batch.num_rows();
@@ -709,12 +732,22 @@ pub(crate) fn parallel_top_n(
             }),
         });
     }
+    // Tie-break by the candidate's ORIGINAL position — its source morsel, then its row within
+    // that morsel — NOT by its position in the flattened candidate array. Those differ exactly
+    // when a morsel's `top_k_indices` returns its rows in some order other than ascending row:
+    // the multi-key (and single-key non-radix/non-string) path uses an *unstable* quickselect,
+    // so among rows tied on the key the flatten order is arbitrary. The eager oracle breaks
+    // such ties by original row, so tie-breaking on the flatten position let a different tied
+    // row survive at the same rank — a data-size-dependent wrong answer that only appears with
+    // real ties on the key (a distinct second key hides it). `(morsel, row)` is the original
+    // order, so this matches the oracle regardless of how each morsel selected its candidates.
     sort_columns.push(SortColumn {
-        values: Arc::new(UInt64Array::from_iter_values(0..total as u64)),
-        options: Some(SortOptions {
-            descending: false,
-            nulls_first: false,
-        }),
+        values: Arc::new(morsel_of.clone()),
+        options: Some(SortOptions::default()),
+    });
+    sort_columns.push(SortColumn {
+        values: Arc::new(row_of.clone()),
+        options: Some(SortOptions::default()),
     });
     let winners = lexsort_to_indices(&sort_columns, Some(k))?;
 
@@ -1260,14 +1293,14 @@ mod sort_tests {
 
     /// A **float** single sort key must agree with the eager stable oracle too.
     ///
-    /// Guards the tie order of the one shape with no O(n) single-key path: a float key gets
-    /// neither the string permutation builder nor the radix, so `top_k_indices` full-sorts the
-    /// morsel and slices `k`. That is *slow* (see the perf note on `top_k_indices`) and the
-    /// obvious fix — route it through the multi-key quickselect, which is O(n) — **changes the
-    /// answer**: with `-0.0` and `0.0` present the quickselect surfaced the `0.0` row where the
-    /// stable sort surfaces the earlier `-0.0` row. This test caught that, and exists so the
-    /// next attempt catches it too. Covers heavy ties, both zeros, NaN and nulls, ascending and
-    /// descending, nulls first and last.
+    /// A float key has no O(n) single-key path (neither the string builder nor the radix), so
+    /// `top_k_indices` routes it through the quickselect. That path selects rather than sorts,
+    /// and its within-morsel order is unstable — so this pins that `parallel_top_n` still yields
+    /// the stable sort's exact top-k, which it does because it breaks ties by original
+    /// `(morsel, row)`, not by the quickselect's output order. The bug this guards: with `-0.0`
+    /// and `0.0` present, tie-breaking on candidate-array position (the old code) surfaced the
+    /// `0.0` row where the stable sort surfaces the earlier `-0.0` row. Covers heavy ties, both
+    /// zeros, NaN and nulls, ascending and descending, nulls first and last.
     #[test]
     fn parallel_top_n_float_key_matches_eager() {
         let n = 40_000usize;
