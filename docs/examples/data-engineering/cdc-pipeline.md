@@ -7,7 +7,7 @@ version, a transaction id). That log is delivered at-least-once and it is not in
 
 :::{warning}
 Treat a change log as a snapshot and you will corrupt the target. The rows are not
-duplicates to be dropped and they are not in the order the changes happened; the last row
+duplicates to be dropped and they are not in the order the changes happened. The last row
 in the file is routinely the oldest change in it.
 :::
 
@@ -79,7 +79,7 @@ print(bt.read.parquet(customers).to_pydict())
 ```
 
 `lsn=30` wins over both `lsn=10` and the redelivered `lsn=20`, regardless of where they
-sat in the batch. Note that `lsn` is *stored in the target*. That is not clutter, it is
+sat in the batch. `lsn` is *stored in the target*. That is not clutter, it is
 the whole mechanism: it lets the next batch tell a fresh change from a stale one.
 
 ## The next batch
@@ -163,7 +163,7 @@ Delta table, where the commit is a real transaction.
 
 ## Wiring the real feed
 
-The feed itself comes off Kafka or a Delta change feed. Only the source line changes; the
+The feed itself comes off Kafka or a Delta change feed. Only the source line changes, and the
 `apply_changes` call is the same one you ran above.
 
 ::::{tab-set}
@@ -201,7 +201,7 @@ changes = bt.read.read_change_feed("s3://lake/customers_raw", starting_version=4
 
 :::{tip}
 Store the version or offset you last applied next to the target, not in the job's memory.
-The apply is idempotent, so overlapping a few versions on restart is free — but a gap is
+The apply is idempotent, so overlapping a few versions on restart is free. A gap is
 not, and a gap is what you get when the bookmark lives only in a dead process.
 :::
 

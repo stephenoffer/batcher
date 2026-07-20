@@ -110,15 +110,17 @@ def adaptive_build_side(
     return _rewrite(plan, estimator, cost, decisions, max_bytes, smr), decisions
 
 
-def _broadcast_max_bytes() -> int:
-    """Build-side broadcast threshold in bytes — `OptimizerConfig.broadcast_max_bytes`.
+def _broadcast_max_bytes(l3_cache_bytes: int = 0) -> int:
+    """Build-side broadcast threshold in bytes, resolved against the last-level cache.
 
-    The single source of truth shared with the distributed executor's runtime guard;
-    a function (not an inlined read) so tests can patch the planner's threshold.
+    Delegates to `OptimizerConfig.resolved_broadcast_max_bytes`, so a pinned value wins and an
+    auto (`0`) value is sized to `l3_cache_bytes` — the residency the strategy actually depends
+    on. The single source of truth shared with the distributed executor's runtime guard; a
+    function (not an inlined read) so tests can patch the planner's threshold.
     """
     from batcher.config import active_config
 
-    return active_config().optimizer.broadcast_max_bytes
+    return active_config().optimizer.resolved_broadcast_max_bytes(l3_cache_bytes)
 
 
 def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
@@ -132,8 +134,9 @@ def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
     equivalent physical algorithms, so the result is invariant."""
     if not ctx.sources:
         return plan
-    learned_bmax = learned_broadcast_max_bytes(ctx.hub)
-    max_bytes = learned_bmax if learned_bmax is not None else _broadcast_max_bytes()
+    cache_default = _broadcast_max_bytes(ctx.hardware.l3_cache_bytes)
+    learned_bmax = learned_broadcast_max_bytes(ctx.hub, default=cache_default)
+    max_bytes = learned_bmax if learned_bmax is not None else cache_default
     learned_smr = learned_sort_merge_min_rows(ctx.hub, SORT_MERGE_MIN_ROWS)
     smr = learned_smr if learned_smr is not None else SORT_MERGE_MIN_ROWS
     plan, decisions = adaptive_build_side(

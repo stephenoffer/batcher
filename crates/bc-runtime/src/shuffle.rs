@@ -687,7 +687,16 @@ pub fn salted_partition_by_keys(
         return partition_by_keys(batch, key_indices, num_partitions);
     }
     let n = batch.num_rows();
+    // Canonicalize float keys FIRST, exactly as `bucket_of_rows` does, so both the row
+    // encoding below and the Utf8 hot-key rendering see the same bits the reducer's join
+    // will group by. `RowConverter` gives `-0.0` and `0.0` distinct bytes (and each NaN
+    // payload its own), so without this a probe `-0.0` and a build `0.0` — equal under
+    // IEEE, and matched by `hash_join_indices`, which *does* canonicalize — land on
+    // different reducers and never meet. That is a silent wrong answer on a distributed
+    // float-key join, and salting engages by default once a hot key is known.
     let key_col = batch.column(key_indices[0]).clone();
+    let canon = crate::keys::canonicalize_float_keys(std::slice::from_ref(&key_col));
+    let key_col = canon.map_or(key_col, |mut c| c.remove(0));
     let converter = RowConverter::new(vec![SortField::new(key_col.data_type().clone())])?;
     let rows = converter.convert_columns(std::slice::from_ref(&key_col))?;
     // Hot membership is tested on the string rendering, matching how hot keys were
@@ -1262,6 +1271,73 @@ mod tests {
         for (s, p) in salted.iter().zip(&plain) {
             assert_eq!(s.num_rows(), p.num_rows());
         }
+    }
+
+    #[test]
+    fn salted_partition_canonicalizes_float_keys() {
+        // Regression: `salted_partition_by_keys` hashed the `RowConverter` encoding of the
+        // raw key column, skipping the `-0.0`/NaN folding every other key path applies
+        // (`bucket_of_rows`, the hash/sort-merge/asof joins, the runtime bloom). Arrow's row
+        // format gives `-0.0` and `0.0` distinct bytes, so a probe `-0.0` and a build `0.0` —
+        // equal under IEEE, and joined by the reducer, which *does* canonicalize — were
+        // routed to different reducers and never met. Two distinct NaN payloads split the
+        // same way. Salting is on by default once a hot key is known, so this was a silent
+        // wrong answer on a distributed float-key join, not an opt-in path.
+        let neg_zero = -0.0f64;
+        let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_b = f64::from_bits(0xfff8_0000_0000_0002);
+
+        // `7.0` is the hot key that engages salting; the ±0.0 and NaN rows ride along cold.
+        let mut probe_keys = vec![7.0f64; 12];
+        probe_keys.extend([neg_zero, nan_a]);
+        let probe = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(Float64Array::from(probe_keys)) as ArrayRef,
+        )])
+        .unwrap();
+        let build = RecordBatch::try_from_iter(vec![(
+            "k",
+            Arc::new(Float64Array::from(vec![7.0, 0.0, nan_b])) as ArrayRef,
+        )])
+        .unwrap();
+
+        let n = 8usize;
+        let hot: HashSet<String> = ["7.0".to_string()].into_iter().collect();
+        let probe_parts = salted_partition_by_keys(&probe, &[0], n, &hot, 4, false).unwrap();
+        let build_parts = salted_partition_by_keys(&build, &[0], n, &hot, 4, true).unwrap();
+
+        // Count join pairs under the engine's key identity: `-0.0 == 0.0`, and NaN is equal
+        // to itself regardless of payload (what `canonicalize_float_keys` encodes).
+        fn pairs(probe: &RecordBatch, build: &RecordBatch) -> usize {
+            let f = |b: &RecordBatch| {
+                let a = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
+            };
+            let (p, b) = (f(probe), f(build));
+            p.iter()
+                .map(|x| {
+                    b.iter()
+                        .filter(|y| x == *y || (x.is_nan() && y.is_nan()))
+                        .count()
+                })
+                .sum()
+        }
+
+        let global = pairs(&probe, &build);
+        let salted: usize = probe_parts
+            .iter()
+            .zip(&build_parts)
+            .map(|(p, b)| pairs(p, b))
+            .sum();
+        assert_eq!(
+            salted, global,
+            "salted float-key join must equal the unsalted join \
+             (-0.0/0.0 and distinct NaN payloads must co-partition)"
+        );
     }
 
     #[test]

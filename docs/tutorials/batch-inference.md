@@ -97,7 +97,7 @@ labeled.write.parquet("output/labeled.parquet")
 
 ## Controlling batching and resources
 
-`map_batches` accepts knobs that tune throughput and placement:
+`map_batches` accepts any of the following arguments to tune throughput and placement:
 
 - `batch_size`: rows per batch handed to `fn`.
 - `output_columns`: declares the columns `fn` adds, when the engine should know the
@@ -118,6 +118,10 @@ same call outright.
 :::
 
 ## What you learned
+
+A batch function takes an Arrow `RecordBatch` and returns one, so no per-row Python runs.
+Pass a class rather than an instance and the model loads once per worker. `batch_size`,
+`num_gpus`, and `concurrency` are declared on the call itself. Where to go next:
 
 ::::{grid} 1 3 3 3
 :gutter: 3

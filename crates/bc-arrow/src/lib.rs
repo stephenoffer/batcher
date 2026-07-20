@@ -21,7 +21,7 @@ pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub use arrow::error::ArrowError;
 
 mod hardware;
-pub use hardware::{HardwareProfile, SimdOverride};
+pub use hardware::{usable_cores, HardwareProfile, SimdOverride};
 
 pub mod float_ident;
 pub use float_ident::{

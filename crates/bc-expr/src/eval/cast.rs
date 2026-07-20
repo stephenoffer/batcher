@@ -407,10 +407,17 @@ fn parse_string_to_int(
     Ok(merged)
 }
 
-/// Cast a `Float16`/`Float32`/`Float64` array to a string `target`, normalizing the two cases
-/// where arrow's formatter disagrees with DuckDB: a NaN renders as `nan` (not `NaN`) and a
-/// negative zero renders as `0.0` (not `-0.0`). Every other value keeps arrow's
-/// shortest-round-trip string. Nulls pass through.
+/// Cast a `Float16`/`Float32`/`Float64` array to a string `target`, normalizing the one case
+/// where arrow's formatter disagrees with DuckDB: a NaN renders as `nan`, not `NaN`. Every
+/// other value keeps arrow's shortest-round-trip string. Nulls pass through.
+///
+/// A negative zero keeps its sign. This previously rendered `-0.0` as `0.0`, on the stated
+/// grounds that DuckDB does — which is true only of a *constant-folded literal*
+/// (`SELECT (-0.0)::VARCHAR` → `0.0`, because the parser folds the sign away). For an actual
+/// `-0.0` in a column, DuckDB emits `-0.0`, as do Polars, Arrow's own formatter, and Python's
+/// `str`. The engine folds `-0.0` to `0.0` for *key identity* (grouping, joins, ordering);
+/// that is about which rows are equal, not about how a value is displayed, and `sign(x)` and
+/// `1/x` still distinguish the two. Rendering it away lost information every oracle keeps.
 fn float_to_string(
     arr: &ArrayRef,
     target: &arrow::datatypes::DataType,
@@ -429,8 +436,6 @@ fn float_to_string(
         let v = f.value(i);
         if v.is_nan() {
             "nan".to_string()
-        } else if v == 0.0 && v.is_sign_negative() {
-            "0.0".to_string()
         } else {
             s.to_string()
         }
@@ -781,11 +786,17 @@ mod float_to_string_tests {
     use arrow::array::{Float64Array, StringArray};
     use arrow::datatypes::DataType;
 
-    /// DuckDB renders a float NaN as `nan` and a negative zero as `0.0`, where arrow's
-    /// formatter emits `NaN` and `-0.0`. Every ordinary value keeps arrow's (DuckDB-matching)
+    /// DuckDB renders a float NaN as `nan`, where arrow's formatter emits `NaN`; that one
+    /// case is normalized. Every ordinary value keeps arrow's (DuckDB-matching)
     /// shortest-round-trip string, and nulls pass through.
+    ///
+    /// A negative zero keeps its sign. This test previously pinned `-0.0` → `"0.0"`, on the
+    /// stated grounds that DuckDB does that — but DuckDB only renders `0.0` for a
+    /// *constant-folded literal*; given a real `-0.0` in a column it emits `-0.0`, and so do
+    /// Polars, Arrow and Python. The `-0.0`/`0.0` fold is a *key identity* rule (which rows
+    /// are equal), not a display rule.
     #[test]
-    fn float_to_string_normalizes_nan_and_negative_zero() {
+    fn float_to_string_normalizes_nan_and_keeps_signed_zero() {
         let src: ArrayRef = Arc::new(Float64Array::from(vec![
             Some(f64::NAN),
             Some(-0.0),
@@ -806,7 +817,7 @@ mod float_to_string_tests {
             got,
             vec![
                 Some("nan"),
-                Some("0.0"),
+                Some("-0.0"), // the sign survives; only NaN's spelling is normalized
                 Some("0.0"),
                 Some("0.1"),
                 Some("-2.5"),

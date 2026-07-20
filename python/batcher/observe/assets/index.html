@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Batcher</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>▚</text></svg>">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<!-- Three top-level destinations. Pipeline and Run are *drill-downs*, reached by clicking
+     through and tracked in the breadcrumb — not tabs, because "the pipeline" and "the run"
+     only mean something once you have chosen one. -->
+<header class="topbar">
+  <div class="brand"><span class="mark" aria-hidden="true">▚</span><span class="name">Batcher</span></div>
+  <nav class="viewnav" role="tablist" aria-label="Sections">
+    <button class="viewtab is-active" data-view="pipelines" role="tab" aria-selected="true">Pipelines</button>
+    <button class="viewtab" data-view="logs" role="tab" aria-selected="false">Logs</button>
+    <button class="viewtab" data-view="system" role="tab" aria-selected="false">System</button>
+    <button class="viewtab" data-view="learn" role="tab" aria-selected="false">Learn</button>
+  </nav>
+  <div class="topbar-right">
+    <span class="hint" id="idle-hint" hidden>idle · every 5s</span>
+    <button id="palette-open" class="ghost" type="button" title="Command palette (Ctrl/Cmd K)" aria-label="Open the command palette"><span aria-hidden="true">⌘K</span></button>
+    <button id="refresh" class="ghost" type="button" title="Refresh now (r)" aria-label="Refresh now"><span aria-hidden="true">⟳</span></button>
+    <button id="pause" class="ghost" type="button" aria-pressed="false" title="Pause auto-refresh (space)" aria-label="Pause auto-refresh"><span aria-hidden="true">❚❚</span></button>
+    <button id="help" class="ghost" type="button" aria-pressed="false" title="Explain the terms (?)" aria-label="Toggle inline explanations"><span aria-hidden="true">?</span></button>
+    <span id="conn" class="pill">connecting</span>
+    <button id="theme" class="ghost" type="button" title="Theme (t)" aria-label="Switch theme"><span aria-hidden="true">◐</span></button>
+  </div>
+</header>
+
+<div id="error-banner" class="banner is-critical" hidden role="alert">
+  <span>Lost contact with the engine. <span id="error-text" class="mono dim"></span></span>
+  <button id="retry" class="ghost" type="button">Retry</button>
+</div>
+
+<!-- The trail down: All pipelines › this pipeline › this run. Always shows where you are
+     and always offers the way back up. -->
+<nav id="crumbs" class="crumbs" aria-label="Breadcrumb" hidden></nav>
+<div id="recent-rail" class="recent-rail" aria-label="Recently viewed" hidden></div>
+
+<main id="main">
+
+<!-- ══════════ 1. ALL PIPELINES — the landing page ══════════
+     Everything engine-wide lives here and only here: health, the session KPIs, and the
+     list of every pipeline. This replaces the old split between "Overview" and
+     "Pipelines", which showed two halves of the same question on two screens. -->
+<section id="view-pipelines" class="view is-active" aria-label="All pipelines">
+  <div id="health-banner" class="health"></div>
+
+  <div class="kpis">
+    <div class="kpi"><span class="kpi-label">Pipelines<button class="helptip" type="button" data-term="pipeline" aria-label="What does pipelines mean?"><span aria-hidden="true">?</span></button></span><span class="kpi-value" id="k-pipelines">—</span><span class="kpi-note">distinct queries</span></div>
+    <div class="kpi"><span class="kpi-label">Runs<button class="helptip" type="button" data-term="run" aria-label="What does runs mean?"><span aria-hidden="true">?</span></button></span><span class="kpi-value" id="k-queries">—</span><span class="kpi-note">this session</span></div>
+    <div class="kpi"><span class="kpi-label">Running</span><span class="kpi-value" id="k-running">—</span><span class="kpi-note">in flight</span></div>
+    <div class="kpi"><span class="kpi-label">Rows / sec<button class="helptip" type="button" data-term="throughput" aria-label="What does rows / sec mean?"><span aria-hidden="true">?</span></button></span><span class="kpi-value" id="k-rate">—</span><span class="kpi-note">finished runs</span></div>
+    <div class="kpi"><span class="kpi-label">p50<button class="helptip" type="button" data-term="p50" aria-label="What does p50 mean?"><span aria-hidden="true">?</span></button></span><span class="kpi-value" id="k-median">—</span><span class="kpi-note">typical run</span></div>
+    <div class="kpi"><span class="kpi-label">p95<button class="helptip" type="button" data-term="p95" aria-label="What does p95 mean?"><span aria-hidden="true">?</span></button></span><span class="kpi-value" id="k-p95">—</span><span class="kpi-note" id="k-p95-note">—</span></div>
+    <div class="kpi"><span class="kpi-label">Spilled<button class="helptip" type="button" data-term="spill" aria-label="What does spilled mean?"><span aria-hidden="true">?</span></button></span><span class="kpi-value" id="k-spill">—</span><span class="kpi-note">to disk</span></div>
+    <div class="kpi"><span class="kpi-label">Failed</span><span class="kpi-value" id="k-failed">—</span><span class="kpi-note">this session</span></div>
+  </div>
+
+  <div class="col2">
+    <section class="panel" data-panel="throughput"><div class="panel-head"><h2>Throughput</h2><span class="hint">whole session</span></div>
+      <div class="panel-body"><div id="throughput"></div></div></section>
+    <section class="panel" data-panel="attention"><div class="panel-head"><h2>Needs attention <span class="badge" id="attention-count">0</span></h2></div>
+      <div class="panel-body"><div id="attention" class="insights"></div></div></section>
+  </div>
+
+  <section class="panel section-gap">
+    <div class="toolbar panel-head">
+      <h2>All pipelines <span class="badge" id="pipeline-count">0</span></h2>
+      <div class="toolbar-controls">
+        <input id="pipeline-filter" class="filter" type="search" placeholder="Filter…" aria-label="Filter pipelines">
+        <select id="pipeline-sort" class="filter" aria-label="Sort pipelines">
+          <option value="time">Most total time</option>
+          <option value="slowest">Slowest typical</option>
+          <option value="runs">Most runs</option>
+          <option value="recent">Most recent</option>
+          <option value="name">Name</option>
+        </select>
+        <div class="segmented" role="group" aria-label="Layout">
+          <button id="lay-cards" class="seg is-on" type="button" aria-pressed="true">Cards</button>
+          <button id="lay-table" class="seg" type="button" aria-pressed="false">Table</button>
+        </div>
+        <button id="clear-filters" class="ghost" type="button" hidden>Clear filters</button>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="cards" id="pipeline-cards"></div>
+      <div id="pipeline-table" class="scroll-x" hidden></div>
+      <p id="pipelines-empty" class="empty">No pipelines yet. Run a query and it appears here.</p>
+    </div>
+  </section>
+
+  <div class="col2 section-gap">
+    <section class="panel" data-panel="rollup"><div class="panel-head"><h2>Cost by step type</h2><span class="hint">which kinds of work cost most</span></div>
+      <div class="panel-body"><div id="op-rollup"></div></div></section>
+    <section class="panel" data-panel="split"><div class="panel-head"><h2>Cost by pipeline</h2><span class="hint">which queries cost most</span></div>
+      <div class="panel-body"><div id="time-split"></div></div></section>
+  </div>
+
+  <section class="panel section-gap" data-panel="failures">
+    <div class="panel-head"><h2>Failures <span class="badge" id="failure-count">0</span></h2>
+      <span class="hint">grouped by cause</span></div>
+    <div class="panel-body"><div id="failures" class="insights"></div></div>
+  </section>
+</section>
+
+<!-- ══════════ 2. ONE PIPELINE ══════════
+     A page about a single query shape: how it behaves over time, and every run of it.
+     Nothing engine-wide appears here — that was the muddle. -->
+<section id="view-pipeline" class="view" aria-label="Pipeline">
+  <header class="page-head">
+    <div>
+      <h1 id="p-title">Pipeline</h1>
+      <p id="p-sub" class="page-sub"></p>
+    </div>
+    <div class="head-actions">
+      <span id="p-verdict" class="verdict" hidden></span>
+      <button id="p-pin" class="ghost" type="button" title="Pin this pipeline">★ Pin</button>
+      <button id="p-compare" class="ghost" type="button" title="Compare its fastest and slowest run">Compare extremes</button>
+    </div>
+  </header>
+
+  <div id="p-strip" class="statstrip"></div>
+
+  <div class="col2 section-gap">
+    <section class="panel"><div class="panel-head"><h2>Duration over time</h2><span class="hint">oldest → newest</span></div>
+      <div class="panel-body"><div id="p-trend"></div></div></section>
+    <section class="panel"><div class="panel-head"><h2>Spread</h2><span class="hint">how consistent it is</span></div>
+      <div class="panel-body"><div id="p-spread"></div></div></section>
+  </div>
+
+  <!-- The pipeline's own plan graph, annotated with typical rather than one-off costs. -->
+  <section class="panel section-gap" data-panel="p-dag">
+    <div class="panel-head">
+      <h2>Plan</h2>
+      <div class="head-actions">
+        <label class="toggle"><input type="checkbox" id="p-dag-critical" checked> Critical path</label>
+        <button id="p-dag-fit" class="ghost" type="button">Fit</button>
+        <span class="zoom" id="p-dag-zoom">100%</span>
+      </div>
+    </div>
+    <div class="panel-body">
+      <p class="hint" id="p-dag-note"></p>
+      <div class="dag-wrap">
+        <svg id="p-dag" class="dag" role="img" aria-label="Pipeline plan graph"></svg>
+        <p class="dag-hint">Drag to pan · scroll to zoom · click a step</p>
+      </div>
+      <div class="legend" id="p-dag-legend"></div>
+    </div>
+  </section>
+
+  <!-- Runs x steps: the one view that shows a step's behaviour across runs. -->
+  <section class="panel section-gap" data-panel="p-grid">
+    <div class="panel-head"><h2>Step history</h2><span class="hint">every run as a column, shaded against each step’s median</span></div>
+    <div class="panel-body"><div id="p-grid"></div></div>
+  </section>
+
+  <section class="panel section-gap" data-panel="p-report">
+    <div class="panel-head"><h2>What holds across runs</h2><span class="hint">the pattern, not one run</span></div>
+    <div class="panel-body"><div id="p-report"></div></div>
+  </section>
+
+  <section class="panel section-gap">
+    <div class="panel-head">
+      <h2>Runs <span class="badge" id="p-run-count">0</span></h2>
+      <div class="chiprow is-inline">
+        <button class="status-chip" data-status="ok" type="button" aria-pressed="false">ok</button>
+        <button class="status-chip" data-status="error" type="button" aria-pressed="false">failed</button>
+        <button class="status-chip" data-status="running" type="button" aria-pressed="false">running</button>
+      </div>
+    </div>
+    <div class="scroll-x"><div id="p-runs"></div></div>
+  </section>
+</section>
+
+<!-- ══════════ 3. ONE RUN ══════════
+     Only this run. The run *list* moved to the pipeline page where it belongs; moving
+     between runs is now prev/next within the pipeline, which is what people actually do. -->
+<section id="view-run" class="view" aria-label="Run detail">
+  <header class="page-head">
+    <div class="detail-title">
+      <h1 id="d-title">Select a run</h1>
+      <span id="d-sub" class="detail-sub"></span>
+    </div>
+    <div class="head-actions">
+      <span id="d-verdict" class="verdict" hidden></span>
+      <div class="segmented" role="group" aria-label="Move between runs of this pipeline">
+        <button id="run-prev" class="seg" type="button" title="Previous run (j)" aria-label="Previous run"><span aria-hidden="true">‹</span></button>
+        <span id="run-position" class="seg is-label">—</span>
+        <button id="run-next" class="seg" type="button" title="Next run (k)" aria-label="Next run"><span aria-hidden="true">›</span></button>
+      </div>
+      <button id="copy-id" class="ghost" type="button" title="Copy the run id">id</button>
+      <button id="copy-link" class="ghost" type="button" title="Copy a link to this view">link</button>
+      <button id="export-run" class="ghost" type="button" title="Download this run as JSON">JSON</button>
+    </div>
+  </header>
+
+  <div id="related" class="related" aria-label="Other runs of this pipeline" hidden></div>
+  <p id="d-story" class="story" hidden></p>
+  <div id="d-timebar" class="timebar" hidden></div>
+  <div id="d-strip" class="statstrip" hidden></div>
+
+  <div class="panel section-gap">
+    <!-- Five sections, not nine. Plan/Timeline/Operators were three tabs over the *same*
+         per-step data, so they are one section with a rendering switch; Decisions folds into
+         Insights (both answer "what did the engine conclude") and Raw into Details. -->
+    <nav class="tabs" role="tablist" aria-label="Run detail sections">
+      <button class="tab is-active" data-tab="steps" role="tab" aria-selected="true">Steps</button>
+      <button class="tab" data-tab="insights" role="tab" aria-selected="false">Findings <span class="badge" id="insight-count" hidden>0</span></button>
+      <button class="tab" data-tab="compare" role="tab" aria-selected="false">Compare</button>
+      <button class="tab" data-tab="logs" role="tab" aria-selected="false">Logs</button>
+      <button class="tab" data-tab="meta" role="tab" aria-selected="false">Details</button>
+    </nav>
+
+    <!-- One dataset, three renderings. A graph shows shape, a timeline shows overlap, a
+         table ranks. Switching between them must not feel like changing subject. -->
+    <div class="pane-switch" id="steps-switch" role="group" aria-label="How to show the steps">
+      <button class="seg is-on" data-steps="plan" type="button" aria-pressed="true">Graph</button>
+      <button class="seg" data-steps="timeline" type="button" aria-pressed="false">Timeline</button>
+      <button class="seg" data-steps="operators" type="button" aria-pressed="false">Table</button>
+    </div>
+
+    <div class="panel-body">
+      <div id="tab-plan" class="tabpane is-active">
+        <div class="explorer">
+          <div class="explorer-main">
+            <div class="dag-toolbar">
+              <input id="dag-search" class="filter" type="search" placeholder="Find a step…" aria-label="Find a step">
+              <label class="toggle"><input type="checkbox" id="dag-critical" checked> Critical path</label>
+              <label class="toggle"><input type="checkbox" id="dag-focus"> Focus</label>
+              <label class="toggle"><input type="checkbox" id="dag-minimap" checked> Minimap</label>
+              <span class="spacer"></span>
+              <button id="dag-full" class="ghost" type="button" title="Expand the graph" aria-label="Expand the graph"><span aria-hidden="true">⤢</span></button>
+              <button id="dag-fit" class="ghost" type="button" title="Fit to view (f)">Fit</button>
+              <button id="dag-reset" class="ghost" type="button" title="Undo moved boxes">Reset</button>
+              <span class="zoom" id="dag-zoom">100%</span>
+            </div>
+            <div class="dag-wrap">
+              <svg id="dag" class="dag" role="img" aria-label="Plan graph"></svg>
+              <div class="minimap" id="minimap" aria-hidden="true"></div>
+              <p class="dag-hint">Drag to pan · scroll to zoom · click a step · arrow keys to walk</p>
+            </div>
+            <div class="legend" id="dag-legend"></div>
+            <!-- Ranked before drawn: the fastest route to "which step is the problem" is a
+                 sorted list, not a graph you have to scan. The graph explains the shape; this
+                 answers the question. Selection is shared between the two. -->
+            <section class="panel section-gap" id="costliest-panel">
+              <div class="panel-head">
+                <h2>Slowest steps</h2>
+                <span class="hint">ranked by share of operator time · click to select in the graph</span>
+              </div>
+              <div id="costliest" class="costliest"></div>
+            </section>
+          </div>
+          <aside class="inspector" id="inspector"></aside>
+        </div>
+      </div>
+
+      <div id="tab-timeline" class="tabpane"><div id="timeline" class="timeline"></div></div>
+      <div id="tab-operators" class="tabpane">
+        <div class="pane-actions"><button id="export-ops" class="ghost" type="button">Download CSV</button></div>
+        <div id="operators" class="scroll-x"></div>
+      </div>
+      <div id="tab-insights" class="tabpane"><div id="insights" class="insights"></div></div>
+      <div id="tab-decisions" class="tabpane"><span id="decision-count" hidden>0</span><div id="decisions" class="decisions"></div></div>
+      <div id="tab-compare" class="tabpane">
+        <div class="pane-actions">
+          <label class="toggle">Compare against
+            <select id="compare-pick" class="filter" aria-label="Run to compare against"></select>
+          </label>
+        </div>
+        <div id="compare" class="scroll-x"></div>
+      </div>
+      <div id="tab-logs" class="tabpane"><div id="run-logs" class="logs is-inline"></div></div>
+      <div id="tab-meta" class="tabpane"><div id="meta" class="meta"></div></div>
+      <div id="tab-raw" class="tabpane"><pre id="raw-json" class="raw"></pre></div>
+      <p id="d-empty" class="empty">Pick a run from a pipeline.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════ LOGS ══════════ -->
+<section id="view-logs" class="view" aria-label="Logs">
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Engine log <span class="badge" id="log-count" aria-live="polite" aria-atomic="true">0</span></h2>
+      <div class="logctl">
+        <select id="log-level" class="filter" aria-label="Minimum level">
+          <option value="DEBUG">Debug and above</option>
+          <option value="INFO" selected>Info and above</option>
+          <option value="WARNING">Warnings and errors</option>
+          <option value="ERROR">Errors only</option>
+        </select>
+        <input id="log-filter" class="filter" type="search" placeholder="Search…" aria-label="Search the log">
+        <label class="follow"><input id="log-regex" type="checkbox"> regex</label>
+        <label class="follow"><input id="log-follow" type="checkbox" checked> follow</label>
+        <button id="log-export" class="ghost" type="button">CSV</button>
+        <button id="log-clear" class="ghost" type="button" title="Clear the local view only">Clear</button>
+      </div>
+    </div>
+    <!-- Volume over time, stacked by level. The single most useful thing above a log list:
+         it answers "when did this start" before you read a line, and dragging a range is
+         faster than typing a timestamp. -->
+    <div class="log-histo" id="log-histo-wrap">
+      <svg id="log-histo" class="log-histo-svg" role="img"
+           aria-label="Log volume over time, by level"></svg>
+      <div class="log-histo-axis"><span id="log-histo-from"></span><span id="log-histo-to"></span></div>
+      <button id="log-histo-clear" class="linkish" type="button" hidden>Clear time filter</button>
+    </div>
+    <!-- Filters the already-loaded lines in the browser, distinct from the query above.
+         Two-tier search: narrow the fetch, then narrow what you are staring at. -->
+    <div class="log-subbar">
+      <input id="log-in-results" class="filter" type="search" placeholder="Filter these results…"
+             aria-label="Filter the loaded results">
+      <span id="log-active-filters" class="chiprow is-inline"></span>
+      <span class="spacer"></span>
+      <span id="log-shown" class="hint"></span>
+    </div>
+    <!-- New lines buffer behind a button rather than being prepended under the reader's
+         cursor. Auto-prepending makes a line you are mid-way through reading jump away. -->
+    <button id="log-new" class="log-new" type="button" hidden></button>
+    <div id="logs" class="logs" role="log" aria-live="polite"></div>
+  </section>
+</section>
+
+<!-- ══════════ SYSTEM ══════════ -->
+<section id="view-system" class="view" aria-label="System">
+  <p class="lede">The machine and settings every timing here is relative to.
+    A 400&nbsp;ms aggregate means something different on 4 cores than on 96.</p>
+  <div class="cards" id="system-cards"></div>
+</section>
+</main>
+
+<div id="scrim" class="scrim" hidden></div>
+
+<div id="modal-palette" class="modal" hidden role="dialog" aria-modal="true" aria-label="Command palette">
+  <input id="palette-input" class="palette-input" type="text" placeholder="Jump to a pipeline, run, or action…" aria-label="Command palette">
+  <ul id="palette-list" class="palette-list" role="listbox"></ul>
+</div>
+
+<div id="modal-shortcuts" class="modal is-sheet" hidden role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+  <div class="modal-head"><h2>Keyboard shortcuts</h2><button class="ghost" data-close-modal type="button">Close</button></div>
+  <!-- Generated from the ACTIONS registry in app.js. Hand-writing this list meant every new
+       shortcut silently went undocumented and every changed key made the overlay lie. -->
+  <div class="shortcuts" id="shortcuts-list"></div>
+  <div class="shortcuts-context">
+    <h3>While a plan graph is open</h3>
+    <div class="shortcuts">
+      <div><kbd>&#8593;</kbd> <kbd>&#8595;</kbd> <kbd>&#8592;</kbd> <kbd>&#8594;</kbd><span>Walk the plan (up/down the flow, left/right across a row)</span></div>
+      <div><kbd>Esc</kbd><span>Deselect</span></div>
+    </div>
+  </div>
+</div>
+
+<section id="view-learn" class="view" aria-label="Reference">
+  <div class="page-head">
+    <div>
+      <h1>Learn</h1>
+      <p class="page-sub">What every term, step, and number on this dashboard means.</p>
+    </div>
+    <div class="head-actions">
+      <input id="learn-search" class="filter" type="search" placeholder="Search the reference…"
+             aria-label="Search the reference" autocomplete="off">
+      <button id="learn-tour" class="ghost" type="button">Take the tour</button>
+    </div>
+  </div>
+  <p class="lede">New to the engine? Start with <b>How do I…</b> — the tasks people actually
+    arrive with. <b>Plan steps</b> explains each operator and why it might be the slow one.
+    The <b>glossary</b> defines every term. Anywhere else on the dashboard, a dotted word can
+    be clicked for the same definition without leaving the page.</p>
+  <div id="learn-body"></div>
+</section>
+
+<div id="live-region" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="tip" class="tip" role="tooltip" hidden></div>
+
+<script src="/ui.js"></script>
+<script src="/reference.js"></script>
+<script src="/dag.js"></script>
+<script src="/learn.js"></script>
+<script src="/views.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

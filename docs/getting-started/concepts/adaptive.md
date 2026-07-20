@@ -1,19 +1,26 @@
 # Adaptive re-optimization
 
-Kyber, the optimizer, does not plan once and commit. At a **pipeline breaker** (a sort,
-an aggregate, a join build) the engine has just *measured* the data it produced: real
-row counts, real memory, real timings. It feeds those numbers back and re-plans the
-rest of the query on them, rather than on the static estimates it started with.
+Kyber, the optimizer, doesn't plan once and commit. A *pipeline breaker* is an operator
+that must materialize before the next one starts, such as a sort, an aggregate, or a
+join build. At each one the engine has already *measured* the data it produced: real row
+counts, real memory, real timings. It feeds those numbers back and re-plans the rest of
+the query on them, rather than on the static estimates it started with.
 
 The classic way a query goes wrong is a bad estimate. A filter expected to cut 90% of
 rows cuts 5%. A join's "small" side turns out huge. A static optimizer commits to the
 plan built from those guesses and runs it to the end, which is how jobs stall or run
 out of memory. Batcher corrects mid-flight.
 
-For comparison, DuckDB plans once, before execution. Spark AQE does re-plan, but only
-at stage boundaries. Continuous re-optimization *inside* a running query is what
-neither can retrofit, and it is why a query that starts on a bad estimate can still
-finish fast and within memory.
+For comparison, DuckDB plans once, before execution. Spark AQE re-plans at stage
+boundaries, and so does Batcher: it's the same mechanism at the same granularity, with
+the difference that Batcher does it single-node too. The loop also stays off below
+20,000,000 input rows, so most queries never reach it.
+
+The half with no equivalent elsewhere is what happens between runs. Batcher records what
+each query actually did into a sketch-backed store, so the next run plans against
+measured history rather than estimates alone.
+
+![Two feedback loops. Within one query, Batcher plans, executes a stage to a pipeline breaker, measures the real cardinalities, and re-plans the remaining stages, which is stage-boundary re-optimization at Spark AQE's granularity and gated off below 20 million input rows. Across runs, it records what happened as sketches into the MetadataHub so the next run plans better.](../../_static/diagrams/adaptive_loop.svg)
 
 ## A bad estimate, corrected
 

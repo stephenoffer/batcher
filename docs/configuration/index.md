@@ -1,11 +1,8 @@
 # Configuration
 
-Most of the time you don't configure Batcher at all — the defaults are tuned to
-saturate your cores and stay within memory on their own. When you do need to tune
-something (a memory limit, the thread count, how aggressively to spill), every knob
-lives on one `Config` object: a typed, immutable dataclass grouped by concern
-(`execution`, `memory`, `flow_control`, `optimizer`, `pid`, `metadata`). No global
-mutable state, no dict of loose keys — you build a `Config`, then make it active.
+This page describes how to build a Batcher `Config`, make it active, and load one from the environment or a file.
+
+Most of the time you don't configure Batcher at all. The defaults are tuned to saturate your cores and stay within memory on their own. When you do need to tune a memory limit, the thread count, or how aggressively the engine spills, every knob lives on one `Config` object. It's a typed, immutable dataclass grouped by concern: `execution`, `memory`, `flow_control`, `optimizer`, `pid`, `metadata`, `distributed`, and `observability`. There's no global mutable state and no dict of loose keys. You build a `Config`, then make it active.
 
 ```python
 import batcher as bt
@@ -62,23 +59,34 @@ print(result)
 
 `Config.from_env()` overlays `BATCHER_*` environment variables onto a base config.
 `Config.from_file(path)` overlays a JSON document. Both return a new `Config` and
-leave their input untouched. See [environment](environment.md) for variable naming
+leave their input untouched. See {doc}`environment` for variable naming
 and the file format.
 
 ## Precedence
 
-When the engine resolves the active config, layers apply highest first:
+When the engine resolves the active config, the layers apply highest first:
 
-1. `config_context(...)` (the innermost active context)
-2. `set_config(...)` (process-wide)
-3. `BATCHER_*` environment variables
-4. A JSON file named by `BATCHER_CONFIG_FILE`
-5. Built-in defaults
+1. `config_context(...)`, the innermost active context.
+1. `set_config(...)`, process-wide.
+1. `BATCHER_*` environment variables.
+1. A JSON file named by `BATCHER_CONFIG_FILE`.
+1. Built-in defaults.
 
 The environment and file layers are read once when `batcher` is imported.
 `set_config` and `config_context` override them at runtime.
 
 ## In this section
+
+{doc}`options` is the field-by-field reference, {doc}`environment` covers the `BATCHER_*` variables and the JSON file format, and {doc}`profiles` shows worked configurations for common deployments.
+
+## See also
+
+:::{seealso}
+- {doc}`../user-guide/performance`: which of these options matter when a query is slow.
+- {doc}`../user-guide/caching`: the result cache and the options that bound it.
+- {doc}`../deep-dives/buffer-pool`: what the memory options actually govern.
+- {doc}`../api/configuration`: the configuration objects as an API surface.
+:::
 
 ```{toctree}
 :maxdepth: 1

@@ -141,11 +141,11 @@ repeat harmless. That is the trade worth taking almost every time.
 
 Discovery is per *file*, keyed by path. A producer that rewrites `part-0.parquet` in
 place with new contents will not be re-read: the path is already marked. If your
-upstream mutates files, this pattern is the wrong one; read a change feed instead (see
+upstream mutates files, this pattern is the wrong one. Read a change feed instead (see
 [CDC pipeline](cdc-pipeline.md)).
 
 `state_dir` is single-writer. Two ingest jobs pointed at one landing zone and one state
-directory will race on the SQLite store. Give each consumer its own `state_dir`; they
+directory will race on the SQLite store. Give each consumer its own `state_dir`, and they
 are cheap, and separate consumers of the same directory is exactly what separate stores
 are for.
 

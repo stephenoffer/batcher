@@ -1,9 +1,13 @@
 # The buffer pool
 
+The *buffer pool* is the single process-wide account of how many bytes the engine has
+outstanding. Every allocation of consequence reserves against it before allocating. This
+page describes the reservation contract, the pressure levels every backpressure mechanism
+reads, cooperative spilling, and where the pool's limit comes from.
+
 Two operators, each estimating its own memory, each deciding independently that it has
-room, will together exceed the machine. That is the whole problem. An engine needs one
-place that knows how many bytes are outstanding, and every allocation of consequence has
-to go through it.
+room, will together exceed the machine. That's the whole problem, and one shared counter
+is the answer to it.
 
 Batcher's is `MemoryPool`, in `crates/bc-resource/src/lib.rs`. It is deliberately the
 smallest crate at the bottom of the DAG (`std` plus `thiserror`, no Arrow, no IR), so
@@ -16,7 +20,7 @@ depending on the other. The design is DataFusion's `MemoryPool` / `MemoryReserva
 
 :::{important}
 A caller reserves bytes *before* it allocates them, and a reservation that would push the pool
-past its limit fails. That is the whole contract, and it only works if everything of consequence
+past its limit fails. That's the whole contract, and it only works if everything of consequence
 honors it. An operator that allocates first and reserves afterwards has already put the process
 over the line by the time the pool hears about it.
 :::
@@ -30,12 +34,12 @@ pub fn release_bytes(&self, bytes: usize)
 
 `try_reserve_bytes` is a compare-and-swap loop on an `AtomicUsize`, with a
 `saturating_add`, and it returns `ResourceError::Exhausted { requested, available, limit }`
-*without mutating* on failure. `release_bytes` clamps at zero, so a double release cannot
+*without mutating* on failure. `release_bytes` clamps at zero, so a double release can't
 underflow the counter into a pool that thinks it has 18 exabytes free.
 
-`MemoryReservation` is the RAII handle: `size()`, `try_grow()` (which leaves the
-reservation unchanged if it cannot), `shrink()`, `free()`, and a `Drop` that releases
-whatever remains. An operator that panics does not leak its budget.
+`MemoryReservation` is the RAII handle. It offers `size()`, `try_grow()` which leaves the
+reservation unchanged when it can't grow, `shrink()`, `free()`, and a `Drop` that releases
+whatever remains. An operator that panics doesn't leak its budget.
 
 The pool itself is policy-free. It accounts and it admits. Every decision about what to
 *do* when a reservation fails lives above it.
@@ -43,11 +47,11 @@ The pool itself is policy-free. It accounts and it admits. Every decision about 
 ## Pressure
 
 `used / limit` is coarsened into levels, and this is the one signal every backpressure
-mechanism reads: proactive spill, the morsel-admission gate, the shuffle credit window. They
-cannot invent disagreeing thresholds.
+mechanism reads: proactive spill, the morsel-admission gate, and the shuffle credit window.
+They can't invent disagreeing thresholds.
 
 ```text
-   memory.max_memory_bytes — auto-sensed once at the terminal op, cgroup-aware,
+   memory.max_memory_bytes: auto-sensed once at the terminal op, cgroup-aware,
                              then frozen for the query
    ┌────────────────────────────────────────────────────────────────────┐  100%
    │                                                                    │
@@ -60,7 +64,7 @@ cannot invent disagreeing thresholds.
    ├─ soft_limit × 0.9    0.765 ───────────────────────────────────────►│  ELEVATED
    │     trim the result cache; narrow the in-flight window             │
    │                                                                    │
-   │     NORMAL — no throttling                                         │
+   │     NORMAL: no throttling                                          │
    │                                                                    │
    └────────────────────────────────────────────────────────────────────┘  0%
 
@@ -74,9 +78,13 @@ cannot invent disagreeing thresholds.
 pub enum Pressure { Nominal, Elevated, Critical }
 ```
 
-`Critical` is `used >= limit`. `Elevated` is `used >= limit * soft_bps / 10_000`, with
-`soft_bps` seeded to 8000 (80%) and overridden by Carbonite via `set_soft_fraction`.
-`Elevated` exists so an operator can spill *proactively*, before the hard cap forces a stall.
+`Critical` is `used >= limit`. `Elevated` is `used >= limit * soft_bps / 10_000`, where
+`soft_bps` is seeded to `DEFAULT_SOFT_BPS` of 8000, meaning 80%. `Elevated` exists so an
+operator can spill *proactively*, before the hard cap forces a stall.
+
+The pool exposes `set_soft_fraction` to move that line, but nothing outside the crate's own
+tests calls it, so the Rust soft line sits at 80% and is independent of
+`memory.soft_limit`. The finer Python ladder is the one that reads the configured limits.
 :::
 
 :::{tab-item} The Python monitor
@@ -89,11 +97,11 @@ The finer ladder lives in `carbonite/memory/pressure.py`:
 | `SPILL` | `memory.soft_limit` | 0.85 |
 | `CRITICAL` | `memory.hard_limit` | 0.90 |
 
-`PressureMonitor.level()` samples with asymmetric hysteresis: it classifies on
+`PressureMonitor.level()` samples with asymmetric hysteresis. It classifies on
 `max(raw, previous_ewma)`, so pressure escalates instantly and de-escalates only as the EWMA
 relaxes. A monitor that flapped between NORMAL and SPILL would flap the morsel size and the
-credit window with it. Readers that must not advance the EWMA (morsel sizing, cache trim) call
-`classify()` instead; exactly one component per round may call `level()`.
+credit window with it. Readers that must not advance the EWMA, such as morsel sizing and the
+cache trim, call `classify()` instead. Exactly one component per round may call `level()`.
 :::
 ::::
 
@@ -103,14 +111,14 @@ over RSS.
 
 :::{warning}
 The Flight `PartitionStore` and any off-pool pyarrow buffer are real memory the pool has never
-heard of. Taking the max against the process footprint is what stops the monitor reporting
+heard of. Taking the maximum against the process footprint is what stops the monitor reporting
 NORMAL while the kernel OOM-kills you.
 :::
 
 ## Cooperative spilling
 
 The interesting method is `try_reserve_cooperative`. A plain reservation failure means
-"you cannot have this memory", which is unhelpful when the reason is that a *different*
+"you can't have this memory", which is unhelpful when the reason is that a *different*
 operator is sitting on the budget and could spill.
 
 ```rust
@@ -120,18 +128,18 @@ pub trait Spillable: Send + Sync {
 }
 ```
 
-Consumers register with `register_consumer` (held as `Weak`, so a dead operator is swept
-rather than leaked). On a failed reservation, the pool computes the shortfall, snapshots
-the live consumers, sorts them largest-first, and asks each to spill, *outside* the
+Consumers register with `register_consumer`, held as `Weak` so a dead operator is swept
+rather than leaked. On a failed reservation, the pool computes the shortfall, snapshots
+the live consumers, sorts them largest-first, and asks each to spill *outside* the
 registry lock, because `spill()` must not re-enter the pool. If a full pass frees nothing,
 it breaks, which is the termination guarantee. Then it retries.
 
-The requester is deliberately not registered yet (it reserves before it builds state), so
-every victim is a different operator or a concurrent query. That is the point: a small
-aggregate no longer dies while a large neighbouring join sits on the whole budget.
+The requester is deliberately not registered yet, because it reserves before it builds
+state, so every victim is a different operator or a concurrent query. That's the point. A
+small aggregate no longer dies while a large neighbouring join sits on the whole budget.
 
-With no registered consumers this is exactly `try_reserve`, so nothing pays for the
-machinery it does not use.
+With no registered consumers this is exactly `try_reserve`, so nothing pays for machinery
+it doesn't use.
 
 ## Where the limit comes from
 
@@ -140,13 +148,14 @@ terminal-op boundary from the live envelope (host RAM, honoring a cgroup limit),
 freezes it for the query. The data-plane budget shipped to Rust is
 `cap × memory.hard_limit`, as `EngineConfig.memory_budget_bytes`.
 
-A `memory_budget_bytes` of `0` means unbounded: `ExecOptions.agg_spill` stays `None` and
-the engine runs fully in memory with zero spill machinery. `memory.unbounded_memory = True`
-is how you ask for that explicitly. A query then fails fast rather than spilling.
+A `memory_budget_bytes` of `0` means unbounded. `ExecOptions.agg_spill` stays `None` and
+the engine runs fully in memory with zero spill machinery. Set
+`memory.unbounded_memory = True` to ask for that explicitly. A query then fails fast rather
+than spilling.
 
 In a container the OS often reports the *host's* RAM rather than the cgroup limit, which
-is why the pressure monitor reads cgroup v2 `memory.max` (and falls back to v1
-`memory.limit_in_bytes`). Where it cannot, set `max_memory_bytes` yourself.
+is why the pressure monitor reads cgroup v2 `memory.max` and falls back to v1
+`memory.limit_in_bytes`. Where it can't, set `max_memory_bytes` yourself.
 
 You can see the budget the engine actually ran under:
 
@@ -177,43 +186,45 @@ with bt.config_context(cfg):
     print(out.num_rows)
 ```
 
-The data-plane budget under that context is `512 MiB × 0.90 = 483 MB`, and any stateful
-operator whose estimated footprint exceeds it goes out of core instead of OOMing.
+The data-plane budget under that context is `512 MiB × 0.90`, about 461 MiB, and any
+stateful operator whose estimated footprint exceeds it goes out of core instead of OOMing.
 
 ## Storage yields to execution
 
 `ResourceManager.reserve` in `carbonite/manager.py` implements Spark's unified memory
-model, in two steps. The result cache (`Dataset.cache()`, bounded by
-`memory.result_cache_max_bytes`) is *storage*; an operator building a hash table is
+model, in two steps. The result cache behind `Dataset.cache()`, bounded by
+`memory.result_cache_max_bytes`, is *storage*. An operator building a hash table is
 *execution*. Execution wins.
 
-Before reserving, the manager trims the cache to the current pressure ladder
-(`ELEVATED` → 3/4 of budget, `SPILL` → 1/2, `CRITICAL` → clear), and if there is still a
-shortfall, evicts exactly the deficit, lowest-value first. Only then does it reserve.
-Caching therefore cannot grow the process without bound, and it hands RAM back rather than
-pushing a query out to disk.
+Before reserving, the manager calls `CacheStore.on_pressure` to trim the cache against the
+current pressure level: three-quarters of the budget at `ELEVATED`, half at `SPILL`, and
+everything at `CRITICAL`. If a shortfall remains, it evicts exactly the deficit,
+lowest-value entries first. Only then does it reserve. Caching therefore can't grow the
+process without bound, and it hands RAM back rather than pushing a query out to disk. The
+trim reads `classify()` rather than `level()`, so it doesn't consume the AIMD round's
+sample. Evicting a cache only costs a recompute, so none of this can change an answer.
 
 ## Costs and limits
 
-The pool is a single atomic counter with a CAS loop, so it is cheap but it is a
-process-wide contention point at high reservation rates. This is why reservations are
-per-*operator*, not per-morsel: one reserve for a hash table build, not one per batch.
+The pool is a single atomic counter with a CAS loop, so it's cheap but it's a process-wide
+contention point at high reservation rates. That's why reservations are per-*operator*,
+not per-morsel: one reserve for a hash table build, not one per batch.
 
-It only accounts what is routed through it. Arrow buffers allocated by pyarrow on the
+It only accounts what's routed through it. Arrow buffers allocated by pyarrow on the
 Python side, the Flight in-memory partition store, and a UDF's torch tensors are all
-invisible to `used`. The pressure monitor's RSS/cgroup floor is the mitigation, and it is
-a floor, not a ledger.
+invisible to `used`. The pressure monitor's RSS and cgroup floor is the mitigation, and
+it's a floor, not a ledger.
 
-And a reservation is an *estimate* accepted in advance. The pool cannot tell you that the
+A reservation is also an *estimate* accepted in advance. The pool can't tell you that the
 hash table you reserved 100 MB for will actually take 400. What corrects that is the
-learned memory model (see [Learned metadata](learned-metadata.md)), which fits a measured
-bytes-per-input-row per operator family from `m_peak_bytes` and blends the plan's estimate
-toward it.
+learned memory model described in [Learned metadata](learned-metadata.md), which fits a
+measured bytes-per-input-row figure per operator family from `m_peak_bytes` and blends the
+plan's estimate toward it.
 
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): Carbonite's lane — it protects, it never decides or executes
+- [Architecture](../architecture/index.md): Carbonite's lane, where it protects but never decides or executes
 - [Carbonite](../internals/carbonite.md): the resource manager that drives the pool
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the control theory behind the hysteresis
 - [Configuration options](../configuration/options.md): every `memory.*` knob named here

@@ -357,6 +357,10 @@ def _native_uri(path: str) -> str:
     """
     if not path.startswith(("s3://", "s3a://")) or "region=" in path:
         return path
+    # Skip the AWS-only GetBucketLocation probe when an endpoint override already says
+    # where the bucket lives: on-prem S3 (MinIO / Ceph) may not implement that call at all.
+    if "endpoint" in path or os.environ.get("AWS_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT"):
+        return path
     bucket = path.split("://", 1)[1].split("/", 1)[0]
     region = _S3_REGION.get(bucket)
     if region is None:

@@ -39,9 +39,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::errors::transport_to_pyerr;
+use crate::flight::{FlightShuffleServer, ShuffleClient};
 use crate::process::shared_runtime;
 use crate::{parse_aggregates, parse_group_keys, to_pyerr, unwrap_batches};
-use crate::{FlightShuffleServer, ShuffleClient};
 
 /// Validate partition-key inputs at the FFI boundary before they reach the engine.
 ///

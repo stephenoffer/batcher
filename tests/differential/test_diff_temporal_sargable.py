@@ -17,9 +17,9 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 from batcher.kyber.rules.extra import temporal_sargable as _temporal_sargable  # noqa: F401
-from conftest import assert_same
 
 # Comparison operators, mapped to the Batcher expression builder and the SQL spelling.
 _OPS = {

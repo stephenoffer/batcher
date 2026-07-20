@@ -25,9 +25,10 @@ class Cost:
 
 :::{important}
 `mem` is deliberately absent from the scalar. It is a *peak*, not a throughput cost, so it gates
-feasibility — can Carbonite admit this plan? — rather than speed. When costs compose up the
-tree, `cpu`/`io`/`net` **sum** over children while `mem` accumulates as a **max**: breakers run
-at different times, so peak memory is the tallest one, not the total.
+feasibility rather than speed. The question it answers is whether Carbonite can admit this plan.
+When costs compose up the tree, `cpu`, `io`, and `net` **sum** over children while `mem`
+accumulates as a **max**. Breakers run at different times, so peak memory is the tallest one
+rather than the total.
 :::
 
 ```text
@@ -66,7 +67,7 @@ The interesting ones:
 
 | Operator | cpu | mem |
 |---|---|---|
-| `Filter` | `filter_row × in_rows × expr_factor` | — |
+| `Filter` | `filter_row × in_rows × expr_factor` | none |
 | `Aggregate` | `hash_build_row × in_rows + output_row × out_rows` | `row_bytes × out_rows` |
 | `Sort` | `sort_row × n × log2(max(2, heap))` | `row_bytes × heap` |
 | `Join` | `hash_build_row × |R| + hash_probe_row × |L| + output_row × out_rows` | `row_bytes(right) × |R|` |
@@ -118,8 +119,8 @@ build on the 1,000-row side, probe with 20,000 rows
   hash_build_row × 1,000   +  hash_probe_row × 20,000
        2.0       ×  1,000  +       1.0       × 20,000
 ```
-The cheaper orientation wins, and because the small side is also under `broadcast_max_bytes`, it
-is broadcast rather than shuffled.
+The cheaper orientation wins, and because the small side is also under the resolved broadcast
+threshold, it is broadcast rather than shuffled.
 :::
 ::::
 
@@ -136,18 +137,24 @@ per column: measured `avg_bytes` from the metadata hub → the Arrow type's widt
 of this node's known columns → the flat 64.
 
 :::{warning}
-This decides broadcast eligibility. `optimizer.broadcast_max_bytes` (4 MiB) is compared against
-the build side's *bytes*, and a two-`int64` key is 16 B/row, not 64. Reading it against a flat
-64 made the effective threshold roughly 4× smaller than its nominal value, and the optimizer
+This decides broadcast eligibility. The broadcast threshold is compared against the build
+side's *bytes*, and a two-`int64` key is 16 B/row, not 64. Reading it against a flat 64 made
+the effective threshold roughly 4 times smaller than its nominal value, and the optimizer
 declined broadcasts it should have taken.
 :::
 
-And that threshold is sized to **cache, not memory**. A broadcast join builds one hash table
-and probes it from every core, so each probe row is a random access into it. The strategy
-wins only while the table stays cache-resident. Past that, the partitioned join wins,
-because each of its buckets probes a small L2-resident table. TPC-H sf1 puts the crossover
-between 4 and 10 MiB (q3's 4.4 MB build over a 3.2M-row probe: 52 ms partitioned versus 83
-ms broadcast).
+That threshold is sized to **cache, not memory**. A broadcast join builds one hash table and
+probes it from every core, so each probe row is a random access into it. The strategy wins only
+while the table stays cache-resident. Past that the partitioned join wins, because each of its
+buckets probes a small L2-resident table. TPC-H sf1 puts the crossover between 4 and 10 MiB:
+q3's 4.4 MB build over a 3.2M-row probe takes 52 ms partitioned against 83 ms broadcast.
+
+Because it bounds a cache-resident table, the threshold is detected rather than fixed.
+`optimizer.broadcast_max_bytes` defaults to `0`, meaning auto, and
+`resolved_broadcast_max_bytes` then returns a quarter of the detected last-level cache. A
+machine whose cache cannot be read, such as a non-Linux host, falls back to 4 MiB, which is the
+historical default and the value a 16 MiB L3 resolves to anyway. Any positive
+`broadcast_max_bytes` pins the threshold and wins over detection.
 
 ## Expressions have costs too
 
@@ -170,7 +177,7 @@ like                       28.0
 regexp_matches             48.0
 levenshtein               230.0
 sha256                    325.0
-image / audio / video     500.0    (estimated, not measured — media decode)
+image / audio / video     500.0    (media decode: estimated, not measured)
 ```
 
 The media functions are costed high on purpose. That is what makes Kyber push a filter
@@ -210,29 +217,35 @@ that should make the optimizer work harder to keep them off hot rows.
 The coefficients are priors. Once enough operators have run, `kyber/calibration.py` refits
 them from measured `op_stats`.
 
-The method matters as much as the fit:
+The method matters as much as the fit. Each operator family maps to the one coefficient its
+dominant per-row term scales, so `aggregate` fits `hash_build_row` as the purest hash-build
+signal and `hash_join` fits `hash_probe_row`. The remaining three, `output_row`, `map_row`, and
+`bytes_per_row`, have no clean single-family signal and keep their defaults.
 
-1. Map each operator family to one coefficient (`aggregate` → `hash_build_row`, the purest
-   hash-build signal; `hash_join` → `hash_probe_row`). `output_row`, `map_row`, and
-   `bytes_per_row` have no clean single-family signal and keep their defaults.
-2. Compute a **global anchor** `k = total_default_work / total_ms`, chosen so that the
-   default model's total work over all samples equals their total measured time. When
-   reality matches the defaults, calibration is a no-op. That is the property you want from
-   a self-tuning system: it must not drift when it has nothing to say.
-3. Per coefficient: `median(k × t / (basis × expr_factor))`. Dividing out `expr_factor` is
-   what keeps the fitted coefficient a property of the *engine* rather than of whichever
-   expressions the workload happened to contain. Without it, a regex-heavy workload fits a
-   huge `filter_row`, which the cost model then multiplies by the regex's factor a second
-   time.
-4. **Shrinkage**, not a fixed blend: `weight = n / (n + prior_strength)`. A fixed `alpha=0.5`
-   blend has a fixed point: a coefficient whose true value was 10× the default converged to
-   5.5× it, forever.
-5. **Clamp** to within `cost_calibration_clamp` (10×) of the default, so timing noise cannot
-   produce a degenerate model.
+Everything is then anchored globally. `k = total_default_work / total_ms` is chosen so the
+default model's total work over all samples equals their total measured time, which means
+calibration is a no-op when reality already matches the defaults. That is the property you want
+from a self-tuning system: it must not drift when it has nothing to say. Each coefficient
+becomes `median(k × t / (basis × expr_factor))`. Dividing out `expr_factor` keeps the fitted
+coefficient a property of the *engine* rather than of whichever expressions the workload
+happened to contain. Without it a regex-heavy workload fits a huge `filter_row`, which the cost
+model then multiplies by the regex's factor a second time.
 
-`jit_speedup` is fitted the same way, from the ratio of interpreted to JIT residual time per
-row on `filter` and `project` operators (`op_stats.backend` tags each). Operators tagged
-`interp+jit` are skipped, since they blend the tiers.
+The measurement is blended toward the shipped default by **shrinkage** rather than a fixed
+ratio, with `weight = n / (n + prior_strength)` and `prior_strength` set to
+`cost_calibration_min_samples` (20). A fixed `alpha=0.5` blend has a fixed point, so a
+coefficient whose true value was 10 times the default converged to 5.5 times it and stayed
+there. The result is finally clamped to within `cost_calibration_clamp` (10 times) of the
+default, so timing noise cannot produce a degenerate model.
+
+`jit_speedup` is fitted from the ratio of interpreted to JIT residual time per row on `filter`
+and `project` operators, which `op_stats.backend` tags as `"interp"` or `"jit"`. Operators
+tagged `"interp+jit"` are skipped, since they blend the tiers. Unlike the absolute
+coefficients it is deliberately *not* shrunk. The absolute coefficients fit a value on the
+engine's own scale, so the shipped default is a genuine independent prior, but the speedup is
+measured as `prior × ratio`, which already anchors it on the prior. Shrinking would anchor it
+twice and reintroduce the fixed point shrinkage exists to remove. The clamp still bounds how
+far it may travel.
 
 Refit is throttled: only after 64 new feedback rows accrue
 (`calibration._RECALIBRATE_AFTER`). Profiling a small query once showed ~90% of its latency
@@ -241,7 +254,7 @@ entire `op_stats` history on every `collect()`.
 
 ## Join ordering
 
-`kyber/rules/join_order.py` dispatches on leaf count:
+`kyber/rules/joins/order.py` dispatches on leaf count:
 
 - fewer than 3 leaves: skip (a two-way join is the build-side rule's business)
 - up to 12: exhaustive subset DP, bushy trees, O(3ⁿ)

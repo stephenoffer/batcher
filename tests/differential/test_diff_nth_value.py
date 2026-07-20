@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, nth_value
 
 pytestmark = pytest.mark.differential
@@ -29,8 +30,6 @@ def _data():
 
 @pytest.mark.parametrize("n", [1, 2, 3, 4])
 def test_nth_value_matches_duckdb(duck, n):
-    from conftest import assert_same
-
     duck.register("t", _data())
     out = (
         bt.from_arrow(_data())

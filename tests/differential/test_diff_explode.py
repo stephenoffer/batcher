@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -21,8 +22,6 @@ def _lists():
 
 
 def test_explode_matches_duckdb_unnest(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_lists()).explode("a").collect()
     duck.register("t", _lists())
     # DuckDB UNNEST drops null/empty lists (no row), matching explode.
@@ -30,8 +29,6 @@ def test_explode_matches_duckdb_unnest(duck):
 
 
 def test_explode_then_filter(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_lists()).explode("a").filter(col("a") > 1).collect()
     duck.register("t", _lists())
     assert_same(
@@ -41,8 +38,6 @@ def test_explode_then_filter(duck):
 
 
 def test_explode_with_alias(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_lists()).explode("a", alias="x").collect()
     duck.register("t", _lists())
     assert_same(out, duck.sql("SELECT UNNEST(a) AS x, b FROM t"))
@@ -52,8 +47,6 @@ def test_explode_fixed_size_list(duck):
     """`explode` of a fixed-size-list column expands each row into its elements, like a
     variable-length list — previously it errored though the planner advertised a schema
     for it. Null rows drop (UNNEST semantics)."""
-    from conftest import assert_same
-
     t = pa.table(
         {
             "id": pa.array([1, 2, 3], type=pa.int64()),

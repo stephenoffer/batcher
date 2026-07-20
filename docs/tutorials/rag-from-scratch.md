@@ -68,7 +68,7 @@ print(chunks.to_pydict()["chunk"][:2])
 # ['A refund is issued within five days of a', 'ays of an approved return request.']
 ```
 
-Real chunks are 200–1,000 characters, not 40. The small size here keeps the output readable.
+Real chunks are 200 to 1,000 characters, not 40. The small size here keeps the output readable.
 
 ## 3. Embed
 
@@ -123,7 +123,7 @@ print(index.count())
 
 Retrieval is a score and a top-N. `.list.cosine_similarity` scores each row's vector against
 a query vector broadcast as a literal, and `top_k` keeps the best rows without sorting the
-relation, using the fused top-N heap that runs 50× Polars and 8× Daft on the benchmark.
+relation, using the fused top-N heap, which runs 8.1x faster than Daft on the top-N benchmark.
 
 The `l2_norm` filter drops empty vectors: a zero vector has no direction, cannot clear any
 threshold, and would otherwise pollute the ranking with undefined scores.
@@ -182,7 +182,7 @@ vectors into candidate pairs, and only the candidates get the exact cosine score
 ## 5. Generate
 
 Build the prompt with a string expression (it is a column operation like any other) and hand
-it to a model. An *engine* is just a zero-arg callable returning a
+it to a model. An *engine* is a zero-arg callable returning a
 `list[str] -> list[str]` function, so a deterministic stub can stand in for a 7B model and
 the pipeline is testable with no GPU.
 

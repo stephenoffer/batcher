@@ -14,6 +14,8 @@ from __future__ import annotations
 import functools
 import os
 
+from _ray_env import init_ray
+
 print = functools.partial(print, flush=True)
 
 _DIR = "/mnt/cluster_storage/gpu_xover"
@@ -25,17 +27,6 @@ _SIZES = [
     for x in os.environ.get("BENCH_XO_SIZES", "300000,1000000,5000000,20000000,40000000").split(",")
 ]
 _GROUPS = 1000
-
-
-def _init() -> None:
-    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
-        os.environ.pop(var, None)
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(
-            address="auto", runtime_env={"pip": None}, logging_level="ERROR", log_to_driver=False
-        )
 
 
 def _gen(path: str, n: int, seed: int) -> int:
@@ -72,7 +63,7 @@ def _ensure(n: int) -> str:
 
 
 def main() -> int:
-    _init()
+    init_ray(unconditional_hook_strip=True)
     import batcher as bt
     from batcher import col, core
     from batcher.kyber.gpu.adaptive import learned_gpu_min_rows

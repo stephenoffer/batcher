@@ -43,7 +43,7 @@ print(ranked.to_pydict())
 #  'price': [30, 20, 10, 40, 15], 'rnk': [1, 2, 3, 1, 2]}
 ```
 
-`rank` leaves gaps after ties; `dense_rank` does not.
+`rank` leaves gaps after ties. `dense_rank` does not.
 
 ```python
 ranks = ds.window(
@@ -56,11 +56,11 @@ print(ranks.to_pydict())
 #  'price': [10, 20, 30, 15, 40], 'rk': [1, 2, 3, 1, 2], 'dr': [1, 2, 3, 1, 2]}
 ```
 
-The *normalized* ranking specs are `"percent_rank"` and `"cume_dist"` (SQL
-`PERCENT_RANK` / `CUME_DIST`). `percent_rank` rescales each row's rank into
-`[0, 1]`, giving `0` to the first row and `1` to the last; `cume_dist` gives the
-fraction of the partition at or below the current row. Either one expresses "the
-cheapest 10% within each category" without hard-coding a row count.
+The *normalized* ranking specs are `"percent_rank"` and `"cume_dist"`, which are SQL
+`PERCENT_RANK` and `CUME_DIST`. `percent_rank` rescales each row's rank into `[0, 1]`,
+giving `0` to the first row and `1` to the last. `cume_dist` gives the fraction of the
+partition at or below the current row. Either one expresses "the cheapest 10% within each
+category" without hard-coding a row count.
 
 ```python
 norm = ds.window(
@@ -74,10 +74,10 @@ print(norm.to_pydict())
 #  'cd': [0.3333333333333333, 0.6666666666666666, 1.0, 0.5, 1.0]}
 ```
 
-Quartiles and deciles come from `ntile(n)`, which splits each ordered partition
-into `n` roughly equal buckets numbered `1..n` (SQL `NTILE`). It takes the bucket
-count as an argument, so a bare string won't do; spell it with the top-level
-`ntile` constructor bound by `.over(...)`, the form covered below:
+Quartiles and deciles come from `ntile(n)`, the SQL `NTILE`, which splits each ordered
+partition into `n` roughly equal buckets numbered `1..n`. It takes the bucket count as an
+argument, so a bare string won't do. Spell it with the top-level `ntile` constructor
+bound by `.over(...)`, the form covered below:
 
 ```python
 from batcher import ntile
@@ -129,9 +129,9 @@ print(running.to_pydict())
 
 Value specs are `(func, column)` for `"first_value"` and `"last_value"`,
 `(func, column, offset)` for `"lag"` and `"lead"`, and `(func, column, n)` for
-`"nth_value"`, which reads the `n`-th row of the ordered partition (SQL
-`NTH_VALUE`; `first_value` is the special case `n = 1`). Use `nth_value` when the
-reference point is a fixed rank: "each product's price relative to its category's
+`"nth_value"`, which reads the `n`-th row of the ordered partition. `nth_value` is SQL
+`NTH_VALUE`, and `first_value` is its special case `n = 1`. Use `nth_value` when the
+reference point is a fixed rank, such as "each product's price relative to its category's
 second-cheapest".
 
 ```python
@@ -196,8 +196,8 @@ print(above.to_pydict())
 # {'category': ['a', 'b'], 'price': [20, 40]}
 ```
 
-Windows may not appear where SQL also forbids them: inside `group_by().agg(...)`,
-in a join key, in a sort key. Compute the window in a `with_columns` step first,
+Windows may not appear where SQL also forbids them, meaning inside `group_by().agg(...)`,
+in a join key, or in a sort key. Compute the window in a `with_columns` step first,
 then reference the resulting column.
 
 ## Expression shorthands
@@ -218,8 +218,8 @@ print(
 #  'growth': [None, 0.5, 1.0], 'rnk': [1, 2, 3]}
 ```
 
-`col("x").is_duplicated()` and `col("x").is_unique()` are the same idea (a
-`count(1) OVER (PARTITION BY x)` compared against 1). Both are most useful inside
+`col("x").is_duplicated()` and `col("x").is_unique()` are the same idea, a
+`count(1) OVER (PARTITION BY x)` compared against 1. Both are most useful inside
 `filter`.
 
 ## Next steps

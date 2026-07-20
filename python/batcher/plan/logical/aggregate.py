@@ -12,6 +12,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher.plan.expr_ir import AggExpr, Expr
+from batcher.plan.ir_specs import aggregates_ir, group_keys_ir, sort_keys_ir
 from batcher.plan.ir_tags import Op
 from batcher.plan.logical.base import LogicalPlan, _reject_duplicate_aliases, _validate_refs
 from batcher.plan.logical.relational import Projection
@@ -100,8 +101,8 @@ class Aggregate(LogicalPlan):
         return {
             "op": Op.AGGREGATE,
             "input": self.input.to_ir(),
-            "group_keys": [{"expr": k.expr.to_ir(), "alias": k.alias} for k in self.group_keys],
-            "aggregates": [s.agg.to_ir(s.alias) for s in self.aggregates],
+            "group_keys": group_keys_ir(self.group_keys),
+            "aggregates": aggregates_ir(self.aggregates),
         }
 
     def available_columns(self) -> list[str]:
@@ -156,14 +157,7 @@ class Sort(LogicalPlan):
         return {
             "op": Op.SORT,
             "input": self.input.to_ir(),
-            "keys": [
-                {
-                    "expr": k.expr.to_ir(),
-                    "descending": k.descending,
-                    "nulls_first": k.nulls_first,
-                }
-                for k in self.keys
-            ],
+            "keys": sort_keys_ir(self.keys),
             "limit": self.limit,
         }
 

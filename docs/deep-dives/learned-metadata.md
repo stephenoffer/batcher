@@ -9,6 +9,12 @@ The `MetadataHub` is where it is kept. The rule around it is one sentence, and e
 subsystem respects it: **Core measures, Kyber decides, Carbonite protects.** Core never
 optimizes. Kyber never executes. Carbonite never rewrites a plan. They meet in the hub.
 
+That division is the same contract loop the whole engine runs on:
+
+![The Kyber-Carbonite-Core feedback loop: Kyber decides and emits a plan with estimated cost, Carbonite protects by granting allocations, Core executes, and measured cardinalities and peak memory flow back to Kyber.](../_static/diagrams/carbonite_loop.svg)
+
+The hub is what the return arrow is made of. The rest of this page is what travels along it.
+
 ```text
               ┌───────────────────────────────────────────────────────────┐
               │                      MetadataHub                          │
@@ -32,6 +38,13 @@ optimizes. Kyber never executes. Carbonite never rewrites a plan. They meet in t
    None of these four subsystems can import another. The hub is where they meet.
 ```
 
+One refinement the diagram flattens. Core is the only subsystem that reports *operator* metrics,
+and Kyber only ever reads them. A join's chosen strategy and its wall time are recorded
+separately, by the conductor in `api/tuning/decisions.py`, which calls into
+`kyber/learned_tuning/` to fold the outcome into the bandit. The conductor is the layer allowed
+to see both the plan it chose and the run that followed, so no Kyber pass has to observe an
+execution to close that loop.
+
 ## What Core measures
 
 `bc-interp` returns metrics alongside the result batches from `execute_plan_metered`. Per
@@ -40,7 +53,7 @@ operator (`crates/bc-interp/src/metrics.rs`):
 ```rust
 pub struct OpMetric {
     pub op_id: u32,          // pre-order DFS index, matching kyber.annotate
-    pub kind: String,
+    pub kind: &'static str,
     pub rows_in: u64,        // probe side only, for a join
     pub rows_build: u64,
     pub rows_out: u64,
@@ -52,15 +65,21 @@ pub struct OpMetric {
     pub spilled: bool,
     pub spill_bytes: u64,
     pub peak_rss_bytes: u64,
-    pub backend: String,     // "interp" | "jit" | "interp+jit"
+    pub backend: &'static str, // "interp" | "jit" | "interp+jit"
 }
 ```
 
-`core/executor.py::_record_op_feedback` transcribes each into an `OperatorFeedback`
-`n_actual`, `t_op_ms`, `m_peak_bytes`, `selectivity`, `signature`, `n_estimated`,
-(`n_actual`, `t_op_ms`, `m_peak_bytes`, `selectivity`, `signature`, `n_estimated`,
-`expr_factor`) and calls `hub.record(feedback)`. That is the whole of Core's involvement.
+`core/executor.py::_record_op_feedback` transcribes each into an `OperatorFeedback`, carrying
+`n_actual`, `n_input`, `t_op_ms`, `m_peak_bytes`, `selectivity`, `signature`, `n_estimated`,
+and `expr_factor`, then calls `hub.record(feedback)`. That is the whole of Core's involvement.
 It does not read anything back.
+
+Two of those fields carry the loop's precision. `n_estimated` is the rows Kyber predicted
+*before* applying any learned correction, so pairing it with `n_actual` measures the structural
+estimator's own error. Reporting the already-corrected estimate would make a converged
+correction look error-free and decay it back to 1.0. `expr_factor` is the per-row cost of the
+expressions the operator evaluated, which calibration divides back out so a fitted coefficient
+describes the engine rather than the workload's expressions.
 
 The `op_id` correspondence is what makes the loop close: Kyber's `annotate_ops` numbers the
 plan in pre-order and stamps each node's estimate and signature onto it; the Rust executor
@@ -96,7 +115,7 @@ deliberately small API.
 :::{dropdown} The whole `MetadataHub` surface
 ```python
 # docs: skip
-hub.record(feedback)                       # the FeedbackSink — Core's only entry point
+hub.record(feedback)                       # the FeedbackSink: Core's only entry point
 hub.version                                # monotonic counter; the cache-invalidation signal
 hub.op_stats_by_kind()                     # bucketed by operator kind, for cost calibration
 hub.op_stats_with_signature()              # oldest-first, for the q-error correction
@@ -153,8 +172,9 @@ implementations:
 | `object_storage` | one fsspec object per key | shared, durable, slow |
 | `layered` | in-process cache over a durable store | the practical shared setup |
 
-`backend="sqlite"` with no `uri` persists to `~/.batcher/metadata.db`, so cross-run learning
-is one line and no path to manage. `LayeredBackend` writes durable-first then caches, and
+`backend="sqlite"` with no `uri` persists to `$BATCHER_HOME`, defaulting to
+`~/.batcher/metadata.db`, so cross-run learning is one line with no path to manage.
+`LayeredBackend` writes durable-first then caches, and
 reads cache-first with fall-through. Its `refresh()` drops the cache entirely, which is the
 cross-driver freshness hook.
 
@@ -164,14 +184,14 @@ Redis costs you learning, not your query.
 
 ## What is learned
 
-Four families, in four subsystems, all reading the same hub.
+Four families, across three subsystems, all reading the same hub.
 
 **Kyber: cardinality and cost.** The per-signature q-error correction
 (`__cardinality_correction__`), plus per-column NDV, quantiles, most-common-values, and
 average byte width. Cost coefficients are recalibrated from measured operator times. See
 [Cost model](cost-model.md).
 
-**Kyber: physical strategy** (`kyber/learned_tuning.py`). A UCB1 bandit over the three
+**Kyber: physical strategy** (`kyber/learned_tuning/`). A UCB1 bandit over the three
 equivalent join algorithms:
 
 ```python
@@ -214,8 +234,8 @@ fan-out, straggler-speculation factor, and join hot keys.
 :::{important}
 Every learned value changes *how* a query runs: how much memory it reserves, when it spills, how
 big a morsel is, which of three equivalent join algorithms it picks, how many workers it fans
-out to. None of them changes *what* it returns. That is not a convention, it is a property that
-is tested — a tuned run must equal an untuned run — and it is what makes it safe to learn
+out to. None of them changes *what* it returns. That is not a convention but a tested property,
+since a tuned run must equal an untuned one, and it is what makes it safe to learn
 aggressively. The worst a stale learned value can do is cost you throughput.
 :::
 
@@ -233,6 +253,12 @@ the plan is different. The *result* is not.
 
 ## Limits worth knowing
 
+Start with the one that governs everything else: the default backend is `in_process`, so a
+fresh interpreter starts cold and everything on this page is learned and then discarded within
+a single session. Cross-run learning is real but opt-in, and until you configure a durable
+backend the warm numbers quoted here describe a repeated query inside one process rather than
+the behavior of a new one.
+
 :::{warning}
 **Nothing expires.** `metadata.decay_per_day` is declared and validated and has no reader. There
 is no TTL and no aging on any backend. What provides recency is smoothing, not expiry: a
@@ -246,7 +272,7 @@ Three more, each a real hole rather than a rough edge:
 | Limit | Consequence |
 |---|---|
 | The join bandit only learns from single-join plans (`record_join_outcomes` bails above one join, because whole-query wall time must be unambiguously attributable to *that* join) | a TPC-H query with five joins contributes nothing to the bandit |
-| Distributed workers' feedback carries no signature — a worker's `op_id`s address its own sub-plan and cannot be correlated with the driver's tree | those rows feed per-kind cost calibration but are excluded from cardinality correction |
+| Distributed workers' feedback carries no signature, because a worker's `op_id`s address its own sub-plan and cannot be correlated with the driver's tree | those rows feed per-kind cost calibration but are excluded from cardinality correction |
 | `learned_broadcast_max_bytes` only trains on the distributed path | on a single-node deployment it returns `None` forever and the static threshold never moves |
 
 ## Code map
@@ -258,7 +284,7 @@ Three more, each a real hole rather than a rough edge:
 | Metric transcription (Core) | `python/batcher/core/executor.py` |
 | Per-operator metrics (Rust) | `crates/bc-interp/src/metrics.rs` |
 | Plan/column signatures | `python/batcher/kyber/{signature,learning}.py` |
-| The join bandit and OLS crossovers | `python/batcher/kyber/learned_tuning.py` |
+| The join bandit and OLS crossovers | `python/batcher/kyber/learned_tuning/` |
 | Learned memory model | `python/batcher/carbonite/memory/learned.py` |
 | Learned distributed sizing | `python/batcher/dist/adaptive_sizing/sizing.py` |
 

@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher._internal.errors import PlanError
 
 
@@ -40,8 +41,6 @@ def sales(duck):
     ],
 )
 def test_reduction_matches_duckdb(duck, sales, method, sql_fn):
-    from conftest import assert_same
-
     # Group by both string columns so the only value columns left to reduce are the
     # two numerics — the bare reduction then targets exactly `amount` and `score`.
     out = getattr(bt.from_arrow(sales).group_by("dept", "region"), method)()
@@ -54,8 +53,6 @@ def test_reduction_matches_duckdb(duck, sales, method, sql_fn):
 
 @pytest.mark.differential
 def test_len_matches_count_star(duck, sales):
-    from conftest import assert_same
-
     out = bt.from_arrow(sales).group_by("dept").len()
     assert out.columns == ["dept", "len"]
     assert_same(out.collect(), duck.sql("SELECT dept, COUNT(*) AS len FROM sales GROUP BY dept"))
@@ -63,8 +60,6 @@ def test_len_matches_count_star(duck, sales):
 
 @pytest.mark.differential
 def test_two_group_keys_and_column_subset(duck, sales):
-    from conftest import assert_same
-
     out = bt.from_arrow(sales).group_by("dept", "region").sum("amount")
     assert out.columns == ["dept", "region", "amount"]
     assert_same(
@@ -75,8 +70,6 @@ def test_two_group_keys_and_column_subset(duck, sales):
 
 @pytest.mark.differential
 def test_selector_selects_reduction_columns(duck, sales):
-    from conftest import assert_same
-
     # `floating()` picks only `score`; `amount` (int) is left out.
     out = bt.from_arrow(sales).group_by("dept").mean(bt.floating())
     assert out.columns == ["dept", "score"]
@@ -87,8 +80,6 @@ def test_selector_selects_reduction_columns(duck, sales):
 
 @pytest.mark.differential
 def test_positional_and_mixed_agg(duck, sales):
-    from conftest import assert_same
-
     out = bt.from_arrow(sales).group_by("dept").agg(bt.col("amount").sum(), n=bt.count())
     assert out.columns == ["dept", "amount", "n"]
     assert_same(
@@ -100,8 +91,6 @@ def test_positional_and_mixed_agg(duck, sales):
 @pytest.mark.differential
 def test_count_is_nonnull_per_column(duck):
     """group_by().count() counts non-null values per column (pandas/SQL COUNT(col))."""
-    from conftest import assert_same
-
     t = pa.table(
         {
             "g": ["a", "a", "b", "b"],
@@ -130,8 +119,6 @@ def test_len_and_count_are_distinct(duck):
 
 @pytest.mark.differential
 def test_quantile_matches_duckdb(duck, sales):
-    from conftest import assert_same
-
     out = bt.from_arrow(sales).group_by("dept").quantile(0.5)
     # numeric-only: the string `region` is excluded.
     assert out.columns == ["dept", "amount", "score"]

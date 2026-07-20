@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from batcher.io.source import Source
     from batcher.plan.logical import LogicalPlan
 
@@ -333,17 +335,27 @@ def metadata_approx_n_unique(
         return None
 
 
-def metadata_learned_quantile(column: str, q: float) -> float | None:
+def metadata_learned_quantile(
+    column: str, q: float, sources: Sequence[object] = ()
+) -> float | None:
     """Approximate quantile `q` of `column` from the hub's learned grid, or None.
 
     A pure hub lookup (no plan estimation): explicitly approximate, backed by the
     `__column_quantiles__` boundaries a past run measured. None when nothing has been
     learned for `column`, so the caller streams an exact-ish sketch instead.
+
+    `sources` identifies *whose* column this is. Learned column statistics are qualified by
+    source key — a bare name identifies nothing, since two tables both have an `id` — so
+    without it the lookup can only ever match the legacy unqualified shape and misses. Only
+    a single-source plan can be attributed unambiguously; anything else stays `None` and
+    streams, which is the safe direction.
     """
     from batcher import core
     from batcher.kyber.metadata_answer import answer_learned_quantile
+    from batcher.plan.source_stats import source_stats_key
 
     try:
-        return answer_learned_quantile(column, q, core.default_hub())
+        key = source_stats_key(sources[0]) if len(sources) == 1 else None
+        return answer_learned_quantile(column, q, core.default_hub(), key)
     except Exception:  # the metadata shortcut must never break a runnable query
         return None

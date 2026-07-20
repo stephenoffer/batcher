@@ -33,6 +33,17 @@ def test_torch_device_maps_backend():
     assert torch_device("cpu") == "cpu"
 
 
+@pytest.mark.parametrize("backend", ["hpu", "neuron", "something_new"])
+def test_unknown_backend_degrades_to_cpu_rather_than_raising(backend):
+    """This was a bare dict lookup, so an unrecognized name raised `KeyError`.
+
+    The names come from places this mapping does not control — a caller naming an
+    accelerator it has not been taught, or a newer `detect_backend`. An accelerator layer
+    is an optimization, so an unknown device must fall back to CPU rather than abort a job
+    that would have run correctly."""
+    assert torch_device(backend) == "cpu"
+
+
 def test_vram_overhead_per_vendor():
     assert vram_context_overhead("cuda") == 0.4
     assert vram_context_overhead("rocm") == 0.5

@@ -10,6 +10,7 @@ the split is an implementation detail.
 
 from __future__ import annotations
 
+from .autoscale_request import release_autoscale, request_autoscale
 from .lifecycle import (
     _ensure_ray,
     _rmtree,
@@ -27,6 +28,7 @@ from .policies import (
     draining_workers,
     fault_options,
     gather_map_results,
+    is_recoverable_task_failure,
     map_barrier,
     recovery_policy,
     runtime_bloom_join,
@@ -39,8 +41,6 @@ from .scaling import (
     clamp_workers,
     cluster_topology,
     node_class_selector,
-    release_autoscale,
-    request_autoscale,
     shuffle_partitions,
     topology_scope,
     worker_node_memory_bytes,
@@ -74,6 +74,7 @@ __all__ = [
     "fault_options",
     "fleet_actor_options",
     "gather_map_results",
+    "is_recoverable_task_failure",
     "map_barrier",
     "node_class_selector",
     "placement_actor_options",

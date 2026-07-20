@@ -2,7 +2,7 @@
 
 Benchmarks are registered by family under ``suites/`` and discovered through
 ``registry.REGISTRY``; this module is the thin CLI that selects the engines, loads the
-public dataset (``sources.py`` — no data is generated), runs the cases, and reports
+public dataset (``sources`` — no data is generated), runs the cases, and reports
 them. Correctness is verified before any timing is trusted (see ``harness.py``): a
 query is only timed once the engines agree.
 
@@ -178,14 +178,14 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
 def _run_aux(which: str, args: argparse.Namespace) -> int:
     """Dispatch a standalone benchmark (its own reporting, not the compare() table)."""
     if which == "distributed":
-        import distributed
+        from internals import distributed
 
         return distributed.run(args.scale, args.partitions)
     if which == "optimizer":
-        import optimizer_bench
+        from internals import optimizer_bench
 
         return optimizer_bench.main()
-    import shuffle_vs_object_store
+    from internals import shuffle_vs_object_store
 
     return shuffle_vs_object_store.main()
 

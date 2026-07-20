@@ -12,6 +12,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -79,8 +80,6 @@ def test_dictionary_with_null_value_group_by(duck):
     # *value* — which replicates to N null rows — was mis-flagged as data loss and the whole
     # batch was rejected with a bogus "value exceeds the Int64 range" error. It must instead
     # decode and group like the plain column, matching DuckDB (NULL forms one group).
-    from conftest import assert_same
-
     t = _dict_with_null_value()
     plain = t.set_column(0, "k", t.column("k").combine_chunks().dictionary_decode())
     duck.register("t", plain)

@@ -83,6 +83,7 @@ class ExprTag:
     LIST_CONTAINS: Final = "list_contains"
     LIST_POSITION: Final = "list_position"
     LIST_SET: Final = "list_set"
+    LIST_ZIP: Final = "list_zip"
     LIST_TRANSFORM: Final = "list_transform"
     LIST_FILTER: Final = "list_filter"
     LIST_SLICE: Final = "list_slice"

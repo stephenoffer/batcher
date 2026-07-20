@@ -10,7 +10,7 @@ from __future__ import annotations
 import batcher as bt
 from batcher import col
 from batcher.kyber.optimizer import Optimizer
-from batcher.kyber.rules import join_projection as m
+from batcher.kyber.rules.joins import projection as m
 from batcher.plan.logical import Join, Project
 from batcher.plan.visitor import walk
 

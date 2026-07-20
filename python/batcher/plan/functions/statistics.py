@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from batcher.plan.expr_ir import count
 from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr, Lit
-from batcher.plan.functions.aggregate import _as_column
+from batcher.plan.functions.aggregate import _as_column, covar_pop
 
 
 def _n(x: Expr) -> Expr:
@@ -62,13 +62,22 @@ def var_pop(column: str | Expr) -> Expr:
     """Population variance — the sum of squared deviations divided by ``n`` (SQL ``VAR_POP``).
 
     Batcher's :meth:`~batcher.Expr.var` is the *sample* variance (divides by ``n - 1``);
-    this is the population form, ``var_samp * (n - 1) / n``.
+    this is the population form, which divides by ``n``.
+
+    Built as ``covar_pop(x, x)`` — the co-moment of a column with itself *is* its
+    population variance — rather than the algebraically equivalent
+    ``var_samp * (n - 1) / n``. That rescaling is wrong at ``n == 1``: `var_samp` is
+    NULL there (it divides by ``n - 1 == 0``), so the product is NULL, while the
+    population variance of a single value is defined and equal to ``0``. Going through
+    the `covar_pop` state, which divides the centered co-moment by ``n`` directly,
+    returns ``0`` and matches DuckDB. It is the same primitive
+    :func:`~batcher.plan.functions.regression.regr_slope` already reduces to.
 
     Args:
         column: The column (or expression) to summarize.
 
     Returns:
-        The population variance per group.
+        The population variance per group, or null for an empty group.
 
     Examples:
         .. doctest::
@@ -77,10 +86,12 @@ def var_pop(column: str | Expr) -> Expr:
             >>> ds = bt.from_pydict({"x": [1.0, 2.0, 4.0, 8.0]})
             >>> ds.agg(v=bt.var_pop("x").round(4)).to_pydict()
             {'v': [7.1875]}
+
+            >>> bt.from_pydict({"x": [5.0]}).agg(v=bt.var_pop("x")).to_pydict()
+            {'v': [0.0]}
     """
     col = _as_column(column)
-    n = _n(col)
-    return col.var() * ((n - Lit(1)) / n)
+    return covar_pop(col, col)
 
 
 def stddev_pop(column: str | Expr) -> Expr:
@@ -155,6 +166,12 @@ def rms(column: str | Expr) -> Expr:
     The magnitude average used for signals and errors (an RMS error weights large
     deviations more than a plain mean does).
 
+    The column is widened to Float64 *before* squaring. Squaring in the input type
+    overflows silently for Int64: ``x * x`` wraps, so a column of ``4e9`` — whose RMS
+    is just ``4e9`` — produced a negative mean and a ``NaN`` root. The result is a
+    real-valued statistic regardless of input type, so there is nothing to gain by
+    squaring narrow, and a silently wrong answer to lose.
+
     Args:
         column: The column (or expression) to summarize.
 
@@ -168,8 +185,12 @@ def rms(column: str | Expr) -> Expr:
             >>> ds = bt.from_pydict({"x": [1.0, 2.0, 4.0, 8.0]})
             >>> ds.agg(r=bt.rms("x").round(4)).to_pydict()
             {'r': [4.6098]}
+
+            >>> ds = bt.from_pydict({"x": [4_000_000_000, 4_000_000_000]})
+            >>> ds.agg(r=bt.rms("x")).to_pydict()
+            {'r': [4000000000.0]}
     """
-    col = _as_column(column)
+    col = _as_column(column).cast("float64")
     return (col * col).mean().sqrt()
 
 

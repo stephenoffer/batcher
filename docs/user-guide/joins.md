@@ -52,7 +52,7 @@ print(out.to_pydict())
 ### Semi and anti
 
 A semi join keeps left rows that have a match, and an anti join keeps left rows
-that do not. Neither adds columns from the right input; they filter by existence.
+that do not. Neither adds columns from the right input. They filter by existence.
 
 ```python
 print(orders.join(dim, on="category", how="semi").select("id").sort("id").to_pydict())
@@ -93,7 +93,7 @@ print(s1.union(s2, distinct=True).sort("x").to_pydict())
 # {'x': [1, 2, 3, 4]}
 ```
 
-`intersect` keeps rows present in both; `except_` keeps rows in the first but not
+`intersect` keeps rows present in both inputs. `except_` keeps rows in the first but not
 the second.
 
 ```python

@@ -22,8 +22,10 @@ from batcher.ml.preprocessors.encoders import (
     MultiHotEncoder,
     OneHotEncoder,
     OrdinalEncoder,
+    TargetEncoder,
 )
 from batcher.ml.preprocessors.imputers import SimpleImputer
+from batcher.ml.preprocessors.polynomial import PolynomialFeatures
 from batcher.ml.preprocessors.scalers import (
     MaxAbsScaler,
     MinMaxScaler,
@@ -44,9 +46,11 @@ __all__ = [
     "Normalizer",
     "OneHotEncoder",
     "OrdinalEncoder",
+    "PolynomialFeatures",
     "Preprocessor",
     "RobustScaler",
     "SimpleImputer",
     "StandardScaler",
+    "TargetEncoder",
     "Tokenizer",
 ]

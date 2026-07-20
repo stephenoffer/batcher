@@ -292,7 +292,7 @@ class Writer:
                     f"only, not {output_mode!r}: a file/Delta sink appends each micro-batch, so a "
                     f"running {output_mode!r} aggregate would be duplicated across part files. Use "
                     "output_mode='append', a memory sink (.write.memory(name, "
-                    "output_mode='complete')), or .write.foreach_batch(fn) for a custom upsert."
+                    "output_mode='complete')), or .write.for_each_batch(fn) for a custom upsert."
                 )
             if distributed is True:
                 drain = self._maybe_distributed_stream(
@@ -1090,11 +1090,19 @@ class Writer:
 
     # --- SQL / warehouses --------------------------------------------------
     def sql(self, table: str, **opts: Any) -> WriteManifest:
-        """Write to a database table via ADBC/FlightSQL.
+        """Bulk-ingest into a database table via ADBC/FlightSQL.
+
+        Takes the same standard connection URI as `bt.read.sql`, so a read and the write
+        that follows it are spelled the same way. Rows are ingested as Arrow, in bulk,
+        never row by row.
+
+        Pass ``password="env:PGPASSWORD"`` rather than embedding a credential in the URI.
 
         Args:
             table: Destination table name.
-            opts: Connection (``uri=``) and driver options passed as keywords.
+            opts: Connection options — ``uri=``, ``password=``, or an explicit
+                ``driver=``/``db_kwargs=`` pair — plus ``mode=`` (``"create"``,
+                ``"append"``, ``"replace"``, ``"create_append"``).
 
         Returns:
             A `WriteManifest` describing the written rows.
@@ -1115,7 +1123,9 @@ class Writer:
 
         Args:
             table: Destination Snowflake table name.
-            opts: Connection credentials (account, warehouse, database, …) as keywords.
+            opts: ``connection_kwargs=`` — a dict passed to the Snowflake connector
+                (``account``, ``user``, ``warehouse``, ``database``, …) — plus
+                ``mode=`` (``"append"`` or ``"overwrite"``).
 
         Returns:
             A `WriteManifest` describing the written rows.
@@ -1126,7 +1136,12 @@ class Writer:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
                 >>> ds.write.snowflake(  # doctest: +SKIP
-                ...     "ORDERS", account="acct", warehouse="WH", database="DB"
+                ...     "ORDERS",
+                ...     connection_kwargs={
+                ...         "account": "acct",
+                ...         "warehouse": "WH",
+                ...         "database": "DB",
+                ...     },
                 ... )
         """
         return self(table, "snowflake", **opts)

@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -22,8 +23,6 @@ def t(duck):
 
 
 def test_ranking_functions(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .window(
@@ -41,8 +40,6 @@ def test_ranking_functions(duck, t):
 
 
 def test_partition_aggregates(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .window(
@@ -62,8 +59,6 @@ def test_running_aggregates(duck, t):
     # Aggregates WITH an ORDER BY are cumulative (running) over the ordered
     # partition, with RANGE peer semantics — tied rows (dept 'b' has two 250s)
     # share the end-of-peer-group value, matching SQL's default frame.
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .window(
@@ -90,8 +85,6 @@ def test_running_aggregates(duck, t):
 
 def test_running_sum_no_partition(duck, t):
     # A single running aggregate over the whole relation ordered by a key.
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .window(order_by=[("salary", False)], functions={"rs": ("sum", "salary")})
@@ -102,8 +95,6 @@ def test_running_sum_no_partition(duck, t):
 
 
 def test_global_window_no_partition(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .window(order_by=[("salary", False)], functions={"rn": "row_number"})
@@ -116,7 +107,6 @@ def test_global_window_no_partition(duck, t):
 def test_window_then_filter_uses_pushdown(duck, t):
     # A filter after a window exercises the pushdown passes' Window branch.
     from batcher import col
-    from conftest import assert_same
 
     out = (
         bt.from_arrow(t)
@@ -134,8 +124,6 @@ def test_window_then_filter_uses_pushdown(duck, t):
 
 
 def test_rows_frame_trailing_sum_vs_duckdb(duck):
-    from conftest import assert_same
-
     tbl = pa.table(
         {
             "dept": ["a", "a", "a", "a", "b", "b", "b"],
@@ -166,8 +154,6 @@ def test_rows_frame_trailing_sum_vs_duckdb(duck):
 
 
 def test_rows_frame_centered_avg_min_max_count_vs_duckdb(duck):
-    from conftest import assert_same
-
     tbl = pa.table(
         {
             "dept": ["a", "a", "a", "a", "a"],
@@ -205,8 +191,6 @@ def test_rows_frame_centered_avg_min_max_count_vs_duckdb(duck):
 
 
 def test_rows_frame_unbounded_following_vs_duckdb(duck):
-    from conftest import assert_same
-
     tbl = pa.table({"g": [1, 1, 1, 1], "ts": [1, 2, 3, 4], "v": [10, 20, 30, 40]})
     duck.register("wu", tbl)
     # CURRENT ROW .. UNBOUNDED FOLLOWING — a "remaining suffix" sum.

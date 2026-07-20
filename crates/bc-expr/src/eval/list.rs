@@ -8,6 +8,7 @@ use arrow::compute::{cast, is_null};
 use arrow::datatypes::DataType;
 
 use crate::eval::binary::eval_binary;
+use crate::eval::list_ops::{accumulate_pair, as_var_list};
 use crate::{BinaryOp, Expr, ExprError, ListBinaryFunc, ListFunc, Literal};
 
 /// Evaluate an array literal `[e0, e1, …]`: each row becomes a `List` whose values
@@ -419,30 +420,39 @@ pub(crate) fn eval_list_binary(
     right: &ArrayRef,
 ) -> Result<ArrayRef, ExprError> {
     use arrow::array::{Array, AsArray, Float64Builder};
-    use arrow::datatypes::Float64Type;
+    use arrow::datatypes::{Float32Type, Float64Type};
 
-    for (name, arr) in [("left", left), ("right", right)] {
-        if !matches!(arr.data_type(), DataType::List(_)) {
-            return Err(ExprError::ExpectedString {
-                func: format!("list.{func:?} ({name})"),
-                got: arr.data_type().to_string(),
-            });
-        }
-    }
+    // `FixedSizeList` is normalized to `List` rather than rejected: it is the physical
+    // type behind `arrow.fixed_shape_tensor`, so every embedding column this project
+    // produces arrives in that shape.
+    let left = as_var_list(left, &format!("list.{func:?} (left)"))?;
+    let right = as_var_list(right, &format!("list.{func:?} (right)"))?;
     let (la, ra) = (left.as_list::<i32>(), right.as_list::<i32>());
-    let lc = cast(la.values(), &DataType::Float64)?;
-    let rc = cast(ra.values(), &DataType::Float64)?;
-    let (lf, rf) = (
-        lc.as_primitive::<Float64Type>(),
-        rc.as_primitive::<Float64Type>(),
-    );
+
+    // Embeddings are overwhelmingly `f32`; keeping them at native width halves the bytes
+    // the inner loop streams. Accumulation is `f64` either way, so the two paths agree
+    // bit-for-bit (`accumulate_pair`'s tests pin this).
+    let both_f32 = matches!(la.values().data_type(), DataType::Float32)
+        && matches!(ra.values().data_type(), DataType::Float32);
+    let (lc, rc) = if both_f32 {
+        (Arc::clone(la.values()), Arc::clone(ra.values()))
+    } else {
+        (
+            cast(la.values(), &DataType::Float64)?,
+            cast(ra.values(), &DataType::Float64)?,
+        )
+    };
     let (lo, ro) = (la.value_offsets(), ra.value_offsets());
 
     // The vector-distance ops are only defined on equal-length vectors; a mismatch is an
     // error, not a silent truncation to the shorter length (which returned a bogus ~1.0).
     let dims_must_match = matches!(
         func,
-        ListBinaryFunc::Dot | ListBinaryFunc::L2Distance | ListBinaryFunc::CosineSimilarity
+        ListBinaryFunc::Dot
+            | ListBinaryFunc::L2Distance
+            | ListBinaryFunc::L1Distance
+            | ListBinaryFunc::Hamming
+            | ListBinaryFunc::CosineSimilarity
     );
 
     let mut b = Float64Builder::with_capacity(la.len());
@@ -463,37 +473,41 @@ pub(crate) fn eval_list_binary(
             });
         }
         let n = llen.min(rlen);
-        let (mut dot, mut lnorm, mut rnorm, mut dist2) = (0f64, 0f64, 0f64, 0f64);
-        let mut agree = 0usize;
-        for k in 0..n {
-            let (lk, rk) = (ls + k, rs + k);
-            if !lf.is_valid(lk) || !rf.is_valid(rk) {
-                continue;
-            }
-            let (x, y) = (lf.value(lk), rf.value(rk));
-            dot += x * y;
-            lnorm += x * x;
-            rnorm += y * y;
-            dist2 += (x - y) * (x - y);
-            // Exact for minhash signatures, whose values are bounded to 32 bits.
-            agree += usize::from(x == y);
-        }
+        let s = if both_f32 {
+            accumulate_pair::<Float32Type>(
+                lc.as_primitive::<Float32Type>(),
+                rc.as_primitive::<Float32Type>(),
+                ls,
+                rs,
+                n,
+            )
+        } else {
+            accumulate_pair::<Float64Type>(
+                lc.as_primitive::<Float64Type>(),
+                rc.as_primitive::<Float64Type>(),
+                ls,
+                rs,
+                n,
+            )
+        };
         match func {
-            ListBinaryFunc::Dot => b.append_value(dot),
-            ListBinaryFunc::L2Distance => b.append_value(dist2.sqrt()),
+            ListBinaryFunc::Dot => b.append_value(s.dot),
+            ListBinaryFunc::L2Distance => b.append_value(s.dist2.sqrt()),
+            ListBinaryFunc::L1Distance => b.append_value(s.dist1),
+            ListBinaryFunc::Hamming => b.append_value(s.disagree as f64),
             ListBinaryFunc::Jaccard => {
                 if n == 0 {
                     b.append_null(); // no positions to agree on
                 } else {
-                    b.append_value(agree as f64 / n as f64)
+                    b.append_value(s.agree as f64 / n as f64)
                 }
             }
             ListBinaryFunc::CosineSimilarity => {
-                let denom = lnorm.sqrt() * rnorm.sqrt();
+                let denom = s.lnorm.sqrt() * s.rnorm.sqrt();
                 if denom == 0.0 {
                     b.append_null(); // a zero-magnitude vector has no direction
                 } else {
-                    b.append_value(dot / denom);
+                    b.append_value(s.dot / denom);
                 }
             }
         }
@@ -503,14 +517,11 @@ pub(crate) fn eval_list_binary(
 
 /// Per-row scalar reduction over a `List` column.
 pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, ExprError> {
-    use arrow::array::{Array, AsArray, Float64Builder, Int64Builder};
+    use arrow::array::{Array, AsArray, Float64Array, Float64Builder, Int64Array};
 
-    if !matches!(arr.data_type(), DataType::List(_)) {
-        return Err(ExprError::ExpectedString {
-            func: format!("{func:?}"),
-            got: arr.data_type().to_string(),
-        });
-    }
+    // Accept `FixedSizeList` here too, so `.list.l2_norm()`/`.normalize()`/`.mean()` work
+    // on a tensor column rather than only on a variable-length list.
+    let arr = as_var_list(arr, &format!("{func:?}"))?;
     let list = arr.as_list::<i32>();
     let offsets = list.value_offsets();
 
@@ -560,69 +571,38 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         return crate::eval::list_ops::eval_flatten(list);
     }
 
-    // `normalize`: divide each row's elements by its L2 norm → List<Float64> (unit
-    // length). Zero vector → zeros; per-element nulls preserved; null/empty row kept.
-    if let ListFunc::Normalize = func {
-        use arrow::array::{Float64Builder, ListBuilder};
-        let child = cast(list.values(), &DataType::Float64)?;
-        let f = child.as_primitive::<arrow::datatypes::Float64Type>();
-        let mut b = ListBuilder::new(Float64Builder::new());
-        for i in 0..list.len() {
-            if list.is_null(i) {
-                b.append_null();
-                continue;
-            }
-            let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
-            let norm = (s..e)
-                .filter(|&k| f.is_valid(k))
-                .map(|k| f.value(k) * f.value(k))
-                .sum::<f64>()
-                .sqrt();
-            let vb = b.values();
-            for k in s..e {
-                if f.is_valid(k) {
-                    vb.append_value(if norm > 0.0 { f.value(k) / norm } else { 0.0 });
-                } else {
-                    vb.append_null();
-                }
-            }
-            b.append(true);
-        }
-        return Ok(Arc::new(b.finish()));
+    // Per-row list-returning numeric transforms — extracted to `list_ops::list_reduce`
+    // to keep this file within its size budget.
+    match func {
+        ListFunc::Normalize => return crate::eval::list_ops::list_reduce::normalize(list),
+        ListFunc::Softmax => return crate::eval::list_ops::list_reduce::softmax(list),
+        ListFunc::ArgSort => return crate::eval::list_ops::list_reduce::arg_sort(list),
+        ListFunc::CumSum => return crate::eval::list_ops::list_reduce::cum_sum(list),
+        ListFunc::Diff => return crate::eval::list_ops::list_reduce::diff(list),
+        _ => {}
     }
 
     if let ListFunc::Len = func {
-        let mut b = Int64Builder::with_capacity(list.len());
-        for i in 0..list.len() {
-            if list.is_null(i) {
-                b.append_null();
-            } else {
-                b.append_value((offsets[i + 1] - offsets[i]) as i64);
-            }
-        }
-        return Ok(Arc::new(b.finish()));
+        let n = (0..list.len())
+            .map(|i| (!list.is_null(i)).then(|| (offsets[i + 1] - offsets[i]) as i64));
+        return Ok(Arc::new(n.collect::<Int64Array>()));
     }
 
     if let ListFunc::NUnique = func {
         // Count distinct non-null elements, type-general and float-canonical (see `Unique`).
         let keys = element_identity(list.values())?;
         let child = list.values();
-        let mut b = Int64Builder::with_capacity(list.len());
-        for i in 0..list.len() {
-            if list.is_null(i) {
-                b.append_null();
-                continue;
-            }
+        let n = (0..list.len()).map(|i| {
             let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
-            let mut seen = std::collections::HashSet::new();
-            for k in s..e {
-                if !child.is_null(k) {
-                    seen.insert(keys.row(k).owned());
-                }
-            }
-            b.append_value(seen.len() as i64);
-        }
-        return Ok(Arc::new(b.finish()));
+            (!list.is_null(i)).then(|| {
+                (s..e)
+                    .filter(|&k| !child.is_null(k))
+                    .map(|k| keys.row(k).owned())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len() as i64
+            })
+        });
+        return Ok(Arc::new(n.collect::<Int64Array>()));
     }
 
     // `min`/`max` over any non-float child (integers, decimals, strings, bools, dates,
@@ -673,6 +653,43 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         return Ok(take(child.as_ref(), &take_idx, None)?);
     }
 
+    // Exact integer `sum`/`avg`. The Float64 view below rounds every element to 53
+    // significant bits, so `list_sum([2^53+1, 2])` returned 2^53+2 where DuckDB returns the
+    // true 2^53+3 — the same precision loss already fixed for `min`/`max` above. Integer
+    // children accumulate in `i64` instead; `sum` returns Int64 (what the scalar `sum`
+    // aggregate returns for an Int64 column) and `avg` divides that exact total as f64,
+    // staying Float64. Overflow is an error, not a wrap, matching `bc-runtime`'s `sum_acc`
+    // (`checked_add` → `SumOverflow`); the wrapping convention in `eval/binary.rs` exists
+    // for JIT parity on scalar arithmetic and deliberately does not extend to reductions.
+    // A null row, an empty row, and an all-null row all have no values, hence null.
+    let int_child = matches!(
+        list.values().data_type(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    );
+    if matches!(func, ListFunc::Sum | ListFunc::Mean) && int_child {
+        let child = cast(list.values(), &DataType::Int64)?;
+        let v = child.as_primitive::<arrow::datatypes::Int64Type>();
+        let rows = (0..list.len())
+            .map(|i| {
+                let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
+                let row = v.slice(s, e - s);
+                let n = row.len() - row.null_count();
+                let t = arrow::compute::sum_checked(&row)?;
+                Ok((!list.is_null(i)).then_some(t).flatten().map(|t| (t, n)))
+            })
+            .collect::<Result<Vec<_>, ExprError>>()?;
+        return Ok(if matches!(func, ListFunc::Sum) {
+            Arc::new(
+                rows.iter()
+                    .map(|r| r.map(|(t, _)| t))
+                    .collect::<Int64Array>(),
+            )
+        } else {
+            let m = rows.iter().map(|r| r.map(|(t, n)| t as f64 / n as f64));
+            Arc::new(m.collect::<Float64Array>())
+        });
+    }
+
     // Numeric reductions: view the child elements as Float64.
     let child = cast(list.values(), &DataType::Float64)?;
     let f = child.as_primitive::<arrow::datatypes::Float64Type>();
@@ -681,16 +698,11 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     // element, first occurrence on ties; empty/all-null/null row → null.
     if matches!(func, ListFunc::ArgMin | ListFunc::ArgMax) {
         let want_min = matches!(func, ListFunc::ArgMin);
-        let mut b = Int64Builder::with_capacity(list.len());
-        for i in 0..list.len() {
-            if list.is_null(i) {
-                b.append_null();
-                continue;
-            }
+        let idx = (0..list.len()).map(|i| {
             let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
             let mut best: Option<(f64, i64)> = None;
             for (local, k) in (s..e).enumerate() {
-                if !f.is_valid(k) {
+                if list.is_null(i) || !f.is_valid(k) {
                     continue;
                 }
                 let v = f.value(k);
@@ -707,12 +719,9 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
                     best = Some((v, local as i64));
                 }
             }
-            match best {
-                Some((_, idx)) => b.append_value(idx),
-                None => b.append_null(),
-            }
-        }
-        return Ok(Arc::new(b.finish()));
+            best.map(|(_, idx)| idx)
+        });
+        return Ok(Arc::new(idx.collect::<Int64Array>()));
     }
 
     let mut b = Float64Builder::with_capacity(list.len());
@@ -782,6 +791,10 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             ListFunc::Mean => vals.iter().sum::<f64>() / vals.len() as f64,
             ListFunc::Product => vals.iter().product(),
             ListFunc::L2Norm => vals.iter().map(|&x| x * x).sum::<f64>().sqrt(),
+            ListFunc::L1Norm => vals.iter().map(|&x| x.abs()).sum(),
+            // Max of the absolute values (the MaxAbs-scaling divisor). `vals` is non-empty
+            // here (empty rows are nulled above), so folding from 0.0 is safe.
+            ListFunc::MaxAbs => vals.iter().map(|&x| x.abs()).fold(0.0f64, f64::max),
             _ => unreachable!("len/n_unique/sort/reverse/unique/std/var/flatten handled above"),
         };
         b.append_value(r);
@@ -896,6 +909,109 @@ mod tests {
         let r3 = f64s(&list.value(3));
         let norm: f64 = r3.iter().map(|v| v.unwrap().powi(2)).sum::<f64>().sqrt();
         assert!((norm - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn softmax_produces_a_probability_distribution() {
+        use arrow::array::{Array, AsArray};
+        let a = lists(&[
+            Some(vec![0.0, 0.0]),      // equal logits → [0.5, 0.5]
+            Some(vec![1.0, 2.0, 3.0]), // increasing → increasing probs, sum 1
+            None,                      // null row stays null
+        ]);
+        let out = eval_list(ListFunc::Softmax, &a).unwrap();
+        let list = out.as_list::<i32>();
+        let r0 = f64s(&list.value(0));
+        assert!((r0[0].unwrap() - 0.5).abs() < 1e-12 && (r0[1].unwrap() - 0.5).abs() < 1e-12);
+        let r1 = f64s(&list.value(1));
+        let sum: f64 = r1.iter().map(|v| v.unwrap()).sum();
+        assert!((sum - 1.0).abs() < 1e-12);
+        assert!(r1[0].unwrap() < r1[1].unwrap() && r1[1].unwrap() < r1[2].unwrap());
+        // Exact stable-softmax value for the last element of [1,2,3].
+        let denom = (1.0f64 - 3.0).exp() + (2.0f64 - 3.0).exp() + 1.0;
+        assert!((r1[2].unwrap() - 1.0 / denom).abs() < 1e-12);
+        assert!(list.is_null(2));
+    }
+
+    #[test]
+    fn l1_norm_sums_absolute_values() {
+        use arrow::array::{Array, Float64Array};
+        let a = lists(&[Some(vec![3.0, -4.0]), Some(vec![]), None]);
+        let out = eval_list(ListFunc::L1Norm, &a).unwrap();
+        let f = out.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(f.value(0), 7.0); // |3| + |-4|
+        assert!(f.is_null(1)); // empty row → null (no elements to sum)
+        assert!(f.is_null(2)); // null row → null
+    }
+
+    #[test]
+    fn max_abs_is_the_largest_magnitude() {
+        use arrow::array::{Array, Float64Array};
+        let a = lists(&[Some(vec![1.0, -5.0, 3.0]), Some(vec![]), None]);
+        let out = eval_list(ListFunc::MaxAbs, &a).unwrap();
+        let f = out.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(f.value(0), 5.0); // max(|1|, |-5|, |3|)
+        assert!(f.is_null(1) && f.is_null(2));
+    }
+
+    #[test]
+    fn cum_sum_accumulates_and_preserves_nulls() {
+        use arrow::array::{Array, AsArray};
+        let a = lists(&[
+            Some(vec![1.0, 2.0, 3.0]), // → [1, 3, 6]
+            None,                      // null row stays null
+            Some(vec![]),              // empty → empty
+        ]);
+        let out = eval_list(ListFunc::CumSum, &a).unwrap();
+        let list = out.as_list::<i32>();
+        assert_eq!(f64s(&list.value(0)), vec![Some(1.0), Some(3.0), Some(6.0)]);
+        assert!(list.is_null(1));
+        assert_eq!(f64s(&list.value(2)), Vec::<Option<f64>>::new());
+    }
+
+    #[test]
+    fn diff_is_first_difference_with_leading_null() {
+        use arrow::array::{Array, AsArray};
+        let a = lists(&[
+            Some(vec![1.0, 2.0, 4.0, 7.0]), // → [null, 1, 2, 3]
+            None,                           // null row stays null
+            Some(vec![5.0]),                // single element → [null]
+            Some(vec![]),                   // empty → empty
+        ]);
+        let out = eval_list(ListFunc::Diff, &a).unwrap();
+        let list = out.as_list::<i32>();
+        assert_eq!(
+            f64s(&list.value(0)),
+            vec![None, Some(1.0), Some(2.0), Some(3.0)]
+        );
+        assert!(list.is_null(1));
+        assert_eq!(f64s(&list.value(2)), vec![None]);
+        assert_eq!(f64s(&list.value(3)), Vec::<Option<f64>>::new());
+    }
+
+    #[test]
+    fn arg_sort_returns_ascending_indices() {
+        use arrow::array::{Array, AsArray, Int64Array};
+        let a = lists(&[
+            Some(vec![0.3, 0.9, 0.1]), // ascending order of values → indices [2, 0, 1]
+            Some(vec![5.0, 5.0, 1.0]), // ties keep original order → [2, 0, 1]
+            None,                      // null row stays null
+            Some(vec![]),              // empty → empty
+        ]);
+        let out = eval_list(ListFunc::ArgSort, &a).unwrap();
+        let list = out.as_list::<i32>();
+        let idx = |i: usize| {
+            list.value(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        assert_eq!(idx(0), vec![2, 0, 1]);
+        assert_eq!(idx(1), vec![2, 0, 1]); // stable on ties
+        assert!(list.is_null(2));
+        assert_eq!(idx(3), Vec::<i64>::new());
     }
 
     /// Build a `List<Utf8>` for the type-general dedup tests.
@@ -1125,5 +1241,128 @@ mod tests {
             .downcast_ref::<arrow::array::Float64Array>()
             .unwrap()
             .is_null(0));
+    }
+
+    /// Build a `List<Int64>`; an inner `None` is a null *element*, an outer `None` a
+    /// null *row*.
+    fn int_lists(rows: &[Option<Vec<Option<i64>>>]) -> ArrayRef {
+        use arrow::array::Int64Builder;
+        let mut b = ListBuilder::new(Int64Builder::new());
+        for row in rows {
+            match row {
+                Some(vs) => {
+                    for v in vs {
+                        b.values().append_option(*v);
+                    }
+                    b.append(true);
+                }
+                None => b.append(false),
+            }
+        }
+        Arc::new(b.finish())
+    }
+
+    fn i64s(a: &ArrayRef) -> Vec<Option<i64>> {
+        use arrow::array::AsArray;
+        let x = a.as_primitive::<arrow::datatypes::Int64Type>();
+        (0..x.len())
+            .map(|i| (!x.is_null(i)).then(|| x.value(i)))
+            .collect()
+    }
+
+    /// The bug this path exists for: routing an integer `list_sum` through Float64
+    /// rounds every element to 53 significant bits, so `[2^53+1, 2]` summed to
+    /// 2^53+2 instead of the true 2^53+3. DuckDB returns the exact integer.
+    #[test]
+    fn int_sum_is_exact_above_two_pow_53() {
+        let big = (1i64 << 53) + 1;
+        let a = int_lists(&[Some(vec![Some(big), Some(2)])]);
+        let s = eval_list(ListFunc::Sum, &a).unwrap();
+        assert_eq!(s.data_type(), &DataType::Int64, "sum of Int64 stays Int64");
+        assert_eq!(i64s(&s), vec![Some(big + 2)]);
+        // The float path would have produced this instead — pin the difference.
+        assert_ne!(i64s(&s)[0].unwrap() as f64, (big as f64 + 2.0) - 1.0);
+    }
+
+    /// `list_avg` keeps a Float64 *result* but must accumulate the total exactly,
+    /// or the division inherits the same lost bit.
+    #[test]
+    fn int_mean_accumulates_exactly_and_stays_float() {
+        let big = (1i64 << 53) + 1;
+        let a = int_lists(&[Some(vec![Some(big), Some(2)])]);
+        let m = eval_list(ListFunc::Mean, &a).unwrap();
+        assert_eq!(m.data_type(), &DataType::Float64);
+        assert_eq!(f64s(&m), vec![Some((big + 2) as f64 / 2.0)]);
+    }
+
+    /// Null elements are skipped; a null row, an empty row and an all-null row each
+    /// have no values to sum and so are null (DuckDB agrees on all three).
+    #[test]
+    fn int_sum_null_empty_and_all_null_rows() {
+        let a = int_lists(&[
+            Some(vec![Some(1), None, Some(2)]), // nulls skipped
+            Some(vec![]),                       // empty row
+            Some(vec![None, None]),             // all-null row
+            None,                               // null row
+            Some(vec![Some(7)]),                // single element
+            Some(vec![Some(-5), Some(3)]),      // negatives
+        ]);
+        let s = eval_list(ListFunc::Sum, &a).unwrap();
+        assert_eq!(i64s(&s), vec![Some(3), None, None, None, Some(7), Some(-2)]);
+        let m = eval_list(ListFunc::Mean, &a).unwrap();
+        assert_eq!(
+            f64s(&m),
+            vec![Some(1.5), None, None, None, Some(7.0), Some(-1.0)]
+        );
+    }
+
+    /// i64 boundary: `i64::MAX` alone is representable and must come back exactly
+    /// (the float path returns 9223372036854775808.0, which is not even an i64).
+    /// Overflowing the accumulator errors rather than wrapping, matching the scalar
+    /// `sum` aggregate (`bc-runtime`'s `checked_add` → `SumOverflow`).
+    #[test]
+    fn int_sum_i64_boundary_and_overflow_errors() {
+        let exact = int_lists(&[Some(vec![Some(i64::MAX)]), Some(vec![Some(i64::MIN)])]);
+        let s = eval_list(ListFunc::Sum, &exact).unwrap();
+        assert_eq!(i64s(&s), vec![Some(i64::MAX), Some(i64::MIN)]);
+
+        let over = int_lists(&[Some(vec![Some(i64::MAX), Some(1)])]);
+        assert!(
+            eval_list(ListFunc::Sum, &over).is_err(),
+            "i64 overflow must error, not wrap"
+        );
+    }
+
+    /// A narrow integer child (Int32) also takes the exact path — the FFI boundary
+    /// normalizes narrow ints to Int64, but a list child can still arrive narrow.
+    #[test]
+    fn narrow_int_child_takes_the_int_path() {
+        use arrow::array::{Int32Builder, ListBuilder};
+        let mut b = ListBuilder::new(Int32Builder::new());
+        for v in [1, 2, 3] {
+            b.values().append_value(v);
+        }
+        b.append(true);
+        let a: ArrayRef = Arc::new(b.finish());
+        let s = eval_list(ListFunc::Sum, &a).unwrap();
+        assert_eq!(s.data_type(), &DataType::Int64);
+        assert_eq!(i64s(&s), vec![Some(6)]);
+    }
+
+    /// The float child path is untouched: still Float64 out, still NaN-aware, and
+    /// `product` (which DuckDB also returns as a double) is unchanged for ints too.
+    #[test]
+    fn float_child_path_unchanged() {
+        let a = lists(&[Some(vec![1.5, 2.5]), Some(vec![]), None]);
+        let s = eval_list(ListFunc::Sum, &a).unwrap();
+        assert_eq!(s.data_type(), &DataType::Float64);
+        assert_eq!(f64s(&s), vec![Some(4.0), None, None]);
+        let m = eval_list(ListFunc::Mean, &a).unwrap();
+        assert_eq!(f64s(&m), vec![Some(2.0), None, None]);
+
+        let ints = int_lists(&[Some(vec![Some(2), Some(3)])]);
+        let p = eval_list(ListFunc::Product, &ints).unwrap();
+        assert_eq!(p.data_type(), &DataType::Float64, "product stays double");
+        assert_eq!(f64s(&p), vec![Some(6.0)]);
     }
 }

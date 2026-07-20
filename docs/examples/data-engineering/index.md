@@ -1,6 +1,6 @@
 # Data engineering recipes
 
-Pipelines that move and reconcile data. The hard part is rarely the transformation; it is
+Pipelines that move and reconcile data. The hard part is rarely the transformation. It is
 everything around it. The source moved. The file arrived twice. Yesterday's numbers changed
 overnight and nobody knows why.
 

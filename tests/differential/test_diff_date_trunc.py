@@ -8,6 +8,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -24,8 +25,6 @@ def t(duck):
 
 @pytest.mark.parametrize("unit", ["year", "month", "day", "hour", "minute", "second"])
 def test_date_trunc_vs_duckdb(duck, t, unit):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(x=col("ts").dt.truncate(unit)).collect()
     expected = duck.sql(f"SELECT date_trunc('{unit}', ts) x FROM t")
     assert_same(out, expected)

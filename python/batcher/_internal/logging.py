@@ -22,9 +22,19 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from batcher.config.config import ObservabilityConfig
 
-__all__ = ["configure", "ensure_configured", "get_logger", "native_tracing_settings"]
+__all__ = [
+    "configure",
+    "ensure_configured",
+    "get_logger",
+    "log_kv",
+    "native_tracing_settings",
+    "suppress_console_handler",
+]
 
 _ROOT = "batcher"
+# The `LogRecord` attribute `log_kv` stashes its structured fields under. Namespaced so it
+# cannot collide with a stdlib record attribute (which `logging` would refuse to overwrite).
+_FIELDS_ATTR = "batcher_fields"
 # The settings the current handlers reflect, so a repeat `configure` with the same
 # config is a no-op and a changed one rebuilds. `None` means "never configured".
 _applied: tuple | None = None
@@ -37,6 +47,25 @@ _native_settings: tuple[str, bool] | None = None
 def get_logger(name: str = "") -> logging.Logger:
     """Return the `batcher`/`batcher.<name>` logger (e.g. ``get_logger("kyber")``)."""
     return logging.getLogger(_ROOT if not name else f"{_ROOT}.{name}")
+
+
+def log_kv(logger: logging.Logger, level: int, msg: str, /, **fields: object) -> None:
+    """Log `msg` with structured `fields` attached, rendered per the configured format.
+
+    The one way the engine logs anything with detail. The human formatter appends the
+    fields as ``key=value`` pairs; the JSON formatter nests them under ``"fields"``; the
+    web UI reads them as real typed data instead of re-parsing a sentence. Writing
+    ``log_kv(log, INFO, "spilled", op="hash_join", bytes=n)`` once therefore serves all
+    three, where an f-string would have served only the first.
+
+    Args:
+        logger: The `batcher.*` logger to record on, from `get_logger`.
+        level: A `logging` level constant.
+        msg: The short, stable, human-readable event name — not a formatted sentence.
+        **fields: Structured detail; must be JSON-encodable.
+    """
+    if logger.isEnabledFor(level):
+        logger.log(level, msg, extra={_FIELDS_ATTR: fields})
 
 
 def ensure_configured() -> None:
@@ -62,7 +91,7 @@ def configure(cfg: ObservabilityConfig) -> None:
     """
     global _applied, _native_settings
     key = (
-        cfg.log_level,
+        cfg.resolved_log_level,
         cfg.console,
         cfg.log_file,
         cfg.log_file_max_bytes,
@@ -72,7 +101,7 @@ def configure(cfg: ObservabilityConfig) -> None:
     if key == _applied:
         return
     logger = logging.getLogger(_ROOT)
-    level = _level_value(cfg.log_level)
+    level = _level_value(cfg.resolved_log_level)
     logger.setLevel(level)
     # Batcher manages its own handlers; don't also propagate to the root logger (which
     # would double-emit if the app configured logging too).
@@ -92,11 +121,37 @@ def configure(cfg: ObservabilityConfig) -> None:
         )
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
-    if not logger.handlers:
-        # No sink chosen — keep records from hitting Python's last-resort stderr handler.
-        logger.addHandler(logging.NullHandler())
+    # Always mirror to the bus, regardless of the console/file choice: the terminal
+    # progress renderer and the web UI are bus sinks, and a user who set `console=False`
+    # to keep stderr clean still wants the UI to show what happened. It also means the
+    # hierarchy always has at least one handler, so records can never reach Python's
+    # last-resort stderr writer even with every configured sink turned off.
+    logger.addHandler(_BusHandler())
     _applied = key
-    _native_settings = (cfg.log_level, cfg.log_format == "json")
+    _native_settings = (cfg.resolved_native_log_level, cfg.log_format == "json")
+
+
+def suppress_console_handler(suppressed: bool) -> None:
+    """Detach (or restore) the plain stderr handler, for a renderer that owns the terminal.
+
+    When the live progress reporter is attached it draws log lines itself, interleaved
+    correctly with the progress bar. Leaving the plain `StreamHandler` in place as well
+    would print every record twice and let a log line land in the middle of the bar. Only
+    the reporter calls this, and it restores the handler on detach, so the terminal has
+    exactly one owner at any moment.
+
+    Args:
+        suppressed: True to remove the console handler, False to reconfigure from config.
+    """
+    logger = logging.getLogger(_ROOT)
+    if not suppressed:
+        global _applied
+        _applied = None  # force `configure` to rebuild the handler set
+        ensure_configured()
+        return
+    for handler in list(logger.handlers):
+        if type(handler) is logging.StreamHandler:
+            logger.removeHandler(handler)
 
 
 def native_tracing_settings() -> tuple[str, bool] | None:
@@ -120,25 +175,71 @@ def _level_value(name: str) -> int:
     return value if isinstance(value, int) else logging.WARNING
 
 
+def _record_fields(record: logging.LogRecord) -> dict[str, object]:
+    """The structured fields `log_kv` attached, or `{}` for a plain `logger.info` call."""
+    fields = getattr(record, _FIELDS_ATTR, None)
+    return fields if isinstance(fields, dict) else {}
+
+
 class _HumanFormatter(logging.Formatter):
-    """A compact one-line layout: ``HH:MM:SS LEVEL  batcher.x: message``."""
+    """A compact one-line layout: ``HH:MM:SS LEVEL  batcher.x: message  key=value``.
+
+    The `batcher.` prefix is stripped from the logger name — every record in this
+    hierarchy has it, so printing it on all of them carries no information and costs
+    eight columns of a terminal line.
+    """
 
     def __init__(self) -> None:
-        super().__init__(
-            fmt="%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S"
-        )
+        super().__init__(fmt="%(message)s", datefmt="%H:%M:%S")
+
+    def format(self, record: logging.LogRecord) -> str:
+        subsystem = record.name.removeprefix(f"{_ROOT}.").removeprefix(_ROOT)
+        head = f"{self.formatTime(record, self.datefmt)} {record.levelname:<7} "
+        head += f"{subsystem or 'engine':<10} {record.getMessage()}"
+        fields = _record_fields(record)
+        if fields:
+            head += "  " + " ".join(f"{k}={v}" for k, v in fields.items())
+        if record.exc_info:
+            head += "\n" + self.formatException(record.exc_info)
+        return head
 
 
 class _JsonFormatter(logging.Formatter):
     """One JSON object per record, for structured log shippers."""
 
     def format(self, record: logging.LogRecord) -> str:
-        payload = {
+        payload: dict[str, object] = {
             "time": self.formatTime(record),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
         }
+        fields = _record_fields(record)
+        if fields:
+            payload["fields"] = fields
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
-        return json.dumps(payload)
+        return json.dumps(payload, default=str)
+
+
+class _BusHandler(logging.Handler):
+    """Mirrors every `batcher.*` record onto the event bus as a `LOG` event.
+
+    This is what puts logs and metrics in the same stream: the web UI's log pane and the
+    terminal renderer's scrollback are both just sinks on the bus, so neither needs its
+    own handler or its own copy of the formatting rules. Costs nothing when no sink is
+    attached — `publish` returns on a tuple check before the payload is built.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        from batcher._internal import events
+
+        if not events.listening():
+            return
+        events.publish(
+            events.LOG,
+            name=record.name.removeprefix(f"{_ROOT}."),
+            level=record.levelname,
+            message=record.getMessage(),
+            fields=_record_fields(record),
+        )

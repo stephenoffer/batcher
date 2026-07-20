@@ -361,6 +361,17 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(bt.col("a").list.arg_max().alias("r")).to_pydict()\n'
         "        {'r': [2]}"
     ),
+    "arg_sort": (
+        "The 0-based indices that sort each list ascending (→ list of Int64).\n\n"
+        "Stable (ties keep original order); `reverse` it for a descending / top-k ranking "
+        "of a per-row score or logit vector.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"scores": [[0.3, 0.9, 0.1]]})\n'
+        '        >>> ds.select(r=bt.col("scores").list.arg_sort()).to_pydict()\n'
+        "        {'r': [[2, 0, 1]]}"
+    ),
     "l2_norm": (
         "The Euclidean norm, sqrt(sum of squares), of each list (→ Float64).\n\n"
         "Examples:\n"
@@ -368,6 +379,24 @@ _DESCRIPTIONS: dict[str, str] = {
         "        >>> import batcher as bt\n"
         '        >>> ds = bt.from_pydict({"xs": [[3.0, 4.0]]})\n'
         '        >>> ds.select(r=bt.col("xs").list.l2_norm()).to_pydict()\n'
+        "        {'r': [5.0]}"
+    ),
+    "l1_norm": (
+        "The Manhattan (L1) norm, sum of absolute values, of each list (→ Float64).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[3.0, -4.0]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.l1_norm()).to_pydict()\n'
+        "        {'r': [7.0]}"
+    ),
+    "max_abs": (
+        "The maximum absolute value of each list — the MaxAbs scaling divisor (→ Float64).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1.0, -5.0, 3.0]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.max_abs()).to_pydict()\n'
         "        {'r': [5.0]}"
     ),
     "normalize": (
@@ -378,6 +407,35 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds = bt.from_pydict({"xs": [[3.0, 4.0]]})\n'
         '        >>> ds.select(r=bt.col("xs").list.normalize()).to_pydict()\n'
         "        {'r': [[0.6, 0.8]]}"
+    ),
+    "cum_sum": (
+        "The cumulative sum of each list — element ``i`` sums ``0..=i`` (→ same-length list).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1.0, 2.0, 3.0]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.cum_sum()).to_pydict()\n'
+        "        {'r': [[1.0, 3.0, 6.0]]}"
+    ),
+    "diff": (
+        "The first difference of each list (→ list of the same length).\n\n"
+        "Element ``i`` is ``xᵢ - xᵢ₋₁`` and element 0 is null (no predecessor); the "
+        "delta-feature building block for audio (MFCC deltas) and time-series.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[1.0, 2.0, 4.0, 7.0]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.diff()).to_pydict()\n'
+        "        {'r': [[None, 1.0, 2.0, 3.0]]}"
+    ),
+    "softmax": (
+        "Softmax over each list — logits to a probability distribution summing to 1 (→ list).\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"logits": [[0.0, 0.0]]})\n'
+        '        >>> ds.select(p=bt.col("logits").list.softmax()).to_pydict()\n'
+        "        {'p': [[0.5, 0.5]]}"
     ),
     # `reverse` is shared by .str (reverse characters) and .list (reverse order);
     # the per-family fallback disambiguates it, so it is intentionally omitted here.

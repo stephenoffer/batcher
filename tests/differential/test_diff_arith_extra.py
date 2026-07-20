@@ -18,8 +18,8 @@ import pytest
 
 import batcher as bt
 import batcher.kyber.rules.extra.arith_extra  # registers the rules into DEFAULT_REGISTRY
+from _harness import assert_same
 from batcher import col, lit
-from conftest import assert_same
 
 
 @pytest.fixture

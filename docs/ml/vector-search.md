@@ -9,8 +9,8 @@ index you never needed or wait for a linear scan you should not have run.
 ## Brute force, in the engine
 
 When the vectors already ride in a column, score them with the `.list` distance
-expressions. No index, no extra service, no data movement: it is a projection and a
-top-n.
+expressions. There is no index, no extra service, and no data movement. It is a
+projection and a top-n.
 
 ```python
 import batcher as bt
@@ -34,9 +34,47 @@ print(hits.select("id", "title").to_pydict())
 # {'id': [1, 3], 'title': ['cats', 'kittens']}
 ```
 
+`ds.ml.nearest_neighbors(query, column, k, metric)` is the one-call shorthand for exactly
+that projection → sort → limit, with `metric="cosine"` (default), `"l2"`, or `"dot"`:
+
+```python
+hits = docs.ml.nearest_neighbors([1.0, 0.0], column="vec", k=2)  # nearest first, + `distance`
+```
+
+Use the explicit form above when you want to keep the score column under your own name or
+combine it with other predicates. Reach for the verb when you want the top `k` and nothing
+else.
+
+Two companions round out the pattern. `ds.ml.similarity_to(query, column=, metric=)` scores
+every row against the query **without** the top-`k` cut, which is what thresholding and
+reranking need. `ds.ml.normalize_embeddings(column)` unit-normalizes an embedding column so
+a later `.list.dot` ranks exactly as cosine, the cheap and index-friendly form:
+
+```python
+scored = docs.ml.normalize_embeddings("vec").ml.similarity_to([1.0, 0.0], column="vec")
+```
+
 `cosine_distance` is `1 - cosine_similarity`: 0 for identical direction, 1 for
 orthogonal, 2 for opposite. It sorts ascending, so nearest comes first.
-`.list.l2_distance` is Euclidean, and `.list.dot` is the raw inner product.
+`.list.l2_distance` is Euclidean, and `.list.dot` is the raw inner product. For the vector
+*magnitude* rather than a pairwise distance, `.list.l2_norm()` is the Euclidean length and
+`.list.l1_norm()` the Manhattan length, the sum of absolute values, used for L1
+normalization. `.list.max_abs()` returns the largest magnitude in the row. That is the
+divisor for MaxAbs scaling, which maps a feature vector into `[-1, 1]` without shifting
+its zero.
+
+For other embedding geometries the engine has the matching metric. `.list.l1_distance` is
+Manhattan distance, the sum of absolute differences. `.list.hamming_distance` handles
+**binary or quantized embeddings**, where each element is `0` or `1` or a small integer.
+Hamming counts the differing positions and is far cheaper than a float metric, which is
+exactly what a binary vector index ranks by:
+
+```python
+# docs: skip
+from batcher import col
+# `bits` columns are quantized 0/1 embeddings; rank by how many bits differ.
+nearest = docs.with_columns(dist=col("bits").list.hamming_distance(query_bits)).sort("dist")
+```
 
 :::{tip}
 Normalize at ingest, then rank with `.list.dot`. On unit vectors the dot product ranks
@@ -62,7 +100,7 @@ print(docs.with_columns(dist=col("vec").list.cosine_distance(query))
 
 ## Filter first, then score
 
-The reason in-engine search is worth having is that a vector distance is just another
+The reason in-engine search is worth having is that a vector distance is another
 expression, so it composes with everything else. A metadata filter runs *before* the
 distance is computed, and the optimizer pushes it into the scan, so a query scoped to one
 tenant scores only that tenant's rows.
@@ -85,8 +123,8 @@ print(out.select("id", "tenant").to_pydict())
 ```
 
 This is the thing a standalone vector database makes hard. There, a metadata filter is
-either a post-filter (you asked for 10, got 10, and 9 belong to another tenant) or a
-pre-filter that defeats the index. Here it is a predicate.
+either a post-filter, where you ask for 10, get 10, and find 9 belong to another tenant,
+or a pre-filter that defeats the index. Here it is a predicate.
 
 ## ANN: an index over Lance
 
@@ -110,17 +148,17 @@ hits = vector_search(
 top = hits.collect()  # k rows, nearest first, with a _distance column
 ```
 
-`vector_search` returns a `Dataset`, so the hits join, filter, and aggregate like any
-other relation. `nprobes` trades recall for latency (more probes, more of the index
-searched); `refine_factor` re-scores an over-fetched candidate set with exact distances,
-which buys back most of the recall an approximate index loses. Vector search needs the
-`batcher-engine[lance]` extra.
+`vector_search` returns a `Dataset`, so the hits join, filter, and aggregate the way any
+other relation does. `nprobes` trades latency for recall, because more probes search more
+of the index. `refine_factor` re-scores an over-fetched candidate set with exact
+distances, which buys back most of the recall an approximate index loses. Vector search
+needs the `batcher-engine[lance]` extra.
 
 :::{warning}
-An ANN index is approximate by construction: it can miss a true nearest neighbour, and
-it will not tell you that it did. If your application cannot tolerate that (a compliance
-lookup, a dedup key), brute force over a filtered candidate set is the honest answer, not
-a higher `nprobes`.
+An ANN index is approximate by construction. It can miss a true nearest neighbour, and it
+will not tell you that it did. If your application cannot tolerate that, as with a
+compliance lookup or a dedup key, brute force over a filtered candidate set is the honest
+answer, not a higher `nprobes`.
 :::
 
 ## Joining on meaning
@@ -169,7 +207,7 @@ one enormous candidate bucket.
 - [RAG](rag.md): retrieval feeding a generation step.
 - [Expressions API](../api/expressions.md): the full `.list` vector method set.
 - [Expression evaluation](../deep-dives/expression-evaluation.md): why a vector distance
-  is just another vectorized expression, and what that buys.
+  is one more vectorized expression, and what that buys.
 - [Sort internals](../deep-dives/sort-internals.md): the bounded heap behind `top_k`.
 - [RAG index recipe](../examples/ml/rag-index.md): building and querying the index.
 - [Distinct and dedup](../user-guide/distinct-and-dedup.md): the exact and near-duplicate

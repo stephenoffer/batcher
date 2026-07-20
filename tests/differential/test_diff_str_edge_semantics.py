@@ -12,6 +12,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -28,8 +29,6 @@ def t(duck):
 
 def test_right_negative_drops_leading_chars(duck, t):
     """`right(s, -2)` drops the first 2 chars (DuckDB), not returns ''."""
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(
@@ -45,8 +44,6 @@ def test_right_negative_drops_leading_chars(duck, t):
 
 def test_split_part_negative_and_empty_delimiter(duck, t):
     """Negative index counts from the right; empty delimiter splits into characters."""
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(
@@ -66,8 +63,6 @@ def test_split_part_negative_and_empty_delimiter(duck, t):
 
 def test_split_empty_delimiter_yields_characters(duck, t):
     """`string_split(s, '')` splits into individual characters, no phantom '' ends."""
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(parts=col("s").str.split("")).collect()
     expected = duck.sql("SELECT string_split(s, '') parts FROM t")
     assert_same(out, expected)
@@ -75,8 +70,6 @@ def test_split_empty_delimiter_yields_characters(duck, t):
 
 def test_replace_empty_pattern_is_noop(duck, t):
     """`replace(s, '', 'X')` returns s unchanged (DuckDB), not X-between-every-char."""
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(r=col("s").str.replace("", "X")).collect()
     expected = duck.sql("SELECT replace(s, '', 'X') r FROM t")
     assert_same(out, expected)
@@ -104,8 +97,6 @@ def test_substring_index_and_overlay_extremes_do_not_crash():
 
 def test_substr_extremes_do_not_crash(duck):
     """substr with i64-extreme start/length clips to the string (DuckDB agrees)."""
-    from conftest import assert_same
-
     tbl = pa.table({"s": pa.array(["abcdef", "héllo", ""])})
     duck.register("t2", tbl)
     # DuckDB rejects i64-extreme substr args at bind time, so compare the large-but-legal

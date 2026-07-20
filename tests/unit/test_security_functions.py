@@ -141,3 +141,64 @@ def test_repr_shows_a_reference_but_hides_a_literal():
 def test_a_bad_inline_key_is_still_rejected_at_plan_build():
     with pytest.raises(PlanError):
         bt.aes_encrypt(bt.col("x"), "too-short")
+
+
+def test_require_key_refs_makes_an_inline_key_a_hard_error(monkeypatch):
+    """`SecurityWarning` is a weak control for a regulated deployment.
+
+    It is a `UserWarning`, so Python shows it once per location and a caller that filtered
+    warnings never sees it — while the key still travels verbatim in the IR JSON, into
+    `explain(format="json")`, into the plan fingerprint, and out to every Ray worker the
+    plan is shipped to. The env var lets an operator make that unrepresentable.
+    """
+    monkeypatch.setenv("BATCHER_REQUIRE_KEY_REFS", "1")
+    for build in (
+        lambda: bt.aes_encrypt(bt.col("x"), HEX_KEY),
+        lambda: bt.aes_decrypt(bt.col("x"), HEX_KEY),
+        lambda: bt.hmac_sha256(bt.col("x"), "secret"),
+    ):
+        with pytest.raises(PlanError, match="BATCHER_REQUIRE_KEY_REFS"):
+            build()
+
+
+def test_require_key_refs_still_allows_a_reference(monkeypatch):
+    """Enforcement must forbid the *inline* form only — references are the fix it points at."""
+    monkeypatch.setenv("BATCHER_REQUIRE_KEY_REFS", "1")
+    assert bt.aes_encrypt(bt.col("x"), "env:MY_KEY") is not None
+    assert bt.aes_encrypt(bt.col("x"), "file:/run/secrets/key") is not None
+
+
+def test_inline_keys_are_allowed_by_default(monkeypatch):
+    """Unset (and falsey) keeps the warn-only default, so notebooks and tests are unaffected."""
+    monkeypatch.delenv("BATCHER_REQUIRE_KEY_REFS", raising=False)
+    with pytest.warns(SecurityWarning):
+        assert bt.aes_encrypt(bt.col("x"), HEX_KEY) is not None
+    monkeypatch.setenv("BATCHER_REQUIRE_KEY_REFS", "0")
+    with pytest.warns(SecurityWarning):
+        assert bt.aes_encrypt(bt.col("x"), HEX_KEY) is not None
+
+
+def test_cmd_reference_is_treated_as_a_reference_not_an_inline_key():
+    """`_KEY_REF_SCHEMES` is a two-sided contract with the `bc-secrets` scheme table.
+
+    A scheme the engine resolves but Python does not recognize is worse than unsupported:
+    Python validates it as raw key material, so it is rejected at plan-build time and the
+    engine never gets the chance to resolve it. This caught exactly that drift when the
+    `cmd:` backend was added on the Rust side only.
+    """
+    from batcher.plan.functions.security import _is_key_ref
+
+    for ref in ("env:K", "file:/run/secrets/k", "cmd:prod/aes-key"):
+        assert _is_key_ref(ref), ref
+        # A reference must pass through untouched — no 32-byte validation, no warning.
+        assert bt.aes_encrypt(bt.col("x"), ref) is not None
+    assert not _is_key_ref("0" * 64)
+
+
+def test_every_engine_scheme_is_known_to_the_plan_layer():
+    """Enumerate the schemes the Rust resolver implements, so adding one there without
+    adding it here fails loudly instead of silently rejecting valid references."""
+    from batcher.plan.functions.security import _KEY_REF_SCHEMES
+
+    # Mirrors the backends registered in `crates/bc-secrets/src/lib.rs`.
+    assert set(_KEY_REF_SCHEMES) == {"env:", "file:", "cmd:"}

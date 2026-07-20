@@ -355,6 +355,20 @@ def _binary_type(expr: object, schema: SchemaRef) -> pa.DataType | None:
             return dec
         common = promote(left, right)
         return widen(common) if common is not None else None
+    if op == "floor_div":
+        # Floored division is type-preserving for integers — Int64 // Int64 stays
+        # Int64 — and promotes to Float64 as soon as either side is floating. A
+        # decimal operand is left uncertain (the engine evaluates it as Float64,
+        # but that is a fallback rather than a derived decimal rule).
+        left = infer_type(expr.left, schema)  # type: ignore[attr-defined]
+        right = infer_type(expr.right, schema)  # type: ignore[attr-defined]
+        if left is None or right is None:
+            return None
+        numeric = pa.types.is_integer, pa.types.is_floating
+        if not all(any(p(t) for p in numeric) for t in (left, right)):
+            return None
+        both_int = pa.types.is_integer(left) and pa.types.is_integer(right)
+        return pa.int64() if both_int else pa.float64()
     if op == "div":
         # True division yields Float64 for int/float operands (the engine always
         # produces a double). It is only uncertain when a decimal operand is

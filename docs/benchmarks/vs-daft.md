@@ -1,9 +1,8 @@
 # vs Daft
 
-Daft is a mature, fast, multi-core Rust engine, roughly DuckDB-class, with about 4 ms of
-fixed overhead. It is the closest competitor Batcher has on single-node compute, and the
-result is genuinely mixed: Batcher takes multimodal ingest and top-N by large margins, ties
-on aggregation and single-stage expression ETL, and loses join-heavy SQL by 2–12×.
+This page compares Batcher against Daft on single-node and distributed work.
+
+Daft is a mature, fast, multi-core Rust engine, roughly DuckDB-class, with about 4 ms of fixed overhead. It's the closest competitor Batcher has on single-node compute, and the result is genuinely mixed. Batcher takes multimodal ingest and top-N by large margins, ties on aggregation and single-stage expression ETL, and still trails on the join-heavy TPC-H queries.
 
 :::{important}
 Daft computes TPC-H **q6 wrong**: it folds `0.06 + 0.01` in IEEE double to `0.06999999999999999`, dropping every `l_discount = 0.07` row, and returns 75.2M where
@@ -17,19 +16,18 @@ page passed that gate first.
 | Shape | Winner |
 |---|---|
 | Image decode → tensor | Batcher, 2.4× |
-| Top-N / sort-limit | Batcher, 8–10× |
+| Top-N / sort-limit | Batcher, 8x to 10x |
 | In-memory filter / sum kernels | Batcher, 6.7× / 18× |
 | Global aggregate, group-by, expression ETL | Tie |
-| Distributed join (sf1–sf100) | Batcher, 1.7–2.2× |
-| Distributed `filter → count` (sf10, sf100) | Daft, 0.84–0.92× |
-| TPC-H multi-join queries | **Daft, 2–12×** |
+| Distributed join (sf1 to sf100) | Batcher, 1.7x to 2.2x |
+| Distributed `filter → count` (sf10, sf100) | Daft, 0.84x to 0.92x |
+| TPC-H multi-join queries | **Daft, up to 2x** |
 | Per-batch Python UDF | **Daft, ~2×** |
 
 :::{note}
 This page mixes three machines. The multimodal table below is a 96-core node, the kernel and
 TPC-H tables are a 16-core node, and the distributed table is a 128-CPU Ray cluster. Compare
-engines *within* a table, never a number from one table against a number from another.
-[Methodology](methodology.md) has the full list.
+engines within a table, never a number from one table against a number from another. {doc}`methodology` has the full list.
 :::
 
 ## Multimodal ingest
@@ -46,8 +44,7 @@ JPEG frames, 640×480 → 224×224:
 This started the session at ~350 img/s, *losing to both*. Five fixes took it to 5,693. The
 one that matters for the comparison is the media-decode throttle: the per-row decode kernels
 ran serially, and the parallel executor capped its rayon pool to the morsel count. A
-small-JPEG corpus is a single morsel, so the entire decode ran on one core. See
-[multimodal ingest](multimodal-ingest.md) for the rest.
+small-JPEG corpus is a single morsel, so the entire decode ran on one core. See {doc}`multimodal-ingest` for the rest.
 
 ## In-memory kernels
 
@@ -65,42 +62,31 @@ Hold on to this table. It is what makes the next one interesting.
 ## Where Daft wins: multi-join SQL
 
 :::{warning}
-**Daft is 2–12× faster on the join-heavy TPC-H queries**, and about **2× faster on a
-per-batch Python UDF** (a numpy `map_batches` reduce: 85 ms against Daft's 41 ms). This is
-the largest single-node gap on the site. Parity on global aggregation, group-by, and
-single-stage expression ETL does not offset it.
+**Daft is faster on the join-heavy TPC-H queries**, led by q20 at 2.03x, q3 at 1.55x, and q4 at 1.51x. It's also about **2x faster on a per-batch Python UDF**, where a numpy `map_batches` reduce takes 85 ms against Daft's 41 ms. Parity on global aggregation, group-by, and single-stage expression ETL doesn't offset that.
 :::
 
-TPC-H at scale factor 1, 16 cores. The ratio is `batcher / daft`, so **above 1 means Daft
-is faster**.
+TPC-H at scale factor 1, 16 cores, re-measured 2026-07-18. The ratio is `batcher / daft`, so **above 1 means Daft is faster**. Batcher is faster on 11 of the 18 queries Daft answers correctly. {doc}`tpch` carries the full per-query table.
 
 | Query | vs Daft |
 |---|---:|
-| q7 | 12× |
-| q5 | 9.6× |
-| q20 | 8.6× |
-| q17 | 6.7× |
-| q9 | 5.9× |
-| q3 | 3.8× (was 7.7×) |
+| q20 | 2.03x |
+| q3 | 1.55x |
+| q4 | 1.51x |
+| q17 | 1.35x |
+| q5 | 1.13x |
 
-Given the kernel table above, the join gap is not the filter and it is not the aggregate.
-Single-node parallelism currently reaches only about 1.7–3.8× on 16 cores, where Daft uses
-effectively all of them, and Batcher does roughly 2× more CPU work per query. Being
-10×-better than Daft on compute-bound single-node work is not reachable by configuration;
-it is a runtime-parallelism and kernel-efficiency effort, and it is the top open lever in
-`benchmarks/BENCHMARK_RESULTS.md`.
+Earlier revisions of this page reported Daft 4x to 12x ahead here. That gap is largely gone. The parallel radix join and the whole-partition window kernel landed since, taking q3 from 3.8x behind to 1.55x.
+
+Given the kernel table above, the remaining join gap isn't the filter and isn't the aggregate. Single-node parallelism plateaus after about 8 cores where Daft uses effectively all 16, and Batcher does roughly 2x more CPU work per query. That isn't reachable by configuration. It's a runtime-parallelism and kernel-efficiency effort, and it's the top open lever in `benchmarks/BENCHMARK_RESULTS.md`.
 
 One thing did move by a plan change rather than a kernel change. Kyber's build-side
 selection used to check broadcast eligibility only on the join's *right* input, so when the
 small side arrived on the left the join fell back to shuffling a 6M-row build. Broadcast is
-now decided from `min(left_bytes, right_bytes)`. q3 went from 7.7× to 3.8×, and the q5
-`orders ⋈ lineitem` join from 419 ms to 175 ms.
+now decided from `min(left_bytes, right_bytes)`. q3 went from 7.7x to 3.8x, and the q5 `orders` to `lineitem` join from 419 ms to 175 ms.
 
 ## Where Batcher wins: top-N
 
-`ORDER BY … DESC LIMIT 20` over sf1: 15 ms against Daft's 121 ms, an **8.1×**. A fused
-top-N heap keeps the running best *k* rows; Daft sorts the relation and then takes twenty.
-Sort-limit is 8–10× across the shapes tested.
+`ORDER BY ... DESC LIMIT 20` over sf1 takes 15 ms against Daft's 121 ms, an **8.1x** lead. A fused top-N heap keeps the running best *k* rows, where Daft sorts the relation and then takes twenty. Sort-limit runs 8x to 10x ahead across the shapes tested.
 
 ## Distributed
 
@@ -132,7 +118,7 @@ as a distributed-scan throughput ceiling. That diagnosis was wrong about the dep
 problem. The dominant cause was a control-plane bug: the cluster-fill fan-out was dead, so
 any query that ran with Ray already initialized used 2 of 16 workers. Fixing it, with five
 other data-movement bugs, produced the table above. The superseded section is kept in
-`benchmarks/BENCHMARK_RESULTS.md`. [Scaling](scaling.md) tells the whole story.
+`benchmarks/BENCHMARK_RESULTS.md`. {doc}`scaling` tells the whole story.
 :::
 
 ## Correctness
@@ -142,7 +128,7 @@ the correct revenue is 123.1M. It also cannot parse the `SUBSTRING(x FROM a FOR 
 The harness declines to time a query whose result does not match, so Daft gets no number on
 q6 rather than a fast one.
 
-Batcher matches DuckDB on all 22. The gap to Daft is purely speed, never correctness, and we
+Batcher matches DuckDB on all 22. The gap to Daft is purely speed, never correctness, and this page
 would rather say that than pretend the speed gap does not exist.
 
 ## Reproduce
@@ -155,13 +141,10 @@ python benchmarks/cluster/vs_ray_daft.py 10
 
 ## See also
 
-- [TPC-H](tpch.md): the query-by-query picture.
-- [Multimodal ingest](multimodal-ingest.md): the image and point-cloud pipelines.
-- [Scaling](scaling.md): the full distributed cluster runs.
-- [vs DuckDB](vs-duckdb.md): the same join gap, against the other native engine.
-- [Join algorithms](../deep-dives/join-algorithms.md) and
-  [morsel parallelism](../deep-dives/morsel-parallelism.md): the two mechanisms the loss
-  lives in.
-- [Cost model](../deep-dives/cost-model.md): the build-side selection that took q3 from 7.7×
-  to 3.8×.
-- [UDFs](../user-guide/udfs.md): why a per-batch Python callback costs what it costs.
+- {doc}`tpch` for the query-by-query picture.
+- {doc}`multimodal-ingest` for the image and point-cloud pipelines.
+- {doc}`scaling` for the full distributed cluster runs.
+- {doc}`vs-duckdb` for the same join gap against the other native engine.
+- {doc}`../deep-dives/join-algorithms` and {doc}`../deep-dives/morsel-parallelism` for the two mechanisms the loss lives in.
+- {doc}`../deep-dives/cost-model` for the build-side selection that took q3 from 7.7x to 3.8x.
+- {doc}`../user-guide/udfs` for why a per-batch Python callback costs what it costs.

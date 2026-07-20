@@ -58,10 +58,30 @@ def test_resolve_auto_config_fills_memory_budget():
 
     base = Config()
     assert base.memory.max_memory_bytes is None
-    assert base._rust_memory_budget_bytes() == 0  # unresolved → unbounded fallback
+    # Unresolved still yields a *bounded* budget — the static `default_total_bytes`
+    # envelope, not `0`. See `test_bypassing_the_resolver_still_bounds_the_budget`.
+    assert base._rust_memory_budget_bytes() > 0
     resolved = resolve_auto_config(base)
     assert resolved.memory.max_memory_bytes is not None
     assert resolved._rust_memory_budget_bytes() > 0
+
+
+def test_bypassing_the_resolver_still_bounds_the_budget():
+    # A `0` budget disarms the whole spill machinery at once — no `bc-resource` pool in
+    # `bc-py`, no `agg_spill` in `bc-interp::par`, and `check_budget` a no-op in the
+    # streaming breakers — so every stateful operator accumulates without bound. Only an
+    # explicit opt-out may produce it; a caller that merely never ran the auto-tuning
+    # resolver (an ad-hoc `Config`, an embedded use, the streaming aggregate path) must
+    # still get a real ceiling.
+    import dataclasses
+
+    base = Config()
+    assert base._rust_memory_budget_bytes() == int(
+        base.memory.default_total_bytes * base.memory.hard_limit
+    )
+    # The explicit opt-out is the one way to get an unbounded data plane.
+    ub = base.replace(memory=dataclasses.replace(base.memory, unbounded_memory=True))
+    assert ub._rust_memory_budget_bytes() == 0
 
 
 def test_resolve_auto_config_honors_explicit_cap_and_unbounded():

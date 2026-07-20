@@ -14,6 +14,7 @@ import pyarrow as pa
 
 import batcher as bt
 import batcher.kyber.rules.extra.metadata_adaptive as _metadata_adaptive  # noqa: F401
+from _harness import assert_same
 from batcher import col
 from batcher.api.dataset import Dataset
 from batcher.io.source import InMemorySource, source_statistics
@@ -52,8 +53,6 @@ def _absent(ds, kind) -> bool:
 
 
 def test_sort_over_one_row_source(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [7], "y": ["a"]})
     ds = _reg(duck, "s1", t)
     assert _absent(ds.sort("x"), Sort)  # one row → the sort is dropped
@@ -61,16 +60,12 @@ def test_sort_over_one_row_source(duck):
 
 
 def test_sort_over_one_null_row(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": pa.array([None], pa.int64()), "y": ["a"]})
     ds = _reg(duck, "s1n", t)
     assert_same(ds.sort("x").collect(), duck.sql("SELECT * FROM s1n ORDER BY x"))
 
 
 def test_sort_over_global_aggregate(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [1, 2, 3, None, 5]})
     ds = _reg(duck, "s2", t)
     q = ds.agg(n=col("x").count(), s=col("x").sum()).sort("s")
@@ -82,8 +77,6 @@ def test_sort_over_global_aggregate(duck):
 
 
 def test_constant_sort_key_pruned(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [3, 1, 2, 2], "y": ["a", "b", "c", "d"]})
     ds = _reg(duck, "c1", t)
     out = ds.with_columns(k=7).sort("k", "x")
@@ -92,8 +85,6 @@ def test_constant_sort_key_pruned(duck):
 
 
 def test_all_constant_sort_keys_dropped(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [3, 1, 2]})
     ds = _reg(duck, "c2", t)
     out = ds.with_columns(k=1).sort("k")
@@ -129,8 +120,6 @@ def _keyed_ds(table, key):
 
 
 def test_distinct_over_declared_unique_key(duck):
-    from conftest import assert_same
-
     t = pa.table({"id": [1, 2, 3, 4, 5], "v": ["a", "a", "b", "b", "c"]})
     duck.register("u1", t)
     ds = _keyed_ds(t, "id")
@@ -139,8 +128,6 @@ def test_distinct_over_declared_unique_key(duck):
 
 
 def test_distinct_over_unique_key_with_nulls(duck):
-    from conftest import assert_same
-
     t = pa.table({"id": [1, 2, 3], "v": pa.array([None, "x", None], pa.string())})
     duck.register("u2", t)
     ds = _keyed_ds(t, "id")  # rows stay distinct via the unique id, despite null v
@@ -151,8 +138,6 @@ def test_distinct_over_unique_key_with_nulls(duck):
 
 
 def test_col_lt_col_always_true(tmp_path, duck):
-    from conftest import assert_same
-
     t = pa.table({"a": list(range(0, 10)), "b": list(range(100, 110))})
     duck.register("f1", t)
     ds = _pq(tmp_path, t, "f1.parquet")
@@ -161,8 +146,6 @@ def test_col_lt_col_always_true(tmp_path, duck):
 
 
 def test_col_lt_col_always_false_is_empty(tmp_path, duck):
-    from conftest import assert_same
-
     t = pa.table({"a": list(range(100, 110)), "b": list(range(0, 10))})
     duck.register("f2", t)
     ds = _pq(tmp_path, t, "f2.parquet")
@@ -171,8 +154,6 @@ def test_col_lt_col_always_false_is_empty(tmp_path, duck):
 
 
 def test_col_ge_col_always_true(tmp_path, duck):
-    from conftest import assert_same
-
     t = pa.table({"a": list(range(100, 110)), "b": list(range(0, 10))})
     duck.register("f3", t)
     ds = _pq(tmp_path, t, "f3.parquet")
@@ -183,8 +164,6 @@ def test_col_ge_col_always_true(tmp_path, duck):
 
 
 def test_col_comparison_overlap_executes(tmp_path, duck):
-    from conftest import assert_same
-
     t = pa.table({"a": [0, 5, 10, 15], "b": [3, 3, 3, 3]})
     duck.register("f4", t)
     ds = _pq(tmp_path, t, "f4.parquet")

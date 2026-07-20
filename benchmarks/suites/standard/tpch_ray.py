@@ -63,16 +63,21 @@ def case_with_ray(name: str, query: str) -> Callable[[Context], EngineQueries]:
 
     Mirrors the operator-mix ``with_native`` mechanism but threads *all* TPC-H table
     handles (a query joins several) so the DataFrame engines compete on the full
-    query: Ray Data (no SQL surface) via its ``ray.data.Dataset`` pipeline, and
-    batcher via its native ``bt.Dataset`` pipeline (a parse-free, apples-to-apples
-    counterpart to Ray Data — same DataFrame-style workload). SQL engines keep the
-    SQL string; an engine without a pipeline for this query simply stays on SQL (or
+    query: Ray Data (no SQL surface) via its ``ray.data.Dataset`` pipeline, batcher
+    via its native ``bt.Dataset`` pipeline (a parse-free, apples-to-apples counterpart
+    to Ray Data — same DataFrame-style workload), and Polars via its lazy DataFrame
+    API (``tpch_polars``) — the way Polars' own published TPC-H benchmark is written,
+    and the only way it covers all 22 queries, since its SQL parser rejects implicit
+    joins, ``EXISTS``, and scalar-subquery comparisons. SQL engines keep the SQL
+    string; an engine without a pipeline for this query simply stays on SQL (or
     ``n/a`` for Ray Data), never a wrong answer.
     """
     from suites.standard.tpch_dataframe import batcher_impl
+    from suites.standard.tpch_polars import polars_impl
 
     sql_build = sql_case(query)
     bt_impl = batcher_impl(name)
+    pl_impl = polars_impl(name)
 
     def build(ctx: Context) -> EngineQueries:
         fns = sql_build(ctx)
@@ -89,6 +94,7 @@ def case_with_ray(name: str, query: str) -> Callable[[Context], EngineQueries]:
 
         native("ray", _IMPLS.get(name))
         native("batcher", bt_impl)
+        native("polars", pl_impl)
         return fns
 
     return build

@@ -9,9 +9,8 @@ the materializing path (`core.udf._execute_node`) — same rows, same per-batch 
 only the scheduling overlaps.
 
 This module owns the *scheduling* of that overlap and the GPU-adaptive sub-batching; the
-per-batch application primitives it calls (`build_udf_callable`, `_formatted`,
-`_coerce_udf_result`, `_resilient_call`) live in `core.udf`, which routes a linear chain
-here from `execute_with_udfs`.
+per-batch call boundary it drives (`_formatted`, `_coerce_udf_result`, `_resilient_call`)
+lives in `core.udf.call`, and `execute_with_udfs` routes a linear chain here.
 """
 
 from __future__ import annotations
@@ -24,12 +23,8 @@ from concurrent.futures import ThreadPoolExecutor
 import pyarrow as pa
 
 from batcher.config import active_config
-from batcher.core.udf.execute import (
-    _coerce_udf_result,
-    _formatted,
-    _resilient_call,
-    build_udf_callable,
-)
+from batcher.core.udf.call import _coerce_udf_result, _formatted, _resilient_call
+from batcher.core.udf.execute import build_udf_callable
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 
 __all__ = ["linear_map_chain", "stream_eligible", "stream_linear_chain"]
@@ -343,14 +338,21 @@ def _apply_udf_stream(
     explicit: int | None = op.batch_size or None
     gpu_cap = _learned_gpu_cap(op) if is_gpu else _GPU_STREAM_BATCH_ROWS
     workers = op.num_workers if isinstance(op.num_workers, int) and op.num_workers > 1 else 1
-    applied_gpu: list[int] = []  # GPU sizes actually used, folded into the learned safe size
+    # What each morsel's *data width* permits, sized against the config cap rather than the
+    # learned one. Folding the size actually applied would make the EMA its own input: the
+    # applied size is `min(learned_cap, by_bytes) <= learned_cap`, so every run could only
+    # ever fold a value at or below the prior EMA. That is a one-way ratchet — a single
+    # wide-row run permanently shrank a model's GPU batch on every later run, including over
+    # narrow data, drifting toward the floor with no path back up. Measuring against the
+    # config cap keeps the signal a property of the data, so it can recover.
+    observed_gpu: list[int] = []
 
     def _subs(batch: pa.RecordBatch) -> list[pa.RecordBatch]:
         if explicit is not None:
             t = explicit
         elif is_gpu:
             t = _gpu_batch_rows(batch, gpu_cap)
-            applied_gpu.append(t)
+            observed_gpu.append(_gpu_batch_rows(batch, _GPU_STREAM_BATCH_ROWS))
         else:
             t = _cpu_batch_rows(batch, morsel)
         if batch.num_rows > t:
@@ -406,11 +408,13 @@ def _apply_udf_stream(
                 for out in pool.map(_emit, _parallel_units(batch)):
                     yield from out
     finally:
-        # Persist the model's SMALLEST applied GPU batch this run (the VRAM-safe size after any
-        # byte-budget shrink) so the next run seeds its cap from it instead of the default. Purely
-        # a starting-size hint — the size never changes what the model computes.
-        if is_gpu and explicit is None and applied_gpu:
-            _fold_ema(_GPU_BATCH_NS, _stage_sig(op), float(min(applied_gpu)))
+        # Persist the SMALLEST size this run's data width permitted (the widest morsel's
+        # byte-budget size) so the next run seeds its cap from it instead of the default.
+        # Measured against the config cap, never the learned one — see `observed_gpu`, or the
+        # EMA becomes a ratchet that can only fall. Purely a starting-size hint; the size never
+        # changes what the model computes, and OOM-halving stays the in-run safety net.
+        if is_gpu and explicit is None and observed_gpu:
+            _fold_ema(_GPU_BATCH_NS, _stage_sig(op), float(min(observed_gpu)))
 
 
 def _pipelined_emit(gen, subs_fn, emit_fn, depth: int) -> Iterator[pa.RecordBatch]:

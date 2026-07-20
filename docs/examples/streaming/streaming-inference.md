@@ -144,7 +144,7 @@ print(q.exception())
 Row 2 is gone and the query survived.
 
 :::{important}
-Be clear-eyed about what that means: the failing *batch* is dropped, not just the offending
+Be clear-eyed about what that means: the failing *batch* is dropped, not only the offending
 row, and the dropped rows go nowhere. There is no dead-letter output. `max_errored_rows` buys
 you uptime at the price of silent data loss. If the loss matters, catch the exception inside
 `__call__`, emit a null prediction plus an error string as columns, and route those rows

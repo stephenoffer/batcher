@@ -1041,7 +1041,7 @@ class Dataset:
         """
         from functools import partial
 
-        from batcher.io.formats.multimodal.media import read_blob_bytes
+        from batcher.io.formats.multimodal.blob import read_blob_bytes
 
         out_cols = list(self.columns)
         if into not in out_cols:
@@ -1487,16 +1487,34 @@ class Dataset:
         right = other.with_columns(**{key: lit(1)})
         return left.join(right, on=key, suffix=suffix).drop(key)
 
-    def explode(self, column: str, *, alias: str | None = None) -> Dataset:
+    def explode(
+        self,
+        column: str,
+        *,
+        alias: str | None = None,
+        outer: bool = False,
+        index: str | None = None,
+    ) -> Dataset:
         """Explode a list/array column into one row per element (SQL ``UNNEST``).
 
-        Other columns repeat per element; null/empty lists produce no rows. The
-        exploded column replaces `column` in place (renamed to `alias` if given) and
-        streams (no breaker). Raises `PlanError` if `column` is not a column.
+        Other columns repeat per element. The exploded column replaces `column` in place
+        (renamed to `alias` if given) and streams (no breaker). Raises `PlanError` if
+        `column` is not a column.
+
+        By default a null or empty list produces **no** rows, which is DuckDB's ``UNNEST``
+        semantics — and a trap for document pipelines, where a row that chunked to nothing
+        then disappears along with its id and metadata. Pass `outer=True` to keep it with a
+        NULL element instead (Spark ``explode_outer``).
+
+        `index` names an extra column holding each element's 0-based position within its
+        own list (Spark ``posexplode``), which is what lets chunks be reassembled in order
+        after a shuffle. It is NULL for a row kept only by `outer`.
 
         Args:
             column: The list/array column to explode.
             alias: Rename the exploded column to this name.
+            outer: Keep rows whose list is null or empty, with a NULL element.
+            index: Name for an appended 0-based element-position column.
 
         Returns:
             A new `Dataset` with one row per list element.
@@ -1508,8 +1526,13 @@ class Dataset:
                 >>> ds = bt.from_pydict({"id": [1, 2], "xs": [[1, 2], [3]]})
                 >>> ds.explode("xs").to_pydict()
                 {'id': [1, 1, 2], 'xs': [1, 2, 3]}
+
+                >>> # A document that chunked to nothing survives, and chunks are ordered.
+                >>> docs = bt.from_pydict({"doc": ["a", "b"], "chunks": [["p", "q"], []]})
+                >>> docs.explode("chunks", outer=True, index="i").to_pydict()
+                {'doc': ['a', 'a', 'b'], 'chunks': ['p', 'q', None], 'i': [0, 1, None]}
         """
-        return build_explode(self, column, alias)
+        return build_explode(self, column, alias, outer=outer, index=index)
 
     def with_row_index(self, name: str = "index", *, offset: int = 0) -> Dataset:
         """Add a sequential row-index column (Polars ``with_row_index``).
@@ -3789,6 +3812,62 @@ class Dataset:
         self._require_column(y, "corr")
         return self._exec_scalar(corr(Col(x), Col(y)))
 
+    def corr_matrix(self, columns: list[str] | None = None) -> Dataset:
+        """The pairwise Pearson correlation matrix over numeric columns.
+
+        **Executes** and returns a small `Dataset`: a ``column`` label column plus one
+        Float64 column per correlated column, forming a symmetric matrix (diagonal ``1.0``,
+        or ``None`` for a constant column). Every pair is computed in a **single** pass —
+        not ``N**2`` separate scans — the standard first step of exploratory data analysis
+        and feature selection. Non-numeric columns are skipped unless named explicitly
+        (which errors).
+
+        Args:
+            columns: optional subset of numeric columns to correlate (default: all numeric).
+
+        Returns:
+            A `Dataset` holding the correlation matrix with a ``column`` label column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1, 2, 3], "b": [2, 4, 6], "c": [3, 2, 1]})
+                >>> m = ds.corr_matrix().to_pydict()
+                >>> m["column"], round(m["a"][1], 4), round(m["c"][0], 4)
+                (['a', 'b', 'c'], 1.0, -1.0)
+        """
+        from batcher.api.dataset._describe import corr_matrix
+
+        return corr_matrix(self, columns)
+
+    def cov_matrix(self, columns: list[str] | None = None) -> Dataset:
+        """The pairwise sample covariance matrix over numeric columns.
+
+        The covariance companion to `corr_matrix`: **executes** and returns a small
+        symmetric `Dataset` (a ``column`` label plus one Float64 column per column), every
+        pair computed in a **single** pass. The diagonal holds each column's variance. The
+        input to PCA / whitening and multivariate-Gaussian modeling.
+
+        Args:
+            columns: optional subset of numeric columns (default: all numeric).
+
+        Returns:
+            A `Dataset` holding the covariance matrix with a ``column`` label column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [1.0, 2.0, 3.0], "b": [2.0, 4.0, 6.0]})
+                >>> m = ds.cov_matrix().to_pydict()
+                >>> m["column"], m["a"][0], m["b"][0]
+                (['a', 'b'], 1.0, 2.0)
+        """
+        from batcher.api.dataset._describe import cov_matrix
+
+        return cov_matrix(self, columns)
+
     def cov(self, x: str, y: str, *, ddof: int = 1) -> float | None:
         """The covariance of columns `x` and `y` (SQL ``COVAR_SAMP``/``COVAR_POP``).
 
@@ -3989,7 +4068,7 @@ class Dataset:
         self._require_column(column, "approx_quantile")
         from batcher.api.terminal.metadata_answer import metadata_learned_quantile
 
-        learned = metadata_learned_quantile(column, q)
+        learned = metadata_learned_quantile(column, q, self._sources)
         if learned is not None:
             return learned
         from batcher.api.orchestration import approx_quantile
@@ -4083,8 +4162,9 @@ class Dataset:
                 3
         """
         from batcher.api.terminal.core import _resolve_distributed
+        from batcher.api.terminal.event_log import pipeline_signature, report_stream
 
-        yield from _iter_batches(
+        batches = _iter_batches(
             self._plan,
             self._sources,
             self.columns,
@@ -4092,6 +4172,13 @@ class Dataset:
             distributed=_resolve_distributed(distributed, self._plan, self._sources),
             num_workers=num_workers,
             transport=transport,
+        )
+        # Wrapped here, at the single public entry, rather than inside `_iter_batches` —
+        # which recurses on the `batch_size` path and would double-count every row.
+        yield from report_stream(
+            batches,
+            label=type(self._plan).__name__.lower(),
+            signature=pipeline_signature(self._plan),
         )
 
     @property
@@ -4171,6 +4258,59 @@ class Dataset:
                 3
         """
         return _to_polars(self._plan, self._sources, self.columns)
+
+    def to_numpy(self, columns: list[str] | None = None) -> dict[str, Any]:
+        """Execute the plan and return the result as a ``{column: numpy.ndarray}`` dict.
+
+        A terminal operation for numeric / scientific work: each column becomes a NumPy
+        array, and a **fixed-shape-tensor or fixed-size-list column** (an image, embedding,
+        or feature-vector column) comes back as a real ``(n, *shape)`` array rather than an
+        opaque per-row object array — so the result feeds NumPy / scikit-learn directly.
+        Streams the output batches, so it holds one materialized copy, not two.
+
+        Args:
+            columns: optional subset of output columns to return (default: all).
+
+        Returns:
+            A dict mapping each column name to its NumPy array.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> out = bt.from_pydict({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0]}).to_numpy()
+                >>> out["x"].tolist(), out["y"].tolist()
+                ([1, 2, 3], [4.0, 5.0, 6.0])
+        """
+        from batcher.api.dataset._export import to_numpy
+
+        return to_numpy(self, columns)
+
+    def to_jax(self, columns: list[str] | None = None) -> dict[str, Any]:
+        """Execute the plan and return the result as a ``{column: jax.Array}`` dict.
+
+        The JAX counterpart of `to_numpy`: each column becomes a ``jax.numpy`` array, with a
+        tensor/fixed-size-list column reshaped to ``(n, *shape)`` — so an embedding or image
+        column feeds a JAX/Flax model directly. Needs JAX installed (``pip install jax``);
+        otherwise raises `BackendError`.
+
+        Args:
+            columns: optional subset of output columns to return (default: all).
+
+        Returns:
+            A dict mapping each column name to its ``jax.Array``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> out = bt.from_pydict({"x": [1, 2, 3]}).to_jax()  # doctest: +SKIP
+                >>> out["x"].shape  # doctest: +SKIP
+                (3,)
+        """
+        from batcher.api.dataset._export import to_jax
+
+        return to_jax(self, columns)
 
     def to_pydict(self) -> dict[str, list[Any]]:
         """Execute the plan and return the result as a column-oriented dict.

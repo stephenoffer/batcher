@@ -152,6 +152,10 @@ def _scalar_function(tr, node):
         base = tr._scalar(node.this).str
         is_left = bool(node.args.get("is_left"))
         return base.lpad(width, fill) if is_left else base.rpad(width, fill)
+    if isinstance(node, exp.Anonymous):
+        ml = _UNARY_ML.get(node.name.lower())
+        if ml is not None and len(node.expressions) == 1:
+            return getattr(tr._scalar(node.expressions[0]), ml)()
     if isinstance(node, exp.Anonymous) and node.name.lower() == "date_part":
         # `date_part('unit', ts)` — the field-name spelling of EXTRACT. sqlglot keeps
         # it Anonymous (unit literal first, then the temporal argument).
@@ -163,6 +167,23 @@ def _scalar_function(tr, node):
             raise NotImplementedError(f"date_part field {args[0].this!r} is not supported")
         return getattr(tr._scalar(args[1]).dt, method)()
     return None
+
+
+# Elementwise ML activation functions callable in SQL → the `Expr` method. These make a
+# feature-engineering / scoring step expressible in the query itself (a small ML-in-SQL
+# surface): ``SELECT sigmoid(logit_score) AS p FROM t``.
+_UNARY_ML = {
+    "sigmoid": "sigmoid",
+    "relu": "relu",
+    "softplus": "softplus",
+    "logit": "logit",
+    "silu": "silu",
+    "swish": "silu",  # SiLU and Swish are the same activation
+    "gelu": "gelu",
+    "mish": "mish",
+    "hardsigmoid": "hardsigmoid",
+    "hardswish": "hardswish",
+}
 
 
 # Typed `Array*`/`SortArray` reduction nodes → `.list` method name.
@@ -186,6 +207,39 @@ _LIST_ANON = {
     "list_max": "max",
 }
 
+# Two-argument vector functions → the binary `.list` method. Both DuckDB's canonical
+# `list_*` spellings and the bare names are accepted, so a vector search reads naturally in
+# SQL: ``ORDER BY cosine_similarity(emb, [0.1, 0.2]) DESC LIMIT 10``. This is the SQL-level
+# vector-search / embedding-math surface (cf. DuckDB's list functions, BigQuery `ML.DISTANCE`).
+_LIST_BINARY_ANON = {
+    "list_cosine_similarity": "cosine_similarity",
+    "cosine_similarity": "cosine_similarity",
+    "list_cosine_distance": "cosine_distance",
+    "cosine_distance": "cosine_distance",
+    "list_distance": "l2_distance",  # DuckDB's L2 spelling
+    "l2_distance": "l2_distance",
+    "euclidean_distance": "l2_distance",
+    "l1_distance": "l1_distance",
+    "manhattan_distance": "l1_distance",
+    "hamming_distance": "hamming_distance",
+    "list_dot_product": "dot",
+    "list_inner_product": "dot",
+    "inner_product": "dot",
+    "dot_product": "dot",
+    "list_jaccard": "jaccard",
+    # Element-wise vector arithmetic.
+    "list_add": "add",
+    "list_subtract": "subtract",
+    "list_multiply": "multiply",
+}
+
+# sqlglot expression *types* (not `Anonymous`) for two-arg vector functions → binary method.
+_LIST_TYPED_BINARY = {
+    "EuclideanDistance": "l2_distance",
+    "CosineDistance": "cosine_distance",
+    "DotProduct": "dot",
+}
+
 
 def _list_function(tr, node):
     """List/array operations dispatched to the `.list` namespace, or None."""
@@ -203,10 +257,21 @@ def _list_function(tr, node):
     reduce = _LIST_REDUCE.get(type(node).__name__)
     if reduce is not None:
         return getattr(tr._scalar(node.this).list, reduce)()
+    # sqlglot promotes a few vector functions to typed nodes (two args in `this`/`expression`)
+    # rather than `Anonymous`; dispatch them to the same binary `.list` methods.
+    typed_binary = _LIST_TYPED_BINARY.get(type(node).__name__)
+    if typed_binary is not None:
+        return getattr(tr._scalar(node.this).list, typed_binary)(tr._scalar(node.expression))
     if isinstance(node, exp.Anonymous):
-        method = _LIST_ANON.get(node.name.lower())
+        name = node.name.lower()
+        method = _LIST_ANON.get(name)
         if method is not None and node.expressions:
             return getattr(tr._scalar(node.expressions[0]).list, method)()
+        binary = _LIST_BINARY_ANON.get(name)
+        if binary is not None and len(node.expressions) == 2:
+            left = tr._scalar(node.expressions[0])
+            right = tr._scalar(node.expressions[1])
+            return getattr(left.list, binary)(right)
     return None
 
 

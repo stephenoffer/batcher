@@ -13,7 +13,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from conftest import assert_same
+from _harness import assert_same
 
 pytestmark = pytest.mark.differential
 
@@ -29,11 +29,17 @@ def test_cast_double_to_int_rounds_half_to_even(duck):
 
 def test_greatest_least_coerce_mixed_numeric(duck):
     """B5: greatest/least over int×float must coerce, not error."""
-    t = pa.table({"a": pa.array([1, 5, 9], pa.int64()), "b": pa.array([2.5, 3.0, -1.0], pa.float64())})
-    out = bt.from_arrow(t).select(
-        g=bt.greatest(bt.col("a"), bt.col("b")),
-        l=bt.least(bt.col("a"), bt.col("b")),
-    ).collect()
+    t = pa.table(
+        {"a": pa.array([1, 5, 9], pa.int64()), "b": pa.array([2.5, 3.0, -1.0], pa.float64())}
+    )
+    out = (
+        bt.from_arrow(t)
+        .select(
+            g=bt.greatest(bt.col("a"), bt.col("b")),
+            l=bt.least(bt.col("a"), bt.col("b")),
+        )
+        .collect()
+    )
     duck.register("t", t)
     assert_same(out, duck.sql("SELECT greatest(a, b) AS g, least(a, b) AS l FROM t"))
 
@@ -94,8 +100,6 @@ def test_join_matches_signed_zero():
 def test_window_max_propagates_nan(duck):
     """B12: window MAX over a partition containing NaN returns NaN (like aggregate MAX)."""
     t = pa.table({"g": ["a", "a", "a"], "v": pa.array([1.0, float("nan"), 2.0], pa.float64())})
-    out = bt.from_arrow(t).with_columns(
-        m=bt.col("v").max().over(partition_by=["g"])
-    ).collect()
+    out = bt.from_arrow(t).with_columns(m=bt.col("v").max().over(partition_by=["g"])).collect()
     got = out.to_pydict()["m"]
     assert all(math.isnan(x) for x in got), got

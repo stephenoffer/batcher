@@ -60,3 +60,49 @@ def test_adaptive_controller_ceiling_honors_byte_budget() -> None:
     for _ in range(50):
         ctrl.observe(congested=False)
     assert ctrl.window <= byte_ceiling
+
+
+def test_the_channel_byte_budget_is_held_under_a_share_of_real_memory(monkeypatch):
+    """The buffered-bytes budget must know how much memory the machine has.
+
+    `credit_byte_budget` is a fixed 256 MiB per channel and `shuffle_fetch_fan_in` channels
+    fetch at once — 8 GiB in flight on the defaults. That is noise on a 512 GiB node and half
+    the RAM of a 16 GiB one. Admission was already memory-aware; backpressure was not, so a
+    node could be admitted for a query and then OOM'd by the transit buffers carrying it.
+    """
+    import batcher.carbonite.policies as policies
+    from batcher.config import active_config
+
+    cfg = active_config()
+    gib = 1 << 30
+    fan_in = cfg.flow_control.shuffle_fetch_fan_in
+
+    def budget_on(total_bytes):
+        monkeypatch.setattr(policies, "total_memory_bytes", lambda: total_bytes)
+        return policies._channel_byte_budget(cfg)
+
+    # A fat node keeps the configured budget — this caps, it never throttles a machine that
+    # can afford the buffer.
+    assert budget_on(512 * gib) == cfg.flow_control.credit_byte_budget
+    # A small node is held down, and the whole in-flight footprint stays a modest share of RAM.
+    small = budget_on(16 * gib)
+    assert small < cfg.flow_control.credit_byte_budget
+    assert small * fan_in <= 16 * gib * 0.15
+    # Monotone in machine size, and never below one morsel (a zero would deadlock the window).
+    assert budget_on(2 * gib) < small
+    assert budget_on(64 * (1 << 20)) >= cfg.execution.morsel_bytes
+    # An unreadable total falls back to the configured value rather than to zero.
+    assert budget_on(0) == cfg.flow_control.credit_byte_budget
+
+
+def test_a_small_node_lowers_the_credit_ceiling_itself(monkeypatch):
+    """The headroom cap has to reach the ceiling callers actually use, not just the helper."""
+    import batcher.carbonite.policies as policies
+    from batcher.config import active_config
+
+    cfg = active_config()
+    monkeypatch.setattr(policies, "total_memory_bytes", lambda: 512 << 30)
+    roomy = policies.credit_ceiling(cfg)
+    monkeypatch.setattr(policies, "total_memory_bytes", lambda: 2 << 30)
+    cramped = policies.credit_ceiling(cfg)
+    assert 1 <= cramped < roomy

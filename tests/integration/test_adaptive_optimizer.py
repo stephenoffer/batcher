@@ -237,8 +237,8 @@ def test_persistent_fleet_worker_loss_retries_on_fresh_fleet(monkeypatch):
     # fresh single fleet, so no cross-stage placement-group deadlock — and is
     # deterministic, so the result is correct. The fleet is never LESS fault-tolerant
     # than the default path.
-    import batcher.api.adaptive as adaptive
     from batcher._internal.errors import ResourceError
+    from batcher.api.adaptive import staging as adaptive
 
     fact, dim = _big_small()
 

@@ -2,10 +2,10 @@
 
 Tokenizing in the training loop is the classic way to leave a GPU idle. The tokenizer is
 CPU work, it is embarrassingly parallel, and it produces a column, so it belongs in the
-data pipeline: run once, written out, never run again. Do it as an engine stage and the
-loop reads token ids straight off disk.
+data pipeline. Run it once, write it out, and never run it again. Do it as an engine
+stage and the loop reads token ids straight off disk.
 
-Which tool depends on what the text actually is:
+Which tool you reach for depends on what the text actually is:
 
 | The column holds | Reach for | What you get |
 | --- | --- | --- |
@@ -16,7 +16,7 @@ Which tool depends on what the text actually is:
 ## The Tokenizer preprocessor
 
 `Tokenizer(column, tokenizer, output_column=None)` applies any callable from a string to
-a list. It is a `Preprocessor`, so it has the standard `fit` / `transform` /
+a list. It is a `Preprocessor`, so it has the standard `fit`, `transform`, and
 `fit_transform` contract, and it is stateless. There is nothing to learn, so `fit` is a
 no-op and `transform` runs anywhere.
 
@@ -86,12 +86,12 @@ tokens.write.parquet("s3://bucket/tokens.parquet")
 :::{warning}
 A real tokenizer has to be constructed **once per worker**, which means a class, not a
 lambda. A lambda closing over a tokenizer object gets pickled to every worker, and a slow
-tokenizer re-created per batch will be the bottleneck of the whole job — the GPU you were
+tokenizer re-created per batch will be the bottleneck of the whole job. The GPU you were
 trying to feed ends up waiting on the CPU stage that was supposed to feed it.
 :::
 
 `num_workers` defaults to `"auto"`, which fans the calls across every local core. A fast
-tokenizer releases the GIL, so threads are the right pool; a pure-Python tokenizer needs
+tokenizer releases the GIL, so threads are the right pool. A pure-Python tokenizer needs
 `multiprocessing=True` to get real parallelism.
 
 ## Token ids are a list column
@@ -112,9 +112,10 @@ print(lengths.describe().to_pydict()["n"][:4])
 ```
 
 :::{important}
-Look at that distribution before you set `max_length`. Truncation is silent: nothing
-raises, and a corpus where 30% of the documents lost their tail trains perfectly happily
-on the first 512 tokens of each. That is a decision you want to have made deliberately.
+Look at that distribution before you set `max_length`. Truncation is silent. Nothing
+raises, and a corpus where a large share of the documents lost their tail trains
+perfectly happily on the first 512 tokens of each. That is a decision you want to have
+made deliberately.
 :::
 
 Filtering by length is a predicate:
@@ -148,9 +149,9 @@ print(packed[0].to_pydict())
 # {'tokens': [[1, 2, 3, 0], [4, 5, 0, 6], [7, 8, 9, 0]]}
 ```
 
-Three documents (3 + 2 + 4 tokens, plus one EOS each) became three dense sequences of
-exactly 4 tokens, with nothing padded. Note the second one: it holds the end of document
-2 and the start of document 3. That is the point, and it is why the EOS token matters,
+Three documents of 3, 2, and 4 tokens, plus one EOS each, became three dense sequences of
+exactly 4 tokens, with nothing padded. The second sequence holds the end of document 2
+and the start of document 3. That is the point, and it is why the EOS token matters,
 since it is the only signal that a document boundary was crossed.
 
 `drop_remainder=True` discards the tail that does not fill a block. Set it `False` and
@@ -178,14 +179,14 @@ print(enc.classes_)
 # ['neg', 'neu', 'pos']
 ```
 
-A value unseen at fit time maps to `unknown_value` (`-1` by default) rather than raising,
-so a new category appearing in production does not take the job down. Fit on train only.
+A value unseen at fit time maps to `unknown_value`, which is `-1` by default, rather than
+raising, so a category appearing in production does not take the job down. Fit on train only.
 Fitting on train+test leaks the test distribution into the encoding.
 
 ## Where the work runs
 
 Tokenization is CPU work and inference is GPU work, so they want different pools. Split
-them into two stages: tokenize with the default CPU fan-out, then hand the token column
+them into two stages. Tokenize with the default CPU fan-out, then hand the token column
 to a GPU stage with its own `concurrency`. The engine overlaps them, so the tokenizer for
 batch *n+1* runs while the GPU chews on batch *n*.
 
@@ -199,14 +200,14 @@ scored = (
 ```
 
 :::{tip}
-Better still: tokenize once, write the token ids to Parquet, and let every subsequent
-epoch and every subsequent experiment read them. Tokenization is deterministic; running
-it every epoch is pure waste.
+Better still, tokenize once, write the token ids to Parquet, and let every subsequent
+epoch and every subsequent experiment read them. Tokenization is deterministic, so
+running it every epoch is pure waste.
 :::
 
 ## See also
 
-- [Preprocessors](preprocessors.md): the fit/transform contract and the rest of the family.
+- [Preprocessors](preprocessors.md): the fit and transform contract, and the rest of the family.
 - [LLM inference](llm.md): generation over the tokens, and sequence packing in context.
 - [Data loaders](data-loaders.md): getting the token column into a training loop.
 - [Distributed training](distributed-training.md): the loader that reads the tokens you

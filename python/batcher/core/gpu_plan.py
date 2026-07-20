@@ -256,7 +256,22 @@ def _window(df, op: dict):
 
 
 def _broadcast(scalar, df, lib):
-    return lib.Series([scalar] * len(df), index=df.index)
+    """`scalar` as a full column, materialized columnar rather than per row.
+
+    `[scalar] * len(df)` built one Python object per row — an `O(rows)` allocation in the
+    control plane, which `.claude/rules/architecture.md` forbids outright, and on the cuDF
+    path it also forced a host-side list across the host/device boundary. Inferring the
+    dtype from a one-element series and repeating it does the fill in the library's own C
+    layer instead.
+
+    The dtype must come from a *list* rather than `Series(scalar, index=...)`, which looks
+    equivalent and is not: a `None` literal coerces to `float64` NaN instead of staying
+    `object`, and a `datetime` lands at `datetime64[us]` instead of `datetime64[ns]` —
+    either of which would silently change the column's type at the Arrow boundary.
+    """
+    col = lib.Series([scalar]).repeat(len(df))
+    col.index = df.index
+    return col
 
 
 def _aggregate(df, op: dict, lib):

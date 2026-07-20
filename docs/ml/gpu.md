@@ -26,8 +26,9 @@ reserved device. With `concurrency` actors, that many batches are in flight at o
 Fractional packing is how you keep expensive GPUs busy: size `num_gpus` to the model's
 memory footprint, then raise `concurrency` until the devices are saturated.
 
-`concurrency` defaults to `"auto"`, meaning one actor per GPU the cluster reports, so a
-multi-GPU cluster is never left idling a single engine (a common scale-out foot-gun).
+Leave `concurrency` unset and the engine sizes the pool automatically at one actor per
+GPU the cluster reports. A multi-GPU cluster is never left idling a single engine, which
+is a common scale-out mistake.
 
 ## Autoscaling the pool
 
@@ -125,6 +126,37 @@ ds.ml.infer(Model(), batch_size=512, num_gpus=1, concurrency=4)
 # Two actors share each GPU; good for a small model.
 ds.ml.map_batches(Model(), batch_size=256, num_gpus=0.5, concurrency=4)
 ```
+
+## Accelerators that are not GPUs (TPU, Trainium, Gaudi)
+
+`num_gpus` covers everything Ray reports as the `GPU` resource, which means NVIDIA, AMD
+(ROCm), Intel, and MetaX. Every other accelerator is a **named resource** instead, so
+request it with `resources=`:
+
+```python
+# docs: skip
+# Google TPU
+ds.ml.map_batches(Model(), resources={"TPU": 4}, concurrency=2)
+
+# AWS Trainium / Inferentia
+ds.ml.map_batches(Model(), resources={"neuron_cores": 2}, concurrency=4)
+
+# Intel Gaudi
+ds.ml.map_batches(Model(), resources={"HPU": 8})
+```
+
+`resources` is a passthrough to Ray, not a fixed vendor list, so it equally requests a
+resource you defined yourself on an on-prem cluster (`resources={"fpga_slot": 1}`).
+`accelerator_type` works alongside it to pin a device generation
+(`resources={"TPU": 4}, accelerator_type="TPU-V6E"`).
+
+Do not pass `num_gpus` for these: a TPU or Trainium node advertises no `GPU` resource, so
+the task would wait for a GPU that never appears rather than failing.
+
+On the model side, `batcher.ml.gpu.detect_backend()` already resolves `cuda` / `rocm` /
+`xpu` (Intel) / `mps` (Apple) / `tpu`, and `torch_device()` maps them to the right torch
+device string (a TPU becomes `xla`). What `resources=` adds is the *placement* half. It
+gets the task onto the node that has the device.
 
 ## Keeping GPUs fed
 

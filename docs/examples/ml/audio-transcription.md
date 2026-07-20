@@ -39,6 +39,29 @@ When the audio is already a column of encoded bytes (downloaded, or read from a 
 averages the channels down to mono. `.audio.resample(rate)` decodes and band-limit-resamples
 in one native pass, which is the one you want in front of a model with a fixed input rate.
 
+When the model wants **mel features** rather than a raw waveform (Whisper, wav2vec2, HuBERT
+all do), `.audio.mel_spectrogram(rate, n_fft=400, hop_length=160, n_mels=80)` decodes,
+resamples, and computes the mel power spectrogram in one native pass. Its output
+numerically matches `torchaudio.transforms.MelSpectrogram`, so it drops straight into a
+model trained on torchaudio features (apply the model's own log/normalization downstream):
+
+```python
+# docs: skip
+from batcher import col
+# Whisper's front end: 16 kHz, 80 mel bands, in the data plane instead of a per-file UDF.
+feats = clips.with_columns(mel=col("bytes").audio.mel_spectrogram(16000, n_mels=80))
+```
+
+For classical speech models (and many audio classifiers) that want the compact **MFCC**
+feature instead, `.audio.mfcc(rate, n_mfcc=13)` runs the whole
+`mel → AmplitudeToDB → DCT` chain natively. Its output numerically matches
+`torchaudio.transforms.MFCC`:
+
+```python
+# docs: skip
+mfccs = clips.with_columns(m=col("bytes").audio.mfcc(16000, n_mfcc=13))
+```
+
 The clip below is a synthesized stereo WAV, so this runs with no files and no model.
 
 ```python
@@ -97,7 +120,7 @@ Which call to reach for:
 :::{tip}
 Every corpus of call recordings contains silence and 20-millisecond blips from a dropped
 connection. Each one costs a full Whisper forward pass and produces nothing.
-Filter on the decoded waveform. It is just a list column, so `list.len` gives you the duration
+Filter on the decoded waveform. It is an ordinary list column, so `list.len` gives you the duration
 and the whole thing is a scan.
 :::
 

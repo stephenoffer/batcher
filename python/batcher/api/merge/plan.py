@@ -117,7 +117,7 @@ def plan_merge(
     if fmt not in _PRUNABLE_FORMATS:
         return MergePlan(rewritten=files, skipped=[])
 
-    from batcher.io.stats.columnar_footer import parquet_file_manifest
+    from batcher.io.stats.parquet_manifest import parquet_file_manifest
 
     # The footer manifest is read even when pruning is off, because the merge still needs the
     # target's file *layout* to write its output back at the same granularity.

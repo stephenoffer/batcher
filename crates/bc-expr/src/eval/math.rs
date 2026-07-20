@@ -68,6 +68,14 @@ pub(crate) fn eval_math2(
     if matches!(func, Math2Func::Gcd | Math2Func::Lcm) {
         return eval_int_math2(func, l, r);
     }
+    // `round` on an integer is an integer, for the same reason: DuckDB returns BIGINT
+    // for `round(bigint, n)`, and the f64 round-trip corrupts values above 2^53
+    // (`round(2^53+1, 0)` came back as `2^53`). `floor`/`ceil` genuinely *do* yield
+    // double in DuckDB, so only `round` needs this — the blanket promotion is right
+    // for its neighbours and wrong here.
+    if matches!(func, Math2Func::Round) && matches!(l.data_type(), DataType::Int64) {
+        return round_int(l, r);
+    }
     let lf = cast(l, &DataType::Float64)?;
     let rf = cast(r, &DataType::Float64)?;
     let a = lf.as_any().downcast_ref::<Float64Array>().expect("f64");
@@ -103,6 +111,41 @@ fn apply_binary(func: Math2Func, x: f64, y: f64) -> f64 {
         // Gcd/Lcm are handled by the integer path (`eval_int_math2`).
         Math2Func::Gcd | Math2Func::Lcm => unreachable!("integer path"),
     }
+}
+
+/// `round(x, digits)` over an Int64 column, computed on the true i64 value.
+///
+/// A non-negative `digits` is the identity on an integer. A negative `digits` rounds to
+/// that power of ten, half away from zero (DuckDB's direction), in `i128` so the scaled
+/// intermediate cannot overflow on the way.
+fn round_int(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
+    let ri = cast(r, &DataType::Int64)?;
+    let a = l.as_any().downcast_ref::<Int64Array>().expect("i64");
+    let b = ri.as_any().downcast_ref::<Int64Array>().expect("i64");
+    let out: Int64Array = (0..a.len())
+        .map(|i| (!a.is_null(i) && !b.is_null(i)).then(|| round_i64(a.value(i), b.value(i))))
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// One `round(x, digits)` on i64, half away from zero.
+#[inline]
+fn round_i64(x: i64, digits: i64) -> i64 {
+    if digits >= 0 {
+        return x; // an integer is already rounded to any non-negative place
+    }
+    // 10^19 already exceeds i64::MAX, so every wider step rounds to 0; clamp the
+    // exponent rather than overflow the i128 power itself.
+    let f = 10i128.pow((-digits).min(19) as u32);
+    let v = x as i128;
+    let half = f / 2;
+    // Rust's `/` truncates toward zero, so biasing by ±half gives half-away-from-zero.
+    let q = if v >= 0 {
+        (v + half) / f
+    } else {
+        (v - half) / f
+    };
+    (q * f) as i64
 }
 
 /// Integer two-argument math (`gcd`/`lcm`): cast both sides to Int64 and apply on the
@@ -225,8 +268,9 @@ pub(crate) fn eval_coalesce(inputs: &[Expr], batch: &RecordBatch) -> Result<Arra
     Ok(acc)
 }
 
-/// Unary math. `abs` keeps the input numeric type; `round`/`floor`/`ceil`/`sqrt`
-/// yield Float64 (integer inputs are promoted).
+/// Unary math. `abs` and `round` keep the input numeric type (both are integer-valued
+/// on an integer, and DuckDB returns BIGINT for both); `floor`/`ceil`/`sqrt` yield
+/// Float64, promoting integer inputs, as DuckDB does.
 pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, ExprError> {
     use MathFunc::*;
     // `bit_count`/`factorial` are integer functions: their result is defined by the
@@ -250,6 +294,11 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             };
             Ok(Arc::new(out))
         }
+        // `round` of an integer is that integer. Promoting to f64 first both mistyped
+        // the schema as `double` (DuckDB returns BIGINT) and silently corrupted values
+        // above 2^53 — `round(2^53+1)` came back as `2^53`. `floor`/`ceil`/`sqrt` really
+        // do yield double in DuckDB, so the promotion below stays right for them.
+        (Round, DataType::Int64) => Ok(Arc::clone(arr)),
         (_, DataType::Int64) => {
             // Promote integers to Float64 and apply the float function.
             let f = cast(arr, &DataType::Float64)?;
@@ -413,6 +462,63 @@ mod int_math_tests {
         let bc = eval_math(MathFunc::BitCount, &i64arr(vec![Some(two53p1)])).unwrap();
         assert_eq!(bc.data_type(), &DataType::Int64);
         assert_eq!(as_i64(&bc), vec![Some(2)]); // bit 53 and bit 0 set
+    }
+
+    /// `round` stays Int64 on an integer input and is exact above 2^53.
+    ///
+    /// Regression: unary and two-arg `round` both promoted integers to Float64 with the
+    /// `floor`/`ceil`/`sqrt` blanket rule. But DuckDB returns BIGINT for `round(bigint)`,
+    /// and the f64 round-trip silently corrupts: `round(2^53+1)` came back as `2^53`, and
+    /// `round(i64::MAX, 0)` as `9.223372036854776e18`.
+    #[test]
+    fn round_is_exact_int64_above_2_pow_53() {
+        let two53p1 = (1i64 << 53) + 1; // not representable as f64
+        let vals = i64arr(vec![Some(two53p1), Some(i64::MAX), Some(-7)]);
+
+        // Unary `round(x)`: the identity on an integer.
+        let r = eval_math(MathFunc::Round, &vals).unwrap();
+        assert_eq!(r.data_type(), &DataType::Int64);
+        assert_eq!(as_i64(&r), vec![Some(two53p1), Some(i64::MAX), Some(-7)]);
+
+        // Two-arg with non-negative digits: also the identity.
+        for digits in [0i64, 2] {
+            let r = eval_math2(Math2Func::Round, &vals, &i64arr(vec![Some(digits); 3])).unwrap();
+            assert_eq!(r.data_type(), &DataType::Int64);
+            assert_eq!(as_i64(&r), vec![Some(two53p1), Some(i64::MAX), Some(-7)]);
+        }
+    }
+
+    /// A negative `digits` rounds an integer to that power of ten, half away from zero,
+    /// without ever forming an overflowing intermediate.
+    #[test]
+    fn round_int_negative_digits() {
+        let vals = i64arr(vec![
+            Some(12345),
+            Some(-12345),
+            Some(-7),
+            Some((1i64 << 53) + 1),
+            None,
+        ]);
+        let r = eval_math2(Math2Func::Round, &vals, &i64arr(vec![Some(-2); 5])).unwrap();
+        assert_eq!(r.data_type(), &DataType::Int64);
+        assert_eq!(
+            as_i64(&r),
+            vec![
+                Some(12300),
+                Some(-12300),
+                Some(0),
+                Some(9_007_199_254_741_000),
+                None
+            ]
+        );
+        // An exponent past i64's range collapses to 0 rather than overflowing the scale.
+        let wide = eval_math2(
+            Math2Func::Round,
+            &i64arr(vec![Some(12345)]),
+            &i64arr(vec![Some(-40)]),
+        )
+        .unwrap();
+        assert_eq!(as_i64(&wide), vec![Some(0)]);
     }
 
     /// `lcm` is Int64 and errors on i64 overflow rather than wrapping or losing precision.

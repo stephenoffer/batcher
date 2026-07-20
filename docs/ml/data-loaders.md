@@ -1,12 +1,12 @@
 # Data loaders
 
-A training loop that spends 40% of its wall time waiting for data is a loop with an
-expensive GPU sitting idle, and the usual cause is a loader doing per-row Python work
-that should have been a columnar operator. The rule here is simple: shape the data in
-the engine, and let the loader do nothing but hand tensors to the step function.
+This page maps the training data loaders: which one to reach for in which situation, and
+what each one guarantees.
 
-This page is the map of the loaders: which one for which situation, and what each one
-guarantees.
+A training loop that waits on data is a loop with an expensive GPU sitting idle, and the
+usual cause is a loader doing per-row Python work that should have been a columnar
+operator. Shape the data in the engine, and let the loader do nothing but hand tensors to
+the step function.
 
 ## Which loader
 
@@ -20,12 +20,18 @@ guarantees.
 | A batch iterator you already have, and torch tensors | `batcher.ml.to_torch_iterable(...)` |
 | NumPy, no torch | `batcher.ml.to_numpy_batches(...)` |
 | TensorFlow | `batcher.ml.to_tf_dataset(...)` |
+| The whole result in memory as NumPy / JAX arrays | `ds.to_numpy()` / `ds.to_jax()` |
+
+`ds.to_numpy()` and `ds.to_jax()` materialize the *entire* result as a
+`{column: array}` dict, where a tensor or embedding column comes back shaped
+`(n, *shape)`. Use them when the result fits in memory and you want arrays rather than a
+streaming loader.
 
 The three that get confused with each other are worth stating plainly.
-`iter_torch_batches` is the single-process loop: it owns the read, the device transfer,
-and the batching. `stream_loader` is the multi-rank one: it owns the *shard*, which is
-why nothing else may. `to_torch_iterable` owns nothing at all — it is a converter you
-hand an existing batch iterator, for a pipeline you assembled yourself.
+`iter_torch_batches` is the single-process loop, and it owns the read, the device
+transfer, and the batching. `stream_loader` is the multi-rank one, and it owns the
+*shard*, which is why nothing else may. `to_torch_iterable` owns nothing at all. It is a
+converter you hand an existing batch iterator, for a pipeline you assembled yourself.
 
 ## iter_batches: the base
 
@@ -50,16 +56,16 @@ for batch in ds.iter_batches(batch_size=2):
 # 2 ['f0', 'f1', 'label']
 ```
 
-A breaker-free pipeline is delivered incrementally; a plan that must materialize (a sort,
-a global aggregate) does that first. So `iter_batches` over a filter-and-project chain
-streams a 10 TB source in bounded memory, and over a sort it does not. That is a property
-of the plan, not of the loader.
+A breaker-free pipeline is delivered incrementally. A plan that must materialize, such as
+one containing a sort or a global aggregate, does that first. So `iter_batches` over a
+filter-and-project chain streams a 10 TB source in bounded memory, and over a sort it does
+not. That is a property of the plan, not of the loader.
 
 ## iter_torch_batches: tensors, single process
 
 It folds the tensor conversion into the stream and yields `{column: tensor}` dicts over
-the numeric columns. `device="auto"` picks CUDA / ROCm / XPU / MPS / CPU; here it is CPU
-so it runs with no GPU.
+the numeric columns. `device="auto"` picks CUDA, ROCm, XPU, MPS, or CPU. Here it is CPU
+so the example runs with no GPU.
 
 ```python
 batches = list(ds.ml.iter_torch_batches(batch_size=2, device="cpu"))
@@ -70,16 +76,15 @@ print(batches[0]["f0"].shape, batches[0]["label"].dtype)
 ```
 
 Non-numeric columns are dropped, since a string column has no tensor. `columns=[...]`
-selects explicitly, which is what you want anyway: it lets projection pushdown prune the
-scan.
+selects explicitly, which is what you want anyway, because it lets projection pushdown
+prune the scan.
 
-The options that matter in a real loop:
-
-`pin_memory=True` page-locks the host tensors so the host→device copy can be async.
-`prefetch_batches` (1 by default) overlaps that copy with the next batch's host work, so
-the GPU is not waiting on the PCIe bus. `local_shuffle_buffer_size` is a streaming
-approximation of a shuffle: it keeps a reservoir and draws from it, which is not a global
-permutation but costs nothing extra to read.
+Three options matter in a real loop. `pin_memory=True` page-locks the host tensors so the
+copy to the device can be asynchronous. `prefetch_batches`, which is 1 by default,
+overlaps that copy with the next batch's host work, so the GPU is not waiting on the PCIe
+bus. `local_shuffle_buffer_size` is a streaming approximation of a shuffle. It keeps a
+reservoir and draws from it, which is not a global permutation but costs nothing extra to
+read.
 
 ```python
 # docs: skip
@@ -124,8 +129,8 @@ for batch in DataLoader(iterable, batch_size=None):  # already sized
 Wrapping this in a `DistributedSampler` shards an already-sharded stream, so each rank
 sees a fraction of its fraction and most of your corpus is never read. The job runs, the
 loss falls, and you are training on a quarter of the data. `stream_loader` is the only
-shard authority. While you are there: passing `batch_size` to the `DataLoader` re-batches
-batches that are already the right size.
+shard authority. While you are there, note that passing `batch_size` to the `DataLoader`
+re-batches batches that are already the right size.
 :::
 
 See [distributed training](distributed-training.md) for the balance, determinism, and
@@ -157,6 +162,9 @@ dropped, so every rank yields the same count and none of them stalls the all-red
 
 ## Framework converters
 
+The converters take a batch iterator and yield framework-native batches. `to_numpy_batches`
+is the NumPy one:
+
 ```python
 from batcher.ml import to_numpy_batches
 
@@ -175,7 +183,7 @@ batches, including a hand-built pipeline.
 :::{tip}
 Anything you can express as an operator should be an operator. Filters, projections,
 feature arithmetic, casts, and a fitted preprocessor's transform all run inside the
-engine: vectorized, parallel, and out of the training process entirely.
+engine, vectorized and parallel, and out of the training process entirely.
 :::
 
 ```python
@@ -191,10 +199,10 @@ print(first.schema.names, first.num_rows)
 # ['f0', 'f_scaled', 'label'] 5
 ```
 
-For learned statistics (standardization, one-hot, imputation), fit a
+For learned statistics such as standardization, one-hot encoding, or imputation, fit a
 [preprocessor](preprocessors.md) on the train split and `transform` the stream. The fit
-is one mergeable pass over the data; the transform is an engine stage. Neither one runs
-in the training loop.
+is one mergeable pass over the data, and the transform is an engine stage. Neither one
+runs in the training loop.
 
 ## Diagnosing an idle GPU
 

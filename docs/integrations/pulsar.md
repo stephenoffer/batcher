@@ -13,7 +13,7 @@
 | **Auth** | Not wired. `pulsar.Client(service_url)` and nothing else. |
 | **Restart** | The subscription cursor on the broker; no seek is applied |
 
-```
+```bash
 pip install 'batcher-engine[pulsar]'
 ```
 
@@ -84,8 +84,8 @@ Batcher subscribes with `ConsumerType.Shared`, under the subscription name you p
 Shared means round-robin dispatch across consumers on that subscription, with **no per-key
 ordering guarantee**. If your pipeline needs messages for a key in publish order, as a CDC
 stream or a state machine or an SCD feed does, a shared subscription is the wrong shape, and
-Batcher does not currently offer `Key_Shared` or `Failover`. Reorder downstream, or accept the
-ordering you get.
+Batcher offers no `Key_Shared` or `Failover` subscription type. Reorder downstream, or accept
+the ordering you get.
 :::
 
 Messages are acknowledged after a batch has been assembled, so a crash before the ack leaves
@@ -117,7 +117,7 @@ q.await_termination()
 
 The checkpoint directory is SQLite plus Arrow IPC on a real filesystem, not an object-store
 path. `collect()` on an unbounded source raises `PlanError`; use `iter_batches()`, a triggered
-write, or `bt.Trigger.available_now()` to drain what is currently there and stop.
+write, or `bt.Trigger.available_now()` to drain the backlog that has already arrived and stop.
 
 ## Failure modes worth knowing
 

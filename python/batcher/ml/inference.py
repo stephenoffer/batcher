@@ -42,9 +42,15 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     """Whether `exc` is a CUDA out-of-memory error, checked structurally so torch is
     not a hard import (the name covers `torch.cuda.OutOfMemoryError`; the message
     covers the older `RuntimeError: CUDA out of memory`)."""
-    if type(exc).__name__ == "OutOfMemoryError":
+    if type(exc).__name__ in ("OutOfMemoryError", "ResourceExhaustedError"):
         return True
-    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+    # XLA (TPU) reports exhaustion as "RESOURCE_EXHAUSTED" rather than "out of memory", so
+    # matching only the CUDA phrasing left the halving retry disabled on a TPU: the batch
+    # simply failed where a CUDA host would have recovered.
+    message = str(exc).lower()
+    return isinstance(exc, RuntimeError) and (
+        "out of memory" in message or "resource_exhausted" in message
+    )
 
 
 def _empty_cuda_cache() -> None:
@@ -66,6 +72,16 @@ def _empty_cuda_cache() -> None:
             avail = getattr(backend, "is_available", None)
             if name == "mps" or avail is None or avail():
                 empty()
+    # XLA (TPU) is not a `torch.<backend>` module and has no `empty_cache`; its allocator
+    # is freed by stepping the execution graph. Without this the halved retry re-ran with
+    # exactly the memory that just overflowed, so the safety net could not help a TPU.
+    with contextlib.suppress(Exception):
+        import importlib.util
+
+        if importlib.util.find_spec("torch_xla") is not None:
+            import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
+
+            xm.mark_step()
 
 
 def _run_with_oom_retry(worker: Worker, batch: pa.RecordBatch) -> tuple[pa.RecordBatch, float]:
@@ -329,22 +345,35 @@ def _pipeline_accel_kwargs() -> dict[str, Any]:
 
         from batcher.ml.gpu import detect_backend, recommend_inference_dtype, torch_device
 
-        # Vendor-agnostic device placement. `detect_backend` only names a backend that is
-        # actually available, so NVIDIA/AMD (cuda), Intel (xpu), Apple (mps), and TPU (xla)
-        # all get placed on the accelerator — not only CUDA. transformers wants an int for
-        # the primary CUDA device and a device string for the rest.
+        # Vendor-agnostic device placement: `detect_backend` names only an available backend,
+        # so NVIDIA/AMD (cuda), Intel (xpu), Apple (mps), TPU (xla) all get placed on the
+        # accelerator. transformers wants an int for the primary CUDA device, a string else.
         backend = detect_backend()
         if backend != "cpu":
             dev = torch_device(backend)
             kwargs["device"] = 0 if dev == "cuda" else dev
         else:
-            # First-class CPU inference: cap torch's MKL/oneDNN/BLIS/OpenBLAS thread pool to the
-            # cores this actor may use, so co-located CPU actors don't each grab every host core.
+            # Cap torch's BLAS thread pool to this actor's cores, so co-located CPU actors
+            # don't each grab every host core.
             _configure_cpu_inference_threads()
         dtype = recommend_inference_dtype(backend)
         if dtype is not None:
             kwargs["torch_dtype"] = getattr(torch, dtype)
-    except Exception:
+    except ImportError:
+        return {}  # no torch → the CPU path is correct and silent
+    except Exception as exc:
+        # An accelerator present but *misconfigured* (broken driver, stale CUDA): silently
+        # returning {} runs CPU FP32 — a 10-50x slowdown that looks like success. Warn.
+        import warnings
+
+        from batcher._internal.errors import PerformanceWarning
+
+        warnings.warn(
+            f"accelerator configuration failed ({type(exc).__name__}: {exc}); using CPU FP32 — "
+            "inference may be far slower than expected. Check the GPU driver / CUDA runtime.",
+            PerformanceWarning,
+            stacklevel=2,
+        )
         return {}
     return kwargs
 

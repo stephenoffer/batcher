@@ -21,8 +21,8 @@ import batcher as bt
 
 # Registers the @rule on import so the full optimizer applies it under `.collect()`.
 import batcher.kyber.rules.extra.filter_split
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 
 def _table() -> pa.Table:

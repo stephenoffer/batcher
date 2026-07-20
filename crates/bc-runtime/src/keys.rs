@@ -65,6 +65,14 @@ pub(crate) fn float_total_cmp(a: f64, b: f64) -> std::cmp::Ordering {
     }
 }
 
+/// Whether `v` is negative zero — the one non-NaN value [`canon_f64`] rewrites.
+///
+/// `v == 0.0` is true for both zeros, so the sign bit is what distinguishes them.
+#[inline]
+fn is_neg_zero(v: f64) -> bool {
+    v == 0.0 && v.is_sign_negative()
+}
+
 /// Canonical `f32` bits, mirroring [`canon_f64`] for a 32-bit float.
 ///
 /// Top-level `Float32` keys are widened to `Float64` at the FFI boundary, but a `Float32`
@@ -107,6 +115,16 @@ fn canon_array(arr: &ArrayRef) -> Option<ArrayRef> {
     match arr.data_type() {
         DataType::Float64 => {
             let f = arr.as_any().downcast_ref::<Float64Array>()?;
+            // Nothing to fold unless a NaN or a `-0.0` is actually present, and on real data
+            // neither usually is. Deciding that with a scan of the raw value buffer — a
+            // branch-free, auto-vectorized linear read — is far cheaper than the rebuild it
+            // guards, which allocates and writes a whole second copy of the column (~48 MB at
+            // 6M rows, serially) before anything else in the operator starts. Slots under a
+            // null are read here too; a null's payload is arbitrary, so at worst it triggers a
+            // rewrite that was not needed, which is still correct.
+            if !f.values().iter().any(|x| x.is_nan() || is_neg_zero(*x)) {
+                return None;
+            }
             // `canon_f64` returns hash bits; map back to the f64 they denote so the column
             // keeps its Float64 type. `f64::from_bits` round-trips every value it emits.
             let canon: Float64Array = f
@@ -117,6 +135,13 @@ fn canon_array(arr: &ArrayRef) -> Option<ArrayRef> {
         }
         DataType::Float32 => {
             let f = arr.as_any().downcast_ref::<Float32Array>()?;
+            if !f
+                .values()
+                .iter()
+                .any(|x| x.is_nan() || (*x == 0.0 && x.is_sign_negative()))
+            {
+                return None;
+            }
             let canon: Float32Array = f.iter().map(|v| v.map(canon_f32)).collect();
             Some(Arc::new(canon) as ArrayRef)
         }

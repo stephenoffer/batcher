@@ -1,8 +1,8 @@
 """Row-wise and set relational logical nodes.
 
-`Scan`, `Filter`, `Projection`/`Project`, `Limit`, `Distinct`, `Union`, and the
-opaque `MapBatches`. These are the non-grouping operators; grouping/ordering and
-windowing live in sibling modules.
+`Scan`, `Filter`, `Projection`/`Project`, `Limit`, `Distinct`, `Sample`, `Union`, and
+the opaque `MapBatches`. These are the non-grouping operators; grouping/ordering,
+windowing, and the row-reshaping nodes live in sibling modules.
 """
 
 from __future__ import annotations
@@ -29,8 +29,6 @@ __all__ = [
     "Sample",
     "Scan",
     "Union",
-    "Unnest",
-    "Unpivot",
     "WatermarkDedup",
 ]
 
@@ -156,6 +154,30 @@ class Distinct(LogicalPlan):
     def to_ir(self) -> dict[str, Any]:
         return {"op": Op.DISTINCT, "input": self.input.to_ir()}
 
+    def as_aggregate(self):
+        """This `Distinct` as the equivalent `Aggregate` — group by every column.
+
+        DISTINCT is a group-by over all columns with no aggregate functions, which is
+        what lets it reuse the mergeable aggregate wholesale: identical rows fold into
+        the same group, so the same `partial → combine → finalize` serves the streaming
+        fold, the distributed shuffle, and the single-node path with no distinct-specific
+        state anywhere.
+
+        The derivation lives on the node because all three callers need it and they sit
+        in mutually-independent subsystems (`core` twice, `dist` once). Those subsystems
+        may not import one another, so a shared helper in any of them would have to be
+        copy-pasted — which is exactly what had happened. `plan` is neutral, so this is
+        the one place all three can reach.
+
+        Returns:
+            An `Aggregate` over the same input, grouping by every available column.
+        """
+        from batcher.plan.expr_ir import Col
+        from batcher.plan.logical.aggregate import Aggregate
+
+        keys = tuple(Projection(c, Col(c)) for c in self.input.available_columns())
+        return Aggregate(self.input, keys, ())
+
     def available_columns(self) -> list[str]:
         return self.input.available_columns()
 
@@ -231,173 +253,6 @@ class Union(LogicalPlan):
         return SchemaRef.from_arrow(
             pa.schema([pa.field(n, t) for n, t in zip(names, out_types, strict=True)])
         )
-
-
-@dataclass(frozen=True, slots=True)
-class Unnest(LogicalPlan):
-    """Explode a list/array column into one row per element (SQL ``UNNEST`` /
-    DataFrame ``explode``).
-
-    The named `column` is replaced in place by its element values bound to `alias`;
-    every other column repeats once per element. Null and empty lists produce no
-    output rows (DuckDB ``UNNEST`` semantics). Streaming and stateless.
-    """
-
-    input: LogicalPlan
-    column: str
-    alias: str
-
-    def __post_init__(self) -> None:
-        available = self.input.available_columns()
-        if self.column not in available:
-            raise PlanError(
-                f"unnest column {self.column!r} not found in input columns: {available}"
-            )
-        # The exploded column is renamed to `alias` in place; if `alias` names a *different*
-        # existing column the output would carry two same-named columns and silently drop
-        # one. Reject the collision instead of losing data.
-        if self.alias != self.column and self.alias in available:
-            raise PlanError(
-                f"explode alias {self.alias!r} collides with an existing column: {available}"
-            )
-
-    def to_ir(self) -> dict[str, Any]:
-        return {
-            "op": Op.UNNEST,
-            "input": self.input.to_ir(),
-            "column": self.column,
-            "alias": self.alias,
-        }
-
-    def available_columns(self) -> list[str]:
-        return [self.alias if c == self.column else c for c in self.input.available_columns()]
-
-    def available_schema(self) -> SchemaRef | None:
-        inp = self.input.available_schema()
-        if inp is None:
-            return None
-        list_t = inp.field(self.column).type
-        if not (
-            pa.types.is_list(list_t)
-            or pa.types.is_large_list(list_t)
-            or pa.types.is_fixed_size_list(list_t)
-        ):
-            return None  # unnest of a non-list: leave it to the engine
-        fields = [
-            pa.field(self.alias, list_t.value_type) if f.name == self.column else f
-            for f in inp.arrow
-        ]
-        return SchemaRef.from_arrow(pa.schema(fields))
-
-
-@dataclass(frozen=True, slots=True)
-class RowId(LogicalPlan):
-    """Append a 0-based (plus `offset`) sequential row-index column (Polars
-    ``with_row_index``).
-
-    The index numbers rows in arrival order across the whole input via one sequential
-    counter, so it is identical on the single-node and parallel paths for an
-    order-preserving pipeline. Streaming.
-    """
-
-    input: LogicalPlan
-    alias: str
-    offset: int = 0
-
-    def __post_init__(self) -> None:
-        if self.alias in self.input.available_columns():
-            raise PlanError(f"with_row_index name {self.alias!r} collides with an existing column")
-
-    def to_ir(self) -> dict[str, Any]:
-        return {
-            "op": Op.ROW_ID,
-            "input": self.input.to_ir(),
-            "alias": self.alias,
-            "offset": self.offset,
-        }
-
-    def available_columns(self) -> list[str]:
-        return [self.alias, *self.input.available_columns()]
-
-    def available_schema(self) -> SchemaRef | None:
-        inp = self.input.available_schema()
-        if inp is None:
-            return None
-        fields = [pa.field(self.alias, pa.int64()), *inp.arrow]
-        return SchemaRef.from_arrow(pa.schema(fields))
-
-
-@dataclass(frozen=True, slots=True)
-class Unpivot(LogicalPlan):
-    """Reshape wide → long (SQL ``UNPIVOT`` / pandas ``melt`` / Polars ``unpivot``).
-
-    Each input row becomes one row per `on` column: the `index` columns repeat, the
-    `variable_name` column holds the melted column's name, and `value_name` holds its
-    value. The `on` columns must share a type. Streaming and stateless.
-    """
-
-    input: LogicalPlan
-    index: tuple[str, ...]
-    on: tuple[str, ...]
-    variable_name: str
-    value_name: str
-
-    def __post_init__(self) -> None:
-        available = self.input.available_columns()
-        missing = [c for c in (*self.index, *self.on) if c not in available]
-        if missing:
-            raise PlanError(f"unpivot columns {missing} not found in input columns: {available}")
-        if not self.on:
-            raise PlanError("unpivot requires at least one column in `on`")
-        # The output columns are [*index, variable_name, value_name]; a collision among
-        # them (e.g. value_name == an index column) would produce two columns of the same
-        # name and silently drop one on the way out. Reject it, like Polars does.
-        out = [*self.index, self.variable_name, self.value_name]
-        dups = sorted({c for c in out if out.count(c) > 1})
-        if dups:
-            raise PlanError(
-                f"unpivot output columns collide: {dups} — variable_name/value_name must "
-                "differ from each other and from every index column"
-            )
-        # The melted `on` columns stack into one `value` column, so they must share a
-        # promotable type. Reject an unmergeable mix (e.g. Utf8 + Int64) here with a clear
-        # plan-time error — else native `concat` fails deep in execution with an opaque
-        # "cannot concatenate arrays of different data types". DuckDB rejects it at bind
-        # time too. Best-effort: only when the input schema (column types) is known.
-        schema = self.input.available_schema()
-        if schema is not None and self.available_schema() is None:
-            raise PlanError(
-                f"unpivot cannot merge `on` columns of incompatible types "
-                f"({[str(schema.field(c).type) for c in self.on]}); cast them to a "
-                "common type before unpivoting"
-            )
-
-    def to_ir(self) -> dict[str, Any]:
-        return {
-            "op": Op.UNPIVOT,
-            "input": self.input.to_ir(),
-            "index": list(self.index),
-            "on": list(self.on),
-            "variable_name": self.variable_name,
-            "value_name": self.value_name,
-        }
-
-    def available_columns(self) -> list[str]:
-        return [*self.index, self.variable_name, self.value_name]
-
-    def available_schema(self) -> SchemaRef | None:
-        inp = self.input.available_schema()
-        if inp is None:
-            return None
-        value_t = inp.field(self.on[0]).type
-        for c in self.on[1:]:  # the melted columns share a (promotable) type
-            value_t = promote(value_t, inp.field(c).type)
-            if value_t is None:
-                return None
-        fields = [inp.field(c) for c in self.index]
-        fields.append(pa.field(self.variable_name, pa.string()))
-        fields.append(pa.field(self.value_name, value_t))
-        return SchemaRef.from_arrow(pa.schema(fields))
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,6 +345,11 @@ class MapBatches(LogicalPlan):
     # Optional GPU model to pin GPU actors/tasks to (a `ray.util.accelerators` name
     # like "NVIDIA_A100"); None lets Ray pick any GPU.
     accelerator_type: str | None = None
+    # Custom Ray resources per worker, as `((name, amount), ...)`. `num_gpus` only covers
+    # what Ray calls the `GPU` resource (NVIDIA/AMD/Intel/MetaX); a TPU, Trainium
+    # (`neuron_cores`), Gaudi (`HPU`), or an operator's own on-prem resource is named
+    # instead. A tuple so the node stays hashable/frozen like every other field here.
+    resources: tuple[tuple[str, float], ...] = ()
     # Optional estimate of the model's memory footprint in GB. Lets the resource layer
     # budget host RAM per worker (so loading the model into many workers can't OOM the
     # node) and VRAM-pack the GPU fraction; lets Kyber's cost model scale the

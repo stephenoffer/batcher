@@ -14,6 +14,7 @@ credentials) are stored verbatim and never logged.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import closing
 from typing import Any
 
 import pyarrow as pa
@@ -26,6 +27,7 @@ from batcher.io.formats.nosql.base import (
     require_driver,
     rows_to_batches,
 )
+from batcher.io.formats.sql._common import connection_fingerprint
 
 __all__ = ["CouchbaseSource"]
 
@@ -86,7 +88,9 @@ class CouchbaseSource(ScanSource):
         columnar = require_driver("couchbase_columnar.cluster", "couchbase")
         credential = require_driver("couchbase_columnar.credential", "couchbase")
         kw = self._conn_kwargs
-        cred = credential.Credential.from_username_and_password(kw["username"], kw["password"])
+        cred = credential.Credential.from_username_and_password(
+            kw["username"], self._secret("password")
+        )
         return columnar.Cluster.create_instance(kw["connstr"], cred)
 
     def _from_clause(self) -> str:
@@ -94,13 +98,29 @@ class CouchbaseSource(ScanSource):
         return f"`{kw['database']}`.`{kw['scope']}`.`{kw['collection']}`"
 
     def _identity_suffix(self) -> str:
+        """``<cluster>:<db>.<scope>.<collection>`` — the cluster identifies the relation.
+
+        The three-part analytics path is a *name*, not an address: the same
+        ``database.scope.collection`` exists on every Couchbase cluster the deployment
+        runs. Keyed on it alone, `identity()` — the persisted learned-statistics key —
+        pooled their statistics, and Kyber planned one cluster's data using another's
+        cardinalities with no error to show for it.
+
+        `connstr` and `username` are fingerprinted; `password` is not, and would be dropped
+        by `connection_fingerprint` anyway. That is deliberate on both counts: the key is
+        written to the metadata store, and a rotated password must not orphan the table's
+        accumulated statistics.
+        """
         kw = self._conn_kwargs
-        return f"{kw['database']}.{kw['scope']}.{kw['collection']}"
+        fingerprint = connection_fingerprint(
+            {"connstr": kw["connstr"], "username": kw["username"]}
+        )
+        return f"{fingerprint}:{kw['database']}.{kw['scope']}.{kw['collection']}"
 
     def _infer_schema(self) -> pa.Schema:
-        cluster = self._cluster()
         stmt = f"SELECT VALUE c FROM {self._from_clause()} c LIMIT 1"
-        rows = list(cluster.execute_query(stmt).rows())
+        with closing(self._cluster()) as cluster:
+            rows = list(cluster.execute_query(stmt).rows())
         if not rows:
             return pa.schema([])
         return pa.RecordBatch.from_pylist([rows[0]]).schema
@@ -127,7 +147,12 @@ class CouchbaseSource(ScanSource):
         """
         stmt = f"SELECT VALUE COUNT(*) FROM {self._from_clause()} c"
         try:
-            rows = list(self._cluster().execute_query(stmt).rows())
+            # `closing` matters especially here: the bare `self._cluster()` leaked a cluster
+            # on *both* paths — on success it was simply never closed, and on the exception
+            # this method exists to swallow it was dropped mid-flight. Sizing the offset
+            # windows is a routine step of every parallel read, so the leak recurred per read.
+            with closing(self._cluster()) as cluster:
+                rows = list(cluster.execute_query(stmt).rows())
         except Exception:  # a count that fails must not fail the read — fall back to serial
             return None
         if not rows:
@@ -167,10 +192,18 @@ class CouchbaseSource(ScanSource):
         if limit or offset:
             effective_limit = limit if limit else _UNBOUNDED_LIMIT
             stmt += f" ORDER BY META(c).id LIMIT {effective_limit} OFFSET {offset}"
-        cluster = self._cluster()
+        # Resolve the schema before opening this window's cluster: `self.schema()` falls
+        # through to `_infer_schema`, which builds a cluster of its own, so leaving it below
+        # held two connections open at once on the first window of every read.
         schema = self.schema() if not projection else None
-        rows = (
-            row if isinstance(row, dict) else dict(row)
-            for row in cluster.execute_query(stmt).rows()
-        )
-        yield from rows_to_batches(rows, schema=schema)
+        # The SDK's `rows()` is a streaming result, so this genuinely reads incrementally —
+        # but the cluster was never closed at all, on any path. Holding it for the life of
+        # the iteration is required (closing early would kill the stream mid-read), so it is
+        # closed when the generator finishes *or is closed*, which is what `closing` around
+        # the yields buys over a bare call.
+        with closing(self._cluster()) as cluster:
+            rows = (
+                row if isinstance(row, dict) else dict(row)
+                for row in cluster.execute_query(stmt).rows()
+            )
+            yield from rows_to_batches(rows, schema=schema)

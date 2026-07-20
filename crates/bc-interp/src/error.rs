@@ -1,3 +1,6 @@
+//! The crate's error type: plan-interpretation failures, plus the expression and
+//! runtime errors it wraps from the crates below it.
+
 use arrow::error::ArrowError;
 use bc_expr::ExprError;
 use bc_runtime::RuntimeError;
@@ -22,6 +25,13 @@ pub enum InterpError {
 
     #[error("join over an empty input side is not yet supported (no input schema)")]
     EmptyJoinInput,
+
+    #[error(
+        "value-based RANGE window frames (`RANGE <n> PRECEDING/FOLLOWING`) are not yet \
+         supported; they need typed order-key arithmetic. Use ROWS units for a \
+         physical-row frame, or a peer RANGE bound (CURRENT ROW / UNBOUNDED)"
+    )]
+    ValueBasedRangeFrame,
 
     #[error(
         "pipeline breaker cannot materialize column {column:?}: its {bytes} bytes of \

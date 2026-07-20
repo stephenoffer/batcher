@@ -12,7 +12,7 @@ time, after the GPU work is paid for.
 label set and **nulls anything that does not resolve to exactly one**. The output column's
 domain is the list you passed, not whatever the model felt like saying.
 
-An engine is just a zero-argument callable returning a `list[str] -> list[str]` function.
+An engine is a zero-argument callable returning a `list[str] -> list[str]` function.
 That contract is why a stub stands in for a model with no GPU, and why the pipeline you
 test locally is the pipeline that runs on the cluster.
 
@@ -120,8 +120,8 @@ batch inference.
 :::{warning}
 That is the difference from `generate(parse_json=True)`, whose struct type is inferred per
 batch: ask for `{vendor, total}`, have the model omit `total` on one batch, and the two
-batches carry incompatible struct types and the scan dies at concat — after the GPU work is
-paid for.
+batches carry incompatible struct types and the scan dies at concat, after the GPU work is
+already paid for.
 :::
 
 A row that will not parse degrades to nulls in its own columns. One bad generation over a
@@ -131,7 +131,7 @@ million rows costs one row, and it is countable.
 | --- | --- | --- |
 | `ds.ml.classify(engine, labels=[...])` | one column whose domain is the label list | the `labels` you declared; anything that does not resolve to exactly one is null |
 | `ds.ml.extract(engine, schema={...})` | one typed Arrow column per field | the `schema` you declared; an unparseable row is nulls in its own columns |
-| `ds.ml.generate(engine, ...)` | the raw text the model produced | nothing — with `parse_json=True` the struct type is inferred per batch |
+| `ds.ml.generate(engine, ...)` | the raw text the model produced | nothing, because with `parse_json=True` the struct type is inferred per batch |
 
 ```python
 import batcher as bt
@@ -202,7 +202,7 @@ a full decode on a GPU you are renting by the hour. Score the *distinct* prompts
 the answers back.
 :::
 
-This is ordinary relational work, which is the point: the LLM stage is just another
+This is ordinary relational work, which is the point: the LLM stage is another
 operator, so the optimizer and the join sit on either side of it.
 
 ```python

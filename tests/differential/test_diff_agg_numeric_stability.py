@@ -16,7 +16,6 @@ import pytest
 
 import batcher as bt
 from batcher import col, corr, covar_pop, covar_samp
-from conftest import assert_same
 
 pytestmark = pytest.mark.differential
 

@@ -5,12 +5,11 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, count
 
 
 def test_filter_project_vs_duckdb(duck):
-    from conftest import assert_same
-
     data = {"x": [1, 2, 3, 4, 5, 6], "y": [10, 20, 30, 40, 50, 60]}
     t = pa.table(data)
     duck.register("t", t)
@@ -21,8 +20,6 @@ def test_filter_project_vs_duckdb(duck):
 
 
 def test_group_by_sum_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = pa.table(
         {
             "dept": ["eng", "eng", "sales", "sales", "eng", "ops"],
@@ -45,8 +42,6 @@ def test_group_by_sum_vs_duckdb(duck):
 
 
 def test_global_aggregate_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [1, 2, 3, 4], "y": [1.5, 2.5, 3.5, 4.5]})
     duck.register("t", t)
 
@@ -58,8 +53,6 @@ def test_global_aggregate_vs_duckdb(duck):
 
 
 def test_two_key_group_by_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = pa.table(
         {
             "a": ["x", "x", "y", "y", "x"],

@@ -37,7 +37,7 @@ print(sales.top_k(2, "revenue").to_pydict())
 ```
 
 `top_k` is sugar for `sort(...).limit(k)` and the engine fuses the pair into a heap, so it
-is genuinely fast. It is just fast at the wrong thing.
+is genuinely fast. It is fast at the wrong thing.
 
 The other wrong turn is to loop: get the distinct categories, then run one query per
 category with a `filter` and a `limit`. Now you have N queries, N scans of the table, and
@@ -47,7 +47,7 @@ fifty thousand SKUs it is the whole afternoon.
 ## Rank inside the partition, then filter
 
 One window, one filter, one scan. `row_number()` numbers the rows within each partition
-in the order you give it; keeping `rn <= k` keeps the top k of every group at once.
+in the order you give it, and keeping `rn <= k` keeps the top k of every group at once.
 
 The SQL tab needs a subquery, because a window cannot appear in a `WHERE` clause: the
 filter runs before the window does. That is the standard shape, and it is why every
@@ -161,7 +161,7 @@ Three functions, three different questions:
 If you only want the single best row per group, `arg_max` gets it as a plain aggregate.
 Being an aggregate makes it mergeable, so it runs in bounded memory and merges across
 partitions without ever materializing a group. A window has to hold each partition to sort
-it; `arg_max` holds one row.
+it, while `arg_max` holds one row.
 :::
 
 ```python

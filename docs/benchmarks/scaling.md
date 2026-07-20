@@ -16,7 +16,7 @@ one-core answer.
 :::{note}
 The tables below come from three different clusters: a 9-node 128-CPU Ray cluster, a 16
 worker node × 8 CPU cluster, and an 8×T4 GPU cluster. Compare engines *within* a table.
-[Methodology](methodology.md) lists the shapes.
+{doc}`methodology` lists the shapes.
 :::
 
 ## Small data should not distribute
@@ -66,7 +66,7 @@ Batcher beats Ray Data on every pipeline at every scale.
 
 :::{warning}
 Against Daft the result is mixed. Batcher wins the join, the group-by and the metadata
-count, and **loses `filter_count` at sf10 and sf100** (0.84–0.92×), the most purely S3-bound
+count, and **loses `filter_count` at sf10 and sf100** (0.84x to 0.92x), the most purely S3-bound
 shape there is. Both engines are reading the same bytes from the same bucket there, and the
 difference is object-store read throughput, not execution. The 10× bar Batcher clears
 against Ray Data is **not attainable against Daft on these shapes**, and pretending
@@ -162,18 +162,18 @@ python benchmarks/scenarios/scale_bench.py
 
 ## See also
 
-- [vs Ray Data](vs-ray-data.md) and [vs Daft](vs-daft.md): the single-node halves.
-- [vs Spark](vs-spark.md): the architectural comparison these measurements stand in for.
-- [Mergeable algebra](../deep-dives/mergeable-algebra.md): why one core and a hundred nodes
+- {doc}`vs-ray-data` and {doc}`vs-daft`: the single-node halves.
+- {doc}`vs-spark`: the architectural comparison these measurements stand in for.
+- {doc}`../deep-dives/mergeable-algebra`: why one core and a hundred nodes
   give the same answer.
-- [Distributed scheduling](../deep-dives/distributed-scheduling.md): what `distributed="auto"`
+- {doc}`../deep-dives/distributed-scheduling`: what `distributed="auto"`
   is deciding, and on what.
-- [Shuffle over Flight](../deep-dives/shuffle-flight.md) and
-  [credit flow control](../deep-dives/credit-flow-control.md): the data movement the page
+- {doc}`../deep-dives/shuffle-flight` and
+  {doc}`../deep-dives/credit-flow-control`: the data movement the page
   names as the real lever.
-- [Spilling](../deep-dives/spilling.md): what keeps per-node memory bounded when a partition
+- {doc}`../deep-dives/spilling`: what keeps per-node memory bounded when a partition
   does not fit.
-- [Fault tolerance](../architecture/fault-tolerance.md): how a distributed query survives
+- {doc}`../architecture/fault-tolerance`: how a distributed query survives
   a lost worker.
-- [Methodology](methodology.md): the cluster shapes; rows measured on different hardware are
+- {doc}`methodology`: the cluster shapes; rows measured on different hardware are
   not comparable.

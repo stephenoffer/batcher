@@ -1,8 +1,7 @@
 # Optimizing a slow query
 
 A query is slow. This tutorial is the loop you run to find out why: look at the plan, run it
-under measurement, find the operator that dominated, fix *that*. Guessing is the thing we are
-trying to avoid.
+under measurement, find the operator that dominated, fix *that*. Guessing is the thing to avoid.
 
 The bug in this page is a real one, and it is the most common one there is.
 
@@ -30,7 +29,7 @@ not tell you that it did.
 
 ## 1. The data and the query
 
-200,000 events. We want the total fee on the failed ones, by country. The fee is three
+200,000 events. You want the total fee on the failed ones, by country. The fee is three
 percent of the amount, so someone reached for `map_batches` and a NumPy multiply.
 
 ```python
@@ -122,8 +121,8 @@ fast = (
 )
 ```
 
-Nothing has run. It is a lazy plan, and this time a fully relational one, so we can look at
-it before we pay for it.
+Nothing has run. It is a lazy plan, and this time a fully relational one, so you can look at
+it before you pay for it.
 
 ## 4. Read the plan
 
@@ -240,8 +239,8 @@ print(failures.group_by("country").agg(n=bt.count()).sort("country").to_pydict()
 ```
 
 :::{tip}
-The second terminal is served from the stored result. Note that `cache()` marks *that*
-dataset: a further transform on it is a new, uncached dataset. If you cache and see no
+The second terminal is served from the stored result. `cache()` marks *that*
+dataset, so a further transform on it is a new, uncached dataset. If you cache and see no
 speedup, check that you are re-running the cached handle rather than something derived from
 it.
 :::
@@ -274,12 +273,15 @@ bit-identical to the in-memory one, so there is nothing to trade away.
 
 ## The loop, in short
 
-1. `explain()`. Is the predicate at the scan? Is the projection above the filter? Did the
+To diagnose any slow query, complete the following steps:
+
+1. Run `explain()`. Is the predicate at the scan? Is the projection above the filter? Did the
    join pick the build side you expected?
-2. `stats()`. Which operator actually ate the wall time, and did anything spill?
-3. Fix that operator. A Python `map_batches` in the middle of a relational pipeline is the
+1. Run `stats()`. Which operator actually ate the wall time, and did anything spill?
+1. Fix that operator. A Python `map_batches` in the middle of a relational pipeline is the
    first thing to suspect, because it blocks both pushdown and the JIT.
-4. `cache()` a shared upstream; set a memory budget so a big query degrades instead of dying.
+1. Cache a shared upstream with `cache()`, and set a memory budget so a big query degrades
+   instead of dying.
 
 ## What you learned
 

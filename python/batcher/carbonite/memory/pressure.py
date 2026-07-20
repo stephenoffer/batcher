@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING
 
+from batcher._internal.hardware import cgroup_v2_dirs, read_cgroup_bytes
 from batcher.config import Config, active_config
 
 if TYPE_CHECKING:
@@ -107,33 +108,12 @@ def _cgroup_limit_bytes() -> int | None:
     the mount root — so the effective cap is the tightest `memory.max` across the whole
     ancestry (`cgroup_v2_dirs`), not just the root. v1 keeps its single well-known path.
     """
-    from batcher._internal.hardware import cgroup_v2_dirs
-
     limits = [
-        v for d in cgroup_v2_dirs() if (v := _read_cgroup_bytes(os.path.join(d, "memory.max")))
+        v for d in cgroup_v2_dirs() if (v := read_cgroup_bytes(os.path.join(d, "memory.max")))
     ]
     if limits:
         return min(limits)
-    return _read_cgroup_bytes("/sys/fs/cgroup/memory/memory.limit_in_bytes")  # cgroup v1
-
-
-def _read_cgroup_bytes(path: str) -> int | None:
-    """A byte-valued cgroup file, or `None` when absent, unlimited (`max`/sentinel), or empty."""
-    try:
-        with open(path) as f:
-            raw = f.read().strip()
-    except OSError:
-        return None
-    if raw in ("max", ""):
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        return None
-    # cgroup v1 reports a sentinel near 2^63 when unlimited; treat huge/non-positive as none.
-    if value <= 0 or value >= (1 << 62):
-        return None
-    return value
+    return read_cgroup_bytes("/sys/fs/cgroup/memory/memory.limit_in_bytes")  # cgroup v1
 
 
 def _cgroup_file_cache_bytes() -> int:
@@ -185,7 +165,7 @@ def _cgroup_total_bytes() -> int | None:
     Not a pressure signal on its own; see `_cgroup_current_bytes`.
     """
     for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
-        value = _read_cgroup_bytes(path)
+        value = read_cgroup_bytes(path)
         if value is not None:
             return value
     return None
@@ -299,6 +279,14 @@ class PressureMonitor:
             self._alpha = self._EWMA_ALPHA
         else:
             self._alpha = min(1.0, max(1e-3, hysteresis_alpha))
+        # Flap accounting for `flap_rate` — the signal `hysteresis_alpha` is itself derived
+        # from, closing that loop. Counts direction *reversals* across sampled levels: the
+        # previous level, the direction of the last change (+1/-1/0), how many changes were
+        # reversals, and how many samples were taken.
+        self._prev_level: PressureLevel | None = None
+        self._last_dir = 0
+        self._reversals = 0
+        self._samples = 0
 
     def snapshot(self) -> MemorySnapshot:
         """Take a current reading of total/available memory and budget usage."""
@@ -351,7 +339,38 @@ class PressureMonitor:
         prev = self._ewma if self._ewma is not None else raw
         level = self._classify(max(raw, prev))
         self._ewma = self._alpha * raw + (1.0 - self._alpha) * prev
+        self._observe_flap(level)
         return level
+
+    def _observe_flap(self, level: PressureLevel) -> None:
+        """Fold one sampled level into the reversal count behind `flap_rate`.
+
+        A *reversal* is a level change whose direction opposes the previous change — the
+        SPILL->NORMAL->SPILL oscillation the hysteresis exists to damp. A monotonic climb or
+        decay is not a flap however many steps it takes, so only direction changes count.
+        """
+        self._samples += 1
+        if self._prev_level is None:
+            self._prev_level = level
+            return
+        if level == self._prev_level:
+            return
+        direction = 1 if level > self._prev_level else -1
+        if self._last_dir and direction != self._last_dir:
+            self._reversals += 1
+        self._last_dir = direction
+        self._prev_level = level
+
+    def flap_rate(self) -> float | None:
+        """Fraction of sampled levels that reversed direction, or `None` before 2 samples.
+
+        This is the measurement `hysteresis_alpha_from_flap` consumes to stiffen de-escalation
+        for a workload observed to oscillate. Nothing produced it, so `load_flap_rate` returned
+        `None` on every real run and the whole anti-oscillation mechanism was permanently
+        inert at the static default. The monitor is the natural producer — it is the component
+        that sees every level — and this only *measures*, consistent with the rest of the class.
+        """
+        return self._reversals / self._samples if self._samples >= 2 else None
 
     def classify(self) -> PressureLevel:
         """The current pressure level **without** advancing the hysteresis average.

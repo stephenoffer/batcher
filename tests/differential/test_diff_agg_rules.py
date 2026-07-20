@@ -20,6 +20,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 from batcher.api.dataset import Dataset
 from batcher.api.orchestration import collect_source_stats
@@ -32,7 +33,6 @@ from batcher.plan.schema import SchemaRef
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
 from batcher.plan.visitor import walk
-from conftest import assert_same
 
 # `id` is unique; `g` has a NULL group and duplicate keys; `k` is a non-null constant; `x`
 # carries a NULL; `n` is entirely NULL.

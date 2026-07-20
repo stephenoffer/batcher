@@ -20,8 +20,8 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same, assert_tables_equal
 from batcher import col, count, window
-from conftest import assert_same, assert_tables_equal
 
 
 def _chunks(unit: str, n_chunks: int = 5, per: int = 40) -> list[pa.RecordBatch]:

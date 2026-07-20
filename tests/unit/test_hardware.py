@@ -99,3 +99,82 @@ def test_cfs_quota_takes_tightest_across_the_hierarchy(monkeypatch):
 
     monkeypatch.setattr(builtins, "open", fake_open)
     assert hardware._cfs_quota_count() == 6  # the parent slice's limit, missed by root+leaf only
+
+
+def test_cpu_contention_reports_load_relative_to_the_usable_cores(monkeypatch):
+    # The denominator must be the cores this process may actually use, not the host's. Inside
+    # a quota-throttled container those differ, and dividing by the host count would report a
+    # saturated box as idle — the exact misreading that makes a diagnosis blame the plan.
+    monkeypatch.setattr(hardware, "available_cpu_count", lambda: 4)
+    monkeypatch.setattr(hardware.os, "getloadavg", lambda: (8.0, 8.0, 8.0))
+    monkeypatch.setattr(hardware, "_cgroup_throttled_ratio", lambda: None)
+    assert hardware.cpu_contention()["load_per_core"] == 2.0
+    # A key the platform cannot answer is omitted, never defaulted to a reassuring zero.
+    assert "throttled_ratio" not in hardware.cpu_contention()
+
+
+def test_cpu_contention_survives_a_platform_without_loadavg(monkeypatch):
+    def boom():
+        raise OSError("no loadavg here")
+
+    monkeypatch.setattr(hardware.os, "getloadavg", boom)
+    monkeypatch.setattr(hardware, "_cgroup_throttled_ratio", lambda: 0.25)
+    out = hardware.cpu_contention()
+    assert "load_per_core" not in out
+    assert out["throttled_ratio"] == 0.25
+
+
+def test_gpu_absence_keys_on_device_nodes_not_the_driver_control_node(monkeypatch):
+    # A GPU-less host built from a GPU-capable cloud image has /dev/nvidiactl (driver loaded)
+    # and no /dev/nvidia0. Keying on the control node would call that host GPU-equipped and
+    # re-introduce the ~2s torch import this probe exists to avoid.
+    hardware.gpu_devices_absent.cache_clear()
+    monkeypatch.setattr(hardware.sys, "platform", "linux")
+    monkeypatch.setattr(hardware.glob, "glob", lambda pat: [])
+    monkeypatch.setattr(hardware.os.path, "exists", lambda p: p == "/dev/nvidiactl")
+    assert hardware.gpu_devices_absent() is True
+
+    hardware.gpu_devices_absent.cache_clear()
+    monkeypatch.setattr(hardware.glob, "glob", lambda pat: ["/dev/nvidia0"])
+    assert hardware.gpu_devices_absent() is False
+    hardware.gpu_devices_absent.cache_clear()
+
+
+def test_gpu_absence_never_false_negatives_off_linux(monkeypatch):
+    # macOS Metal devices have no device node, so the cheap path must decline to answer there
+    # rather than report "no GPU" on a machine that has one.
+    hardware.gpu_devices_absent.cache_clear()
+    monkeypatch.setattr(hardware.sys, "platform", "darwin")
+    monkeypatch.setattr(hardware.os.path, "exists", lambda p: False)
+    assert hardware.gpu_devices_absent() is False
+    hardware.gpu_devices_absent.cache_clear()
+
+
+def test_l3_cache_size_is_parsed_from_sys(monkeypatch):
+    from batcher._internal import hardware
+
+    assert hardware._parse_cache_size("16384K") == 16384 * 1024
+    assert hardware._parse_cache_size("32M") == 32 * 1024 * 1024
+    assert hardware._parse_cache_size("1G") == 1 << 30
+    assert hardware._parse_cache_size("512") == 512
+    assert hardware._parse_cache_size("") == 0
+
+
+def test_machine_memory_takes_the_min_of_host_and_cgroup(monkeypatch):
+    from batcher._internal import hardware
+
+    hardware.machine_memory_bytes.cache_clear()
+    # cgroup cap tighter than host RAM → the container limit binds.
+    monkeypatch.setattr(hardware, "cgroup_v2_dirs", lambda: ["/sys/fs/cgroup"])
+    monkeypatch.setattr(hardware, "read_cgroup_bytes", lambda p: 8 << 30)
+    monkeypatch.setattr(
+        hardware.os, "sysconf", lambda name: (4096 if "PHYS" not in name else (64 << 30) // 4096)
+    )
+    assert hardware.machine_memory_bytes() == 8 << 30
+    hardware.machine_memory_bytes.cache_clear()
+
+
+def test_a_cgroup_sentinel_is_treated_as_unlimited():
+    from batcher._internal import hardware
+
+    assert hardware.read_cgroup_bytes.__doc__  # documented

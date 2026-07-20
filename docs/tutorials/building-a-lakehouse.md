@@ -22,6 +22,9 @@ aggregate. Then file skipping, which is the mechanism that makes the whole thing
 
 ## 1. Somewhere to work
 
+Every runnable block below writes into one temp directory, so nothing lands in your
+project tree.
+
 ```python
 import os
 import tempfile
@@ -173,7 +176,7 @@ its per-column min/max. That is a zone map over the *file* dimension, and Batche
 never split, never shipped to a worker.
 
 Write a table clustered by day, so each append lands its own file, and watch the predicate
-cut the file list rather than just the rows:
+cut the file list rather than only the rows:
 
 ```python
 from batcher.io.formats.lakehouse import DeltaSource
@@ -204,8 +207,8 @@ match; a missing statistic keeps the file. Skipping can cost you extra I/O. It c
 you a row. That asymmetry is why you can trust it without checking it.
 :::
 
-On a 10M-row, 200-file Delta table, that mechanism takes a `count(*) WHERE day = 42` from
-98.8 ms reading 200 files to 13.4 ms reading one, past DuckDB's `delta_scan` at 19.0 ms.
+On a 200-file Delta table, that mechanism takes a `count(*) WHERE day = 42` from 98.8 ms
+reading 200 files to 7.4 ms reading one, past DuckDB's `delta_scan` at 21.8 ms.
 See [vs DuckDB](../benchmarks/vs-duckdb.md).
 
 ## 9. Do it on a cluster

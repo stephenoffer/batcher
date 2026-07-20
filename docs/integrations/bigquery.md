@@ -13,7 +13,7 @@ results in BigQuery, write Parquet to GCS and load it, or use `bq load`.
 | **Pushdown** | Predicates become `row_restriction`. Projection only via `selected_fields=`. |
 | **Credentials** | The ambient `google.auth` environment. Nothing is passed as a keyword. |
 
-```
+```bash
 pip install 'batcher-engine[bigquery]'
 ```
 
@@ -76,7 +76,7 @@ job, then read its result in parallel.
 
 :::{note}
 The positional argument to `bt.read.bigquery(...)` is the **query**, so
-`bt.read.bigquery("SELECT ...", project="acme-billing")` reads what it looks like it reads.
+`bt.read.bigquery("SELECT ...", project="acme-billing")` reads exactly what it appears to read.
 To read a whole table instead, pass `table=` and leave the positional slot empty:
 `bt.read.bigquery(table="acme-data.analytics.events", project="acme-billing")`.
 :::

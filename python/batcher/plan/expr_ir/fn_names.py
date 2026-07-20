@@ -65,6 +65,8 @@ class ListBinaryFn(StrEnum):
     DOT = "dot"
     COSINE_SIMILARITY = "cosine_similarity"
     L2_DISTANCE = "l2_distance"
+    L1_DISTANCE = "l1_distance"
+    HAMMING = "hamming"
     JACCARD = "jaccard"
 
 
@@ -74,6 +76,14 @@ class ListSetFn(StrEnum):
     ARRAY_INTERSECT = "array_intersect"
     ARRAY_EXCEPT = "array_except"
     ARRAY_UNION = "array_union"
+
+
+class ListZipFn(StrEnum):
+    """Element-wise arithmetic between two List columns carried by `ListZip`."""
+
+    LIST_ADD = "list_add"
+    LIST_SUBTRACT = "list_subtract"
+    LIST_MULTIPLY = "list_multiply"
 
 
 class Math2Fn(StrEnum):
@@ -94,7 +104,9 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "aes_decrypt", "aes_encrypt", "ascii", "base64", "bit_length", "chunk", "contains",
         "crc32", "ends_with", "from_base64", "hash64", "hex", "hmac_sha256", "ilike",
         "initcap", "json_extract_bool", "json_extract_float", "json_extract_int",
-        "json_extract_string", "l_trim", "len", "levenshtein", "like", "lower",
+        "damerau_levenshtein", "jaro_similarity", "jaro_winkler_similarity",
+        "json_extract_string", "l_trim",
+        "len", "levenshtein", "like", "lower",
         "lpad", "mask", "md5", "minhash", "octet_length", "overlay", "position", "r_trim",
         "regexp_count", "regexp_extract", "regexp_extract_all", "regexp_matches",
         "regexp_replace", "regexp_replace_all", "repeat", "replace", "reverse",
@@ -123,9 +135,9 @@ DATE_FNS: Final[frozenset[str]] = frozenset(
 
 LIST_FNS: Final[frozenset[str]] = frozenset(
     {
-        "arg_max", "arg_min", "flatten", "l2_norm", "len", "max", "mean", "median",
-        "min", "n_unique", "normalize", "product", "reverse", "sort", "std", "sum",
-        "unique", "var",
+        "arg_max", "arg_min", "arg_sort", "cum_sum", "diff", "flatten", "l1_norm", "l2_norm", "len",
+        "max", "max_abs", "mean", "median", "min", "n_unique", "normalize", "product",
+        "reverse", "softmax", "sort", "std", "sum", "unique", "var",
     }
 )  # fmt: skip
 

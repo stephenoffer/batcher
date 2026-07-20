@@ -26,8 +26,8 @@ import pytest
 
 import batcher as bt
 import batcher.kyber.rules.extra.pushdown_gaps
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 pytestmark = pytest.mark.differential
 

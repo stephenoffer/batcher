@@ -41,6 +41,15 @@ The optimizer re-plans mid-query on measured row counts, not static guesses.
   [Joins](../../user-guide/joins.md),
   [Window functions](../../user-guide/window-functions.md).
 
+## See also
+
+:::{seealso}
+- {doc}`../../architecture/index`: the same split, at the level of the whole system.
+- {doc}`../../deep-dives/query-lifecycle`: what actually happens between `collect()` and
+  the Arrow batches coming back.
+- {doc}`../../user-guide/explain-plans`: reading the plan these concepts describe.
+:::
+
 ```{toctree}
 :hidden:
 

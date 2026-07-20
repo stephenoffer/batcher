@@ -16,8 +16,8 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 
 def test_json_extract_int_rounds_float_leaf(duck):

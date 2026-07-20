@@ -69,6 +69,39 @@ def sentence_transformer_encoder(
 Encoder = Callable[[list[str]], Sequence[Sequence[float]]]
 """Encodes a list of strings into a sequence of equal-length numeric vectors."""
 
+
+def _to_embedding_column(vectors: Sequence[Sequence[float]]) -> pa.Array:
+    """Convert an encoder's output into a fixed-shape-tensor column.
+
+    Goes through NumPy so the conversion happens once at C speed over the whole block.
+    The obvious spelling — a nested comprehension calling ``float()`` per element — is
+    ``O(rows x dims)`` Python-level work in the hot path (a 256-row batch of 1024-dim
+    vectors is a quarter-million ``float()`` calls), which is exactly the per-tuple work
+    the control plane must never do.
+
+    The result is a fixed-shape-tensor column (``FixedSizeList`` storage) rather than a
+    ``list<float64>``: it keeps the encoder's native width (``f32`` for essentially every
+    embedding model, so half the bytes), carries its dimensionality in the type, and
+    matches what `sentence_transformer_encoder` already emits so both encoder paths agree.
+    """
+    import numpy as np
+
+    from batcher.io.formats.ml.tensor import to_tensor_column
+
+    arr = np.asarray(vectors)
+    if arr.ndim != 2 or arr.dtype == object:
+        from batcher._internal.errors import BackendError
+
+        msg = (
+            "embed() expects the encoder to return equal-length numeric vectors "
+            f"(a 2-D array of shape (rows, dims)); got {arr.ndim}-D with dtype "
+            f"{arr.dtype}. A ragged result usually means the model emitted variable-"
+            "length output — pool or truncate it inside the encoder."
+        )
+        raise BackendError(msg)
+    return to_tensor_column(arr)
+
+
 EncoderFactory = Callable[[], Encoder]
 """Builds an `Encoder`, called once per worker so the model loads a single time."""
 
@@ -100,7 +133,8 @@ def embed(
             (`list[str] -> sequence of vectors`); called once per worker so the
             model loads once.
         text_column: the string column to embed.
-        output_column: name of the appended `list<float64>` column.
+        output_column: name of the appended fixed-shape-tensor column, whose element
+            width follows the encoder's own (``f32`` for most models).
         num_workers: pool size — encoders built, and batches embedded, in parallel.
         target_batch_rows: rows per batch handed to an encoder.
         pool_kwargs: further `InferencePool` options (e.g. ``target_latency_ms``).
@@ -115,11 +149,7 @@ def embed(
 
         def worker(batch: pa.RecordBatch) -> pa.RecordBatch:
             texts = batch.column(text_column).to_pylist()
-            vectors = encoder(texts)
-            embeddings = pa.array(
-                [[float(x) for x in vector] for vector in vectors],
-                type=pa.list_(pa.float64()),
-            )
+            embeddings = _to_embedding_column(encoder(texts))
             arrays = [batch.column(i) for i in range(batch.num_columns)] + [embeddings]
             names = [*batch.schema.names, output_column]
             return pa.RecordBatch.from_arrays(arrays, names=names)
@@ -130,7 +160,12 @@ def embed(
         make_worker,
         num_workers=num_workers,
         target_batch_rows=target_batch_rows,
-        **pool_kwargs,  # type: ignore[arg-type]
+        # Offline bulk embedding is the throughput objective, not the latency one: there
+        # is no request to be timely for, only rows/sec to maximize under a VRAM cap.
+        # Left at the pool's "latency" default this ran at a *fixed* batch size, because
+        # that objective only engages when a `target_latency_ms` is supplied — so no
+        # controller ran at all. Overridable via `pool_kwargs` for a latency-bound caller.
+        **{"objective": "throughput", **pool_kwargs},  # type: ignore[arg-type]
     )
     yield from pool.run(batches)
 

@@ -7,6 +7,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -24,8 +25,6 @@ def t(duck):
 
 
 def test_inverse_trig_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(asn=col("u").asin(), acs=col("u").acos(), atn=col("y").atan())
@@ -35,8 +34,6 @@ def test_inverse_trig_vs_duckdb(duck, t):
 
 
 def test_hyperbolic_and_angle_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(

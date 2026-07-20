@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -32,8 +33,6 @@ def emp(duck):
     ],
 )
 def test_simple_case(duck, emp, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, emp=emp).collect(), duck.sql(q))
 
 
@@ -48,8 +47,6 @@ def test_simple_case(duck, emp, q):
     ],
 )
 def test_count_star_over(duck, emp, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, emp=emp).collect(), duck.sql(q))
 
 
@@ -64,6 +61,4 @@ def test_count_star_over(duck, emp, q):
     ],
 )
 def test_bool_aggregates(duck, emp, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, emp=emp).collect(), duck.sql(q))

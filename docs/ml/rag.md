@@ -12,13 +12,16 @@ Retrieval is a query. Keep them separate.
 
 ## Ingest
 
+Ingest turns a raw corpus into an indexed set of chunks. Each of the four stages below
+runs as engine operators over a `Dataset`, so the whole chain streams and distributes.
+
 ### Clean the markup
 
 A scraped page is markup. The `regexp_replace('<[^>]*>', '')` idiom that everyone
-reaches for is wrong in three ways: it leaves the body of `<script>` in the corpus as
+reaches for is wrong in three ways. It leaves the body of `<script>` in the corpus as
 prose, it leaves `&amp;` undecoded, and it welds `<p>a</p><p>b</p>` into `ab`.
-`.str.strip_html()` is a text extractor: it drops script and style bodies, decodes
-entities, and separates block elements.
+`.str.strip_html()` is a text extractor instead. It drops script and style bodies,
+decodes entities, and separates block elements.
 
 ```python
 import batcher as bt
@@ -43,7 +46,7 @@ abort the scan.
 
 ### Chunk, and keep the provenance
 
-`.str.chunk(size, overlap)` slices text into overlapping windows; `explode` turns the
+`.str.chunk(size, overlap)` slices text into overlapping windows, and `explode` turns the
 list into one row per chunk. Carry the source id through, and add a chunk index. A
 retrieved chunk that cannot name its source document is a citation you cannot render.
 
@@ -59,8 +62,8 @@ print(chunks.select("url", "chunk_id", "chunk").to_pydict())
 ```
 
 :::{warning}
-Sizes are in characters. Pick one comfortably under the embedding model's token limit
-(about 4 characters per token as a rough conversion), because text past the limit is
+Sizes are in characters. Pick one comfortably under the embedding model's token limit,
+using about 4 characters per token as a rough conversion. Text past the limit is
 silently truncated, and a vector for the first half of a chunk is worse than no vector.
 `overlap` is what keeps a sentence split across a boundary whole in one of the two
 chunks.
@@ -92,10 +95,10 @@ print(sorted(clean.to_pydict()["chunk_id"]))
 # [1, 4]
 ```
 
-`distinct` gets the byte-identical ones cheaply; `drop_near_duplicates` (MinHash + LSH)
-gets the ones that differ by a header or a trailing exclamation mark. On a web corpus
-the near-duplicate rate is routinely 20–40%, and every one of them is a wasted GPU
-forward pass and a polluted retrieval.
+`distinct` gets the byte-identical ones cheaply. `drop_near_duplicates`, built on MinHash
+and LSH, gets the ones that differ by a header or a trailing exclamation mark. On a web
+corpus the near-duplicate rate is routinely 20% to 40%, and every one of them is a wasted
+GPU forward pass and a polluted retrieval.
 
 ### Embed and index
 
@@ -115,11 +118,11 @@ vectors.write.lance("s3://bucket/chunks.lance")
 build_vector_index("s3://bucket/chunks.lance", "embedding")
 ```
 
-The whole ingest chain (scan, strip, chunk, explode, dedupe, embed) is row-wise apart
-from the dedup, so it streams and distributes with no breaker before the GPU stage. The
-one thing no static estimate can know is how many chunks a document yields; the engine
-measures the real fan-out on the first run and sizes the downstream GPU stage for it on
-the next. See [adaptive re-optimization](../internals/kyber.md).
+The whole ingest chain of scan, strip, chunk, explode, dedupe, and embed is row-wise
+apart from the dedup, so it streams and distributes with no breaker before the GPU stage.
+The one thing no static estimate can know is how many chunks a document yields. The
+engine measures the real fan-out on the first run and sizes the downstream GPU stage for
+it on the next. See [adaptive re-optimization](../internals/kyber.md).
 
 ## Retrieval
 
@@ -129,7 +132,8 @@ everything downstream of them is identical.
 ::::{tab-set}
 :::{tab-item} Brute force
 
-On a corpus small enough to scan, this is a projection and a top-n: no index, no service.
+On a corpus small enough to scan, this is a projection and a top-n. No index and no
+service are involved.
 
 ```python
 from batcher import array
@@ -181,7 +185,7 @@ have to throw away". See [vector search](vector-search.md).
 ## Building the prompt
 
 Concatenate the retrieved chunks into one context string per question. This is a
-`group_by` with `array_agg` and a list join: an aggregate, not a Python loop.
+`group_by` with `array_agg` and a list join. It is an aggregate, not a Python loop.
 
 ```python
 prompt = retrieved.group_by().agg(context=col("chunk").array_agg())
@@ -235,7 +239,7 @@ so long.
 :::{warning}
 Model skew is the subtle one. The query must be embedded by the same model as the corpus,
 and nothing enforces that. Store the model name alongside the vectors, so a re-embed with
-a new model cannot silently mix two vector spaces — a mixed index does not fail, it just
+a new model cannot silently mix two vector spaces. A mixed index does not fail. It
 retrieves nonsense with confident-looking distances.
 :::
 

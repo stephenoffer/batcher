@@ -9,7 +9,7 @@ The tempting answer is a bespoke `TensorArray` type. Batcher does not have one, 
 absence is the design.
 
 ```text
-   read.images()  ──►  schema {uri, bytes, size, mime}   — no pixels yet
+   read.images()  ──►  schema {uri, bytes, size, mime}   (no pixels yet)
                             │
                             ▼
                     ┌────────────────┐
@@ -100,7 +100,7 @@ to its plain storage type, and the shape would be gone by the time anything noti
 :::
 
 ```rust
-// A bare Expr::Col passthrough CLONES the source field, preserving its metadata —
+// A bare Expr::Col passthrough CLONES the source field, preserving its metadata,
 // notably the Arrow extension type. Rebuilding from array.data_type() would drop it,
 // downgrading a tensor column to its plain storage type.
 ```
@@ -124,9 +124,10 @@ the point-cloud path inherited the win for free.
 
 ## Bytes at read time, tensors downstream
 
-`read.images()` / `read.audio()` / `read.video()` produce a `bytes` column, not pixels. The
-schema is `{uri, bytes, size, mime}`. Decoding is a downstream Rust *expression*, never a
-read-time side effect:
+`read.images()`, `read.audio()`, and `read.video()` produce a `bytes` column, not pixels. Each
+lists media files and yields `uri`, `bytes`, `size`, and `mime`, plus whatever cheap header-derived
+columns that medium offers, such as `sample_rate`, `channels`, and `duration` for audio. Decoding
+is a downstream Rust *expression*, never a read-time side effect:
 
 ```text
 col("bytes").image.to_tensor(width, height)   -> FixedSizeList<UInt8> + tensor metadata
@@ -142,9 +143,9 @@ variable-length list and there is no shape to carry.
 The decode kernels live in `crates/bc-expr/src/eval/media/`. They are interpreter-only (the
 JIT cannot compile a library-backed decode), and they fan out per *row* over rayon above a
 threshold of 8 rows. That per-row fan-out exists because a 2,000-JPEG corpus is a single
-morsel, and the parallel executor used to cap its thread pool at the morsel count, so the
-entire decode ran on one core. `Expr::contains_media_decode()` now lifts the pool to every
-core for a media plan. Decode alone got 17–22× faster.
+morsel, and the parallel executor capped its thread pool at the morsel count, so the entire decode
+ran on one core. `Expr::contains_media_decode()` lifts the pool to every core for a media plan,
+which made decode alone 17x to 22x faster.
 
 ## Out to numpy and torch
 
@@ -190,12 +191,12 @@ for batch in ds.ml.iter_torch_batches(batch_size=2):
 ## Coming back from a UDF
 
 `pa.RecordBatch.from_pydict` cannot build a column from a multi-dimensional numpy array. So
-`core/udf/execute.py::_tensorize_columns` intercepts any returned `ndarray` with `ndim >= 2`
+`core/udf/call.py::_tensorize_columns` intercepts any returned `ndarray` with `ndim >= 2`
 and runs it through `to_tensor_column`.
 
-This is what makes a two-stage decode → model pipeline expressible at all: a UDF returning
-`{"emb": (B, 2048) float32}` previously raised `ArrowInvalid`. It now round-trips zero-copy
-through the FFI, out to numpy and torch.
+That interception is what makes a two-stage decode-then-model pipeline expressible at all. A UDF
+returning `{"emb": (B, 2048) float32}` round-trips zero-copy through the FFI, out to numpy and
+torch, where without it the batch construction fails outright.
 
 ## Costs and limits
 
@@ -244,7 +245,7 @@ python/batcher/ml/decode.py::video_dataset
 | Decode kernels | `crates/bc-expr/src/eval/media/{image,audio,video}.rs` |
 | Decode orchestration | `python/batcher/ml/decode.py` |
 | Arrow → numpy / torch | `python/batcher/ml/{converters,batch_format,loader}.py` |
-| UDF output tensorization | `python/batcher/core/udf/execute.py` |
+| UDF output tensorization | `python/batcher/core/udf/call.py` |
 
 ## See also
 

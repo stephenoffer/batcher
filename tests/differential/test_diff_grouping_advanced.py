@@ -20,6 +20,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -38,8 +39,6 @@ def t(duck):
 
 
 def _run(t, duck, sql):
-    from conftest import assert_same
-
     assert_same(bt.sql(sql, t=bt.from_arrow(t)).collect(), duck.sql(sql))
 
 

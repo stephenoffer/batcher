@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, greatest, least, nullif
 
 
@@ -23,15 +24,11 @@ def t(duck):
 
 
 def test_nullif_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(n=nullif(col("a"), col("b"))).collect()
     assert_same(out, duck.sql("SELECT nullif(a, b) n FROM t"))
 
 
 def test_greatest_least_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(
@@ -44,15 +41,11 @@ def test_greatest_least_vs_duckdb(duck, t):
 
 
 def test_greatest_least_with_literal(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(g=greatest(col("a"), 4), l=least(col("a"), 4)).collect()
     assert_same(out, duck.sql("SELECT greatest(a, 4) g, least(a, 4) l FROM t"))
 
 
 def test_nonfinite_float_literals_parse_and_match(duck, t):
-    from conftest import assert_same
-
     # A NaN/Inf float literal used to blow up plan parsing entirely: Python's
     # ``json.dumps`` emits the non-standard ``NaN``/``Infinity`` tokens that
     # serde_json rejects, so ANY query carrying such a constant raised

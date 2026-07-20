@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 from batcher.config import Config
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.metadata import MetadataHub
+from batcher.plan.resource import HardwareProfile
 
 if TYPE_CHECKING:
     from batcher.kyber.cost import CostModel
@@ -44,6 +45,11 @@ class OptimizerContext:
     estimator: CardinalityEstimator
     cost_model: CostModel | None = None
     notes: dict[str, Any] = field(default_factory=dict)
+    #: The hardware this plan targets — this machine single-node, the cluster's binding node
+    #: when distributed. Rules read it so a threshold sized to cache/memory/VRAM tracks the
+    #: real device instead of a constant. Defaults to detecting the local machine, so a caller
+    #: that does not supply one (a test, a single-node run) still plans against real hardware.
+    hardware: HardwareProfile = field(default_factory=HardwareProfile.local)
 
     def costs(self) -> CostModel:
         """The cost model for this run, building a default-coefficient one over the

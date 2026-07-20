@@ -11,9 +11,9 @@ only. Batcher has no Kafka sink, so producing back to Kafka goes through
 | **Extra** | `pip install 'batcher-engine[kafka]'` |
 | **Parallelism** | One split per topic partition |
 | **Pushdown** | None. The payload arrives as opaque bytes. |
-| **Restart** | The consumer group's committed offsets; a checkpointed seek only under explicit `partitions=` |
+| **Restart** | Batcher's checkpoint, applied on partition assignment; the group offset is the fallback |
 
-```
+```bash
 pip install 'batcher-engine[kafka]'
 ```
 
@@ -99,17 +99,18 @@ them. Each pipeline then sees half the data and neither complains.
 Give every query its own group id, and keep it stable across restarts, because that id *is*
 the offset bookmark.
 
-Batcher disables `enable.auto.commit` and commits synchronously after each poll assembles a
-batch. A crash before that commit re-delivers the batch; a crash after does not.
+Batcher disables `enable.auto.commit` and advances the group only after a micro-batch is
+*published*, never when it is merely polled. A crash in between re-delivers the batch, which
+an idempotent sink absorbs. The ordering is chosen so the failure mode is always a duplicate
+and never a gap.
 
-The subtlety is the restart path. With a plain group subscription (no `partitions=`), the
-consumer's position on restart is whatever the group's committed offsets say. A checkpointed
-`seek` is a no-op there, because a group rebalance decides the assignment, not you. Only when
-partitions are explicitly assigned, which is what the distributed split path does, does a
-checkpointed offset drive a real seek to `offset + 1`. If you need replay of an in-flight
-micro-batch to be exact, run the query with explicit partition assignment and a `checkpoint=`.
-Otherwise treat restart as "resume from the group's last commit", which can lose a batch that
-was polled and committed but not yet written.
+The restart path follows from that. Batcher's own checkpoint, not the group offset, is the
+source of truth. Under explicit `partitions=`, which is what the distributed split path uses,
+the consumer already owns its partitions and repositions immediately to `offset + 1`. Under a
+plain group subscription the partitions aren't known until the group assigns them, so the
+resume happens in the assignment callback: each partition Kafka hands over is rewound to the
+checkpointed position before reading starts. A partition with no checkpointed position keeps
+the offset the broker assigned, which is what `auto_offset_reset` controls.
 
 :::{note}
 `auto_offset_reset` defaults to `"earliest"`: a brand-new group id starts at the head of the

@@ -1,3 +1,5 @@
+//! The crate's error type: how the stateful runtime structures report failure.
+
 use arrow::error::ArrowError;
 use thiserror::Error;
 

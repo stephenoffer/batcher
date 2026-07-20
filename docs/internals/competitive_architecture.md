@@ -37,7 +37,7 @@ These are real, and none of the competitors have all of them:
    Batcher beats Ray Data 50–450× — Ray Data's object-store spill storms are structural.
 3. **A learned cross-query loop nobody else has.** Sketch-backed cardinality (HLL/KLL wired end to
    end), cost coefficients *calibrated from measured `op_stats`*, a UCB1 bandit over join
-   strategies, learned partition counts and hot keys (`kyber/learning.py`, `learned_tuning.py`,
+   strategies, learned partition counts and hot keys (`kyber/learning.py`, `learned_tuning/`,
    `dist/skew.py`). DuckDB and Spark have nothing comparable.
 4. **O(1)-memory global shuffle for training.** A 4-round Feistel permutation with cycle-walking
    (`ml/permutation.py`) makes the epoch order a *computed bijection*, not a materialized index
@@ -61,7 +61,7 @@ Legend: **W** Batcher wins architecturally · **=** parity · **L** Batcher lose
 | Single-node ≤10M rows | **W** | **W** | **W** | — | **W** | — |
 | Single-node ≥100M rows | **L** (2–11×, **OOM** on q3/q4/q5) | **L** on 6 shapes | — | — | **W** | — |
 | Distributed batch | **W** | **W** | = | — | **W** (50–450×) | L |
-| Optimizer breadth | = (259 rules, DP join order) | **W** | **W** | — | **W** | L |
+| Optimizer breadth | = (302 rules, bushy DP join order) | **W** | **W** | — | **W** | L |
 | Learned/adaptive | **W** | **W** | **W** | — | **W** | = |
 | String execution | **L** (no StringView, dict decoded at leaf) | **L** | = | — | L | L |
 | Streaming guarantees | — | — | L | **✗** | — | — |
@@ -69,6 +69,68 @@ Legend: **W** Batcher wins architecturally · **=** parity · **L** Batcher lose
 | Skew handling | — | — | **L** (AQE splits; Batcher salts opt-in) | — | = | L |
 | AI / GPU pipelines | — | — | — | — | **L** by default | — |
 | Lakehouse formats | — | — | L (all via pyiceberg/delta-rs) | — | = | L |
+
+## AI-preprocessing coverage: the native expression surface (verified in code)
+
+The scorecard row "AI / GPU pipelines" is about *execution* (GPU residency, the disabled
+streaming pipeline) and stays **L by default** — see ceiling #5, unchanged. This section is
+narrower and separate: the **in-engine, no-per-row-Python preprocessing surface** — image,
+audio, vector, and text-mining operators that run in the Rust data plane over Arrow rather
+than in a `map_batches` UDF. On *this* axis Batcher is now unusually broad, and two primitives
+(native mel-spectrogram and MFCC) have no in-engine equivalent in any competitor surveyed.
+
+What runs natively (data plane, parallel, per-row-null-tolerant), with the kernel:
+
+| Capability | Where | Note |
+|---|---|---|
+| Image decode → resized `uint8` tensor | `bc-expr/.../media/image.rs::to_tensor` | DCT-scaled JPEG + SIMD resize |
+| Image decode → **normalized `f32` tensor** (`/255`, per-channel mean/std, HWC/CHW) | `image.rs::to_tensor_f32` | the torchvision `ToTensor`+`Normalize` step, in-engine |
+| Image **center-crop** (torchvision-style zero-pad) | `image.rs::center_crop` | the crop half of resize→crop→tensor |
+| Image **grayscale** (Rec.601 luma → 1 channel) | `image.rs::to_grayscale` | color-convert for 1-channel models |
+| Perceptual hash (dHash) for image dedup | `image.rs::dhash` | Hamming-thresholded near-dup |
+| Audio decode / mono / resample (sinc) | `media/audio.rs` | WAV/FLAC (symphonia) |
+| **Mel power spectrogram** (STFT + HTK filterbank) | `media/mel.rs` | matches `torchaudio.transforms.MelSpectrogram` to 1e-6 |
+| **MFCC** (mel → AmplitudeToDB → DCT-II) | `media/mel.rs::mfcc` | matches `torchaudio.transforms.MFCC` to 1e-6 |
+| Vector distances: cosine, dot, L2, **L1, Hamming** | `eval/list.rs`, `list_ops/coerce.rs` | accept `FixedSizeList` (the tensor type), `f32` fast path |
+| Vector reductions: l2_norm, normalize, mean/max pool, argmin/max | `eval/list.rs` | embedding sanity/pooling |
+| MinHash / SimHash LSH signatures | `eval/str/minhash.rs`, `list_ops/simhash.rs` | fuzzy-dedup / similarity-join blocking |
+| Fuzzy string match: Levenshtein, **Damerau-Levenshtein, Jaro, Jaro-Winkler** | `eval/str/{mod,jaro}.rs` | matches DuckDB; entity resolution |
+| Exact top-k vector retrieval verb | `api/dataset/ml.py::nearest_neighbors` | brute-force, composes the distance kernels |
+| **Vector search in SQL** (`ORDER BY list_cosine_similarity(emb, [...]) LIMIT k`) | `_sql/parser/expressions/functions.py` | the two-arg vector functions run in SQL |
+| RAG document chunking, HTML strip, token estimate | `eval/str/{chunk,html}.rs` | corpus prep |
+
+How the competitors compare **on this native-preprocessing axis** (not on GPU execution or
+training, where Batcher does not compete — see ceilings):
+
+- **Daft** is the closest. It has native URL-download, image decode/resize/crop/`to_mode`,
+  a variable-shape tensor type, and embedding/cosine expressions — a strong multimodal surface.
+  Batcher now matches its **image center-crop** (`.image.center_crop`) and **grayscale
+  color-convert** (`.image.to_grayscale`), and leads on **audio**: Daft has **no native
+  mel-spectrogram / MFCC** (per-row UDFs), which Batcher does in-engine (both torchaudio-matched).
+  Daft still leads on the
+  **variable-shape tensor type** (ceiling below) and richer color-mode conversions (Batcher
+  has grayscale, not the full `to_mode` palette).
+- **Ray Data** has good CPU preprocessors (scalers/encoders/imputers) and a tensor type, but
+  multimodal decode is a torch/PIL **UDF per batch**, not an engine expression; **no native
+  mel-spectrogram**; fuzzy-match/minhash are user code.
+- **BigQuery ML** has the richest *SQL-level* ML (learned `ML.STANDARD_SCALER` etc.,
+  `VECTOR_SEARCH`, `AI.GENERATE`). Batcher now has **vector search in SQL** — the two-arg
+  vector functions (`list_cosine_similarity`/`list_distance`/`list_dot_product`, DuckDB-matched)
+  run in `SELECT … ORDER BY … LIMIT k`, so brute-force retrieval is a plain query. BigQuery
+  still leads on **model inference in SQL** (`ML.PREDICT`/`AI.GENERATE`) and **learned
+  preprocessing state** (`TRANSFORM`), which Batcher does not have — the standing ML-in-SQL
+  gap. And BigQuery decodes **no media in its engine**: image/PDF ops are per-row Cloud Run
+  containers that HTTP-fetch each object, so in-engine preprocessing throughput is not its game.
+- **Spark (MLlib)** has the mature training/feature ecosystem but **no native multimodal
+  expressions** and no mel-spectrogram; **spark-rapids** accelerates SQL, not media decode.
+- **Polars / DuckDB** have no image/audio surface at all; DuckDB has the fuzzy-string and some
+  list/vector functions Batcher is differential-tested against, but no multimodal.
+
+**Honest bottom line for this axis:** among general-purpose engines, Batcher has the broadest
+*native* (non-UDF) AI-preprocessing expression surface, and native mel-spectrogram + MFCC are a genuine
+first. This does **not** change the GPU-execution verdict (ceiling #5) or close the two AI gaps
+called out next: **no ML-in-SQL** (BigQuery leads) and **no variable-shape tensor type** (Daft
+and Ray Data lead). Do not let a preprocessing-coverage win be read as a GPU-pipeline win.
 
 ## The structural ceilings
 
@@ -170,22 +232,43 @@ thread running `while True: pull → execute_plan → write`.
 
 Exactly-once *is* real for Delta (idempotent `txn` actions, genuinely good), but only for Delta.
 
-### 5. The AI moat is implemented and shipped disabled
+### 5. The AI moat was shipped disabled — **fixed (the CPU→GPU overlap is now default)**
 
 `dist/streaming/pipeline.py` is real: separate CPU producer and GPU map actor pools, Flight
-handoff, credit-bounded window, spot recovery. It is gated behind `stream_inference: bool = False`
-(`config/config.py:971`).
+handoff, credit-bounded window, spot recovery. It was gated behind `stream_inference: bool = False`.
 
-**The default path therefore runs the entire CPU→GPU chain inside one actor** — the GPU actor
-holds a whole GPU while it decodes JPEGs. "The GPU stays saturated because CPU decode is a
+**The default path therefore ran the entire CPU→GPU chain inside one actor** — the GPU actor
+held a whole GPU while it decoded JPEGs. "The GPU stays saturated because CPU decode is a
 separate concurrently-executing stage" — the actual Ray Data feature, and the thing every
-GPU-pipeline benchmark and doc leans on — **is not what a user gets**. And even when enabled it
-splits at exactly *one* boundary (2 stages); there is no N-stage topology and no per-stage
-autoscaling.
+GPU-pipeline benchmark and doc leans on — **was not what a user got**. The Ray guides name this
+exact shape as their #1 GPU-utilization bug ("CPU preprocessing starving GPU is #1 cause",
+`workloads/batch-inference/`), and it is the one their whole CPU:GPU-node-ratio tuning chapter
+exists to work around.
 
-Also missing for AI: **no variable-shape tensor type** (Ray Data and Daft both have one), data
-never stays resident on the GPU across operators (host round-trip per op), and video decode is a
-per-row Python loop that decodes *every frame of a clip* to sample 8.
+**`stream_inference` now defaults to True**, so the overlap is what a user gets without
+configuring anything. It is a pure scheduling change — every stage runs the identical sub-plan
+through `core.execute_with_udfs` — and the equivalence is pinned three ways in
+`tests/integration/test_stream_inference.py`: against single-node, against the three-stage
+(CPU→GPU→postprocess) shape, and against the non-overlapped map itself. A chain with no
+resource-class boundary to split at falls back to the embarrassingly-parallel map, so a
+homogeneous pipeline is unaffected. `test_stream_inference_is_on_by_default` pins the default,
+because a silent revert would cost every batch-inference pipeline its GPU utilization with
+nothing turning red.
+
+**Still open on this ceiling:** it splits at exactly *one* boundary (2 stages, the third stage
+riding in the consumer); there is no N-stage topology and no per-stage autoscaling.
+
+Also missing for AI: **no variable-shape tensor type** (Ray Data and Daft both have one) and
+data never stays resident on the GPU across operators (host round-trip per op).
+
+Video decode *was* the third item here — a per-row Python loop that materialized **every frame
+of a clip** to sample 8 of them (a 1-minute 1080p clip is ~1,800 x 6.2 MB ≈ 11 GB resident, for
+8 frames of output). **Fixed:** `ml/decode.py` now learns the frame count first and keeps only
+the frames it was going to keep, so peak memory is the output plus one frame — measured
+**275 MB → 15 MB (18x)** on a 10-second clip, and *flat* in clip length rather than linear. The
+output is byte-identical to the retaining implementation, which is pinned by a test that keeps
+the old version as its oracle. Still a Python loop, and still per row; what changed is that it
+is no longer unbounded.
 
 ### 6. Task granularity ≈ node, not partition
 
@@ -290,8 +373,10 @@ In dependency order. (1) and (2) are the ones that change what Batcher *is*.
 3. **Wire the shuffle replication that already exists** (four call sites) and call `clear_plan` on
    the batch path. Converts spot preemption from recompute to re-fetch, and stops long-lived
    fleets leaking every bucket.
-4. **Default `stream_inference=True`, generalize to N stages with per-stage autoscaling.** Turns
-   the AI moat on. Add a variable-shape tensor type and keep data resident on-device across ops.
+4. **~~Default `stream_inference=True`~~ (done), generalize to N stages with per-stage
+   autoscaling.** The AI moat is now on out of the box. Remaining: the N-stage topology,
+   per-stage autoscaling, a variable-shape tensor type, and keeping data resident on-device
+   across ops.
 5. **Per-partition watermarks + a real state backend** (spillable, incremental, object-store
    checkpoints). Until then, do not claim Flink parity — and refuse, loudly, the shapes that
    cannot be honoured (the distributed watermark gate now does).

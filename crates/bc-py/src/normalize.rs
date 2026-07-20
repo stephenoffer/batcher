@@ -99,9 +99,77 @@ fn normalize_to(dt: &DataType) -> Option<DataType> {
     }
 }
 
+/// Whether `dt` is a type whose normalization is a *pure numeric widening* — either a
+/// narrow numeric itself, or a container whose element type is one — and so can be
+/// losslessly restored on the way out.
+///
+/// This deliberately mirrors [`normalize_to`]'s container recursion but stops short of
+/// its `Dictionary` and `LargeUtf8` cases: those are normalized for operator
+/// compatibility, not width, and re-encoding a dictionary on output is explicitly not
+/// safe yet (see the NOTE on [`normalize_to`]).
+///
+/// The container arms are the point. [`normalize_to`] widens a `FixedSizeList<Float32>`
+/// tensor column's *child* to `Float64`, but the restore side used to ask the flat
+/// [`widen_to`], which answers `None` for any container — so an embedding or image
+/// tensor column was widened on the way in and never narrowed back. That doubled the
+/// bytes of every tensor result and, because `pa.fixed_shape_tensor` encodes its value
+/// type, silently dropped the canonical extension type on the round trip: a column
+/// written as `fixed_shape_tensor<float>` came back as a bare
+/// `fixed_size_list<double>`.
+fn restorable_narrow(dt: &DataType) -> bool {
+    use DataType::*;
+    match dt {
+        Struct(fields) => fields.iter().any(|f| restorable_narrow(f.data_type())),
+        List(field) | LargeList(field) | FixedSizeList(field, _) | Map(field, _) => {
+            restorable_narrow(field.data_type())
+        }
+        other => widen_to(other).is_some(),
+    }
+}
+
+/// Total nulls in `arr` *including* one level of children.
+///
+/// The restore cast runs in `safe` mode, where an unrepresentable value becomes a null
+/// rather than an error. For a top-level primitive that shows up in the array's own
+/// `null_count`, but for a container the loss lands in the **child**, leaving the
+/// top-level count untouched — so a lossy `FixedSizeList<Float64> -> FixedSizeList<Float32>`
+/// narrowing would otherwise pass the "introduced no new nulls" guard unnoticed.
+fn nulls_including_children(arr: &dyn Array) -> usize {
+    let own = arr.null_count();
+    let data = arr.to_data();
+    own + data
+        .child_data()
+        .iter()
+        .map(|c| c.null_count())
+        .sum::<usize>()
+}
+
+/// Whether `field` carries an Arrow extension type (`ARROW:extension:name`).
+///
+/// An extension column is opaque at the boundary: its storage type and element widths
+/// are part of the type's contract, not incidental. The canonical
+/// `arrow.fixed_shape_tensor` (an embedding / decoded-image column) encodes its
+/// `value_type` — so widening its `f32` child to `f64` does not merely double the bytes
+/// of the AI hot path, it *changes the extension type* from `tensor<float>` to
+/// `tensor<double>`. Carry-through operators treat a tensor as an opaque unit (no
+/// element-wise arithmetic), so there is nothing for the widening to make compatible.
+/// Leaving it untouched also keeps the column genuinely zero-copy across the FFI.
+pub(crate) fn is_extension_field(field: &Field) -> bool {
+    field.metadata().contains_key("ARROW:extension:name")
+}
+
 /// The normalized form of `field` (recursing its data type), or `None` if unchanged.
+///
+/// Field metadata is carried across any width change so a nested tensor keeps its
+/// extension type. Extension columns themselves are left entirely alone (see
+/// [`is_extension_field`]).
 fn normalize_field(field: &Field) -> Option<Field> {
-    normalize_to(field.data_type()).map(|t| Field::new(field.name(), t, field.is_nullable()))
+    if is_extension_field(field) {
+        return None;
+    }
+    normalize_to(field.data_type()).map(|t| {
+        Field::new(field.name(), t, field.is_nullable()).with_metadata(field.metadata().clone())
+    })
 }
 
 /// Recurse [`normalize_to`] over a struct's fields, returning the rebuilt `Fields` only if at
@@ -164,7 +232,14 @@ pub(crate) fn normalize_batch(batch: &RecordBatch) -> PyResult<RecordBatch> {
     let mut columns = Vec::with_capacity(batch.num_columns());
     for (i, field) in schema.fields().iter().enumerate() {
         let col = batch.column(i);
-        match normalize_to(col.data_type()) {
+        // An extension column (e.g. a fixed-shape-tensor embedding) is opaque at the
+        // boundary — never rewrite its storage type. See `is_extension_field`.
+        let normalized = if is_extension_field(field) {
+            None
+        } else {
+            normalize_to(col.data_type())
+        };
+        match normalized {
             Some(target) => match cast(col, &target) {
                 Ok(arr) => {
                     // A lossless widening never introduces a null. The one cast that can
@@ -181,7 +256,12 @@ pub(crate) fn normalize_batch(batch: &RecordBatch) -> PyResult<RecordBatch> {
                         )));
                     }
                     changed = true;
-                    fields.push(Field::new(field.name(), target, field.is_nullable()));
+                    // Preserve field metadata (the tensor extension type) across the
+                    // input-side widening, same as the output-side restore.
+                    fields.push(
+                        Field::new(field.name(), target, field.is_nullable())
+                            .with_metadata(field.metadata().clone()),
+                    );
                     columns.push(arr);
                 }
                 Err(_) => {
@@ -222,7 +302,7 @@ pub(crate) fn original_narrow_types(
     for relation in sources {
         if let Some(batch) = relation.first() {
             for field in batch.schema().fields() {
-                if widen_to(field.data_type()).is_none() {
+                if !restorable_narrow(field.data_type()) {
                     continue; // not a widened narrow numeric — nothing to restore
                 }
                 match seen.get(field.name()) {
@@ -271,14 +351,25 @@ pub(crate) fn narrow_output(
             for (i, field) in batch.schema().fields().iter().enumerate() {
                 let col = batch.column(i);
                 let target = targets.get(field.name());
+                // `normalize_to`, not `widen_to`: the recorded target may be a container
+                // (a tensor column) whose *child* was the thing widened.
                 let widened_match = target
-                    .map(|t| widen_to(t).as_ref() == Some(col.data_type()))
+                    .map(|t| normalize_to(t).as_ref() == Some(col.data_type()))
                     .unwrap_or(false);
                 if let (Some(t), true) = (target, widened_match) {
                     match cast_with_options(col, t, &opts) {
-                        Ok(arr) if arr.null_count() == col.null_count() => {
+                        Ok(arr)
+                            if nulls_including_children(&arr)
+                                == nulls_including_children(col.as_ref()) =>
+                        {
                             changed = true;
-                            fields.push(Field::new(field.name(), t.clone(), field.is_nullable()));
+                            // Carry the field metadata so a restored tensor column keeps
+                            // its `arrow.fixed_shape_tensor` extension type (mirrors
+                            // `normalize_field`).
+                            fields.push(
+                                Field::new(field.name(), t.clone(), field.is_nullable())
+                                    .with_metadata(field.metadata().clone()),
+                            );
                             columns.push(arr);
                             continue;
                         }

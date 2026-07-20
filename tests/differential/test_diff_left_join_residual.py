@@ -13,6 +13,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -32,8 +33,6 @@ def cust_orders(duck):
 
 def test_left_join_residual_on_right_side(duck, cust_orders):
     """Q13 shape: customers with no eligible (non-special) order keep a 0 count."""
-    from conftest import assert_same
-
     customer, orders = cust_orders
     query = (
         "SELECT c_custkey, count(o_orderkey) AS cnt "
@@ -47,8 +46,6 @@ def test_left_join_residual_on_right_side(duck, cust_orders):
 
 def test_left_join_residual_keeps_unmatched_rows(duck, cust_orders):
     """The null-extended left rows survive the residual (not silently filtered out)."""
-    from conftest import assert_same
-
     customer, orders = cust_orders
     query = (
         "SELECT c_custkey, o_orderkey "
@@ -61,8 +58,6 @@ def test_left_join_residual_keeps_unmatched_rows(duck, cust_orders):
 
 def test_right_join_residual_on_left_side(duck):
     """RIGHT JOIN residual on the (nullable) left side pre-filters the left input."""
-    from conftest import assert_same
-
     a = pa.table({"k": [1, 2, 3], "tag": ["keep", "drop", "keep"]})
     b = pa.table({"k": [1, 2, 4], "bv": [10, 20, 40]})
     duck.register("a", a)
@@ -74,8 +69,6 @@ def test_right_join_residual_on_left_side(duck):
 
 def test_inner_join_residual_unchanged(duck, cust_orders):
     """Inner-join residuals are unaffected (still a correct post-join filter)."""
-    from conftest import assert_same
-
     customer, orders = cust_orders
     query = (
         "SELECT c_custkey, o_orderkey "
@@ -120,8 +113,6 @@ def both_sides_v(duck):
 @pytest.mark.parametrize("op", ["<", "<=", ">", ">=", "=", "<>"])
 def test_inner_join_residual_on_column_present_on_both_sides(duck, both_sides_v, op):
     """Every comparison must discriminate the two sides, not fold to a self-comparison."""
-    from conftest import assert_same
-
     a, b = both_sides_v
     query = f"SELECT a.k AS k, a.v AS av, b.v AS bv FROM a JOIN b ON a.k = b.k AND a.v {op} b.v"
     out = bt.sql(query, a=a, b=b).collect()
@@ -130,8 +121,6 @@ def test_inner_join_residual_on_column_present_on_both_sides(duck, both_sides_v,
 
 def test_inner_join_residual_both_sides_null_row_is_dropped(duck, both_sides_v):
     """The `k=5` row has a NULL `a.v`: `NULL < 50` is NULL, so the join must drop it."""
-    from conftest import assert_same
-
     a, b = both_sides_v
     query = "SELECT a.k AS k FROM a JOIN b ON a.k = b.k AND a.v < b.v"
     out = bt.sql(query, a=a, b=b).collect()

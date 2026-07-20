@@ -75,9 +75,11 @@ class PointCloudSource(FileSource):
         columns: tuple[str, ...] | list[str] = ("x", "y", "z", "intensity"),
         dtype: str = "float32",
         frame_column: str | None = _FRAME,
-        schema_mode: str = "strict",
+        **kwargs: Any,
     ) -> None:
-        super().__init__(path, schema_mode=schema_mode)
+        # Forward the base options. `schema_mode` was forwarded but `on_error` was not,
+        # so a corrupt sweep in a directory of thousands still failed the whole read.
+        super().__init__(path, **kwargs)
         self._bin_cols = tuple(columns)
         self._bin_dtype = dtype
         self._frame_col = frame_column
@@ -87,6 +89,7 @@ class PointCloudSource(FileSource):
         # reader with the default `columns`/`dtype`/`frame_column` re-strides the bytes wrong and
         # silently returns different data than single-node. Carry the layout to the worker.
         return {
+            **super()._reader_kwargs(),
             "columns": self._bin_cols,
             "dtype": self._bin_dtype,
             "frame_column": self._frame_col,

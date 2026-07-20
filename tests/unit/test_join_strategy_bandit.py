@@ -138,16 +138,18 @@ def test_the_scaled_radius_does_not_resurrect_a_genuinely_worse_arm():
 
 
 def test_record_join_strategy_normalizes_by_input_rows():
-    from batcher.kyber import learned_tuning
+    # Patched on the defining module (`learned_tuning.bandit`), which is where
+    # `record_join_strategy` resolves `record_arm` from.
+    from batcher.kyber.learned_tuning import bandit
 
     recorded: list[tuple[str, float]] = []
-    original = learned_tuning.record_arm
+    original = bandit.record_arm
     try:
-        learned_tuning.record_arm = lambda hub, ns, key, arm, reward: recorded.append((arm, reward))
+        bandit.record_arm = lambda hub, ns, key, arm, reward: recorded.append((arm, reward))
         # 40 ms over 2M input rows => 20 ms per million rows.
-        learned_tuning.record_join_strategy(object(), "sig", "hash", 40.0, 2_000_000.0)
+        bandit.record_join_strategy(object(), "sig", "hash", 40.0, 2_000_000.0)
         # An unknown input size must fall back to the raw wall time, not divide by zero.
-        learned_tuning.record_join_strategy(object(), "sig", "hash", 40.0, 0.0)
+        bandit.record_join_strategy(object(), "sig", "hash", 40.0, 0.0)
     finally:
-        learned_tuning.record_arm = original
+        bandit.record_arm = original
     assert recorded == [("hash", 20.0), ("hash", 40.0)]

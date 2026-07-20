@@ -4,6 +4,7 @@ One module per metadata family, each a pure extraction function a connector's
 `statistics()` calls:
 
   - `columnar_footer`   : Parquet column min/max/null/count + ORC row counts
+  - `parquet_manifest`  : per-FILE Parquet bounds, for skipping whole files
   - `pruning`           : per-row-group zone-map bounds for file/row-group pruning
   - `lakehouse_manifest`: Delta/Iceberg manifest record counts + column bounds
   - `free_counts`       : NumPy ``.npy`` header row counts
@@ -19,6 +20,7 @@ from __future__ import annotations
 from batcher.io.stats.columnar_footer import orc_statistics, parquet_statistics
 from batcher.io.stats.free_counts import numpy_statistics
 from batcher.io.stats.lakehouse_manifest import manifest_statistics
+from batcher.io.stats.parquet_manifest import parquet_file_manifest
 from batcher.io.stats.pruning import (
     RowGroupBounds,
     parquet_row_group_bounds,
@@ -32,6 +34,7 @@ __all__ = [
     "manifest_statistics",
     "numpy_statistics",
     "orc_statistics",
+    "parquet_file_manifest",
     "parquet_row_group_bounds",
     "parquet_statistics",
     "surviving_rows_for_range",

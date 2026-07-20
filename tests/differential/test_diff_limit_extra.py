@@ -22,6 +22,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same_ordered, assert_tables_equal
 from batcher import col
 from batcher.kyber.rules.extra import limit_extra as _limit_extra  # noqa: F401  (registers)
 
@@ -70,8 +71,6 @@ def empty(duck):
 
 
 def test_topn_through_project(duck, t):
-    from conftest import assert_same_ordered
-
     out = (
         bt.from_arrow(t)
         .select(col("id").alias("k"), (col("x") * 2).alias("w"))
@@ -83,8 +82,6 @@ def test_topn_through_project(duck, t):
 
 
 def test_topn_through_project_with_offset_and_descending(duck, t):
-    from conftest import assert_same_ordered
-
     out = (
         bt.from_arrow(t)
         .select(col("id").alias("k"), col("x"))
@@ -96,8 +93,6 @@ def test_topn_through_project_with_offset_and_descending(duck, t):
 
 
 def test_topn_through_project_with_null_keys(duck, t):
-    from conftest import assert_same_ordered
-
     # NULLs sort last (both engines' default for ASC) and the limit must cut the same rows.
     out = bt.from_arrow(t).select(col("n"), col("id")).sort("n", "id").limit(5).collect()
     assert_same_ordered(out, duck.sql("SELECT n, id FROM t ORDER BY n, id LIMIT 5"))
@@ -107,8 +102,6 @@ def test_topn_through_project_with_null_keys(duck, t):
 
 
 def test_topn_over_union_all(duck, t, u):
-    from conftest import assert_same_ordered
-
     out = (
         bt.from_arrow(t)
         .select("id", "x")
@@ -127,8 +120,6 @@ def test_topn_over_union_all(duck, t, u):
 
 
 def test_topn_over_union_all_with_ties(duck, t, u):
-    from conftest import assert_same_ordered
-
     # A tie-heavy key, projected alone: every valid top-N is the same table.
     out = (
         bt.from_arrow(t)
@@ -145,8 +136,6 @@ def test_topn_over_union_all_with_ties(duck, t, u):
 
 
 def test_topn_over_union_beyond_total_rows(duck, t, u):
-    from conftest import assert_same_ordered
-
     out = (
         bt.from_arrow(t)
         .select("id")
@@ -164,8 +153,6 @@ def test_topn_over_union_beyond_total_rows(duck, t, u):
 
 
 def test_topn_over_distinct_union(duck, t, u):
-    from conftest import assert_same_ordered
-
     # Not rewritten (the dedup crosses branches) — but it must still be right.
     out = (
         bt.from_arrow(t)
@@ -184,8 +171,6 @@ def test_topn_over_distinct_union(duck, t, u):
 
 
 def test_topn_of_topn_same_keys(duck, t):
-    from conftest import assert_same_ordered
-
     out = (
         bt.from_arrow(t)
         .select("id", "x")
@@ -204,8 +189,6 @@ def test_topn_of_topn_same_keys(duck, t):
 
 
 def test_topn_of_topn_different_keys(duck, t):
-    from conftest import assert_same_ordered
-
     # Different orderings do not collapse — the inner one is a real row filter.
     out = bt.from_arrow(t).select("id", "x").sort("x", "id").limit(5).sort("id").limit(3).collect()
     assert_same_ordered(
@@ -220,15 +203,11 @@ def test_topn_of_topn_different_keys(duck, t):
 
 
 def test_topn_limit_zero(duck, t):
-    from conftest import assert_same_ordered
-
     out = bt.from_arrow(t).select("id").sort("id").limit(0).collect()
     assert_same_ordered(out, duck.sql("SELECT id FROM t ORDER BY id LIMIT 0"))
 
 
 def test_empty_limit_prunes_a_filter_sort_distinct_chain(duck, t):
-    from conftest import assert_same_ordered
-
     out = bt.from_arrow(t).select("g").filter(col("g") > 1).distinct().sort("g").limit(0).collect()
     assert_same_ordered(
         out, duck.sql("SELECT g FROM (SELECT DISTINCT g FROM t WHERE g > 1) ORDER BY g LIMIT 0")
@@ -236,8 +215,6 @@ def test_empty_limit_prunes_a_filter_sort_distinct_chain(duck, t):
 
 
 def test_topn_over_empty_relation(duck, empty):
-    from conftest import assert_same_ordered
-
     out = bt.from_arrow(empty).select("id").sort("id").limit(3).collect()
     assert_same_ordered(out, duck.sql("SELECT id FROM e ORDER BY id LIMIT 3"))
 
@@ -246,8 +223,6 @@ def test_topn_over_empty_relation(duck, empty):
 
 
 def test_sort_by_unique_key_then_more(duck, t):
-    from conftest import assert_same_ordered
-
     # `id` is unique, so `x` never breaks a tie — with or without the pruning, the order
     # is the same one DuckDB produces.
     out = bt.from_arrow(t).select("id", "x").sort("id", "x").limit(4).collect()
@@ -255,8 +230,6 @@ def test_sort_by_unique_key_then_more(duck, t):
 
 
 def test_sort_by_tied_key_then_unique_key(duck, t):
-    from conftest import assert_same_ordered
-
     # `g` ties heavily; `id` is the real tiebreak and must survive.
     out = bt.from_arrow(t).select("g", "id").sort("g", "id").limit(6).collect()
     assert_same_ordered(out, duck.sql("SELECT g, id FROM t ORDER BY g, id LIMIT 6"))
@@ -266,16 +239,12 @@ def test_sort_by_tied_key_then_unique_key(duck, t):
 
 
 def test_limit_over_bounded_sample_is_the_identity(t):
-    from conftest import assert_tables_equal
-
     sampled = bt.from_arrow(t).sample(n=3, seed=11)
     assert_tables_equal(sampled.limit(5).collect(), sampled.collect(), ordered=True)
     assert_tables_equal(sampled.limit(3).collect(), sampled.collect(), ordered=True)
 
 
 def test_limit_inside_the_sample_bound_still_cuts(t):
-    from conftest import assert_tables_equal
-
     sampled = bt.from_arrow(t).sample(n=3, seed=11)
     capped = sampled.limit(2).collect()
     assert capped.num_rows == 2
@@ -283,8 +252,6 @@ def test_limit_inside_the_sample_bound_still_cuts(t):
 
 
 def test_offset_past_the_sample_bound_is_empty(t):
-    from conftest import assert_tables_equal
-
     sampled = bt.from_arrow(t).sample(n=3, seed=11)
     out = sampled.limit(5, offset=3).collect()
     assert out.num_rows == 0

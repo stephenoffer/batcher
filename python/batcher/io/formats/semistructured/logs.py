@@ -46,8 +46,9 @@ class LogSource(FileSource):
 
     __slots__ = ("pattern",)
 
-    def __init__(self, path: str, *, pattern: str | None = None) -> None:
-        super().__init__(path)
+    def __init__(self, path: str, *, pattern: str | None = None, **kwargs: Any) -> None:
+        # Forward the base options; dropping them made `on_error="skip"` a silent no-op.
+        super().__init__(path, **kwargs)
         self.pattern = pattern
 
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:  # noqa: ARG002 (fixed schema)

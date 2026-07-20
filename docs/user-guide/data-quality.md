@@ -1,7 +1,7 @@
 # Data quality
 
 Data-quality checks live on the `ds.dq` accessor: a chain of expectations over a
-dataset, then a terminal action. A constraint is just a boolean expression that is
+dataset, then a terminal action. A constraint is a boolean expression that is
 TRUE for a valid row. Checks therefore compose like any other operation and lower to
 the same relational operators. There is no separate validation engine.
 
@@ -66,7 +66,7 @@ print(report.ok, report.total_violations)
 ## Drop invalid rows
 
 `drop` returns only the rows that satisfy every constraint. It is the cleansing
-path, for when bad rows should simply go away.
+path, for when bad rows should go away.
 
 ```python
 clean = people.dq.in_range("age", 0, 120).not_null("email").drop()
@@ -181,3 +181,5 @@ print(evolved.to_pydict())
 - [Transformations](transformations.md): cleanse and reshape what survived the checks.
 - [Aggregations](aggregations.md): summarize it.
 - [Dataset API](../api/dataset.md): the full reference for `ds.dq` and `distinct`.
+- [Agent skills](../agents/index.md): `validate-data-quality`, on choosing between
+  fail, drop, and quarantine, and profiling before you write the checks.

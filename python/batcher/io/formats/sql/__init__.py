@@ -4,7 +4,7 @@ Each module here registers an Arrow-native relational source (and, where it
 makes sense, a sink) into the `SOURCES` / `SINKS` registries as an import side
 effect, exactly like the file-format modules. Importing this package imports them
 all, so the registry names (``adbc``, ``connectorx``, ``snowflake``,
-``databricks``, ``bigquery``, ``clickhouse``, ``odbc``) become available.
+``databricks``, ``bigquery``, ``clickhouse``, ``odbc``, ``dbapi``) become available.
 
 Every connector honors the same contract: one query submission, distributed
 reads via the backend's *native* result partitioning (no schema or bound
@@ -20,6 +20,7 @@ from batcher.io.formats.sql.bigquery import BigQuerySource
 from batcher.io.formats.sql.clickhouse import ClickHouseSource
 from batcher.io.formats.sql.connectorx import ConnectorXSource
 from batcher.io.formats.sql.databricks import DatabricksSource
+from batcher.io.formats.sql.dbapi import DBAPISource
 from batcher.io.formats.sql.odbc import ODBCSource
 from batcher.io.formats.sql.snowflake import SnowflakeSink, SnowflakeSource
 
@@ -29,6 +30,7 @@ __all__ = [
     "BigQuerySource",
     "ClickHouseSource",
     "ConnectorXSource",
+    "DBAPISource",
     "DatabricksSource",
     "ODBCSource",
     "SnowflakeSink",

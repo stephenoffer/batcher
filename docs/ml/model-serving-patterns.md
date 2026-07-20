@@ -1,11 +1,11 @@
 # Model serving patterns
 
-There are two ways to get a model's predictions into a pipeline: load the weights into
-the worker, or call a service that already has them loaded. The first is faster (no
-network, no serialization, no shared queue) and it is what a batch job should do. The
-second is what you do when the model does not belong to you: another team owns it, it
-runs on hardware you cannot schedule, or the same endpoint has to serve an online path
-that must not be starved by your backfill.
+There are two ways to get a model's predictions into a pipeline. You either load the
+weights into the worker, or call a service that already has them loaded. The first is
+faster, with no network, no serialization, and no shared queue, and it is what a batch job
+should do. The second is what you do when the model does not belong to you. Another team
+owns it, it runs on hardware you cannot schedule, or the same endpoint has to serve an
+online path that must not be starved by your backfill.
 
 :::{warning}
 The mistake is picking the second because it is architecturally tidier. A 10-million-row
@@ -33,7 +33,7 @@ can schedule yourself.
 
 :::{tab-item} A served model
 
-An adapter turns the endpoint into a UDF: a class you drop into `map_batches`, which
+An adapter turns the endpoint into a UDF, a class you drop into `map_batches`, which
 connects once per worker rather than once per row.
 
 ```python
@@ -68,12 +68,12 @@ When the model lives elsewhere, pick the adapter for the backend that holds it.
 | `serving_udf(connect, ...)` | Your own `ServingClient` |
 
 The adapter sends a **batch** per request, not a row. That is the whole reason the
-pattern is viable: 10 million rows at `batch_size=64` is 156,000 requests instead of 10
+pattern is viable. Ten million rows at `batch_size=64` is 156,000 requests instead of ten
 million.
 
 :::{important}
 Tune `batch_size` against what the endpoint will accept. Most serving stacks have a max
-payload, and a batch that exceeds it does not degrade — it fails every request.
+payload, and a batch that exceeds it does not degrade. It fails every request.
 :::
 
 `retries` handles the transient failure, and a request that keeps failing raises. If the
@@ -83,10 +83,10 @@ endpoint is flaky enough that you would rather lose rows than the job, pair it w
 Writing your own adapter means implementing `ServingClient` and handing `serving_udf` a
 `connect` callable. Same shape, so the connection is made once per worker.
 
-## Overlapping stages: run_pipeline
+## Overlapping stages with run_pipeline
 
 The problem with a single map stage doing decode-then-forward is that both wait on each
-other: the CPU decodes batch *n+1* only after the GPU finishes batch *n*.
+other. The CPU decodes batch *n+1* only after the GPU finishes batch *n*.
 `run_pipeline` chains `Stage`s with credit-based backpressure, so each stage runs while
 the next one is still working. No stage can run ahead far enough to blow up memory,
 because credits bound the queue between them.
@@ -122,17 +122,17 @@ print(out[0].to_pydict())
 # {'x': [2.0, 4.0, 6.0, 8.0], 'label': [False, False, True, True]}
 ```
 
-`credits` is how many batches may sit queued ahead of a stage: one credit is one batch
+`credits` is how many batches may sit queued ahead of a stage. One credit is one batch
 slot, and the producer blocks at zero. Two is a sane default, enough to overlap without
 buffering a pipeline's worth of decoded images in RAM. This is the same credit-based flow
 control the engine's shuffle uses.
 
-## InferencePool: adaptive batching
+## Adaptive batching with InferencePool
 
 `InferencePool` sits underneath the `infer` path and is worth reaching for directly when
 you are driving the stream yourself, in a serving process or a custom loop. It keeps
-workers alive (the factory runs once per worker, so the model loads once), and it
-*rebatches* the incoming stream to a target size, which is the difference between feeding
+workers alive, so the factory runs once per worker and the model loads once, and it
+*rebatches* the incoming stream to a target size. That is the difference between feeding
 a GPU 64-row batches and feeding it whatever size the reader happened to produce.
 
 ```python
@@ -156,14 +156,14 @@ print([b.to_pydict() for b in pool.run(ds.iter_batches())])
 Results come back **in input order**, whichever worker produced them, so a downstream
 join on row position stays valid. `target_latency_ms` with `objective="latency"` shrinks
 the batch to hold a latency target instead of maximizing throughput, which is the
-online-serving trade. `min_batch_rows` / `max_batch_rows` bound the adaptation.
+online-serving trade. `min_batch_rows` and `max_batch_rows` bound the adaptation.
 
 ## Batch and online, one model
 
 :::{tip}
-The pattern that keeps a team honest: the same worker class runs in the offline pipeline
-and inside the serving process. Offline it is handed to `map_batches`; online it is handed
-to `InferencePool` and fed by request handlers. One implementation, so a preprocessing
+The pattern that keeps a team honest is to run the same worker class in the offline
+pipeline and inside the serving process. Offline it is handed to `map_batches`. Online it
+is handed to `InferencePool` and fed by request handlers. One implementation, so a preprocessing
 step cannot drift between training-time scoring and serving-time scoring. That drift is
 the most common source of training/serving skew and the hardest to find, because both
 halves look correct in isolation.
@@ -185,10 +185,10 @@ for result in pool.run(request_batches()):
 | Situation | Reach for |
 | --- | --- |
 | A batch job, model you can schedule | `ds.ml.infer(ModelClass, num_gpus=…)` |
-| Model owned by another team / another cluster | `http_client` / `triton_client` / `serve_deployment` |
+| Model owned by another team or another cluster | `http_client`, `triton_client`, or `serve_deployment` |
 | CPU preprocessing starving a GPU stage | `run_pipeline` with `Stage` credits |
 | You are driving the stream, and want adaptive batching | `InferencePool` |
-| An LLM behind an OpenAI-compatible endpoint | `http_engine` (see [LLM inference](llm.md)) |
+| An LLM behind an OpenAI-compatible endpoint | `http_engine`, covered in [LLM inference](llm.md) |
 
 ## See also
 

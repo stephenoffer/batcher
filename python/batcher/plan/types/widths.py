@@ -31,6 +31,16 @@ DEFAULT_VARLEN_BYTES = 32.0
 # Arrow's offset buffers cost 4 or 8 bytes per row on top of the value bytes.
 _OFFSET_BYTES = 4.0
 
+# Elements assumed in a variable-length `list`/`large_list` with no measured width.
+# A list column's width is `len × element_width`, so charging it a flat scalar prior —
+# as this module did before, ignoring the value type entirely — under-predicts by the
+# element size times the length. That is not a rounding error on the columns that
+# matter: a `list<float64>` embedding is ~8 B per element, so the old flat 36 B/row
+# stood in for kilobytes. `fixed_size_list` (the usual embedding type) needs no prior
+# at all — its length is in the type — so this only covers the genuinely unknown case,
+# and a learned `avg_byte_width` replaces it the moment the column is measured.
+_DEFAULT_LIST_LEN = 8.0
+
 
 def column_bytes(dtype: pa.DataType, default_varlen: float = DEFAULT_VARLEN_BYTES) -> float:
     """Estimated bytes per row for a column of `dtype`.
@@ -55,8 +65,14 @@ def column_bytes(dtype: pa.DataType, default_varlen: float = DEFAULT_VARLEN_BYTE
         return default_varlen + _OFFSET_BYTES
     if pa.types.is_large_string(dtype) or pa.types.is_large_binary(dtype):
         return default_varlen + 2 * _OFFSET_BYTES
+    if pa.types.is_fixed_size_list(dtype):
+        # Exact: the length is in the type, so no measurement is needed and no offset
+        # buffer exists. This is the embedding/vector column, and it is the one nested
+        # case whose width is fully known statically.
+        return dtype.list_size * column_bytes(dtype.value_type, default_varlen)
     if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
-        return default_varlen + _OFFSET_BYTES
+        offsets = _OFFSET_BYTES if pa.types.is_list(dtype) else 2 * _OFFSET_BYTES
+        return _DEFAULT_LIST_LEN * column_bytes(dtype.value_type, default_varlen) + offsets
     if pa.types.is_struct(dtype):
         return sum(column_bytes(f.type, default_varlen) for f in dtype)
     try:

@@ -12,6 +12,7 @@ import datetime as dt
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 
 
 def _session_and_duck(duck, table: pa.Table) -> bt.Session:
@@ -22,8 +23,6 @@ def _session_and_duck(duck, table: pa.Table) -> bt.Session:
 
 
 def test_int_in_list_large_with_nulls(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [1, 2, 3, 5, 8, 13, 21, None, 5, 1], "g": list(range(10))})
     s = _session_and_duck(duck, t)
     q = "SELECT x, g FROM t WHERE x IN (1, 5, 8, 13, 21, 99)"  # 6 values → folds
@@ -31,8 +30,6 @@ def test_int_in_list_large_with_nulls(duck):
 
 
 def test_string_in_list(duck):
-    from conftest import assert_same
-
     codes = ["13", "31", "23", "29", "30", "18", "17"]
     t = pa.table({"c": ["13", "31", "00", "17", None, "29", "99", "30", "23", "18"]})
     s = _session_and_duck(duck, t)
@@ -42,8 +39,6 @@ def test_string_in_list(duck):
 
 
 def test_date_in_list(duck):
-    from conftest import assert_same
-
     days = [dt.date(1995, 1, d) for d in range(1, 11)]
     t = pa.table({"d": pa.array(days, pa.date32())})
     s = _session_and_duck(duck, t)
@@ -53,8 +48,6 @@ def test_date_in_list(duck):
 
 
 def test_small_in_list_unfolded(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [1, 2, 3, 4, 5, None]})
     s = _session_and_duck(duck, t)
     q = "SELECT x FROM t WHERE x IN (2, 4)"  # 2 values → stays a comparison chain
@@ -62,8 +55,6 @@ def test_small_in_list_unfolded(duck):
 
 
 def test_in_list_combined_with_other_predicate(duck):
-    from conftest import assert_same
-
     t = pa.table({"x": [1, 5, 8, 13, 21, 2, 7], "y": [10, 20, 30, 40, 50, 60, 70]})
     s = _session_and_duck(duck, t)
     q = "SELECT x, y FROM t WHERE x IN (1, 5, 8, 13, 21, 99) AND y < 45"

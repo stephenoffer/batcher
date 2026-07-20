@@ -14,13 +14,12 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 pytestmark = pytest.mark.differential
 
 
 def test_asof_null_by_key_matches_nothing(duck):
-    from conftest import assert_same
-
     trades = pa.table(
         {
             "sym": pa.array(["A", None, None, "B"]),
@@ -48,8 +47,6 @@ def test_asof_null_by_key_matches_nothing(duck):
 
 
 def test_asof_multi_col_by_partial_null_matches_nothing(duck):
-    from conftest import assert_same
-
     trades = pa.table(
         {
             "sym": pa.array(["A", "A", "A"]),
@@ -69,9 +66,7 @@ def test_asof_multi_col_by_partial_null_matches_nothing(duck):
     duck.register("t2", trades)
     duck.register("q2", quotes)
     out = (
-        bt.from_arrow(trades)
-        .join_asof(bt.from_arrow(quotes), on="ts", by=["sym", "grp"])
-        .collect()
+        bt.from_arrow(trades).join_asof(bt.from_arrow(quotes), on="ts", by=["sym", "grp"]).collect()
     )
     assert_same(
         out,

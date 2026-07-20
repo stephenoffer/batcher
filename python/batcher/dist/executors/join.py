@@ -14,6 +14,7 @@ import os
 
 import pyarrow as pa
 
+from batcher._internal.hardware import l3_cache_bytes
 from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     _apply_above,
@@ -90,6 +91,42 @@ def _bloom_beneficial(join: Join, sources: list[Source]) -> bool:
         build > 0
         and probe >= build * _BLOOM_AUTO_PROBE_RATIO
         and probe >= _BLOOM_AUTO_MIN_PROBE_ROWS
+    )
+
+
+def salting_is_safe(join: Join, reducer_ir: str | None) -> bool:
+    """Whether skew salting may engage for this shuffle join without changing the answer.
+
+    Salting spreads a hot key's probe rows across several reducers (replicating its build
+    rows to each), so the key's work fans across the cluster instead of overloading one
+    node. That is result-preserving **only when each reducer's output is concatenated**.
+
+    It is *not* safe when the reducer FINALIZES — a fused join+aggregate
+    (`_distributed_join_aggregate`, which passes `reducer_ir`). That fusion is correct
+    precisely because co-partitioning by the join key puts every group in exactly one
+    bucket, letting a reducer finalize its bucket locally. Salting deliberately breaks
+    that precondition: each of the salted reducers would finalize a *partial* group, and
+    the union would carry several half-summed rows for the hot key instead of one correct
+    row. No error is raised — the query simply returns a wrong answer.
+
+    This guard is load-bearing rather than defensive, because salting engages on the
+    **default** path: a measured hot key turns it on even when `skew_join_salt` is 0
+    (see the `salt = DEFAULT_LEARNED_SALT` fallback in `_shuffle_join`).
+
+    Args:
+        join: The join being scheduled; salting needs a single equi-key and a left-driven
+            join type, since it replicates build rows and must not duplicate output rows.
+        reducer_ir: The per-bucket reducer override. `None` means the reducer is the plain
+            join, whose buckets are concatenated — the only shape salting is safe for.
+
+    Returns:
+        True when salting may engage.
+    """
+    return (
+        reducer_ir is None
+        and len(join.left_keys) == 1
+        and len(join.right_keys) == 1
+        and join.join_type in _BROADCAST_SAFE
     )
 
 
@@ -202,11 +239,7 @@ def _shuffle_join(
         # identically on both sides, so the joined relation is unchanged.
         salt, frac = skew_join_salt()
         hot: list[str] = []
-        salt_eligible = (
-            len(join.left_keys) == 1
-            and len(join.right_keys) == 1
-            and join.join_type in _BROADCAST_SAFE
-        )
+        salt_eligible = salting_is_safe(join, reducer_ir)
         if salt_eligible:
             # Where the hot keys come from, cheapest source first. Salting is
             # result-preserving (it only moves a key's work between reducers), so engaging
@@ -448,7 +481,8 @@ def _broadcast_join(
     if (
         not right_full
         or sum(b.num_rows for b in right_full) == 0
-        or sum(b.nbytes for b in right_full) > active_config().optimizer.broadcast_max_bytes
+        or sum(b.nbytes for b in right_full)
+        > active_config().optimizer.resolved_broadcast_max_bytes(l3_cache_bytes())
     ):
         return _shuffle_join(above, join, sources, workers, hub=hub)
 

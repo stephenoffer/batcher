@@ -51,6 +51,16 @@ def _streaming():
     return config_context(Config().replace(distributed=DistributedConfig(stream_inference=True)))
 
 
+def _non_overlapped():
+    """Pin the pre-overlap scheduling explicitly.
+
+    `stream_inference` defaults to True, so a test that wants the non-overlapped map as a
+    *comparison baseline* must ask for it — relying on the default would compare the
+    streamed path against itself and assert nothing.
+    """
+    return config_context(Config().replace(distributed=DistributedConfig(stream_inference=False)))
+
+
 def test_streaming_pipeline_equals_single_node():
     out = bt.from_pydict({"id": list(range(200)), "x": list(range(200))})
     out = out.ml.map_batches(_double).ml.map_batches(_AddOne)
@@ -76,10 +86,19 @@ def test_streaming_three_stage_equals_single_node():
 def test_streaming_pipeline_equals_non_overlapped_map():
     out = bt.from_pydict({"id": list(range(150)), "x": list(range(150))})
     out = out.ml.map_batches(_double).ml.map_batches(_AddOne)
-    plain = out.collect(distributed=True, num_workers=3).sort_by("id").to_pydict()
+    with _non_overlapped():
+        plain = out.collect(distributed=True, num_workers=3).sort_by("id").to_pydict()
     with _streaming():
         streamed = out.collect(distributed=True, num_workers=3).sort_by("id").to_pydict()
     assert plain == streamed
+
+
+def test_stream_inference_is_on_by_default():
+    # The overlap is the out-of-the-box behaviour, not an opt-in: a user who never touches
+    # config still gets the CPU stage running ahead of the GPU stage. Pinned because the
+    # value of this default is the whole point — a silent revert to False would cost every
+    # batch-inference pipeline its GPU utilization with nothing turning red.
+    assert DistributedConfig().stream_inference is True
 
 
 def test_streaming_pipeline_empty_input():

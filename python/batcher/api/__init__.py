@@ -42,6 +42,7 @@ from batcher.api.session import (
 )
 from batcher.api.sql_session import Session
 from batcher.governance import GovernanceEvent, Principal, SecurityCatalog
+from batcher.observe import start_ui, stop_ui, ui_url
 from batcher.plan.streaming import OutputMode, Trigger
 
 # Session names listed as literals so ruff recognizes the explicit imports above as
@@ -79,7 +80,10 @@ __all__ = [
     "register_function",
     "security",
     "sql",
+    "start_ui",
+    "stop_ui",
     "streams",
+    "ui_url",
     *_functions.__all__,
     "vacuum",
 ]

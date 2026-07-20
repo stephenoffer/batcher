@@ -33,8 +33,10 @@ from batcher.dist.executors.ray_runtime import (
     release_placement,
     shuffle_partitions,
 )
-from batcher.dist.flight_worker import _ticket
+from batcher.dist.flight_worker import _ticket, current_plan_id
+from batcher.dist.shuffle_replication import replicate_shuffle_output
 from batcher.io.source import Source
+from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import Aggregate, LogicalPlan
 
 __all__ = ["execute_aggregate_flight"]
@@ -106,8 +108,7 @@ def execute_aggregate_flight(
 
     _ensure_ray(workers)
 
-    gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys])
-    aj = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+    gk, aj = agg_spec_json(agg)
     map_plan, sid = _relabel_single_source(agg.input)
     map_ir = json.dumps(map_plan.to_ir())
     n_keys = len(agg.group_keys)
@@ -162,12 +163,18 @@ def execute_aggregate_flight(
         addrs, dead = map_barrier(
             workers,
             lambda host, src: actors[host].map_publish.remote(
-                map_ir, gk, aj, partitions[src], n_keys, n_reducers, src, 0
+                map_ir, gk, aj, partitions[src], n_keys, n_reducers, src, 0, current_plan_id()
             ),
         )
 
+        # Placed HERE, as soon as the buckets exist and before anything can take a worker
+        # away — replicating after a loss would be probing a corpse. `None` (the default
+        # factor of 1) leaves the reduce byte-identical to the unreplicated path.
+        replicas = replicate_shuffle_output(actors, addrs, n_reducers, workers, dead)
+
         # Simulate worker loss after the map barrier (test hook): the killed workers'
-        # published buckets vanish, so the reduce must recompute them.
+        # published buckets vanish, so the reduce must recompute them — or, with
+        # replication on, re-fetch them from the survivor holding the copy.
         if _fault_inject:
             for i in _fault_inject:
                 ray.kill(actors[i])
@@ -182,7 +189,18 @@ def execute_aggregate_flight(
         reduce_args = (actors, addrs, partitions, map_ir, gk, aj, n_keys, n_reducers, workers)
         if workers > fan_in:
             batches = _tree_reduce_with_recovery(
-                actors, addrs, partitions, map_ir, gk, aj, n_keys, n_reducers, fan_in, workers, dead
+                actors,
+                addrs,
+                partitions,
+                map_ir,
+                gk,
+                aj,
+                n_keys,
+                n_reducers,
+                fan_in,
+                workers,
+                dead,
+                replicas,
             )
         else:
             # `on_actors`: keep the result on the workers — each reducer publishes its
@@ -190,7 +208,11 @@ def execute_aggregate_flight(
             # the intermediate in place. Otherwise the reducers return their batches.
             on_actors = materialize is False and not above
             out = _reduce_with_recovery(
-                *reduce_args, materialize=on_actors, reducer_hosts=reducer_hosts, dead=dead
+                *reduce_args,
+                materialize=on_actors,
+                reducer_hosts=reducer_hosts,
+                dead=dead,
+                replicas=replicas,
             )
             if on_actors:
                 from batcher.dist.fleet import FlightMaterializedSource
@@ -268,6 +290,7 @@ def _reduce_with_recovery(
     materialize=False,
     reducer_hosts=None,
     dead=None,
+    replicas=None,
 ):
     """Run the reduce stage under Carbonite recompute-on-worker-loss recovery.
 
@@ -281,7 +304,12 @@ def _reduce_with_recovery(
     import ray
 
     from batcher._internal.errors import ResourceError
-    from batcher.carbonite.resilience import ShuffleLineage, ShuffleRecovery, gather_with_backups
+    from batcher.carbonite.resilience import (
+        ShuffleLineage,
+        ShuffleRecovery,
+        SourcePlacement,
+        gather_with_backups,
+    )
     from batcher.dist.executors.ray_runtime import (
         draining_workers,
         recovery_policy,
@@ -303,6 +331,12 @@ def _reduce_with_recovery(
             if i not in dead and i not in avoid:
                 return i
         raise ResourceError("no surviving worker to recover the shuffle on")
+
+    # Where each source's latest map output lives. Identity until a recompute relocates a
+    # source, after which the source id and its host are different numbers — and it is the
+    # HOST that dies. `map_barrier` keeps the same mapping for the same reason
+    # (`ray_runtime/policies.py::_on_lost`).
+    placement = SourcePlacement(workers)
 
     # A reducer that returns "ok" fetched *all* its sources completely, so its result
     # is final and deterministic — cache it across recovery rounds (keyed by reducer
@@ -335,7 +369,9 @@ def _reduce_with_recovery(
 
         def _launch(r: int, avoid: set[int]):
             host = _host_for(r, avoid)
-            ref = getattr(actors[host], method).remote(gk, aj, mapper_addrs, r, epochs)
+            ref = getattr(actors[host], method).remote(
+                gk, aj, mapper_addrs, r, epochs, replicas, current_plan_id()
+            )
             ref_host[ref] = host
             return ref
 
@@ -360,19 +396,43 @@ def _reduce_with_recovery(
             elif status == "__dead__":
                 if payload is not None:  # the reducer's host died — its mapper data too
                     dead.add(payload)
-                    failed.add(payload)
+                    # `payload` is a HOST id; `failed` carries SOURCE ids (the other branch
+                    # reports unreachable sources). Translate through the current placement
+                    # so a relocated source is recomputed and an unrelated one is not —
+                    # on a clean run this is `{payload}`, exactly as before.
+                    failed.update(placement.sources_on(payload))
             else:
                 failed.update(payload)
         return [p for p in done.values() if p is not None], failed
 
     def recompute(failed_srcs):
         for src in failed_srcs:
-            dead.add(src)  # an unreachable mapper means that worker is gone
+            # The HOST holding `src` is what died — which is `src` itself only until this
+            # source has been relocated once. Marking `src` unconditionally would re-mark an
+            # already-dead worker and leave the real one live for `_pick_live`/`_host_for`
+            # to hand out again, spending the recovery budget on a host that cannot answer.
+            host = placement.host_of(src)
+            dead.add(host)
+            # Retire this source's replicas BEFORE reincarnating it: a stale replica holds
+            # the old epoch's ticket, which reads back as an EMPTY bucket rather than an
+            # error, so falling back to it would silently drop this mapper's rows. See the
+            # epoch invariant in `dist/shuffle_replication.py`.
+            if replicas is not None and src < len(replicas):
+                replicas[src] = []
             lineage[src] = lineage.get(src, ShuffleLineage(0, src)).reincarnate()
-            target = _pick_live({src})
+            target = _pick_live({host})
+            placement.relocate(src, target)  # it lives here now, not on `src`
             mapper_addrs[src] = ray.get(
                 actors[target].map_publish.remote(
-                    map_ir, gk, aj, partitions[src], n_keys, n_reducers, src, lineage[src].epoch
+                    map_ir,
+                    gk,
+                    aj,
+                    partitions[src],
+                    n_keys,
+                    n_reducers,
+                    src,
+                    lineage[src].epoch,
+                    current_plan_id(),
                 )
             )
 
@@ -392,7 +452,7 @@ def _reduce_with_recovery(
     return [b for b in finals if b is not None and b.num_rows > 0]
 
 
-def _tree_reduce(actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead=None):
+def _tree_reduce(actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead=None, replicas=None):
     """Combine each bucket's `workers` leaf partials into one via a combiner tree.
 
     Each round groups a bucket's current partials into chunks of `fan_in`, and a
@@ -415,32 +475,52 @@ def _tree_reduce(actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead=N
         r: [(leaf_addrs[src], _ticket(0, src, r)) for src in range(workers)]
         for r in range(n_reducers)
     }
+    # fallbacks[r][i]: replica addresses for frontier[r][i], carried POSITIONALLY alongside
+    # the frontier because `gather_combine` indexes replicas by source position, not by
+    # worker id. Only the leaf level has any: an interior combiner's output is published on
+    # a single node and is never replicated, so it contributes an empty list and a loss
+    # there still costs a recompute round.
+    fallbacks = {
+        r: [
+            list(replicas[src]) if replicas and src < len(replicas) else []
+            for src in range(workers)
+        ]
+        for r in range(n_reducers)
+    }
     stage = 1
     while any(len(srcs) > fan_in for srcs in frontier.values()):
         tasks, next_frontier, assign = [], {r: [] for r in range(n_reducers)}, 0
+        next_fallbacks: dict[int, list[list[str]]] = {r: [] for r in range(n_reducers)}
         for r in range(n_reducers):
             srcs = frontier[r]
             for i in range(0, len(srcs), fan_in):
                 chunk = srcs[i : i + fan_in]
+                chunk_reps = fallbacks[r][i : i + fan_in]
                 if len(chunk) == 1:
                     next_frontier[r].append(chunk[0])  # nothing to combine yet
+                    next_fallbacks[r].append(chunk_reps[0])  # its replicas carry forward
                     continue
-                tasks.append((r, live[assign % len(live)], chunk, _ticket(stage, assign, r)))
+                tasks.append(
+                    (r, live[assign % len(live)], chunk, _ticket(stage, assign, r), chunk_reps)
+                )
                 assign += 1
         new_addrs = ray.get(
             [
-                actors[combiner].combine_publish.remote(gk, aj, chunk, out_ticket)
-                for (_r, combiner, chunk, out_ticket) in tasks
+                actors[combiner].combine_publish.remote(gk, aj, chunk, out_ticket, chunk_reps)
+                for (_r, combiner, chunk, out_ticket, chunk_reps) in tasks
             ]
         )
-        for (r, _combiner, _chunk, out_ticket), addr in zip(tasks, new_addrs, strict=True):
+        for (r, _combiner, _chunk, out_ticket, _reps), addr in zip(tasks, new_addrs, strict=True):
             next_frontier[r].append((addr, out_ticket))
-        frontier, stage = next_frontier, stage + 1
+            next_fallbacks[r].append([])  # a combined partial exists on one node only
+        frontier, fallbacks, stage = next_frontier, next_fallbacks, stage + 1
 
     # Final level: each bucket has <= fan_in sources — one combine+finalize per bucket.
     finals = ray.get(
         [
-            actors[live[r % len(live)]].combine_finalize_fetch.remote(gk, aj, frontier[r])
+            actors[live[r % len(live)]].combine_finalize_fetch.remote(
+                gk, aj, frontier[r], fallbacks[r]
+            )
             for r in range(n_reducers)
         ]
     )
@@ -448,7 +528,18 @@ def _tree_reduce(actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead=N
 
 
 def _tree_reduce_with_recovery(
-    actors, leaf_addrs, partitions, map_ir, gk, aj, n_keys, n_reducers, fan_in, workers, dead=None
+    actors,
+    leaf_addrs,
+    partitions,
+    map_ir,
+    gk,
+    aj,
+    n_keys,
+    n_reducers,
+    fan_in,
+    workers,
+    dead=None,
+    replicas=None,
 ):
     """Run the tree reduce under Carbonite recompute-on-worker-loss recovery.
 
@@ -461,7 +552,10 @@ def _tree_reduce_with_recovery(
     import ray
 
     from batcher.carbonite.resilience import ShuffleRecovery
-    from batcher.dist.executors.ray_runtime import recovery_policy
+    from batcher.dist.executors.ray_runtime import (
+        is_recoverable_task_failure,
+        recovery_policy,
+    )
 
     dead: set[int] = set(dead or ())
 
@@ -480,19 +574,40 @@ def _tree_reduce_with_recovery(
     def attempt():
         try:
             return _tree_reduce(
-                actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead
+                actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead, replicas
             ), set()
-        except (ray.exceptions.RayActorError, ray.exceptions.RayTaskError):
+        except ray.exceptions.RayTaskError as exc:
+            # A combine fetches inside its task, so a lost peer arrives here as a
+            # `RetryableShuffleError` wrapped in a `RayTaskError` — the same type a user's
+            # failing UDF produces. Only the transport-classified ones are recoverable;
+            # anything else is deterministic, and retrying it would spend the whole recovery
+            # budget re-running a bug and then bury the real traceback under
+            # `ResourceError("shuffle did not recover...")`. Re-raise so the user sees the
+            # actual exception. Mirrors `gather_map_results`, which re-raises `RayTaskError`
+            # outright on the flat path.
+            if not is_recoverable_task_failure(exc):
+                raise
+            before = set(dead)
+            _detect_dead()
+            return None, (dead - before or {-1})  # -1: force a retry even if nothing new
+        except ray.exceptions.RayActorError:
             before = set(dead)
             _detect_dead()
             return None, (dead - before or {-1})  # -1: force a retry even if nothing new
 
     def recompute(failed):
         for src in (s for s in failed if isinstance(s, int) and s >= 0):
+            # Retire this source's replicas before republishing it — the same epoch
+            # invariant the flat path enforces (see `dist/shuffle_replication.py`): a
+            # stale replica's ticket reads back as an EMPTY bucket, not an error, so
+            # falling back to it would silently drop this mapper's rows. The tree
+            # republishes at the leaf, so the recomputed primary is the only valid copy.
+            if replicas is not None and src < len(replicas):
+                replicas[src] = []
             target = next(j for j in range(workers) if j not in dead)
             leaf_addrs[src] = ray.get(
                 actors[target].map_publish.remote(
-                    map_ir, gk, aj, partitions[src], n_keys, n_reducers, src
+                    map_ir, gk, aj, partitions[src], n_keys, n_reducers, src, 0, current_plan_id()
                 )
             )
 

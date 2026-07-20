@@ -189,7 +189,18 @@ def _collect(
 
     from batcher import core
     from batcher.api import executors
-    from batcher.api.terminal.event_log import event_log_collector, write_event_log
+    from batcher.api.terminal.event_log import (
+        event_log_collector,
+        pipeline_signature,
+        query_label,
+        report_failure,
+        start_query_report,
+        write_event_log,
+    )
+    from batcher.observe import ensure_sinks
+
+    ensure_sinks()  # attach the progress bar / dashboard the config asks for (idempotent)
+    query_id = start_query_report(query_label(plan), pipeline_signature(plan))
 
     ctx = core.ExecutionContext(
         columns=columns,
@@ -201,9 +212,16 @@ def _collect(
         profile=event_log_collector(),
     )
     t0 = time.perf_counter()
-    table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
+    try:
+        table = executors.select(plan, distributed=distributed).execute(plan, sources, ctx)
+    except BaseException as exc:
+        # A failed query must close out on the bus too, or its progress bar spins forever
+        # and the dashboard shows it as still running. Re-raised unchanged — reporting the
+        # failure must not alter it.
+        report_failure(query_id, total_ms=(time.perf_counter() - t0) * 1000.0, exc=exc)
+        raise
     total_ms = (time.perf_counter() - t0) * 1000.0
-    write_event_log(ctx.profile, total_ms=total_ms, rows=table.num_rows)
+    write_event_log(ctx.profile, total_ms=total_ms, rows=table.num_rows, query_id=query_id)
     from batcher.api.terminal.gpu_backend import record_cpu_crossover  # adaptive-crossover sample
 
     record_cpu_crossover(plan, sources, ctx.hub, total_ms)  # gated to a GPU cluster; else no-op

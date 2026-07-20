@@ -94,17 +94,24 @@ def test_spot_metadata_respects_explicit_backend(monkeypatch):
     assert cfg.metadata.backend == "sqlite"
 
 
-_AUTOSCALE_ENV_VARS = (
-    "BATCHER_AUTOSCALE",
-    "RAY_AUTOSCALING",
-    "BATCHER_SPOT",
-    "RAY_SPOT",
-    "RAY_NODE_TYPE_NAME",
-    "NODE_LIFECYCLE",
-    "INSTANCE_LIFECYCLE",
-    "ANYSCALE_SESSION_ID",
-    "ANYSCALE_CLUSTER_ID",
-)
+def _autoscale_env_vars() -> tuple[str, ...]:
+    """Every env var the detectors read, taken from the module itself.
+
+    Listed by hand this drifts the moment a platform is added — and it drifts *silently*,
+    because a var the fixture forgets to clear is simply inherited from the host. That is
+    a real failure mode here: these tests run on Ray/KubeRay CI, where the managed-cluster
+    markers are genuinely set in the environment."""
+    from batcher.config import profiles
+
+    return (
+        *profiles._AUTOSCALE_FLAG_VARS,
+        *profiles._SPOT_FLAG_VARS,
+        *profiles._SPOT_LIFECYCLE_VARS,
+        *profiles._MANAGED_AUTOSCALE_VARS,
+    )
+
+
+_AUTOSCALE_ENV_VARS = _autoscale_env_vars()
 
 
 @pytest.fixture
@@ -144,6 +151,64 @@ def test_detect_autoscaling_spot_implies_autoscaling(_clean_autoscale_env):
     from batcher.config.profiles import detect_autoscaling_environment
 
     _clean_autoscale_env.setenv("BATCHER_SPOT", "1")
+    assert detect_autoscaling_environment() is True
+
+
+@pytest.mark.parametrize(
+    ("body", "draining"),
+    [
+        ('{"Events": []}', False),  # the steady state — always 200, usually empty
+        ('{"Events": [{"EventType": "Preempt"}]}', True),  # spot eviction
+        ('{"Events": [{"EventType": "Terminate"}]}', True),  # announced shutdown
+        ('{"Events": [{"EventType": "Reboot"}]}', False),  # maintenance, not reclamation
+        ('{"Events": [{"EventType": "Freeze"}]}', False),
+        ('{"Events": [{"EventType": "Freeze"}, {"EventType": "Preempt"}]}', True),
+        ("not json", False),  # a malformed body must never read as a drain
+        ("null", False),
+        ("{}", False),
+    ],
+)
+def test_azure_scheduled_events_drain_detection(body, draining):
+    """Azure always answers 200, so the payload — not the status — decides.
+
+    Without this probe the `spot` profile is a silent no-op on Azure: the budgets harden
+    but nothing ever notices a preemption, so eviction costs a full recompute instead of
+    the proactive migration the profile exists to buy."""
+    from batcher.carbonite.resilience.preemption import _azure_is_draining
+
+    assert _azure_is_draining(body) is draining
+
+
+def test_detect_managed_cluster_off_with_no_signal(_clean_autoscale_env):
+    from batcher.config.profiles import detect_managed_cluster
+
+    assert detect_managed_cluster() is False
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        "ANYSCALE_SESSION_ID",  # Anyscale
+        "RAY_CLUSTER_NAME",  # KubeRay, on any cloud or on-prem Kubernetes
+        "RAY_CLUSTER_NAMESPACE",
+        "RAY_USAGE_STATS_KUBERAY_IN_USE",
+        "BATCHER_RAY_CLUSTER",  # the escape hatch for an unnamed platform
+    ],
+)
+def test_detect_managed_cluster_is_platform_neutral(_clean_autoscale_env, var):
+    """Every platform marker is equally authoritative — batcher must not privilege one
+    vendor, or "attach to the running cluster" works on that vendor and silently strands a
+    distributed job on one node everywhere else."""
+    from batcher.config.profiles import detect_managed_cluster
+
+    _clean_autoscale_env.setenv(var, "x")
+    assert detect_managed_cluster() is True
+
+
+def test_managed_cluster_implies_autoscaling_on_kuberay(_clean_autoscale_env):
+    from batcher.config.profiles import detect_autoscaling_environment
+
+    _clean_autoscale_env.setenv("RAY_CLUSTER_NAME", "raycluster-prod")
     assert detect_autoscaling_environment() is True
 
 

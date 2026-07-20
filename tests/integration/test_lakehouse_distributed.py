@@ -20,6 +20,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _ray_cluster import init_test_ray, shutdown_test_ray
 
 pytest.importorskip("ray", reason="ray not installed")
 pytest.importorskip("deltalake", reason="deltalake not installed")
@@ -32,8 +33,6 @@ WORKERS = 4
 
 @pytest.fixture(scope="module", autouse=True)
 def _ray_session():
-    from conftest import init_test_ray, shutdown_test_ray
-
     started = init_test_ray(WORKERS)
     yield
     shutdown_test_ray(started)

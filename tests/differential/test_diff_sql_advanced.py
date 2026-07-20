@@ -8,6 +8,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -37,8 +38,6 @@ def emp(duck):
     ],
 )
 def test_sql_scalar_extras(duck, emp, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, emp=emp).collect(), duck.sql(q))
 
 
@@ -51,8 +50,6 @@ def test_sql_scalar_extras(duck, emp, q):
     ],
 )
 def test_sql_ilike(duck, emp, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, emp=emp).collect(), duck.sql(q))
 
 
@@ -74,8 +71,6 @@ def ts(duck):
     "part", ["year", "month", "day", "hour", "minute", "second", "quarter", "week", "dow", "doy"]
 )
 def test_sql_extract(duck, ts, part):
-    from conftest import assert_same
-
     q = f"SELECT extract({part} FROM d) r FROM ts"
     assert_same(bt.sql(q, ts=ts).collect(), duck.sql(q))
 
@@ -90,8 +85,6 @@ def test_sql_extract(duck, ts, part):
     ],
 )
 def test_sql_named_window(duck, emp, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, emp=emp).collect(), duck.sql(q))
 
 
@@ -106,8 +99,6 @@ def test_sql_named_window(duck, emp, q):
     ],
 )
 def test_sql_no_from(duck, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q).collect(), duck.sql(q))
 
 
@@ -122,8 +113,6 @@ def test_sql_no_from(duck, q):
     ],
 )
 def test_sql_is_distinct_from(duck, q):
-    from conftest import assert_same
-
     nl = pa.table({"id": [1, 2, 3, 4, 5], "mgr": [None, 1, 1, 2, 2]})
     duck.register("nl", nl)
     assert_same(bt.sql(q, nl=nl).collect(), duck.sql(q))
@@ -143,8 +132,6 @@ def test_sql_is_distinct_from(duck, q):
     ],
 )
 def test_sql_like_wildcards(duck, q):
-    from conftest import assert_same
-
     lk = pa.table({"id": [1, 2, 3, 4, 5, 6], "s": ["abc", "aXc", "abbc", "a_c", "a%c", "xyz"]})
     duck.register("lk", lk)
     assert_same(bt.sql(q, lk=lk).collect(), duck.sql(q))
@@ -162,8 +149,6 @@ def test_sql_like_wildcards(duck, q):
     ],
 )
 def test_sql_grouping_sets(duck, q):
-    from conftest import assert_same
-
     gs = pa.table(
         {
             "dept": ["x", "x", "y", "y", "z"],

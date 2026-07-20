@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -23,8 +24,6 @@ def _wide():
 
 
 def test_unpivot_matches_duckdb(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_wide()).unpivot(index=["id"], on=["q1", "q2", "q3"]).collect()
     duck.register("t", _wide())
     assert_same(
@@ -37,8 +36,6 @@ def test_unpivot_matches_duckdb(duck):
 
 
 def test_unpivot_then_aggregate(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_wide())
         .unpivot(index=["id"], on=["q1", "q2", "q3"])
@@ -57,8 +54,6 @@ def test_unpivot_then_aggregate(duck):
 
 
 def test_unpivot_infers_value_columns(duck):
-    from conftest import assert_same
-
     # `on` omitted → every non-index column is melted.
     out = bt.from_arrow(_wide()).unpivot(index=["id"]).collect()
     duck.register("t", _wide())
@@ -72,8 +67,6 @@ def test_unpivot_infers_value_columns(duck):
 
 
 def test_unpivot_custom_names_and_filter(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_wide())
         .unpivot(index=["id"], on=["q1", "q2"], variable_name="quarter", value_name="amount")
@@ -93,8 +86,6 @@ def test_unpivot_custom_names_and_filter(duck):
 def test_unpivot_mixed_numeric_promotes(duck):
     """Melting an Int64 column together with a Float64 column promotes to Float64
     (DuckDB/Polars), rather than erroring on the concat of differing types."""
-    from conftest import assert_same
-
     wide = pa.table(
         {
             "id": pa.array([1, 2], type=pa.int64()),

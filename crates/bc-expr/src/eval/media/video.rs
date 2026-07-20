@@ -14,29 +14,51 @@ use crate::{ExprError, VideoFunc};
 pub(crate) fn eval_video(func: VideoFunc, arr: &ArrayRef) -> Result<ArrayRef, ExprError> {
     use std::sync::Arc;
 
-    use arrow::array::{Array, BinaryArray, Float64Array, Int32Array, Int64Array, StructArray};
+    use arrow::array::{
+        Array, Float64Array, GenericBinaryArray, Int32Array, Int64Array, OffsetSizeTrait,
+        StructArray,
+    };
     use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, Field};
 
-    let bytes =
-        arr.as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| ExprError::ExpectedBinary {
+    // Binary and LargeBinary both accepted: a media source stores payloads as
+    // LargeBinary, since 32-bit offsets cap an array at 2 GB total and a batch of video
+    // clips reaches that immediately.
+    let bytes: &dyn Array = arr.as_ref();
+    let (i32_bytes, i64_bytes) = match arr.data_type() {
+        DataType::Binary => (
+            bytes.as_any().downcast_ref::<GenericBinaryArray<i32>>(),
+            None,
+        ),
+        DataType::LargeBinary => (
+            None,
+            bytes.as_any().downcast_ref::<GenericBinaryArray<i64>>(),
+        ),
+        other => {
+            return Err(ExprError::ExpectedBinary {
                 func: format!("{func:?}"),
-                got: arr.data_type().to_string(),
-            })?;
+                got: other.to_string(),
+            })
+        }
+    };
+    let len = i32_bytes
+        .map(|b| b.len())
+        .or(i64_bytes.map(|b| b.len()))
+        .unwrap_or(0);
+    let value_at = |i: usize| -> Option<&[u8]> {
+        match (i32_bytes, i64_bytes) {
+            (Some(b), _) if !b.is_null(i) => Some(b.value(i)),
+            (_, Some(b)) if !b.is_null(i) => Some(b.value(i)),
+            _ => None,
+        }
+    };
     let VideoFunc::Decode = func;
 
     // Probe every clip in parallel (each spawns an FFmpeg probe over its own temp file, so
     // the rows are independent), then fold into the column buffers serially. See
     // `super::map_rows` — without it a sub-morsel batch would probe on a single core.
-    let metas: Vec<Option<(i32, i32, i64, f64, f64)>> = super::map_rows(bytes.len(), |i| {
-        if bytes.is_null(i) {
-            None
-        } else {
-            decode_video_meta(bytes.value(i))
-        }
-    });
+    let metas: Vec<Option<(i32, i32, i64, f64, f64)>> =
+        super::map_rows(len, |i| value_at(i).and_then(decode_video_meta));
     let (mut w, mut h) = (Vec::new(), Vec::new());
     let (mut frames, mut dur, mut fps) = (Vec::new(), Vec::new(), Vec::new());
     let mut valid = Vec::with_capacity(bytes.len());

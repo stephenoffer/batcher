@@ -1,9 +1,6 @@
 # Query lifecycle
 
-A `collect()` has to cross a language boundary. On one side is a Python object graph the
-user built by chaining method calls; on the other is native code that must not call back
-into Python for a single row. The lifecycle is the sequence that gets from one to the
-other, exactly once per execution, and brings measurements back.
+A `collect()` has to cross a language boundary. On one side is a Python object graph you built by chaining method calls. On the other is native code that must not call back into Python for a single row. The lifecycle is the sequence that gets from one to the other, exactly once per execution, and brings measurements back.
 
 Nothing happens until a terminal call. `filter`, `select`, `join`, `group_by` each return a
 new `Dataset` wrapping a new `LogicalPlan`. No data is read; no expression is evaluated.
@@ -68,11 +65,7 @@ Drawn with the boundary in it, and with the loop that closes back on the optimiz
                         back to step 2 for the rest of the plan  ◄──────┘
 ```
 
-Steps 2–6 are sequenced in exactly one place: `python/batcher/api/orchestration.py`
-(`run_relational`). Every relational terminal (single-node, distributed, and each adaptive
-stage) routes through it, so the three subsystems are wired together once rather than at
-each call site. `api` is the only layer permitted to import all of Kyber, Carbonite, and
-Core; they cannot import each other.
+Steps 2 through 6 are sequenced in exactly one place: `run_relational` in `python/batcher/api/orchestration/run.py`. Every relational terminal routes through it, whether single-node, distributed, or an adaptive stage, so the three subsystems are wired together once rather than at each call site. `api` is the only layer permitted to import all of Kyber, Carbonite, and Core. They cannot import each other.
 
 ### 1. The metadata shortcut
 
@@ -92,19 +85,14 @@ terminal: the shortcut returns `None` and the query executes normally. Weaken th
 See `python/batcher/api/terminal/metadata_answer/` and
 [the execution engine page](../internals/execution.md).
 
-### 2–3. Optimize, then admit
+### 2 and 3. Optimize, then admit
 
-Kyber rewrites the logical plan (predicate and projection pushdown, fusion, join order) and
-lowers it to a `PhysicalPlan` carrying per-operator `ResourceBounds` and cardinality
-estimates tagged with provenance. Carbonite reads those bounds and decides whether the plan
-fits the memory envelope; if it does not, it narrows the envelope the executor is handed
-(spill enabled, lower parallelism, a smaller credit window) rather than letting the process
-walk into an OOM.
+Kyber rewrites the logical plan by pushing down predicates and projections, fusing operators, and choosing a join order. It lowers the result to a `PhysicalPlan` carrying per-operator `ResourceBounds` and cardinality estimates tagged with provenance. Carbonite reads those bounds and decides whether the plan fits the memory envelope. If it doesn't, Carbonite narrows the envelope the executor is handed rather than letting the process walk into an OOM, by enabling spill, lowering parallelism, or shrinking the credit window.
 
 Neither subsystem touches data. Kyber decides, Carbonite protects, Core measures. The verbs
 stay in their lanes because the subsystems cannot import one another.
 
-### 4–5. Lower and execute
+### 4 and 5. Lower and execute
 
 `PhysicalPlan.to_json()` serializes the relational IR. Core calls the one FFI entry point:
 
@@ -142,11 +130,7 @@ Everything else stays on its own side of the boundary.
 ### 6. Feed back
 
 `execute_plan_metered` returns a metrics side-channel alongside the data: per-operator row
-counts in and out, elapsed milliseconds, result bytes, whether the operator spilled and by
-how much. Core records those into the `MetadataHub`, keyed by a *structural plan signature*
-(stable across executions, unlike an operator's position in one plan walk). Kyber reads them
-on the next run, and at a pipeline breaker during this one. That loop is what makes the
-optimizer improve the more a query shape is run.
+counts in and out, elapsed milliseconds, result bytes, whether the operator spilled and by how much. Core records those into the `MetadataHub`, keyed by a *structural plan signature*. That signature is stable across executions, unlike an operator's position in one plan walk. Kyber reads the measurements on the next run, and at a pipeline breaker during this one. That loop is what makes the optimizer improve the more a query shape is run.
 
 ## What the user can see
 
@@ -180,27 +164,24 @@ filled in after an `analyze=True` run.
 
 ## What it costs
 
-The fixed cost of a small query is the thing this design most easily gets wrong, so it is
-worth being exact about which side of the line each cost falls on.
+The fixed cost of a small query is the thing this design most easily gets wrong, so it's worth being exact about which side of the line each cost falls on.
 
 | Cost | Paid | Why |
 |---|---|---|
-| Cranelift compilation | once per distinct `(expr, schema, simd)`, process-wide | `crates/bc-codegen/src/cache.rs`. Before the memo, a 64-row query with one filter and two projections paid 16.6 ms of it. |
+| Cranelift compilation | once per distinct `(expr, schema, simd)`, process-wide | Memoized in `crates/bc-codegen/src/cache.rs`, so a small query doesn't pay it repeatedly. |
 | Thread pool construction | once per width, cached | `par.rs::pool_for`. A one-row query does not spin up 96 threads; the worker count is capped by the morsels the inputs can produce. |
 | Plan JSON parse | once per `execute_plan` call | Not per batch. |
 | Arrow handoff | once per input relation | Zero-copy through the C Data Interface. |
 | The metrics walk | once per metered run | Only on the metered entry point. |
 
-On the operator microbenchmarks a global sum over 6M rows completes in 0.5 ms end to end,
-which is the honest measure of the fixed overhead (DuckDB: 2.7 ms; see
-[the analytics benchmarks](../benchmarks/analytics.md)).
+On the operator benchmarks a global sum over TPC-H `lineitem` at scale factor 1, 6M rows on 16 cores, completes in 0.5 ms end to end against DuckDB's 2.7 ms. That is the honest measure of the fixed overhead. See [the analytics benchmarks](../benchmarks/analytics.md) for the full table and the hardware.
 
 ## Where the code lives
 
 | Step | Code |
 |---|---|
 | Dataset / terminal ops | `python/batcher/api/dataset/frame.py`, `python/batcher/api/terminal/` |
-| The contract loop | `python/batcher/api/orchestration.py` |
+| The contract loop | `python/batcher/api/orchestration/run.py` |
 | Metadata shortcut | `python/batcher/api/terminal/metadata_answer/` |
 | Logical plan + `to_ir()` | `python/batcher/plan/logical/`, `python/batcher/plan/ir_tags.py` |
 | Physical plan + `to_json()` | `python/batcher/plan/physical.py` |
@@ -210,18 +191,13 @@ which is the honest measure of the fixed overhead (DuckDB: 2.7 ms; see
 
 ## Adaptive stages
 
-One thing the diagram above flattens: a query with a pipeline breaker may run steps 2–5 more
-than once. At a breaker the engine has *measured* the data it just processed. If an estimate
-was off by more than `optimizer.reoptimize_error` (default 2x), the remainder of the plan is
-re-optimized on the measured numbers and executed as a new stage. The stateful operator's
-state lives in `bc-runtime`, not in generated code, so a compiled pipeline can be thrown away
-and rebuilt at a breaker without losing progress.
+One thing the diagram above flattens: a query with a pipeline breaker may run steps 2 through 5 more than once. At a breaker the engine has *measured* the data it just processed. If an estimate was off by more than `optimizer.reoptimize_error`, which defaults to 2.0, the remainder of the plan is re-optimized on the measured numbers and executed as a new stage. The stateful operator's state lives in `bc-runtime`, not in generated code, so a compiled pipeline can be thrown away and rebuilt at a breaker without losing progress.
 
 ## See also
 
 :::{seealso}
 - [Architecture](../architecture/index.md): the three-subsystem shape this sequence wires together
-- [Execution engine](../internals/execution.md): the architecture-level view of steps 4–6
+- [Execution engine](../internals/execution.md): the architecture-level view of steps 4 through 6
 - [Kyber](../internals/kyber.md): what step 2 actually does to the plan
 - [Carbonite](../internals/carbonite.md): what step 3 admits against
 - [Reading a plan](../user-guide/explain-plans.md): how to read the `explain()` output above
@@ -229,5 +205,5 @@ and rebuilt at a breaker without losing progress.
 - [Analytics benchmarks](../benchmarks/analytics.md): where the 0.5 ms fixed-overhead figure comes from
 - [Plan IR](plan-ir.md): the JSON wire contract the boundary speaks
 - [Morsel parallelism](morsel-parallelism.md): how a plan becomes work for N cores
-- [Adaptive re-optimization](adaptive-reoptimization.md): why steps 2–5 can run more than once
+- [Adaptive re-optimization](adaptive-reoptimization.md): why steps 2 through 5 can run more than once
 :::

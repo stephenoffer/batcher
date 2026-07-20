@@ -21,7 +21,7 @@ use parquet::file::statistics::Statistics;
 use serde::Deserialize;
 
 /// One node of the pushed predicate's pushable subset.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(tag = "node", rename_all = "snake_case")]
 pub(crate) enum Pred {
     /// `col <op> lit`, already normalized so the column is on the left.
@@ -48,7 +48,7 @@ pub(crate) enum CmpOp {
 /// A comparison literal. `untagged` so the JSON carries a bare `5` / `5.5` / `true` /
 /// `"x"`; variant order matters (bool before int before float) so an integer never
 /// deserializes as a float.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(untagged)]
 pub(crate) enum Lit {
     Bool(bool),
@@ -114,7 +114,8 @@ fn col_stats<'a>(rg: &'a RowGroupMetaData, col: &str) -> Option<(&'a Statistics,
         let cc = rg.column(i);
         let parts = cc.column_path().parts();
         if parts.len() == 1 && parts[0] == col {
-            cc.statistics().map(|s| (s, is_unsigned_int(cc.column_descr())))
+            cc.statistics()
+                .map(|s| (s, is_unsigned_int(cc.column_descr())))
         } else {
             None
         }
@@ -123,7 +124,7 @@ fn col_stats<'a>(rg: &'a RowGroupMetaData, col: &str) -> Option<(&'a Statistics,
 
 /// Whether a column's logical/converted type is an *unsigned* integer, so its signed
 /// physical min/max stats must be read back as unsigned before comparison.
-fn is_unsigned_int(descr: &parquet::schema::types::ColumnDescriptor) -> bool {
+pub(crate) fn is_unsigned_int(descr: &parquet::schema::types::ColumnDescriptor) -> bool {
     use parquet::basic::{ConvertedType, LogicalType};
     match descr.logical_type() {
         Some(LogicalType::Integer { is_signed, .. }) => !is_signed,
@@ -168,7 +169,10 @@ fn cmp_survives(rg: &RowGroupMetaData, col: &str, op: CmpOp, lit: &Lit) -> bool 
             let (mn, mx) = if unsigned {
                 (i32_unsigned(s.min_opt()), i32_unsigned(s.max_opt()))
             } else {
-                (s.min_opt().map(|x| *x as i128), s.max_opt().map(|x| *x as i128))
+                (
+                    s.min_opt().map(|x| *x as i128),
+                    s.max_opt().map(|x| *x as i128),
+                )
             };
             range_survives(mn, mx, *v as i128, op)
         }
@@ -176,7 +180,10 @@ fn cmp_survives(rg: &RowGroupMetaData, col: &str, op: CmpOp, lit: &Lit) -> bool 
             let (mn, mx) = if unsigned {
                 (i64_unsigned(s.min_opt()), i64_unsigned(s.max_opt()))
             } else {
-                (s.min_opt().map(|x| *x as i128), s.max_opt().map(|x| *x as i128))
+                (
+                    s.min_opt().map(|x| *x as i128),
+                    s.max_opt().map(|x| *x as i128),
+                )
             };
             range_survives(mn, mx, *v as i128, op)
         }
@@ -238,7 +245,12 @@ fn i64_unsigned(v: Option<&i64>) -> Option<i128> {
 /// (`NaN > lit`, `NaN < lit` are both false) — silently dropping rows that actually match.
 /// Since these readers ingest untrusted files from every writer, a NaN bound is treated as
 /// "unknown" and the group is kept (superset-safe), matching how a missing stat is handled.
-fn float_range_survives(min: Option<f64>, max: Option<f64>, lit: f64, op: CmpOp) -> bool {
+pub(crate) fn float_range_survives(
+    min: Option<f64>,
+    max: Option<f64>,
+    lit: f64,
+    op: CmpOp,
+) -> bool {
     if min.is_some_and(f64::is_nan) || max.is_some_and(f64::is_nan) {
         return true;
     }
@@ -246,7 +258,12 @@ fn float_range_survives(min: Option<f64>, max: Option<f64>, lit: f64, op: CmpOp)
 }
 
 /// Can any value in `[min, max]` satisfy `value <op> lit`? Unknown bounds keep the group.
-fn range_survives<T: PartialOrd>(min: Option<T>, max: Option<T>, lit: T, op: CmpOp) -> bool {
+pub(crate) fn range_survives<T: PartialOrd>(
+    min: Option<T>,
+    max: Option<T>,
+    lit: T,
+    op: CmpOp,
+) -> bool {
     match op {
         // `col == lit` is possible iff lit lies within [min, max].
         CmpOp::Eq => min.is_none_or(|mn| mn <= lit) && max.is_none_or(|mx| lit <= mx),

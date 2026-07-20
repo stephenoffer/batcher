@@ -1,14 +1,16 @@
-# Reading and Writing
+# Reading and writing
 
-Readers hang off {py:obj}`bt.read <batcher.read>` and return a lazy `Dataset`; writers hang off
-`ds.write` and are terminal (they execute the plan and return a `WriteManifest`).
-{py:obj}`bt.read(path, format=None, **opts) <batcher.read>` infers the format from the path; the dedicated
-readers below are explicit. Some connectors need an optional dependency; the
-"Extra" column gives the install (`pip install 'batcher-engine[<extra>]'`).
+This page lists every reader and writer, then the connector types behind them. For the transformations that sit between a read and a write, see [Dataset](dataset.md).
+
+Readers hang off {py:obj}`bt.read <batcher.read>` and return a lazy `Dataset`. Writers hang off `ds.write` and are terminal, so they execute the plan and return a `WriteManifest`. {py:obj}`bt.read(path, format=None, **opts) <batcher.read>` infers the format from the path, and the dedicated readers below are explicit. Some connectors need an optional dependency. The "Extra" column gives the install name for `pip install 'batcher-engine[<extra>]'`.
 
 ## Readers
 
+The readers are grouped by the kind of system they pull from. Within each group they're ordered by how often you'll reach for them.
+
 ### Files
+
+These read one file, a directory, or a glob from local disk or object storage:
 
 | Reader | Reads | Extra |
 | --- | --- | --- |
@@ -32,6 +34,8 @@ readers below are explicit. Some connectors need an optional dependency; the
 
 ### Lakehouse tables
 
+These read a transactional table through its metadata layer, so a read sees one consistent snapshot:
+
 | Reader | Reads | Extra |
 | --- | --- | --- |
 | `bt.read.delta(path, version=, timestamp=)` | a Delta Lake table (time travel) | |
@@ -43,14 +47,18 @@ readers below are explicit. Some connectors need an optional dependency; the
 
 ### Warehouses and databases
 
+These submit a query to an external engine and stream the Arrow result back:
+
 | Reader | Reads |
 | --- | --- |
-| `bt.read.sql(query=, table=)` | ADBC / FlightSQL in a single submission |
-| `bt.read.snowflake(query)` | a Snowflake query (parallel result-chunk fetch) |
+| `bt.read.sql(query, uri=)` | ADBC / FlightSQL in a single submission (or `table=` for a whole table) |
+| `bt.read.snowflake(query, connection_kwargs=)` | a Snowflake query (parallel result-chunk fetch) |
 | `bt.read.bigquery(...)` | BigQuery via the Storage Read API (parallel Arrow streams) |
 | `bt.read.clickhouse(query)` | a ClickHouse query (Arrow-native) |
 
 ### NoSQL
+
+Each of these splits the keyspace so the collection reads in parallel:
 
 | Reader | Reads |
 | --- | --- |
@@ -60,6 +68,8 @@ readers below are explicit. Some connectors need an optional dependency; the
 | `bt.read.elasticsearch(...)` | Elasticsearch via ES\|QL Arrow / sliced scroll |
 
 ### Streaming
+
+These return an unbounded `Dataset`. See [streaming](../user-guide/streaming.md) for triggers and checkpoints.
 
 | Reader | Reads |
 | --- | --- |
@@ -71,6 +81,8 @@ readers below are explicit. Some connectors need an optional dependency; the
 
 ### Multimodal and ML formats
 
+These read media and document files as rows of bytes plus metadata, decoding only when you ask:
+
 | Reader | Reads | Extra |
 | --- | --- | --- |
 | `bt.read.images(path, decode=False)` | images (uri/bytes/size/mime + header meta) | `image` |
@@ -81,10 +93,11 @@ readers below are explicit. Some connectors need an optional dependency; the
 
 ## Writers
 
-`ds.write(path, fmt=None, ...)` infers the format; the dedicated writers are
-explicit. Each executes the plan and returns a `WriteManifest`.
+`ds.write(path, fmt=None, ...)` infers the format, and the dedicated writers are explicit. Each executes the plan and returns a `WriteManifest`.
 
 ### Files
+
+These write one file per output partition:
 
 | Writer | Writes | Extra |
 | --- | --- | --- |
@@ -97,6 +110,8 @@ explicit. Each executes the plan and returns a `WriteManifest`.
 | `ds.write.msgpack(path)` | MessagePack | |
 
 ### Lakehouse tables
+
+These commit through the table's transaction log rather than writing loose files:
 
 | Writer | Writes | Extra |
 | --- | --- | --- |
@@ -125,10 +140,12 @@ row and the row already in the table. See the
 
 ### Warehouses and databases
 
+These load the result into an external system:
+
 | Writer | Writes |
 | --- | --- |
-| `ds.write.snowflake(table)` | a Snowflake table |
-| `ds.write.sql(...)` | a database table via ADBC / FlightSQL |
+| `ds.write.snowflake(table, connection_kwargs=)` | a Snowflake table |
+| `ds.write.sql(table, driver=, db_kwargs=)` | a database table via ADBC / FlightSQL |
 | `ds.write.mongo(...)` | a MongoDB collection |
 
 ## The connector surface
@@ -143,9 +160,7 @@ from batcher.io import Source, Sink, Split, SOURCES
 
 A {py:obj}`Source <batcher.io.Source>` answers two questions. What is your schema, and how
 do you break into independently readable pieces? Each piece is a
-{py:obj}`Split <batcher.io.Split>`, and that split is the unit of parallelism. It is why a
-1,000-file Parquet directory and a single 1,000-row-group file both parallelize, and why a
-format that cannot be divided still works, just serially.
+{py:obj}`Split <batcher.io.Split>`, and that split is the unit of parallelism. That's why a 1,000-file Parquet directory and a single 1,000-row-group file both parallelize, and why a format that can't be divided still works, serially.
 
 ### Protocols
 
@@ -164,7 +179,7 @@ format that cannot be divided still works, just serially.
 The unit of read parallelism. A {py:obj}`RowGroupSplit <batcher.io.RowGroupSplit>` reads
 one Parquet row group, a {py:obj}`FileSplit <batcher.io.FileSplit>` reads a byte range of
 one file, and a {py:obj}`WholeSourceSplit <batcher.io.WholeSourceSplit>` is the
-degenerate case for a source that cannot be divided.
+degenerate case for a source that can't be divided.
 
 ```{eval-rst}
 .. autoclass:: Split
@@ -220,8 +235,7 @@ The concrete implementations behind `bt.read.*` and `ds.write.*`.
 
 ### The registries
 
-Formats are discovered, not hard-coded: registering a source under a name is what makes
-`bt.read(path, format="myfmt")` resolve.
+Formats are discovered, not hard-coded. Registering a source under a name is what makes `bt.read(path, format="myfmt")` resolve.
 
 ```{eval-rst}
 .. autodata:: SOURCES
@@ -232,8 +246,7 @@ Formats are discovered, not hard-coded: registering a source under a name is wha
 ### Write results
 
 A write is terminal and returns a {py:obj}`WriteManifest <batcher.io.WriteManifest>`: the
-list of files it actually produced. That is what makes a write auditable and a failed run
-resumable.
+list of files it produced. That's what makes a write auditable and a failed run resumable.
 
 ```{eval-rst}
 .. autoclass:: WriteManifest

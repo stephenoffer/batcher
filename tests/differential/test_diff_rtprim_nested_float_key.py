@@ -16,7 +16,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
-from conftest import assert_same
+from _harness import assert_same
 
 
 def test_group_by_list_of_float_folds_signed_zero(duck) -> None:

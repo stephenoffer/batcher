@@ -12,7 +12,7 @@ over `boto3` and the classic `GetRecords` API. Read only. There is no Kinesis si
 | **Credentials** | The ambient `boto3` chain. There is no credential keyword. |
 | **Restart** | The raw sequence number per shard, re-obtained with `AFTER_SEQUENCE_NUMBER` |
 
-```
+```bash
 pip install 'batcher-engine[kinesis]'
 ```
 
@@ -47,23 +47,23 @@ There is no credential keyword. If `boto3` can find them, so can Batcher.
 ## The rows you get
 
 Every broker source shares one fixed schema: `key`, `value`, `partition`, `offset`,
-`timestamp`, `topic`. For Kinesis they map like this.
+`timestamp`, `topic`. For Kinesis the columns carry the following.
 
 | Column | What Kinesis puts there |
 | --- | --- |
 | `key` | The record's partition key, UTF-8 encoded |
 | `value` | The record `Data` blob, raw bytes, undecoded |
 | `partition` | The index of the shard in the discovered shard list |
-| `offset` | The sequence number, reduced modulo 2⁶³ |
+| `offset` | The sequence number, reduced modulo 2^63 |
 | `timestamp` | `ApproximateArrivalTimestamp`, in milliseconds |
 | `topic` | The stream name |
 
 The two that surprise people are `partition` and `offset`. `partition` is the *index* of the
 shard in the discovered shard list, not the shard id. `offset` is the sequence number, which
-is a large decimal string, reduced modulo 2⁶³ so it fits an int64 column. It stays monotonic
+is a large decimal string, reduced modulo 2^63 so it fits an int64 column. It stays monotonic
 within a shard, but it is not the sequence number and you cannot hand it back to AWS. The
-real sequence number is kept out of band as the resume token, which is what recovery uses; it
-simply does not appear as a column.
+real sequence number is kept out of band as the resume token, which is what recovery uses. It
+does not appear as a column.
 
 ```python
 import batcher as bt
@@ -93,7 +93,7 @@ print(sorted(zip(d["partition"], d["records_read"], strict=True)))
 [(0, 2), (1, 1)]
 ```
 
-Grouping by `partition` like that is the cheapest way to see whether your producer's partition
+Grouping by `partition` that way is the cheapest way to see whether your producer's partition
 key is spreading traffic or piling one shard high.
 
 ## How it parallelizes
@@ -159,10 +159,9 @@ live = bt.read.kinesis(
 
 ::::
 
-With `checkpoint=` set, recovery works properly here. The raw sequence number is stored per
-shard and the shard iterator is re-obtained with `AFTER_SEQUENCE_NUMBER`, so no record is
-replayed and none is skipped. Of the five broker sources, Kinesis has the sturdiest resume
-path.
+With `checkpoint=` set, recovery is exact. The raw sequence number is stored per shard and
+the shard iterator is re-obtained with `AFTER_SEQUENCE_NUMBER`, so no record is replayed and
+none is skipped.
 
 :::{dropdown} A checkpointed write into a bronze Delta table
 ```python

@@ -20,7 +20,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from conftest import assert_same, duck_materialize
+from _harness import assert_same, duck_materialize
 
 pytestmark = pytest.mark.differential
 
@@ -71,12 +71,7 @@ def test_arg_max_with_negative_nan_key_matches_duckdb(duck):
         }
     )
     duck_materialize(duck, "k", table)
-    out = (
-        bt.from_arrow(table)
-        .group_by("g")
-        .agg(am=bt.col("v").arg_max(bt.col("k")))
-        .collect()
-    )
+    out = bt.from_arrow(table).group_by("g").agg(am=bt.col("v").arg_max(bt.col("k"))).collect()
     assert_same(out, duck.sql("SELECT g, arg_max(v, k) AS am FROM k GROUP BY g"))
 
 
@@ -84,10 +79,5 @@ def test_signed_zero_is_one_group_in_mode_and_distinct(duck):
     """`-0.0` and `0.0` are one value: `mode` folds them and `count(distinct)` counts one."""
     table = pa.table({"g": [0, 0, 0], "v": pa.array([-0.0, -0.0, 0.0], pa.float64())})
     duck_materialize(duck, "z", table)
-    out = (
-        bt.from_arrow(table)
-        .group_by("g")
-        .agg(nu=bt.col("v").n_unique())
-        .collect()
-    )
+    out = bt.from_arrow(table).group_by("g").agg(nu=bt.col("v").n_unique()).collect()
     assert_same(out, duck.sql("SELECT g, count(DISTINCT v) AS nu FROM z GROUP BY g"))

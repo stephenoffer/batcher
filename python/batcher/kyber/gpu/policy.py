@@ -127,7 +127,7 @@ def decide_gpu_backend(
             False, False, f"{rows} rows < {learned}min_rows={min_rows}: CPU wins on overhead", rows
         )
 
-    one_gpu_gb = max(dc.gpu_memory_gb, 1e-9)
+    one_gpu_gb = max(dc.resolved_gpu_memory_gb(), 1e-9)
     if ws_gb <= one_gpu_gb:
         return GpuDecision(True, False, f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)", rows)
     if ws_gb <= one_gpu_gb * gpu_count:
@@ -165,7 +165,7 @@ def decide_gpu_map_params(
     `ThroughputController` refines it from measured throughput/VRAM, but a memory-aware start
     beats a fixed 256 (too small for a light model, an instant OOM for a heavy one)."""
     dc = active_config().distributed
-    gpu_gb = max(dc.gpu_memory_gb, 1e-9)
+    gpu_gb = max(dc.resolved_gpu_memory_gb(), 1e-9)
     cap = 0.85  # leave VRAM headroom for activations + fragmentation (the guides' ~80-85%)
 
     if model_memory_gb <= 0.0:

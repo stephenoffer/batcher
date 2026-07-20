@@ -18,6 +18,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -51,8 +52,6 @@ def _table():
 
 
 def test_temporal_minmax_matches_duckdb(duck):
-    from conftest import assert_same
-
     tbl = _table()
     duck.register("t", tbl)
     out = (
@@ -77,8 +76,6 @@ def test_temporal_minmax_matches_duckdb(duck):
 
 
 def test_temporal_min_preserves_timezone(duck):
-    from conftest import assert_same
-
     tz = pa.timestamp("us", tz="UTC")
     tbl = pa.table(
         {

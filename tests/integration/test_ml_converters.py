@@ -36,6 +36,63 @@ def test_to_numpy_batches_column_subset():
     assert all(d.keys() == {"a"} for d in out)
 
 
+def test_dataset_to_numpy_concatenates_columns():
+    import batcher as bt
+
+    out = bt.from_pydict({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0]}).to_numpy()
+    assert set(out) == {"x", "y"}
+    np.testing.assert_array_equal(out["x"], np.array([1, 2, 3]))
+    np.testing.assert_array_equal(out["y"], np.array([4.0, 5.0, 6.0]))
+    # subset
+    assert set(bt.from_pydict({"x": [1], "y": [2]}).to_numpy(columns=["x"])) == {"x"}
+
+
+def test_dataset_to_numpy_reshapes_tensor_columns():
+    import batcher as bt
+
+    arr = np.arange(3 * 2 * 2, dtype=np.float32).reshape(3, 2, 2)
+    t = pa.table({"img": to_tensor_column(arr)})
+    out = bt.from_arrow(t).to_numpy()["img"]
+    assert out.shape == (3, 2, 2)
+    assert out.dtype == np.float32
+    np.testing.assert_allclose(out, arr)
+
+
+def test_dataset_to_numpy_empty_preserves_columns():
+    import batcher as bt
+
+    out = bt.from_pydict({"x": [1, 2, 3]}).filter(bt.col("x") > 10).to_numpy()
+    assert set(out) == {"x"}
+    assert out["x"].shape == (0,)
+
+
+def test_dataset_to_jax_roundtrips_or_reports_missing_jax():
+    import batcher as bt
+
+    jax = pytest.importorskip("jax", reason="tested here only when JAX is installed")
+    out = bt.from_pydict({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0]}).to_jax()
+    assert out["x"].shape == (3,)
+    assert isinstance(out["y"], jax.Array)
+
+
+def test_dataset_to_jax_without_jax_raises_backend_error(monkeypatch):
+    import builtins
+
+    import batcher as bt
+    from batcher._internal.errors import BackendError
+
+    real_import = builtins.__import__
+
+    def _no_jax(name, *args, **kwargs):
+        if name == "jax.numpy" or name.startswith("jax"):
+            raise ImportError("no jax")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_jax)
+    with pytest.raises(BackendError, match="to_jax"):
+        bt.from_pydict({"x": [1, 2, 3]}).to_jax()
+
+
 def test_to_torch_iterable():
     torch = pytest.importorskip("torch")
     ds = to_torch_iterable(_batches())

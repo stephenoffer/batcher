@@ -23,7 +23,7 @@ from batcher.io.formats.base import SOURCES
 from batcher.io.splits import Split, WholeSourceSplit
 from batcher.plan.source_stats import SourceStatistics
 
-__all__ = ["DeltaFileSplit", "DeltaSource", "read_fragment"]
+__all__ = ["DeltaFileSplit", "DeltaSource", "iter_fragment", "read_fragment"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +97,25 @@ class DeltaFileSplit:
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        yield from self._fragment_table(projection, predicate).to_batches()
+        """Stream this data file, never materializing it.
+
+        This used to be ``self._fragment_table(...).to_batches()`` — a whole-fragment read
+        into one table, then a re-chunk of something already in memory. It streamed in
+        signature only: peak memory was the decoded size of the entire data file, so a
+        `read → transform → write` over a table of 1 GB fragments held a gigabyte per worker
+        for no reason, and a fragment larger than the worker's memory could not be read at
+        all. `iter_fragment` yields the same batches in the same order without ever holding
+        more than one.
+        """
+        dataset, index = self._dataset()
+        frag = index.get(self.file_path)
+        if frag is None:
+            # File compacted/removed between planning and read: empty, schema-correct.
+            empty = dataset.schema.empty_table()
+            yield from (empty.select(projection) if projection is not None else empty).to_batches()
+            return
+        mask = self._snapshot().deletion_masks().get(self.file_path)
+        yield from iter_fragment(frag, dataset.schema, projection, predicate, mask)
 
     def row_count(self) -> int | None:
         return self.rows
@@ -197,11 +215,14 @@ class DeltaSource:
             # No file carries a deletion vector: the whole scan keeps full pushdown.
             yield from dataset.to_batches(columns=projection, filter=self._pa_filter(predicate))
             return
-        # Some files do. Each is read through `read_fragment`, which applies that file's
+        # Some files do. Each is read through `iter_fragment`, which applies that file's
         # vector before the predicate — and leaves the unaffected files on the fast path.
+        # Streamed per fragment: the table-building variant held a whole data file in memory
+        # at a time, which is the one thing a scan called `iter_batches` must not do.
         for path, fragment in index.items():
-            table = read_fragment(fragment, dataset.schema, projection, predicate, masks.get(path))
-            yield from table.to_batches()
+            yield from iter_fragment(
+                fragment, dataset.schema, projection, predicate, masks.get(path)
+            )
 
     def row_count(self) -> int | None:
         """Exact row count from the log: the files' records, less what the vectors delete.
@@ -210,11 +231,20 @@ class DeltaSource:
         *overcount* a table that has one. Subtracting the vectors' deleted rows makes the
         count exact again — it used to return `None` for any DV table, leaving the
         estimator to guess at a number the log states outright.
+
+        Returns None when the log does not record `num_records` — a writer is not obliged
+        to, and `_snapshot` already guards the same column for its zone maps. Reading it
+        unguarded raised `KeyError` out of what is a best-effort statistic: the planner
+        asks for a count it can do without, so an absent column must degrade to "unknown"
+        rather than fail the query.
         """
         import pyarrow.compute as pc
 
+        actions = self._add_actions()
+        if "num_records" not in actions.column_names:
+            return None
         snapshot = self._snapshot()
-        physical = int(pc.sum(self._add_actions().column("num_records")).as_py() or 0)
+        physical = int(pc.sum(actions.column("num_records")).as_py() or 0)
         return physical - snapshot.deleted_rows()
 
     def statistics(self) -> SourceStatistics | None:
@@ -371,6 +401,57 @@ def read_fragment(
         )
     table = table.filter(mask)
     return table.filter(flt) if flt is not None else table
+
+
+def iter_fragment(
+    fragment: Any,
+    schema: pa.Schema,
+    projection: list[str] | None,
+    predicate: dict | None,
+    mask: Any | None,
+) -> Iterator[pa.RecordBatch]:
+    """`read_fragment`, streamed — identical rows, in order, one batch resident at a time.
+
+    The deletion-vector argument from `read_fragment` carries over unchanged, and is the
+    only subtle part of streaming this. A vector is indexed by the file's **physical row
+    positions**, so the masked path still reads unfiltered (a predicate pushed into the
+    Parquet scan would slide every position and the mask would then delete the wrong rows)
+    and still applies the mask before the predicate. Streaming adds one requirement: each
+    batch must be masked with *its own slice* of the vector, which means tracking a running
+    offset, because `to_batches` hands back successive windows of the same physical
+    sequence.
+
+    The length check has to move earlier than it was. `read_fragment` compares the vector
+    against the materialized table, which a streaming read no longer has; `count_rows()`
+    answers the same question from the Parquet footer, before any data page is read. Doing
+    it up front also *strengthens* the guarantee — a mismatch is refused before a single
+    batch is emitted, rather than after a consumer has already processed some of them.
+    """
+    flt = None
+    if predicate is not None:
+        from batcher.io.predicate import to_pyarrow_expression
+
+        flt = to_pyarrow_expression(predicate, schema)
+
+    if mask is None:
+        yield from fragment.to_batches(schema=schema, columns=projection, filter=flt)
+        return
+
+    physical = fragment.count_rows()  # footer metadata, not a scan
+    if len(mask) != physical:
+        raise BackendError(
+            f"Delta deletion vector for {getattr(fragment, 'path', '?')!r} covers "
+            f"{len(mask)} rows but the file holds {physical}; the table's log and its "
+            "data files disagree."
+        )
+    offset = 0
+    for batch in fragment.to_batches(schema=schema, columns=projection):
+        kept = batch.filter(mask[offset : offset + batch.num_rows])
+        offset += batch.num_rows
+        if flt is not None:
+            kept = kept.filter(flt)
+        if kept.num_rows:
+            yield kept
 
 
 def _demote_bounds(stats: SourceStatistics, *, rows: int) -> SourceStatistics:

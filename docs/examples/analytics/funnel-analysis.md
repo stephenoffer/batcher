@@ -80,11 +80,11 @@ The usual fix is to join the event table to itself once per step:
 # docs: skip
 views = events.filter(col("step") == "view").rename({"ts": "t_view"})
 carts = events.filter(col("step") == "cart").rename({"ts": "t_cart"})
-# ...and so on, then join views ⋈ carts ⋈ checkouts ⋈ purchases on user.
+# ...and so on, then join views to carts to checkouts to purchases on user.
 ```
 
 That works on four users. On real data it does not. A user with 12 views and 3 carts
-produces 36 rows out of the first join before you have filtered anything; add two more
+produces 36 rows out of the first join before you have filtered anything. Add two more
 steps and the intermediate blows past the size of the input by orders of magnitude.
 The join is doing a cross product inside each user, and then you throw almost all of it
 away.
@@ -177,7 +177,7 @@ print(sql_funnel.to_pydict())
 :::
 ::::
 
-4 → 2 → 1 → 1. Monotonically non-increasing, which a funnel must be. `u3` is gone from
+Four viewed, two carted, one checked out, one purchased. Monotonically non-increasing, which a funnel must be. `u3` is gone from
 the purchase count, because its purchase preceded its view.
 
 ## Reading it as a table

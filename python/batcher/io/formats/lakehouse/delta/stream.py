@@ -109,7 +109,6 @@ class DeltaStreamSource:
                 f"failed to read Delta change feed for {self._table_uri!r} "
                 f"(is delta.enableChangeDataFeed set?): {exc}"
             ) from exc
-        self._cursor = latest
         if not self._cdf:
             # Append mode: keep insert changes, present the table's own schema.
             import pyarrow.compute as pc
@@ -117,6 +116,21 @@ class DeltaStreamSource:
             change_type = pc.cast(table.column("_change_type"), pa.string())
             table = table.filter(pc.equal(change_type, "insert")).drop(list(_CDF_META))
         if table.num_rows == 0:
+            self._cursor = latest  # nothing to deliver, so the window is genuinely done
             return
         out = table.select(projection) if projection is not None else table
         yield from out.to_batches()
+        # Advance ONLY after every batch has been handed to the consumer.
+        #
+        # This used to run before the first `yield`, which turned the cursor into a promise
+        # the stream had not kept: `snapshot_position()` reported the window as consumed
+        # while the batches were still inside an unstarted generator. A consumer that
+        # checkpoints its position — which is the entire reason `snapshot_position`/`seek`
+        # exist — and then fails partway through the drain resumed at `latest + 1` and
+        # never saw the rest. Silent, unrecoverable, and worse the larger the window.
+        #
+        # Placing it here makes the stream at-least-once: a consumer that dies mid-drain
+        # replays the whole window, which is the correct failure mode for a change feed and
+        # the one every checkpointing consumer is already built to handle. Abandoning the
+        # generator early likewise leaves the cursor where it was, by construction.
+        self._cursor = latest

@@ -9,6 +9,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -30,8 +31,6 @@ def _topn(ds, fn, k, op="le"):
 
 
 def test_row_number_top2(duck):
-    from conftest import assert_same
-
     out = _topn(_t(duck), "row_number", 2).collect()
     assert_same(
         out,
@@ -40,8 +39,6 @@ def test_row_number_top2(duck):
 
 
 def test_rank_top2_keeps_ties(duck):
-    from conftest import assert_same
-
     out = _topn(_t(duck), "rank", 2).collect()
     assert_same(
         out,
@@ -50,8 +47,6 @@ def test_rank_top2_keeps_ties(duck):
 
 
 def test_dense_rank_top2(duck):
-    from conftest import assert_same
-
     out = _topn(_t(duck), "dense_rank", 2).collect()
     assert_same(
         out,
@@ -60,8 +55,6 @@ def test_dense_rank_top2(duck):
 
 
 def test_row_number_strict_lt(duck):
-    from conftest import assert_same
-
     out = _topn(_t(duck), "row_number", 3, op="lt").collect()  # rn < 3  →  top 2
     assert_same(
         out,
@@ -70,8 +63,6 @@ def test_row_number_strict_lt(duck):
 
 
 def test_row_number_eq_one(duck):
-    from conftest import assert_same
-
     ranked = _t(duck).window(partition_by=["k"], order_by=["v"], functions={"r": "row_number"})
     out = ranked.filter(col("r") == 1).select("k", "v").collect()
     assert_same(
@@ -82,8 +73,6 @@ def test_row_number_eq_one(duck):
 
 def test_topn_global_partition(duck):
     """No PARTITION BY: top-k over the whole relation."""
-    from conftest import assert_same
-
     ranked = _t(duck).window(order_by=["v"], functions={"r": "row_number"})
     out = ranked.filter(col("r") <= 3).select("k", "v").collect()
     assert_same(
@@ -94,8 +83,6 @@ def test_topn_global_partition(duck):
 
 def test_topn_with_extra_predicate(duck):
     """A non-rank conjunct stays as a filter above the fused window."""
-    from conftest import assert_same
-
     ranked = _t(duck).window(partition_by=["k"], order_by=["v"], functions={"r": "row_number"})
     out = ranked.filter((col("r") <= 2) & (col("v") > 6)).select("k", "v").collect()
     assert_same(

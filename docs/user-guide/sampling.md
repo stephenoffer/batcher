@@ -94,9 +94,9 @@ print(train.count(), test.count(), train.count() + test.count())
 :::{warning}
 Pass `key`. Without it the assignment hashes *every column*, so recomputing an unrelated
 feature re-draws the split and rows silently migrate from train to test. That is the
-classic leak, and nothing in the metrics will report it: the model simply scores better
-than it should. Hashing a stable identifier instead keeps a row on the side it started on
-however the other columns change.
+classic leak, and nothing in the metrics reports it: the model scores better than it
+should. Hashing a stable identifier instead keeps a row on the side it started on however
+the other columns change.
 :::
 
 `random_split` is the n-way generalization.
@@ -108,7 +108,7 @@ print(tr.count(), val.count(), te.count())
 ```
 
 Sizes are binomial around the requested fractions, for the same reason `sample(0.5)`
-was not exactly 500. Disjointness and coverage are exact; the sizes are not.
+was not exactly 500. Disjointness and coverage are exact. The sizes are not.
 
 ## Stratified sampling
 
@@ -137,13 +137,14 @@ Sample when you want *rows*. Sketch when you want a *number*. The decision table
 | Rows to eyeball, or a dev fixture | `sample(fraction)` | streams, no breaker |
 | An exact row count out | `sample(n=...)` | ranks by hash, so it breaks |
 | Disjoint modelling splits | `ml.train_test_split` / `ml.random_split` | row-wise filters, both stay lazy |
-| A random *ordering* | `with_random(...)` then `sort` | a full breaker; use it on the small side |
+| A random *ordering* | `with_random(...)` then `sort` | a full breaker, so use it on the small side |
 | A distinct count or a quantile | `approx_n_unique` / `approx_quantile` | one pass, mergeable, no sampling error to reason about |
 :::
 
 Sampling to *estimate* an aggregate is usually the wrong tool. The engine already has
-exact and sketch-based answers that read the same data in one pass: `approx_n_unique`
-runs a HyperLogLog (about 2% error) and `approx_quantile` a DDSketch. Both are mergeable,
+exact and sketch-based answers that read the same data in one pass. `approx_n_unique`
+runs a HyperLogLog, and `approx_quantile` streams a TDigest, or answers from a learned
+KLL sketch left behind by a past run when one is available. Both sketches are mergeable,
 so they give the same number single-node and distributed.
 
 ```python
@@ -154,8 +155,8 @@ print(ds.approx_median("value"))
 # 499.5
 ```
 
-Sample when you want *rows* (to eyeball data, to build a dev fixture, to train on a
-subset). Sketch when you want a *number*.
+Sample when you want *rows*, such as data to eyeball, a dev fixture, or a subset to train
+on. Sketch when you want a *number*.
 
 ## See also
 

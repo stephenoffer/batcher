@@ -9,6 +9,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -37,8 +38,6 @@ def test_json_extract_malformed_is_null():
 
 
 def test_json_extract_int(duck):
-    from conftest import assert_same
-
     t = _json_table()
     duck.register("j", t)
     out = bt.from_arrow(t).select(n=col("j").json.extract_int("$.n")).collect()
@@ -46,8 +45,6 @@ def test_json_extract_int(duck):
 
 
 def test_json_extract_float(duck):
-    from conftest import assert_same
-
     t = _json_table()
     duck.register("j", t)
     out = bt.from_arrow(t).select(f=col("j").json.extract_float("$.f")).collect()
@@ -55,8 +52,6 @@ def test_json_extract_float(duck):
 
 
 def test_json_extract_bool(duck):
-    from conftest import assert_same
-
     t = _json_table()
     duck.register("j", t)
     out = bt.from_arrow(t).select(b=col("j").json.extract_bool("$.b")).collect()

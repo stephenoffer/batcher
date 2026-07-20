@@ -20,7 +20,7 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.config import active_config
 from batcher.io.formats.base import SOURCES
 from batcher.io.splits import Split
@@ -30,11 +30,7 @@ __all__ = ["HDF5SliceSplit", "HDF5Source"]
 
 def _require_h5py() -> Any:
     """Import and return the `h5py` module or raise `BackendError`."""
-    try:
-        import h5py
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError("HDF5 requires h5py: pip install 'batcher-engine[hdf5]'") from exc
-    return h5py
+    return require("h5py", feature="HDF5", provides="h5py", extra="hdf5")
 
 
 def _slice_to_batch(array: Any, projection: list[str] | None) -> pa.RecordBatch:

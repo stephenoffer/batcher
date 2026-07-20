@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, gcd, hypot, lcm, lit, width_bucket
 
 pytestmark = pytest.mark.differential
@@ -24,8 +25,6 @@ def _ints():
 
 
 def test_gcd_lcm_match_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _ints())
     out = (
         bt.from_arrow(_ints())
@@ -36,8 +35,6 @@ def test_gcd_lcm_match_duckdb(duck):
 
 
 def test_factorial_bit_count_match_duckdb(duck):
-    from conftest import assert_same
-
     # Small values so factorial stays in DuckDB's HUGEINT range.
     data = pa.table({"a": pa.array([6, 5, 3, 0, 10], type=pa.int64())})
     duck.register("t", data)

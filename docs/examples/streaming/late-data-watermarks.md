@@ -176,7 +176,7 @@ the key is gone.
 
 :::{important}
 Your lateness is therefore also your deduplication window. Size it to
-your producer's retry behavior, not just to your window latency.
+your producer's retry behavior, not only to your window latency.
 :::
 
 ## What you don't get

@@ -13,7 +13,7 @@ production.
 
 | The leak | What it looks like | The fix |
 | --- | --- | --- |
-| The same entity on both sides | a user's events split across train and test; the model memorizes the user | `key="user_id"` — hash the entity, not the row |
+| The same entity on both sides | a user's events split across train and test; the model memorizes the user | `key="user_id"`, which hashes the entity rather than the row |
 | The split moves when you touch a feature | two experiments compared on two different test sets | name a stable `key`; the default hashes every column |
 | The future in the training set | a random split over time-ordered data trains on Tuesday to predict Monday | cut on time with a `filter`, and hold out a gap |
 
@@ -62,7 +62,7 @@ print(sorted(train_users), sorted(test_users), train_users & test_users)
 The intersection is empty by construction, because the assignment is a function of
 `user_id` alone. The part sizes now follow the *users*, not the rows, so a whale with
 10,000 events moves as one block, which is exactly what you want and also why the split is
-lumpier. Check the row counts, not just the entity counts.
+lumpier. Check the row counts, not only the entity counts.
 
 Group-splitting is the correct default for anything with a repeated actor: users, patient
 IDs, source documents, product SKUs, or a `session_id` in clickstream data.

@@ -24,7 +24,7 @@ work rather than a claim about less of it.
 | Batch inference | ResNet-50 | **2.05×** |
 | Batch embeddings (image) | ResNet-50 features | **1.98×** |
 | Fractional-GPU packing | EfficientNet-B0, 2 per GPU | **1.96×** |
-| Multimodal (JPEG → GPU) | two-stage decode → model | **1.3–2×** |
+| Multimodal (JPEG → GPU) | two-stage decode → model | **1.3x to 2x** |
 | Zero-config GPU | `map_batches(Model, num_gpus=1)` | Ray Data hard-errors |
 
 These come from general engine mechanisms, not per-workload tuning, which is why they carry
@@ -55,7 +55,7 @@ Same result, same hardware. The device just stops waiting. This is an execution 
 of the engine rather than a feature of the inference operator, so any CPU→GPU pipeline
 inherits it.
 
-A caveat worth stating, because it cuts against us elsewhere: a *higher* GPU-utilization
+A caveat worth stating, because it cuts the other way elsewhere: a *higher* GPU-utilization
 percentage is not automatically better. A slower engine spreads the same GPU work over more
 wall-clock and reads as higher utilization. Throughput is the number that matters;
 utilization only explains it.
@@ -85,25 +85,25 @@ one image, not the job.
 The two tables below were measured on a single 96-core CPU node. Everything above them was
 measured on an 8×T4 cluster. Read them as separate results: an img/s figure from one machine
 and a clip/s figure from another are not on the same axis, however tempting the arithmetic
-is. [Methodology](methodology.md) has the hardware per family.
+is. {doc}`methodology` has the hardware per family.
 :::
 
 Turning a corpus of media files into model-ready tensors, on one 96-core node, against both
 competitors:
 
-**Image decode + resize** — 2,000 JPEGs, 640×480 → 224×224:
+**Image decode and resize.** 2,000 JPEGs, 640x480 to 224x224:
 
 | Engine | Time | Throughput | Batcher's lead |
 |---|---:|---:|:---:|
-| **Batcher** | 351 ms | 5,693 img/s | — |
+| **Batcher** | 351 ms | 5,693 img/s | baseline |
 | Daft | 838 ms | 2,388 img/s | **2.4×** |
 | Ray Data | 2,136 ms | 936 img/s | **6.1×** |
 
-**Point-cloud / LiDAR → torch** — 20,000 frames of 4,096×3 points:
+**Point cloud and LiDAR to torch.** 20,000 frames of 4,096x3 points:
 
 | Engine | Time | Throughput | Batcher's lead |
 |---|---:|---:|:---:|
-| **Batcher** | 932 ms | 21,467 frames/s | — |
+| **Batcher** | 932 ms | 21,467 frames/s | baseline |
 | Ray Data | 2,198 ms | 9,099 frames/s | **2.4×** |
 
 The point-cloud win needed no modality-specific work. It falls out of the same tensor-column
@@ -123,13 +123,13 @@ documentation concedes it runs about 20% slower than a native PyTorch `DataLoade
 
 ## See also
 
-- [vs Ray Data](vs-ray-data.md): the same workloads, arranged as a head-to-head.
-- [Multimodal ingest](multimodal-ingest.md): the image, point-cloud, audio and video
+- {doc}`vs-ray-data`: the same workloads, arranged as a head-to-head.
+- {doc}`multimodal-ingest`: the image, point-cloud, audio and video
   pipelines in full, including the part where they lost.
-- [GPU execution](../deep-dives/gpu-execution.md): stage overlap and the warm pool, from the
+- {doc}`../deep-dives/gpu-execution`: stage overlap and the warm pool, from the
   inside.
-- [Tensor columns](../deep-dives/tensor-columns.md): the representation the point-cloud win
+- {doc}`../deep-dives/tensor-columns`: the representation the point-cloud win
   falls out of.
-- [ML guide](../ml/index.md) and [GPU inference](../ml/gpu.md): how to write these pipelines.
-- [Analytics and I/O benchmarks](analytics.md): the relational half.
-- [Methodology](methodology.md): the machines, and the correctness gate.
+- {doc}`../ml/index` and {doc}`../ml/gpu`: how to write these pipelines.
+- {doc}`analytics`: the relational half.
+- {doc}`methodology`: the machines, and the correctness gate.

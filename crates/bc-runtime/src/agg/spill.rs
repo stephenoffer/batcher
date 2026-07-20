@@ -223,6 +223,28 @@ pub struct DiskSpillStore {
     bytes_per_partition: Vec<u64>,
 }
 
+/// Restrict a spill directory to its owner (`0o700` on Unix); best-effort elsewhere.
+///
+/// Spilled data is the query's *actual rows* — the same bytes the caller may have taken
+/// care to encrypt in flight — written to a shared scratch path such as `/tmp`. Created
+/// with the default mode it is world-readable, so any other local user on the node can
+/// read a spilled join or aggregate. Restricting the directory is the single choke point:
+/// without search permission on it, the `part-*.arrow` files inside are unreachable
+/// regardless of their own mode.
+///
+/// Best-effort by design — a filesystem that cannot represent Unix modes (or a Windows
+/// host) must not fail the query over a hardening step, and the spill path is otherwise
+/// platform-neutral.
+fn restrict_to_owner(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
 impl DiskSpillStore {
     /// Create `partitions` empty, **uncompressed** spill files under a private
     /// subdirectory of `root` — the historical path, byte-for-byte unchanged.
@@ -247,6 +269,7 @@ impl DiskSpillStore {
         let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = root.join(format!("bc-spill-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
+        restrict_to_owner(&dir);
         let n = partitions.max(1);
         let paths = (0..n)
             .map(|i| dir.join(format!("part-{i}.arrow")))
@@ -971,5 +994,19 @@ mod tests {
         let mut store = MemSpillStore::new(1);
         let got = spilled(&keys, &vals, 3, &mut store);
         assert_eq!(want, to_map(&got.group_columns[0], &got.agg_columns));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spill_directory_is_not_readable_by_other_local_users() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Spilled data is the query's actual rows, written to a shared scratch path.
+        // Created with the default mode it is world-readable, so a co-tenant on the node
+        // could read a spilled join or aggregate straight off disk.
+        let root = std::env::temp_dir();
+        let store = DiskSpillStore::new(root, 2).unwrap();
+        let mode = std::fs::metadata(&store.dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "spill dir mode was {:o}", mode & 0o777);
     }
 }

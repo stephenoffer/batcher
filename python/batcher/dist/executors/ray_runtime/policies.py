@@ -31,6 +31,34 @@ _FATAL_RAY_ERROR_NAMES = (
 )
 
 
+def is_recoverable_task_failure(exc: BaseException) -> bool:
+    """Whether a `RayTaskError` reports lost data rather than a deterministic bug.
+
+    `gather_map_results` can re-raise every `RayTaskError` outright, because a map task
+    that fails reports worker loss as a *Ray* error. The combiner tree cannot: a combine
+    fetches from its upstreams inside the task, so a genuinely-lost peer surfaces as a
+    `RetryableShuffleError` **wrapped in** a `RayTaskError` — indistinguishable, by type
+    alone, from a user's UDF raising `ZeroDivisionError`.
+
+    Treating them alike in either direction is a real failure. Retrying everything makes a
+    deterministic bug burn the whole recovery budget and then surface as
+    `ResourceError("shuffle did not recover...")` with the original traceback gone — a
+    resource error for a Python bug. Re-raising everything would abort a query whose only
+    problem was a preempted peer, which is exactly what recovery exists to survive.
+
+    So the transport's own classification decides. `RetryableShuffleError` (the Rust
+    `FetchFault::Retryable`, i.e. an unreachable peer) and `ResourceError` (a spill file
+    that vanished with an ephemeral disk) are recoverable; `FatalShuffleError` and every
+    application exception are not. Ray fuses the original type into the raised class, so
+    the instance check usually matches directly; `cause` covers the versions where it does
+    not.
+    """
+    from batcher._internal.errors import ResourceError, RetryableShuffleError
+
+    recoverable = (RetryableShuffleError, ResourceError)
+    return isinstance(exc, recoverable) or isinstance(getattr(exc, "cause", None), recoverable)
+
+
 def _is_fatal_ray_error(exc: BaseException) -> bool:
     """Whether `exc` is a Ray error that a worker-loss retry must NOT absorb."""
     try:

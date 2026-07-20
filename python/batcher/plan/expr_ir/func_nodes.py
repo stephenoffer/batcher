@@ -20,6 +20,7 @@ from batcher.plan.expr_ir.fn_names import (
     STR_FNS,
     ListBinaryFn,
     ListSetFn,
+    ListZipFn,
     MapFn,
 )
 from batcher.plan.expr_ir.node_base import IRNode, child, expr_node, literal, scalar
@@ -101,6 +102,19 @@ class ListSet(IRNode):
 
     tag = ExprTag.LIST_SET
     vocab = frozenset(ListSetFn)
+    fn: str = scalar()
+    left: Expr = child()
+    right: Expr = child()
+
+
+@expr_node
+class ListZip(IRNode):
+    """Element-wise arithmetic between two equal-length numeric List columns
+    (`list_add`/`list_subtract`/`list_multiply`) — the embedding-math primitive. Built
+    via ``.list.add`` / ``.list.subtract`` / ``.list.multiply``. → List<Float64>."""
+
+    tag = ExprTag.LIST_ZIP
+    vocab = frozenset(ListZipFn)
     fn: str = scalar()
     left: Expr = child()
     right: Expr = child()

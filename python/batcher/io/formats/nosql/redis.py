@@ -84,7 +84,7 @@ class RedisSource(ScanSource):
             host=kw["host"],
             port=kw["port"],
             db=kw["db"],
-            password=kw["password"],
+            password=self._secret("password"),
             decode_responses=True,
         )
 
@@ -113,9 +113,16 @@ class RedisSource(ScanSource):
         predicate: dict | None = None,  # noqa: ARG002 (a key/value scan has no server-side filter)
     ) -> Iterator[pa.RecordBatch]:
         client = self._client()
-        rows = _scan_range(client, partition, self._conn_kwargs["match"])
-        for batch in rows_to_batches(rows, schema=_REDIS_SCHEMA):
-            yield batch.select(projection) if projection else batch
+        try:
+            rows = _scan_range(client, partition, self._conn_kwargs["match"])
+            for batch in rows_to_batches(rows, schema=_REDIS_SCHEMA):
+                yield batch.select(projection) if projection else batch
+        finally:
+            # There was no cleanup here at all — not even a GC-time one, since nothing
+            # closed the client on the normal path either. Every partition read leaked a
+            # connection pool, so a wide scan exhausted Redis's `maxclients` rather than
+            # merely holding sockets a little too long.
+            client.close()
 
 
 def _scan_range(client: Any, slot_range: _SlotRange, match: str) -> Iterator[dict[str, Any]]:

@@ -26,6 +26,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, lit
 
 pytestmark = pytest.mark.differential
@@ -44,38 +45,28 @@ def _t(duck):
 
 def test_or_to_in_range_keeps_nan_disjunct(duck):
     """`f = 0.0 OR f = NaN OR f = 2.0` must keep NaN rows (the added range must not drop them)."""
-    from conftest import assert_same
-
     ds = _t(duck)
     out = ds.filter((col("f") == lit(0.0)) | (col("f") == lit(_NAN)) | (col("f") == lit(2.0)))
     out = out.select("f").collect()
     assert_same(
         out,
-        duck.sql(
-            "SELECT f FROM nant WHERE f = 0.0 OR f = CAST('nan' AS DOUBLE) OR f = 2.0"
-        ),
+        duck.sql("SELECT f FROM nant WHERE f = 0.0 OR f = CAST('nan' AS DOUBLE) OR f = 2.0"),
     )
 
 
 def test_or_to_in_range_leading_nan(duck):
     """A NaN first in the OR list must not collapse the whole filter (Python min([nan,…])=nan)."""
-    from conftest import assert_same
-
     ds = _t(duck)
     out = ds.filter((col("f") == lit(_NAN)) | (col("f") == lit(0.0)) | (col("f") == lit(2.0)))
     out = out.select("f").collect()
     assert_same(
         out,
-        duck.sql(
-            "SELECT f FROM nant WHERE f = CAST('nan' AS DOUBLE) OR f = 0.0 OR f = 2.0"
-        ),
+        duck.sql("SELECT f FROM nant WHERE f = CAST('nan' AS DOUBLE) OR f = 0.0 OR f = 2.0"),
     )
 
 
 def test_constant_fold_nan_comparison_via_propagation(duck):
     """`f > -0.0 AND f = NaN` must keep the NaN row (fold of `NaN > -0.0` must not be FALSE)."""
-    from conftest import assert_same
-
     ds = _t(duck)
     out = ds.filter((col("f") > lit(-0.0)) & (col("f") == lit(_NAN))).select("f").collect()
     assert_same(

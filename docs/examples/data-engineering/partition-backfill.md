@@ -78,7 +78,7 @@ key-shaped. Using the wrong one produces a table that looks fine and is wrong.
 
 | Write | What it reconciles | Target rows the source never mentions | Use it for | It is wrong when |
 |---|---|---|---|---|
-| `mode="append"` | nothing; it adds rows | untouched | a fresh partition nobody has written yet | the rows are already in the table — you get them twice |
+| `mode="append"` | nothing; it adds rows | untouched | a fresh partition nobody has written yet | the rows are already in the table, so you get them twice |
 | `merge_on=` | rows, by key | survive | upserts, CDC, dimension loads | a correct backfill must *delete* rows the recompute no longer produces |
 | `replace_where=` | a region, by predicate | deleted | rebuilding a day, a partition, any slice | the predicate is wider than the slice your source actually produces |
 
@@ -148,7 +148,7 @@ print(bt.read.parquet_dataset(lake).sort("day", "revenue").to_pydict())
 
 The partition column is not in the payload (it lives in the directory name, and
 `parquet_dataset` recovers it on read). Two caveats, both real: the rewrite is not atomic,
-so a concurrent reader can catch it mid-swap; and it only replaces the part files it
+so a concurrent reader can catch it mid-swap. It also only replaces the part files it
 writes, so if the old partition had more parts than the new one, the leftovers are still
 there and still readable. `repartition(num_files=1)` above keeps that from biting, and
 `bt.compact` (see [file compaction](file-compaction.md)) cleans up after a write that did

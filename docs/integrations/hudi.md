@@ -135,7 +135,7 @@ is copy-on-write with no pending log files. That guarantee is the catch, so meas
 it.
 
 Predicate pushdown does work. An AND of column-vs-literal comparisons becomes hudi-rs filter tuples
-and prunes at the source. Anything it cannot express (an `OR`, a computed term) is simply not
+and prunes at the source. Anything it cannot express, such as an `OR` or a computed term, is not
 pushed, and the engine's own filter produces the same rows over a wider scan. If hudi-rs rejects
 the pushed filters outright, on a version or format mismatch, the read retries unfiltered rather
 than failing. A correct answer is never at stake, only I/O.

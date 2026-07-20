@@ -15,7 +15,7 @@ them to a different shape, gets no timing rather than a fast one.
 This page mixes two machines. The image, point-cloud, and audio-decode results are a single
 96-core CPU node; the audio *pipeline* and the video results are an 8×T4 Ray cluster,
 because they run a model. The tables are not comparable with each other, only within
-themselves. [Methodology](methodology.md) lists the hardware per family.
+themselves. {doc}`methodology` lists the hardware per family.
 :::
 
 ## Image decode and resize
@@ -67,7 +67,7 @@ the large-row regime where a fixed `batch_size` either wastes memory or blows it
 `batch_size` or it runs out of memory. Batcher's morselization is byte-aware, so a morsel
 splits at whichever bound trips first and a few very wide rows cannot blow the budget.
 
-## The part where we lost
+## The measured regression
 
 Image ingest started this work at **~350 img/s**, behind Ray Data *and* Daft. It finished at
 5,693, about 16×.
@@ -77,7 +77,7 @@ Image ingest started this work at **~350 img/s**, behind Ray Data *and* Daft. It
    parallel executor capped its rayon pool to the morsel count. A small-JPEG corpus is one
    morsel, so the entire decode of the entire corpus ran single-threaded. The kernels now do
    a rayon per-row `map_rows`, and `contains_media_decode()` on the plan lifts the pool to
-   every core for a media query. Decode alone: 17–22×.
+   every core for a media query. Decode alone runs 17x to 22x ahead.
 2. **A re-type UDF was halving throughput.** `read.images(decode=True)` appended a Python
    `map_batches` purely to re-type the flat list as a shaped tensor. *Any* downstream
    `map_batches`, even an identity one, roughly halves throughput and core use. The reader
@@ -110,14 +110,14 @@ python benchmarks/cluster/gpu_video.py
 
 ## See also
 
-- [AI and GPU](ai-and-gpu.md): the ten GPU workload families.
-- [vs Daft](vs-daft.md): the engine the image pipeline had to pass to get here.
-- [Multimodal guide](../ml/multimodal.md): how to write these pipelines.
-- [Tensor columns](../deep-dives/tensor-columns.md): the `fixed_shape_tensor` representation
+- {doc}`ai-and-gpu`: the ten GPU workload families.
+- {doc}`vs-daft`: the engine the image pipeline had to pass to get here.
+- {doc}`../ml/multimodal`: how to write these pipelines.
+- {doc}`../deep-dives/tensor-columns`: the `fixed_shape_tensor` representation
   fix 2 turned on.
-- [Morsel parallelism](../deep-dives/morsel-parallelism.md): the pool sizing that fix 1
+- {doc}`../deep-dives/morsel-parallelism`: the pool sizing that fix 1
   corrected.
-- [UDFs](../user-guide/udfs.md): the cost of the Python boundary, and how to avoid paying
+- {doc}`../user-guide/udfs`: the cost of the Python boundary, and how to avoid paying
   it.
-- [Methodology](methodology.md): the machines; the 96-core and 8×T4 tables above are not
+- {doc}`methodology`: the machines; the 96-core and 8×T4 tables above are not
   comparable with each other.

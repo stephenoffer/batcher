@@ -143,44 +143,15 @@ _INFERENCE_VRAM_MULTIPLIER = 1.5
 def detect_backend() -> str:
     """The accelerator backend: ``cuda`` / ``rocm`` / ``xpu`` / ``mps`` / ``tpu`` / ``cpu``.
 
-    Detected via torch (the most portable probe): ROCm reports through the CUDA API
-    with ``torch.version.hip`` set; Intel GPUs via ``torch.xpu``; Apple via MPS; Cloud
-    TPUs via ``torch_xla``. Falls back to ``cpu`` when torch is absent or no accelerator
-    is present.
+    Thin re-export of `_internal.hardware.accelerator_backend`. The detection itself is a
+    hardware fact and lives in the neutral layer so `core` can use it to place the
+    relational GPU kernels without importing this user-facing package; keeping one
+    implementation is what stops the executor and the ML layer from disagreeing about
+    which device is present.
     """
-    try:
-        import torch
-    except ImportError:
-        return "cpu"
-    if torch.cuda.is_available():
-        return "rocm" if getattr(torch.version, "hip", None) else "cuda"
-    xpu = getattr(torch, "xpu", None)
-    if xpu is not None and xpu.is_available():
-        return "xpu"
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
-        return "mps"
-    if _tpu_available():
-        return "tpu"
-    return "cpu"
+    from batcher._internal.hardware import accelerator_backend
 
-
-def _tpu_available() -> bool:
-    """Whether a Cloud TPU is present, via `torch_xla` — import-gated and side-effect-free.
-
-    `find_spec` avoids importing (and so initializing) the XLA runtime on the common
-    no-TPU host; only when `torch_xla` is actually installed do we ask its runtime for
-    the device type. Any failure (older API, no device) reads as "no TPU"."""
-    import importlib.util
-
-    if importlib.util.find_spec("torch_xla") is None:
-        return False
-    try:
-        import torch_xla.runtime as xr  # type: ignore[import-not-found]
-
-        return xr.device_type() == "TPU"
-    except Exception:
-        return False
+    return accelerator_backend()
 
 
 def torch_device(backend: str | None = None) -> str:
@@ -188,6 +159,13 @@ def torch_device(backend: str | None = None) -> str:
 
     ROCm uses the ``cuda`` device string (HIP shims the CUDA API); Intel is ``xpu``,
     Apple ``mps``, a TPU is ``xla`` (torch_xla), and CPU ``cpu``.
+
+    An unrecognized backend degrades to ``cpu`` rather than raising. This is a mapping of
+    *names*, and the names come from places this function does not control — a caller
+    naming an accelerator we have not taught it about (``"hpu"``, ``"neuron"``), or a newer
+    `detect_backend`. A `KeyError` from a device-string lookup would abort a job that could
+    have run correctly, if slower, on the CPU; the whole point of the accelerator layer is
+    that it is an optimization.
     """
     b = backend or detect_backend()
     return {
@@ -197,7 +175,7 @@ def torch_device(backend: str | None = None) -> str:
         "mps": "mps",
         "tpu": "xla",
         "cpu": "cpu",
-    }[b]
+    }.get(b, "cpu")
 
 
 def vram_context_overhead(backend: str | None = None) -> float:
@@ -506,6 +484,14 @@ def recommend_inference_dtype(backend: str | None = None) -> str | None:
     ``"float16"`` on Turing/Volta and Apple MPS (fast FP16, no native BF16), and `None`
     (keep FP32) on older/CPU/probe-failure so the model never silently loses precision
     where half gives no speedup. The per-GPU default Ray Data users otherwise set by hand.
+
+    TPU and Intel XPU deliberately still return `None`, even though both have native BF16
+    and a TPU's MXU multiplies in it. Returning ``"bfloat16"`` there would set the model's
+    *storage* dtype, which is a stronger change than the FP32→BF16 rewrite XLA already
+    applies to matmuls on its own — so it is a numerics change, not just a speed one, and
+    nobody has measured it on the hardware. Characterize it on a real device before
+    changing this; an unvalidated half-precision default is exactly the "fast wrong
+    answer" this function exists to avoid.
     """
     b = backend or detect_backend()
     try:

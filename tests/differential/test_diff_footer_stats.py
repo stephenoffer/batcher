@@ -21,11 +21,11 @@ from batcher import col, count
 duckdb = pytest.importorskip("duckdb")
 pytest.importorskip("batcher._native", reason="native engine not built")
 
+from _harness import assert_same  # noqa: E402
 from batcher.api.terminal.metadata_answer import (  # noqa: E402
     metadata_aggregate_table,
     metadata_count,
 )
-from conftest import assert_same  # noqa: E402
 
 
 @pytest.fixture

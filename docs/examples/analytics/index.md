@@ -23,7 +23,7 @@ whichever reads better for the question you are asking.
 :::{grid-item-card} {octicon}`stack;1.1em` Cohort analysis
 :link: cohort-analysis
 :link-type: doc
-A row has no cohort; a user does. Label the user, then pivot the triangle.
+A row has no cohort. A user does. Label the user, then pivot the triangle.
 :::
 
 :::{grid-item-card} {octicon}`meter;1.1em` Retention curves

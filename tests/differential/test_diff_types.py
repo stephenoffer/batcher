@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, count
 
 
@@ -25,8 +26,6 @@ def t(duck):
 
 
 def test_narrow_groupby_agg(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .group_by("k")
@@ -39,15 +38,11 @@ def test_narrow_groupby_agg(duck, t):
 
 
 def test_narrow_filter_projection(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter(col("u") > 200).select(r=col("a") * col("k") + col("b")).collect()
     assert_same(out, duck.sql("SELECT a*k + b AS r FROM t WHERE u > 200"))
 
 
 def test_narrow_join(duck, t):
-    from conftest import assert_same
-
     dim = pa.table({"k": pa.array([1, 2, 3], pa.int32()), "name": ["x", "y", "z"]})
     duck.register("dim", dim)
     out = bt.from_arrow(t).join(bt.from_arrow(dim), on="k").select("k", "name", "a").collect()

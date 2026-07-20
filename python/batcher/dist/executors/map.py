@@ -36,6 +36,7 @@ from batcher.dist.executors.partition_io import (
 from batcher.dist.executors.plan_analysis import _relabel_single_source
 from batcher.dist.executors.ray_runtime import _ensure_ray, engine_config_json
 from batcher.io.source import Source
+from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import LogicalPlan, MapBatches
 
 # Smallest CPU share a task may request: a tiny partition gets a fraction of a core so
@@ -69,6 +70,14 @@ _INFERENCE_POOLS: contextvars.ContextVar[dict[tuple, list] | None] = contextvars
 # execution, paying the ~20x-first-batch cold start each time). Torn down at process exit or
 # by `release_inference_pools()`; a pool whose actors died is rebuilt on next use.
 _SESSION_POOLS: dict[tuple, list] = {}
+
+# Pins the `fn` objects whose `id()` a live pool's key was built from. Without this the key
+# is a bare address: once a pipeline's model callable is freed (its `Dataset` went out of
+# scope while the warm pool outlived it), CPython may hand that same address to a *different*
+# model, whose pipeline then matches the old key and silently runs inference on the wrong
+# model. `kyber.plan_cache` pins its source objects for exactly this reason. Keyed by the
+# same signature as the registries, and dropped in step with them.
+_POOL_KEEPALIVE: dict[tuple, tuple] = {}
 
 
 def release_inference_pools() -> None:
@@ -111,20 +120,40 @@ def _shutdown_pools(registry: dict[tuple, list]) -> None:
         for actor in actors:
             with contextlib.suppress(Exception):
                 ray.kill(actor)
+    _unpin_pool_keys(registry)
     registry.clear()
+
+
+def _pipeline_functions(plan0: LogicalPlan) -> tuple:
+    """`plan0`'s `map_batches` callables, outermost first (a class factory is one object)."""
+    fns: list[object] = []
+    node: LogicalPlan | None = plan0
+    while node is not None:
+        if isinstance(node, MapBatches):
+            fns.append(node.fn)
+        node = getattr(node, "input", None)
+    return tuple(fns)
 
 
 def _pipeline_signature(plan0: LogicalPlan) -> tuple:
     """A reuse key for `plan0`'s inference pool: the identities of its `map_batches`
     functions (a class factory is one stable object), so the same model maps to the same
-    resident pool and a different model gets its own."""
-    fns: list[int] = []
-    node: LogicalPlan | None = plan0
-    while node is not None:
-        if isinstance(node, MapBatches):
-            fns.append(id(node.fn))
-        node = getattr(node, "input", None)
-    return tuple(fns)
+    resident pool and a different model gets its own.
+
+    The key is only as stable as those addresses, so whoever stores a pool under it must
+    also pin the callables in `_POOL_KEEPALIVE` — see `_pin_pool_key`."""
+    return tuple(id(fn) for fn in _pipeline_functions(plan0))
+
+
+def _pin_pool_key(sig: tuple, plan0: LogicalPlan) -> None:
+    """Hold `plan0`'s callables alive for as long as a pool is cached under `sig`."""
+    _POOL_KEEPALIVE[sig] = _pipeline_functions(plan0)
+
+
+def _unpin_pool_keys(sigs) -> None:
+    """Release the callables pinned for `sigs` (their pools are gone)."""
+    for sig in list(sigs):
+        _POOL_KEEPALIVE.pop(sig, None)
 
 
 def _new_map_actor(plan0: LogicalPlan, opts: dict):
@@ -147,6 +176,7 @@ def _resident_pool_for(plan0: LogicalPlan, opts: dict, size: int, registry: dict
     if len(pool) < max(1, size):
         pool = pool + [_new_map_actor(plan0, opts) for _ in range(max(1, size) - len(pool))]
     registry[sig] = pool
+    _pin_pool_key(sig, plan0)
     return pool
 
 
@@ -259,9 +289,11 @@ def _evict_session_pool(plan0) -> None:
     """Drop (and kill) the session-warm pool for `plan0` — after a preemption or on demand."""
     import ray
 
-    for actor in _SESSION_POOLS.pop(_pipeline_signature(plan0), []):
+    sig = _pipeline_signature(plan0)
+    for actor in _SESSION_POOLS.pop(sig, []):
         with contextlib.suppress(Exception):
             ray.kill(actor)
+    _unpin_pool_keys([sig])
 
 
 def _map_resources(plan: LogicalPlan) -> tuple[float, bool, object, str | None]:
@@ -274,12 +306,18 @@ def _map_resources(plan: LogicalPlan) -> tuple[float, bool, object, str | None]:
     wants_pool = False
     concurrency: object = None
     accelerator_type: str | None = None
+    resources: dict[str, float] = {}
     node: LogicalPlan | None = plan
     while node is not None:
         if isinstance(node, MapBatches):
             num_gpus = max(num_gpus, node.num_gpus)
             if node.accelerator_type is not None:
                 accelerator_type = node.accelerator_type
+            # Stacked map stages fuse into one task, so their accelerator needs combine:
+            # take the max per resource name, matching how `num_gpus` merges above. A
+            # stage asking for 4 TPU chips and one asking for 2 must get 4, not 2.
+            for name, amount in node.resources:
+                resources[name] = max(resources.get(name, 0.0), amount)
             # An explicit concurrency, or a class (factory) UDF that must build the
             # model once per worker, both require long-lived actors.
             if node.concurrency is not None or isinstance(node.fn, type):
@@ -287,7 +325,7 @@ def _map_resources(plan: LogicalPlan) -> tuple[float, bool, object, str | None]:
                 if node.concurrency is not None:
                     concurrency = _merge_concurrency(concurrency, node.concurrency)
         node = getattr(node, "input", None)
-    return num_gpus, wants_pool, concurrency, accelerator_type
+    return num_gpus, wants_pool, concurrency, accelerator_type, resources
 
 
 def _merge_concurrency(a: object, b: object) -> object:
@@ -333,7 +371,7 @@ def _distributed_map(
     default load-balanced assignment is fine for every order-independent map/scan."""
     _ensure_ray(workers)
     plan0, sid = _relabel_single_source(plan)
-    num_gpus, wants_pool, concurrency, accelerator_type = _map_resources(plan)
+    num_gpus, wants_pool, concurrency, accelerator_type, resources = _map_resources(plan)
     # Carbonite's scheduling envelope carries the *adapted* GPU request (the raw
     # `map_batches(num_gpus=...)` tag tuned by measured utilization). When present it
     # is authoritative, so the per-task `.options(num_gpus=...)` uses the adapted value.
@@ -361,7 +399,7 @@ def _distributed_map(
         sources[sid], n_parts, projection=proj, predicate=pred, preserve_order=preserve_order
     )
 
-    opts = _gpu_options(num_gpus, accelerator_type)
+    opts = _gpu_options(num_gpus, accelerator_type, resources)
     if wants_pool:
         if isinstance(concurrency, tuple):
             lo, hi = concurrency
@@ -661,10 +699,63 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
     weight *= _learned_weight_factor(plan, hub)
     rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
     want = math.ceil((total * weight) / rows_per_cpu)
+    want = max(want, _byte_partition_count(source, plan, total, hub))
     n = max(1, min(want, int(_cluster_cores())))
     with contextlib.suppress(Exception):
         n = min(n, max(1, len(source.splits())))  # never more tasks than splits
     return n
+
+
+def _byte_partition_count(source, plan, total_rows: int, hub=None) -> int:
+    """Task count implied by the source's *bytes*, not its rows.
+
+    Row count alone is the wrong unit whenever rows are wide: 4M rows of 4 KB thumbnails
+    and 4M rows of 200 MB videos size to the same fan-out, and the second lands ~800 GB on
+    one task. This is the ordinary shape of a multimodal scan, not an edge case.
+
+    `auto_num_partitions` (`api/tuning/decisions.py`) already shards *shuffle* partitions
+    this way, on the same `target_bytes_per_task` budget and the same estimator; the
+    map/scan fan-out simply never adopted it. Taking the larger of the row- and
+    byte-derived counts means a narrow source is unaffected and a wide one fans out.
+
+    Returns 1 — i.e. defers entirely to the row-derived count — when the width cannot be
+    estimated, since a task count only shards rows and is result-identical either way.
+    """
+    try:
+        import math
+
+        from batcher.config import active_config
+
+        opt = active_config().optimizer
+        total_bytes = _source_total_bytes(source)
+        if total_bytes is None:
+            from batcher.kyber import load_learned_stats
+            from batcher.kyber.cardinality import CardinalityEstimator
+
+            learned = load_learned_stats(_learning_hub(hub))
+            width = CardinalityEstimator(sources=[source], learned=learned).row_width(
+                plan, opt.row_bytes
+            )
+            total_bytes = total_rows * width
+        return max(1, math.ceil(total_bytes / max(1, opt.target_bytes_per_task)))
+    except Exception:  # pragma: no cover - sizing must never break a query
+        return 1
+
+
+def _source_total_bytes(source) -> float | None:
+    """The source's own byte total, when its statistics report one.
+
+    Preferred over `rows x estimated width` because the estimator's width for a
+    variable-length column is a *type prior* — 36 bytes for `binary`, whatever the column
+    actually holds. On a media corpus that prior is wrong by four orders of magnitude, and
+    it is exactly the case where byte-based sizing matters, so a source that knows its real
+    size (a listing gives it for free) must be believed over the prior.
+    """
+    try:
+        stats = source.statistics()
+    except Exception:
+        return None
+    return float(stats.byte_size) if stats is not None and stats.byte_size else None
 
 
 def _adaptive_task_cpus(partitions, plan, hub=None) -> list[float]:
@@ -711,7 +802,7 @@ def stream_distributed_map(plan: LogicalPlan, sources: list[Source], workers: in
 
     _ensure_ray(workers)
     plan0, sid = _relabel_single_source(plan)
-    num_gpus, _wants_pool, _concurrency, accelerator_type = _map_resources(plan)
+    num_gpus, _wants_pool, _concurrency, accelerator_type, resources = _map_resources(plan)
     from batcher.dist.executors.ray_runtime import current_envelope
 
     env = current_envelope()
@@ -720,7 +811,7 @@ def stream_distributed_map(plan: LogicalPlan, sources: list[Source], workers: in
 
     proj, pred = _scan_pushdown(plan0)
     partitions = partition_descriptors(sources[sid], workers, projection=proj, predicate=pred)
-    opts = _gpu_options(num_gpus, accelerator_type)
+    opts = _gpu_options(num_gpus, accelerator_type, resources)
     task = _map_udf_task.options(**opts) if opts else _map_udf_task
     pending = [task.remote(plan0, p) for p in partitions]
     # Collect one finished partition at a time so the driver holds a single partition's
@@ -749,14 +840,31 @@ def _record_gpu_feedback(
     record_gpu_peak_vram(hub, key, gpu_vram)
 
 
-def _gpu_options(num_gpus: float, accelerator_type: str | None) -> dict:
-    """Ray `.options(...)` GPU kwargs: reserve GPUs only when positive, pin the model
-    only when both a GPU and an `accelerator_type` are requested."""
+def _gpu_options(
+    num_gpus: float,
+    accelerator_type: str | None,
+    resources: dict[str, float] | None = None,
+) -> dict:
+    """Ray `.options(...)` accelerator kwargs: GPUs, a device-model pin, and custom
+    accelerator resources.
+
+    `num_gpus` covers every accelerator Ray reports as the ``GPU`` resource — NVIDIA, AMD,
+    Intel, MetaX. The rest are *custom resources* instead (``TPU``, ``neuron_cores``,
+    ``HPU``, ``NPU``, ...), which is what `resources` carries. Passing the dict straight
+    through rather than enumerating vendors is deliberate: it also covers a private on-prem
+    resource an operator defined on their own Ray cluster, which no vendor list could.
+
+    `accelerator_type` is applied whenever it is set, **not** only alongside `num_gpus`.
+    Gating it on GPUs silently dropped the pin on exactly the hardware that needs it most:
+    a TPU or Trainium node has `num_gpus == 0`, so a job asking for a specific device model
+    got no pin at all and could land on any node in the cluster."""
     opts: dict = {}
     if num_gpus:
         opts["num_gpus"] = num_gpus
-        if accelerator_type:
-            opts["accelerator_type"] = accelerator_type
+    if resources:
+        opts["resources"] = dict(resources)
+    if accelerator_type and (num_gpus or resources):
+        opts["accelerator_type"] = accelerator_type
     return opts
 
 
@@ -1115,7 +1223,6 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     the result; the driver `combine_finalize`s the partials (mergeable two-phase) and
     applies anything above the aggregate. The UDF — the costly part — runs across the
     cluster, not single-node on the driver."""
-    import json
 
     import pyarrow as pa
 
@@ -1126,8 +1233,7 @@ def _distributed_map_aggregate(above, agg, sources, workers):
 
     _ensure_ray(workers)
     map_plan, sid = _relabel_single_source(agg.input)
-    gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys])
-    aj = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+    gk, aj = agg_spec_json(agg)
     n_parts = _adaptive_partition_count(sources[sid], agg.input, workers)
     proj, pred = _scan_pushdown(map_plan)
     partitions = partition_descriptors(sources[sid], n_parts, projection=proj, predicate=pred)

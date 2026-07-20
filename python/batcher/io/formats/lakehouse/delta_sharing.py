@@ -20,6 +20,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SOURCES
 from batcher.io.splits import Split
@@ -29,14 +30,12 @@ __all__ = ["DeltaSharingFileSplit", "DeltaSharingSource"]
 
 def _require_delta_sharing() -> Any:
     """Import and return the `delta_sharing` module or raise `BackendError`."""
-    try:
-        import delta_sharing
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError(
-            "Delta Sharing support requires the delta-sharing client: "
-            "pip install 'batcher-engine[delta-sharing]'"
-        ) from exc
-    return delta_sharing
+    return require(
+        "delta_sharing",
+        feature="Delta Sharing support",
+        provides="the delta-sharing client",
+        extra="delta-sharing",
+    )
 
 
 def _parse_url(url: str) -> tuple[str, Any]:
@@ -68,6 +67,25 @@ def _list_files(url: str) -> list[Any]:
     except Exception as exc:
         raise BackendError(f"failed to list Delta Sharing files for {url!r}: {exc}") from exc
     return list(response.add_files)
+
+
+def _declared_rows(files: list[Any]) -> dict[str, int]:
+    """Each shared file's server-declared `numRecords`, keyed by its pre-signed URL."""
+    import json
+
+    out: dict[str, int] = {}
+    for f in files:
+        raw = getattr(f, "stats", None)
+        if not raw:
+            continue
+        try:
+            stats = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except (ValueError, TypeError):
+            continue
+        count = stats.get("numRecords")
+        if isinstance(count, int):
+            out[f.url] = count
+    return out
 
 
 def _surviving_urls(files: list[Any], predicate: dict | None) -> list[str]:
@@ -118,8 +136,16 @@ def _stats_manifest(files: list[Any]) -> pa.Table | None:
                 for column, value in (stats.get(key) or {}).items():
                     row[f"{prefix}{column}"] = value
         rows.append(row)
+    # `from_pylist` takes its column set from the FIRST dict alone. Files carry different
+    # stat columns — a file with no `stats` contributes only `path`/`num_records` — so if
+    # the first shared file happens to lack them, every `min.`/`max.`/`null_count.` column
+    # vanishes and the manifest prunes nothing, for the whole table, silently. The
+    # direction is safe (under-pruning never drops a row) but the cost is total: the zone
+    # maps the server went to the trouble of sending are discarded. Normalizing every row
+    # to the union of keys first is what makes the manifest reflect what actually arrived.
+    columns = {key: None for row in rows for key in row}
     try:
-        return pa.Table.from_pylist(rows)
+        return pa.Table.from_pylist([{**columns, **row} for row in rows])
     except (pa.ArrowInvalid, pa.ArrowTypeError):
         return None  # heterogeneous stat types across files → prune nothing
 
@@ -216,7 +242,11 @@ class DeltaSharingSource:
         """
         files = self._files()
         surviving = _surviving_urls(files, predicate)
-        return [DeltaSharingFileSplit(file_url=url) for url in surviving]
+        # The server already told us each file's row count in its `stats`. Carrying it on
+        # the split is what stops `row_count()` re-fetching a footer over a pre-signed URL
+        # once per split — see `DeltaSharingFileSplit.row_count`.
+        rows = _declared_rows(files)
+        return [DeltaSharingFileSplit(file_url=url, rows=rows.get(url)) for url in surviving]
 
 
 class DeltaSharingFileSplit:
@@ -226,10 +256,11 @@ class DeltaSharingFileSplit:
     that reads its single file directly from object storage.
     """
 
-    __slots__ = ("_file_url",)
+    __slots__ = ("_file_url", "_rows")
 
-    def __init__(self, *, file_url: str) -> None:
+    def __init__(self, *, file_url: str, rows: int | None = None) -> None:
         self._file_url = file_url
+        self._rows = rows
 
     def schema(self) -> pa.Schema:
         return _read_presigned(self._file_url, None).schema
@@ -245,6 +276,19 @@ class DeltaSharingFileSplit:
         yield from _read_presigned(self._file_url, projection, predicate).to_batches()
 
     def row_count(self) -> int | None:
+        """The count the sharing server declared, falling back to the file's own footer.
+
+        The server sends `numRecords` in each file's `stats`, and `splits()` now carries it
+        here. Without it this opened a **pre-signed URL per split** just to read a footer —
+        serially, on the driver, every time the planner balanced — re-fetching a number the
+        manifest had already parsed. The sibling `DeltaFileSplit` has always carried `rows`;
+        this is the same fix.
+
+        Returns:
+            The row count, or None if neither the server nor the footer states one.
+        """
+        if self._rows is not None:
+            return self._rows
         import pyarrow.parquet as pq
 
         fs = resolve_filesystem(self._file_url)

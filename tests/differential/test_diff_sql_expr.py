@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -33,8 +34,6 @@ def t(duck):
     ],
 )
 def test_string_concat(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
@@ -42,7 +41,6 @@ def test_concat_dataframe_roundtrip(duck, t):
     """`Binary("concat", ...)` round-trips through the JSON IR to the engine."""
     from batcher import col
     from batcher.plan.expr_ir import Binary
-    from conftest import assert_same
 
     out = bt.from_arrow(t).select("g", r=Binary("concat", col("a"), col("b"))).collect()
     assert_same(out, duck.sql("SELECT g, a || b AS r FROM t"))
@@ -58,8 +56,6 @@ def test_concat_dataframe_roundtrip(duck, t):
     ],
 )
 def test_case_without_else(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
@@ -71,8 +67,6 @@ def test_case_without_else(duck, t, q):
     ],
 )
 def test_null_literal(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
@@ -86,6 +80,4 @@ def test_null_literal(duck, t, q):
     ],
 )
 def test_aggregate_filter(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))

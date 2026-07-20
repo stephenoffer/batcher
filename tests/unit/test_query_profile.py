@@ -12,8 +12,7 @@ import json
 import pytest
 
 from batcher.plan.logical import Filter, Scan
-from batcher.plan.profile import OpProfile, QueryProfile, build_op_profiles
-from batcher.plan.profile.collect import _walk_ir
+from batcher.plan.profile import OpProfile, QueryProfile, build_op_profiles, walk_ir
 from batcher.plan.schema import SchemaRef
 from batcher.plan.visitor import walk
 
@@ -34,7 +33,7 @@ def test_ir_walk_matches_logical_walk_order():
 
     plan = Filter(_scan("a", "b"), col("a") > 1)
     ir = plan.to_ir()
-    walked = [n["op"] for _depth, n in _walk_ir(ir)]
+    walked = [n["op"] for _depth, n in walk_ir(ir)]
     expected_count = len(list(walk(plan)))  # logical nodes only
     assert walked == ["filter", "scan"]
     assert len(walked) == expected_count  # the predicate's `gt` is not a plan node

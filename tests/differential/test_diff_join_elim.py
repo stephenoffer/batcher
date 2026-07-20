@@ -14,6 +14,7 @@ import pyarrow as pa
 
 import batcher as bt
 import batcher.kyber.rules.extra.join_elim
+from _harness import assert_same
 from batcher import col
 from batcher.api.dataset import Dataset
 from batcher.io.source import InMemorySource, source_statistics
@@ -24,7 +25,6 @@ from batcher.plan.schema import SchemaRef
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
 from batcher.plan.visitor import walk
-from conftest import assert_same
 
 # --- fixtures ----------------------------------------------------------------
 
@@ -363,3 +363,46 @@ def test_overlapping_key_ranges_still_join(tmp_path, duck):
     out = dsl.join(dsr, on="k", how="inner").select("k", "w")
     assert not _empty_marked(out)  # the ranges touch at 3 → a match is possible
     assert_same(out.collect(), duck.sql("SELECT ol.k, orr.w FROM ol JOIN orr ON ol.k = orr.k"))
+
+
+def test_sketched_ndv_is_not_a_uniqueness_proof(duck):
+    """A measured (HyperLogLog) ndv must never license a uniqueness-gated rewrite.
+
+    `_right_unique_on_keys` gated on the column bundle's `provenance`, but a scanned
+    column carries EXACT *bounds* alongside a *sketched* ndv — so the bundle reads EXACT
+    while the count itself is a ~1%-error estimate. HLL overestimates above ~50k distinct
+    values, making `ndv >= rows` true for a table that is not unique, which then licensed
+    `eliminate_left_join`, `pre_aggregation_through_join`, and
+    `inner_join_to_semi_when_right_unique`.
+
+    The visible damage: this LEFT JOIN dropped one of key 0's two matches, and the
+    grouped aggregate below it halved SUM and COUNT. The gate must read the ndv's own
+    tag (`ndv_is_exact`), as every other consumer of these stats does.
+
+    The row count has to clear HLL's overestimate threshold (~50k) for the sketch to
+    exceed the true ndv, which is why this needs a large fixture rather than a toy one.
+    """
+    n = 60_000
+    # Key 0 appears twice, so the right side is NOT unique on `k`.
+    right = pa.table({"k": [*range(n - 1), 0], "c": [1.0] * n})
+    left = pa.table({"k": [0] * 40 + [1, 2], "a": list(range(42))})
+    duck.register("u_right", right)
+    duck.register("u_left", left)
+    dsl, dsr = bt.from_arrow(left), bt.from_arrow(right)
+
+    # The LEFT JOIN must keep both of key 0's matches for every left row.
+    assert_same(
+        dsl.join(dsr, on="k", how="left").select("k", "a").collect(),
+        duck.sql("SELECT l.k, l.a FROM u_left l LEFT JOIN u_right r ON l.k = r.k"),
+    )
+    # And an aggregate must not be pushed below the fan-out.
+    assert_same(
+        dsl.join(dsr, on="k", how="inner")
+        .group_by("k")
+        .agg(sa=bt.sum(col("a")), n=bt.count())
+        .collect(),
+        duck.sql(
+            "SELECT k, sum(a) AS sa, count(*) AS n "
+            "FROM u_left JOIN u_right USING (k) GROUP BY k"
+        ),
+    )

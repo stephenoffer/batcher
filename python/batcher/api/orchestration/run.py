@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
+from batcher._internal.hardware import available_cpu_count
+from batcher._internal.logging import get_logger, log_kv
 from batcher.api._join_helpers import _empty_result_schema
 from batcher.api.source_stats import (
     collect_source_stats,
@@ -33,9 +36,72 @@ DEFAULT_PARTITIONS = 16
 _MIN_PARTITIONS = 4
 _MAX_PARTITIONS = 4096
 
+_log = get_logger("api.run")
+
+
+def _phase(name: str, seconds: float) -> None:
+    """Record one contract-loop phase timing (stats → Kyber → Carbonite → Core) as DEBUG.
+
+    Formerly `print`s behind a `BATCHER_SORT_PROFILE` env var — stdout noise that no log
+    file, log shipper, or dashboard ever saw, and that a user could not turn on per
+    subsystem. On `batcher.api.run` at DEBUG they follow the one `log_level`, and the
+    phase/duration are structured fields, so "where did the control plane spend its time"
+    is answerable without re-parsing text.
+    """
+    log_kv(_log, logging.DEBUG, "run phase", phase=name, seconds=round(seconds, 3))
+
+
+def _log_decisions(opt, decisions, verdict, *, distributed: bool) -> None:
+    """Record the plan verdict at INFO and each join's build-side choice beside it.
+
+    This is what makes ``verbosity="verbose"`` mean what it says. The optimizer's choices
+    already existed as `Decision` objects on the profile, but the profile is an artifact you
+    read *afterwards* — so without these records the verbose rung showed nothing a user
+    could not already see at `normal`, and the level was a promise the engine did not keep.
+
+    INFO, not DEBUG: a join order flipping or an admission verdict turning infeasible is the
+    kind of thing an operator wants to see without opting into per-phase timing noise.
+    """
+    log_kv(
+        _log,
+        logging.INFO,
+        "plan admitted" if verdict.feasible else "plan infeasible",
+        ops=len(opt.ops),
+        feasible=verdict.feasible,
+        binding=verdict.binding_constraint or "none",
+        distributed=distributed,
+    )
+    for i, decision in enumerate(decisions):
+        log_kv(
+            _log,
+            logging.INFO,
+            "join build side",
+            join=i,
+            build=("right" if decision.swapped else "left"),
+            broadcast=decision.broadcast,
+            left_rows=round(decision.left_rows),
+            right_rows=round(decision.right_rows),
+            why=decision.provenance,
+        )
+
 
 def _clamp_partitions(n: int) -> int:
     return max(_MIN_PARTITIONS, min(_MAX_PARTITIONS, n))
+
+
+def _distributed_hardware():
+    """The cluster's `HardwareProfile` for planning, or `None` if the topology is unreadable.
+
+    Isolated so the `dist` import stays lazy — a single-node run never touches Ray — and so a
+    topology read that fails (Ray down, no worker nodes) degrades to `None`, leaving the
+    Optimizer to plan against the local machine rather than a fabricated cluster.
+    """
+    try:
+        from batcher.dist.executors.ray_runtime.scaling import cluster_hardware_profile
+
+        return cluster_hardware_profile()
+    except Exception:  # pragma: no cover - Ray optional / topology unreadable
+        return None
 
 
 def partitions_from_physical(opt: PhysicalPlan) -> int | None:
@@ -44,11 +110,19 @@ def partitions_from_physical(opt: PhysicalPlan) -> int | None:
     Reuses the per-breaker ``n_max_parallelism`` Kyber already computed (input rows
     / `target_rows_per_task`) — the same data-sized fan-out the distributed path
     uses — so out-of-core spilling shards by data volume instead of a blind 16.
+
+    Floored at the machine's usable core count, because data volume alone answers only half
+    the question. Kyber sizes this purely from rows, which is right for the distributed path
+    where `clamp_workers` refits it to the cluster afterwards — but nothing refits it here.
+    A 40M-row aggregate at the default 4M rows/task is 10 partitions whether the box has 4
+    cores or 128, and a spilled merge cannot use more cores than it has partitions, so the
+    other 118 sit idle for the whole out-of-core phase. Partitions are the unit of work; there
+    must be at least one per core for the phase to fill the machine.
     """
     widths = [op.bounds.n_max_parallelism for op in opt.ops if op.bounds.n_max_parallelism > 0]
     if not widths:
         return None
-    return _clamp_partitions(max(widths))
+    return _clamp_partitions(max(max(widths), available_cpu_count()))
 
 
 # `auto_num_partitions` (the data-sized spill/shuffle partition count, learned-seeded) is an
@@ -101,6 +175,36 @@ def run_relational(
         return _run_relational(plan, sources, ctx, distributed=distributed, materialize=materialize)
 
 
+def _projected_input_bytes(sources: list[Source], projections: dict[int, list[str]]) -> int:
+    """Bytes the sources would occupy if resolved whole, from metadata alone.
+
+    The in-memory path materializes every source before the engine starts, so this is
+    the resident cost of *reading*, independent of what the query then computes. It is
+    a declared `row_count()` times the projected schema's per-row width — no I/O, no
+    scan, so it is available early enough to choose the streaming path instead.
+
+    Returns `0` when any source cannot declare its size. A partial sum would understate
+    the total, and understating here is the direction that OOMs, so an unknown makes the
+    whole figure unknown rather than optimistic.
+    """
+    from batcher.plan.types import schema_row_bytes
+
+    total = 0.0
+    for i, src in enumerate(sources):
+        rows = _declared_row_count(src)
+        if rows is None or rows < 0:
+            return 0
+        try:
+            schema = src.schema()
+            projection = projections.get(i)
+            if projection:
+                schema = pa.schema([schema.field(schema.get_field_index(c)) for c in projection])
+        except Exception:  # pragma: no cover - a source that cannot describe itself
+            return 0
+        total += rows * schema_row_bytes(schema)
+    return int(total)
+
+
 def _declared_row_count(src: Source) -> int | None:
     """The exact row count a source declares without a scan, or None if it cannot.
 
@@ -147,7 +251,7 @@ def _run_relational(
     import time
 
     from batcher import carbonite, core, kyber
-    from batcher._internal.logging import ensure_configured, get_logger
+    from batcher._internal.logging import ensure_configured
 
     ensure_configured()
     _t0 = time.perf_counter()  # wall clock for the join-strategy bandit's per-run reward
@@ -156,33 +260,33 @@ def _run_relational(
     # the conductor's already-collected stats when present (the metadata-answer
     # attempt for a missed count()/is_empty() collected them), so a terminal op reads
     # each source's footer once across both passes.
-    import os as _rp_os
-
-    _rpp = _rp_os.environ.get("BATCHER_SORT_PROFILE")
     _rpt = time.perf_counter()
     source_stats = (
         ctx.source_stats
         if ctx.source_stats is not None
         else collect_source_stats(sources, ctx.hub, need_columns=column_bounds_needed(plan))
     )
-    if _rpp:
-        print(f"[rr] collect_source_stats {time.perf_counter() - _rpt:.1f}s", flush=True)
-        _rpt = time.perf_counter()
+    _phase("collect_source_stats", time.perf_counter() - _rpt)
+    _rpt = time.perf_counter()
     # Seed the distinct counts the optimizer is about to read: no file footer carries
     # `ndv`, so without this a query's *first* run orders its joins blind.
     from batcher.api.terminal._metadata import seed_column_ndv
 
     seed_column_ndv(ctx.hub, sources, plan)
+    # The hardware Kyber plans for. Single-node: the Optimizer detects this machine. Distributed:
+    # the cluster's *binding* worker (smallest cores/RAM), so a cache/memory-sized threshold
+    # tracks the workers rather than a possibly-fat driver. Falls back to the local profile when
+    # the topology is unreadable, so a distributed run on a down cluster plans exactly as before.
+    hardware = _distributed_hardware() if distributed else None
     # One optimizer run yields both the physical plan (admission/costing) and the
     # optimized *logical* plan (the distributed / out-of-core executors read its derived
     # join keys + pushed predicates). Computing both here avoids re-running the entire
     # pipeline a second time via `optimize_logical` on those paths.
     opt, logical_opt, decisions = kyber.optimize_full(
-        plan, sources=sources, hub=ctx.hub, source_stats=source_stats
+        plan, sources=sources, hub=ctx.hub, source_stats=source_stats, hardware=hardware
     )
-    if _rpp:
-        print(f"[rr] kyber.optimize_full {time.perf_counter() - _rpt:.1f}s", flush=True)
-        _rpt = time.perf_counter()
+    _phase("kyber.optimize_full", time.perf_counter() - _rpt)
+    _rpt = time.perf_counter()
     prof = ctx.profile
     if prof is not None:
         from batcher.api.terminal.profile import record_plan
@@ -208,7 +312,7 @@ def _run_relational(
     # changes where data lives, never the answer.
     rm = carbonite.ResourceManager(hub=ctx.hub)
     verdict = rm.validate(opt)
-    get_logger("api").debug("optimized %d ops; feasible=%s", len(opt.ops), verdict.feasible)
+    _log_decisions(opt, decisions, verdict, distributed=distributed)
     if prof is not None:
         from batcher.api.terminal.profile import admission_decision, verdict_summary
 
@@ -230,13 +334,11 @@ def _run_relational(
         # gave none) and warm-start the shuffle credit window from what this signature converged
         # on last time. Both are pure scheduling levers (AIMD still governs the window used, the
         # mergeable algebra makes any worker count identical), so a cold hub grants the default.
-        if _rpp:
-            print(f"[rr] carbonite.validate {time.perf_counter() - _rpt:.1f}s", flush=True)
-            _rpt = time.perf_counter()
+        _phase("carbonite.validate", time.perf_counter() - _rpt)
+        _rpt = time.perf_counter()
         workers, envelope = distributed_grant(rm, opt, plan, sources, ctx)
-        if _rpp:
-            print(f"[rr] distributed_grant {time.perf_counter() - _rpt:.1f}s", flush=True)
-            _rpt = time.perf_counter()
+        _phase("distributed_grant", time.perf_counter() - _rpt)
+        _rpt = time.perf_counter()
         # Distribute the OPTIMIZED logical plan, not the raw one: the distributed executor
         # reads join keys / pushed predicates straight off the LogicalPlan, and a comma
         # join (`FROM a, b WHERE a.k=b.k`) is raw-lowered as a cartesian inner join on a
@@ -258,17 +360,15 @@ def _run_relational(
             materialize=materialize,
             metrics_out=wm if prof is not None else None,
         )
-        if _rpp:
-            print(f"[rr] execute_distributed {time.perf_counter() - _rpt:.1f}s", flush=True)
-            _rpt = time.perf_counter()
+        _phase("execute_distributed", time.perf_counter() - _rpt)
+        _rpt = time.perf_counter()
         if prof is not None:
             prof.worker_metrics = wm
         # Core collects metadata on every path so later plans improve with use.
         from batcher.api.terminal._metadata import collect_source_metadata
 
         collect_source_metadata(ctx.hub, sources)
-        if _rpp:
-            print(f"[rr] collect_source_metadata {time.perf_counter() - _rpt:.1f}s", flush=True)
+        _phase("collect_source_metadata", time.perf_counter() - _rpt)
         # Close the loops: persist the shuffle window used and feed the join-strategy bandit.
         record_distributed(
             ctx.hub,
@@ -286,7 +386,12 @@ def _run_relational(
     # instead of OOMing. Shapes with no spilling path fall through to in-memory —
     # unless admission already proved it won't fit, in which case that is a real
     # infeasibility rather than a silent OOM.
-    if must_spill or rm.should_spill(opt):
+    # The input is the third signal, and on a scan-heavy query the dominant one: the
+    # in-memory path below resolves every source to Arrow *before* the engine runs, so a
+    # 600M-row scan is resident in full even when the query returns four rows. Sized from
+    # source metadata (no I/O), so it is known here rather than discovered by the OOM.
+    input_bytes = _projected_input_bytes(sources, opt.source_projections)
+    if must_spill or rm.should_spill(opt) or rm.input_exceeds_budget(input_bytes):
         from batcher.dist.spill import spill_collect
 
         # Shard the out-of-core spill by data volume: prefer the learned recommendation
@@ -298,6 +403,12 @@ def _run_relational(
             or partitions_from_physical(opt)
             or DEFAULT_PARTITIONS
         )
+        # Close the loop's return leg: when admission refused this plan it attached a
+        # `suggested_bounds` counter-offer naming the envelope the plan *would* fit in.
+        # Honor it as a floor, so each bucket actually fits the budget that forced the
+        # spill — the count above is sized from a fixed bytes-per-partition constant that
+        # knows nothing about this machine's memory. Result-invariant (mergeable algebra).
+        partitions = max(partitions, rm.partitions_for_bounds(opt, verdict.suggested_bounds))
         if prof is not None:
             from batcher.api.terminal.profile import record_spill
 
@@ -333,7 +444,7 @@ def _run_relational(
     import time as _time
 
     from batcher.api.source_stats import _source_identity
-    from batcher.metadata.io_stats import record_source_io
+    from batcher.metadata.io_stats import record_source_io, scanned_byte_count
 
     resolved = []
     complete_scan: list[bool] = []
@@ -351,8 +462,12 @@ def _run_relational(
         declared = _declared_row_count(src)
         scanned = sum(b.num_rows for b in batches)
         complete_scan.append(predicate is None and declared is not None and scanned == declared)
+        identity = _source_identity(src)
         record_source_io(
-            ctx.hub, _source_identity(src), sum(b.nbytes for b in batches), _elapsed_ms
+            ctx.hub,
+            identity,
+            scanned_byte_count(identity, opt.source_projections.get(i), scanned, batches),
+            _elapsed_ms,
         )
     # Reserve the estimated envelope against the process-wide buffer pool for the
     # duration of execution, so concurrent queries draw on one budget. If the
@@ -416,4 +531,20 @@ def _run_relational(
         input_rows=total_source_rows(sources),
         wall_ms=(time.perf_counter() - _t0) * 1000.0,
     )
+    # Close the pressure-hysteresis loop too: the manager reads a past run's flap rate at
+    # construction to stiffen de-escalation for an oscillating workload, but nothing had ever
+    # written one, so that read was permanently cold and the mechanism never engaged.
+    _record_flap_rate(ctx.hub, rm)
     return table, decisions
+
+
+def _record_flap_rate(hub: object, rm: object) -> None:
+    """Persist this run's measured pressure-flap rate. Best-effort; never breaks a query."""
+    try:
+        from batcher.carbonite.memory.pressure import record_flap_rate
+
+        rate = rm.flap_rate()  # type: ignore[attr-defined]
+        if rate is not None:
+            record_flap_rate(hub, rate)  # type: ignore[arg-type]
+    except Exception:  # pragma: no cover - a learned write must never fail a run
+        return

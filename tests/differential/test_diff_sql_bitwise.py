@@ -8,6 +8,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.mark.parametrize(
@@ -22,8 +23,6 @@ import batcher as bt
     ],
 )
 def test_bitwise(duck, q):
-    from conftest import assert_same
-
     t = pa.table({"a": [12, 7, 255, 1024], "b": [10, 3, 15, 7]})
     duck.register("t", t)
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
@@ -41,8 +40,6 @@ def test_bitwise(duck, q):
     ],
 )
 def test_month_year_interval(duck, q):
-    from conftest import assert_same
-
     # Month-end clamping + leap year edges (Jan 31, Feb 29).
     t = pa.table(
         {

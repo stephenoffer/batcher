@@ -1,28 +1,30 @@
 # Credit-based flow control
 
+*Credit-based flow control* bounds how much data a producer can put in flight toward a
+consumer: the producer may only send what the consumer has said it has room for. This page
+describes the credit protocol on the shuffle wire, how credits are replenished, how
+Carbonite sizes the window, and how the AIMD controller moves that window at run time.
+
 A Parquet scanner produces batches at 10,000/s. A GPU embedding model consumes them at
 100/s. Connect them and, with no intervention, 99% of the scanned data sits in RAM waiting
-its turn, until the worker's memory is gone. This is not a pathological case; it is what
+its turn, until the worker's memory is gone. This isn't a pathological case. It's what
 every pipeline with a slow stage does by default.
 
 The shuffle has the same shape. A mapper can serialize its bucket far faster than a reducer
 can fold it, and a reducer fetching from sixteen mappers at once is sixteen producers
-against one consumer.
-
-The fix is the one TCP uses: the producer may only send what the consumer has said it has
-room for.
+against one consumer. The fix is the one TCP uses.
 
 ## One credit is one batch slot
 
 :::{important}
 A channel's in-flight memory is at most `credits × batch_bytes`. Not "usually bounded", not
-"bounded under normal load". Bounded, because the producer physically cannot send batch `n+1`
-until a permit for it exists. That is what makes the memory bound arithmetic rather than
+"bounded under normal load". Bounded, because the producer physically can't send batch `n+1`
+until a permit for it exists. That's what makes the memory bound arithmetic rather than
 aspirational.
 :::
 
 ```text
-   PRODUCER  (mapper — FlightHandler::do_exchange)        CONSUMER  (reducer)
+   PRODUCER  (mapper: FlightHandler::do_exchange)        CONSUMER  (reducer)
    ─────────────────────────────────────────────          ──────────────────
 
                      credits: tokio::sync::Semaphore
@@ -62,13 +64,13 @@ let gated = async_stream::stream! {
 ```
 
 `credits` is a `tokio::sync::Semaphore`. The consumer seeds it in the first `DoExchange`
-message, a little-endian `u32` in `app_metadata`, and a decoded zero (missing or
-malformed seed) falls back to a compiled-in default rather than stalling forever.
+message as a little-endian `u32` in `app_metadata`. A decoded zero, from a missing or
+malformed seed, falls back to a compiled-in default rather than stalling forever.
 
 ## Replenishment
 
 Granting one credit per batch would double the message count for no benefit. The consumer
-does batched low-watermark refill (`credit_exchange_inner` in `exchange.rs`):
+does a batched low-watermark refill in `credit_exchange_inner` in `exchange.rs`:
 
 ```rust
 let refill_at = (credits / 2).max(1);
@@ -87,8 +89,8 @@ The server runs a spawned pump task that drains inbound grant messages and calls
 `credits.add_permits(granted)`. Half the window is the refill point, so the producer never
 runs dry while a grant is in flight.
 
-There is an `InflightGauge` alongside, tracking `current` and a high-water `max`. It is not
-decoration: it is how the credit bound is *tested*, surfaced as
+An `InflightGauge` runs alongside, tracking `current` and a high-water `max`. It isn't
+decoration. It's how the credit bound gets *tested*, surfaced as
 `ShuffleSession.max_inflight` so a test can assert that no channel ever held more batches
 than its window allowed.
 
@@ -101,85 +103,82 @@ the single entry point, and it clamps every request:
 # docs: skip
 # python/batcher/carbonite/policies.py
 def credit_ceiling(config, effective_morsel_bytes=None) -> int:
-    count_ceiling = fc.default_credits * fc.credit_ceiling_factor   # 16 * 4 = 64
+    count_ceiling = fc.default_credits * fc.credit_ceiling_factor
     morsel_bytes = max(1, effective_morsel_bytes or config.execution.morsel_bytes)
-    byte_ceiling = max(1, fc.credit_byte_budget // morsel_bytes)    # 256 MiB // 1 MiB = 256
+    byte_ceiling = max(1, _channel_byte_budget(config) // morsel_bytes)
     return max(1, min(count_ceiling, byte_ceiling))
 ```
 
-Two ceilings, and the tighter wins. The count ceiling is the obvious one. The byte ceiling
-exists because a credit is *one batch*, and a batch of 768-dimensional embeddings is not
-the same object as a batch of int64 keys. Sixty-four credits of wide rows can be gigabytes.
-`_learned_channel_morsel_bytes` widens the assumed batch size from the learned row width,
-so a wide-row workload gets *fewer* credits automatically.
+Two ceilings, and the tighter wins. The count ceiling is the obvious one, `default_credits
+× credit_ceiling_factor`. The byte ceiling exists because a credit is *one batch*, and a
+batch of 768-dimensional embeddings isn't the same object as a batch of int64 keys.
+Sixty-four credits of wide rows can be gigabytes. `_learned_channel_morsel_bytes` widens
+the assumed batch size from the learned row width, so a wide-row workload gets *fewer*
+credits automatically.
 
-Defaults (`config.flow_control`):
+The per-channel byte budget is itself memory-aware. `_channel_byte_budget` caps the
+configured `credit_byte_budget` at `_SHUFFLE_BUFFER_FRACTION` of the machine's total RAM,
+which is 10%, divided by `shuffle_fetch_fan_in`, with a floor of one morsel. That matters
+because 256 MiB per channel across 32 concurrent fetches is 8 GiB in flight, which is
+unremarkable on a 512 GiB node and more than half the RAM of a 16 GiB one. The cap only
+ever lowers the configured value, so tuning `credit_byte_budget` down keeps your number.
+
+These are the defaults under `config.flow_control`:
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `default_credits` | 16 | starting window when there is no learned estimate |
-| `credit_ceiling_factor` | 4 | count ceiling = 16 × 4 = 64 |
-| `credit_byte_budget` | 256 MiB | byte ceiling per channel |
+| `default_credits` | 16 | starting window when there's no learned estimate |
+| `credit_ceiling_factor` | 4 | count ceiling is `default_credits` times this |
+| `credit_byte_budget` | 256 MiB | configured byte ceiling per channel, before the RAM cap |
+| `shuffle_fetch_fan_in` | 32 | channels fetching at once, which divides the RAM share |
 | `aimd_alpha` | 1 | additive increase, +1 credit per round |
 | `aimd_beta` | 0.5 | multiplicative decrease on congestion |
 
-With the shipped defaults the count ceiling binds and the byte ceiling is slack:
+Which ceiling binds depends on the host, so read it rather than assuming:
 
 ```python
 from batcher.config import Config
+from batcher.carbonite.policies import credit_ceiling
 
 cfg = Config()
 count_ceiling = cfg.flow_control.default_credits * cfg.flow_control.credit_ceiling_factor
-byte_ceiling = cfg.flow_control.credit_byte_budget // cfg.execution.morsel_bytes
-print(count_ceiling, byte_ceiling, "->", min(count_ceiling, byte_ceiling))
+print("count ceiling:", count_ceiling)
+print("effective ceiling:", credit_ceiling(cfg))
+print("with 8 MiB batches:", credit_ceiling(cfg, 8 << 20))
 ```
 
-```text
-64 256 -> 64
-```
+On a machine with enough RAM the count ceiling of 64 binds. Raise `morsel_bytes`, run on a
+smaller node, or let the learned row width widen the assumed batch for an embedding column,
+and the byte ceiling drops below the count ceiling and starts binding instead. That
+crossover is the whole point of having both.
 
-Raise `morsel_bytes`, or let the learned row width widen it for an embedding column, and
-the byte ceiling drops below 64 and starts binding instead. That crossover is the whole
-point of having both.
-
-The starting window was 4 and is now 16, which matters more than it sounds. A cross-node
-fetch's throughput is `window × batch / RTT`, so a small window throttles the opening
-rounds before any adaptation can help. On a 50 ms-RTT link, a single 18 MiB partition
-transferred at 2.4 MiB/s at 4 credits and 7.7 MiB/s at 16.
+The starting window of 16 matters more than it sounds. A cross-node fetch's throughput is
+`window × batch / RTT`, so a small window throttles the opening rounds before any
+adaptation can help. The rationale recorded alongside the default in
+`config/config.py` measures a single 18 MiB partition over a 50 ms-RTT link at 2.4 MiB/s
+with 4 credits against 7.7 MiB/s with 16.
 
 ## AIMD
 
-A static window is a compromise: too small and you leave bandwidth on the floor, too large
-and you buffer memory you did not need.
+A static window is a compromise. Too small and you leave bandwidth on the floor. Too large
+and you buffer memory you didn't need.
 
-::::{tab-set}
-:::{tab-item} Static window
-```text
-distributed.adaptive_credits = False
+`distributed.adaptive_credits` selects between the two, and it defaults to `True`.
 
-  the window is whatever grant_credits() returned, clamped to credit_ceiling
-  no slow start, no reaction to pressure
-  simple, and wrong in one direction or the other on most links
-```
-:::
+Set it to `False` and the window is whatever `grant_credits()` returned, clamped to
+`credit_ceiling`. There's no slow start and no reaction to pressure. That's simple, and
+wrong in one direction or the other on most links.
 
-:::{tab-item} AIMD (the default)
-```text
-distributed.adaptive_credits = True
-
-  slow start:  window × 2 each uncongested round, until the first congestion signal
-  then:        +aimd_alpha per uncongested round;  ×aimd_beta on congestion
-  always clamped to [1, credit_ceiling]
-```
-AIMD moves the window *inside* the envelope Carbonite set. It does not move the envelope.
-:::
-::::
-
-`distributed.adaptive_credits` turns on the TCP-like controller.
+Leave it at `True` and a TCP-like controller runs. Slow start doubles the window each
+uncongested round until the first congestion signal. After that it's classic
+additive-increase, multiplicative-decrease: `+aimd_alpha` per uncongested round, and
+`×aimd_beta` on congestion. The window is always clamped to `[1, credit_ceiling]`, so
+AIMD moves the window *inside* the envelope Carbonite set and never moves the envelope
+itself.
 
 ```python
 # docs: skip
-# python/batcher/carbonite/policies.py — AIMDFlowControl
+# python/batcher/carbonite/policies.py, AIMDFlowControl
 def observe(self, *, congested: bool) -> int:
     if congested:
         self._window = max(self._floor, self._window * self._beta)
@@ -191,12 +190,8 @@ def observe(self, *, congested: bool) -> int:
     return self.window
 ```
 
-Slow-start doubles the window each uncongested round until the first congestion signal,
-then it is classic additive-increase/multiplicative-decrease. The window is always clamped
-to `[1, credit_ceiling]`, so adaptation can never escape the memory bound Carbonite set.
-
 The congestion signal is memory pressure, not queue occupancy.
-`ShuffleSession._observe_backpressure`:
+`ShuffleSession._observe_backpressure` reads it:
 
 ```python
 # docs: skip
@@ -204,11 +199,11 @@ congested = self._pressure.level() >= PressureLevel.SPILL
 self._flow_control.observe(congested=congested)
 ```
 
-That is worth being precise about, because it is easy to assume otherwise. The channel does
-not measure its own buffer depth. It asks the process-wide `PressureMonitor` whether the
-node is past `memory.soft_limit`, and shrinks if so. The `PressureMonitor` has asymmetric
-hysteresis (escalate instantly, de-escalate on an EWMA), which is what keeps the window
-from oscillating.
+That's worth being precise about, because it's easy to assume otherwise. The channel
+doesn't measure its own buffer depth. It asks the process-wide `PressureMonitor` whether
+the node is past `memory.soft_limit`, and shrinks if so. The `PressureMonitor` escalates
+instantly and de-escalates only as an EWMA relaxes, and that asymmetric hysteresis is what
+keeps the window from oscillating.
 
 :::{note}
 `flow_control.backpressure_high` (0.70) and `backpressure_low` (0.40) are declared and
@@ -219,33 +214,34 @@ have no runtime consumer. The live thresholds are the `PressureLevel` ladder in
 
 ## Warm-starting a recurring channel
 
-Slow-start costs a few rounds every time, and a shuffle of the same shape converges to the
-same window every time. So the converged window is persisted per shuffle signature
-(namespace `carbonite.shuffle_window`, exponentially smoothed) and `grant_credits(signature=…)`
-warm-starts the next run from it, skipping slow-start entirely.
+Slow start costs a few rounds every time, and a shuffle of the same shape converges to the
+same window every time. So the converged window is persisted per shuffle signature under
+the `carbonite.shuffle_window` namespace, exponentially smoothed, and
+`grant_credits(signature=…)` warm-starts the next run from it, skipping slow start
+entirely.
 
 Learning only moves the *starting point*. AIMD still governs the window actually used from
 live pressure, and the ceiling still clamps it. A credit window bounds in-flight batches and
-nothing else, so none of this can change a result. Which is exactly why it is safe to learn
+nothing else, so none of this can change a result. That's exactly why it's safe to learn
 aggressively.
 
 ## Costs and limits
 
 Credits cost a semaphore acquire per batch on the producer and one grant message per half
-window on the consumer. At 1 MiB batches that is negligible; at very small batches the
+window on the consumer. At 1 MiB batches that's negligible. At very small batches the
 per-batch permit is a real fraction of the work, which is one more reason morsels are
 16,384 rows and not 100.
 
 :::{warning}
 Striping is the sharp edge. `ClientPool::fetch_secured_striped` gives **each shard its own full
 window**, so a peer fetched over 4 connections can have `4 × credits` batches in flight. The
-byte bound is per-channel, not per-peer, and `distributed.flight_connections_per_peer` (4) is
-the only thing bounding the multiplier.
+byte bound is per-channel, not per-peer, and `distributed.flight_connections_per_peer`, which
+defaults to 4, is the only thing bounding the multiplier.
 :::
 
-And the bound is on *transport* memory only. Credits stop a mapper from flooding a reducer's
-socket buffers; they do not stop the reducer's own hash table from growing. That is the
-buffer pool's job, and the two meet in the pressure signal that AIMD reads.
+The bound also covers *transport* memory only. Credits stop a mapper from flooding a
+reducer's socket buffers. They don't stop the reducer's own hash table from growing. That's
+the buffer pool's job, and the two meet in the pressure signal that AIMD reads.
 
 ## See also
 

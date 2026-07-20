@@ -16,6 +16,7 @@ from batcher.plan.profile.collect import (
     ProfileCollector,
     build_op_profiles,
     merge_metric_ops,
+    walk_ir,
     worker_op_profiles,
 )
 from batcher.plan.profile.types import Decision, OpProfile, QueryProfile
@@ -27,5 +28,6 @@ __all__ = [
     "QueryProfile",
     "build_op_profiles",
     "merge_metric_ops",
+    "walk_ir",
     "worker_op_profiles",
 ]

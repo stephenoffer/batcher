@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 # Timestamps chosen to exercise the edges: negative epoch (incl. sub-second),
@@ -68,8 +69,6 @@ _FIELDS = [
 
 @pytest.mark.parametrize(("method", "sql"), _FIELDS)
 def test_field_extraction_vs_duckdb(duck, t, method, sql):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(v=getattr(col("ts").dt, method)()).collect()
     expected = duck.sql(f"SELECT {sql} AS v FROM t")
     assert_same(out, expected)
@@ -77,8 +76,6 @@ def test_field_extraction_vs_duckdb(duck, t, method, sql):
 
 def test_epoch_floors_negative_subsecond(duck, t):
     """epoch must floor: 1969-12-31T23:59:59.5 → -1 second, not 0 (regression)."""
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(v=col("ts").dt.epoch()).collect()
     # DuckDB's epoch is a fractional DOUBLE; whole floored seconds is the oracle.
     expected = duck.sql("SELECT CAST(floor(epoch(ts)) AS BIGINT) AS v FROM t")
@@ -100,16 +97,12 @@ def test_epoch_floors_negative_subsecond(duck, t):
     ],
 )
 def test_offset_by_vs_duckdb(duck, t, by, sql):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(v=col("ts").dt.offset_by(by)).collect()
     expected = duck.sql(f"SELECT {sql} AS v FROM t")
     assert_same(out, expected)
 
 
 def test_last_day_leap_february(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(v=col("ts").dt.days_in_month()).collect()
     expected = duck.sql("SELECT day(last_day(ts)) AS v FROM t")
     assert_same(out, expected)

@@ -21,12 +21,11 @@ Data work has splintered into a tool per job. One for SQL, another for DataFrame
 third for streaming, more again for images and models. Every one of them is a system to
 run and a seam to leak. Batcher collapses that stack into a single engine.
 
-![One engine: any source — Parquet, media, Kafka, lakehouse — flows into Batcher and back out to any workload: SQL and ETL, batch inference, embeddings, and training data.](_static/diagrams/hub.png)
+![One engine: any source, whether Parquet, media, Kafka, or a lakehouse table, flows into Batcher and back out to any workload: SQL and ETL, batch inference, embeddings, and training data.](_static/diagrams/hub.svg)
 
 ## Why Batcher
 
-The tools we reach for each stop somewhere, and the gaps between them are where the
-time goes:
+Every tool stops somewhere, and the gaps between them are where the time goes.
 
 ::::{grid} 1 3 3 3
 :gutter: 3
@@ -226,7 +225,7 @@ Translate the API you already know, side by side.
 :::{grid-item-card} {octicon}`meter;1.1em` Benchmarks
 :link: benchmarks/index
 :link-type: doc
-Correctness-gated numbers across every workload, including where we still lose.
+Correctness-gated numbers across every workload, including where Batcher still loses.
 :::
 
 :::{grid-item-card} {octicon}`book;1.1em` Recipes
@@ -250,15 +249,19 @@ How the engine actually works, one mechanism at a time.
 
 ## It tunes itself
 
-You don't size batches, pick join strategies, or guess partition counts. Batcher measures
-the data as it flows and re-plans the rest of the query on real numbers, so a query that
-starts on a bad estimate corrects itself instead of stalling. A plan-once optimizer cannot
-do that, because by the time it learns it was wrong the query is already over. The
-[architecture guide](architecture/index.md) covers how, if you're curious.
+You don't size batches, pick join strategies, or guess partition counts. Batcher
+re-optimizes at stage boundaries on measured cardinalities, the same mechanism and the same
+granularity as Spark AQE, but available single-node too. It stays off for queries under 20M
+input rows, so most queries never reach it.
+
+The half that has no equivalent in DuckDB or Spark is what happens *between* runs. A
+sketch-backed learned-stats and bandit loop records what each query actually did, so the
+plan improves the more often you run it. The {doc}`architecture/index` covers both halves,
+and {doc}`deep-dives/adaptive-reoptimization` covers where each one stops.
 
 ## How it compares
 
-Each tool stops somewhere; Batcher's aim is the whole range on one engine.
+Each tool stops somewhere. Batcher aims at the whole range on one engine.
 
 ```{raw} html
 <table class="bt-matrix">
@@ -277,7 +280,8 @@ Each tool stops somewhere; Batcher's aim is the whole range on one engine.
 <tr><td>DataFrame API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
 <tr><td>Composable expression API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
 <tr><td>Cost-based optimizer</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
-<tr><td>Adaptive re-optimization mid-query</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Stage-boundary re-optimization, single-node</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
+<tr><td>Cross-query learned statistics</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
 <tr><td>Streaming</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td></tr>
 <tr><td>ML / batch inference</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
 <tr><td>Multimodal (images, audio, video)</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
@@ -292,61 +296,56 @@ it.
 
 ## Benchmarks
 
-Numbers, not adjectives. Every one is **correctness-gated**: the harness runs each query
+Numbers, not adjectives, and every one is **correctness-gated**: the harness runs each query
 on every engine, checks they return the identical result, and only then trusts the timing. A
-fast wrong answer is a bug, not a win. (The gate earns its keep: on TPC-H q6 both Daft and
-Polars compute the wrong revenue, and the harness refuses to time them.)
+fast wrong answer is a bug, not a win. The gate earns its keep. On TPC-H q6 both Daft and
+Polars compute the wrong revenue, and the harness refuses to time them.
+
+These are the headline results. The full picture, including the shapes where Batcher is
+slower and the methodology behind every figure, is in {doc}`benchmarks/index`.
 
 ### AI and multimodal: the widest margin
 
-Ten GPU workload families on 8×T4, real models, every one at least 2× Ray Data:
+Ten GPU workload families on 8×T4, real models, every one at least 2× Ray Data.
 
-| workload | vs Ray Data |
-|---|---:|
-| text embeddings (MiniLM) | **47×** |
-| audio feature extraction | **12.5×** |
-| LLM batch inference (gpt2) | **11.1×** |
-| image generation (diffusion) | **8.6×** |
-| training ingest (`iter_torch_batches`) | **3.0×** |
-| batch inference (ResNet-50) | **2.05×** |
-| zero-config `map_batches(Model, num_gpus=1)` | Ray Data hard-errors |
+![Horizontal bar chart of GPU throughput, Batcher against Ray Data on 8xT4 with real models and 100 percent output agreement. Text embeddings with sentence-transformers MiniLM is 47 times faster, audio feature extraction 12.5 times, LLM batch inference on gpt2 11.1 times, image generation by diffusion 8.6 times, training ingest 3 times, and ResNet-50 batch inference 2.05 times. A dashed line marks 1x parity.](_static/diagrams/gpu_speedup.svg)
 
-Image decode → tensor beats **both** competitors: 2.4× Daft and 6.1× Ray Data. Stage-overlapped
-streaming keeps the device fed. The CPU decode of the next morsel runs while the GPU forward of
-the current one is still in flight, which took a two-stage ResNet-50 pipeline from 942 to
-**2,504 img/s** and utilization from ~30% to **81%**.
+Decoding images into tensors beats **both** competitors: 2.4× Daft and 6.1× Ray Data. And on
+`map_batches(Model, num_gpus=1)` with no batch size given, Ray Data hard-errors where Batcher
+just runs.
 
-### Analytics: three full benchmark suites, measured 2026-07-18
+Stage-overlapped streaming is why. The CPU decode of the next morsel runs while the GPU
+forward of the current one is still in flight, so the device stays fed.
 
-Every engine reads the **identical zero-copy Arrow input**, so this is a like-for-like
-comparison of execution, not of storage formats. Single node, 16 cores, release build.
+![Two panels comparing a two-stage ResNet-50 pipeline before and after stage overlap, with the same result and the same order. Throughput rises from 942 to 2,504 images per second. GPU utilization rises from 30 percent to 81 percent of the device kept busy.](_static/diagrams/stage_overlap.svg)
+
+### Analytics: three suites, measured 2026-07-18
+
+Single node, 16 cores, release build. Every engine reads the **identical zero-copy Arrow
+input**, so this compares execution rather than storage formats.
 
 | suite | vs DuckDB on the same Arrow |
 |---|---|
-| **TPC-H** — all 22 queries | **won 22 of 22**, 1.1×–6.9× faster |
-| **ClickBench** — 43 queries | **won 42 of 43**, and 43/43 correct |
-| **Semi-structured JSON** — 5 queries | **won 5 of 5**, 3.5×–12.7× faster |
+| **TPC-H**, 22 comparable queries | **won 22 of 22**, 1.1× to 6.9× faster |
+| **ClickBench**, 43 queries | **won 42 of 43**, and 43/43 correct |
+| **Semi-structured JSON**, 5 queries | **won 5 of 5**, 3.5× to 12.7× faster |
+| **Operator mix**, 11 kernels | **won 10 of 11** |
 
-Against Polars the JSON suite is **12×–81× faster**, and Polars' SQL front-end cannot express
-most of TPC-H at all (multi-table `FROM`, `EXISTS`, non-equi joins).
+Against Polars the JSON suite is **12× to 81× faster**, and Polars' SQL front-end cannot
+express most of TPC-H at all (multi-table `FROM`, `EXISTS`, non-equi joins).
 
-Standout single queries, all correctness-gated: TPC-H q15 **6.9×**, q11 **6.8×**, q5 **4.3×**;
-ClickBench q27 **37×**, q40 **16×**, q37 **12×**.
+Seven ClickBench queries return in about 0.2 ms because Kyber answers them from **metadata**,
+meaning footer statistics and sketches, rather than scanning at all. Those are excluded from
+the ranges above, so the headline reflects execution rather than planning.
 
-:::{note}
-Seven ClickBench queries return in ~0.2 ms because Kyber answers them from **metadata**
-(footer statistics and sketches) instead of scanning — a real capability, and the reason the
-ratios there reach three digits. They are excluded from the ranges above so the headline
-reflects execution, not planning.
-:::
-
-Reading data is where the gap to Ray Data is structural rather than incidental: Parquet read →
-sum is **20.8×**, CSV **14.3×**, `count()` roughly **1,400×** (it comes from metadata, not a scan).
+Reading data is where the gap to Ray Data is structural rather than incidental. Reading Parquet
+and summing a column is **20.8×**, CSV **14.3×**, and `count()` roughly **1,400×**, because the
+count comes from metadata rather than a scan.
 
 ### Cluster against cluster
 
-The mergeable algebra means the *same* operators run distributed. On an 8-node / 128-CPU
-cluster, with **both engines distributed** and reading the same S3 parquet — TPC-H sf10 q6:
+The mergeable algebra means the *same* operators run distributed. TPC-H sf10 q6 on an 8-node,
+128-CPU cluster, with **both engines distributed** and reading the same S3 parquet:
 
 | engine | time | correct? |
 |---|---:|---|
@@ -356,25 +355,7 @@ cluster, with **both engines distributed** and reading the same S3 parquet — T
 
 **2.4× faster than Daft on equal hardware, and correct where Daft is not.**
 
-### Where Batcher loses
-
-Two places, both stated plainly.
-
-**DuckDB on its own native store** still wins 15 of 22 TPC-H queries (geometric mean ~1.4× its
-way). That is not the same comparison as the table above: DuckDB decompresses its own format as
-it scans and never pays an Arrow ingest. It is, however, what a user gets from `duckdb` at a
-prompt, so we publish it. The cause is understood — single-node parallelism plateaus after ~8
-cores (4.0× from 16 on q3), with the join as the ceiling, not the aggregate.
-
-**High-concurrency serving** is not Batcher's shape at all. Against a serving engine such as
-Databricks' Reyden, Batcher meets the latency bar (p50 ~6.5 ms) but sustains ~145 queries/sec
-where a serving tier does thousands: every query goes through full planning, and a point lookup
-scans rather than using an index. Use a serving database for that workload.
-
-Correctness is not in question in either case: Batcher matches DuckDB on all 22 TPC-H queries
-and returns the official answer on q6, where Daft and Polars do not.
-
-**[Full benchmarks, methodology, and reproduction commands →](benchmarks/index.md)**
+**[Full benchmarks, methodology, and where Batcher loses](benchmarks/index.md)**
 
 ### Why the wins happen
 
@@ -383,12 +364,30 @@ None of this is tuning. Each speedup traces to a design choice you can read abou
 
 Batcher runs in-process and native over Arrow, with no task-scheduler or object-store hop
 per operation, so the fixed cost that dominates Ray Data's small and medium queries is
-never paid at all. That alone is most of the 50–450×.
+never paid at all. That alone is most of the 50× to 450×.
 
 On the AI side, GPU inference loads a model once per session and overlaps CPU prep with the
-GPU forward pass, which is where the 2–47× comes from. And plans re-tune on measured
+GPU forward pass, which is where the 2× to 47× comes from. And plans re-tune on measured
 cardinalities mid-query, so a bad estimate corrects itself rather than stalling or running
 out of memory.
+
+## Where to start
+
+The docs branch by what you are doing, not by what part of the engine you are touching.
+
+- **New here?** {doc}`getting-started/index` installs Batcher and runs a first query, then
+  {doc}`getting-started/concepts/index` covers the one idea the rest of the API rests on.
+- **Porting something?** {doc}`migration/index` maps Spark, pandas, Polars, DuckDB, Ray
+  Data, and Daft verb by verb.
+- **Building something specific?** {doc}`user-guide/index` is one page per capability, and
+  {doc}`examples/index` is working code you can paste and change.
+- **Running a model?** {doc}`ml/index` covers inference, embeddings, retrieval, and feeding
+  a training loop.
+- **Curious how it works?** {doc}`architecture/index` gives the shape, and
+  {doc}`deep-dives/index` takes one mechanism at a time.
+
+If you would rather be handed an ordered reading list for your role, use
+{doc}`learning-paths/index`.
 
 ```{toctree}
 :hidden:
@@ -406,6 +405,7 @@ learning-paths/index
 
 user-guide/index
 ml/index
+integrations/index
 configuration/index
 migration/index
 agents/index
@@ -413,36 +413,17 @@ agents/index
 
 ```{toctree}
 :hidden:
-:caption: Performance
+:caption: Reference
 
+api/index
 benchmarks/index
 ```
 
 ```{toctree}
 :hidden:
-:caption: Integrate
-
-integrations/index
-```
-
-```{toctree}
-:hidden:
-:caption: Understand
-
-deep-dives/index
-```
-
-```{toctree}
-:hidden:
-:caption: Reference
-
-api/index
-```
-
-```{toctree}
-:hidden:
-:caption: Design
+:caption: How it works
 
 architecture/index
+deep-dives/index
 internals/index
 ```

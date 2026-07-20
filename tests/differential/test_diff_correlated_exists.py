@@ -14,7 +14,7 @@ import numpy as np
 import pyarrow as pa
 
 import batcher as bt
-from conftest import assert_same
+from _harness import assert_same
 
 
 def _tbl(duck):

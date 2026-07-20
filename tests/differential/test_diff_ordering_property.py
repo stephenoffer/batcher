@@ -13,8 +13,8 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same_ordered
 from batcher import col
-from conftest import assert_same_ordered
 
 pytestmark = pytest.mark.differential
 

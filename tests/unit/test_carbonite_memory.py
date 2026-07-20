@@ -19,6 +19,7 @@ from batcher.carbonite.memory import (
     peak_operator_bytes,
     process_pool,
 )
+from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.config import Config, MemoryConfig, config_context
 
 pytestmark = pytest.mark.unit
@@ -103,11 +104,52 @@ def test_should_spill_when_estimate_exceeds_cap():
         assert rm.should_spill(_plan_with_peak(500)) is False
 
 
-def test_unsized_plan_never_spills():
+def test_input_that_will_not_fit_routes_out_of_core():
+    # The in-memory path resolves every source to Arrow *before* the engine runs, so the
+    # input is resident in full however small the result is. That term is invisible to the
+    # plan estimate — `m_max_bytes` sizes an operator's working set, so a query whose
+    # breakers are all tiny reads as "fits" while the scan feeding them does not. Measured
+    # on sf100 TPC-H: a GROUP BY returning four rows materialized ~19 GiB of input.
+    cfg = Config().replace(memory=MemoryConfig(max_memory_bytes=1_000))
+    with config_context(cfg):
+        rm = ResourceManager()
+        assert rm.input_exceeds_budget(10_000) is True  # budget = 1000 * 0.90
+        assert rm.input_exceeds_budget(100) is False
+
+
+def test_unsized_input_is_not_read_as_fitting():
+    # `0` means the sources could not size themselves. That is an absence of evidence, not
+    # evidence of fitting, so it must not be spelled the same way as "small enough" — the
+    # caller falls back to its other signals instead.
+    cfg = Config().replace(memory=MemoryConfig(max_memory_bytes=1_000))
+    with config_context(cfg):
+        assert ResourceManager().input_exceeds_budget(0) is False
+
+
+def test_unsized_plan_does_not_spill_on_a_guess(monkeypatch):
     cfg = Config().replace(memory=MemoryConfig(max_memory_bytes=1))
     with config_context(cfg):
-        # No Kyber estimate (m_max_bytes == 0) → never spill on a guess.
-        assert ResourceManager().should_spill(_plan_with_peak(0)) is False
+        rm = ResourceManager()
+        # No Kyber estimate (m_max_bytes == 0) and no measured pressure → don't spill
+        # on a guess. The estimate alone can never *prevent* a spill, only add one.
+        monkeypatch.setattr(rm._pressure, "classify", lambda: PressureLevel.NORMAL)
+        assert rm.should_spill(_plan_with_peak(0)) is False
+
+
+def test_unsized_plan_spills_when_memory_pressure_is_measured(monkeypatch):
+    # The OOM path this closes: Kyber emits 0 bytes for any operator whose cardinality
+    # is unknown, so an un-sized plan used to run fully in memory no matter how much of
+    # the box was already gone. The measured footprint — the one signal that cannot be
+    # wrong the way an estimate can — now overrules the missing estimate. Spilling is
+    # result-invariant, so a false positive costs latency and a false negative costs
+    # the process.
+    cfg = Config().replace(memory=MemoryConfig(max_memory_bytes=1 << 40))
+    with config_context(cfg):
+        rm = ResourceManager()
+        monkeypatch.setattr(rm._pressure, "classify", lambda: PressureLevel.SPILL)
+        assert rm.should_spill(_plan_with_peak(0)) is True
+        # And it holds for a plan whose estimate says it comfortably fits.
+        assert rm.should_spill(_plan_with_peak(1000)) is True
 
 
 def test_pressure_monitor_reports_sane_memory():

@@ -4,7 +4,7 @@ The benchmark suite never generates data: it reads TPC-H from the Ray public buc
 ClickBench from the ClickHouse mirror. Those raw files are unusable for the ``--scan``
 path at scale, though — the TPC-H files carry positional ``column0..N`` names and
 decimal types, and every engine's *native* scan needs the canonical ``l_``/``o_``...
-names and the float64 normalization that ``benchmarks/sources.py`` otherwise applies
+names and the float64 normalization that ``benchmarks/sources/`` otherwise applies
 after materializing into Arrow (which does not fit at sf100).
 
 This tool performs that normalization once, out-of-core, into a local mirror laid out as
@@ -83,8 +83,8 @@ def mirror_tpch(con: duckdb.DuckDBPyConnection, scale: int, base: str, out: str)
 
 # ClickBench stores its temporal columns as integers: `EventDate` is days since the epoch
 # (uint16), the `*EventTime` columns are unix seconds (int64). The *loaded* path rebuilds them
-# in memory (`benchmarks/sources.py::_reconstruct_clickbench_temporals`), but a **scan** hands
-# each engine the raw file — so the four queries that call `toMonth`/`toHour` on them (q18,
+# in memory (`benchmarks/sources/tables.py::_reconstruct_clickbench_temporals`), but a **scan**
+# hands each engine the raw file — so the four queries that call `toMonth`/`toHour` on them (q18,
 # q36, q37, q41) fail on every engine, ours included. Normalizing them once, on disk, is what
 # makes ClickBench runnable in scan mode at its full 100 M rows.
 _CLICKBENCH_DATE_COLUMNS = ("EventDate",)

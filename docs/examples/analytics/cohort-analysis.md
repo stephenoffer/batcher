@@ -174,8 +174,8 @@ print(triangle.to_pydict())
 ```
 
 :::{important}
-Do not fill the nulls in the lower-right with zeros. A zero means "nobody came back"; a
-null means "we do not know yet", and averaging a column that mixes the two is how a
+Do not fill the nulls in the lower-right with zeros. A zero means "nobody came back". A
+null means "not known yet", and averaging a column that mixes the two is how a
 retention chart starts trending down for no reason.
 :::
 
@@ -190,7 +190,7 @@ period range is known and the input is large.
 The `min().over(partition_by=["user"])` is a hash shuffle on `user`. It is the expensive step,
 and the one that decides whether this query fits in memory. Two things keep it bounded:
 
-- Project first. `orders` here has three columns; a real event table has forty. Select
+- Project first. `orders` here has three columns, while a real event table has forty. Select
   the three you need *before* the window, so the shuffle moves bytes you will use.
 - If `user` is skewed (one bot account with a million orders), the window partition for
   that key is what spills. Batcher's aggregates and windows spill to disk rather than

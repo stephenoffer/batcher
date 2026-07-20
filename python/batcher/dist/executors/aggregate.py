@@ -27,6 +27,7 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.io.source import Source
+from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import Aggregate, LogicalPlan
 
 
@@ -49,10 +50,7 @@ def _distributed_aggregate(
     _ensure_ray(workers)
     cfg_json = engine_config_json()  # driver config → shipped to workers
 
-    group_keys_json = json.dumps(
-        [{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys]
-    )
-    aggregates_json = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+    group_keys_json, aggregates_json = agg_spec_json(agg)
     map_plan, source_id = _relabel_single_source(agg.input)
     map_ir = json.dumps(map_plan.to_ir())
     n_keys = len(agg.group_keys)

@@ -3,7 +3,7 @@
 The full TPC-DS suite is large; this is a curated, commonly-cited subset (brand/
 category roll-ups, a window-function revenue ratio, a correlated-subquery returns
 query) that exercises multi-join, grouping, windowing, and correlated subqueries
-while touching only the tables ``sources.py`` fetches. Each query is standard TPC-DS
+while touching only the tables ``sources`` fetches. Each query is standard TPC-DS
 SQL with the validation-default substitution parameters; expanding to all 99 is
 mechanical once a query's tables are added to ``sources.TPCDS_TABLES``.
 """

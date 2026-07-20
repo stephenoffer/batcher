@@ -14,8 +14,8 @@ import pyarrow as pa
 
 import batcher as bt
 import batcher.kyber.rules.extra.join_extra
+from _harness import assert_same
 from batcher.api.dataset.frame import Dataset
-from conftest import assert_same
 
 
 def _a() -> pa.Table:

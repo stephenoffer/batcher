@@ -5,30 +5,30 @@ are made at runtime rather than at plan time. This page follows a `group_by(...)
 from the morsel to the output rows.
 
 The algebra it obeys (`partial → combine → finalize`, with `combine` associative and
-commutative) is covered in [Mergeable algebra](mergeable-algebra.md). Here we look at what
-those three functions actually do, and at the one decision the executor refuses to take on
-faith.
+commutative) is covered in [Mergeable algebra](mergeable-algebra.md). This page covers what
+those three functions do, and the one decision the executor refuses to take on faith.
 
 ## Step 1: assign each row a dense group id
 
 `assign_groups` (`crates/bc-runtime/src/agg/group/assign.rs`) is the hot path of every hash
 aggregate, `DISTINCT`, and partitioned window. It maps each row to a `u32` group id and
-returns the distinct key columns in first-seen order.
+returns the group count and the distinct key columns in first-seen order.
 
-There are three paths, and which one runs depends on the key:
+Which strategy runs depends on the key, and the dispatch falls into three families:
 
-| Path | Taken when | How the group id is found | Cost |
+| Family | Taken when | How the group id is found | Cost |
 |---|---|---|---|
-| Dense direct map | a single non-nullable integer key with a small value range (dictionary codes, dense ids, enums), whose span fits `4 × rows` and 2^20 slots | one linear pass for `(min, max)`, then `value - min` through a direct-indexed table | no hashing at all |
-| Typed hash | a single integer key | hash the native values directly | one hash, no encode |
-| Row encoding | everything else: multi-column keys, variable-length keys, floats | Arrow's `RowConverter` into a comparable byte string, then hash | a per-row encode and an allocation |
+| Dense direct map | a non-nullable integer-like key whose value span fits the dense budget: dictionary codes, dense ids, enums, and the canonical bits of a non-null `Float64` | one linear pass for `(min, max)`, then `value - min` through a direct-indexed table | no hashing at all |
+| Typed hash | a single `Int64`, `Utf8`/`Binary`, or non-null `Float64` key, and multi-column keys the engine can pack natively | hash the native values or bytes directly | one hash, no encode |
+| Row encoding | everything else: nullable floats, and mixed multi-column keys the packers decline | Arrow's `RowConverter` into a comparable byte string, then hash | a per-row encode and an allocation |
 
-The 2^20 cap on the dense map keeps the `u32` table under 4 MiB. Floats and strings never take
-the typed-hash path: floats need the `-0.0`/NaN canonicalization from `keys.rs`, and strings
-need a total order, so both go through the encoder.
+The dense budget is `4 × rows`, clamped to between 1,024 and 2^20 slots. The upper cap keeps
+the `u32` table under 4 MiB, and the lower clamp keeps the dense path reachable for a small
+morsel. A non-null `Float64` key reaches these fast paths through the `-0.0` and NaN
+canonicalization in `keys.rs`, so the fast path and the encoder agree on group identity.
 
 The fast paths exist because that per-row encode is the difference between a group-by that
-keeps up with DuckDB and one that does not.
+keeps up with DuckDB and one that doesn't.
 
 ## Step 2: accumulate (`partial`)
 
@@ -43,20 +43,22 @@ each accumulator owns only its own state, and the fused loop visits rows in the 
 `0..num_rows` order as the per-call kernels, so the per-(group, column) sequence of operations
 is unchanged and the result is element-for-element identical. The complex aggregates
 (variance, median, `arg_min`/`arg_max`, covariance, the sketches) keep their own per-call
-pass.
+pass, as do two-input aggregates, which decline fusion outright.
 
 `partial` emits **state**, not answers. `mean` emits `(sum, count)`. `median` emits the
-group's values as a `List`. `approx_count_distinct` emits an HLL register array. The state
-columns get synthetic names (`__s{agg}_{col}`) so a partial can travel as an ordinary Arrow
-batch: across a thread, a spill file, or a network hop.
+group's values as a `List`. `approx_count_distinct` emits an HLL register array. When a partial
+crosses the distributed boundary its state columns are given synthetic names of the form
+`__s{aggregate_index}_{state_column_index}` (`crates/bc-interp/src/dist.rs`), so the partial
+travels as an ordinary Arrow batch across a thread, a spill file, or a network hop.
 
 ## Step 3: combine
 
 `combine` concatenates the partials' key columns and state columns, regroups by key, and
 merges each aggregate's state with its associative reducer.
 
-Above `radix_parallel_threshold` (default 200,000 concatenated rows) it takes the parallel
-path, `combine_radix` (`agg/group/combine.rs`): hash-radix partition the concatenated partials
+Above `radix_parallel_threshold` (default 200,000 concatenated rows, set on `RuntimeTuning`
+in `bc-arrow` and mirrored on `EngineConfig` in `bc-ir`) it takes the parallel path,
+`combine_radix` (`agg/group/combine.rs`): hash-radix partition the concatenated partials
 by key so every row of a group lands in one partition, then group *and* merge each partition
 independently across threads with **no cross-partition merge**. The otherwise-serial per-group
 accumulate scan, which dominates a many-group combine, becomes a parallel one. Group *order*
@@ -67,13 +69,13 @@ differs from the serial path, which callers already treat as unspecified for a h
 `partial → combine` is the right shape when grouping *reduces*. `GROUP BY l_returnflag` turns
 a 16,384-row morsel into 3 rows and the merge is trivial.
 
-It is the wrong shape when grouping does not reduce. `GROUP BY l_orderkey` over TPC-H
+It's the wrong shape when grouping doesn't reduce. `GROUP BY l_orderkey` over TPC-H
 `lineitem` yields ~4 rows per group, so a morsel's partial has ~4,096 groups and the merge
 inherits nearly the whole relation. `GROUP BY l_orderkey, l_linenumber` reduces *nothing*:
 every partial row survives, and `combine` concatenates 60M rows of keys and states, hashes
 them, bins them, and gathers them again. Measured at scale factor 10: the entire per-morsel
 hash build (~60M inserts) is thrown away, and `combine` costs ~35 ns per *partial row*:
-2.25 s for a group-by DuckDB answers in 429 ms.
+2.25 s for a group-by DuckDB answers in 396 ms.
 
 So there is a second shape, `partition → partial → finalize`
 (`crates/bc-interp/src/agg_par.rs`): hash-partition the input morsels by group key first, then
@@ -100,7 +102,7 @@ is the answer. One hash build over the relation instead of two, one gather inste
       one hash build over the relation instead of two; one gather instead of three.
 ```
 
-This is not a second aggregation semantics. It is the exact composition `bc-interp::dist` runs
+This isn't a second aggregation semantics. It's the exact composition `bc-interp::dist` runs
 across machines, executed across cores.
 
 **How the choice is made: by measurement, not estimation.** The optimizer's `ndv` for a group
@@ -110,7 +112,7 @@ reads the reduction those partials actually achieved. Below `REDUCTION_CEILING` 
 rows kept per input row) the sample says grouping reduces, and its partials are handed straight
 back to the standard path, unwasted.
 
-The threshold is measured, not argued. Aggregating a 60M-row table on 96 cores over a synthetic
+The threshold is measured rather than argued. Aggregating a 60M-row table on 96 cores over a synthetic
 key of varying cardinality (milliseconds, lower is better):
 
 | rows kept per input row | 0.012 | 0.049 | 0.100 | 0.182 | 0.342 | 0.683 | 0.999 |
@@ -141,15 +143,16 @@ bytes and cannot change a result.
 `DISTINCT` is an aggregate with no aggregates: assign group ids over all columns, keep one row
 per group. It gets one specialization worth knowing about. `distinct_dense`
 (`agg/distinct.rs`) handles a whole-relation `DISTINCT` over a single dense integer column
-without hashing, partitioning, or materializing the input: "which values occur" is a presence
+without hashing, partitioning, or materializing the input. Which values occur is a presence
 bitmap indexed by `value - min`, each morsel-chunk ORs into its own bitmap across cores, the
 bitmaps reduce with a word-wise OR, and the distinct values fall out of a scan of the set bits.
-Two linear passes over the key and nothing else.
+Two linear passes over the key and nothing else. It declines, and the general path runs, unless
+the input is exactly one `Int64` column with no nulls whose value span fits the dense budget.
 
 :::{warning}
 `DISTINCT` has no defined row order, and the three paths genuinely differ: ascending value
 order from `distinct_dense`, first-seen order from the sequential oracle, bucket order from the
-parallel dedup. Do not depend on one. If you need an order, sort.
+parallel dedup. Don't depend on one. If you need an order, sort.
 :::
 
 ## What it looks like

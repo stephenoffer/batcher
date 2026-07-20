@@ -1468,4 +1468,47 @@ mod tests {
         assert_eq!(m["a"], 1); // distinct non-null {1}
         assert_eq!(m["b"], 0); // all null → 0
     }
+
+    /// The radix-parallel `combine` must equal the serial one — including float key
+    /// identity on a COMPOSITE key.
+    ///
+    /// Regression: `hash_keys` stated the float-canonicalization policy per encoder, and
+    /// its `RowConverter` fallback omitted it. Arrow's row format is deliberately
+    /// non-canonical for floats, so a group whose representative is `-0.0` in one partial
+    /// and `0.0` in another — legal, since `assign_groups` takes reps from the original
+    /// column — hashed into different radix buckets. Buckets merge by plain `concat` on
+    /// the "key-disjoint" assumption, so the two halves were never reconciled and the
+    /// query returned two groups where the oracle returns one. Only the fallback was
+    /// affected (a composite key mixing a float with a non-`is_hashable_mixed` type, here
+    /// `Date32`), and only above `RADIX_PARALLEL_THRESHOLD` — which is why `combine_with`
+    /// is called directly with a threshold of 1 rather than building a 200k-row fixture.
+    #[test]
+    fn radix_combine_preserves_float_key_identity_on_a_composite_key() {
+        use arrow::array::Date32Array;
+
+        let part_for = |f: f64| {
+            let d: ArrayRef = Arc::new(Date32Array::from(vec![19723]));
+            let fl: ArrayRef = Arc::new(Float64Array::from(vec![f]));
+            let one: ArrayRef = Arc::new(Int64Array::from(vec![1i64]));
+            partial(&[d, fl], &[AggCall::new(AggFunc::Sum, Some(one))], 1).unwrap()
+        };
+        // Same SQL group (-0.0 == 0.0), different representatives across the two partials.
+        let parts = [part_for(-0.0), part_for(0.0)];
+
+        let serial = combine_with(&parts, &[AggFunc::Sum], usize::MAX).unwrap();
+        let radix = combine_with(&parts, &[AggFunc::Sum], 1).unwrap();
+        assert_eq!(
+            serial.group_columns[0].len(),
+            1,
+            "serial combine must fold -0.0 and 0.0 into one group"
+        );
+        assert_eq!(
+            radix.group_columns[0].len(),
+            serial.group_columns[0].len(),
+            "radix combine must agree with serial on float key identity"
+        );
+        // And the counts must have merged, not split.
+        let sums = finalize(&[AggFunc::Sum], &radix).unwrap();
+        assert_eq!(sums[0].as_primitive::<Int64Type>().value(0), 2);
+    }
 }

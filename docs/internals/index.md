@@ -14,7 +14,7 @@ with worked examples you can run: the [query lifecycle](../deep-dives/query-life
 
 ## Architecture overview
 
-![Batcher's layered architecture from the User API down through the Dataset API, Logical Plan, Kyber optimizer, Physical Plan, Execution Engine, Carbonite, and optional Ray.](../_static/diagrams/layer_stack.png)
+![Batcher's layered architecture from the User API down through the Dataset API, Logical Plan, Kyber optimizer, Physical Plan, Execution Engine, Carbonite, and optional Ray.](../_static/diagrams/layer_stack.svg)
 
 Ray is an optional dependency used only for distributed scheduling. Single-node
 execution does not require it, and even on a cluster the data plane moves Arrow
@@ -66,7 +66,7 @@ primitives run on one core, many cores, or many machines.
 
 A typical query flows through the system:
 
-![The eight-step data flow from user code through logical plan, Kyber optimization, physical plan, execution engine, Carbonite, the Rust data plane, and collected results.](../_static/diagrams/data_flow.png)
+![The eight-step data flow from user code through logical plan, Kyber optimization, physical plan, execution engine, Carbonite, the Rust data plane, and collected results.](../_static/diagrams/data_flow.svg)
 
 ## Key concepts
 

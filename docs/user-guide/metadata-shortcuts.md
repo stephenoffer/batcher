@@ -7,7 +7,7 @@ header records its row count. A lakehouse manifest records both, per file. A war
 catalog records them per table. And an in-memory relation, being immutable, can compute
 them once and remember them forever. So when you ask "how many rows is that?", or "does
 this column have gaps?", or "is `id` actually unique?", there is very often nothing to
-compute — only something to read.
+compute, only something to read.
 
 **You do not have to ask for this.** It happens underneath the API you already use:
 
@@ -28,20 +28,20 @@ ds.dq.not_null("id").in_range("amount", 0, 1e6).fail()   # a contract the footer
 Each of those is an ordinary call. Each one, on this data, costs a metadata round trip
 instead of a scan. Nothing in that snippet mentions metadata, and that is the point.
 
-The rest of this page explains **when** it fires (so you can tell why something was slow),
-and then covers `ds.meta` — an *optional* introspection namespace for asking the metadata
-layer directly. You will rarely need it; reach for it when you want to know what the engine
-knows, or to ask something the ordinary API has no spelling for ("would this join match
-anything?", "how many files am I about to open?").
+The rest of this page explains **when** it fires, so you can tell why something was slow.
+It then covers `ds.meta`, an *optional* introspection namespace for asking the metadata
+layer directly. You will rarely need it. Reach for it when you want to know what the engine
+knows, or to ask something the ordinary API has no spelling for, such as "would this join
+match anything?" or "how many files am I about to open?".
 
 ## The one rule that makes it safe
 
 **A shortcut returns exactly what executing would return.** Not an estimate of it, not a
-usually-right version of it — the same value.
+usually-right version of it. The same value.
 
 That is not a hope, it is how the layer is built. Kyber only answers from a statistic whose
-provenance is *exact* — a footer bound, a manifest count, an immutable relation's own
-measurement. If the statistic it needs is missing or merely estimated, it declines, and
+provenance is *exact*, meaning a footer bound, a manifest count, or an immutable relation's
+own measurement. If the statistic it needs is missing or merely estimated, it declines, and
 `ds.meta` quietly runs the query that computes the answer instead. Which of the two happened
 is invisible to you, because the answers are identical. Only the cost moves.
 
@@ -65,17 +65,17 @@ These are the calls people already write. Nothing here needs `ds.meta`.
 | `ds.drop_nulls(c)` / `ds.fill_null(...)` on a column with no nulls | a no-op |
 | `ds.limit(n)` with `n` at or above the row count | a no-op |
 | `ds.join(other, on=k)` whose key ranges are **disjoint** | no build, no probe, no shuffle |
-| `ds.dq.…fail()` / `.drop()` / `.validate()` on a contract that holds | three numbers |
+| `ds.dq.not_null(...).fail()`, `.drop()`, or `.validate()` on a contract that holds | three numbers |
 
 The last two are the ones that change what a query costs rather than shaving it. A join whose
-key ranges cannot overlap emits nothing — provable from four numbers, with neither side read —
-and a data-quality contract exists precisely to *confirm* that data is fine, which is the
-answer a footer usually already contains.
+key ranges cannot overlap emits nothing, which is provable from four numbers with neither
+side read. And a data-quality contract exists precisely to *confirm* that data is fine,
+which is the answer a footer usually already contains.
 
 ## Introspection: `ds.meta`
 
 Everything from here on is the **optional** namespace. You do not need it for any of the speed
-above — it exists to ask the metadata layer directly: what does the engine know, why wasn't
+above. It exists to ask the metadata layer directly: what does the engine know, why wasn't
 that free, and the handful of questions the ordinary API has no spelling for.
 
 The examples run against this dataset:
@@ -117,10 +117,10 @@ assert report["columns"]["amount"]["min"] == 3.25
 
 ## Rows, and whole-relation questions
 
-`shape` gives you `(rows, columns)`. `count_where` counts a filter's survivors — often for
-free, since `col IS NULL` is a recorded null count and `col > <above the maximum>` is
-provably zero. `is_empty_where`, `any_match`, `none_match`, and `all_match` are the boolean
-forms; `none_match` is the one a pruning decision reads best as.
+`shape` gives you `(rows, columns)`. `count_where` counts a filter's survivors, often for
+free, since `col IS NULL` is a recorded null count and a comparison above the recorded
+maximum is provably zero. `is_empty_where`, `any_match`, `none_match`, and `all_match` are
+the boolean forms, and `none_match` is the one a pruning decision reads best as.
 
 ```python
 assert ds.meta.shape() == (4, 8)
@@ -133,7 +133,7 @@ assert ds.meta.is_empty_where(bt.col("amount") > 1_000_000)
 
 `is_key` checks a candidate primary key (unique *and* never null), for one column or a
 composite. `sorted_by` reports the ordering the data is already known to carry, and
-`is_known_sorted_by` tells you whether a sort would be a no-op — both are one-sided: they
+`is_known_sorted_by` tells you whether a sort would be a no-op. Both are one-sided: they
 report what is *recorded*, never guessing that unrecorded means unsorted.
 
 ```python
@@ -144,7 +144,10 @@ assert ds.meta.sorted_by() == ()
 assert ds.meta.is_known_sorted_by("day") is False
 ```
 
-## One column at a time — `ds.meta.col(...)`
+## One column at a time with `ds.meta.col(...)`
+
+`ds.meta.col(name)` narrows the namespace to a single column. Every method below is
+answered from a recorded statistic when there is one, and from a query when there is not.
 
 ```python
 c = ds.meta.col("amount")
@@ -170,13 +173,13 @@ assert c.summary()["n_unique"] == 4  # all of the above, as one dict
 ```
 
 `sum` and `mean` are the ones with an interesting economics. No footer records a sum, so
-they usually run an aggregate — but an immutable in-memory relation *computes and caches* one
+they usually run an aggregate. But an immutable in-memory relation *computes and caches* one
 the first time you ask, so the second query that needs it is free. That is the
 learned-metadata idea in miniature: a query that gets cheaper the more it runs.
 
-## Predicates on a column — `ds.meta.col(...).check`
+## Predicates on a column with `ds.meta.col(...).check`
 
-A minimum and a maximum are not just statistics. They are *values that occur in the column*,
+A minimum and a maximum are not only statistics. They are *values that occur in the column*,
 and that turns a whole class of questions into arithmetic on two numbers.
 
 ```python
@@ -200,7 +203,7 @@ assert not amt.any_less_equal(0)
 ```
 
 `any_greater_than` is worth dwelling on. A maximum *above* the threshold proves a match
-exists; a maximum *at or below* it proves none does. The second half is what lets
+exists, and a maximum *at or below* it proves none does. The second half is what lets
 `WHERE amount > 1000000` over a column whose maximum is 99 be answered "no rows" without
 opening the file.
 
@@ -217,13 +220,16 @@ assert ids.any_in([3, 4])         # SQL IN — refuted for free when every candi
 assert ids.none_in([9998, 9999])
 ```
 
-A value outside `[min, max]` — or one a membership bloom rejects — is *not in the column*, and
+A value outside `[min, max]`, or one a membership bloom rejects, is *not in the column*, and
 cannot be in any subset of it. That refutation is what skips a file, a partition, or a whole
-query. Presence, by contrast, bounds cannot confirm (except on a constant column), so a
-"maybe" runs the filter. `may_contain` never executes at all: a `False` from it is always safe
-to act on.
+query. Presence is the other direction, and bounds cannot confirm it unless the column is
+constant, so a "maybe" runs the filter. `may_contain` never executes at all, and a `False`
+from it is always safe to act on.
 
-## Missing data — `ds.meta.nulls`
+## Missing data with `ds.meta.nulls`
+
+The `nulls` namespace answers whole-relation completeness questions across every column at
+once.
 
 ```python
 assert ds.meta.nulls.counts()["amount"] == 0  # every column, one question
@@ -235,10 +241,10 @@ assert ds.meta.nulls.columns_with_nulls() == []
 assert "amount" in ds.meta.nulls.complete_columns()
 ```
 
-When the footers cannot answer, this runs **one** aggregate for every column together — never
+When the footers cannot answer, this runs **one** aggregate covering every column, never
 one pass per column.
 
-## Types — `ds.meta.schema`
+## Types with `ds.meta.schema`
 
 The cheapest shortcuts here: the plan knows its own output schema, so these never touch data
 and can never be wrong.
@@ -267,7 +273,7 @@ assert schema.nested() == ["tags"]
 assert schema.select("numeric").columns == ["id", "user_id", "amount"]
 ```
 
-## Physical layout — `ds.meta.storage`
+## Physical layout with `ds.meta.storage`
 
 What a scan *would* read, before it reads it. "340 files, 12 GB, partitioned by day" is a
 sentence you can act on, and it costs one metadata round trip to say.
@@ -288,14 +294,14 @@ assert storage.row_group_count() is None  # ...and its row-group count
 assert storage.bytes_per_row() is None
 ```
 
-On a Parquet source, `num_files` is the small-files diagnosis without a scan — a thousand
+On a Parquet source, `num_files` is the small-files diagnosis without a scan. A thousand
 files for a gigabyte means the query is about to spend its time on footers rather than on
-data — and `row_group_count` is the granularity a zone-map prune actually skips at.
+data. `row_group_count` is the granularity a zone-map prune actually skips at.
 
-## Joins — `ds.meta.against(other)`
+## Joins with `ds.meta.against(other)`
 
 The shortcut that saves the most work in absolute terms. If one side's key range is `[1, 10]`
-and the other's is `[900, 999]`, the inner join is **empty** — provably, from four numbers,
+and the other's is `[900, 999]`, the inner join is **empty**, provably, from four numbers,
 with neither side read. No build, no probe, no shuffle.
 
 ```python
@@ -309,10 +315,10 @@ assert ds.meta.against(present).key_overlap("user_id") == (10, 11)
 assert ds.meta.against(present).estimated_rows("user_id") >= 0
 ```
 
-Only *emptiness* is proved. Overlapping ranges do not imply a match exists — two key columns
-can share a range and share no value — so an overlap runs the join.
+Only *emptiness* is proved. Overlapping ranges do not imply a match exists, because two key
+columns can share a range and share no value, so an overlap runs the join.
 
-## Approximate answers — `ds.meta.approx`
+## Approximate answers with `ds.meta.approx`
 
 Different contract, and it is named so it cannot be confused with the rest. **Nothing here
 executes, and nothing here is exact.** Each method reads a sketch a previous run recorded, and
@@ -341,14 +347,15 @@ approx.histogram("amount", 4)  # equal-probability buckets from a KLL grid
 executor when a query runs, so a column nobody has read has nothing measured. Run the query
 once and the second run answers for free.
 
-If you need an approximate quantile *now*, use the `Dataset` terminals (`ds.approx_median`,
-`ds.approx_quantile`, `ds.approx_n_unique`) — they consult the same learned sketches first and
-then stream one if there is none. `ds.meta.approx` is the free-or-nothing probe.
+If you need an approximate quantile *now*, use the `Dataset` terminals `ds.approx_median`,
+`ds.approx_quantile`, and `ds.approx_n_unique`. They consult the same learned sketches first
+and then stream one if there is none. `ds.meta.approx` is the free-or-nothing probe.
 
 ## Where this comes from
 
 `ds.meta` is the user-facing half of Batcher's metadata-first design. The other half is
 invisible: `ds.count()`, `ds.min()`, `ds.n_unique()`, and the optimizer's own pruning all
-consult the same statistics before executing. The `meta` namespace simply opens that layer up
-and lets you ask it directly — and, crucially, ask it things no SQL terminal has a spelling
-for, like "would this join match anything?" or "how many files am I about to open?".
+consult the same statistics before executing. The `meta` namespace opens that layer up and
+lets you ask it directly. Crucially, it also lets you ask things no SQL terminal has a
+spelling for, such as "would this join match anything?" or "how many files am I about to
+open?".

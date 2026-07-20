@@ -1,8 +1,6 @@
 # Complete reference
 
-Every public name in `batcher`, generated from the source docstrings — the
-exhaustive backstop behind the [quick reference](reference.md) and the
-example-first [area pages](index.md). Each top-level function links to its own page.
+This page lists every public name in `batcher`, rendered from the source docstrings. It's the exhaustive backstop behind the [quick reference](reference.md) and the example-first [area pages](index.md). Each top-level function links to its own page.
 
 ## Construction and I/O
 
@@ -40,6 +38,9 @@ register SQL functions or sessions.
    compact
    vacuum
    engine_version
+   start_ui
+   stop_ui
+   ui_url
 ```
 
 ## Expressions and columns
@@ -65,10 +66,7 @@ Reference and derive columns, build literals, and branch.
 
 ## Column selectors
 
-Stand for *every column matching a predicate* — pass one anywhere a column is
-expected (`ds.select(bt.numeric())`, `ds.with_columns(bt.floating().round(2))`) and it
-expands against the input schema. See the
-[transformations guide](../user-guide/transformations.md) for how they compose.
+A *selector* stands for every column matching a predicate. Pass one anywhere a column is expected, such as `ds.select(bt.numeric())` or `ds.with_columns(bt.floating().round(2))`, and it expands against the input schema. See the [transformations guide](../user-guide/transformations.md) for how they compose.
 
 ```{eval-rst}
 .. autosummary::
@@ -136,10 +134,9 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    hash_rows
 ```
 
-## Horizontal (row-wise across columns) functions
+## Horizontal functions
 
-These reduce *across* the listed expressions within one row, rather than down a
-column. The vertical counterparts are the aggregates below.
+These reduce *across* the listed expressions within one row, rather than down a column. The vertical counterparts are the aggregates below.
 
 ```{eval-rst}
 .. autosummary::
@@ -305,8 +302,7 @@ Column-level lineage is reached from the dataset itself: :meth:`batcher.Dataset.
 
 ### Expression accessors
 
-The typed namespaces reached as `col("x").str`, `.dt`, `.list`, `.struct`,
-`.json`, `.map`, and — for multimodal columns — `.image`, `.audio`, and `.video`.
+These are the typed namespaces reached as `col("x").str`, `.dt`, `.list`, `.struct`, `.json`, and `.map`. Multimodal columns add `.image`, `.audio`, and `.video`.
 
 ```{eval-rst}
 .. autoclass:: batcher.plan.expr_ir.namespaces.strings._StrNamespace
@@ -385,9 +381,7 @@ and slowly-changing-dimension workflows.
 
 ## Metadata shortcuts
 
-The `ds.meta` namespace and the accessors it hands out — answers read from footers,
-manifests, and catalogs instead of from the data. See the
-[metadata shortcuts guide](../user-guide/metadata-shortcuts.md).
+The `ds.meta` namespace and the accessors it hands out read answers from footers, manifests, and catalogs instead of from the data. See the [metadata shortcuts guide](../user-guide/metadata-shortcuts.md).
 
 ```{eval-rst}
 .. autoclass:: batcher.api.dataset.meta.frame.DatasetMeta

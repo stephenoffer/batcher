@@ -50,7 +50,11 @@ polars = ["polars>=1.0"]
 duckdb = ["duckdb>=1.0"]
 # Pluggable MetadataHub backends.
 redis = ["redis>=5"]
-cloud = ["fsspec", "s3fs", "gcsfs"]
+# One extra that covers every object store the filesystem façade routes to fsspec: S3,
+# GCS, Azure (`adlfs` — `az://`, and the fallback for `abfs://` when pyarrow is built
+# without its native Azure backend), and HTTP(S) presigned URLs (`aiohttp`). Without adlfs
+# and aiohttp the error told users to install this extra and installing it did not help.
+cloud = ["fsspec", "s3fs", "gcsfs", "adlfs", "aiohttp"]
 # OpenTelemetry span export (observability.otel_traces). Only the API is needed to emit;
 # the host app owns the SDK + OTLP exporter that ships spans to its collector.
 otel = ["opentelemetry-api>=1.20"]
@@ -108,6 +112,11 @@ pulsar = ["pulsar-client>=3.4"]
 image = ["pillow>=10"]
 audio = ["soundfile>=0.12"]
 video = ["av>=12"]
+# --- Robotics / ADAS logs ---
+# `mcap` reads the container; `mcap-ros2-support` decodes ROS 2 message payloads out of
+# the `data` column, which is a downstream step the reader deliberately does not do.
+mcap = ["mcap>=1.1"]
+ros2 = ["mcap-ros2-support>=0.5"]
 # --- Framework interop (Ray Data `from_*` parity) ---
 pandas = ["pandas>=2"]
 huggingface = ["datasets>=2.18"]
@@ -117,6 +126,7 @@ warehouse = ["batcher-engine[sql,connectorx,snowflake,databricks,bigquery,clickh
 nosql = ["batcher-engine[mongo,elasticsearch,couchbase,cassandra,nosql-redis,dynamodb,neo4j,hbase]"]
 streaming = ["batcher-engine[kafka,kinesis,eventhubs,pubsub,pulsar]"]
 multimodal = ["batcher-engine[image,audio,video,pdf]"]
+robotics = ["batcher-engine[mcap,ros2,hdf5]"]
 ml-formats = ["batcher-engine[lance,avro,hdf5,zarr,tfrecord]"]
 dev = [
     "maturin>=1.7,<2",
@@ -126,6 +136,11 @@ dev = [
     "hypothesis>=6",
     "import-linter>=2",
     "ruff>=0.6",
+    # Runs the dashboard's JavaScript in `tests/unit/test_observe.py`. That JS has no other
+    # gate — a syntax error would ship a blank dashboard with every Python test green.
+    # QuickJS, not esprima: esprima is stuck at ES2017 and fails on object spread, `?.`,
+    # and `??`, so it flagged correct code as broken.
+    "quickjs>=1.19",
     "duckdb>=1.0",
     "polars>=1.0",
     "numpy>=1.24",
@@ -228,6 +243,26 @@ forbidden_modules = [
     "batcher.dist",
     "batcher.api",
     "batcher.ml",
+]
+
+# `observe` holds the observability *sinks* (terminal reporter, activity store, web UI). Every
+# subsystem publishes to the event bus in `_internal.events`; only this package consumes it. It
+# sits at layer 2 beside `io` for exactly one reason: if a sink could import a subsystem, the
+# subsystem it observes would end up importing it back through the bus wiring, and "observability
+# is decoupled from the engine" would stop being true. A sink reads events, never the engine.
+[[tool.importlinter.contracts]]
+name = "observe is a neutral sink layer"
+type = "forbidden"
+source_modules = ["batcher.observe"]
+forbidden_modules = [
+    "batcher.kyber",
+    "batcher.carbonite",
+    "batcher.core",
+    "batcher.governance",
+    "batcher.dist",
+    "batcher.api",
+    "batcher.ml",
+    "batcher.io",
 ]
 
 # `dist` is a *backend* of the conductor, not a peer of it: `api` decides to distribute and

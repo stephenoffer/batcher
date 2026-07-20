@@ -18,6 +18,7 @@ from batcher.dist.executors.plan_analysis import _single_source
 from batcher.dist.spill import _fd_safe, _iter_spill_morsels, _make_store, _work_dir
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
+from batcher.plan.ir_specs import sort_keys_ir
 from batcher.plan.logical import Sort
 
 
@@ -145,10 +146,7 @@ def stream_spilling_sort(
 
     map_plan, sid = _relabel_single_source(sort.input)
     map_ir = json.dumps(map_plan.to_ir())
-    keys_ir = [
-        {"expr": k.expr.to_ir(), "descending": k.descending, "nulls_first": k.nulls_first}
-        for k in sort.keys
-    ]
+    keys_ir = sort_keys_ir(sort.keys)
     scan = {"op": "scan", "source_id": 0}
     sort_ir = json.dumps({"op": "sort", "input": scan, "keys": keys_ir, "limit": sort.limit})
 

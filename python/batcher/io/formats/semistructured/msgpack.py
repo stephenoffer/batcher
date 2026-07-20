@@ -20,6 +20,7 @@ from typing import IO, Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.config import active_config
 from batcher.io.base import FileSink, FileSource
 from batcher.io.formats.base import SINKS, SOURCES
@@ -31,13 +32,9 @@ _LEN = struct.Struct(">I")  # 4-byte big-endian length prefix per record.
 
 def _require_ormsgpack() -> Any:
     """Import and return the `ormsgpack` module or raise `BackendError`."""
-    try:
-        import ormsgpack
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError(
-            "MessagePack support requires ormsgpack: pip install 'batcher-engine[msgpack]'"
-        ) from exc
-    return ormsgpack
+    return require(
+        "ormsgpack", feature="MessagePack support", provides="ormsgpack", extra="msgpack"
+    )
 
 
 def _iter_records(fh: IO[bytes], ormsgpack: Any) -> Any:

@@ -45,9 +45,7 @@ def _grouped_sum(eng, tbl, cfg) -> dict:
             "op": "aggregate",
             "input": {"op": "scan", "source_id": 0},
             "group_keys": [{"expr": {"e": "col", "name": "g"}, "alias": "g"}],
-            "aggregates": [
-                {"func": "sum", "input": {"e": "col", "name": "v"}, "alias": "s"}
-            ],
+            "aggregates": [{"func": "sum", "input": {"e": "col", "name": "v"}, "alias": "s"}],
         }
     )
     out = eng.execute_plan(plan, [list(tbl.to_batches())], cfg)

@@ -17,10 +17,10 @@ import pytest
 
 import batcher as bt
 import batcher.kyber.rules.extra.conditional  # registers the rules under test
+from _harness import assert_same
 from batcher import col, lit
 from batcher.plan.expr_ir import Case, Coalesce, Greatest
 from batcher.plan.expr_ir.constructors import coalesce, greatest, least, nullif, when
-from conftest import assert_same
 
 
 @pytest.fixture

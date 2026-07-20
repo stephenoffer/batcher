@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
-from batcher.ml.preprocessors.base import Preprocessor, distinct_values
+from batcher.ml.preprocessors.base import Preprocessor, distinct_values, fit_aggregate
 from batcher.plan.expr_ir import Expr, col, lit, when
 
 if TYPE_CHECKING:
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
     from batcher.api.dataset import Dataset
 
-__all__ = ["LabelEncoder", "MultiHotEncoder", "OneHotEncoder", "OrdinalEncoder"]
+__all__ = ["LabelEncoder", "MultiHotEncoder", "OneHotEncoder", "OrdinalEncoder", "TargetEncoder"]
 
 
 def _ordinal_expr(column: str, categories: list[Any], unknown_value: int) -> Expr:
@@ -268,6 +268,120 @@ class OneHotEncoder(Preprocessor):
             for cat in cats:
                 indicators[f"{c}_{cat}"] = when(col(c) == cat).then(1).otherwise(0)
         return ds.select(*keep, **indicators)
+
+
+def _target_expr(column: str, mapping: dict[Any, float], prior: float) -> Expr:
+    """A CASE expression mapping each category to its smoothed target mean, else `prior`."""
+    builder = None
+    for cat, value in mapping.items():
+        cond = col(column) == cat
+        builder = when(cond).then(value) if builder is None else builder.when(cond).then(value)
+    if builder is None:
+        return lit(prior)
+    return builder.otherwise(prior)
+
+
+class TargetEncoder(Preprocessor):
+    """Replace each categorical column with the smoothed mean of a target column.
+
+    Mean (a.k.a. likelihood) target encoding — the standard high-cardinality-categorical
+    encoding for gradient-boosted and linear tabular models (scikit-learn ``TargetEncoder``,
+    cuML, ``category_encoders``). Each category maps to an m-estimate shrinkage of its
+    per-category target mean toward the global mean::
+
+        encoding(cat) = (n·mean(cat) + m·prior) / (n + m)
+
+    where ``n`` is the category's row count, ``prior`` the global target mean, and ``m`` the
+    `smoothing` weight — so rare categories fall back to the prior and cannot overfit. `fit`
+    is one mergeable ``group_by(col).agg(count, sum)`` per column; `transform` is a lazy CASE
+    `Expr`. Unseen categories (and nulls) map to `prior`. This is plain (non cross-fitted)
+    encoding: fit on the training split only, or the target leaks into the features.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import TargetEncoder
+            >>> ds = bt.from_pydict({"c": ["a", "a", "b", "b"], "y": [1.0, 1.0, 0.0, 0.0]})
+            >>> TargetEncoder(["c"], "y", smoothing=0.0).fit_transform(ds).to_pydict()["c"]
+            [1.0, 1.0, 0.0, 0.0]
+
+    Args:
+        columns: the categorical columns to replace in place with their target encoding.
+        target: the (numeric or 0/1) target column whose mean supplies the encoding.
+        smoothing: the m-estimate weight pulling small categories toward the global mean.
+    """
+
+    __slots__ = ("columns", "mapping_", "prior_", "smoothing", "target")
+
+    def __init__(self, columns: Sequence[str], target: str, *, smoothing: float = 10.0) -> None:
+        self.columns = list(columns)
+        if not self.columns:
+            raise PlanError("TargetEncoder requires at least one column")
+        self.target = target
+        self.smoothing = smoothing
+        self.prior_: float = 0.0
+        self.mapping_: dict[str, dict[Any, float]] = {}
+
+    def fit(self, ds: Dataset) -> TargetEncoder:
+        """Learn each category's smoothed target mean and the global prior.
+
+        Stored in `mapping_[col][category]` with the global mean in `prior_`; each is one
+        mergeable ``group_by(col).agg(count, sum)`` pass over `ds`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import TargetEncoder
+                >>> ds = bt.from_pydict({"c": ["a", "a", "b"], "y": [1.0, 0.0, 1.0]})
+                >>> round(TargetEncoder(["c"], "y").fit(ds).prior_, 4)
+                0.6667
+
+        Args:
+            ds: The (training) dataset supplying both the categories and the target.
+
+        Returns:
+            ``self``, fitted.
+        """
+        prior = fit_aggregate(ds, {"_p": col(self.target).mean()})["_p"]
+        self.prior_ = float(prior) if prior is not None else 0.0
+        for c in self.columns:
+            grp = ds.group_by(c).agg(_n=col(self.target).count(), _s=col(self.target).sum())
+            rows = grp.to_pydict()
+            mapping: dict[Any, float] = {}
+            for cat, n, s in zip(rows[c], rows["_n"], rows["_s"], strict=False):
+                if cat is None or not n:
+                    continue
+                mapping[cat] = (s + self.smoothing * self.prior_) / (n + self.smoothing)
+            self.mapping_[c] = mapping
+        self._fitted = True
+        return self
+
+    def transform(self, ds: Dataset) -> Dataset:
+        """Replace each fitted column with its smoothed target encoding.
+
+        Categories unseen at fit time (and nulls) map to the global `prior_`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import TargetEncoder
+                >>> ds = bt.from_pydict({"c": ["a", "a", "b", "b"], "y": [1.0, 1.0, 0.0, 0.0]})
+                >>> enc = TargetEncoder(["c"], "y", smoothing=0.0).fit(ds)
+                >>> enc.transform(bt.from_pydict({"c": ["a", "z"]})).to_pydict()["c"]
+                [1.0, 0.5]
+
+        Args:
+            ds: The dataset to encode.
+
+        Returns:
+            A new lazy `Dataset` with each fitted column replaced by its encoding.
+        """
+        self._require_fitted()
+        new = {c: _target_expr(c, self.mapping_[c], self.prior_) for c in self.columns}
+        return ds.with_columns(**new)
 
 
 class MultiHotEncoder(Preprocessor):

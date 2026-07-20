@@ -2,7 +2,7 @@
 
 The standard ClickBench statements over the public ``hits`` dataset, written once as
 SQL and fanned across every SQL-capable engine. Columns follow the ClickBench schema
-(``sources.py`` reads the dataset as-is and normalizes date columns to
+(``sources`` reads the dataset as-is and normalizes date columns to
 ``timestamp[us]``). Engines whose SQL planner cannot express a query (e.g. the regex
 back-reference in Q28) surface as ``n/a``/``PARTIAL``, never a wrong answer.
 

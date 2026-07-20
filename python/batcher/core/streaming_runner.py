@@ -68,17 +68,38 @@ class LocalRunner:
     existed; it is the reference the distributed runner has to agree with.
     """
 
-    __slots__ = ("_iterator", "_processor", "_sink", "_source")
+    __slots__ = ("_iterator", "_predicate", "_processor", "_projection", "_sink", "_source")
 
-    def __init__(self, source: Source, processor: MicroBatchProcessor, sink: Any) -> None:
+    def __init__(
+        self,
+        source: Source,
+        processor: MicroBatchProcessor,
+        sink: Any,
+        *,
+        projection: list[str] | None = None,
+        predicate: dict | None = None,
+    ) -> None:
         self._source = source
         self._processor = processor
         self._sink = sink
+        # Kyber's source pushdown for this plan, or None when there is none to push (a
+        # `map_batches` pipeline, whose UDF is opaque to the optimizer).
+        self._projection = projection
+        self._predicate = predicate
         self._iterator: Iterator[pa.RecordBatch] | None = None
 
     def stage(self, batch_id: int) -> pa.RecordBatch | None:  # noqa: ARG002
         if self._iterator is None:
-            self._iterator = self._source.iter_batches(None)
+            # Read *through* the pushdown, exactly as `_iter_streaming` does. This was
+            # `iter_batches(None)`, which decoded every column regardless of the plan's
+            # projection — the batch and streaming paths disagreeing on pushdown for the
+            # same pipeline. `iter_source` degrades safely: a source whose `iter_batches`
+            # takes no predicate is called with the projection only, and the plan's own
+            # `Filter` re-checks every batch, so correctness never depends on the source
+            # honoring either.
+            from batcher.io.source import iter_source
+
+            self._iterator = iter_source(self._source, self._projection, self._predicate)
         batch = next(self._iterator, None)
         if batch is None:
             # Exhausted: every batch the source yielded has already been published (each

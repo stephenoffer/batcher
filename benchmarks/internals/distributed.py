@@ -28,11 +28,11 @@ import time
 # as ``benchmarks/iso/run.py``. No-op when imported through ``run.py --benchmark``.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import batcher as bt  # noqa: E402
-import engines as engines_mod  # noqa: E402
-from batcher import col, count  # noqa: E402
-from context import Context  # noqa: E402
-from harness import bench, results_match  # noqa: E402
+import batcher as bt
+import engines as engines_mod
+from batcher import col, count
+from context import Context
+from harness import bench, results_match
 
 try:
     import ray  # noqa: F401

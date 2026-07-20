@@ -26,15 +26,76 @@ one partition (``_poll``). All Arrow assembly lives here in ``_make_batch``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
+from contextlib import closing
 from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
 
+from batcher.io.formats.sql._common import connection_fingerprint
 from batcher.io.splits import Split
 
-__all__ = ["BrokerMessage", "BrokerSource", "BrokerSplit", "broker_schema"]
+__all__ = [
+    "BrokerMessage",
+    "BrokerSource",
+    "BrokerSplit",
+    "broker_schema",
+    "redact_broker_options",
+]
+
+#: Substrings marking a broker option that carries authentication material.
+#:
+#: Matched as a *substring* rather than by equality, unlike the SQL fingerprint's exact-key
+#: set, because broker clients namespace their credentials: confluent-kafka takes
+#: ``sasl.password``, kafka-python ``sasl_plain_password``, and Event Hubs hides a
+#: ``SharedAccessKey`` inside a ``connection_str``. An exact-match list matched none of them,
+#: which is precisely how these values reached `identity()` and a dataclass `repr`.
+_BROKER_SECRET_HINTS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "credential",
+    "api_key",
+    "apikey",
+    "connection_str",
+    "conn_str",
+    "sas",
+    "private_key",
+    "certificate",
+)
+
+
+def redact_broker_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Broker client options with every credential-bearing value masked.
+
+    Two call sites need this and they fail differently. A `repr` leak prints a SASL password
+    into a traceback or a log line. An `identity()` leak is worse: identity is the key learned
+    statistics are *persisted* under, so the credential is written to the metadata store and
+    outlives the process that held it.
+
+    Masking rather than dropping is what keeps the key stable across a credential rotation —
+    a rotated password maps to the same ``"***"``, so the topic's accumulated statistics are
+    not orphaned on every rotation. This mirrors
+    `batcher.io.formats.sql.odbc.redact_connection_string`, which exists for the same reason.
+
+    Args:
+        options: Broker client options, as passed through to the concrete client.
+
+    Returns:
+        A new mapping with credential-bearing values replaced by ``"***"``.
+    """
+    return {
+        key: ("***" if any(hint in key.lower() for hint in _BROKER_SECRET_HINTS) else value)
+        for key, value in options.items()
+    }
+
+
+def _options_fingerprint(options: Mapping[str, Any]) -> str:
+    """The connection's contribution to an identity — redacted, then fingerprinted."""
+    return connection_fingerprint(redact_broker_options(options))
 
 
 def broker_schema() -> pa.Schema:
@@ -114,14 +175,53 @@ class BrokerSource(ABC):
         return None  # unbounded stream
 
     def identity(self) -> str:
-        return f"{self.format_name}:{self.topic}"
+        """A stats key that distinguishes the same topic name on different clusters.
+
+        The connection has to be part of the key. ``kafka:events`` names a topic, not a
+        relation: the same topic exists on the production cluster and on staging, and keyed
+        on the name alone the two share one learned-statistics entry. Kyber then plans the
+        thousand-message staging topic with the billion-message production cardinalities and
+        nothing errors — the query is merely planned for the wrong data.
+
+        The connection is folded in as a `connection_fingerprint`, which is `sha256` and not
+        `hash()` on purpose: Python salts `hash()` per process, so a `hash()`-based identity
+        would differ on every run and no statistic would ever be reused — a feedback loop
+        that looks alive while never improving a plan. Options are redacted first, so the
+        persisted key never carries a credential and survives a rotation unchanged.
+        """
+        return f"{self.format_name}:{self.topic}:{_options_fingerprint(self._options)}"
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        """Materialize the stream — only safe for a bounded test broker.
+        """Materialize the stream — only valid for a bounded broker.
 
-        An unbounded broker never terminates here; production reads go through
-        ``iter_batches``. Provided so a broker satisfies the ``Source`` protocol.
+        This used to be ``list(self.iter_batches(...))`` unconditionally, which on an
+        unbounded broker is not slow but non-terminating: `iter_batches` polls forever by
+        contract, so `read()` accumulates every message ever published into a list until the
+        process dies of memory exhaustion. Nothing raises and nothing logs — a `collect()` on
+        a Kafka topic simply never returns, which reads as a hang rather than as the misuse
+        it is.
+
+        A bounded broker (a test broker whose ``_poll`` returns ``None`` at end-of-stream)
+        still materializes, so the `Source` protocol is satisfied where it can be. An
+        unbounded one refuses with an actionable error naming `iter_batches`, following
+        `RateSource.read`, which already declined for exactly this reason.
+
+        Args:
+            projection: Columns the scan must produce. All columns when omitted.
+
+        Returns:
+            Every batch of a bounded broker, materialized.
+
+        Raises:
+            PlanError: If the broker is unbounded, where materializing cannot terminate.
         """
+        if not self.bounded:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                f"{self.format_name!r} is an unbounded stream: read()/collect() would never "
+                "terminate. Use iter_batches(), or a streaming query with a trigger."
+            )
         return list(self.iter_batches(projection))
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
@@ -131,6 +231,18 @@ class BrokerSource(ABC):
         keeps polling. A subclass whose ``_poll`` returns ``None`` signals
         end-of-stream (a bounded test broker), which stops the loop.
         """
+        try:
+            yield from self._poll_loop(projection)
+        finally:
+            # A consumer abandons this generator constantly — `break`ing out of a
+            # micro-batch loop, a trigger firing, an exception upstream. Without a `finally`
+            # the client socket and its background threads live until the generator is
+            # garbage-collected, which for a reference cycle is *never*. A long-running
+            # driver then leaks one broker connection per query restart.
+            self.close()
+
+    def _poll_loop(self, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        """The poll/assemble/publish/commit cycle, wrapped by `iter_batches`' cleanup."""
         while True:
             messages = self._poll()
             if messages is None:
@@ -152,6 +264,13 @@ class BrokerSource(ABC):
             self._commit_delivered()
 
     # ---- exactly-once checkpoint/resume (Checkpointable protocol) ----------
+    def close(self) -> None:  # noqa: B027
+        """Release the client this source opened. Idempotent; safe on a never-opened source.
+
+        The base is a no-op — a broker with no client (a test broker) has nothing to release.
+        A broker holding a socket, a consumer, or background threads overrides this.
+        """
+
     def _commit_delivered(self) -> None:  # noqa: B027
         """Advance the broker's own offsets to the last *published* batch.
 
@@ -262,7 +381,11 @@ class BrokerSplit:
     topic: str
     partition: int
     poll_size: int
-    options: dict[str, Any] = field(default_factory=dict)
+    #: `repr=False` because these are the *client* options — they carry `sasl.password`,
+    #: `sasl_plain_password`, and Event Hubs' `connection_str` (a SAS key). A split is
+    #: pickled to every worker and appears verbatim in any traceback that mentions it, so
+    #: the generated dataclass `repr` was printing broker credentials into logs.
+    options: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def _reader(self) -> BrokerSource:
         from batcher.io.formats.base import SOURCES
@@ -298,20 +421,40 @@ class BrokerSplit:
 
         Returns the batch (empty when the poll had nothing) and the new resume position.
         """
-        src = self._reader()
-        if start_offset is not None:
-            src.seek({"offsets": {str(self.partition): start_offset}})
-        messages = src._poll()
-        if not messages:  # None (end of stream) or an empty poll
-            return [], start_offset
-        src._track_positions(messages)
-        batch = src._make_batch(messages)
-        if projection is not None:
-            batch = batch.select(projection)
-        return [batch], src.snapshot_position()["offsets"].get(str(self.partition))
+        # `closing` because this builds a *fresh* client per epoch and calls `_poll`
+        # directly, bypassing `iter_batches`' cleanup. A streaming query runs one epoch per
+        # trigger interval, so an unclosed client here leaks a broker connection every few
+        # seconds for the life of the query.
+        with closing(self._reader()) as src:
+            if start_offset is not None:
+                src.seek({"offsets": {str(self.partition): start_offset}})
+            messages = src._poll()
+            if not messages:  # None (end of stream) or an empty poll
+                return [], start_offset
+            src._track_positions(messages)
+            batch = src._make_batch(messages)
+            if projection is not None:
+                batch = batch.select(projection)
+            # Deliberately does *not* `_commit_delivered()`. This returns *before* the driver
+            # has published the epoch, so committing here would be the same at-most-once bug
+            # the single-node path was fixed for: a crash between this return and the publish
+            # would leave the broker believing the messages were handled. On this path the
+            # driver's write-ahead log is the source of truth for position, not the broker's
+            # own offsets.
+            return [batch], src.snapshot_position()["offsets"].get(str(self.partition))
 
     def row_count(self) -> int | None:
         return None
 
     def identity(self) -> str:
-        return f"{self.format_name}:{self.topic}:p{self.partition}"
+        """Partition-scoped stats key, carrying the same connection fingerprint as the source.
+
+        A split's identity had the same cluster-blindness as the source's: partition 3 of
+        ``events`` on production and on staging were one key. It is fingerprinted from the
+        redacted options so the split and the source it came from agree, and so the persisted
+        key never carries a credential.
+        """
+        return (
+            f"{self.format_name}:{self.topic}:p{self.partition}"
+            f":{_options_fingerprint(self.options)}"
+        )

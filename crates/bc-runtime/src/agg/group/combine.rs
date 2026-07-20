@@ -136,6 +136,20 @@ pub(crate) fn combine_radix(
 /// values directly (no row encoding); everything else goes through arrow's row encoding.
 /// Nulls hash to a fixed sentinel so they co-locate (and thus form one group).
 fn hash_keys(group_keys: &[ArrayRef], num_rows: usize) -> Result<Vec<u64>, RuntimeError> {
+    // Canonicalize float keys ONCE, up front — the same shape `bucket_of_rows` uses — so
+    // every path below (typed fast path, mixed fold, or `RowConverter` fallback) buckets on
+    // the bits `assign_groups` grouped by. Stating the policy per-encoder is what let the
+    // `RowConverter` fallback drift: arrow's row format is deliberately non-canonical for
+    // floats, so a group whose representative is `-0.0` in one partial and `0.0` in another
+    // (legal — `assign_groups` takes reps from the original column) hashed into different
+    // radix buckets, and buckets merge by plain `concat` on the "key-disjoint" assumption,
+    // so the two were never reconciled: two output groups where the oracle returns one.
+    // Differing NaN payloads split the same way. It reached the fallback for any composite
+    // key mixing a float with a non-`is_hashable_mixed` type, any composite key with a
+    // nullable column, and any float nested in a `List`/`Struct` — and only above
+    // `RADIX_PARALLEL_THRESHOLD`, so no small test could see it.
+    let canon = crate::keys::canonicalize_float_keys(group_keys);
+    let group_keys: &[ArrayRef] = canon.as_deref().unwrap_or(group_keys);
     if group_keys.len() == 1 {
         let arr = &group_keys[0];
         match arr.data_type() {

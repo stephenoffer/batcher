@@ -43,7 +43,14 @@ class IcebergSource:
     # mismatch degrades to no pushdown (the engine still filters).
     supports_predicate = True
 
-    __slots__ = ("_catalog", "_identifier", "_manifest_cache", "_row_filter", "_snapshot_id")
+    __slots__ = (
+        "_catalog",
+        "_identifier",
+        "_manifest_cache",
+        "_row_filter",
+        "_snapshot_id",
+        "_table_cache",
+    )
 
     def __init__(
         self,
@@ -58,14 +65,30 @@ class IcebergSource:
         self._snapshot_id = snapshot_id
         self._row_filter = row_filter
         self._manifest_cache: Any = _UNSET
+        self._table_cache: Any = _UNSET
 
     def _table(self) -> Any:
+        """The loaded pyiceberg table, resolved once per source.
+
+        Loading a table is a catalog round trip plus a metadata-JSON fetch — not something
+        to repeat per call. It was: `_scan()` calls this, and every caller of `_scan()`
+        called it again first, so an ordinary split read loaded the same table **twice**,
+        and `_source()` builds a fresh source per split, so a 1,000-split scan was 2,000
+        catalog round trips before a byte of data moved.
+
+        Memoized on the instance, which is the right scope: a source is pinned to one
+        identifier and (optionally) one snapshot, so the table it names cannot change
+        underneath it within its own lifetime.
+        """
+        if self._table_cache is not _UNSET:
+            return self._table_cache
         _require_pyiceberg()
         cat = resolve_catalog(self._catalog if self._catalog is not None else "default")
         try:
-            return cat.load_table(self._identifier)
+            self._table_cache = cat.load_table(self._identifier)
         except Exception as exc:
             raise BackendError(f"failed to load Iceberg table {self._identifier!r}: {exc}") from exc
+        return self._table_cache
 
     def _pushed_filter(self, predicate: dict | None) -> Any:
         """The pyiceberg expression for `predicate`, or None.
@@ -125,8 +148,19 @@ class IcebergSource:
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
+        """Stream the table, normalizing each batch to the engine's types.
+
+        The normalization is a `cast` against a target schema derived **once** for the scan.
+        It used to wrap every batch into a one-batch `pa.Table`, call
+        `normalize_engine_types` (which re-derived the same target schema from scratch), and
+        unwrap it again — three allocations and a full schema walk per batch, in the scan's
+        hot path, to reach a conclusion that cannot change between batches of one reader.
+        """
+        target: pa.Schema | None = None
         for batch in self._scan(projection, predicate).to_arrow_batch_reader():
-            yield from normalize_engine_types(pa.Table.from_batches([batch])).to_batches()
+            if target is None:
+                target = engine_schema(batch.schema)
+            yield batch if target.equals(batch.schema) else batch.cast(target)
 
     def row_count(self) -> int | None:
         """Row count from the current snapshot's summary — or None if it would be wrong.
@@ -293,6 +327,7 @@ class IcebergSource:
                 snapshot_id=self._snapshot_id,
                 task=task,
                 rows=getattr(task.file, "record_count", None),
+                row_filter=self._row_filter,
             )
             for task in tasks
         ]
@@ -330,7 +365,7 @@ class IcebergTableSplit:
     or resurrects deleted rows.
     """
 
-    __slots__ = ("_catalog", "_identifier", "_rows", "_snapshot_id", "_task")
+    __slots__ = ("_catalog", "_identifier", "_row_filter", "_rows", "_snapshot_id", "_task")
 
     def __init__(
         self,
@@ -340,21 +375,32 @@ class IcebergTableSplit:
         snapshot_id: int | None,
         task: Any,
         rows: int | None = None,
+        row_filter: Any = None,
     ) -> None:
         self._identifier = identifier
         self._catalog = catalog
         self._snapshot_id = snapshot_id
         self._task = task
         self._rows = rows
+        # The source's constructor `row_filter` MUST travel with the split. A worker sees
+        # only this object — it rebuilds the source from these fields — so a filter left
+        # behind here is a filter the worker never applies. `plan_files` prunes at *file*
+        # granularity, so the surviving files still contain non-matching rows, and the
+        # filter is not part of Kyber's pushed predicate, so no `Filter` re-checks them:
+        # the distributed read simply returns extra rows. Measured before this was
+        # carried: single-node 10 rows, distributed 100, same query, no error.
+        self._row_filter = row_filter
 
     def _source(self) -> IcebergSource:
         return IcebergSource(
             self._identifier,
             catalog=self._catalog,
             snapshot_id=self._snapshot_id,
+            row_filter=self._row_filter,
         )
 
-    def _read_table(self, projection: list[str] | None, predicate: dict | None = None) -> pa.Table:
+    def _arrow_scan(self, projection: list[str] | None, predicate: dict | None) -> Any:
+        """The pyiceberg `ArrowScan` for this split's one task, ready to read."""
         from pyiceberg.io.pyarrow import ArrowScan
 
         from batcher.io.filesystem import ensure_io_threads
@@ -363,10 +409,11 @@ class IcebergTableSplit:
         source = self._source()
         table = source._table()
         scan = source._scan(projection, predicate)
+        return ArrowScan(table.metadata, table.io, scan.projection(), scan.row_filter, True)
+
+    def _read_table(self, projection: list[str] | None, predicate: dict | None = None) -> pa.Table:
         try:
-            arrow = ArrowScan(
-                table.metadata, table.io, scan.projection(), scan.row_filter, True
-            ).to_table([self._task])
+            arrow = self._arrow_scan(projection, predicate).to_table([self._task])
         except ValueError as exc:
             # pyiceberg raises a bare ValueError for an equality-delete table (Flink CDC).
             raise BackendError(f"cannot read Iceberg table {self._identifier!r}: {exc}") from exc
@@ -383,7 +430,29 @@ class IcebergTableSplit:
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        yield from self._read_table(projection, predicate).to_batches()
+        """Stream this data file's batches, never materializing the file.
+
+        `to_table` builds the whole data file — deletes applied, every column decoded — and
+        the old `.to_batches()` on the result merely re-chunked what was already resident.
+        `to_record_batches` is the same read incrementally, so peak memory is one batch
+        rather than one file. The `ValueError` translation has to be repeated here because
+        pyiceberg raises it lazily, when the generator is first advanced, not when it is
+        created — wrapping only the call would let the bare error escape.
+        """
+        try:
+            batches = self._arrow_scan(projection, predicate).to_record_batches([self._task])
+            target: pa.Schema | None = None
+            for batch in batches:
+                # Normalize the reader's *schema* once, then cast each batch to it. The old
+                # per-batch `normalize_engine_types(pa.Table.from_batches([batch]))` rebuilt
+                # a Table and re-derived the target schema for every batch in the scan's hot
+                # path, to compute the same answer each time.
+                if target is None:
+                    target = engine_schema(batch.schema)
+                yield batch if target.equals(batch.schema) else batch.cast(target)
+        except ValueError as exc:
+            # pyiceberg raises a bare ValueError for an equality-delete table (Flink CDC).
+            raise BackendError(f"cannot read Iceberg table {self._identifier!r}: {exc}") from exc
 
     def _data_file_path(self) -> str:
         """This split's data file, taken from the scan task it already carries.

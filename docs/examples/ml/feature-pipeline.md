@@ -41,8 +41,8 @@ what else that decision buys.
 `Chain` is the sklearn `Pipeline` equivalent. It fits each step on the **previous step's
 output** and replays the fitted steps, in order, over any split. Sequencing this by hand
 is where leaks appear: fit step *i* on data that steps *0..i-1* have not transformed and
-the statistics no longer match what the model will see at serving time. Nothing fails; the
-metric is just wrong.
+the statistics no longer match what the model will see at serving time. Nothing fails. The
+metric is wrong.
 
 The classic order is impute → scale → encode.
 
@@ -76,7 +76,7 @@ print(imputer.statistics_)
 :::{warning}
 That 44.0 is the *training* median, and it is the value that fills the test set's nulls
 too. Refit on test and the two splits stop sharing a scale, which is the leak in its most
-common form. Nothing raises; the metric is simply wrong, and it is wrong in the flattering
+common form. Nothing raises. The metric is wrong, and it is wrong in the flattering
 direction.
 :::
 
@@ -162,7 +162,7 @@ reads, and its cardinality has to be measured rather than estimated.
 :::{dropdown} Quantile bins, learned on the training split
 
 `KBinsDiscretizer` with `strategy="quantile"` learns the quantile edges so each bin holds
-roughly equal counts. That is the right move for a heavy-tailed column like spend, where
+roughly equal counts. That is the right move for a heavy-tailed column such as spend, where
 equal *width* bins put 95% of your rows in bin 0.
 
 ```python

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 import pyarrow as pa
@@ -27,6 +28,7 @@ from batcher.io.formats.nosql.base import (
     require_driver,
     rows_to_batches,
 )
+from batcher.io.formats.sql._common import connection_fingerprint
 
 __all__ = ["DynamoDBSource"]
 
@@ -76,7 +78,6 @@ class DynamoDBSource(ScanSource):
             aws_secret_access_key=aws_secret_access_key,
             endpoint_url=endpoint_url,
         )
-        # The translated ``Scan`` filter for the active read, or None. Set per-read
 
     def _client(self) -> Any:
         boto3 = require_driver("boto3", "dynamodb")
@@ -85,13 +86,32 @@ class DynamoDBSource(ScanSource):
             "dynamodb",
             region_name=kw["region_name"],
             aws_access_key_id=kw["aws_access_key_id"],
-            aws_secret_access_key=kw["aws_secret_access_key"],
+            aws_secret_access_key=self._secret("aws_secret_access_key"),
             endpoint_url=kw["endpoint_url"],
         )
 
     def _identity_suffix(self) -> str:
-        region = self._conn_kwargs["region_name"] or "default"
-        return f"{region}/{self._conn_kwargs['table']}"
+        """``<endpoint>:<region>/<table>`` — the endpoint is part of the relation's identity.
+
+        The region was already in the key, which hides how much this matters: `endpoint_url`
+        is what distinguishes DynamoDB Local from the real service, and one AWS account's
+        table from another's at the same region and name. Both are the *same* relation under
+        a region-only key, so a laptop's ten-item fixture table taught Kyber the cardinality
+        it then used to plan the production table — and `identity()` is persisted, so that
+        estimate outlives the process that made it.
+
+        `aws_secret_access_key` and `aws_access_key_id` are excluded rather than passed to
+        `connection_fingerprint`: its `_NON_IDENTIFYING` filter matches on key *name* and
+        does not cover the ``aws_``-prefixed spellings, so handing it the full kwargs would
+        digest the live credentials instead of dropping them. Excluding them also keeps a
+        key rotation from orphaning the table's statistics.
+        """
+        kw = self._conn_kwargs
+        region = kw["region_name"] or "default"
+        fingerprint = connection_fingerprint(
+            {"region_name": region, "endpoint_url": kw["endpoint_url"] or "aws"}
+        )
+        return f"{fingerprint}:{region}/{kw['table']}"
 
     def _infer_schema(self) -> pa.Schema:
         client = self._client()
@@ -231,22 +251,38 @@ def _serialize(value: Any) -> dict[str, Any]:
 
 
 def _scan_items(client: Any, kwargs: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    """Paginate a `Scan`, following `LastEvaluatedKey`, yielding decoded items."""
+    """Paginate a `Scan`, following `LastEvaluatedKey`, yielding decoded items.
+
+    Genuinely incremental: one page is held at a time and `LastEvaluatedKey` drives the
+    next request, so a scan of a table larger than memory streams rather than accumulating.
+    """
+    deserializer = _type_deserializer()
     while True:
         resp = client.scan(**kwargs)
         for item in resp.get("Items", []):
-            yield _deserialize(item)
+            yield _deserialize(item, deserializer)
         last = resp.get("LastEvaluatedKey")
         if not last:
             return
         kwargs["ExclusiveStartKey"] = last
 
 
-def _deserialize(item: dict[str, Any]) -> dict[str, Any]:
-    """Decode a DynamoDB low-level item ``{attr: {type: value}}`` to plain Python."""
+@lru_cache(maxsize=1)
+def _type_deserializer() -> Any:
+    """The one `TypeDeserializer` every decode shares.
+
+    It is stateless, so the per-item construction it replaces bought nothing — but it was
+    paid for on **every row of every scan**, along with an `import boto3.dynamodb.types`
+    lookup, in the one loop the whole connector's throughput runs through.
+    """
     from boto3.dynamodb.types import TypeDeserializer
 
-    deserializer = TypeDeserializer()
+    return TypeDeserializer()
+
+
+def _deserialize(item: dict[str, Any], deserializer: Any = None) -> dict[str, Any]:
+    """Decode a DynamoDB low-level item ``{attr: {type: value}}`` to plain Python."""
+    deserializer = deserializer if deserializer is not None else _type_deserializer()
     return {k: _to_py(deserializer.deserialize(v)) for k, v in item.items()}
 
 

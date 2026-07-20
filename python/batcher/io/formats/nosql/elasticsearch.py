@@ -27,6 +27,7 @@ from batcher.io.formats.nosql.base import (
     require_driver,
     rows_to_batches,
 )
+from batcher.io.formats.sql._common import probe_is_typed
 
 __all__ = ["ElasticsearchSource"]
 
@@ -117,22 +118,35 @@ class ElasticsearchSource(ScanSource):
     def _client(self) -> Any:
         es = require_driver("elasticsearch", "elasticsearch")
         kw = self._conn_kwargs
-        return es.Elasticsearch(hosts=kw["hosts"], api_key=kw["api_key"])
+        return es.Elasticsearch(hosts=kw["hosts"], api_key=self._secret("api_key"))
 
     def _identity_suffix(self) -> str:
         return str(self._conn_kwargs["index"])
 
     def _infer_schema(self) -> pa.Schema:
-        if self._conn_kwargs["esql"]:
-            client = self._client()
-            table = _esql_arrow(client, self._conn_kwargs["esql"])
-            return table.schema
-        client = self._client()
-        resp = client.search(
-            index=self._conn_kwargs["index"],
-            query=self._conn_kwargs["query"],
-            size=1,
-        )
+        """The relation's columns, from a one-row probe rather than the whole result.
+
+        The ES|QL path ran the user's *entire* query and took `.schema` off the
+        materialized table — the column names of a cluster-wide aggregation cost the
+        cluster-wide aggregation. Worse, the plan needs the schema *before* it executes,
+        so an ordinary ``read(...).collect()`` submitted the query twice.
+
+        ``| LIMIT 1`` is the ES|QL spelling of the ``WHERE 1 = 0`` probe the SQL
+        connectors use: the coordinator stops after one row, and the Arrow stream's IPC
+        header carries the full typed schema regardless. `probe_is_typed` guards the case
+        a probe comes back untyped, falling back to the full query — slow, which is merely
+        what it did before, rather than wrong.
+        """
+        esql = self._conn_kwargs["esql"]
+        with contextlib.closing(self._client()) as client:
+            if esql:
+                probed = _esql_schema(client, f"{esql} | LIMIT 1")
+                return probed if probe_is_typed(probed) else _esql_schema(client, esql)
+            resp = client.search(
+                index=self._conn_kwargs["index"],
+                query=self._conn_kwargs["query"],
+                size=1,
+            )
         hits = resp["hits"]["hits"]
         if not hits:
             return pa.schema([])
@@ -151,17 +165,28 @@ class ElasticsearchSource(ScanSource):
         predicate: dict | None = None,
     ) -> Iterator[pa.RecordBatch]:
         self = self._with_pushed(predicate)  # push into the ES query, on the worker too
-        client = self._client()
-        if self._conn_kwargs["esql"]:
-            table = _esql_arrow(client, self._conn_kwargs["esql"])
-            yield from (table.select(projection) if projection else table).to_batches()
-            return
-        rows = _scroll_slice(
-            client, self._conn_kwargs["index"], self._conn_kwargs["query"], partition
-        )
+        # Resolved before the client is opened: `schema()` dials Elasticsearch itself, and
+        # a raise from it between `_client()` and the `try` would strand a live connection
+        # with nothing left holding a reference to close it.
         schema = self.schema() if not projection else None
-        for batch in rows_to_batches(rows, schema=schema):
-            yield batch.select(projection) if projection else batch
+        client = self._client()
+        try:
+            if self._conn_kwargs["esql"]:
+                # Streamed off the IPC reader rather than `read_all()`-ed into a table
+                # first: the whole point of `iter_batches` is that a caller which stops
+                # early, or which only ever holds one batch, never pays for the rest.
+                for batch in _esql_batches(client, self._conn_kwargs["esql"]):
+                    yield batch.select(projection) if projection else batch
+                return
+            rows = _scroll_slice(
+                client, self._conn_kwargs["index"], self._conn_kwargs["query"], partition
+            )
+            for batch in rows_to_batches(rows, schema=schema):
+                yield batch.select(projection) if projection else batch
+        finally:
+            # A consumer that abandons this generator (a LIMIT, an exception downstream)
+            # otherwise leaves the connection pool open until the collector happens to run.
+            client.close()
 
 
 # IR comparison op → Elasticsearch ``range`` query operator (``eq`` uses ``term``).
@@ -218,12 +243,23 @@ def _col_and_literal(left: dict[str, Any], right: dict[str, Any]) -> tuple[str, 
     return None
 
 
-def _esql_arrow(client: Any, esql: str) -> pa.Table:
-    """Run an ES|QL query asking for Arrow output and read it into a `pa.Table`."""
+def _esql_stream(client: Any, esql: str) -> Any:
+    """Open the Arrow IPC stream for an ES|QL query without reading its batches."""
     resp = client.esql.query(query=esql, format="arrow")
     raw = resp.body if hasattr(resp, "body") else resp
-    with pa.ipc.open_stream(io.BytesIO(raw)) as reader:
-        return reader.read_all()
+    return pa.ipc.open_stream(io.BytesIO(raw))
+
+
+def _esql_batches(client: Any, esql: str) -> Iterator[pa.RecordBatch]:
+    """Yield an ES|QL result's Arrow batches one at a time."""
+    with contextlib.closing(_esql_stream(client, esql)) as reader:
+        yield from reader
+
+
+def _esql_schema(client: Any, esql: str) -> pa.Schema:
+    """An ES|QL result's schema, read from the IPC header without consuming a batch."""
+    with contextlib.closing(_esql_stream(client, esql)) as reader:
+        return reader.schema
 
 
 def _scroll_slice(

@@ -45,10 +45,74 @@ pub struct SimdOverride {
     pub force_scalar: bool,
 }
 
-fn detect_raw() -> HardwareProfile {
-    let logical_cores = std::thread::available_parallelism()
+/// Whole cores the cgroup CFS bandwidth quota permits, or `None` when unlimited or
+/// unreadable. cgroup v2 (`cpu.max`, the tightest across the process's whole cgroup
+/// ancestry) then v1 (`cpu.cfs_quota_us` / `cpu.cfs_period_us`).
+///
+/// The quota is enforced at *every* level of a v2 hierarchy, so a limit set on a parent
+/// slice — a Ray worker under a systemd scope, a nested container — binds even when the
+/// leaf is unlimited. Taking the minimum over the chain is correct for any topology.
+#[cfg(target_os = "linux")]
+fn cfs_quota_cores() -> Option<usize> {
+    fn quota_at(dir: &str) -> Option<usize> {
+        let raw = std::fs::read_to_string(format!("{dir}/cpu.max")).ok()?;
+        let mut parts = raw.split_whitespace();
+        let quota: usize = parts.next()?.parse().ok()?; // "max" fails to parse ⇒ unlimited
+        let period: usize = parts.next().unwrap_or("100000").parse().ok()?;
+        (quota > 0 && period > 0).then(|| quota.div_ceil(period).max(1))
+    }
+    let mut dirs = vec!["/sys/fs/cgroup".to_string()];
+    if let Ok(own) = std::fs::read_to_string("/proc/self/cgroup") {
+        if let Some(sub) = own.lines().find_map(|l| l.strip_prefix("0::")) {
+            let parts: Vec<&str> = sub.trim().split('/').filter(|p| !p.is_empty()).collect();
+            for i in 1..=parts.len() {
+                dirs.push(format!("/sys/fs/cgroup/{}", parts[..i].join("/")));
+            }
+        }
+    }
+    let v2 = dirs.iter().filter_map(|d| quota_at(d)).min();
+    if v2.is_some() {
+        return v2;
+    }
+    let quota: i64 = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let period: i64 = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (quota > 0 && period > 0).then(|| (quota as usize).div_ceil(period as usize).max(1))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cfs_quota_cores() -> Option<usize> {
+    None
+}
+
+/// Cores this process may actually use: `available_parallelism` capped by the cgroup CFS
+/// quota. Never fewer than 1.
+///
+/// `available_parallelism` honors the CPU *affinity mask* (a cpuset pin) but not the CFS
+/// *bandwidth* quota, and Kubernetes' `cpu` limit is the latter — a pod limited to 15 cores
+/// on a 16-core node reports 16 and sizes every pool one thread too wide. Oversubscription
+/// does not merely waste a thread: exceeding the quota gets the whole cgroup throttled for
+/// the rest of the CFS period, so the extra worker buys stalls for *all* the others. This is
+/// the figure to size thread pools and shard counts from.
+pub fn usable_cores() -> usize {
+    let affinity = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
+    match cfs_quota_cores() {
+        Some(q) => affinity.min(q).max(1),
+        None => affinity.max(1),
+    }
+}
+
+fn detect_raw() -> HardwareProfile {
+    let logical_cores = usable_cores();
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -163,5 +227,36 @@ mod tests {
             HardwareProfile::resolved(SimdOverride::default()),
             *HardwareProfile::detect()
         );
+    }
+}
+
+#[cfg(test)]
+mod usable_cores_tests {
+    use super::*;
+
+    /// `usable_cores` must never exceed what the affinity mask allows, never be 0, and must
+    /// agree with the detected profile — the profile is what the JIT and scheduler read, so a
+    /// divergence between the two would size pools differently from the reported hardware.
+    #[test]
+    fn usable_cores_is_bounded_and_consistent() {
+        let affinity = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let usable = usable_cores();
+        assert!(usable >= 1, "must never be zero");
+        assert!(
+            usable <= affinity,
+            "quota may only narrow the affinity mask, never widen it ({usable} > {affinity})"
+        );
+        assert_eq!(usable, HardwareProfile::detect().logical_cores);
+    }
+
+    /// A quota, when present, is a whole-core ceiling ≥ 1 — `cpu.max` of "50000 100000"
+    /// (half a core) must round *up* to 1 rather than to a pool of zero threads.
+    #[test]
+    fn a_quota_is_a_positive_whole_core_count() {
+        if let Some(q) = cfs_quota_cores() {
+            assert!(q >= 1, "a sub-core quota must round up to one usable core");
+        }
     }
 }

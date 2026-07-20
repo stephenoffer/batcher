@@ -57,6 +57,7 @@ impl Expr {
             | Expr::NullIf { left, right }
             | Expr::Math2 { left, right, .. }
             | Expr::ListSet { left, right, .. }
+            | Expr::ListZip { left, right, .. }
             | Expr::ListBinary { left, right, .. } => {
                 left.contains_media_decode() || right.contains_media_decode()
             }
@@ -107,6 +108,9 @@ mod tests {
             input: col("bytes"),
             width: Some(224),
             height: Some(224),
+            mean: None,
+            std: None,
+            channels_first: false,
         };
         assert!(bare.contains_media_decode());
 

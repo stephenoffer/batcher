@@ -82,8 +82,8 @@ already consumed everything.
 | --- | --- | --- |
 | `ds.write(path, format=...)` | by **position** | the file name, `part-batch00007.parquet` |
 | `ds.write.delta(uri)` | by **transaction id** | a `txn` action of `(app_id, batch_id)` in the log |
-| `for_each_batch` | none — but you are handed the `batch_id` | whatever idempotency key you build from it |
-| `for_each`, `console`, `memory` | none | — |
+| `for_each_batch` | none, but you are handed the `batch_id` | whatever idempotency key you build from it |
+| `for_each`, `console`, `memory` | none | none |
 
 **File sinks** (`ds.write(path, format="parquet")`) write one file per micro-batch, named
 `part-batch00000.parquet`, `part-batch00001.parquet`, and so on. On a replay of batch 7,

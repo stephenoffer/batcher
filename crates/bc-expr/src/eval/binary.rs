@@ -236,6 +236,10 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
         // (inf/nan), so it passes straight through.
         Div => int_div_or_mod(true, l, r)?,
         Mod => int_div_or_mod(false, l, r)?,
+        // Python/Polars `//`: the quotient rounded toward NEGATIVE INFINITY, which
+        // is deliberately NOT DuckDB's truncating integer division (`-7 // 3` is
+        // `-3`, not `-2`). Zero divisor → NULL, as for `Div`/`Mod`.
+        FloorDiv => floor_div(l, r)?,
         // SQL three-valued logic: `FALSE AND NULL` is FALSE, `TRUE OR NULL` is
         // TRUE (a known-controlling operand wins over an unknown). Arrow's plain
         // `and`/`or` propagate the null instead, so use the Kleene kernels to match
@@ -443,6 +447,84 @@ fn int_div_or_mod(is_div: bool, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, 
     // Null every row whose divisor was zero (a null `is_zero` element — a null divisor —
     // leaves the already-null kernel output untouched).
     Ok(arrow::compute::nullif(&out, &is_zero)?)
+}
+
+/// Floored division (`a // b`) — the quotient rounded toward **negative infinity**.
+///
+/// This is Python/Polars `//`, deliberately *not* SQL/DuckDB integer division, which
+/// truncates toward zero: `-7 // 3` is `-3` here and `-2` under `Div`. That direction is
+/// the documented contract of `Expr.__floordiv__`, so DuckDB is not the oracle for it.
+///
+/// Int64 ÷ Int64 is computed **in integers** and stays Int64. That is the whole reason
+/// this is an op rather than sugar for `floor(a / b)`: routing through Float64 silently
+/// loses precision above 2^53 (`i64::MAX // 3` came back as `3.07e18`) and turns a zero
+/// divisor into `inf`/`NaN` instead of NULL.
+///
+/// Float64 is IEEE `(l / r).floor()`, so `/0.0` still yields ±inf / NaN exactly as `Div`
+/// does. Any other numeric type (notably Decimal128) keeps the pre-existing behavior of
+/// the old desugaring — computed as Float64 — rather than inventing floored-decimal
+/// semantics here.
+fn floor_div(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
+    use arrow::array::Float64Array;
+    use arrow::datatypes::DataType::{Float64, Int64};
+
+    match (l.data_type(), r.data_type()) {
+        (Int64, Int64) => {
+            let (a, b) = (
+                l.as_any().downcast_ref::<Int64Array>().expect("int64"),
+                r.as_any().downcast_ref::<Int64Array>().expect("int64"),
+            );
+            let out: Int64Array = (0..a.len())
+                .map(|i| {
+                    if a.is_null(i) || b.is_null(i) {
+                        return None;
+                    }
+                    let (x, y) = (a.value(i), b.value(i));
+                    // A zero divisor is NULL (never a CPU trap), matching `Div`/`Mod`.
+                    if y == 0 {
+                        return None;
+                    }
+                    // `wrapping_div`/`wrapping_rem` so the single overflowing input
+                    // `i64::MIN / -1` wraps to `i64::MIN` instead of trapping; the
+                    // remainder is then 0, so no correction applies and the result
+                    // agrees with the wrapping `Add`/`Sub`/`Mul` convention this
+                    // engine already uses (see the note on the arithmetic arms).
+                    let q = x.wrapping_div(y);
+                    let rem = x.wrapping_rem(y);
+                    // Truncating quotient → floored quotient: when the remainder is
+                    // non-zero and its sign differs from the divisor's, truncation
+                    // rounded toward zero, i.e. one step UP from the floor.
+                    Some(if rem != 0 && ((rem < 0) != (y < 0)) {
+                        q.wrapping_sub(1)
+                    } else {
+                        q
+                    })
+                })
+                .collect();
+            Ok(Arc::new(out))
+        }
+        (Float64, Float64) => {
+            let (a, b) = (
+                l.as_any().downcast_ref::<Float64Array>().expect("float64"),
+                r.as_any().downcast_ref::<Float64Array>().expect("float64"),
+            );
+            let out: Float64Array = (0..a.len())
+                .map(|i| {
+                    if a.is_null(i) || b.is_null(i) {
+                        return None;
+                    }
+                    Some((a.value(i) / b.value(i)).floor())
+                })
+                .collect();
+            Ok(Arc::new(out))
+        }
+        // Decimal128 and any other numeric pair: preserve what `floor(a / b)` produced
+        // before this op existed by evaluating in Float64.
+        _ => {
+            let (a, b) = (cast(l, &Float64)?, cast(r, &Float64)?);
+            floor_div(&a, &b)
+        }
+    }
 }
 
 /// Widen two decimal operands to a common precision/scale so a comparison kernel (which
@@ -1099,5 +1181,177 @@ mod dict_path_tests {
         assert!(try_dict_compare(BinaryOp::Eq, &col, &lit, &plain)
             .unwrap()
             .is_none());
+    }
+}
+
+/// Floored division (`//`) — Python/Polars semantics, NOT DuckDB's truncating
+/// integer division. These pin the two properties that motivated making it a real
+/// op instead of desugaring to `floor(a / b)`: Int64 stays Int64 (exact past 2^53)
+/// and a zero divisor is NULL rather than `inf`/`NaN`.
+#[cfg(test)]
+mod floor_div_tests {
+    use super::*;
+    use arrow::array::Float64Array;
+
+    fn fd_i64(l: Vec<Option<i64>>, r: Vec<Option<i64>>) -> Vec<Option<i64>> {
+        let (l, r): (ArrayRef, ArrayRef) =
+            (Arc::new(Int64Array::from(l)), Arc::new(Int64Array::from(r)));
+        let out = eval_binary(BinaryOp::FloorDiv, &l, &r).expect("floor_div");
+        assert_eq!(
+            out.data_type(),
+            &DataType::Int64,
+            "Int64 // Int64 must stay Int64 — a Float64 result is the precision bug"
+        );
+        let a = out.as_any().downcast_ref::<Int64Array>().expect("i64");
+        (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+            .collect()
+    }
+
+    fn fd_f64(l: Vec<Option<f64>>, r: Vec<Option<f64>>) -> Vec<Option<f64>> {
+        let (l, r): (ArrayRef, ArrayRef) = (
+            Arc::new(Float64Array::from(l)),
+            Arc::new(Float64Array::from(r)),
+        );
+        let out = eval_binary(BinaryOp::FloorDiv, &l, &r).expect("floor_div");
+        assert_eq!(out.data_type(), &DataType::Float64);
+        let a = out.as_any().downcast_ref::<Float64Array>().expect("f64");
+        (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+            .collect()
+    }
+
+    /// All four sign combinations round toward NEGATIVE INFINITY, matching Python's
+    /// `//`. Truncating (DuckDB `/`) would give -2 and -2 for the mixed-sign rows.
+    #[test]
+    fn rounds_toward_negative_infinity_in_every_sign_combination() {
+        assert_eq!(
+            fd_i64(
+                vec![Some(7), Some(-7), Some(7), Some(-7)],
+                vec![Some(3), Some(3), Some(-3), Some(-3)],
+            ),
+            // Python: 7//3=2, -7//3=-3, 7//-3=-3, -7//-3=2
+            vec![Some(2), Some(-3), Some(-3), Some(2)],
+        );
+    }
+
+    /// Exact division needs no correction in any sign combination.
+    #[test]
+    fn exact_division_is_unadjusted() {
+        assert_eq!(
+            fd_i64(
+                vec![Some(6), Some(-6), Some(6), Some(-6), Some(0)],
+                vec![Some(3), Some(3), Some(-3), Some(-3), Some(5)],
+            ),
+            vec![Some(2), Some(-2), Some(-2), Some(2), Some(0)],
+        );
+    }
+
+    /// The regression this op exists for: past 2^53 a Float64 round-trip loses
+    /// precision. `i64::MAX // 3` came back as `3.0744573456182584e18` (and
+    /// `(2^53+1) // 3` was off by one) when `//` desugared to `floor(a / b)`.
+    #[test]
+    fn exact_at_i64_and_f64_mantissa_boundaries() {
+        assert_eq!(
+            fd_i64(
+                vec![Some(i64::MAX), Some(9007199254740993), Some(i64::MIN)],
+                vec![Some(3), Some(3), Some(3)],
+            ),
+            vec![
+                Some(3074457345618258602),
+                Some(3002399751580331),
+                // i64::MIN/3 = -3074457345618258602.67 → floor = ...603
+                Some(-3074457345618258603),
+            ],
+        );
+    }
+
+    /// `i64::MIN / -1` is the one input whose true quotient is unrepresentable.
+    /// It WRAPS to `i64::MIN` rather than trapping, matching the wrapping
+    /// convention the `Add`/`Sub`/`Mul` arms already use. The remainder is 0, so
+    /// the floor correction does not fire and cannot turn it into a second wrap.
+    #[test]
+    fn i64_min_over_negative_one_wraps() {
+        assert_eq!(
+            fd_i64(vec![Some(i64::MIN)], vec![Some(-1)]),
+            vec![Some(i64::MIN)]
+        );
+    }
+
+    /// A zero divisor is NULL — never a CPU trap, and never `inf`/`NaN`. The old
+    /// float desugaring returned `inf`; both DuckDB and Polars return NULL.
+    #[test]
+    fn zero_divisor_is_null() {
+        assert_eq!(
+            fd_i64(
+                vec![Some(7), Some(-7), Some(0)],
+                vec![Some(0), Some(0), Some(0)]
+            ),
+            vec![None, None, None],
+        );
+    }
+
+    /// Nulls propagate from either side, exactly as for the other arithmetic ops.
+    #[test]
+    fn nulls_propagate_from_either_side() {
+        assert_eq!(
+            fd_i64(
+                vec![None, Some(7), None, Some(9)],
+                vec![Some(3), None, None, Some(2)],
+            ),
+            vec![None, None, None, Some(4)],
+        );
+    }
+
+    /// Float64 is IEEE `(l / r).floor()`: a zero divisor yields ±inf / NaN just as
+    /// `Div` does, rather than the integer arm's NULL.
+    #[test]
+    fn float_is_ieee_floor_of_the_quotient() {
+        let out = fd_f64(
+            vec![
+                Some(7.0),
+                Some(-7.0),
+                Some(7.5),
+                Some(1.0),
+                Some(-1.0),
+                Some(0.0),
+                None,
+            ],
+            vec![
+                Some(2.0),
+                Some(2.0),
+                Some(2.0),
+                Some(0.0),
+                Some(0.0),
+                Some(0.0),
+                Some(2.0),
+            ],
+        );
+        assert_eq!(out[0], Some(3.0));
+        // -3.5 floors to -4, not -3 (truncation would give -3).
+        assert_eq!(out[1], Some(-4.0));
+        assert_eq!(out[2], Some(3.0));
+        assert_eq!(out[3], Some(f64::INFINITY));
+        assert_eq!(out[4], Some(f64::NEG_INFINITY));
+        assert!(out[5].expect("0.0/0.0 is NaN, not null").is_nan());
+        assert_eq!(out[6], None);
+    }
+
+    /// A mixed Int64/Float64 pair promotes to Float64 (`coerce_numeric`), matching
+    /// every other arithmetic op, so `int_col // 2.0` is a float floor.
+    #[test]
+    fn mixed_int_and_float_promotes_to_float() {
+        let l: ArrayRef = Arc::new(Int64Array::from(vec![Some(-7)]));
+        let r: ArrayRef = Arc::new(Float64Array::from(vec![Some(2.0)]));
+        let out = eval_binary(BinaryOp::FloorDiv, &l, &r).expect("floor_div");
+        assert_eq!(out.data_type(), &DataType::Float64);
+        let a = out.as_any().downcast_ref::<Float64Array>().expect("f64");
+        assert_eq!(a.value(0), -4.0);
+    }
+
+    /// An empty input yields an empty Int64 array, not an error.
+    #[test]
+    fn empty_input() {
+        assert_eq!(fd_i64(vec![], vec![]), Vec::<Option<i64>>::new());
     }
 }

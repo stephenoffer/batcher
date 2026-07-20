@@ -19,6 +19,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher.io.splits.base import Split
+from batcher.io.stats.file_identity import file_identity
 
 __all__ = ["RowGroupSplit", "fragment_index", "pack_row_groups", "parquet_row_group_splits"]
 
@@ -55,16 +56,39 @@ def fragment_index(key: Any, build_dataset: Any) -> tuple[Any, dict[str, Any]]:
     return cached
 
 
-@lru_cache(maxsize=1024)
 def _parquet_footer(path: str):
-    """The Parquet `FileMetaData` for `path`, read once and cached per process.
+    """The Parquet `FileMetaData` for `path`, read once per *version* and cached.
 
     Reading the footer (row-group offsets, schema) is a ~100ms object-store round trip;
     a worker reads many row-group splits of the same file, so caching the footer turns
-    N footer reads into one. The metadata is immutable — safe to share across the
-    threads of the scan prefetch pool. Bounded LRU so a long-lived process scanning many
-    files stays memory-bounded.
+    N footer reads into one. Bounded LRU so a long-lived process scanning many files
+    stays memory-bounded.
+
+    Keyed on the file's identity — `(path, size, mtime)` — not on the path. The path
+    alone was justified by "Parquet is write-once", which holds for an immutable lake and
+    not for a pipeline re-run: `FileSink` writes deterministic names, so a job overwrites
+    its own output, and a path-keyed footer then describes the *previous* file. That is
+    not a stale file but stale metadata about a new one — row-group offsets from the old
+    footer index into the middle of the new bytes (`RowGroupSplit` passes this metadata
+    straight to `ParquetFile`), and a cached row count answers a `count()` that
+    `collect()` then contradicts.
+
+    A file that cannot be stat-ed is read uncached rather than cached under a token that
+    could not detect its changing.
     """
+    identity = file_identity(path)
+    if identity is None:
+        return _read_footer(path)
+    return _parquet_footer_cached(identity)
+
+
+@lru_cache(maxsize=1024)
+def _parquet_footer_cached(identity: tuple[str, int, int]):
+    """`_parquet_footer` keyed on the file identity (see there)."""
+    return _read_footer(identity[0])
+
+
+def _read_footer(path: str):
     import pyarrow.parquet as pq
 
     from batcher.io.filesystem import resolve_filesystem

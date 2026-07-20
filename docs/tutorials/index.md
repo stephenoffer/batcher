@@ -92,8 +92,8 @@ Build a model-ready feature matrix with fit/transform preprocessors and `Chain`.
 
 ## See also
 
-- [Quickstart](../getting-started/quickstart.md): shorter than a tutorial, if you just want
-  to see the shape of the thing.
+- [Quickstart](../getting-started/quickstart.md): shorter than a tutorial, if you want to see
+  the shape of the thing.
 - [User guide](../user-guide/index.md): the reference-by-topic these tutorials teach from.
 - [Examples](../examples/index.md): short recipes, one problem each, when you already know
   the API.

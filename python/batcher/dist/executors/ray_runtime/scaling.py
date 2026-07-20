@@ -14,6 +14,7 @@ import math
 import threading
 
 from batcher.config import active_config
+from batcher.plan.resource import HardwareProfile
 
 
 class _Topology:
@@ -219,6 +220,35 @@ def node_classes() -> list[dict]:
         return []
 
 
+def cluster_hardware_profile() -> HardwareProfile | None:
+    """The `HardwareProfile` Kyber should plan against for a distributed run, or `None`.
+
+    Built from live topology so the optimizer's cache/memory-sized thresholds track the
+    *workers*, not the driver — which may be a fat head node next to small workers. Every
+    field is the **binding** (weakest) worker so a plan sized against it is valid on every
+    node it might land on: cores from the smallest worker, RAM from `worker_node_memory_bytes`
+    (already the minimum), GPU VRAM left `0` (Ray advertises GPU *count*, not bytes, so the
+    per-device budget stays with `OptimizerConfig.resolved_gpu_memory_gb`). `l3_cache_bytes`
+    is left `0` — the driver's cache says nothing about a worker's — so a cache-sized threshold
+    keeps its default rather than guessing from the wrong machine.
+
+    Returns `None` when the topology is unreadable (Ray down), so the caller falls back to the
+    single-node local profile rather than a fabricated one.
+    """
+    classes = node_classes()
+    if not classes:
+        return None
+    worker_count = len(classes)
+    min_cores = min((int(c["cpus"]) for c in classes if c["cpus"] > 0), default=0)
+    gpu_nodes = sum(1 for c in classes if c["gpus"] > 0)
+    return HardwareProfile.for_cluster(
+        cpu_cores=min_cores,
+        memory_bytes=worker_node_memory_bytes(),
+        worker_count=worker_count,
+        gpu_count=gpu_nodes,
+    )
+
+
 def cpu_only_can_host(workers: int, num_cpus: float) -> bool:
     """Whether the cluster's **CPU-only** nodes alone can host `workers` x `num_cpus` cores.
 
@@ -307,68 +337,6 @@ def clamp_workers(workers: int, num_cpus: float = 1.0, num_gpus: float = 0.0) ->
     if num_gpus > 0:
         fit = min(fit, int(float(cluster_topology()["gpus"]) / num_gpus))
     return max(1, min(workers, fit))
-
-
-# --- Autoscaler request lifecycle (scale up for a query, reclaim after) -------------
-# `request_resources` sets a *sticky* floor: the autoscaler keeps that many cores until
-# told otherwise. Left unmanaged, one big query pins the cluster scaled-up forever. We
-# track a process-wide high-water floor across in-flight query scopes and reset it to 0
-# the moment the last one ends, so the autoscaler reclaims the now-idle nodes. A
-# running query's nodes are *busy* (tasks / persistent-fleet actors), so they are never
-# reclaimed mid-query regardless of the floor — the floor only drives scale-*up* and
-# keeps a node from being reclaimed in the brief gap before it picks up work.
-_autoscale_lock = threading.Lock()
-_autoscale_active = 0
-_autoscale_floor = 0
-_autoscale_gpu_floor = 0
-
-
-def _apply_autoscale_floor(cpus: int, gpus: int = 0) -> None:
-    with contextlib.suppress(Exception):
-        from ray.autoscaler.sdk import request_resources
-
-        if gpus > 0:
-            # A GPU floor needs GPU *bundles* — `request_resources(num_cpus=)` alone never
-            # triggers GPU-node scale-up, so a GPU query would hang or fall back to CPU
-            # nodes it can't run on. One `{"GPU": 1}` bundle per requested GPU asks the
-            # autoscaler for that many GPUs; the CPU floor rides alongside for the
-            # relational stages. (Whole-GPU bundles — fractional packing is a scheduling
-            # concern, not an autoscale-shape one.)
-            request_resources(num_cpus=cpus, bundles=[{"GPU": 1}] * gpus)
-        else:
-            request_resources(num_cpus=cpus)
-
-
-def request_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
-    """Register a query scope wanting `target_cpus` cores (and `target_gpus` GPUs); maintain
-    the high-water floor.
-
-    The autoscaler is asked for the max over every in-flight scope, so concurrent
-    queries compose and one scope never lowers the floor a live sibling still needs. A
-    GPU query (`target_gpus > 0`) also lifts a GPU floor so the autoscaler provisions GPU
-    nodes — not just cores. Balanced by exactly one `release_autoscale` at the scope's
-    teardown.
-    """
-    global _autoscale_active, _autoscale_floor, _autoscale_gpu_floor
-    with _autoscale_lock:
-        _autoscale_active += 1
-        _autoscale_floor = max(_autoscale_floor, target_cpus)
-        _autoscale_gpu_floor = max(_autoscale_gpu_floor, math.ceil(target_gpus))
-        _apply_autoscale_floor(_autoscale_floor, _autoscale_gpu_floor)
-
-
-def release_autoscale() -> None:
-    """End one query scope; when the last one ends, drop the autoscaler floor (CPU and GPU)
-    to 0 so it can reclaim the idle nodes the query scaled up (instead of pinning them
-    forever)."""
-    global _autoscale_active, _autoscale_floor, _autoscale_gpu_floor
-    with _autoscale_lock:
-        _autoscale_active -= 1
-        if _autoscale_active <= 0:
-            _autoscale_active = 0
-            _autoscale_floor = 0
-            _autoscale_gpu_floor = 0
-            _apply_autoscale_floor(0, 0)
 
 
 # The capacity a wait *confirmed* the autoscaler won't exceed (set when a wait stalls below

@@ -6,7 +6,7 @@ Read a collection into Arrow, write a dataset back as bulk upserts. Both directi
 | | |
 | --- | --- |
 | **Read** | `bt.read.mongo(uri=..., database=..., collection=...)` |
-| **Write** | `ds.write.mongo(collection, uri=..., database=...)` — bulk upsert on `key_field` |
+| **Write** | `ds.write.mongo(collection, uri=..., database=...)`, a bulk upsert on `key_field` |
 | **Extra** | `pip install 'batcher-engine[mongo]'` |
 | **Parallelism** | Off by default. `PartitionSpec(segments=N)` splits the `_id` range. |
 | **Pushdown** | Predicates become a Mongo filter document, AND-merged into the `find` |
@@ -74,8 +74,8 @@ print(to_mongo_filter(predicate))
 ```
 :::
 
-What cannot be expressed as a filter document is simply not pushed, and the engine's own filter
-produces the same rows from a wider scan. Correctness never depends on the push; throughput does.
+What cannot be expressed as a filter document is not pushed, and the engine's own filter
+produces the same rows from a wider scan. Correctness never depends on the push. Throughput does.
 Index the fields you filter on, or the server does a collection scan and the pushdown buys you
 nothing but a smaller result.
 

@@ -15,6 +15,7 @@ import pytest
 
 import batcher as bt
 import batcher.kyber.rules.extra.setops_extra  # (importing registers the rules)
+from _harness import assert_same
 from batcher import col
 
 _ROWS = {"a": [1, 2, 2, 3, None], "b": [10, 20, 20, 30, 40]}
@@ -48,8 +49,6 @@ def nn(duck):
 
 
 def test_null_partition_union(duck, t):
-    from conftest import assert_same
-
     ds = bt.from_arrow(t)
     out = (
         ds.filter(col("a").is_null())
@@ -63,8 +62,6 @@ def test_null_partition_union(duck, t):
 
 
 def test_null_partition_union_all(duck, t):
-    from conftest import assert_same
-
     # The rule must NOT fire: the duplicate rows of `t` survive a UNION ALL.
     ds = bt.from_arrow(t)
     out = ds.filter(col("a").is_null()).union(ds.filter(col("a").is_not_null())).collect()
@@ -75,8 +72,6 @@ def test_null_partition_union_all(duck, t):
 
 
 def test_null_partition_union_over_empty_input(duck, empty):
-    from conftest import assert_same
-
     ds = bt.from_arrow(empty)
     out = (
         ds.filter(col("a").is_null())
@@ -90,8 +85,6 @@ def test_null_partition_union_over_empty_input(duck, empty):
 
 
 def test_nullable_comparison_partition_is_not_a_partition(duck, t):
-    from conftest import assert_same
-
     # `a > 2` and `a <= 2` are both NULL on the NULL row, which therefore appears in NEITHER
     # branch. If the rule wrongly fired, the NULL row would come back.
     ds = bt.from_arrow(t)
@@ -100,16 +93,12 @@ def test_nullable_comparison_partition_is_not_a_partition(duck, t):
 
 
 def test_non_nullable_comparison_partition(duck, nn):
-    from conftest import assert_same
-
     ds = bt.from_arrow(nn)
     out = ds.filter(col("x") > 2).union(ds.filter(col("x") <= 2), distinct=True).collect()
     assert_same(out, duck.sql("SELECT * FROM nn WHERE x > 2 UNION SELECT * FROM nn WHERE x <= 2"))
 
 
 def test_non_nullable_comparison_partition_union_all(duck, nn):
-    from conftest import assert_same
-
     ds = bt.from_arrow(nn)
     out = ds.filter(col("x") > 2).union(ds.filter(col("x") <= 2)).collect()
     assert_same(
@@ -121,8 +110,6 @@ def test_non_nullable_comparison_partition_union_all(duck, nn):
 
 
 def test_overlapping_filters_union(duck, t):
-    from conftest import assert_same
-
     # `a = 2` and `b = 20` select the SAME (duplicated) rows: the dedup is load bearing.
     ds = bt.from_arrow(t)
     out = ds.filter(col("a") == 2).union(ds.filter(col("b") == 20), distinct=True).collect()
@@ -130,8 +117,6 @@ def test_overlapping_filters_union(duck, t):
 
 
 def test_overlapping_filters_union_all(duck, t):
-    from conftest import assert_same
-
     # The rule must NOT fire: a row satisfying both predicates appears TWICE.
     ds = bt.from_arrow(t)
     out = ds.filter(col("a") == 2).union(ds.filter(col("b") == 20)).collect()
@@ -139,16 +124,12 @@ def test_overlapping_filters_union_all(duck, t):
 
 
 def test_disjoint_filters_union(duck, t):
-    from conftest import assert_same
-
     ds = bt.from_arrow(t)
     out = ds.filter(col("a") == 1).union(ds.filter(col("b") == 30), distinct=True).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE a = 1 UNION SELECT * FROM t WHERE b = 30"))
 
 
 def test_three_filters_on_one_relation_union(duck, t):
-    from conftest import assert_same
-
     ds = bt.from_arrow(t)
     out = (
         ds.filter(col("a") == 1)
@@ -165,8 +146,6 @@ def test_three_filters_on_one_relation_union(duck, t):
 
 
 def test_filters_on_different_relations_union(duck, t):
-    from conftest import assert_same
-
     other = pa.table({"a": [7, 8], "b": [70, 80]})
     duck.register("u", other)
     out = (
@@ -179,8 +158,6 @@ def test_filters_on_different_relations_union(duck, t):
 
 
 def test_filters_union_over_empty_input(duck, empty):
-    from conftest import assert_same
-
     ds = bt.from_arrow(empty)
     out = ds.filter(col("a") == 1).union(ds.filter(col("b") == 30), distinct=True).collect()
     assert_same(out, duck.sql("SELECT * FROM t WHERE a = 1 UNION SELECT * FROM t WHERE b = 30"))
@@ -190,16 +167,12 @@ def test_filters_union_over_empty_input(duck, empty):
 
 
 def test_relation_union_its_own_filtered_subset(duck, t):
-    from conftest import assert_same
-
     ds = bt.from_arrow(t)
     out = ds.union(ds.filter(col("a") == 1), distinct=True).collect()
     assert_same(out, duck.sql("SELECT * FROM t UNION SELECT * FROM t WHERE a = 1"))
 
 
 def test_relation_union_all_its_own_filtered_subset(duck, t):
-    from conftest import assert_same
-
     # The rule must NOT fire: the subset's rows are additional copies under bag semantics.
     ds = bt.from_arrow(t)
     out = ds.union(ds.filter(col("a") == 1)).collect()
@@ -207,8 +180,6 @@ def test_relation_union_all_its_own_filtered_subset(duck, t):
 
 
 def test_relation_union_its_own_limited_subset(duck, t):
-    from conftest import assert_same
-
     ds = bt.from_arrow(t)
     out = ds.union(ds.sort("a").limit(2), distinct=True).collect()
     assert_same(
@@ -217,8 +188,6 @@ def test_relation_union_its_own_limited_subset(duck, t):
 
 
 def test_absorption_over_empty_input(duck, empty):
-    from conftest import assert_same
-
     ds = bt.from_arrow(empty)
     out = ds.union(ds.filter(col("a") == 1), distinct=True).collect()
     assert_same(out, duck.sql("SELECT * FROM t UNION SELECT * FROM t WHERE a = 1"))
@@ -228,8 +197,6 @@ def test_absorption_over_empty_input(duck, empty):
 
 
 def test_max_over_a_distinct_union(duck, t):
-    from conftest import assert_same
-
     ds = bt.from_arrow(t)
     out = ds.union(ds, distinct=True).group_by("a").agg(m=col("b").max()).collect()
     assert_same(
@@ -239,8 +206,6 @@ def test_max_over_a_distinct_union(duck, t):
 
 
 def test_sum_over_a_distinct_union_keeps_the_dedup(duck, t):
-    from conftest import assert_same
-
     # SUM is duplicate-SENSITIVE: dropping the union's dedup would double every group.
     ds = bt.from_arrow(t)
     out = ds.union(ds, distinct=True).group_by("a").agg(s=col("b").sum()).collect()
@@ -251,8 +216,6 @@ def test_sum_over_a_distinct_union_keeps_the_dedup(duck, t):
 
 
 def test_count_over_a_distinct_union_keeps_the_dedup(duck, t):
-    from conftest import assert_same
-
     ds = bt.from_arrow(t)
     out = ds.union(ds, distinct=True).group_by("a").agg(c=col("b").count()).collect()
     assert_same(
@@ -262,8 +225,6 @@ def test_count_over_a_distinct_union_keeps_the_dedup(duck, t):
 
 
 def test_max_over_a_union_all_is_unchanged(duck, t):
-    from conftest import assert_same
-
     ds = bt.from_arrow(t)
     out = ds.union(ds).group_by("a").agg(m=col("b").max()).collect()
     assert_same(
@@ -275,8 +236,6 @@ def test_max_over_a_union_all_is_unchanged(duck, t):
 
 
 def test_max_over_a_distinct_union_of_empty(duck, empty):
-    from conftest import assert_same
-
     ds = bt.from_arrow(empty)
     out = ds.union(ds, distinct=True).group_by("a").agg(m=col("b").max()).collect()
     assert_same(
@@ -289,8 +248,6 @@ def test_max_over_a_distinct_union_of_empty(duck, empty):
 
 
 def test_semi_join_against_a_distinct_union(duck, t):
-    from conftest import assert_same
-
     ds = bt.from_arrow(t)
     out = ds.join(ds.union(ds, distinct=True), on="a", how="semi").collect()
     assert_same(
@@ -303,8 +260,6 @@ def test_semi_join_against_a_distinct_union(duck, t):
 
 
 def test_anti_join_against_a_distinct_union(duck, t):
-    from conftest import assert_same
-
     ds = bt.from_arrow(t)
     other = bt.from_arrow(pa.table({"a": [1, 1, 9], "b": [10, 10, 90]}))
     duck.register("u", pa.table({"a": [1, 1, 9], "b": [10, 10, 90]}))
@@ -319,8 +274,6 @@ def test_anti_join_against_a_distinct_union(duck, t):
 
 
 def test_inner_join_against_a_distinct_union_keeps_the_dedup(duck, t):
-    from conftest import assert_same
-
     # An inner join emits one row per matching right row — the dedup changes the row count.
     ds = bt.from_arrow(t)
     other = bt.from_arrow(pa.table({"a": [1, 2], "c": [100, 200]}))

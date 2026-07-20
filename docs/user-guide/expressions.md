@@ -139,8 +139,7 @@ print(out.to_pydict())
 When no named `*_horizontal` helper fits, `reduce_horizontal(fn, *exprs)` folds the
 columns left-to-right with your own binary combiner, and `fold_horizontal(acc, fn,
 *exprs)` does the same from an explicit seed. The combiner runs once at plan-build
-time on `Expr` operands — it never touches a row — so the fold still lowers to pure
-Rust:
+time on `Expr` operands, never on a row, so the fold still lowers to pure Rust:
 
 ```python
 cols = [bt.col("a"), bt.col("b"), bt.col("c")]
@@ -190,8 +189,8 @@ print(out.to_pydict())
 
 A few math functions take two columns. {py:obj}`bt.gcd <batcher.gcd>` and
 {py:obj}`bt.lcm <batcher.lcm>` are integer number-theory helpers;
-{py:obj}`bt.hypot(a, b) <batcher.hypot>` is the Euclidean norm `sqrt(a² + b²)`
-(like `atan2`, a top-level two-argument form).
+{py:obj}`bt.hypot(a, b) <batcher.hypot>` is the Euclidean norm `sqrt(a^2 + b^2)`, a
+top-level two-argument form as `atan2` is.
 
 ```python
 pairs = bt.from_pydict({"a": [12.0, 15.0], "b": [18.0, 20.0], "x": [3.0, 5.0], "y": [4.0, 12.0]})
@@ -509,16 +508,7 @@ print(out.to_pydict())
 # {'total': [60.0], 'avg_qty': [2.0], 'rows': [3]}
 ```
 
-## Next steps
-
-- [Expressions API](../api/expressions.md): every `Expr` method and accessor
-  (`.str`/`.dt`/`.list`/`.struct`/`.json`/`.map`/`.image`/`.audio`/`.video`) in one
-  exhaustive reference.
-- [Aggregations](aggregations.md) and [Window functions](window-functions.md): where
-  aggregate and windowed expressions are used.
-- [SQL](sql.md): the same column language, spelled as SQL.
-
-## Migrating from Polars / pandas
+## Migrating from Polars or pandas
 
 Coming from another DataFrame library, the operation you know by its Polars or pandas
 name is usually available under that name too, delegating to Batcher's SQL-style
@@ -531,7 +521,7 @@ primary. On `.str`: `to_lowercase`, `to_uppercase`, `to_titlecase`, `pad_start`,
 expression: `arcsin`/`arccos`/`arctan`/`arcsinh`/`arccosh`/`arctanh`, `clip_min` /
 `clip_max`, and `is_between`; plus top-level `bt.arctan2(y, x)`.
 
-The pandas spellings are there too — on `.str`: `strip`, `startswith`, `endswith`,
+The pandas spellings are there too. On `.str`: `strip`, `startswith`, `endswith`,
 `match`, `title`, and Python's `removeprefix` / `removesuffix`; on `.dt`: `day_name`,
 `month_name`, `daysinmonth`, `weekofyear`, `normalize`, and `floor(unit)`. On the
 `Dataset` itself: `fillna`, `dropna`, `isna`, `notna`, `astype`, `assign`, `groupby`,
@@ -551,10 +541,9 @@ print(out.to_pydict())
 ## Feature engineering for data science
 
 The expression layer carries the transforms a model pipeline needs, so feature
-engineering runs in the engine rather than in pandas. Scaling and encoding —
-`zscore`, `minmax_scale`, `maxabs_scale`, `mean_center`, `label_encode`, and
-`hash_bucket` for a reproducible split key — each accept `partition_by=` to fit per
-group. Activations (`sigmoid`, `logit`, `relu`, `softplus`), share/ratio features
+engineering runs in the engine rather than in pandas. The scaling and encoding functions
+each accept `partition_by=` to fit per group: `zscore`, `minmax_scale`, `maxabs_scale`,
+`mean_center`, `label_encode`, and `hash_bucket` for a reproducible split key. Activations (`sigmoid`, `logit`, `relu`, `softplus`), share/ratio features
 (`pct_of_total`, `cumulative_pct`, `normalize_l1`, `rank_pct`, `safe_divide`), and the
 expanding statistics (`expanding_mean`, `expanding_var`, `expanding_std`) round it out.
 Value predicates `is_positive`, `is_negative`, `is_zero`, `is_even`, `is_odd`, and
@@ -661,9 +650,10 @@ whole-string `is_url` / `is_email`. Extraction gives `extract_urls`, `extract_em
 `remove_repeated_punctuation`, `remove_markdown_links`, `remove_code_blocks`,
 `remove_stopwords`, and `truncate_sentences`.
 
-Embedding columns also carry `dim`, `is_zero_vector`, `sum_squares`, `mean_pool`, and
-`max_pool`, alongside `magnitude`, `is_unit_norm` (assert normalization before a cosine
-search), `euclidean_distance`, and `angular_distance`. Preparing the training set itself
+An embedding is a list column, so its vector methods live on `.list` alongside the
+reductions above: `dim`, `is_zero_vector`, `sum_squares`, `mean_pool`, `max_pool`,
+`magnitude`, `is_unit_norm` (assert normalization before a cosine search),
+`euclidean_distance`, and `angular_distance`. Preparing the training set itself
 uses `ds.shuffle(seed=)`, `ds.stratified_split(label, test_size)`,
 `ds.sample_per_group(by, n)`, `ds.class_balance(label)`, and `ds.class_weights(label)`.
 
@@ -673,3 +663,13 @@ train, test = labelled.stratified_split("y", 0.25, seed=5)
 print(labelled.class_weights("y").sort("y").to_pydict())
 # {'y': ['a', 'b'], 'weight': [0.6666666666666666, 2.0]}
 ```
+
+## Next steps
+
+- [Expressions API](../api/expressions.md): every `Expr` method and accessor
+  (`.str`/`.dt`/`.list`/`.struct`/`.json`/`.map`/`.image`/`.audio`/`.video`) in one
+  exhaustive reference.
+- [Aggregations](aggregations.md) and [Window functions](window-functions.md): where
+  aggregate and windowed expressions are used.
+- [SQL](sql.md): the same column language, spelled as SQL.
+- [Transformations](transformations.md): where expressions are applied to a Dataset.

@@ -72,10 +72,9 @@ pub fn partial_aggregate(
     let agg_jit = ops::compile_agg(group_keys, aggregates, non_empty[0]);
     // Share the executor's width-sized pool (NOT rayon's global pool, which a Ray worker
     // leaves at 1 thread — see `par::execute_parallel_with_metrics`), so the fold spreads
-    // across every core. `available_parallelism` reads the actor's applied CPU affinity.
-    let width = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1);
+    // across every core. `usable_cores` reads the actor's applied CPU affinity *and* the
+    // cgroup CPU quota, which is what a Ray/K8s worker is actually limited by.
+    let width = bc_arrow::usable_cores();
     let partials: Vec<agg::Partial> = crate::par::pool_for(width)?.install(|| {
         non_empty
             .par_iter()
@@ -360,9 +359,7 @@ impl Iterator for PartialFiles<'_> {
 /// single core. The width-sized pool (the same fix `partial_aggregate` applies to the map
 /// fold) spreads them across every core the actor owns. Result-identical; scheduling only.
 fn in_worker_pool<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T, InterpError> {
-    let width = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1);
+    let width = bc_arrow::usable_cores();
     Ok(crate::par::pool_for(width)?.install(f))
 }
 

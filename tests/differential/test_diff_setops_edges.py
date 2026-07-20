@@ -11,8 +11,8 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 
 def _fa():
@@ -32,8 +32,6 @@ def _fb():
 # --- float key folding: -0.0 == 0.0, all NaNs one, NULL == NULL for set ops -----------
 @pytest.mark.differential
 def test_union_distinct_float_folds_zero_nan_null(duck):
-    from conftest import assert_same
-
     a, b = _fa(), _fb()
     duck.register("a", a)
     duck.register("b", b)
@@ -43,8 +41,6 @@ def test_union_distinct_float_folds_zero_nan_null(duck):
 
 @pytest.mark.differential
 def test_union_all_float(duck):
-    from conftest import assert_same
-
     a, b = _fa(), _fb()
     duck.register("a", a)
     duck.register("b", b)
@@ -55,8 +51,6 @@ def test_union_all_float(duck):
 @pytest.mark.differential
 @pytest.mark.parametrize("distinct", [True, False])
 def test_intersect_float(duck, distinct):
-    from conftest import assert_same
-
     a, b = _fa(), _fb()
     duck.register("a", a)
     duck.register("b", b)
@@ -68,8 +62,6 @@ def test_intersect_float(duck, distinct):
 @pytest.mark.differential
 @pytest.mark.parametrize("distinct", [True, False])
 def test_except_float(duck, distinct):
-    from conftest import assert_same
-
     a, b = _fa(), _fb()
     duck.register("a", a)
     duck.register("b", b)
@@ -82,8 +74,6 @@ def test_except_float(duck, distinct):
 @pytest.mark.differential
 @pytest.mark.parametrize("op,kw", [("intersect", "INTERSECT ALL"), ("except_", "EXCEPT ALL")])
 def test_setop_all_multiplicity_float(duck, op, kw):
-    from conftest import assert_same
-
     a = pa.table(
         {"x": pa.array([0.0, 0.0, 0.0, -0.0, float("nan"), float("nan"), 1.0, 1.0], pa.float64())}
     )
@@ -97,8 +87,6 @@ def test_setop_all_multiplicity_float(duck, op, kw):
 # --- multi-column DISTINCT with all-NULL rows and signed zero, chunked & spilled ------
 @pytest.mark.differential
 def test_distinct_multicol_null_signed_zero(duck):
-    from conftest import assert_same
-
     t = pa.table(
         {
             "a": pa.array([1.0, 1.0, None, None, 2.0, 2.0, 1.0], pa.float64()),
@@ -112,8 +100,6 @@ def test_distinct_multicol_null_signed_zero(duck):
 
 @pytest.mark.differential
 def test_distinct_float_chunked_matches_duckdb(duck):
-    from conftest import assert_same
-
     rng = np.random.default_rng(0)
     x = np.concatenate(
         [
@@ -131,8 +117,6 @@ def test_distinct_float_chunked_matches_duckdb(duck):
 # --- empty operands -------------------------------------------------------------------
 @pytest.mark.differential
 def test_setops_empty_operands(duck):
-    from conftest import assert_same
-
     empty = pa.table({"x": pa.array([], pa.int64())})
     ne = pa.table({"x": pa.array([1, 2, 3], pa.int64())})
     duck.register("empty", empty)
@@ -152,8 +136,6 @@ def test_setops_empty_operands(duck):
 # --- count(distinct) folds signed zero / NaN, excludes NULL ---------------------------
 @pytest.mark.differential
 def test_count_distinct_float_folding(duck):
-    from conftest import assert_same
-
     a = _fa()
     duck.register("a", a)
     got = bt.from_arrow(a).group_by().agg(n=col("x").n_unique()).collect()
@@ -210,8 +192,6 @@ def test_genuinely_incompatible_setop_raises_cleanly_not_panics():
 @pytest.mark.parametrize("op,kw", [("intersect", "INTERSECT"), ("except_", "EXCEPT")])
 @pytest.mark.parametrize("distinct", [True, False])
 def test_setop_spill_path_does_not_crash(duck, op, kw, distinct):
-    from conftest import assert_same
-
     a = pa.table({"x": pa.array([1, 1, 2, 2, 3, 3, 4, None], pa.int64())})
     b = pa.table({"x": pa.array([2, 3, 3, 5, None], pa.int64())})
     duck.register("a", a)

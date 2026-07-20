@@ -93,7 +93,7 @@ what the control plane is for. Recompute those days from raw and replace them:
 
 :::{note}
 `replace_where=` has to resolve to partition filters delta-rs can act on from the log
-alone, which today means an AND of `partition_col == value`. A multi-value `is_in([...])`
+alone, which means an AND of `partition_col == value`. A multi-value `is_in([...])`
 is not expressible that way, so `rebuild` loops and issues one partition-scoped overwrite
 per day. Each one is still a metadata operation that moves no data, so the loop costs about
 what a single call would.
@@ -127,7 +127,7 @@ bound and the job dies on a Sunday.
 
 A watermark is where you write that decision down. `with_watermark(time_col, lateness)`
 says: once I have seen event time T, I will accept rows back to `T - lateness` and drop
-anything older. The query is the same either way; what changes is what the watermark is
+anything older. The query is the same either way. What changes is what the watermark is
 actually doing.
 
 ::::{tab-set}
@@ -154,7 +154,7 @@ print(windowed.sort("w").to_pydict())
 ```
 
 Two five-minute windows, bucketed by event time and not by when the row showed up. On a
-bounded source like this one, the watermark changes nothing: everything is already here.
+bounded source such as this one, the watermark changes nothing: everything is already here.
 :::
 
 :::{tab-item} Kafka stream
@@ -178,7 +178,7 @@ its state can be evicted, and it decides which stragglers are dropped rather tha
 
 Pick the lateness from the delivery-delay distribution you actually observe, not from a
 number that sounds tidy. Ten minutes of allowed lateness means ten minutes of state per
-open window; an hour means an hour of it. That is the real cost, and it is why "just set it
+open window, and an hour means an hour of it. That is the real cost, and it is why "set it
 to a day" is not free.
 
 ## You cannot have both
@@ -186,7 +186,7 @@ to a day" is not free.
 :::{important}
 Bounded state and unbounded lateness are incompatible. A watermark buys you the first by
 giving up the second, and the straggler that arrives after it passes is *gone from the
-streaming aggregate* — not counted late, not counted at all. There is no configuration
+streaming aggregate*. It is not counted late. It is not counted at all. There is no configuration
 that avoids this trade.
 :::
 

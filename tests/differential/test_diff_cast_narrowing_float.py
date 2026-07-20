@@ -15,17 +15,15 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 pytestmark = pytest.mark.differential
 
 
 def test_try_cast_f64_to_f32_finite_overflow_is_null(duck):
     """`TRY_CAST(1e300 AS REAL)` → NULL (not ``inf``); a real ``inf`` stays ``inf``."""
-    t = pa.table(
-        {"x": pa.array([1.5, 1e300, -1e300, math.inf, -math.inf, None], pa.float64())}
-    )
+    t = pa.table({"x": pa.array([1.5, 1e300, -1e300, math.inf, -math.inf, None], pa.float64())})
     duck.register("nf", t)
     out = bt.from_arrow(t).select(w=col("x").try_cast("float32")).collect()
     assert_same(out, duck.sql("SELECT TRY_CAST(x AS REAL) w FROM nf"))

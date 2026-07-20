@@ -101,6 +101,7 @@ class DatasetML:
         concurrency: int | tuple[int, int] | None = None,
         batch_format: str = "pyarrow",
         accelerator_type: str | None = None,
+        resources: dict[str, float] | None = None,
         model_memory_gb: float = 0.0,
         multiprocessing: bool = False,
         max_errored_rows: int = 0,
@@ -177,7 +178,11 @@ class DatasetML:
             concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
             batch_format: What `fn` sees — ``"pyarrow"``, ``"numpy"``, ``"pandas"``,
                 or ``"torch"``.
-            accelerator_type: Pin GPU actors to a model (e.g. ``"NVIDIA_A100"``).
+            accelerator_type: Pin actors to a device model (e.g. ``"NVIDIA_A100"``).
+            resources: Custom Ray resources per worker, e.g. ``{"TPU": 4}`` or
+                ``{"neuron_cores": 2}``. `num_gpus` covers only what Ray reports as the
+                ``GPU`` resource (NVIDIA, AMD, Intel); every other accelerator — and any
+                resource defined on your own cluster — is named here instead.
             model_memory_gb: The model's footprint, for memory budgeting.
             multiprocessing: Run CPU-bound pure-Python calls across processes.
             max_errored_rows: Rows a raising `fn` may drop per worker before failing.
@@ -221,6 +226,7 @@ class DatasetML:
                 concurrency=concurrency,
                 batch_format=batch_format,
                 accelerator_type=accelerator_type,
+                resources=tuple(sorted((resources or {}).items())),
                 model_memory_gb=model_memory_gb,
                 multiprocessing=multiprocessing,
                 max_errored_rows=max_errored_rows,
@@ -667,6 +673,151 @@ class DatasetML:
             left_key=left_key,
             right_key=right_key,
         )
+
+    def nearest_neighbors(
+        self,
+        query: list[float],
+        *,
+        column: str = "embedding",
+        k: int = 10,
+        metric: str = "cosine",
+        distance_column: str = "distance",
+    ) -> Dataset:
+        """Return the `k` rows whose embedding is nearest to `query` (exact brute force).
+
+        The retrieval primitive for RAG / similarity lookup when there is **no index**:
+        every row's embedding is scored against the one `query` vector, and the `k` nearest
+        are kept, with their distance in `distance_column`. It is exact (unlike
+        `similarity_join`'s LSH recall trade-off) and composes the operators the engine
+        already has — a projected distance, a sort, and a limit — so it runs wherever a
+        sort runs, including distributed, and nothing is materialized on the driver.
+
+        For a large corpus queried repeatedly, build a real ANN index instead (see
+        `batcher.ml.build_vector_index` / `vector_search`); brute force is `O(n)` per query.
+
+        Args:
+            query: The query embedding as a list of floats. Its length must match the
+                stored vectors' dimension.
+            column: The embedding column to search (a list/tensor of floats).
+            k: How many nearest rows to return.
+            metric: ``"cosine"`` (default), ``"l2"`` (Euclidean), or ``"dot"`` (inner
+                product). ``cosine``/``l2`` rank by smallest distance; ``dot`` by largest.
+            distance_column: Name of the appended score column.
+
+        Returns:
+            A new `Dataset` of the `k` nearest rows, nearest first, with `distance_column`
+            appended.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict(
+                ...     {"id": [1, 2, 3], "embedding": [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]}
+                ... )
+                >>> hits = ds.ml.nearest_neighbors([1.0, 0.0], column="embedding", k=2)
+                >>> hits.to_pydict()["id"]
+                [1, 3]
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.plan.expr_ir import array, col, lit
+
+        if k < 1:
+            raise PlanError(f"nearest_neighbors k must be >= 1, got {k}")
+        q = array(*[lit(float(x)) for x in query])
+        vec = col(column)
+        # cosine/l2 are distances (smaller = nearer); dot is a similarity (larger = nearer).
+        if metric == "cosine":
+            score, descending = vec.list.cosine_distance(q), False
+        elif metric == "l2":
+            score, descending = vec.list.l2_distance(q), False
+        elif metric == "dot":
+            score, descending = vec.list.dot(q), True
+        else:
+            raise PlanError(f"metric must be 'cosine', 'l2', or 'dot', got {metric!r}")
+        return (
+            self._ds.with_columns(**{distance_column: score})
+            .sort(distance_column, descending=descending)
+            .head(k)
+        )
+
+    def normalize_embeddings(self, column: str, *, output_column: str | None = None) -> Dataset:
+        """Unit-normalize an embedding column (L2 norm = 1), in the data plane.
+
+        The standard preprocessing before dot-product retrieval: on unit vectors the inner
+        product ranks identically to cosine similarity but skips the per-query norm, so it
+        is the cheap, index-friendly form. A zero vector stays zero (no divide-by-zero).
+        Runs as a native `.list.normalize()` projection — no per-row Python.
+
+        Args:
+            column: The embedding column (a list/tensor of floats).
+            output_column: Where to write the normalized vector; defaults to `column`
+                (in place).
+
+        Returns:
+            A new `Dataset` with the normalized embedding column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"emb": [[3.0, 4.0]]})
+                >>> ds.ml.normalize_embeddings("emb").to_pydict()
+                {'emb': [[0.6, 0.8]]}
+        """
+        from batcher.plan.expr_ir import col
+
+        out = output_column or column
+        return self._ds.with_columns(**{out: col(column).list.normalize()})
+
+    def similarity_to(
+        self,
+        query: list[float],
+        *,
+        column: str = "embedding",
+        metric: str = "cosine",
+        output_column: str = "score",
+    ) -> Dataset:
+        """Score every row's embedding against a fixed `query` vector (→ a new column).
+
+        The retrieval-scoring step without the top-k cut: use it to threshold, rerank, or
+        combine the score with other predicates before selecting. `nearest_neighbors` is
+        this plus a sort and a limit. Composes the native `.list` distance kernels, so it
+        runs wherever a projection runs, including distributed.
+
+        Args:
+            query: The query embedding as a list of floats (length must match the column).
+            column: The embedding column to score (a list/tensor of floats).
+            metric: ``"cosine"`` similarity (default), ``"dot"`` inner product, or ``"l2"``
+                (negative Euclidean distance, so larger is still nearer).
+            output_column: Name of the appended score column.
+
+        Returns:
+            A new `Dataset` with `output_column` appended (larger = more similar).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1, 2], "emb": [[1.0, 0.0], [0.0, 1.0]]})
+                >>> out = ds.ml.similarity_to([1.0, 0.0], column="emb").to_pydict()
+                >>> round(out["score"][0], 4), round(out["score"][1], 4)
+                (1.0, 0.0)
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.plan.expr_ir import array, col, lit
+
+        q = array(*[lit(float(x)) for x in query])
+        vec = col(column)
+        if metric == "cosine":
+            score = vec.list.cosine_similarity(q)
+        elif metric == "dot":
+            score = vec.list.dot(q)
+        elif metric == "l2":
+            score = vec.list.l2_distance(q) * -1.0  # negate so "larger = nearer" holds
+        else:
+            raise PlanError(f"metric must be 'cosine', 'dot', or 'l2', got {metric!r}")
+        return self._ds.with_columns(**{output_column: score})
 
     def stream_loader(
         self,

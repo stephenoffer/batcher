@@ -5,6 +5,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 
 
 def _tables(duck):
@@ -16,8 +17,6 @@ def _tables(duck):
 
 
 def test_inner_join_vs_duckdb(duck):
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = emp.join(dept, on="dept_id").collect()
     expected = duck.sql("SELECT * FROM emp JOIN dept USING (dept_id)")
@@ -25,8 +24,6 @@ def test_inner_join_vs_duckdb(duck):
 
 
 def test_left_join_vs_duckdb(duck):
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = emp.join(dept, on="dept_id", how="left").collect()
     expected = duck.sql("SELECT * FROM emp LEFT JOIN dept USING (dept_id)")
@@ -34,8 +31,6 @@ def test_left_join_vs_duckdb(duck):
 
 
 def test_right_join_vs_duckdb(duck):
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = emp.join(dept, on="dept_id", how="right").collect()
     expected = duck.sql("SELECT * FROM emp RIGHT JOIN dept USING (dept_id)")
@@ -43,8 +38,6 @@ def test_right_join_vs_duckdb(duck):
 
 
 def test_semi_join_vs_duckdb(duck):
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = emp.join(dept, on="dept_id", how="semi").collect()
     expected = duck.sql("SELECT emp.* FROM emp SEMI JOIN dept USING (dept_id)")
@@ -52,8 +45,6 @@ def test_semi_join_vs_duckdb(duck):
 
 
 def test_anti_join_vs_duckdb(duck):
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = emp.join(dept, on="dept_id", how="anti").collect()
     expected = duck.sql("SELECT emp.* FROM emp ANTI JOIN dept USING (dept_id)")
@@ -62,7 +53,6 @@ def test_anti_join_vs_duckdb(duck):
 
 def test_join_then_aggregate_vs_duckdb(duck):
     from batcher import col, count
-    from conftest import assert_same
 
     emp, dept = _tables(duck)
     out = (
@@ -82,10 +72,9 @@ def test_sort_merge_join_strategy_vs_duckdb(duck, monkeypatch):
     """Force the sort-merge strategy (thresholds) and check every join type still
     matches DuckDB end-to-end (Python plan → IR strategy=sort_merge → engine)."""
     from batcher.kyber.rules import selection
-    from conftest import assert_same
 
     # No broadcast, and any join qualifies as sort-merge → exercise the SMJ path.
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: -1)
     monkeypatch.setattr(selection, "SORT_MERGE_MIN_ROWS", 0.0)
 
     emp, dept = _tables(duck)
@@ -108,9 +97,8 @@ def test_sort_merge_presorted_inputs_vs_duckdb(duck, monkeypatch):
     """Pre-sorted inputs picked for sort-merge (the engine's no-sort fast path) must
     still match DuckDB for every join type — the W4 already-ordered case."""
     from batcher.kyber.rules import selection
-    from conftest import assert_same
 
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: -1)
     monkeypatch.setattr(selection, "SORT_MERGE_MIN_ROWS", 0.0)
 
     emp, dept = _tables(duck)

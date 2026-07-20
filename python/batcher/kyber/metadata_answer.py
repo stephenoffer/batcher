@@ -22,7 +22,7 @@ import itertools
 from typing import Any
 
 from batcher.config import Config
-from batcher.kyber.learning import QUANTILES_KEY, load_learned_stats
+from batcher.kyber.learning import QUANTILES_KEY, columns_for, load_learned_stats
 from batcher.kyber.optimizer import optimize_logical
 from batcher.kyber.stats import StatsEstimator
 from batcher.metadata.hub import MetadataHub
@@ -375,6 +375,7 @@ def answer_learned_quantile(
     column: str,
     q: float,
     hub: MetadataHub | None = None,
+    source_key: str | None = None,
 ) -> float | None:
     """Approximate quantile `q` of `column` from the hub's learned quantile grid, or None.
 
@@ -382,9 +383,17 @@ def answer_learned_quantile(
     run measured (SKETCH/HISTOGRAM provenance), so it must only ever back an
     `approx_*` terminal, never an exact one. Returns None when no grid has been learned
     for `column` (the caller then streams an exact-ish sketch instead).
+
+    Resolved through `learning.columns_for`, like every other learned column map. Reading
+    `grid[column]` directly could never hit: a bare column name identifies nothing (two
+    tables both have an `id`), so `record_column_stats` qualifies every entry as
+    `source_key\\x1f column` and refuses to write a source it cannot key. An unqualified
+    lookup therefore missed 100% of the time and this shortcut always fell through to the
+    streaming TDigest. `columns_for` still honors the legacy unqualified shape, so a hub
+    persisted by an older build keeps resolving.
     """
     learned = load_learned_stats(hub) if hub is not None else {}
-    grid = learned.get(QUANTILES_KEY, {}).get(column)
+    grid = columns_for(learned, QUANTILES_KEY, source_key).get(column)
     if not grid:
         return None
     return _value_at_quantile(float(q), grid.get("probs", []), grid.get("values", []))

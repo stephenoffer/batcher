@@ -40,9 +40,7 @@ print(out.to_pydict())
 `hash_rows` digests the row's **values**, typed: an integer from its bits, a float from
 its canonicalized IEEE bits (so `-0.0` and `0.0` agree, and every NaN agrees), a string
 from its UTF-8. It is order-sensitive, treats null as a positional value, and is stable
-across partitions, runs, machines and versions — which is what lets it key a
-reproducible split, a surrogate key, or a hash bucket. It is 3–10x faster than hashing
-`cast(col, "string")`, and unlike that idiom it does not depend on how a float prints.
+across partitions, runs, machines and versions. That stability is what lets it key a reproducible split, a surrogate key, or a hash bucket. It's 3 to 10x faster than hashing `cast(col, "string")`, and unlike that idiom it doesn't depend on how a float prints.
 
 ```python
 keys = bt.from_pydict({"a": [1, 1, 2]})
@@ -99,7 +97,7 @@ print(out.to_pydict())
 | --- | --- |
 | `.is_null()` | true where null |
 | `.is_not_null()` | true where not null |
-| `.is_nan()` / `.is_not_nan()` | true where the float value is (not) NaN — distinct from null |
+| `.is_nan()` / `.is_not_nan()` | true where the float value is NaN, or is not NaN. NaN is distinct from null |
 | `.is_finite()` / `.is_infinite()` | true where the float value is finite / ±infinity |
 | `.fill_null(value)` | replace nulls with a value |
 | `.forward_fill()` / `.backward_fill()` | carry the nearest non-null value along an ordered window (`.over(order_by=…)` required) |
@@ -155,7 +153,7 @@ print(out.to_pydict())
 | `.alias(name)` | bind an output name to a derived expression, for positional `select` |
 | `.clip(lower=None, upper=None)` | clamp each value into `[lower, upper]` (either bound optional) |
 | `.eq_missing(other)` | null-safe equality (SQL `IS NOT DISTINCT FROM`): two nulls compare equal, null vs non-null is false (never null) |
-| `.try_cast(type)` | like `.cast` but unconvertible values become NULL instead of erroring (DuckDB `TRY_CAST`) — the safe-ingest spelling |
+| `.try_cast(type)` | the safe-ingest spelling of `.cast`: unconvertible values become NULL instead of erroring (DuckDB `TRY_CAST`) |
 | `.approx_count_distinct()` | approximate `COUNT(DISTINCT)` via a HyperLogLog sketch (~2% error) |
 
 ## Aggregation methods
@@ -171,10 +169,7 @@ Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
 `List`; SQL `array_agg` /
 Spark `collect_list`), `.arg_min(by=…)` / `.arg_max(by=…)` (the value at the
 row with the extreme `by` key), and `.first(order_by=…)` / `.last(order_by=…)`
-(the value at the first/last row in `order_by` order — a required argument, since
-an arrival-order first/last would not be partition-independent). `bt.count()` is
-the top-level `COUNT(*)`. Each of these returns an `AggExpr`, the aggregate type
-that `group_by(...).agg(...)` and `.over(...)` consume; you rarely name it directly.
+(the value at the first or last row in `order_by` order). `order_by` is required there, because an arrival-order first or last wouldn't be partition-independent. `bt.count()` is the top-level `COUNT(*)`. Each of these returns an `AggExpr`, the aggregate type that `group_by(...).agg(...)` and `.over(...)` consume. You rarely name it directly.
 
 For heavy skew, the bounded-memory **approximate** variants keep one fixed-size
 sketch per group instead of every value, so a hot key cannot OOM: `.approx_n_unique()`
@@ -222,10 +217,7 @@ print(c.with_columns(cs=bt.col("x").cum_sum(), prev=bt.col("x").shift(1)).to_pyd
 # {'x': [1, 2, 3, 4], 'cs': [1, 3, 6, 10], 'prev': [None, 1, 2, 3]}
 ```
 
-A window expression composes with ordinary arithmetic and other windows — the engine
-lifts it into a `Window` operator and rewrites the surrounding expression to read the
-result (see [window functions](../user-guide/window-functions.md)). The shapes that
-come up most have their own names:
+A window expression composes with ordinary arithmetic and other windows. The engine lifts it into a `Window` operator and rewrites the surrounding expression to read the result, as described in [window functions](../user-guide/window-functions.md). The shapes that come up most have their own names:
 
 | Method | Equivalent |
 | --- | --- |
@@ -261,14 +253,14 @@ Breadth lives on accessor namespaces rather than on the expression itself.
 
 | Namespace | Covers |
 | --- | --- |
-| `.str` | `upper`, `lower`, `trim(chars=None)`, `lstrip`/`rstrip(chars=None)`, `len`, `contains`, `starts_with`, `ends_with`, `like`, `ilike`, `substr`, `left`, `right`, `split`, `split_part(delim, n)`, `strip_html()` (markup → prose; drops `<script>`/`<style>` bodies and decodes entities), `chunk(size, overlap=0)` (RAG document splitter), `minhash(num_perm=128, ngram=5)` (fuzzy-dedup signature), `replace`, `regexp_replace`, `regexp_replace_all`, `regexp_extract`, `initcap`, `hex`, `base64`, `translate`, `zfill(width)` (zero-pad numeric strings), `contains_any([...])` (true if any literal substring is present), and more |
+| `.str` | `upper`, `lower`, `trim(chars=None)`, `lstrip`/`rstrip(chars=None)`, `len`, `contains`, `starts_with`, `ends_with`, `like`, `ilike`, `substr`, `left`, `right`, `split`, `split_part(delim, n)`, `strip_html()` (markup → prose; drops `<script>`/`<style>` bodies and decodes entities), `chunk(size, overlap=0, boundary="char")` (RAG document splitter; `boundary` may be `"char"`/`"word"`/`"sentence"`/`"line"` so a chunk never ends mid-word), `minhash(num_perm=128, ngram=5)` (fuzzy-dedup signature), `replace`, `regexp_replace`, `regexp_replace_all`, `regexp_extract`, `initcap`, `hex`, `base64`, `translate`, `zfill(width)` (zero-pad numeric strings), `contains_any([...])` (true if any literal substring is present), and more |
 | `.dt` | `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `dayofyear`, `dayname`, `monthname`, `epoch`, `epoch_ms()` / `epoch_us()` / `epoch_ns()` (integer epoch at ms/µs/ns resolution), `iso_year`, `is_leap_year`, `days_in_month`, `truncate(unit)`, `strftime(fmt)`, `offset_by("1mo15d")`, `convert_timezone(from_tz, to_tz)` (DST-aware), and more |
-| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `normalize`, `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `first()`, `last()`, `slice`, `head(n)`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `transform(element()-expr)`, `filter(element()-pred)`, `join(sep)`; vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)`, `jaccard(o)` (agreement rate; the MinHash/SimHash similarity estimate), `simhash(num_bits=64, seed=0)` (random-hyperplane LSH signature — the blocking key for a vector similarity join) |
+| `.list` | `len`, `sum`, `min`, `max`, `mean`, `median`, `std`, `var`, `product`, `n_unique`, `l2_norm`, `l1_norm` (Manhattan magnitude), `max_abs` (MaxAbs-scaling divisor), `normalize`, `softmax` (per-row logits→probabilities), `arg_sort` (indices sorting ascending, so reverse for top-k), `cum_sum` (cumulative sum), `diff` (first difference with a leading null, for delta features), `sort`, `reverse`, `unique`, `flatten`, `get(i)` (negative ok), `first()`, `last()`, `slice`, `head(n)`, `contains(v)`, `position(v)`, `intersect(o)`, `difference(o)`, `union(o)`, `transform(element()-expr)`, `filter(element()-pred)`, `join(sep)`, `add(o)` / `subtract(o)` / `multiply(o)` (element-wise vector arithmetic → List<Float64>); vector ops `dot(o)`, `cosine_similarity(o)`, `cosine_distance(o)`, `l2_distance(o)`, `l1_distance(o)` (Manhattan), `hamming_distance(o)` (differing positions, for binary or quantized embeddings), `jaccard(o)` (agreement rate; the MinHash/SimHash similarity estimate), `simhash(num_bits=64, seed=0)` (random-hyperplane LSH signature, the blocking key for a vector similarity join) |
 | `.struct` | `field(name)` |
 | `.json` | `extract_string(path)` |
-| `.map` | `get(key)`, `keys()`, `values()` — read a `Map`-typed column |
-| `.image` | `decode()`, `to_tensor(width, height)`, `resize(width, height)` (re-encode to PNG bytes) |
-| `.audio` | `decode()`, `to_waveform()` (decode to a mono PCM `List<Float>` signal), `resample(rate)` (decode + band-limited resample to `rate` Hz — the 16 kHz audio-ML preprocessing step) |
+| `.map` | `get(key)`, `keys()`, `values()`, which read a `Map`-typed column |
+| `.image` | `decode()`, `to_tensor(width, height)`, `to_tensor_f32(width, height, mean=, std=, channels_first=)` (model-ready `float32` tensor: scale to `[0,1]`, per-channel normalize, HWC/CHW), `center_crop(width, height)` (centered crop, torchvision-style zero-pad when smaller), `to_grayscale(width, height)` (decode+resize to a single Rec.601 luma channel), `resize(width, height)` (re-encode to PNG bytes), `dhash()` (64-bit perceptual hash for near-duplicate detection) |
+| `.audio` | `decode()`, `to_waveform()` (decode to a mono PCM `List<Float>` signal), `resample(rate)` (decode + band-limited resample to `rate` Hz, the 16 kHz audio-ML preprocessing step), `mel_spectrogram(rate, n_fft=400, hop_length=160, n_mels=80)` (the speech-model mel power-spectrogram front end; matches `torchaudio.transforms.MelSpectrogram`), `mfcc(rate, n_fft=400, hop_length=160, n_mels=128, n_mfcc=40)` (Mel-Frequency Cepstral Coefficients; matches `torchaudio.transforms.MFCC`) |
 | `.video` | `decode()` |
 
 ### More `.str` methods
@@ -286,13 +278,16 @@ Breadth lives on accessor namespaces rather than on the expression itself.
 | `.unhex()` | decode pairs of hex digits to a UTF-8 string; null if invalid |
 | `.md5()` / `.sha1()` / `.sha256()` | cryptographic digest as lowercase hex; null → null |
 | `.crc32()` | CRC-32 (IEEE) checksum of the UTF-8 bytes (Spark `crc32`, → Int64) |
-| `.hash64()` | deterministic FNV-1a 64-bit hash, stable across partitions/machines — surrogate-key building block (→ Int64) |
+| `.hash64()` | deterministic FNV-1a 64-bit hash, stable across partitions and machines, so it's a surrogate-key building block (→ Int64) |
 | `.xxhash64()` | fast non-cryptographic 64-bit xxHash; the standard bucketing/sharding hash (→ Int64) |
 | `.substring_index(delimiter, count)` | substring before the `count`-th `delimiter` (Spark) |
 | `.overlay(replacement, pos, length=None)` | replace `length` chars from 1-based `pos` (SQL `OVERLAY`) |
 | `.regexp_extract_all(pattern)` | every regex match as a `List<Utf8>` (DuckDB `regexp_extract_all`) |
 | `.regexp_count(pattern)` | number of non-overlapping regex matches (→ Int64) |
 | `.levenshtein(target)` | edit distance to the constant `target` (DuckDB `levenshtein`, → Int64) |
+| `.damerau_levenshtein(target)` | edit distance to `target` counting an adjacent-swap as one edit (DuckDB `damerau_levenshtein`, → Int64), which handles typos better |
+| `.jaro_similarity(target)` | Jaro similarity to `target`, `[0,1]` (DuckDB `jaro_similarity`, → Float64), for fuzzy matching and record linkage |
+| `.jaro_winkler_similarity(target)` | Jaro-Winkler similarity to `target`, `[0,1]` (DuckDB `jaro_winkler_similarity`, → Float64), prefix-weighted for name matching |
 | `.soundex()` | American Soundex phonetic code, a 4-character key (→ Utf8) |
 | `.to_date(format="%Y-%m-%d")` | parse into a Date with a strftime format; unmatched → NULL (→ Date32) |
 | `.to_datetime(format)` | parse into a Timestamp (DuckDB `try_strptime`); unmatched → NULL (→ Timestamp(us)) |
@@ -300,8 +295,7 @@ Breadth lives on accessor namespaces rather than on the expression itself.
 ### More `.dt` methods
 
 `.century()`, `.decade()`, `.isodow()` (ISO day of week), `.last_day()` (last day
-of the month), `.millennium()` — each extracts the named field of a date/time
-column (→ Int64).
+of the month), and `.millennium()`. Each extracts the named field of a date/time column (→ Int64).
 
 ### More `.json` methods
 
@@ -328,7 +322,7 @@ print(out.to_pydict())
 ## Compatibility spellings (Polars / pandas / SQL names)
 
 For migration, many operations carry a second, framework-familiar name alongside the
-SQL-style primary. These delegate to the primary spelling — same behavior, no new IR.
+SQL-style primary. These delegate to the primary spelling, with the same behavior and no new IR.
 
 Trig / clip / range on `Expr`: `.arcsin()`, `.arccos()`, `.arctan()`, `.arcsinh()`,
 `.arccosh()`, `.arctanh()` (NumPy/Polars names for `.asin()`…), `.clip_min(lo)` /
@@ -362,16 +356,20 @@ pandas string spellings: `.strip(chars=None)` (for `trim`), `.startswith(p)` /
 ## Data science toolkit
 
 Feature engineering, profiling, and text/calendar features as expressions, so a
-fit-and-apply transform is one pass over Arrow with no Python state — and, being
-ordinary window + arithmetic nodes, identical single-node and distributed.
+fit-and-apply transform is one pass over Arrow with no Python state. They're ordinary window and arithmetic nodes, so they're identical single-node and distributed.
 
 **Scaling and encoding** (each takes `partition_by=` to fit per group):
 `.zscore()` (standardize), `.minmax_scale()`, `.maxabs_scale()`, `.mean_center()`,
 `.label_encode()` (0-based codes by sorted value), and `.hash_bucket(n, seed=0)` for
 reproducible shard / split assignment.
 
-**Activations and shape**: `.sigmoid()`, `.logit()`, `.relu()`, `.softplus()`, and
-`.softmax()` (scores to a distribution summing to 1).
+**Activations and shape**: `.sigmoid()`, `.logit()`, `.relu()`, `.softplus()`, `.silu()`
+(Swish, `x·sigmoid(x)`), `.gelu()` (the transformer default, tanh approximation), `.mish()`,
+`.hardsigmoid()` / `.hardswish()` (the cheap piecewise-linear MobileNet variants),
+`.leaky_relu(negative_slope=0.01)`, `.elu(alpha=1.0)`, `.hardtanh()`, `.softsign()`,
+`.tanhshrink()`, and
+`.softmax()` (scores to a distribution summing to 1). Each matches its `torch.nn.functional`
+counterpart and runs in the data plane.
 
 **Comparison and de-duplication**: `.abs_diff(other)`, plus
 `.is_first_distinct(order_by)` / `.is_last_distinct(order_by)`, which mark one row per
@@ -382,7 +380,7 @@ distinct value (the `order_by` is required so the pick is partition-independent)
 yields null rather than infinity when the divisor is zero.
 
 **Expanding (cumulative) statistics**: `.expanding_mean()`, `.expanding_var()`,
-`.expanding_std()` — the growing-frame counterparts of the `rolling_*` family.
+`.expanding_std()`, the growing-frame counterparts of the `rolling_*` family.
 
 **Value predicates**: `.is_positive()`, `.is_negative()`, `.is_zero()`, `.is_even()`,
 `.is_odd()`, and `.is_outlier(threshold=3.0)` (the z-score rule, as a filterable
@@ -416,8 +414,7 @@ print(out.to_pydict())
 
 Column-level profiling aggregates complete the toolkit: `bt.q1(x)` / `bt.q3(x)` /
 `bt.iqr(x)` (robust spread), `bt.value_range(x)`, `bt.null_rate(x)` /
-`bt.non_null_rate(x)` (completeness), and `bt.nunique_ratio(x)` (cardinality ratio —
-near 1 marks an identifier, near 0 a categorical).
+`bt.non_null_rate(x)` (completeness), and `bt.nunique_ratio(x)`, the cardinality ratio, where near 1 marks an identifier and near 0 a categorical.
 
 ## AI data-pipeline toolkit
 
@@ -425,9 +422,7 @@ Curating a training corpus, scrubbing PII, and budgeting context windows are all
 per-row scans, so they belong in the engine rather than a Python loop. These score a
 whole corpus in one vectorized pass.
 
-**Corpus quality heuristics** on `.str` — the character-class ratios and shape
-statistics that Gopher / C4 / RefinedWeb-style filters threshold on to drop boilerplate
-and machine-generated text: `.alpha_ratio()`, `.digit_ratio()`, `.uppercase_ratio()`,
+**Corpus quality heuristics** on `.str` are the character-class ratios and shape statistics that Gopher, C4, and RefinedWeb-style filters threshold on to drop boilerplate and machine-generated text: `.alpha_ratio()`, `.digit_ratio()`, `.uppercase_ratio()`,
 `.lowercase_ratio()`, `.punctuation_ratio()`, `.whitespace_ratio()`,
 `.non_ascii_ratio()`, `.alnum_ratio()`, plus `.non_ascii_count()`, `.line_count()`,
 `.mean_line_length()`, `.avg_word_length()`, `.sentence_count()`, `.url_count()`, and
@@ -470,16 +465,14 @@ Normalization for dedup keys and prose corpora: `.slugify()`, `.remove_bullets()
 `.remove_stopwords(words)`, and `.truncate_sentences(n)`.
 
 **Token budgeting**: `.estimate_tokens(chars_per_token=4.0)` and
-`.fits_token_budget(budget)` — the tokenizer-free estimate used to size context windows
-without paying to tokenize the corpus.
+`.fits_token_budget(budget)` give the tokenizer-free estimate used to size context windows without paying to tokenize the corpus.
 
 Embedding sanity and pooling on `.list`: `.dim()` (the embedding dimension),
 `.is_zero_vector()` (the failed-encoder check), `.sum_squares()`, `.mean_pool()`, and
 `.max_pool()`.
 
 **Embedding helpers** on `.list`: `.magnitude()`, `.is_unit_norm(tol)` (assert the
-normalization invariant held), `.euclidean_distance(o)`, and `.angular_distance(o)` — a
-true metric, unlike `1 - cosine`, which nearest-neighbour indexes require.
+normalization invariant held), `.euclidean_distance(o)`, and `.angular_distance(o)`. Angular distance is a true metric, unlike `1 - cosine`, and that is what nearest-neighbour indexes require.
 
 ```python
 docs_ds = bt.from_pydict({"text": ["Real prose here, with sentences.", "AAA 111 &&& http://x.co"]})

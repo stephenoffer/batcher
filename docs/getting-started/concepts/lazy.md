@@ -1,6 +1,6 @@
 # Lazy, immutable datasets
 
-A `Dataset` holds no data. It is a handle to a logical plan plus the inputs bound to
+A `Dataset` holds no data. It's a handle to a logical plan plus the inputs bound to
 it. Every operation returns a *new* `Dataset`. Nothing is mutated in place, and no
 work happens until you ask for results.
 
@@ -25,13 +25,13 @@ optimizer sees the whole thing at once.
 Chaining calls only grows the plan. The optimizer runs, and the engine executes, when
 you call a *terminal* operation.
 
-![The query lifecycle: reading and transforming build a lazy LogicalPlan; a terminal operation triggers optimization and execution, returning an Arrow result.](../../_static/diagrams/lifecycle.png)
+![The query lifecycle: reading and transforming build a lazy LogicalPlan; a terminal operation triggers optimization and execution, returning an Arrow result.](../../_static/diagrams/lifecycle.svg)
 
 The common terminals:
 
 - `to_pydict()` gives you a column-oriented dict; `to_pylist()` gives you a list of
   row dicts.
-- `collect()` returns a `pyarrow.Table`, and `count()` returns just the row count.
+- `collect()` returns a `pyarrow.Table`, and `count()` returns only the row count.
 - `iter_batches()` streams Arrow record batches instead of materializing everything.
 - `write.parquet(...)`, `write.csv(...)`, `write.json(...)`, and the generic
   `write(...)` send the result to a sink.

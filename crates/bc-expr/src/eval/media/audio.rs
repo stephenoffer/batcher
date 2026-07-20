@@ -12,8 +12,8 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, Float32Builder, Float64Array, Int32Array, Int64Array,
-    ListBuilder, StructArray,
+    Array, ArrayRef, Float32Builder, Float64Array, GenericBinaryArray, Int32Array, Int64Array,
+    ListBuilder, OffsetSizeTrait, StructArray,
 };
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field};
@@ -28,24 +28,178 @@ use super::map_rows;
 use crate::{AudioFunc, ExprError};
 
 /// Evaluate an audio function over a Binary array of encoded audio bytes. `rate` is the
-/// target sample rate for [`AudioFunc::Resample`] (ignored by the other functions).
+/// target sample rate for [`AudioFunc::Resample`]/[`AudioFunc::MelSpectrogram`] (ignored by
+/// the others); `n_fft`/`hop`/`n_mels` parameterize the mel spectrogram only.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_audio(
     func: AudioFunc,
     arr: &ArrayRef,
     rate: Option<i64>,
+    n_fft: Option<i64>,
+    hop: Option<i64>,
+    n_mels: Option<i64>,
+    n_mfcc: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
-    let bytes =
-        arr.as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| ExprError::ExpectedBinary {
-                func: format!("{func:?}"),
-                got: arr.data_type().to_string(),
-            })?;
+    let mel = MelParams::resolve(func, rate, n_fft, hop, n_mels, n_mfcc)?;
+    match arr.data_type() {
+        DataType::Binary => eval_audio_sized::<i32>(func, arr, rate, mel),
+        DataType::LargeBinary => eval_audio_sized::<i64>(func, arr, rate, mel),
+        other => Err(ExprError::ExpectedBinary {
+            func: format!("{func:?}"),
+            got: other.to_string(),
+        }),
+    }
+}
+
+/// Validated spectral parameters (resolved for `MelSpectrogram` and `Mfcc`). `n_mfcc` is
+/// `Some` only for `Mfcc`, and is required to be `<= n_mels`.
+#[derive(Clone, Copy)]
+struct MelParams {
+    rate: u32,
+    n_fft: usize,
+    hop: usize,
+    n_mels: usize,
+    n_mfcc: Option<usize>,
+}
+
+impl MelParams {
+    fn resolve(
+        func: AudioFunc,
+        rate: Option<i64>,
+        n_fft: Option<i64>,
+        hop: Option<i64>,
+        n_mels: Option<i64>,
+        n_mfcc: Option<i64>,
+    ) -> Result<Option<Self>, ExprError> {
+        let which = match func {
+            AudioFunc::MelSpectrogram => "mel_spectrogram",
+            AudioFunc::Mfcc => "mfcc",
+            _ => return Ok(None),
+        };
+        let pos = |v: Option<i64>, what: &str| -> Result<usize, ExprError> {
+            v.and_then(|x| usize::try_from(x).ok())
+                .filter(|&x| x > 0)
+                .ok_or_else(|| ExprError::InvalidArgument {
+                    func: which.to_string(),
+                    reason: format!("{what} must be a positive integer"),
+                })
+        };
+        let rate = rate
+            .and_then(|r| u32::try_from(r).ok())
+            .filter(|&r| r > 0)
+            .ok_or(ExprError::MissingAudioRate)?;
+        let n_mels = pos(n_mels, "n_mels")?;
+        let n_mfcc = if matches!(func, AudioFunc::Mfcc) {
+            let c = pos(n_mfcc, "n_mfcc")?;
+            if c > n_mels {
+                return Err(ExprError::InvalidArgument {
+                    func: "mfcc".to_string(),
+                    reason: format!("n_mfcc ({c}) must not exceed n_mels ({n_mels})"),
+                });
+            }
+            Some(c)
+        } else {
+            None
+        };
+        Ok(Some(Self {
+            rate,
+            n_fft: pos(n_fft, "n_fft")?,
+            hop: pos(hop, "hop_length")?,
+            n_mels,
+            n_mfcc,
+        }))
+    }
+}
+
+/// `eval_audio` for one offset width. Both are supported because a media source stores
+/// payloads as `LargeBinary` — 32-bit offsets cap an array at 2 GB total, which a batch of
+/// audio files reaches.
+fn eval_audio_sized<O: OffsetSizeTrait>(
+    func: AudioFunc,
+    arr: &ArrayRef,
+    rate: Option<i64>,
+    mel: Option<MelParams>,
+) -> Result<ArrayRef, ExprError> {
+    let bytes = arr
+        .as_any()
+        .downcast_ref::<GenericBinaryArray<O>>()
+        .ok_or_else(|| ExprError::ExpectedBinary {
+            func: format!("{func:?}"),
+            got: arr.data_type().to_string(),
+        })?;
     match func {
         AudioFunc::Decode => decode_meta(bytes),
         AudioFunc::ToWaveform => to_waveform(bytes),
         AudioFunc::Resample => resample(bytes, rate),
+        // `resolve` guaranteed `Some` for these variants.
+        AudioFunc::MelSpectrogram => mel_spectrogram_col(bytes, mel.expect("mel params")),
+        AudioFunc::Mfcc => mfcc_col(bytes, mel.expect("mfcc params")),
     }
+}
+
+/// `mel_spectrogram(...)` → `List<Float32>` of `n_mels * n_frames` per row.
+///
+/// Decode + resample to the target rate + compute the mel power spectrogram, per row in
+/// parallel. The per-row list length is `n_mels * n_frames`, and `n_frames` depends on the
+/// clip length — so, like any variable-length list, rows can differ across a batch of
+/// unequal clips. Null/undecodable → null.
+fn mel_spectrogram_col<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+    p: MelParams,
+) -> Result<ArrayRef, ExprError> {
+    use crate::eval::media::mel::mel_spectrogram;
+
+    let rows: Vec<Option<Vec<f32>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let decoded = decode_pcm(bytes.value(i))?;
+        let signal = resample_signal(&decoded.samples, decoded.sample_rate, p.rate);
+        let (mel, _frames) = mel_spectrogram(&signal, p.rate as f64, p.n_fft, p.hop, p.n_mels);
+        Some(mel)
+    });
+
+    Ok(build_f32_list_column(rows))
+}
+
+/// `mfcc(...)` → `List<Float32>` of `n_mfcc * n_frames` per row, `(n_mfcc, n_frames)`
+/// row-major. Decode + resample + MFCC per row in parallel. Null/undecodable → null.
+fn mfcc_col<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+    p: MelParams,
+) -> Result<ArrayRef, ExprError> {
+    use crate::eval::media::mel::mfcc;
+
+    let n_mfcc = p.n_mfcc.expect("mfcc n_mfcc");
+    let rows: Vec<Option<Vec<f32>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let decoded = decode_pcm(bytes.value(i))?;
+        let signal = resample_signal(&decoded.samples, decoded.sample_rate, p.rate);
+        let (out, _frames) = mfcc(&signal, p.rate as f64, p.n_fft, p.hop, p.n_mels, n_mfcc);
+        Some(out)
+    });
+    Ok(build_f32_list_column(rows))
+}
+
+/// Assemble per-row `Vec<f32>` (or `None`) into a `List<Float32>` column. Shared by the
+/// spectral ops; a batch of equal-length clips gives every row the same length, which the
+/// projection layer can tag as a fixed-shape tensor.
+fn build_f32_list_column(rows: Vec<Option<Vec<f32>>>) -> ArrayRef {
+    let mut builder = ListBuilder::new(Float32Builder::new());
+    for row in rows {
+        match row {
+            Some(vals) => {
+                for v in vals {
+                    builder.values().append_value(v);
+                }
+                builder.append(true);
+            }
+            None => builder.append(false),
+        }
+    }
+    Arc::new(builder.finish())
 }
 
 /// A decoded mono signal: sample rate (Hz) and the channel-averaged f32 samples.
@@ -100,7 +254,7 @@ fn decode_pcm(data: &[u8]) -> Option<Decoded> {
 
 /// `decode` → struct `{sample_rate: Int32, channels: Int32, num_frames: Int64,
 /// duration_secs: Float64}`. Null/undecodable bytes → null struct.
-fn decode_meta(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
+fn decode_meta<O: OffsetSizeTrait>(bytes: &GenericBinaryArray<O>) -> Result<ArrayRef, ExprError> {
     // Decode every clip in parallel across the shared rayon pool (each is milliseconds of
     // symphonia work), then fold the results into the column buffers serially — the fold is
     // a cheap memcpy next to the decode. Without the row-level fan-out a batch smaller than
@@ -153,7 +307,7 @@ fn decode_meta(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
 }
 
 /// `to_waveform` → `List<Float32>` of mono samples per row. Null/undecodable → null.
-fn to_waveform(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
+fn to_waveform<O: OffsetSizeTrait>(bytes: &GenericBinaryArray<O>) -> Result<ArrayRef, ExprError> {
     // Decode every clip in parallel (see `decode_meta`); the `ListBuilder` append is
     // inherently serial, but it is a memcpy of already-decoded samples, not decode work.
     let decoded: Vec<Option<Decoded>> = map_rows(bytes.len(), |i| {
@@ -180,7 +334,10 @@ fn to_waveform(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
 
 /// `resample(rate)` → `List<Float32>` of mono samples resampled to `rate` Hz per row.
 /// Decode + band-limited (sinc) resample per row in parallel; null/undecodable → null.
-fn resample(bytes: &BinaryArray, rate: Option<i64>) -> Result<ArrayRef, ExprError> {
+fn resample<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+    rate: Option<i64>,
+) -> Result<ArrayRef, ExprError> {
     // `u32::try_from` (not `as u32`) so a rate past u32::MAX is rejected rather than
     // silently wrapped down to a tiny — or zero — sample rate that empties the output.
     let target = rate
@@ -238,7 +395,15 @@ fn resample_signal(samples: &[f32], src: u32, dst: u32) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{BinaryArray, LargeBinaryArray};
+
     use super::*;
+
+    /// `eval_audio` for the non-mel ops, which ignore the mel params — keeps their tests
+    /// readable at three arguments.
+    fn ea(func: AudioFunc, arr: &ArrayRef, rate: Option<i64>) -> Result<ArrayRef, ExprError> {
+        eval_audio(func, arr, rate, None, None, None, None)
+    }
     use arrow::array::{Float32Array, ListArray};
 
     /// Build a minimal mono 16-bit PCM WAV from `samples` at `sample_rate`.
@@ -273,13 +438,37 @@ mod tests {
             None,
             Some(b"not audio".as_slice()),
         ]));
-        let out = eval_audio(AudioFunc::Decode, &arr, None).unwrap();
+        let out = ea(AudioFunc::Decode, &arr, None).unwrap();
         let s = out.as_any().downcast_ref::<StructArray>().unwrap();
         let rate = s.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         let frames = s.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         assert!(s.is_valid(0) && rate.value(0) == 8000 && frames.value(0) == 6);
         assert!(s.is_null(1)); // null bytes → null
         assert!(s.is_null(2)); // undecodable → null
+    }
+
+    /// `LargeBinary` must decode identically to `Binary` — the layout a media source
+    /// actually produces (32-bit offsets cap an array at 2 GB total).
+    #[test]
+    fn large_binary_matches_binary_for_every_audio_func() {
+        let wav = make_wav(8000, &[0, 16384, -16384, 0, 100, -100]);
+        let rows = vec![Some(wav.as_slice()), None];
+        let narrow: ArrayRef = Arc::new(BinaryArray::from(rows.clone()));
+        let wide: ArrayRef = Arc::new(LargeBinaryArray::from(rows));
+
+        for func in [
+            AudioFunc::Decode,
+            AudioFunc::ToWaveform,
+            AudioFunc::Resample,
+        ] {
+            let narrow_out = ea(func, &narrow, Some(8000)).unwrap();
+            let wide_out = ea(func, &wide, Some(8000)).unwrap();
+            assert_eq!(
+                narrow_out.as_ref(),
+                wide_out.as_ref(),
+                "{func:?} disagreed between Binary and LargeBinary"
+            );
+        }
     }
 
     #[test]
@@ -304,7 +493,7 @@ mod tests {
         let arr: ArrayRef = Arc::new(BinaryArray::from(
             rows.iter().map(|o| o.as_deref()).collect::<Vec<_>>(),
         ));
-        let out = eval_audio(AudioFunc::Decode, &arr, None).unwrap();
+        let out = ea(AudioFunc::Decode, &arr, None).unwrap();
         let s = out.as_any().downcast_ref::<StructArray>().unwrap();
         let frames = s.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         for (i, exp) in expect_frames.iter().enumerate() {
@@ -355,7 +544,7 @@ mod tests {
             None,
             Some(b"not audio".as_slice()),
         ]));
-        let out = eval_audio(AudioFunc::Resample, &arr, Some(4000)).unwrap();
+        let out = ea(AudioFunc::Resample, &arr, Some(4000)).unwrap();
         let list = out.as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(list.value_length(0), 4); // 8 frames at 8k -> 4 at 4k
         assert!(list.is_null(1) && list.is_null(2)); // null + undecodable -> null
@@ -365,20 +554,20 @@ mod tests {
     fn resample_requires_rate() {
         let wav = make_wav(8000, &[0, 1, 2]);
         let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(wav.as_slice())]));
-        assert!(eval_audio(AudioFunc::Resample, &arr, None).is_err());
-        assert!(eval_audio(AudioFunc::Resample, &arr, Some(0)).is_err());
-        assert!(eval_audio(AudioFunc::Resample, &arr, Some(-8000)).is_err());
+        assert!(ea(AudioFunc::Resample, &arr, None).is_err());
+        assert!(ea(AudioFunc::Resample, &arr, Some(0)).is_err());
+        assert!(ea(AudioFunc::Resample, &arr, Some(-8000)).is_err());
         // Past u32::MAX must be rejected, not wrapped down (e.g. 2^32 → 0 Hz, which would
         // silently empty every clip instead of erroring).
-        assert!(eval_audio(AudioFunc::Resample, &arr, Some(i64::from(u32::MAX) + 1)).is_err());
-        assert!(eval_audio(AudioFunc::Resample, &arr, Some(i64::MAX)).is_err());
+        assert!(ea(AudioFunc::Resample, &arr, Some(i64::from(u32::MAX) + 1)).is_err());
+        assert!(ea(AudioFunc::Resample, &arr, Some(i64::MAX)).is_err());
     }
 
     #[test]
     fn to_waveform_decodes_mono_samples() {
         let wav = make_wav(8000, &[0, 16384, -16384]);
         let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(wav.as_slice()), None]));
-        let out = eval_audio(AudioFunc::ToWaveform, &arr, None).unwrap();
+        let out = ea(AudioFunc::ToWaveform, &arr, None).unwrap();
         let list = out.as_any().downcast_ref::<ListArray>().unwrap();
         assert!(list.is_valid(0) && list.value_length(0) == 3);
         let row0 = list.value(0);

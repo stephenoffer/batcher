@@ -65,7 +65,8 @@ pub use parallel::{execute_streaming_parallel, execute_streaming_parallel_metere
 
 use breaker::{drain, exec_breaker};
 pub(crate) use meter::Meter;
-use pipeline::{limit_stream, scan_stream};
+pub(crate) use pipeline::limit_stream;
+use pipeline::scan_stream;
 
 /// Everything a stream stage needs, in one `Copy` handle so an iterator closure can capture it
 /// by value rather than borrowing a struct that has to outlive the stream.
@@ -81,6 +82,10 @@ pub(crate) struct Ctx<'a> {
     /// nest rayon and duplicate work. Only the un-sharded (`fallback`) path passes the real count,
     /// which is exactly where a stage can still be serial and would like not to be.
     workers: usize,
+    /// Spine breakers already evaluated, in parallel, over the **unsharded** sources.
+    ///
+    /// `None` on the sequential path, which materializes its breakers inline. See [`MatCache`].
+    mats: Option<&'a MatCache>,
     /// `None` when the caller did not ask for metrics — the counters are not free (an atomic add
     /// and a clock read per morsel), and a query nobody is measuring should not pay for them.
     meter: Option<&'a Meter>,
@@ -117,10 +122,21 @@ impl<'a> Ctx<'a> {
         Self {
             sources,
             cache,
+            mats: None,
             meter,
             budget,
             workers,
         }
+    }
+
+    /// This context, reading the caller's already-materialized spine breakers.
+    ///
+    /// Threaded rather than rebuilt: a worker must see the *same* materialized relation every
+    /// other worker sees, because it was computed once from the unsharded sources and is the very
+    /// thing that licenses sharding the spine above it.
+    pub(crate) fn with_mats(mut self, mats: Option<&'a MatCache>) -> Self {
+        self.mats = mats;
+        self
     }
 
     /// Stop if `needed` bytes of breaker state would exceed the envelope.
@@ -175,6 +191,26 @@ impl JoinBuild {
 /// so the address is a stable identity — and it distinguishes two structurally identical joins in
 /// the same plan, which a structural key would conflate.
 pub(crate) type BuildCache = HashMap<usize, Arc<JoinBuild>>;
+
+/// Spine breakers that have already been evaluated, keyed the same way (`node_key`).
+///
+/// A breaker sitting between the plan root and the driving scan used to force the *whole* query
+/// onto the sequential path: sharding cannot cross it (a breaker handed one shard answers for one
+/// shard), and `spine_is_shardable` refuses the plan rather than risk that. But its own subtree is
+/// usually the expensive half and is very often perfectly shardable on its own — TPC-H q17's
+/// decorrelated aggregate over 6M rows of `lineitem` is exactly that, and it ran on one core.
+///
+/// So the breaker is evaluated **up front, in parallel, over the unsharded sources** — the same
+/// treatment [`prebuild_joins`] already gives a join's build side — and its result is stored here.
+/// From then on it is a materialized *leaf*: [`build_with`] yields the stored batches instead of
+/// executing the subtree, and the spine above it becomes shardable because nothing on that spine
+/// is a breaker any more.
+///
+/// The soundness argument is the one that matters, because this is a wrong-answer-shaped change:
+/// sharding is never extended *through* a breaker. The breaker is fully evaluated first, over
+/// every row of its input, and what the workers then share is a finished relation — identical in
+/// every worker, and never itself sharded.
+pub(crate) type MatCache = HashMap<usize, Arc<Vec<RecordBatch>>>;
 
 /// Execute (and hash) every hash-join build side in `plan`, once, across `workers`.
 ///
@@ -322,6 +358,18 @@ pub(crate) fn strip_empties(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
 
 /// Compose the stream for `plan`. Pipeline operators wrap their child lazily; breakers drain it.
 pub(crate) fn build_with<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpError> {
+    // An already-materialized spine breaker is a leaf: yield what it produced. Checked before the
+    // match, so it wins over every arm below — including the breaker arm that would otherwise
+    // re-execute this subtree once per worker, and (crucially) over any arm that would execute it
+    // against this worker's *shard*. Metrics are not re-recorded: the run that filled the cache
+    // was metered, and counting it again in every worker would inflate the very cardinalities
+    // Kyber learns from.
+    if let Some(batches) = ctx.mats.and_then(|m| m.get(&node_key(plan))) {
+        let batches = Arc::clone(batches);
+        let n = batches.len();
+        return Ok(Box::new((0..n).map(move |i| Ok(batches[i].clone()))));
+    }
+
     let id = ctx.id(plan);
     match plan {
         RelOp::Scan { source_id } => {
@@ -342,6 +390,13 @@ pub(crate) fn build_with<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a
         }
 
         // ---- linear pipeline operators: one morsel in, one morsel out --------------------
+        // Filter and Project stay on the interpreter here, and that is a measured choice rather
+        // than an oversight: wiring the Tier-1 JIT into this path (compile once per operator on
+        // the first morsel, reuse across the rest) was tried and measured 1.01x over TPC-H in an
+        // interleaved A/B, with five queries slower. Arrow's compare/boolean kernels are already
+        // SIMD, so a scalar Cranelift loop has nothing to win on these predicates, and the real
+        // cost on this path is in the joins and aggregates rather than the scalar expressions.
+        // `par.rs` still compiles, which is where the fused-pipeline shapes make it pay.
         RelOp::Filter { input, predicate } => {
             let child = build_with(input, ctx)?;
             Ok(Box::new(child.map(move |b| {
@@ -370,13 +425,43 @@ pub(crate) fn build_with<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a
             input,
             column,
             alias,
+            outer,
+            index_alias,
         } => {
             let child = build_with(input, ctx)?;
             Ok(Box::new(child.map(move |b| {
                 let b = b?;
                 let rows_in = b.num_rows() as u64;
                 let t = std::time::Instant::now();
-                let out = ops::unnest_batch(&b, column, alias)?;
+                let out = ops::unnest_batch(&b, column, alias, *outer, index_alias.as_deref())?;
+                ctx.morsel(id, rows_in, &out, t);
+                Ok(out)
+            })))
+        }
+
+        // A *fractional* sample keeps a row iff a seeded hash of its values falls under the
+        // fraction — a per-row predicate, so it is a pipeline operator, not a breaker. The
+        // sequential oracle already treats it exactly this way (`lib.rs`: it maps
+        // `sample_batch` over each batch independently and records it as streaming, while
+        // only the fixed-`n` arm is a breaker), so this is the same kernel on the same
+        // per-batch boundary — a scheduling change, not a second semantics.
+        //
+        // A *fixed-count* sample (`n = Some(k)`) is NOT included: it keeps the k
+        // smallest-hash rows of the WHOLE relation, so a per-morsel draw would keep k rows
+        // from every morsel — a different sample, not a faster one. It stays deferred.
+        RelOp::Sample {
+            input,
+            fraction,
+            seed,
+            n: None,
+        } => {
+            let child = build_with(input, ctx)?;
+            let (fraction, seed) = (*fraction, *seed);
+            Ok(Box::new(child.map(move |b| {
+                let b = b?;
+                let rows_in = b.num_rows() as u64;
+                let t = std::time::Instant::now();
+                let out = ops::sample_batch(&b, fraction, seed)?;
                 ctx.morsel(id, rows_in, &out, t);
                 Ok(out)
             })))
@@ -498,7 +583,19 @@ fn build_join<'a>(
         // and filtered to 57k). Run it across the workers instead; we are not inside a rayon loop
         // here, exactly because this join stopped the sharding.
         if ctx.workers > 1 {
-            let batches = parallel::run(left, ctx.sources, ctx.workers, ctx.meter, ctx.budget)?;
+            // Both caches go with it. The probe subtree holds joins whose build sides `ctx.cache`
+            // already contains (`collect_builds` descends the probe spine) and possibly a spine
+            // breaker `ctx.mats` already evaluated; re-entering without them re-executes every one
+            // of those, which is invisible in the result and doubles the work.
+            let batches = parallel::run_reusing(
+                left,
+                ctx.sources,
+                ctx.workers,
+                ctx.meter,
+                ctx.budget,
+                Some(ctx.cache),
+                ctx.mats,
+            )?;
             return materialized_join_from(
                 Box::new(batches.into_iter().map(Ok)),
                 left_keys,

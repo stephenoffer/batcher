@@ -12,6 +12,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 pytestmark = pytest.mark.differential
 
@@ -34,7 +35,6 @@ def _tables(duck):
 def test_learned_join_strategy_arm_is_result_invariant(duck, monkeypatch, arm):
     """Forcing the bandit to any arm keeps every join type equal to DuckDB and to the default."""
     from batcher.kyber.rules import selection
-    from conftest import assert_same
 
     # Pin the learned bandit to `arm` for every signature — the on/off switch for the tuning.
     monkeypatch.setattr(selection, "learned_join_strategy", lambda hub, sig, *a, **k: arm)
@@ -56,7 +56,6 @@ def test_learned_thresholds_are_result_invariant(duck, monkeypatch):
     crossover to 0 (always sort-merge) — the extreme the OLS learners could produce — and every
     join type still matches DuckDB, proving the learned thresholds are pure performance knobs."""
     from batcher.kyber.rules import selection
-    from conftest import assert_same
 
     monkeypatch.setattr(selection, "learned_broadcast_max_bytes", lambda hub, *a, **k: -1)
     monkeypatch.setattr(selection, "learned_sort_merge_min_rows", lambda hub, default, *a, **k: 0.0)
@@ -72,7 +71,6 @@ def test_join_then_aggregate_invariant_under_forced_strategy(duck, monkeypatch):
     ordering/partitioning must not leak into the grouped result)."""
     from batcher import col, count
     from batcher.kyber.rules import selection
-    from conftest import assert_same
 
     monkeypatch.setattr(selection, "learned_join_strategy", lambda hub, sig, *a, **k: "sort_merge")
 
@@ -93,7 +91,6 @@ def test_join_then_aggregate_invariant_under_forced_strategy(duck, monkeypatch):
 def test_forced_arm_matches_the_untuned_default(duck, monkeypatch):
     """The on/off proof: the tuned result is byte-for-byte the same as the default (hash) result."""
     from batcher.kyber.rules import selection
-    from conftest import assert_same
 
     emp, dept = _tables(duck)
     default = emp.join(dept, on="dept_id").collect()  # cold hub → cost-model default

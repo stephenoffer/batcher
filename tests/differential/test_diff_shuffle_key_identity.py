@@ -26,13 +26,12 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from conftest import assert_same
-
 pytestmark = pytest.mark.differential
 
 bt = pytest.importorskip("batcher")
 nat = pytest.importorskip("batcher._native")
 
+from _harness import assert_same  # noqa: E402
 from batcher.plan.expr_ir import col  # noqa: E402  (after importorskip)
 
 PARTITIONS = 8

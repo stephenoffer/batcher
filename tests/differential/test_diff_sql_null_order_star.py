@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same, assert_same_ordered
 from batcher._internal.errors import PlanError
 
 
@@ -49,8 +50,6 @@ def wide(duck):
     ],
 )
 def test_null_ordering_vs_duckdb(duck, nulls, query):
-    from conftest import assert_same_ordered
-
     out = bt.sql(query, t=nulls).collect()
     assert_same_ordered(out, duck.sql(query))
 
@@ -69,8 +68,6 @@ def test_null_ordering_vs_duckdb(duck, nulls, query):
     ],
 )
 def test_star_modifiers_vs_duckdb(duck, wide, query):
-    from conftest import assert_same
-
     out = bt.sql(query, u=wide).collect()
     duck_table = duck.sql(query).to_arrow_table()
     # Column *order* is part of the star-modifier contract, not just the set.

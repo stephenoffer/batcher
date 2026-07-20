@@ -8,133 +8,17 @@ their first argument.
 from __future__ import annotations
 
 from batcher._internal.errors import PlanError
+from batcher._sql.parser.agg_rewrites import rewrite_distinct_aggs, sort_for_ordered_aggs
 from batcher._sql.parser.core_utils import (
     _alias_of,
     _has_aggregate,
     _positional,
     _unwrap_alias,
 )
-from batcher._sql.parser.literals import _AGG_FUNCS
+from batcher._sql.parser.expressions import _AGG_FUNCS
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import AggExpr, Expr, col
 from batcher.plan.expr_ir.selectors import expand_selectors, has_selector
-
-
-def _grouping_key(e) -> str:
-    """Identity of a grouping expression across levels.
-
-    A bare column is identified by its (unqualified) name so a `GROUP BY a`
-    key matches a `SELECT t.a` projection; any other expression is identified
-    by its SQL text (`b * 10`, `extract(...)`).
-    """
-    from sqlglot import expressions as exp
-
-    return e.name if isinstance(e, exp.Column) else e.sql()
-
-
-def _grouping_set_members(m) -> list:
-    """The grouping expressions in one GROUPING SETS member.
-
-    `(a, b)` → `[a, b]`, `(b + 1)` → `[b + 1]`, `()` → `[]`, bare `a` → `[a]`.
-    """
-    from sqlglot import expressions as exp
-
-    if isinstance(m, exp.Tuple):
-        return list(m.expressions)  # `(a, b)` and `()`
-    if isinstance(m, exp.Paren):
-        return [m.this]  # `(a)` / `(b + 1)`
-    return [m]  # a bare column / expression
-
-
-def _grouping_factors(group) -> list[list[list]]:
-    """The GROUP BY as a list of factors; the levels are their cross product.
-
-    A plain item list, `ROLLUP(...)`, `CUBE(...)`, and `GROUPING SETS(...)` each
-    contribute one factor — a list of alternative grouping sets. DuckDB's overall
-    set of levels is the Cartesian product of the factors (so `GROUP BY ROLLUP(a),
-    ROLLUP(b)` yields the product of the two rollups), which is what `itertools.
-    product` over these factors produces.
-    """
-    import itertools
-
-    factors: list[list[list]] = []
-    if group.expressions:  # plain items — present in every level
-        factors.append([list(group.expressions)])
-    for r in group.args.get("rollup") or ():
-        cols = list(r.expressions)
-        factors.append([cols[:i] for i in range(len(cols), -1, -1)])
-    for cu in group.args.get("cube") or ():
-        cols = list(cu.expressions)
-        factors.append(
-            [list(c) for k in range(len(cols), -1, -1) for c in itertools.combinations(cols, k)]
-        )
-    for gs in group.args.get("grouping_sets") or ():
-        factors.append([_grouping_set_members(m) for m in gs.expressions])
-    return factors or [[[]]]
-
-
-def _grouping_sets_union(tr, node, group) -> Dataset:
-    """Expand ROLLUP/CUBE/GROUPING SETS into a UNION ALL over grouping levels.
-
-    Each level groups by its active expressions; the inactive grouping expressions
-    are projected as NULL. (Matches DuckDB's row output for non-null group keys.)
-    """
-    import itertools
-
-    factors = _grouping_factors(group)
-    levels = [[e for part in combo for e in part] for combo in itertools.product(*factors)]
-
-    # Every grouping expression that appears in any level, deduped by identity.
-    every: dict[str, object] = {}
-    for level in levels:
-        for e in level:
-            every.setdefault(_grouping_key(e), e)
-
-    datasets = [
-        tr.select(_grouping_level_node(node, {_grouping_key(e): e for e in level}, every))
-        for level in levels
-    ]
-    out = datasets[0]
-    for d in datasets[1:]:
-        out = out.union(d, distinct=False)
-    return out
-
-
-def _grouping_level_node(node, active: dict, every: dict):
-    """A copy of `node` grouping only by `active`; inactive grouping expressions in
-    the SELECT list become NULL so every level shares one output schema."""
-    from sqlglot import expressions as exp
-
-    m = node.copy()
-    inactive = {k: v for k, v in every.items() if k not in active}
-
-    def typed_null(e):
-        # NULLIF(e, e) is a NULL *of the expression's type*; used both as a
-        # (constant) group key — so it survives aggregation and the output
-        # schema matches across levels — and as the projected value.
-        return exp.Nullif(this=e.copy(), expression=e.copy())
-
-    group_exprs = [e.copy() for e in active.values()]
-    group_exprs += [typed_null(e) for e in inactive.values()]
-    m.set("group", exp.Group(expressions=group_exprs))
-
-    # GROUPING(x, y, ...) is a per-level constant: the integer whose bits mark which
-    # of its arguments are rolled up (inactive) in this level, first argument the
-    # most-significant bit (DuckDB/SQL-standard). GROUPING_ID(...) is a spelling of the
-    # same bit-vector. Replace either with that literal.
-    for gnode in list(m.find_all(exp.Grouping, exp.GroupingId)):
-        bits = 0
-        for arg in gnode.expressions:
-            bits = (bits << 1) | (0 if _grouping_key(arg) in active else 1)
-        # Paren-wrap so an `ORDER BY GROUPING(a)` constant is not mistaken for a
-        # 1-based positional SELECT-item reference.
-        gnode.replace(exp.Paren(this=exp.Literal.number(bits)))
-
-    for proj in list(m.expressions):
-        inner = proj.this if isinstance(proj, exp.Alias) else proj
-        if _grouping_key(inner) in inactive:
-            proj.replace(exp.alias_(typed_null(inner), proj.alias_or_name))
-    return m
 
 
 def _expand_star(tr, star, visible: list[str]) -> dict[str, Expr]:
@@ -208,7 +92,25 @@ def _projection_map(tr, ds: Dataset, projections) -> dict[str, Expr]:
     return named
 
 
-def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
+def _is_group_agg(a) -> bool:
+    """Whether aggregate node `a` is a GROUP BY aggregate rather than a window function.
+
+    `sum(sum(x)) OVER (...)` holds two aggregates: the outer one is the *window*
+    function (its parent is the `Window` node) and runs after grouping, while the inner
+    one is an ordinary group aggregate supplying its input. Registering the outer one as
+    a group aggregate is what made TPC-DS q98 fail with an aggregate referencing a
+    column the grouping had not produced yet.
+
+    An aggregate inside a (scalar) subquery belongs to that inner query, not this one.
+    """
+    from sqlglot import expressions as exp
+
+    if isinstance(a.parent, exp.Window):
+        return False
+    return a.find_ancestor(exp.Subquery) is None
+
+
+def _aggregate(tr, ds: Dataset, projections, group, having, windows=None, order=None) -> tuple:
     from sqlglot import expressions as exp
 
     # Plain (non-ROLLUP/CUBE/GROUPING SETS) GROUP BY: no level is ever rolled up, so
@@ -230,6 +132,7 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
         a = _alias_of(p)
         if a:
             select_aliases[a] = _unwrap_alias(p)
+    input_cols = set(ds.columns)
     if group is not None:
         group_items = list(group.expressions)
         # GROUP BY ALL groups by every SELECT item that is not itself an aggregate
@@ -249,11 +152,15 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
             if isinstance(g, exp.Literal) and not g.is_string:
                 g = _unwrap_alias(_positional(projections, g, "GROUP BY"))
             # GROUP BY <select-alias> of a derived expression resolves to that expression
-            # (skip when the alias just re-names a same-named column — that's a real key).
-            if isinstance(g, exp.Column) and g.name in select_aliases:
-                aliased = select_aliases[g.name]
-                if not (isinstance(aliased, exp.Column) and aliased.name == g.name):
-                    g = aliased
+            # — but only as a *fallback*. GROUP BY resolves an input column first and
+            # reaches for a select alias only when no input column carries the name;
+            # that is the opposite precedence from ORDER BY, and it is DuckDB's
+            # (`SELECT b*10 AS a FROM t GROUP BY a` is a binder error there, because
+            # `a` binds to the input column, not to the alias). Preferring the alias
+            # unconditionally made `SELECT SUM(p) AS k, k AS p ... GROUP BY k` try to
+            # group by `SUM(p)`.
+            if isinstance(g, exp.Column) and g.name in select_aliases and g.name not in input_cols:
+                g = select_aliases[g.name]
             # A key repeated in the GROUP BY (`GROUP BY region, region`, or `GROUP BY
             # 1, region` where both name the same column) is redundant — DuckDB accepts
             # it and groups once. Dedup so the engine does not raise on a duplicate
@@ -269,6 +176,9 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
     # Collect every aggregate from SELECT and HAVING, assigning each a column.
     tr._agg_map = {}
     tr._agg_n = 0
+    tr._agg_distinct = {}
+    tr._agg_pending_distinct = []
+    tr._agg_order = []
     used_aliases = set(group_cols) | set(group_exprs)
     for p in projections:
         inner = _unwrap_alias(p)
@@ -276,16 +186,39 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
             _register_agg(tr, inner, _alias_of(p), used_aliases)
         else:
             for a in inner.find_all(exp.AggFunc):
-                if a.find_ancestor(exp.Subquery) is None:
+                if _is_group_agg(a):
                     _register_agg(tr, a, None, used_aliases)
+    # A window item's *inner* aggregates are group aggregates feeding the window, so
+    # they must be registered here alongside the SELECT list's own.
+    for w in windows or ():
+        for a in _unwrap_alias(w).find_all(exp.AggFunc):
+            if _is_group_agg(a):
+                _register_agg(tr, a, None, used_aliases)
     if having is not None:
         for a in having.this.find_all(exp.AggFunc):
-            if a.find_ancestor(exp.Subquery) is None:
+            if _is_group_agg(a):
+                _register_agg(tr, a, None, used_aliases)
+    # An aggregate the query only ever names in ORDER BY (`... ORDER BY MIN(x)`) still
+    # has to be computed by the grouping — it is a sort key over the grouped rows. It is
+    # registered here, materialized as an internal column, and dropped by the projection
+    # that follows the sort.
+    for o in order.expressions if order is not None else ():
+        for a in o.find_all(exp.AggFunc):
+            if _is_group_agg(a):
                 _register_agg(tr, a, None, used_aliases)
 
     agg_kwargs = dict(tr._agg_map.values())
+    if agg_kwargs and tr._agg_order:
+        ds = sort_for_ordered_aggs(tr, ds)
     if agg_kwargs:
-        ds = ds.group_by(*group_cols, **group_exprs).agg(**agg_kwargs)
+        if tr._agg_distinct:
+            # The rewrite returns the relation to group and the aggregates to apply to it,
+            # having already materialized the computed group keys — so group by their
+            # aliases rather than recomputing them over columns that are gone.
+            ds, agg_kwargs = rewrite_distinct_aggs(tr, ds, group_cols, group_exprs, agg_kwargs)
+            ds = ds.group_by(*group_cols, *group_exprs).agg(**agg_kwargs)
+        else:
+            ds = ds.group_by(*group_cols, **group_exprs).agg(**agg_kwargs)
     else:
         # A GROUP BY with no aggregate anywhere (`SELECT k FROM t GROUP BY k`, incl.
         # with a HAVING over the keys) collapses to one row per distinct key — a
@@ -298,6 +231,15 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
     if having is not None:
         ds = ds.filter(tr._scalar(having.this))
 
+    # SQL evaluates window functions *after* GROUP BY and HAVING, over the grouped
+    # relation. Their aggregate arguments are now materialized columns, so point them
+    # at those columns and let the ordinary window pass compute them here.
+    if windows:
+        from batcher._sql.parser.windowing import rewrite_aggs_in_windows
+
+        rewrite_aggs_in_windows(tr, windows)
+        ds = tr._window(ds, windows)
+
     # Final projection (group keys, aggregate refs, and arithmetic over them).
     # A SELECT item that *is* a GROUP BY expression resolves to that key's
     # materialized column rather than being recomputed.
@@ -305,15 +247,21 @@ def _aggregate(tr, ds: Dataset, projections, group, having) -> Dataset:
     for p in projections:
         out = _alias_of(p)
         inner = _unwrap_alias(p)
-        if isinstance(inner, exp.Column) and inner.name in group_cols:
+        if tr._is_window(p):
+            # Already materialized under `out` by the window pass above.
+            named[out] = col(out)
+        elif isinstance(inner, exp.Column) and inner.name in group_cols:
             named[out] = col(inner.name)
         elif inner.sql() in group_expr_alias:
             named[out] = col(group_expr_alias[inner.sql()])
         else:
             named[out] = tr._scalar(inner)
-    # NB: `_agg_map` stays live so an ORDER BY over an aggregate can resolve;
-    # the caller (`select`) clears it once ordering is done.
-    return ds.select(**named)
+    # The *unprojected* relation is returned with its projection map so the caller can
+    # sort before projecting: SQL resolves an ORDER BY term against the select-list
+    # aliases AND the columns underneath them, and projecting first destroys the latter.
+    # NB: `_agg_map` stays live so an ORDER BY over an aggregate can resolve; the
+    # caller (`select`) clears it once ordering is done.
+    return ds, named
 
 
 def _distinct_on(tr, ds: Dataset, projections, order, on_exprs) -> Dataset:
@@ -377,7 +325,12 @@ def _register_agg(tr, node, preferred: str | None, used: set) -> None:
         alias = f"__agg{tr._agg_n}"
         tr._agg_n += 1
     used.add(alias)
+    before = len(tr._agg_pending_distinct)
     tr._agg_map[key] = (alias, _agg(tr, node))
+    if len(tr._agg_pending_distinct) > before:
+        # `_agg` records a DISTINCT argument as it lowers; it does not know the output
+        # name, so the association is made here where the alias is assigned.
+        tr._agg_distinct[alias] = tr._agg_pending_distinct.pop()
 
 
 def _agg(tr, node) -> AggExpr:
@@ -411,7 +364,16 @@ def _agg(tr, node) -> AggExpr:
                 "array_agg(DISTINCT x) / string_agg(DISTINCT x) is not supported; "
                 "pre-aggregate the distinct values in a subquery"
             )
-        return AggExpr("list_agg", tr._scalar(node.this))
+        arg = node.this
+        if isinstance(arg, exp.Order):
+            # `string_agg(x ORDER BY y)` collects x in y's order. The list aggregate appends
+            # in input order, so ordering the *input* once up front gives exactly that —
+            # the same shape as the DISTINCT rewrite's pre-dedup. Recorded here and applied
+            # by the assembler, which checks every ordered aggregate asks for the same sort
+            # (one pass cannot serve two different orderings).
+            tr._agg_order.append((arg.sql(), list(arg.expressions)))
+            arg = arg.this
+        return AggExpr("list_agg", tr._scalar(arg))
     mapped = _AGG_FUNCS.get(fname)
     if mapped is None:
         raise NotImplementedError(f"unsupported aggregate: {fname}")
@@ -426,8 +388,13 @@ def _agg(tr, node) -> AggExpr:
             raise NotImplementedError(f"{fname}(DISTINCT ...) supports exactly one expression")
         if mapped in ("min", "max"):
             return AggExpr(mapped, tr._scalar(exprs[0]))
-        raise NotImplementedError(
-            f"{fname.upper()}(DISTINCT x) is not supported (only COUNT/MIN/MAX(DISTINCT) are); "
-            f"pre-aggregate the distinct values in a subquery"
-        )
+        # `SUM(DISTINCT x)` and friends need a per-group dedup the engine's aggregate has
+        # no flag for. It is exactly `<agg>(x)` over rows deduped on the group keys plus
+        # `x`, so record the expression and let the assembler dedup once up front; the
+        # aggregate itself is then an ordinary non-distinct one. Recorded per registered
+        # aggregate (not globally) so the assembler can verify every aggregate in the
+        # query shares one distinct expression — the only shape a single dedup is
+        # correct for.
+        tr._agg_pending_distinct.append((exprs[0].sql(), exprs[0]))
+        return AggExpr(mapped, tr._scalar(exprs[0]))
     return AggExpr(mapped, tr._scalar(arg))

@@ -32,6 +32,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 
 __all__ = ["DeltaSnapshot", "open_snapshot", "require_deltalake"]
 
@@ -49,13 +50,7 @@ _HANDLE_LOCK = threading.Lock()
 
 def require_deltalake() -> Any:
     """Import and return the `deltalake` module, or raise `BackendError`."""
-    try:
-        import deltalake
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError(
-            "Delta Lake support requires delta-rs: pip install 'batcher-engine[delta]'"
-        ) from exc
-    return deltalake
+    return require("deltalake", feature="Delta Lake support", provides="delta-rs", extra="delta")
 
 
 @dataclass(slots=True)

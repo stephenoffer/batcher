@@ -26,7 +26,9 @@ from batcher.dist.executors.ray_runtime import (
 )
 from batcher.dist.fleet import acquire_fleet, release_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
+from batcher.dist.flight_worker import current_plan_id
 from batcher.io.source import Source
+from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import Aggregate, Join, LogicalPlan
 
 __all__ = ["execute_join_flight"]
@@ -104,8 +106,7 @@ def execute_join_flight(
     # each reducer to fold its joined bucket down before it leaves the worker.
     gk = aj = None
     if fused_agg is not None:
-        gk = json.dumps([{"expr": k.expr.to_ir(), "alias": k.alias} for k in fused_agg.group_keys])
-        aj = json.dumps([s.agg.to_ir(s.alias) for s in fused_agg.aggregates])
+        gk, aj = agg_spec_json(fused_agg)
 
     # 0-row schema probes so reducers can type the null-extended side of an outer join.
     def probe(sub_ir, source):
@@ -159,7 +160,9 @@ def execute_join_flight(
 
         def _launch(host: int, src: int):
             left, right = _sides(src)
-            return actors[host].map_publish_join.remote(left, right, n_buckets, src)
+            return actors[host].map_publish_join.remote(
+                left, right, n_buckets, src, 0, current_plan_id()
+            )
 
         mapper_addrs, mapper_dead = map_barrier(workers, _launch)
 
@@ -335,10 +338,22 @@ def _join_reduce_with_recovery(
             # intermediate join never round-trips through the driver (see
             # `reduce_join_publish`). Otherwise the reducer ships its batches back.
             if publish:
-                ref = actors[host].reduce_join_publish.remote(join_ir, addrs, r, lschema, rschema)
+                ref = actors[host].reduce_join_publish.remote(
+                    join_ir, addrs, r, lschema, rschema, None, None, current_plan_id()
+                )
             else:
                 ref = actors[host].reduce_join.remote(
-                    join_ir, addrs, r, lschema, rschema, gk, aj, finalize
+                    join_ir,
+                    addrs,
+                    r,
+                    lschema,
+                    rschema,
+                    gk,
+                    aj,
+                    finalize,
+                    None,
+                    None,
+                    current_plan_id(),
                 )
             ref_host[ref] = host
             return ref
@@ -379,6 +394,8 @@ def _join_reduce_with_recovery(
                     (right_ir, right_keys, rparts[src]),
                     n_buckets,
                     src,
+                    0,
+                    current_plan_id(),
                 )
             )
 

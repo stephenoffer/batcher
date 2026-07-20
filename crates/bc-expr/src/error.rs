@@ -1,3 +1,5 @@
+//! The crate's error type: every way scalar expression evaluation can fail.
+
 use arrow::error::ArrowError;
 use thiserror::Error;
 

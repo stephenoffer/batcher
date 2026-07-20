@@ -142,6 +142,18 @@ exclude_patterns = [
     # structural ceilings, and the claims the code does not support. A working record for
     # contributors (and deliberately blunt about our own marketing), not a site page.
     "internals/competitive_architecture.md",
+    # A code-checked parity scorecard against the Databricks stack (Catalyst/AQE, Photon,
+    # Reyden/Lakehouse//RT) covering the optimizer, vectorized execution, the distributed
+    # path, and the enterprise surface — plus the Databricks claims that are secondary-
+    # sourced and must not be cited. A working record for contributors, not a site page.
+    "internals/databricks_parity.md",
+    # A code-checked audit of which Ray performance pitfalls Batcher avoids by design and
+    # which it still inherits, read against a field-engineering corpus. A contributor
+    # working record like the parity scorecards above, not a site page.
+    "internals/ray_pitfall_parity.md",
+    # The authoring guide for the diagram sources that live beside it (palette, the
+    # rsvg-convert render step). A contributor note in an asset directory, not a page.
+    "_static/diagrams/README.md",
 ]
 
 # -- Options for HTML output -------------------------------------------------

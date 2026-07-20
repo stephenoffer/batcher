@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 import batcher as bt
+from _harness import assert_same
 
 
 def _double_v(batch: pa.RecordBatch) -> pa.RecordBatch:
@@ -79,8 +80,6 @@ def test_aggregate_then_map_then_join_adaptive() -> None:
 
 
 def test_map_join_adaptive_matches_duckdb(duck) -> None:
-    from conftest import assert_same
-
     left = pa.table({"k": [1, 2, 3, None, 2, 2, 5], "v": [10, 20, 30, 40, 50, 60, 70]})
     right = pa.table({"k": [2, 2, 3, None, 9], "w": [1, 2, 3, 4, 5]})
     duck.register("l", left)

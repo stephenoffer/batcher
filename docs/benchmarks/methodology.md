@@ -92,9 +92,9 @@ with no failures in it is a marketing document, not a measurement.
 
 ## See also
 
-- [TPC-H](tpch.md): the suite where the gate has the most to say about other engines.
-- [Analytics and I/O](analytics.md) and [AI and GPU](ai-and-gpu.md): the two halves of the
+- {doc}`tpch`: the suite where the gate has the most to say about other engines.
+- {doc}`analytics` and {doc}`ai-and-gpu`: the two halves of the
   measurement.
-- [Testing strategy](../internals/testing-strategy.md): the same discipline applied to the
+- {doc}`../internals/testing-strategy`: the same discipline applied to the
   engine itself, where DuckDB is the differential oracle.
-- [Performance tuning](../user-guide/performance.md): the levers you have on your own query.
+- {doc}`../user-guide/performance`: the levers you have on your own query.

@@ -3,6 +3,16 @@
 Operator-mix cases build on an eager ``pl.DataFrame``; the standard suites run
 through ``pl.SQLContext`` (Polars covers a large SQL subset — queries it cannot
 parse surface as ``n/a``/``PARTIAL``, never a wrong answer).
+
+Two limits of that SQL surface are worth knowing before adding a suite to it. It
+rejects implicit ``FROM a, b WHERE a.x = b.x`` joins, ``EXISTS`` subqueries, and
+scalar-subquery comparisons — which is most of TPC-H. And its constant folding of
+decimal literals is lossy: ``0.06 + 0.01`` folds to the ``f64`` one ulp *below*
+``0.07``, so TPC-H q6's ``BETWEEN 0.06 - 0.01 AND 0.06 + 0.01`` silently dropped
+every ``l_discount = 0.07`` row and returned a wrong revenue. TPC-H therefore runs
+Polars through native lazy-DataFrame pipelines (``suites/standard/tpch_polars``),
+the way Polars' own published TPC-H benchmark does; this SQL path still serves
+TPC-DS, ClickBench, and the scan suite.
 """
 
 from __future__ import annotations

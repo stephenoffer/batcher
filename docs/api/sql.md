@@ -24,15 +24,11 @@ print(out.to_pydict())
 # {'category': ['a', 'b', 'c'], 'n': [3, 2, 1]}
 ```
 
-{py:obj}`bt.sql <batcher.sql>` returns a `Dataset`, so it is lazy and composes with the rest of the API:
-add `.filter`, `.with_columns`, or another {py:obj}`bt.sql <batcher.sql>` on top before a terminal
-operation runs the whole plan.
+{py:obj}`bt.sql <batcher.sql>` returns a `Dataset`, so it's lazy and composes with the rest of the API. Add `.filter`, `.with_columns`, or another {py:obj}`bt.sql <batcher.sql>` on top before a terminal operation runs the whole plan.
 
 ## Supported SQL
 
-The SQL surface reads DuckDB syntax by default; pass `dialect=` to parse another
-sqlglot dialect (`"postgres"`, `"spark"`, …). It covers the common analytical
-shape of a query:
+The SQL surface reads DuckDB syntax by default. Pass `dialect=` to parse another sqlglot dialect, such as `"postgres"` or `"spark"`. The following table lists the clauses and features the surface covers, in the order a query writes them:
 
 | Clause / feature | Notes |
 | --- | --- |
@@ -46,7 +42,7 @@ shape of a query:
 | Set operations | `UNION` / `UNION ALL`, `INTERSECT`, `EXCEPT`. |
 | `WITH` | Common table expressions (CTEs). |
 | Subqueries | Derived tables, `IN` / `NOT IN`, `EXISTS` / `NOT EXISTS`, correlated scalar subqueries. |
-| Window functions | `<fn> OVER (PARTITION BY … ORDER BY … [ROWS BETWEEN …])` — ranking, aggregates, and `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`, with explicit `ROWS` frames. |
+| Window functions | `<fn> OVER (PARTITION BY ... ORDER BY ... [ROWS BETWEEN ...])`: ranking, aggregates, and `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`, with explicit `ROWS` frames. |
 | `QUALIFY` | Filter on a window-function result (referenced by its output alias). |
 | `TABLESAMPLE` | `BERNOULLI(p PERCENT)` (fraction) or `RESERVOIR(n ROWS)` (fixed count). |
 | `CASE` | `CASE WHEN ... THEN ... ELSE ... END`. |
@@ -100,10 +96,7 @@ print(out.to_pydict())
 
 ### Star modifiers
 
-`SELECT *` accepts DuckDB's modifiers, so a wide table needs no exhaustive column
-list to drop, rewrite, or rename a few columns. `EXCLUDE (…)` omits columns,
-`REPLACE (expr AS c)` swaps a column's expression in place, and `RENAME (c AS d)`
-renames one — each keeps every other column in its original position.
+`SELECT *` accepts DuckDB's modifiers, so a wide table needs no exhaustive column list to drop, rewrite, or rename a few columns. `EXCLUDE (...)` omits columns, `REPLACE (expr AS c)` swaps a column's expression in place, and `RENAME (c AS d)` renames one. Each keeps every other column in its original position.
 
 ```python
 out = bt.sql(
@@ -114,14 +107,11 @@ print(out.to_pydict())
 # {'category': ['a', 'a', 'a', 'b', 'b'], 'amount': [20.0, 60.0, 100.0, 40.0, 80.0]}
 ```
 
-`ORDER BY` places nulls last by default (matching DuckDB); write `NULLS FIRST` or
-`NULLS LAST` per key to control it explicitly.
+`ORDER BY` places nulls last by default, matching DuckDB. Write `NULLS FIRST` or `NULLS LAST` per key to control it explicitly.
 
 ### Dynamic columns with COLUMNS(...)
 
-DuckDB's `COLUMNS(*)` and `COLUMNS('regex')` project a set of columns chosen at plan
-time, and a function applied to `COLUMNS(...)` runs on each matched column — so a
-wide-table transform needs no exhaustive column list.
+DuckDB's `COLUMNS(*)` and `COLUMNS('regex')` project a set of columns chosen at plan time, and a function applied to `COLUMNS(...)` runs on each matched column. A wide-table transform therefore needs no exhaustive column list.
 
 ```python
 metrics = bt.from_pydict(
@@ -134,7 +124,7 @@ print(out.to_pydict())
 
 ### Joins
 
-Bind one table per keyword. Inner and left joins are supported.
+Bind one table per keyword. The join types listed in the table above all apply here.
 
 ```python
 dim = bt.from_pydict({"category": ["a", "b"], "region": ["west", "east"]})
@@ -157,21 +147,17 @@ print(out.to_pydict())
 ## Sessions, registered tables, and dialects
 
 {py:obj}`bt.Session <batcher.Session>` is the DuckDB-connection / SparkSession
-analogue: a context that holds a table catalog, registered Python functions, and a
-dialect. The module-level `bt.sql` and `bt.register_function` delegate to a shared
-default session, so the global zero-setup spelling keeps working; build a `Session`
-to register named tables, isolate a workload, or pick a non-default dialect.
+analogue: a context that holds a table catalog, registered Python functions, and a dialect. The module-level `bt.sql` and `bt.register_function` delegate to a shared default session, so the zero-setup spelling keeps working. Build a `Session` when you want to register named tables, isolate a workload, or pick a different dialect.
 
 ```python
 s = bt.Session()
-s.register("events", events)  # like DuckDB con.register / Spark createOrReplaceTempView
+s.register("events", events)  # the DuckDB con.register / Spark createOrReplaceTempView equivalent
 out = s.sql("SELECT category, SUM(amount) AS total FROM events GROUP BY category ORDER BY category")
 print(out.to_pydict())
 # {'category': ['a', 'b'], 'total': [90.0, 60.0]}
 ```
 
-`dialect=` (on `bt.sql` or `bt.Session(dialect=...)`) selects the sqlglot read
-dialect:
+Pass `dialect=` to either `bt.sql` or `bt.Session(dialect=...)` to select the sqlglot read dialect:
 
 ```python
 out = bt.sql("SELECT STRPOS(category, 'a') AS p FROM events", events=events, dialect="postgres")
@@ -184,10 +170,9 @@ print(out.to_pydict())
 Register a Python function with
 {py:obj}`register_function <batcher.register_function>` and call it from SQL. The
 function runs over Arrow batches (it lowers to `map_batches`), so it composes with
-relational operators in one plan. Two call forms:
+relational operators in one plan. There are two call forms.
 
-A **scalar** function — `SELECT f(x)` / `WHERE f(x)` — is vectorized by default
-(it receives an Arrow array and returns one):
+A **scalar** function, called as `SELECT f(x)` or `WHERE f(x)`, is vectorized by default. It receives an Arrow array and returns one:
 
 ```python
 import pyarrow.compute as pc
@@ -198,7 +183,7 @@ print(out.to_pydict())
 # {'id': [3, 4, 5], 'scaled': [300.0, 400.0, 500.0]}
 ```
 
-A **table** function — `SELECT * FROM f(t)` — transforms a whole relation:
+A **table** function, called as `SELECT * FROM f(t)`, transforms a whole relation:
 
 ```python
 def add_flag(batch):
@@ -213,13 +198,11 @@ print(out.to_pydict())
 # {'id': [1, 2, 3, 4, 5], 'big': [False, False, True, True, True]}
 ```
 
-Scalar functions are not supported in a `GROUP BY` key, an aggregate argument, or
-`ORDER BY` directly — compute them in a subquery or a projected alias first.
+Scalar functions aren't supported directly in a `GROUP BY` key, an aggregate argument, or `ORDER BY`. Compute them in a subquery or a projected alias first.
 
 ## Defining tables and views with SQL
 
-`CREATE TABLE/VIEW … AS` and `DROP TABLE` register and unregister a **lazy**
-dataset in the session catalog (nothing is materialized; a terminal op runs it):
+`CREATE TABLE/VIEW ... AS` and `DROP TABLE` register and unregister a **lazy** dataset in the session catalog. Nothing is materialized until a terminal operation runs it:
 
 ```python
 s.sql("CREATE VIEW big_events AS SELECT id, amount FROM events WHERE amount > 25")

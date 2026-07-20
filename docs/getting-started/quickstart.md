@@ -1,8 +1,9 @@
 # Quickstart
 
-A complete pipeline, start to finish: build a dataset, transform it, aggregate it,
-read the result. The data here is small and in-memory so the examples run anywhere.
-The API is the same one you would point at a terabyte of Parquet.
+This page walks a complete pipeline from start to finish, building a dataset and
+transforming, aggregating, joining, and reading it back. The data is small and
+in-memory so the examples run anywhere, and the API is the same one you'd point at a
+terabyte of Parquet.
 
 ## Import and build a dataset
 
@@ -103,10 +104,10 @@ print(table.num_rows)
 print(ds.filter(bt.col("price") > 25.0).explain())
 ```
 
-## Reading and writing files
+## Read and write files
 
 Readers and writers use the same API. Only the source or the sink changes. The
-snippet below needs real files, so it is shown rather than run.
+snippet below needs real files, so it's shown rather than run.
 
 ```python
 # docs: skip

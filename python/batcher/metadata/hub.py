@@ -25,6 +25,7 @@ is O(1), and the backend is scanned exactly once per view per process.
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 from batcher._internal.logging import get_logger
@@ -110,28 +111,45 @@ class MetadataHub:
         # incremental consumer (Kyber's q-error fold) tell how many rows are new since it
         # last read, so it absorbs only those instead of re-folding the whole view.
         self._signed_appends = 0
+        # `record` is the one writer, and several queries call it at once: the hub is a
+        # process singleton (`core.default_hub`), so two concurrent pipelines both fold
+        # their measurements in here. `self._seq += 1` is a read-modify-write, and `_seq`
+        # is half the storage key — a lost update makes two rows collide and one query's
+        # feedback silently overwrite another's. Measured with preemption forced: 124 of
+        # 32,000 rows collided. Core measures and Kyber consumes, so a dropped row is not
+        # a wrong answer, it is a plan that quietly stops improving. `record` runs once per
+        # operator per query, so serializing it costs nothing on the hot path.
+        self._lock = threading.Lock()
 
     # --- FeedbackSink ------------------------------------------------------
     def record(self, feedback: OperatorFeedback) -> None:
-        """Persist one operator's feedback. Never raises into the caller."""
+        """Persist one operator's feedback. Never raises into the caller.
+
+        Thread-safe: concurrent pipelines share one hub (see `_lock`).
+        """
         try:
-            self._seq += 1
-            key = (int(feedback.op_id), self._seq)
-            row = _row_of(feedback)
-            self._backend.put(_OP_STATS, key, json.dumps(row).encode())
-            # Fold the row into whichever derived views have been materialized. A view
-            # still `None` has not been read yet; its lazy load will pick this row up
-            # from the backend, so there is nothing to do.
-            if self._by_kind is not None:
-                bucket = self._by_kind.setdefault(row["kind"], [])
-                bucket.append(row)
-                _trimmed(bucket, _PER_KIND_MAX)
-            if self._signed is not None and row["signature"]:
-                self._signed.append(row)  # keep the hot view current without a re-scan
-                self._signed_appends += 1
-                _trimmed(self._signed, _SIGNED_HISTORY_MAX)
+            with self._lock:
+                self._record_locked(feedback)
         except Exception:  # pragma: no cover - feedback must not break execution
             _log.warning("dropped operator feedback", exc_info=True)
+
+    def _record_locked(self, feedback: OperatorFeedback) -> None:
+        """The body of `record`, serialized against concurrent writers by `_lock`."""
+        self._seq += 1
+        key = (int(feedback.op_id), self._seq)
+        row = _row_of(feedback)
+        self._backend.put(_OP_STATS, key, json.dumps(row).encode())
+        # Fold the row into whichever derived views have been materialized. A view
+        # still `None` has not been read yet; its lazy load will pick this row up
+        # from the backend, so there is nothing to do.
+        if self._by_kind is not None:
+            bucket = self._by_kind.setdefault(row["kind"], [])
+            bucket.append(row)
+            _trimmed(bucket, _PER_KIND_MAX)
+        if self._signed is not None and row["signature"]:
+            self._signed.append(row)  # keep the hot view current without a re-scan
+            self._signed_appends += 1
+            _trimmed(self._signed, _SIGNED_HISTORY_MAX)
 
     @property
     def signed_appends(self) -> int:

@@ -10,6 +10,8 @@ decides *where* to run, never *what* the result is (single-node == distributed i
 
 from __future__ import annotations
 
+import logging
+
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
@@ -82,7 +84,24 @@ def resolve_distributed(
             return True
         rows = _estimated_input_rows(sources)
         return rows is None or rows >= min_rows
-    except Exception:
+    except Exception as e:
+        # "Auto" is a best-effort *routing* decision, so any failure here degrades to the
+        # always-correct single-node answer rather than failing the query. But the failure
+        # modes are not all equivalent: "no cluster" and "the configured cluster is
+        # unreachable / its topology could not be read" both land here and both look like a
+        # query that merely chose not to distribute. Log the cause so a real
+        # misconfiguration is diagnosable instead of silently costing the user their
+        # cluster. Debug level — on a machine with no Ray this is the expected path, not a
+        # problem worth warning about on every query.
+        from batcher._internal.logging import get_logger, log_kv
+
+        log_kv(
+            get_logger("api"),
+            logging.DEBUG,
+            "distributed=auto resolved to single-node",
+            reason=type(e).__name__,
+            detail=str(e),
+        )
         return False
 
 

@@ -6,7 +6,7 @@ import batcher as bt
 from batcher.config import active_config
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.pass_base import OptimizerContext
-from batcher.kyber.rules.join_order import reorder_joins
+from batcher.kyber.rules.joins.order import reorder_joins
 
 
 def _tables():

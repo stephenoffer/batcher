@@ -27,6 +27,7 @@ from batcher.io.formats.nosql.base import (
     require_driver,
     rows_to_batches,
 )
+from batcher.io.formats.sql._common import connection_fingerprint
 
 __all__ = ["CassandraSource"]
 
@@ -105,7 +106,25 @@ class _CassandraSourceBase(ScanSource):
         return ", ".join(cols)
 
     def _identity_suffix(self) -> str:
-        return f"{self._conn_kwargs['keyspace']}.{self._conn_kwargs['table']}"
+        """``<cluster>:<keyspace>.<table>`` — the cluster is part of the relation's identity.
+
+        ``keyspace.table`` alone made one relation out of every cluster that happens to use
+        the same schema names, which for Cassandra is the *normal* case: a keyspace named
+        for the service, replicated across prod, staging, and a local ring. `identity()` is
+        the persisted learned-statistics key, so their cardinalities were being pooled and
+        Kyber planned each one against the others' data. Silent — no error, just a worse
+        plan.
+
+        Only the contact points and port are fingerprinted. `auth` is deliberately excluded:
+        it holds the password, and `identity()` is written to the metadata store rather than
+        merely printed. Excluding it also means rotating the password does not change the
+        key and orphan everything the optimizer has learned about the table.
+        """
+        kw = self._conn_kwargs
+        fingerprint = connection_fingerprint(
+            {"contact_points": kw["contact_points"], "port": kw["port"]}
+        )
+        return f"{fingerprint}:{kw['keyspace']}.{kw['table']}"
 
     def _infer_schema(self) -> pa.Schema:
         kw = self._conn_kwargs
@@ -133,17 +152,25 @@ class _CassandraSourceBase(ScanSource):
         pushed = _pushed_cql(predicate)
         cols = ", ".join(projection) if projection else "*"
         pk = self._pk_expr()
+        stmt = (
+            f"SELECT {cols} FROM {kw['table']} "
+            f"WHERE token({pk}) >= {start} AND token({pk}) < {end}"
+        )
+        if pushed is not None:
+            stmt += f" AND {pushed} ALLOW FILTERING"
+        # Resolve the schema *before* opening this partition's session. `self.schema()`
+        # falls through to `_infer_schema`, which builds and shuts down a cluster of its
+        # own — done inside the `try` below, that stood up a second connection to the ring
+        # while this one was live, on the first partition of every read. The result is
+        # cached, so hoisting it costs nothing and the nesting simply disappears.
+        schema = self.schema() if not projection else None
         cluster, session = self._session()
         try:
-            stmt = (
-                f"SELECT {cols} FROM {kw['table']} "
-                f"WHERE token({pk}) >= {start} AND token({pk}) < {end}"
-            )
-            if pushed is not None:
-                stmt += f" AND {pushed} ALLOW FILTERING"
-            schema = self.schema()
+            # `session.execute` returns a paging ResultSet, so the rows genuinely stream:
+            # the driver fetches a page at a time and `rows_to_batches` converts at batch
+            # granularity. Nothing here materializes the token range.
             rows = (dict(row._asdict()) for row in session.execute(stmt))
-            yield from rows_to_batches(rows, schema=schema if not projection else None)
+            yield from rows_to_batches(rows, schema=schema)
         finally:
             cluster.shutdown()
 

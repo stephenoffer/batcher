@@ -33,10 +33,44 @@ GUARDRAILS = [
     *sorted((ROOT / ".claude" / "rules").glob("*.md")),
     *sorted((ROOT / ".claude" / "skills").rglob("SKILL.md")),
     *sorted(ROOT.glob("*/CLAUDE.md")),
+    # The contributor cookbook routes a change to the file that should hold it — the same
+    # job as a skill, for humans. A stale path here misroutes exactly as badly.
+    ROOT / "docs" / "internals" / "extending.md",
 ]
 
 #: Only these roots are treated as repo paths; everything else in backticks is prose.
-PATH_ROOTS = ("python/", "crates/", "tests/", "tools/", "docs/", "benchmarks/", "examples/", ".claude/")
+PATH_ROOTS = (
+    "python/",
+    "crates/",
+    "tests/",
+    "tools/",
+    "docs/",
+    "benchmarks/",
+    "examples/",
+    ".claude/",
+)
+
+#: The control-plane packages, so a path written the way contributors actually say it
+#: ("a rule goes in `kyber/rules/<family>.py`") is checked rather than skipped as prose.
+#: Guidance names these relative to `python/batcher/`, which is the natural spelling — but
+#: it left them unverified, and that is precisely how `plan/nodes/` survived in the cookbook
+#: after the module became `plan/logical/`. Paths under these roots resolve against
+#: `python/batcher/` as well as the repo root; see `_resolves`.
+PACKAGE_ROOTS = (
+    "api/",
+    "carbonite/",
+    "config/",
+    "core/",
+    "dist/",
+    "governance/",
+    "io/",
+    "kyber/",
+    "metadata/",
+    "ml/",
+    "plan/",
+    "_internal/",
+    "_sql/",
+)
 
 #: `path/to/thing` inside backticks, optionally with a `::symbol` suffix or a trailing slash.
 PATH_RE = re.compile(r"`([A-Za-z0-9_./\-]+/[A-Za-z0-9_./\-]*)`")
@@ -44,6 +78,24 @@ RECIPE_RE = re.compile(r"`just ([a-z][a-z0-9-]*)")
 
 #: Paths that are patterns/placeholders, not literal files.
 PLACEHOLDER = re.compile(r"[<>*{}]|\.\.\.|\bfmt\b|\bfamily\b|\bname\b")
+
+
+def _resolves(path: str) -> bool:
+    """Return whether a documented path names something that actually exists.
+
+    A path may be written relative to the repo root (`python/batcher/kyber/rules/`) or,
+    for the control-plane packages, relative to `python/batcher/` (`kyber/rules/`) — both
+    spellings appear in the guidance and both are legitimate. A module that has since become
+    a package is still a hit: the import path the prose is teaching survives the split, so
+    `plan/logical.py` resolving to `plan/logical/` is correct, not stale.
+    """
+    for base in (ROOT, ROOT / "python" / "batcher"):
+        candidate = base / path
+        if candidate.exists():
+            return True
+        if candidate.suffix == ".py" and candidate.with_suffix("").is_dir():
+            return True
+    return False
 
 
 def _justfile_recipes() -> set[str]:
@@ -65,9 +117,9 @@ def main() -> int:
         for lineno, line in enumerate(text.splitlines(), 1):
             for raw in PATH_RE.findall(line):
                 path = raw.split("::", 1)[0].rstrip("/")
-                if not path.startswith(PATH_ROOTS) or PLACEHOLDER.search(path):
+                if not path.startswith(PATH_ROOTS + PACKAGE_ROOTS) or PLACEHOLDER.search(path):
                     continue
-                if not (ROOT / path).exists():
+                if not _resolves(path):
                     failures.append(f"{rel_doc}:{lineno}: path does not exist: {path}")
 
             for recipe in RECIPE_RE.findall(line):

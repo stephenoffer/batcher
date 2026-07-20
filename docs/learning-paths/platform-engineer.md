@@ -7,16 +7,16 @@ its budget.
 ## Reading order
 
 1. [Getting started](../getting-started/index.md): install and verify the build.
-2. [Installation](../getting-started/installation.md): packaging and extras.
-3. [Configuration](../configuration/index.md): the `Config` model and precedence.
-4. [Configuration options](../configuration/options.md): every field and default.
-5. [Environment variables](../configuration/environment.md): `BATCHER_*` and
+1. [Installation](../getting-started/installation.md): packaging and extras.
+1. [Configuration](../configuration/index.md): the `Config` model and precedence.
+1. [Configuration options](../configuration/options.md): every field and default.
+1. [Environment variables](../configuration/environment.md): `BATCHER_*` and
    `BATCHER_CONFIG_FILE`.
-6. [Configuration recipes](../configuration/profiles.md): configs for common goals.
-7. [Cloud storage](../user-guide/cloud-storage.md): object-store access.
-8. [Best practices](../user-guide/best-practices.md) and
+1. [Configuration recipes](../configuration/profiles.md): configs for common goals.
+1. [Cloud storage](../user-guide/cloud-storage.md): object-store access.
+1. [Best practices](../user-guide/best-practices.md) and
    [troubleshooting](../user-guide/troubleshooting.md).
-9. [Configuration API reference](../api/configuration.md).
+1. [Configuration API reference](../api/configuration.md).
 
 ## Example: set process-wide defaults
 
@@ -100,7 +100,7 @@ What actually happens when you add nodes.
 ::::
 
 :::{seealso}
-- [Optimizing a slow query](../tutorials/optimizing-a-slow-query.md) — a real diagnosis, start to finish.
-- [Explain plans](../user-guide/explain-plans.md) — reading what the optimizer decided.
-- [Ray](../integrations/ray.md) — scheduling only; the data plane goes over Arrow Flight.
+- [Optimizing a slow query](../tutorials/optimizing-a-slow-query.md): a real diagnosis, start to finish.
+- [Explain plans](../user-guide/explain-plans.md): reading what the optimizer decided.
+- [Ray](../integrations/ray.md): scheduling only. The data plane goes over Arrow Flight.
 :::

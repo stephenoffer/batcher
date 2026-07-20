@@ -87,3 +87,47 @@ def test_exceeds_all_gpus_falls_back_to_cpu(restore_config):
     _set_gpu(gpu_min_rows=10, gpu_memory_gb=ws / 8)  # 2 GPUs hold only a quarter of the set
     d = decide_gpu_backend(plan, sources, gpu_count=2, force=True)
     assert d.use_gpu is False
+
+
+def test_gpu_memory_budget_is_detected_not_assumed(monkeypatch):
+    """Kyber must size against the GPU it actually has, not a 2018 T4.
+
+    `gpu_memory_gb` was hardcoded to 12.0 ("targets a T4"). Three decisions ride on it — single
+    GPU vs shard vs CPU routing, the `num_gpus` packing fraction, and the inference batch-size
+    seed — so on an 80 GB A100 every one of them was wrong by ~6x in the direction that leaves
+    the device idle: sharding a working set one card would have held, and seeding tiny batches.
+    """
+    import dataclasses
+
+    import batcher._internal.hardware as hw
+    from batcher.config import active_config
+
+    dc = active_config().distributed
+    assert dc.gpu_memory_gb == 0.0, "the default must be 'detect', not a device guess"
+
+    # An 80 GB A100: usable budget scales with the real device.
+    monkeypatch.setattr(
+        hw, "gpu_inventory", lambda: [{"index": 0, "name": "A100", "memory_bytes": 80 << 30}]
+    )
+    assert dc.resolved_gpu_memory_gb() == 80 * 0.75
+
+    # A heterogeneous cluster plans for the SMALLEST device — sizing to the largest would
+    # dispatch a working set that OOMs every other card.
+    monkeypatch.setattr(
+        hw,
+        "gpu_inventory",
+        lambda: [
+            {"index": 0, "name": "A100", "memory_bytes": 80 << 30},
+            {"index": 1, "name": "T4", "memory_bytes": 16 << 30},
+        ],
+    )
+    assert dc.resolved_gpu_memory_gb() == 16 * 0.75
+
+    # No visible device → the historical default, so a CPU-only driver planning for a remote
+    # GPU worker behaves exactly as it did before.
+    monkeypatch.setattr(hw, "gpu_inventory", lambda: [])
+    assert dc.resolved_gpu_memory_gb() == 12.0
+
+    # An explicit setting always wins over detection.
+    pinned = dataclasses.replace(dc, gpu_memory_gb=40.0)
+    assert pinned.resolved_gpu_memory_gb() == 40.0

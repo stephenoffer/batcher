@@ -12,6 +12,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -23,8 +24,6 @@ def _dates():
 
 
 def test_offset_months_and_days_vs_duckdb(duck):
-    from conftest import assert_same
-
     t = _dates()
     duck.register("t", t)
     out = bt.from_arrow(t).select(
@@ -45,8 +44,6 @@ def test_offset_months_and_days_vs_duckdb(duck):
 
 
 def test_offset_timestamp_subday_vs_duckdb(duck):
-    from conftest import assert_same
-
     ts = pa.array(
         [datetime.datetime(2024, 1, 1, 10, 0, 0), datetime.datetime(2024, 2, 29, 23, 30, 0)]
     ).cast(pa.timestamp("us"))

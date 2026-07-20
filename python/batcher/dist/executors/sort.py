@@ -20,7 +20,7 @@ import pyarrow as pa
 
 from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import _apply_above, _partition_source, merge_boundaries
-from batcher.dist.executors.plan_analysis import _relabel_single_source
+from batcher.dist.executors.plan_analysis import _relabel_single_source, empty_result_table
 from batcher.dist.executors.ray_runtime import (
     _ensure_ray,
     _rmtree,
@@ -30,6 +30,7 @@ from batcher.dist.executors.ray_runtime import (
 )
 from batcher.dist.shuffle_io import distributed_work_dir, read_ipc
 from batcher.io.source import Source
+from batcher.plan.ir_specs import sort_keys_ir
 from batcher.plan.logical import LogicalPlan, Sort
 
 # Per-worker CDF sample granularity: a fine grid (33 probe points) so the merged
@@ -62,10 +63,7 @@ def _distributed_sort(
         {
             "op": "sort",
             "input": {"op": "scan", "source_id": 0},
-            "keys": [
-                {"expr": k.expr.to_ir(), "descending": k.descending, "nulls_first": k.nulls_first}
-                for k in sort.keys
-            ],
+            "keys": sort_keys_ir(sort.keys),
             "limit": sort.limit,
         }
     )
@@ -143,7 +141,7 @@ def _distributed_sort(
         result = (
             pa.Table.from_batches(out)
             if out
-            else pa.table({c: [] for c in sort.available_columns()})
+            else empty_result_table(sort, sort.available_columns())
         )
         if sort.limit is not None:
             result = result.slice(0, sort.limit)

@@ -335,7 +335,8 @@ def _run_proc_probe(op: MapBatches, total_rows: int, current: list[pa.RecordBatc
 
 def _probe_callable(op: MapBatches):
     """Build the per-batch callable for the probe (Arrow in/out, or format-wrapped)."""
-    from batcher.core.udf.execute import _formatted, build_udf_callable
+    from batcher.core.udf.call import _formatted
+    from batcher.core.udf.execute import build_udf_callable
 
     fn = build_udf_callable(op.fn)
     return fn if op.batch_format == "pyarrow" else _formatted(fn, op.batch_format)

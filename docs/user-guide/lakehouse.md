@@ -124,16 +124,16 @@ print(bt.read.parquet(sales_path).sort("day", "region").to_pydict())
 # {'day': ['2024-01-01', '2024-01-02'], 'region': ['us', 'us'], 'amount': [999, 30]}
 ```
 
-The two `2024-01-01` rows are replaced by the single backfilled row; the
-`2024-01-02` row is untouched. `replace_where` works on any file target (here
-Parquet) and on Delta tables.
+The two `2024-01-01` rows are replaced by the single backfilled row, and the
+`2024-01-02` row is untouched. `replace_where` works on any file target, Parquet
+here, and on Delta tables.
 
 ## Slowly changing dimensions
 
 The `ds.scd` accessor maintains dimension tables from an incoming snapshot. The
-dataset is the new snapshot (natural keys plus attributes); the method writes the
-reconciled dimension to `target`. These compose existing operators, with no special
-engine path, and they write to any file target (Parquet here) or to a Delta table.
+dataset is the new snapshot, meaning natural keys plus attributes, and the method writes
+the reconciled dimension to `target`. These compose existing operators, with no special
+engine path, and they write to any file target, Parquet here, or to a Delta table.
 
 ### Type 1: overwrite in place
 
@@ -228,7 +228,7 @@ Three rules make this safe against a feed you do not control:
   redeliveries and out-of-order rows collapse to the latest.
 * `sequence_by` is **stored in the target**, so a *later* batch can recognize a change
   older than what already landed and discard it, rather than resurrecting old data.
-* A row matching `deletes` removes the target row; a delete for an absent key is a
+* A row matching `deletes` removes the target row. A delete for an absent key is a
   tombstone and changes nothing.
 
 ```python
@@ -243,7 +243,7 @@ print(bt.read.parquet(cdc).select("id", "city").to_pydict())
 # {'id': [1], 'city': ['SF']}
 ```
 
-`id=2` was deleted; the stale `seq=0` update for `id=1` was discarded because the target
+`id=2` was deleted. The stale `seq=0` update for `id=1` was discarded because the target
 already holds `seq=3`.
 
 Re-applying a batch is therefore a no-op. Apply batches in non-decreasing sequence
@@ -275,7 +275,7 @@ orders.write.iceberg("db.orders", mode="append")
 snapshot = bt.read.iceberg("db.orders", catalog="prod", snapshot_id=1234567890)
 ```
 
-Hudi is supported read-only (`pip install 'batcher-engine[hudi]'`); writes require
+Hudi is supported read-only, via `pip install 'batcher-engine[hudi]'`. Writes require
 the Spark/Flink write stack.
 
 ```python
@@ -306,8 +306,8 @@ print(bt.read.delta(clustered).filter(bt.col("day") == 2).count())
 # 3
 ```
 
-You can see the elimination happen at planning time — the predicate cuts the *file* list,
-not just the rows:
+You can see the elimination happen at planning time. The predicate cuts the *file* list,
+not only the rows:
 
 ```python
 from batcher.io.formats.lakehouse import DeltaSource
@@ -321,18 +321,18 @@ print(len(source.splits()), "->", len(source.splits(predicate=predicate)))
 This is not merely a row filter that runs earlier. The pruning happens *before* I/O, so
 the files it eliminates cost nothing at all: no footer read, no split, no task. On a
 distributed read that is the difference between one worker task per file in the table and
-one per file that can actually contribute. Columns are pruned the same way (projection
-pushdown), and whatever survives is then row-group and page pruned inside the file.
+one per file that can actually contribute. Projection pushdown prunes columns the same
+way, and whatever survives is then row-group and page pruned inside the file.
 
 Pruning is deliberately one-sided: a file is dropped only when the log *proves* it cannot
 match. A missing statistic, an unrecorded column, or a predicate the log cannot decide
-all keep the file — so skipping only ever costs extra I/O, never a missing row. The
+all keep the file. Skipping therefore only ever costs extra I/O, never a missing row. The
 engine re-checks every predicate regardless.
 
 `count()` benefits too. A `count(*)` over a filter is fused into a single counting pass,
 and the predicate still reaches the source, so the count is answered from the files the
-log says can contribute. An *unfiltered* `count()` needs no files at all — the log's own
-record counts are exact.
+log says can contribute. An *unfiltered* `count()` needs no files at all, because the
+log's own record counts are exact.
 
 Each surviving data file is an independent split carrying its row count from the log, so
 a table larger than any single node is read file by file across workers and never
@@ -341,21 +341,24 @@ materialized on the driver. One mergeable read path, single-node and distributed
 ## Writes leave the index the next read uses
 
 A write is the other half of the same mechanism. Each worker writes its shard as a final
-data file and records that file's column bounds while the data is still in memory; the
-driver then commits only the resulting *add actions* — paths, sizes, partition values,
-and those statistics.
+data file and records that file's column bounds while the data is still in memory. The
+driver then commits only the resulting *add actions*, meaning paths, sizes, partition
+values, and those statistics.
 
-Two consequences. The driver never re-encodes the result, so its cost is one log write no
-matter how much the cluster wrote, and the bytes move exactly once (worker → storage). And
-the statistics the write leaves behind are precisely what the next query prunes against —
-a table written this way is a table that can be read with file skipping.
+Two consequences follow. The driver never re-encodes the result, so its cost is one log
+write no matter how much the cluster wrote, and the bytes move exactly once, from worker
+to storage. And the statistics the write leaves behind are precisely what the next query
+prunes against, so a table written this way is a table that can be read with file
+skipping.
 
 A distributed write is **one** transaction: workers produce files, the driver commits
-once. The write is atomic (a reader never sees half of it) and the log records one version
-per logical write, not one per worker.
+once. The write is atomic, so a reader never sees half of it, and the log records one
+version per logical write, not one per worker.
 
 ## Next steps
 
 - [Data quality](data-quality.md): validate and quarantine before you commit.
 - [Writing data](writing-data.md): save modes, partitioning, atomic writes.
 - [I/O API](../api/io.md): the full `read`/`write` reference.
+- [Agent skills](../agents/index.md): `manage-a-lakehouse-table` is this page as a
+  procedure for a coding agent, covering merge, SCD, CDC, backfill, and compaction.

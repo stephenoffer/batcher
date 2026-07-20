@@ -12,8 +12,7 @@ from __future__ import annotations
 
 from batcher.dist.executors.aggregate import _distributed_aggregate
 from batcher.io.source import Source
-from batcher.plan.expr_ir import Col
-from batcher.plan.logical import Aggregate, Distinct, LogicalPlan, Projection
+from batcher.plan.logical import Distinct, LogicalPlan
 
 
 def _distributed_distinct(
@@ -36,9 +35,7 @@ def _distributed_distinct(
     keeps the disk-path result partitioned (the aggregate shuffle's behavior) for the
     next adaptive stage.
     """
-    cols = distinct.input.available_columns()
-    group_keys = tuple(Projection(c, Col(c)) for c in cols)
-    agg = Aggregate(distinct.input, group_keys, ())
+    agg = distinct.as_aggregate()
     if transport == "flight":
         from batcher.dist.flight_aggregate import execute_aggregate_flight
 

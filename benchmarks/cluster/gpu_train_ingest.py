@@ -21,6 +21,7 @@ import time
 
 import numpy as np
 import pyarrow as pa
+from _ray_env import init_ray
 
 print = functools.partial(print, flush=True)
 
@@ -94,26 +95,9 @@ def ray_iter(table: pa.Table, cfg: dict):
     return run
 
 
-def _init() -> None:
-    import importlib.util
-
-    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
-        v = os.environ.get(var)
-        if v:
-            head = v.lstrip("[{\"' ").split(".")[0].split("[")[0]
-            if head and importlib.util.find_spec(head) is None:
-                os.environ.pop(var, None)
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(
-            address="auto", runtime_env={"pip": None}, logging_level="ERROR", log_to_driver=False
-        )
-
-
 def main() -> int:
     cfg = _cfg()
-    _init()
+    init_ray()
     table = make_table(cfg["n"], cfg["dim"])
     print(
         f"rows={cfg['n']} dim={cfg['dim']} batch={cfg['batch']} "

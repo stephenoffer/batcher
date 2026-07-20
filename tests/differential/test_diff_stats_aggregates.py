@@ -12,6 +12,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, corr, covar_pop, covar_samp
 
 pytestmark = pytest.mark.differential
@@ -25,8 +26,6 @@ def _data():
 
 
 def test_corr_covar_match_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _data())
     out = (
         bt.from_arrow(_data())
@@ -44,8 +43,6 @@ def test_corr_covar_match_duckdb(duck):
 
 
 def test_skewness_kurtosis_match_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _data())
     out = bt.from_arrow(_data()).agg(s=col("x").skewness(), k=col("x").kurtosis()).collect()
     assert_same(out, duck.sql("SELECT skewness(x) AS s, kurtosis(x) AS k FROM t"))

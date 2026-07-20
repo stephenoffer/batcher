@@ -22,7 +22,7 @@ ds = bt.from_pydict(
 ## select
 
 `select` chooses the full output. Pass existing column names as positional
-arguments and derived columns as keyword arguments; the result contains exactly
+arguments and derived columns as keyword arguments. The result contains exactly
 the columns you name.
 
 ```python
@@ -110,12 +110,14 @@ print(ds.select(bt.exclude("qty")).columns)
 # ['name', 'price']
 ```
 
-The dtype selectors pick columns by kind: `bt.numeric()` (integer, float, or
-decimal), `bt.integer()`, `bt.floating()`, `bt.string()`, `bt.boolean()`, and
-`bt.temporal()` (date, time, timestamp, or duration); `bt.by_dtype(pa.int32(), ...)`
-matches exact Arrow types. The name selectors match column *names*: `bt.matches(regex)`
-by regular expression, and `bt.starts_with(...)` / `bt.ends_with(...)` /
-`bt.contains(...)` by literal prefix / suffix / substring (each accepts several).
+The dtype selectors pick columns by kind. `bt.numeric()` covers integer, float, and
+decimal, and `bt.integer()`, `bt.floating()`, `bt.string()`, and `bt.boolean()` narrow
+that to one kind each. `bt.temporal()` covers date, time, timestamp, and duration, and
+`bt.by_dtype(pa.int32(), ...)` matches exact Arrow types.
+
+The name selectors match column *names*. `bt.matches(regex)` matches by regular
+expression, and `bt.starts_with(...)`, `bt.ends_with(...)`, and `bt.contains(...)` match
+by literal prefix, suffix, and substring. Each of those three accepts several arguments.
 `bt.all()` matches every column.
 
 ```python
@@ -181,10 +183,9 @@ print(ds.select(bt.numeric() - bt.floating()).columns)
 
 ## Choosing between select and with_columns
 
-One obvious tool per intent. `select` defines the complete set of output columns;
-`with_columns` (or `with_column`) adds to or replaces columns in the set you already
-have. Casting is an expression method taking an Arrow type name, and works inside
-either one:
+One obvious tool per intent. `select` defines the complete set of output columns.
+`with_columns` and `with_column` add to or replace columns in the set you already have.
+Casting is an expression method taking an Arrow type name, and works inside either one:
 
 ```python
 print(ds.with_columns(qty=bt.col("qty").cast("float64")).to_pydict())
@@ -206,8 +207,8 @@ print(ds.pipe(with_total, tax=0.5).filter(bt.col("total") > 20).to_pydict()["tot
 # [60.0, 135.0]
 ```
 
-Without `pipe` the same pipeline reads backwards; `with_total(ds).filter(...)` puts
-the first step in the middle. Reach for it whenever a chain grows a step that has no
+Without `pipe` the same pipeline reads backwards. `with_total(ds).filter(...)` puts the
+first step in the middle. Reach for `pipe` whenever a chain grows a step that has no
 built-in method.
 
 ## Flattening nested data
@@ -216,7 +217,7 @@ Semistructured data arrives with lists and structs inside columns. Two relationa
 transforms flatten them, and they compose to unnest arbitrarily deep shapes.
 
 `explode` turns a **list** column into one row per element, repeating the other
-columns (SQL `UNNEST`); empty and null lists drop out.
+columns, the same as SQL `UNNEST`. Empty and null lists drop out.
 
 ```python
 nested = bt.from_pydict({"id": [1, 2], "tags": [["a", "b"], ["c"]]})

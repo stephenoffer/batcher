@@ -1,16 +1,16 @@
 # Query optimization
 
-Batcher's optimizer, Kyber, rewrites a logical plan into a better one and then
-lowers it to a physical plan. It is a small, ordered set of passes, not a catalog
-of hundreds of rules. The rewrite that produced v2 deleted exactly that kind of
-sprawl; a rule ships only when it makes a query measurably better, and every rule is
-proven semantics-preserving. The optimizer runs automatically on every terminal
-operation, so the plan you describe and the plan that runs differ, but the result
-does not.
+This page describes what Batcher's optimizer, Kyber, does to a query: the phases it
+runs, the rewrites each phase applies, and how it re-plans on measured numbers.
 
-This page is the architectural tour. The authoritative model (the rule families,
-cost coefficients, and configuration knobs) lives in
-[the Kyber reference](../internals/kyber.md).
+Kyber rewrites a logical plan into a better one and then lowers it to a physical plan.
+It's an ordered set of passes rather than an unstructured catalog. A rule ships only
+when it makes a query measurably better, and every rule is proven semantics-preserving.
+The optimizer runs automatically on every terminal operation, so the plan you describe
+and the plan that runs differ, but the result doesn't.
+
+The authoritative model, covering the rule families, cost coefficients, and
+configuration knobs, lives in {doc}`the Kyber reference <../internals/kyber>`.
 
 ## The phased pipeline
 
@@ -31,18 +31,21 @@ rather than converge to one.
 
 ## What the passes do
 
+The sections below walk the phases in the order they run, from the cheap syntactic
+rewrites through the cost-based decisions that need an estimate to make.
+
 ### Constant folding and simplification
 
-The `NORMALIZE` phase evaluates constant expressions at plan time and drops
-algebraic identities — `x + 0`, `x * 1`, an always-true filter, an identity
-projection. This shrinks the plan before any later pass reasons about it, and it
-collapses expressions the user wrote for clarity rather than the engine's benefit.
+The `NORMALIZE` phase evaluates constant expressions at plan time and drops algebraic
+identities such as `x + 0`, `x * 1`, an always-true filter, and an identity projection.
+This shrinks the plan before any later pass reasons about it, and it collapses
+expressions you wrote for clarity rather than for the engine's benefit.
 
 ### Predicate pushdown
 
-Filters move toward the data source. A predicate that can run earlier reads less:
-the source skips data that would be discarded anyway, which cuts I/O and the memory
-the rest of the pipeline carries.
+Filters move toward the data source. A predicate that can run earlier reads less,
+because the source skips data that would be discarded anyway, which cuts I/O and the
+memory the rest of the pipeline carries.
 
 ```python
 ds = bt.read("data.parquet").filter(bt.col("year") == 2024)
@@ -52,7 +55,7 @@ Kyber pushes the filter through projections, aggregates, sorts, and unions, spli
 conjunctions so each part lands as early as it legally can, and merges adjacent
 filters into one. For Parquet, a pushed predicate lets the reader skip row groups
 whose statistics rule them out, and skip partitions entirely when the column is a
-partition key — which can cut a selective scan by orders of magnitude.
+partition key. On a selective scan that can cut the work by orders of magnitude.
 
 ### Projection and column pruning
 
@@ -98,9 +101,9 @@ ds = ds.sort("score", descending=True).limit(100)  # fused into top-N
 Join order dominates the cost of a multi-table query, because the wrong order
 materializes a large intermediate that a better order never builds. Kyber reorders
 joins cost-based, minimizing the estimated intermediate sizes. The search is exact
-dynamic programming at or below `optimizer.join_dp_max_tables` tables (12 by
-default), a greedy heuristic up to 25, and no reordering beyond that, the point
-where exhaustive search stops paying for itself.
+dynamic programming at or below `optimizer.join_dp_max_tables` tables, 12 by default,
+and a greedy heuristic up to `optimizer.greedy_max_tables`, 25 by default. Beyond that
+count, exhaustive search stops paying for itself and Kyber leaves the order alone.
 
 ```python
 result = table_a.join(table_b, on="key").join(table_c, on="key")
@@ -116,33 +119,39 @@ than shuffled.
 
 ## Adaptive re-optimization
 
-This is the part a static optimizer cannot do. Every estimate above is a guess until
-the query runs. At a pipeline breaker — a sort, an aggregate, a join build — the
-engine has *measured* the real size of what it just processed. Core records that
-measurement, and when an estimate was off by more than `optimizer.reoptimize_error`
-(2× by default), Kyber re-plans the rest of the query on the measured numbers before
-continuing. The same mechanism runs single-node and distributed.
+Every estimate above is a guess until the query runs. At a stage boundary, which is a
+pipeline breaker such as a sort, an aggregate, or a join build, the engine has
+*measured* the real size of what it just processed. Core records that measurement, and
+when an estimate was off by more than `optimizer.reoptimize_error`, 2.0 by default,
+Kyber re-plans the rest of the query on the measured numbers before continuing. The
+same mechanism runs single-node and distributed.
 
-DuckDB optimizes once, before execution. Spark AQE adapts only at stage boundaries.
-Kyber adapts at every breaker. That is the moat — and the reason the architecture
-keeps Core (which measures) and Kyber (which decides) as separate subsystems with a
-feedback loop between them.
+This is stage-boundary re-optimization, the same granularity Spark AQE adapts at, and
+the difference is that Batcher runs it on one machine too. DuckDB optimizes once,
+before execution, and never revises. The loop is gated by `adaptive="auto"`, the
+default, which engages it only when measuring could flip a downstream decision such as
+a build side or a join order. Kyber also carries a cross-query loop that neither DuckDB
+nor Spark has: sketch-backed statistics and a bandit over join strategies, both
+persisted between runs.
+
+This split is the reason the architecture keeps Core, which measures, and Kyber, which
+decides, as separate subsystems with a feedback loop between them.
 
 ## Cost and cardinality
 
 The cost-based phases compare candidate plans against one scalar cost. Kyber's model
-collapses three axes — CPU, I/O, and network — into that single number, weighting
-network shuffle bytes more heavily than local bytes (`optimizer.cost_weights.net`
-defaults to 2× the others), since moving data between workers costs more than
-touching it locally. Per-operator coefficients come from `optimizer.cost_coeffs` and are
-recalibrated from measured operator times once enough samples accumulate, clamped so
-timing noise cannot skew the model.
+collapses three axes, CPU, I/O, and network, into that single number. It weights
+network shuffle bytes more heavily than local bytes, because moving data between
+workers costs more than touching it locally, and `optimizer.cost_weights.net` defaults
+to 2.0 against 1.0 for the other two. Per-operator coefficients come from
+`optimizer.cost_coeffs` and are recalibrated from measured operator times once enough
+samples accumulate, clamped so timing noise can't skew the model.
 
 Those costs ride on cardinality estimates. With nothing learned yet, Kyber uses
 Selinger-style selectivities: `col = literal` passes 10% of rows, a range predicate a
-third, `IS NULL` 5%. Sketches built during execution — HyperLogLog for distinct
-counts, KLL for quantiles — and learned per-query statistics in the MetadataHub
-supersede those defaults and sharpen the estimates each time a query runs.
+third, and `IS NULL` 5%. Sketches built during execution, HyperLogLog for distinct
+counts and KLL for quantiles, together with learned per-query statistics in the
+MetadataHub, supersede those defaults and sharpen the estimates each time a query runs.
 
 ## Viewing the optimized plan
 
@@ -155,12 +164,13 @@ print(ds.explain())
 ```
 
 The output is the optimized plan tree annotated with estimated row counts and the
-provenance of each estimate (a default, a sketch, or a learned statistic), followed
-by any build-side swaps. This is how you confirm a predicate landed at the scan or a
-join was reordered the way you expected.
+provenance of each estimate, which is a default, a sketch, or a learned statistic,
+followed by any build-side swaps. This is how you confirm a predicate landed at the
+scan, or that a join was reordered the way you expected.
 
 ## See also
 
-- [Kyber reference](../internals/kyber.md) — the rule families, cost coefficients, and knobs
-- [Architecture overview](overview.md) — the control-plane / data-plane split
-- [Configuration options](../configuration/options.md) — the cost-model and cardinality settings
+- {doc}`Kyber reference <../internals/kyber>`: the rule families, cost coefficients, and knobs.
+- {doc}`Architecture overview <overview>`: the control-plane and data-plane split.
+- {doc}`Execution model <execution>`: the breakers the adaptive loop measures at.
+- {doc}`Configuration options <../configuration/options>`: the cost-model and cardinality settings.

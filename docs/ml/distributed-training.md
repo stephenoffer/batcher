@@ -2,9 +2,9 @@
 
 Batcher does not train models. It feeds them, which at 512 ranks is most of the
 problem. The data path has to give every rank a disjoint slice, give them all the *same
-number* of batches (or the fast ranks sit at the all-reduce barrier waiting for the slow
-one), reproduce the epoch order after a crash, and do all of that without materializing
-an index list that would not fit in driver RAM.
+number* of batches so the fast ranks do not sit at the all-reduce barrier waiting for the
+slow one, reproduce the epoch order after a crash, and do all of that without
+materializing an index list that would not fit in driver RAM.
 
 This page is the data-side contract. The training loop itself is yours.
 
@@ -13,8 +13,8 @@ This page is the data-side contract. The training loop itself is yours.
 `ds.ml.stream_loader` gives each rank a `torch.utils.data.IterableDataset` over its
 slice of one global order, and holds four properties a distributed loop actually needs.
 
-**Balanced.** Every rank yields the same number of batches. `drop_last=True` (the
-default) trims the epoch's tail to a multiple of `world_size`; `drop_last=False` keeps
+**Balanced.** Every rank yields the same number of batches. The default `drop_last=True`
+trims the epoch's tail to a multiple of `world_size`. `drop_last=False` keeps
 every sample and pads by repeating a few. Neither hands the ranks unequal counts, so no
 rank finishes early and stalls the barrier.
 
@@ -22,8 +22,8 @@ rank finishes early and stalls the barrier.
 not of `world_size` and not of how the data is partitioned. So a job that dies on 64 GPUs
 can resume on 32 and see the same permutation.
 
-**Resumable.** Pass `global_consumed` (the sample count already processed this epoch,
-read from your checkpoint) and the rank picks up mid-epoch with no repeated and no
+**Resumable.** Pass `global_consumed`, the sample count already processed this epoch as
+read from your checkpoint, and the rank picks up mid-epoch with no repeated and no
 skipped samples.
 
 **Independent.** Each rank computes its own index slice with no central coordinator, so
@@ -60,17 +60,20 @@ and skips data it never saw. Nothing in the loss curve will tell you.
 ## The order is computed, not stored
 
 A shuffled list of every sample index costs about 28 bytes per sample in CPython. For a
-10-billion-sample corpus that is 280 GB of driver RAM, before a single row is read. So
-the order is not a list: `epoch_permutation` is a keyed pseudorandom bijection on
-`[0, n)`. Index in, shuffled index out, no state.
+10-billion-sample corpus that is roughly 280 GB of driver RAM, before a single row is
+read. So the order is not a list. `epoch_permutation` is a keyed pseudorandom bijection on
+`[0, n)`. An index goes in, a shuffled index comes out, and nothing is stored.
 
-| Corpus samples | Shuffled index list | Batcher (computed) |
+The table contrasts what the in-RAM index list costs at each corpus size against Batcher's
+computed order, whose memory does not grow with the corpus.
+
+| Corpus samples | Shuffled index list | Batcher |
 | --- | --- | --- |
-| 10 M | 280 MB | 0.5 MB |
-| 1 B | 28 GB | 0.8 MB |
-| 1 T | 28 TB | 0.8 MB |
+| 10 M | about 280 MB | constant |
+| 1 B | about 28 GB | constant |
+| 1 T | about 28 TB | constant |
 
-Because the order is a function rather than a table, seeking is O(1): resuming at sample
+Because the order is a function rather than a table, seeking is O(1). Resuming at sample
 900,000,000,000 of a trillion is a modular-arithmetic step, not a walk.
 
 The two functions the whole contract rests on are usable on their own, which is the
@@ -88,9 +91,9 @@ print(usable_length(8, 3), usable_length(8, 3, drop_last=False))
 # 6 9
 ```
 
-`usable_length` is how many sample positions the epoch spans: always a multiple of
-`world_size`, rounded down when `drop_last=True` (the remainder is dropped) or up when
-`False` (the remainder is padded).
+`usable_length` is how many sample positions the epoch spans. That is always a multiple of
+`world_size`, rounded down when `drop_last=True`, which drops the remainder, or up when
+`drop_last=False`, which pads it.
 
 `epoch_order` materializes the whole order, so it costs O(n) memory, which is fine for a
 test or a corpus that fits in driver RAM. For the real thing, `rank_index_batches`
@@ -110,8 +113,8 @@ for indices in rank_index_batches(10**12, batch_size=8, world_size=1024, rank=3,
 ## Checkpointing the position
 
 `ResumableSampler` owns the `(epoch, global_consumed)` pair and speaks the
-`state_dict` / `load_state_dict` protocol your checkpoint already uses, so the loop never
-computes a sample offset by hand.
+`state_dict` and `load_state_dict` protocol your checkpoint already uses, so the loop
+never computes a sample offset by hand.
 
 ```python
 from itertools import islice
@@ -172,9 +175,9 @@ iterable = shard_stream_loader(
 :::{tab-item} An unbounded source
 
 There is no global length to index, so there is nothing to permute. `streaming_split`
-fans a single read out to `world_size` rank iterators instead: read once, distributed
-round-robin, with backpressure. It emits only complete rounds, so the ranks stay
-balanced.
+fans a single read out to `world_size` rank iterators instead. The source is read once and
+distributed round-robin, with backpressure. It emits only complete rounds, so the ranks
+stay balanced.
 
 ```python
 import batcher as bt
@@ -193,20 +196,23 @@ print([b["f"].tolist() for b in rank1])
 :::{warning}
 Called without `rank`, `streaming_split` hands back a list of `world_size` iterators, and
 they must be consumed **concurrently**. One reader feeds all of them through bounded
-queues, so draining one serially deadlocks on the others: no error, no progress.
+queues, so draining one serially deadlocks on the others, with no error and no progress.
 :::
 
 ## How this compares
 
+The table sets Batcher's ordering contract against the loaders it replaces, on the four
+properties a distributed run depends on.
+
 | System | Global shuffle | Mid-epoch resume | Balanced ranks | Elastic world size |
 | --- | --- | --- | --- | --- |
-| `DistributedSampler` | in-RAM index list, O(n) per rank | no | yes (pads) | no |
-| WebDataset | shard order + local buffer (approximate) | no | heuristic | no |
-| MosaicML Streaming | shard/block shuffle, bounded | yes | yes | yes |
+| `DistributedSampler` | in-RAM index list, O(n) per rank | no | yes, by padding | no |
+| WebDataset | approximate: shard order plus a local buffer | no | heuristic | no |
+| MosaicML Streaming | shard and block shuffle, bounded | yes | yes | yes |
 | Ray Data `streaming_split` | local buffer only | no | not guaranteed | n/a |
-| Batcher | exact, O(1) memory | yes | yes (drop or pad) | yes |
+| Batcher | exact, O(1) memory | yes | yes, by dropping or padding | yes |
 
-The distinction worth being precise about: WebDataset and MosaicML shuffle
+One distinction is worth being precise about. WebDataset and MosaicML shuffle
 *approximately*, with a shard permutation plus a local buffer, so two samples in the same
 shard stay correlated. Batcher's is an exact permutation of the whole corpus, and it uses
 less memory than either, because it is never stored.
@@ -214,8 +220,8 @@ less memory than either, because it is never stored.
 ## Preparing the data, once
 
 Everything upstream of the loader is a `Dataset`, so the split, the feature transform,
-and the dedup all run as engine stages: distributed, vectorized, and out of the training
-process.
+and the dedup all run as engine stages, distributed and vectorized and out of the
+training process.
 
 ```python
 import batcher as bt
@@ -242,15 +248,15 @@ print(train.count() + test.count(), train_ready.columns)
 
 :::{important}
 Fit on train only. Fitting the scaler on train+test leaks the test distribution into the
-model, and it is the easiest leak in the world to ship without noticing: every metric
+model, and it is the easiest leak in the world to ship without noticing. Every metric
 improves, and the improvement is not real.
 :::
 
 ## See also
 
 - [Data loaders](data-loaders.md): the loader map and the framework converters.
-- [PyTorch](pytorch.md): DDP/FSDP wiring on the training side.
-- [Preprocessors](preprocessors.md): the fit/transform contract.
+- [PyTorch](pytorch.md): DDP and FSDP wiring on the training side.
+- [Preprocessors](preprocessors.md): the fit and transform contract.
 - [Streaming for training](streaming.md): the bounded-memory ingest path in depth.
 - [Distributed training pipeline](../tutorials/distributed-training-pipeline.md): the
   tutorial, from raw files to a multi-rank loop.

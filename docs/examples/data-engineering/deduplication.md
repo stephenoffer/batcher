@@ -91,7 +91,7 @@ monotonic sequence and keeping the last is the "latest state per key" pattern th
 
 ::::
 
-| A repeat of the key is a… | Meaning | `keep` | Order by |
+| A repeat of the key is a... | Meaning | `keep` | Order by |
 |---|---|---|---|
 | replay | the same event delivered twice | `"first"` | ingest time, offset, arrival sequence |
 | update | a newer version of the same entity | `"last"` | the version's sequence (LSN, `updated_at`) |

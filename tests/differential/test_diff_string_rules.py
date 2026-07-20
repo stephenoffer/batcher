@@ -23,9 +23,9 @@ import pytest
 
 import batcher as bt
 import batcher.kyber.rules.extra.strings  # importing runs the @rule decorators (registration)
+from _harness import assert_same
 from batcher import col
 from batcher.plan.expr_ir import Binary, Col, Lit
-from conftest import assert_same
 
 
 @pytest.fixture

@@ -21,29 +21,14 @@ import functools
 import os
 import time
 
+from _ray_env import init_ray
+
 print = functools.partial(print, flush=True)
 
 # Pin numpy to the cluster's version so numpy arrays returned from the task unpickle on the
 # driver (cudf's install otherwise pulls numpy 2.x → `No module named 'numpy._core'` mismatch).
 _CUDF_RT = {"pip": ["cudf-cu13==26.6.0", "numpy==1.26.4"]}
 _GROUPS = int(os.environ.get("BENCH_DC_GROUPS", "1000"))
-
-
-def _init() -> None:
-    import importlib.util
-
-    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
-        v = os.environ.get(var)
-        if v:
-            head = v.lstrip("[{\"' ").split(".")[0].split("[")[0]
-            if head and importlib.util.find_spec(head) is None:
-                os.environ.pop(var, None)
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(
-            address="auto", runtime_env={"pip": None}, logging_level="ERROR", log_to_driver=False
-        )
 
 
 def _shard_agg(n: int, groups: int, seed: int, runs: int):
@@ -83,7 +68,7 @@ def _combine(parts):
 
 
 def main() -> int:
-    _init()
+    init_ray()
     import ray
 
     n_gpus = max(1, int(ray.cluster_resources().get("GPU", 1)))

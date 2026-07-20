@@ -79,6 +79,31 @@ class ConsoleStreamSink:
 _MEMORY: dict[str, list[pa.Table]] = {}
 
 
+def _check_memory_sink_size(name: str) -> None:
+    """Raise a clear `ResourceError` if a named in-memory sink has outgrown the cap.
+
+    In `append`/`update` mode this sink retains every micro-batch for the lifetime of
+    the process, and `close()` frees nothing — so an unbounded stream written to it
+    grows until the box dies, having looked healthy for hours. It is a debugging sink
+    (the Spark `memory` sink is documented the same way), so the honest failure is an
+    actionable error naming the sink, not a silent OOM. The cap is the same
+    `memory.streaming_state_max_bytes` envelope that bounds watermark-held state.
+    """
+    from batcher.config import active_config
+
+    cap = active_config().memory.streaming_state_budget_bytes()
+    held = sum(t.nbytes for t in _MEMORY.get(name, ()))
+    if held > cap:
+        from batcher._internal.errors import ResourceError
+
+        raise ResourceError(
+            f"in-memory streaming sink {name!r} reached {held} bytes (cap {cap}): it "
+            "retains every micro-batch in append/update mode and never evicts. Use a "
+            "durable sink (parquet/delta) for an unbounded stream, switch to "
+            "outputMode='complete', or raise memory.streaming_state_max_bytes."
+        )
+
+
 def memory_table(name: str) -> pa.Table:
     """Return the accumulated table for a named in-memory streaming sink.
 
@@ -110,6 +135,7 @@ class MemoryStreamSink:
             _MEMORY[self._name] = [table]
         else:
             _MEMORY[self._name].append(table)
+            _check_memory_sink_size(self._name)
         return None
 
     def close(self) -> None:

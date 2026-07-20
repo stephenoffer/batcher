@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same, assert_same_ordered
 
 
 @pytest.fixture
@@ -31,8 +32,6 @@ def tables(duck):
     ],
 )
 def test_cross_join(duck, tables, q):
-    from conftest import assert_same
-
     emp, dept = tables
     assert_same(bt.sql(q, emp=emp, dept=dept).collect(), duck.sql(q))
 
@@ -46,8 +45,6 @@ def test_cross_join(duck, tables, q):
     ],
 )
 def test_group_by_position(duck, tables, q):
-    from conftest import assert_same
-
     emp, _ = tables
     assert_same(bt.sql(q, emp=emp).collect(), duck.sql(q))
 
@@ -61,8 +58,6 @@ def test_group_by_position(duck, tables, q):
     ],
 )
 def test_order_by_position(duck, tables, q):
-    from conftest import assert_same_ordered
-
     emp, _ = tables
     assert_same_ordered(bt.sql(q, emp=emp).collect(), duck.sql(q))
 
@@ -75,15 +70,11 @@ def test_order_by_position(duck, tables, q):
     ],
 )
 def test_qualified_star(duck, tables, q):
-    from conftest import assert_same
-
     emp, _ = tables
     assert_same(bt.sql(q, emp=emp).collect(), duck.sql(q))
 
 
 def test_cross_join_then_filter(duck, tables):
-    from conftest import assert_same
-
     emp, dept = tables
     q = "SELECT emp.id, dept.loc FROM emp, dept WHERE dept.loc = 'NY'"
     assert_same(bt.sql(q, emp=emp, dept=dept).collect(), duck.sql(q))

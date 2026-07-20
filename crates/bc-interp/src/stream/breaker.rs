@@ -43,9 +43,17 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             // would not be a missing number, it would be a *wrong* one.
             match fold_partial(build_with(input, ctx)?, group_keys, aggregates)? {
                 (Some(merged), rows_in) => {
+                    // Both halves of the state, not just the keys. The accumulator columns
+                    // are the half that can actually be unbounded: a holistic aggregate
+                    // (`median`/`quantile`/`n_unique`/`mode`/`listagg`) keeps every value it
+                    // has seen per group, so its state grows with the *input*, while the keys
+                    // grow only with the group count. Counting keys alone let the one shape
+                    // that OOMs here — few groups, huge per-group value lists — read as
+                    // kilobytes and sail past the check.
                     let state_bytes = merged
                         .group_columns
                         .iter()
+                        .chain(merged.states.iter().flatten())
                         .map(|c| c.get_array_memory_size() as u64)
                         .sum::<u64>();
                     // The streaming aggregate folds in memory. A group count too large for the
@@ -149,7 +157,7 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             distinct: true,
         } => {
             let t = Instant::now();
-            let inner = Ctx::new(ctx.sources, ctx.cache, None, ctx.budget);
+            let inner = Ctx::new(ctx.sources, ctx.cache, None, ctx.budget).with_mats(ctx.mats);
             let mut all = Vec::new();
             for inp in inputs {
                 all.extend(drain(build_with(inp, inner)?)?);
@@ -209,7 +217,7 @@ fn exec_deferred_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch>,
     // Drain each child with a meter-less context: a deferred subtree reports no metrics on this
     // tier (the oracle emits its own), and draining to measure must not change that. The drained
     // batches are the same bytes the oracle would hold, so they are the honest quantity to budget.
-    let measure = Ctx::new(ctx.sources, ctx.cache, None, ctx.budget);
+    let measure = Ctx::new(ctx.sources, ctx.cache, None, ctx.budget).with_mats(ctx.mats);
     let mut drained: Vec<Vec<RecordBatch>> = Vec::with_capacity(children.len());
     let mut held: u64 = 0;
     for child in &children {

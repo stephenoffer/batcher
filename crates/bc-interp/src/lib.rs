@@ -154,13 +154,15 @@ fn exec_seq(
             input,
             column,
             alias,
+            outer,
+            index_alias,
         } => {
             let batches = exec_seq(input, sources, m, ids)?;
             let rows_in = count_rows(&batches);
             let t0 = Stopwatch::start();
             let out: Vec<RecordBatch> = batches
                 .iter()
-                .map(|b| ops::unnest_batch(b, column, alias))
+                .map(|b| ops::unnest_batch(b, column, alias, *outer, index_alias.as_deref()))
                 .collect::<Result<_, _>>()?;
             record_op(m, op_id, "unnest", rows_in, &out, t0, false);
             Ok(out)

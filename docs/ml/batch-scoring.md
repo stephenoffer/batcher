@@ -1,11 +1,14 @@
 # Batch scoring
 
 An offline scoring job is a scan with a model in the middle. The model is the expensive
-part, so everything else in the pipeline exists to keep it busy: filter before the model
+part, so everything else in the pipeline exists to keep it busy. Filter before the model
 so you do not score rows you throw away, load the weights once per worker rather than
 once per batch, and size the batch to the device rather than to the file.
 
 ## The shape of the job
+
+The job below reads reviews, cuts them down before the GPU sees them, scores what is left
+on an actor pool, and writes the result partitioned by label.
 
 ```python
 # docs: skip
@@ -52,9 +55,9 @@ scored = (
 scored.write.parquet("s3://bucket/scored/", partition_by=["label"])
 ```
 
-Everything above the `infer` is an ordinary lazy pipeline: the filter and the projection
+Everything above the `infer` is an ordinary lazy pipeline. The filter and the projection
 get pushed into the scan, so the Parquet reader skips row groups and never decodes the
-columns the model does not read. That is not a micro-optimization; on a wide table it is
+columns the model does not read. That is not a micro-optimization. On a wide table it is
 most of the I/O.
 
 ## Pass the class, not an instance, not a function
@@ -62,12 +65,12 @@ most of the I/O.
 :::{tip}
 This is the one mistake that costs an order of magnitude. A plain function is rebuilt per
 batch, which reloads the model per batch. A class is constructed **once per worker** and
-then called per batch. The engine warns you (`PerformanceWarning`) if a GPU stage gets a
-bare function, because it is the most common inference foot-gun there is.
+then called per batch. The engine raises a `PerformanceWarning` if a GPU stage gets a
+bare function, because it is the most common inference mistake there is.
 :::
 
 The mechanics are visible without a GPU. The "model" here is arithmetic, but the contract
-(constructor once, `__call__` per batch) is exactly the real one.
+is exactly the real one: the constructor runs once, and `__call__` runs per batch.
 
 ```python
 import pyarrow as pa
@@ -95,12 +98,12 @@ print(scored.to_pydict())
 #  'label': [False, True, True, False]}
 ```
 
-`infer` is `map_batches` with inference defaults; use whichever name reads better. Both
+`infer` is `map_batches` with inference defaults, so use whichever name reads better. Both
 take `batch_size`, `num_gpus`, `concurrency`, and `output_columns`.
 
 ## Sizing the pool
 
-`num_gpus` is what each actor holds; `concurrency` is how many actors run.
+`num_gpus` is what each actor holds, and `concurrency` is how many actors run.
 
 | The situation | The knobs | What happens |
 | --- | --- | --- |
@@ -113,8 +116,8 @@ take `batch_size`, `num_gpus`, `concurrency`, and `output_columns`.
 eight workers will not each load a 20 GB model into a 64 GB box. See
 [GPU scheduling](gpu.md).
 
-`batch_size` should be the model's batch size, not the file's. A `batch_size` too small
-leaves the GPU launching kernels on tiny inputs; too large and the activations do not
+`batch_size` should be the model's batch size, not the file's. Too small a `batch_size`
+leaves the GPU launching kernels on tiny inputs. Too large and the activations do not
 fit. It is a property of the model and the device, so pin it explicitly rather than
 inheriting the morsel size.
 
@@ -148,13 +151,13 @@ resilience. It is a data-loss bug with a config flag.
 Under `distributed=True`, a worker whose node is reclaimed mid-batch is reassigned and
 its partition **recomputed** from the durable input. So the scoring function must be
 idempotent. A pure transform is. A function that POSTs a prediction to an API, upserts
-into a vector store, or increments an external counter is not: on a retry it applies the
+into a vector store, or increments an external counter is not. On a retry it applies the
 effect twice.
 :::
 
-The fix is to keep side effects out of the model stage: return the prediction as a
-column, and let a `write` land it. If you genuinely must call an external sink from inside
-the UDF, make it idempotent (upsert on a key). The retry is not optional; it is how a
+The fix is to keep side effects out of the model stage. Return the prediction as a
+column, and let a `write` land it. If you must call an external sink from inside the UDF,
+make it idempotent by upserting on a key. The retry is not optional. It is how a
 spot-instance job survives at all.
 
 ## Checkpoint by partition
@@ -178,8 +181,8 @@ for day in days:
     )
 ```
 
-Crude, and it works. The alternative, one enormous job with an internal checkpoint, is a
-lot of machinery to rebuild what a partitioned write gives you for free.
+It is crude, and it works. The alternative, one enormous job with an internal checkpoint,
+is a lot of machinery to rebuild what a partitioned write gives you for free.
 
 ## Verify before you scale
 
@@ -194,9 +197,9 @@ print(scored.group_by("label").agg(n=bt.count()).sort("label").to_pydict())
 # {'label': [False, True], 'n': [2, 2]}
 ```
 
-If every row came back with the same class, the pipeline is wrong somewhere: a column
-mix-up, a truncation, or a preprocessing step that did not run. Find that on a thousand
-rows, not on a billion.
+If every row came back with the same class, the pipeline is wrong somewhere. Look for a
+column mix-up, a truncation, or a preprocessing step that did not run. Find that on a
+thousand rows, not on a billion.
 
 ## See also
 

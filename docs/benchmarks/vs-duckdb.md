@@ -1,8 +1,8 @@
 # vs DuckDB
 
-DuckDB is the single-node analytical engine to beat, and on join-heavy SQL it is still
-ahead of us. This page gives the split: the operator shapes Batcher takes, the query
-shapes DuckDB takes, and why.
+This page compares Batcher against DuckDB on single-node analytics: the operator shapes Batcher takes, the query shapes DuckDB takes, and why.
+
+DuckDB is the single-node analytical engine to beat, and on join-heavy SQL it's still ahead.
 
 :::{important}
 Every number below was produced by a run that had to pass the correctness gate first: the
@@ -17,12 +17,13 @@ directions.
 | Shape | Winner |
 |---|---|
 | Global aggregate, filtered count | Batcher, by 5× |
-| Group-by (one or two keys) | Batcher, 1.3–1.5× |
+| Group-by (one or two keys) | Batcher, 1.3x to 1.5x |
 | Window running `sum()` | Batcher, 1.4× |
 | Window `rank()`, `lag()` | DuckDB |
 | `MEDIAN` / `QUANTILE_CONT` per group | Batcher, 1.1× |
 | Join → aggregate | DuckDB, 1.15× |
-| TPC-H overall (sf1) | DuckDB, geomean ~1.36× |
+| TPC-H overall (sf1), DuckDB on its native store | DuckDB, geomean ~1.40× |
+| TPC-H overall (sf1), DuckDB reading the same Arrow | Batcher, all 22 queries |
 | Delta file skipping (`count(*)` with a predicate) | Batcher, 1.42× |
 
 ## Operators
@@ -50,29 +51,13 @@ over a filter compiles to a `COUNT(*)` aggregate, so projection pushdown prunes 
 to the one column the predicate touches and the count fuses into a single `count_if` pass.
 Nothing else is read, and no matching row is ever materialized.
 
-`rank()` and `lag()` go the other way. DuckDB's window operator is better than ours on the
-ordered frame kernels, and we have not closed that.
+`rank()` and `lag()` go the other way. DuckDB's window operator is better on the ordered frame kernels, and that gap is still open.
 
 :::{tip}
 Both directions are reachable from your own query. `ds.explain()` shows whether the
 predicate reached the scan and which columns survived pruning; `ds.stats()` reports what
-each operator actually cost. [Optimizing a slow
-query](../tutorials/optimizing-a-slow-query.md) walks the loop.
+each operator actually cost. {doc}`../tutorials/optimizing-a-slow-query` walks the loop.
 :::
-
-## In-memory kernels
-
-To separate compute from I/O, the in-memory microbenchmark in the run log loads roughly 60M
-TPC-H rows into Arrow once and times each engine's kernels. Single node, 16 cores:
-
-| Operator | Batcher | DuckDB |
-|---|---:|---:|
-| filter | 28 ms | 1,601 ms |
-| group-by | 359 ms | 2,729 ms |
-| sum | 10 ms | 92 ms |
-
-The Rust kernels are not the problem. That matters for the next section, because it means
-the TPC-H gap is not kernel speed.
 
 ## Aggregates DuckDB used to win
 
@@ -94,32 +79,12 @@ instead of the handful of groups.
 ## Where DuckDB wins: TPC-H
 
 :::{warning}
-All 22 queries, scale factor 1, 16 cores. **DuckDB is faster on 16 of the 21 comparable
-queries**, with a geometric mean of about **1.36× in DuckDB's favor**. This is the headline
-loss on the site and it is not going to be argued away by the operator table above it.
+All 22 queries, scale factor 1, 16 cores, release build, measured 2026-07-18. Against DuckDB's native compressed store, **DuckDB is faster on 15 of 22**, with a geometric mean of about **1.40× in DuckDB's favor**. This is the headline loss on the site, and the operator table above doesn't argue it away.
 :::
 
-Re-measured 2026-07-18 on a release build, against DuckDB's **native compressed store**:
+Against DuckDB reading the same Arrow, the result inverts: Batcher wins all 22, by 1.1× to 6.9×. That's the like-for-like execution comparison. The native-store number is what you get from `duckdb` at a prompt, where DuckDB decompresses its own format as it scans and never pays an Arrow ingest. Both are published, with the per-query breakdown, on {doc}`tpch`.
 
-| | Queries |
-|---|---|
-| Batcher faster | q15 (0.46×), q12 (0.74×), q11 (0.80×), q1 (0.88×), q9 (0.88×), q18 (0.91×), q6 (0.92×) |
-| Batcher slower | the other 15; worst are q17 (7.91×), q20 (2.81×), q3 (2.57×), q21 (2.38×) |
-| Not comparable | none — **all 22 run**. Correlated subqueries are now supported, so q21 is measured |
-
-Against **DuckDB reading the same Arrow**, the result inverts: Batcher wins **all 22**, by
-1.1×–6.9×. That is the like-for-like execution comparison; the table above is what a user gets
-from `duckdb` at a prompt, where DuckDB also decompresses its own format as it scans and never
-pays an Arrow ingest. Both are published, on [the TPC-H page](tpch.md).
-
-The pattern is clean. Batcher wins the scan-and-aggregate queries and loses the multi-join
-ones. Given the kernel numbers above, the cause is not the aggregation or the filter. It is
-that single-node parallelism currently reaches only about 1.7–3.8× on 16 cores where DuckDB
-and Daft use effectively all of them, and Batcher does roughly 2× more CPU work per query.
-Closing that is a runtime-parallelism and kernel-efficiency effort, and it is the top open
-lever in `benchmarks/BENCHMARK_RESULTS.md`. It is not a knob.
-
-[The TPC-H page](tpch.md) has the per-query detail.
+The pattern is clean. Batcher wins the scan-and-aggregate queries and loses the multi-join ones. The cause is single-node parallelism: it plateaus after roughly 8 cores where DuckDB and Daft use effectively all 16, and Batcher does roughly 2× more CPU work per query. `GROUP BY` alone scales 19.2× while the join alone scales only 5.9×, so the join is the ceiling. Closing that is a runtime-parallelism and kernel-efficiency effort tracked as an open lever in `benchmarks/BENCHMARK_RESULTS.md`. It isn't a knob you can turn.
 
 ## Lakehouse reads
 
@@ -133,8 +98,7 @@ game. Single node, 10M rows across 200 Delta files, one `day` per file:
 | **Batcher** | **13.4 ms** | **1** |
 | DuckDB `delta_scan` | 19.0 ms | baseline |
 
-We were 2.7× slower than DuckDB here and are now 1.42× faster. The bug was ours and it was
-in the optimizer, not the connector: the `COUNT(*)`-over-`Filter` fusion deleted the
+Batcher was 2.7× slower than DuckDB here and is now 1.42× faster. The bug was in the optimizer, not the connector. The `COUNT(*)`-over-`Filter` fusion deleted the
 `Filter` node that source-predicate extraction was looking for, so the most ordinary
 lakehouse query in existence pushed nothing down and scanned the whole table. Predicates
 are now recovered from the user's plan, where a `Filter` on a `Scan` constrains that scan
@@ -142,11 +106,9 @@ whatever the optimizer does above it.
 
 ## What DuckDB cannot do
 
-The gap that matters most is not on this page as a number. DuckDB is single-node and its
-optimizer is static: it commits to a plan before the first row is read and cannot change
-its mind. Batcher re-optimizes *during* the query at pipeline breakers, on measured
-cardinalities, and the same mergeable operators run across a cluster with a bit-identical
-result. See [scaling](scaling.md).
+The gap that matters most doesn't appear on this page as a number. DuckDB is single-node and its optimizer is static. It commits to a plan before the first row is read and can't change its mind. Batcher re-optimizes at stage boundaries on measured cardinalities, the same granularity Spark AQE works at but available single-node too, and it carries a sketch-backed cross-query learned-stats loop that DuckDB has no equivalent for. The same mergeable operators then run across a cluster with a bit-identical result.
+
+Two honest caveats. Stage-boundary re-optimization is off for queries under 20M input rows, so most small queries never use it. And it's the same mechanism and granularity as Spark AQE, not something finer. See {doc}`scaling`.
 
 ## Reproduce
 
@@ -157,13 +119,10 @@ python benchmarks/run.py --benchmark tpch      --tier single --scale 1
 
 ## See also
 
-- [TPC-H](tpch.md): the per-query breakdown.
-- [Analytics and I/O](analytics.md): operators, connectors, the lazy control plane.
-- [vs Polars](vs-polars.md) and [vs Daft](vs-daft.md): the other two single-node engines.
-- [Aggregation internals](../deep-dives/aggregation-internals.md): the quickselect finalize
-  behind the median and quantile wins.
-- [Join algorithms](../deep-dives/join-algorithms.md): the operator the TPC-H gap lives in.
-- [Adaptive re-optimization](../deep-dives/adaptive-reoptimization.md): what a static
-  optimizer cannot do, and the reason the last section is not a number.
-- [Methodology](methodology.md): hardware, gating, and why cross-hardware comparison is
-  meaningless.
+- {doc}`tpch` for the per-query breakdown.
+- {doc}`analytics` for operators, connectors, and the lazy control plane.
+- {doc}`vs-polars` and {doc}`vs-daft` for the other two single-node engines.
+- {doc}`../deep-dives/aggregation-internals` for the quickselect finalize behind the median and quantile wins.
+- {doc}`../deep-dives/join-algorithms` for the operator the TPC-H gap lives in.
+- {doc}`../deep-dives/adaptive-reoptimization` for what a static optimizer can't do.
+- {doc}`methodology` for hardware, gating, and why cross-hardware comparison is meaningless.

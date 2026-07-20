@@ -19,6 +19,7 @@ from typing import IO, Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.config import active_config
 from batcher.io.base import FileSource
 from batcher.io.formats.base import SOURCES
@@ -28,13 +29,9 @@ __all__ = ["ProtobufSource"]
 
 def _require_protarrow() -> Any:
     """Import and return the `protarrow` module or raise `BackendError`."""
-    try:
-        import protarrow
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError(
-            "Protobuf support requires protarrow + protobuf: pip install 'batcher-engine[protobuf]'"
-        ) from exc
-    return protarrow
+    return require(
+        "protarrow", feature="Protobuf support", provides="protarrow + protobuf", extra="protobuf"
+    )
 
 
 def _read_varint(fh: IO[bytes]) -> int | None:
@@ -80,14 +77,15 @@ class ProtobufSource(FileSource):
 
     __slots__ = ("_message_cls",)
 
-    def __init__(self, path: str, *, message_cls: Any) -> None:
-        super().__init__(path)
+    def __init__(self, path: str, *, message_cls: Any, **kwargs: Any) -> None:
+        # Forward the base options; dropping them made `on_error="skip"` a silent no-op.
+        super().__init__(path, **kwargs)
         self._message_cls = message_cls
 
     def _reader_kwargs(self) -> dict[str, object]:
         # `message_cls` is required — a worker rebuilding the reader without it raises. The
         # generated protobuf class is picklable (module-qualified), so it ships to the worker.
-        return {"message_cls": self._message_cls}
+        return {**super()._reader_kwargs(), "message_cls": self._message_cls}
 
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:  # noqa: ARG002 (from descriptor)
         protarrow = _require_protarrow()

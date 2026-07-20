@@ -15,7 +15,7 @@ partition, compute one output column per function, scatter each column back to t
 it came from, and append them to the input columns.
 
 ```text
-   input rows — original order, and every one of them survives
+   input rows in original order, and every one of them survives
    ┌────┬────┬────┬────┬────┬────┬────┬────┐
    │ r0 │ r1 │ r2 │ r3 │ r4 │ r5 │ r6 │ r7 │
    └────┴────┴────┴────┴────┴────┴────┴────┘
@@ -78,30 +78,33 @@ window machinery. It computes via **dense group ids**: reduce each group in one 
 the rows, then broadcast its value back by index. That is exactly a group-by aggregate followed
 by a scatter, and it skips the per-partition index lists and the scattered gather they force.
 
-It is the cheapest window in the engine, and the benchmark shows it: `sum() OVER (PARTITION BY
-...)` runs in 92.7 ms against DuckDB's 99.9 ms (Polars: 73.8 ms, one of the few operator
-shapes where Polars is ahead).
+It's the cheapest window in the engine, and it's the shape where Batcher's margin over DuckDB is
+narrowest, because there is so little work left to remove.
 
 ## Explicit `ROWS` frames
 
 `window_frame.rs` handles `ROWS BETWEEN <start> AND <end>`: for each row, aggregate the physical
 rows in `[start, end]` of its ordered partition.
 
-Both frame edges are non-decreasing in the row position (each is `pos + const`, clamped), so the
-frame only ever slides right; it never rewinds. The kernel exploits that to run in **one pass**:
+Both frame edges are non-decreasing in the row position, since each is `pos + const` clamped to the
+partition, so the frame only ever slides right and never rewinds. That makes the frame a FIFO
+queue, and the kernel exploits it to run in **one pass** with no frame ever rescanned. A naive
+implementation that re-aggregates each frame is O(n·k), and for a wide frame that is the whole cost
+of the query.
 
-- `sum` / `avg` / `count` keep a running accumulator: add the entering row, subtract the leaving
-  one. O(n).
-- `min` / `max` keep a monotonic deque. O(n) amortized.
-
-No frame is ever rescanned. A naive implementation that re-aggregates each frame is O(n·k), and
-for a wide frame that is the whole cost of the query.
+Which one-pass structure a function uses depends on its arithmetic. `count`, and `sum` over
+integers, keep a running accumulator in O(n): drop the leaving row, add the entering one. `sum` and
+`avg` over floats can't do that, because subtracting floats is catastrophically unstable, so they
+use a `FifoSum`, a two-stack sliding aggregate that never subtracts. `min` and `max` keep a
+monotonic deque, O(n) amortized. Only the aggregate functions take a frame at all.
 
 :::{note}
 `FrameBound` and `FrameUnits` here are *mirror* types of `bc_ir::FrameBound`/`FrameUnits`.
 `bc-runtime` does not depend on `bc-ir`, because the crate DAG points one way and does not bend
 for convenience, so the interpreter maps the IR enum onto these exactly as it does for
-`WindowFn`. A numeric `RANGE` offset is not supported and falls back upstream.
+`WindowFn`. `Rows` counts physical rows while `Range` and `Groups` count peer groups, and `Range`
+is reached only for peer bounds such as `CURRENT ROW` and `UNBOUNDED`. A numeric `RANGE` offset is
+not supported and falls back upstream.
 :::
 
 ## Parallelism
@@ -184,20 +187,26 @@ The no-`ORDER BY` aggregate is planned separately and takes the dense-group-id s
 
 ## Where it stands
 
-The window numbers are the engine's most mixed (16 cores, `lineitem` at scale factor 1):
+All four measured window shapes beat DuckDB on the operator sweep, though by very different
+margins. The table below reads as a speedup factor, so 2.6x means Batcher is 2.6 times faster.
+The rows run from the widest margin to the narrowest, and PyArrow has no window operator to
+compare against.
 
-| Shape | Batcher | DuckDB | Polars |
-|---|---:|---:|---:|
-| running `sum()` | 171 ms | 240 | 786 |
-| `sum()` over partition | 92.7 ms | 99.9 | 73.8 |
-| `lag()` | 180 ms | 151 | 3,217 |
-| `rank()` | 221 ms | 133 | 989 |
+| Shape | vs DuckDB | vs Polars |
+|---|---:|---:|
+| running `sum()` | 2.6x | 6.3x |
+| `lag()` | 1.9x | 25x |
+| `rank()` | 1.4x | 6.7x |
+| `sum()` over partition | 1.1x | 1.0x |
 
-The aggregate windows win. `rank()` loses to DuckDB by 1.66x and `lag()` by 1.19x, and the reason
-is the sort: a ranking function needs the partition ordered, and the ranking path pays a full
-per-partition sort plus the scatter back to row order, where DuckDB's window operator is more
-specialized. Against Polars the same shapes win by 4.5x and 17x, so the absolute cost is not
-outrageous. DuckDB is simply good at this.
+The two aggregate shapes bracket the range for a reason. A running `sum()` streams the ordered
+partition once and wins comfortably. A whole-partition `sum()` is already so cheap through the
+dense-group-id shortcut that there's little left to win, which is why it sits at parity with
+Polars. The ranking and value functions land in between, because both need the partition ordered
+and pay a per-partition sort plus the scatter back to row order.
+
+These figures come from the operator-mix sweep in `benchmarks/BENCHMARK_RESULTS.md`, measured on
+a 16-core release build with every correctness check passing.
 
 ## Where the code lives
 

@@ -22,6 +22,7 @@ import pyarrow as pa
 from batcher._internal.errors import BackendError
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.nosql.base import PartitionSpec, ScanSource, require_driver
+from batcher.io.formats.sql._common import connection_fingerprint
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.plan.source_stats import SourceStatistics
 
@@ -30,6 +31,35 @@ __all__ = ["MongoSink", "MongoSource"]
 # An ``_id`` range split is a half-open ObjectId/key interval ``(lo, hi)``; either
 # bound may be None to mean "unbounded on that side".
 _IdRange = tuple[Any, Any]
+
+
+def redact_mongo_uri(uri: str | None) -> str | None:
+    """A MongoDB URI with the password in its userinfo masked.
+
+    A Mongo URI carries its credentials inline — ``mongodb://user:pw@host/db`` — so unlike
+    a kwarg named ``password`` there is no field to drop. That matters here more than for a
+    `repr`, because the URI is what makes a connection *identifying*, and `identity()` is
+    **persisted** as the learned-statistics key. Fingerprinting the raw URI would write the
+    password into the metadata store, where it outlives the process.
+
+    Masking rather than removing the whole userinfo keeps the username identifying, so two
+    different accounts against one host stay distinct relations.
+
+    Args:
+        uri: A MongoDB connection URI, or None.
+
+    Returns:
+        The URI with the password masked, or None.
+    """
+    if not uri:
+        return uri
+    scheme, sep, rest = uri.partition("://")
+    if not sep or "@" not in rest:
+        return uri
+    userinfo, _, hostpart = rest.rpartition("@")
+    user, has_pw, _ = userinfo.partition(":")
+    userinfo = f"{user}:***" if has_pw else userinfo
+    return f"{scheme}://{userinfo}@{hostpart}"
 
 
 @SOURCES.register("mongo")
@@ -97,7 +127,8 @@ class MongoSource(ScanSource):
 
     def _client(self) -> Any:
         pymongo = require_driver("pymongo", "mongo")
-        return pymongo.MongoClient(self._conn_kwargs["uri"])
+        # The URI embeds credentials, so it resolves like any other secret.
+        return pymongo.MongoClient(self._secret("uri"))
 
     def _coll(self, client: Any) -> Any:
         return client[self._conn_kwargs["database"]][self._conn_kwargs["collection"]]
@@ -119,7 +150,21 @@ class MongoSource(ScanSource):
         return None if rows is None else SourceStatistics(row_count=rows, exact_rows=True)
 
     def _identity_suffix(self) -> str:
-        return f"{self._conn_kwargs['database']}.{self._conn_kwargs['collection']}"
+        """``<connection>:<db>.<collection>`` — the server is part of the relation's identity.
+
+        Keyed on ``database.collection`` alone, the same collection name on **production**
+        and on **staging** was one relation: `identity()` is the key learned statistics are
+        stored under, so Kyber applied the billion-document collection's cardinalities to
+        the thousand-document one and picked a plan for data that was not there. Nothing
+        errors — it is a silently worse plan, which is the hardest kind of bug to see.
+
+        The URI is masked before it is fingerprinted (`redact_mongo_uri`), and the digest is
+        `sha256` rather than `hash()` so the key is stable across processes; a per-run key
+        would make the stats loop look alive while never reusing anything.
+        """
+        kw = self._conn_kwargs
+        fingerprint = connection_fingerprint({"uri": redact_mongo_uri(kw["uri"])})
+        return f"{fingerprint}:{kw['database']}.{kw['collection']}"
 
     def _infer_schema(self) -> pa.Schema:
         require_driver("pymongoarrow", "mongo")
@@ -149,6 +194,25 @@ class MongoSource(ScanSource):
         projection: list[str] | None,
         predicate: dict | None = None,
     ) -> Iterator[pa.RecordBatch]:
+        """One ``_id`` range, fetched as Arrow and yielded batch by batch.
+
+        **This is not incrementally streamed, and deliberately does not pretend to be.**
+        ``pymongoarrow`` exposes no batched reader — `find_arrow_all` is its only `find`
+        entry point and it returns a fully materialized `Table`. The honest alternative is
+        a plain ``pymongo`` cursor through `rows_to_batches`, which *would* stream, but it
+        gives up ``pymongoarrow``'s BSON typing: an ``ObjectId`` or ``Decimal128`` that the
+        Arrow reader types correctly is something `pa.RecordBatch.from_pylist` cannot
+        encode at all. Trading a correctness property for a memory one is the wrong trade,
+        so the bound stays where it is — at the *partition*, which is why `partition_spec`
+        segments the ``_id`` space rather than reading the collection in one call.
+
+        The client is closed **before** the first batch is yielded rather than in a
+        `finally` around the yields. A generator abandoned after its first batch runs its
+        `finally` only whenever the garbage collector gets to it, so the connection (and
+        its socket pool) outlived every early-exit read — a `limit`, a `head`, an exception
+        downstream. Since the rows are already materialized by the time we can yield, there
+        is nothing to keep it open for.
+        """
         require_driver("pymongoarrow", "mongo")
         from pymongoarrow.api import find_arrow_all
 
@@ -168,9 +232,9 @@ class MongoSource(ScanSource):
         client = self._client()
         try:
             table = find_arrow_all(self._coll(client), query, projection=projection_doc)
-            yield from table.to_batches()
         finally:
             client.close()
+        yield from table.to_batches()
 
 
 def _id_ranges(coll: Any, query: dict[str, Any], segments: int) -> list[_IdRange]:
@@ -234,7 +298,14 @@ class MongoSink:
             pymongo.ReplaceOne({self.key_field: row.get(self.key_field)}, row, upsert=True)
             for row in rows
         ]
-        client = pymongo.MongoClient(self.uri)
+        # Resolve the URI here, where the connection is dialed, exactly as `MongoSource`
+        # does via `_secret`. The sink was calling `MongoClient(self.uri)` on the raw
+        # attribute, so an ``env:``/``file:`` reference that read fine was handed to the
+        # driver verbatim and failed to connect — the reference form worked for reads and
+        # silently did not for writes.
+        from batcher.io.credentials import resolve_secret
+
+        client = pymongo.MongoClient(resolve_secret(self.uri, what="mongo uri"))
         try:
             client[self.database][self.collection].bulk_write(ops, ordered=False)
         except Exception as exc:

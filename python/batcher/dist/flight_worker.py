@@ -18,9 +18,11 @@ and its lineage-recovery contract without a circular import.
 
 from __future__ import annotations
 
+import contextvars
 from concurrent import futures
 from typing import TYPE_CHECKING
 
+from batcher._internal.errors import ConfigError
 from batcher._internal.native import engine
 from batcher.carbonite.transfer import ShuffleTicket
 
@@ -31,18 +33,28 @@ __all__ = [
     "_FlightWorker",
     "_combine_sources",
     "_ticket",
+    "current_plan_id",
     "new_plan_id",
     "set_current_plan_id",
     "spawn_flight_workers",
 ]
 
-# The shuffle plan id for the query in flight on THIS process (driver or worker). One
-# in-flight plan per process, so a module-level value is correct; it is set once per
-# query (`set_current_plan_id`) on the driver and on every worker so all tickets carry
-# the same id. Fences a query's published partitions from another query's — and from a
-# crashed prior query's leftovers when a persistent fleet actor is reused.
+# The shuffle plan id for the query in flight in THIS context (driver thread or worker
+# task). Set once per query on the driver and re-asserted per call on every worker, so
+# all of a query's tickets carry the same id. Fences a query's published partitions from
+# another query's — and from a crashed prior query's leftovers when a fleet actor is
+# reused.
+#
+# A `ContextVar`, not a module global: several pipelines share one warm session fleet
+# (`dist.fleet`) precisely so they need not each reserve the cluster's whole CPU
+# capacity, and they run concurrently in separate driver threads. Under a plain global
+# the later query's `set_current_plan_id` retroactively changed the tickets the earlier
+# query's driver was still building. A fresh thread starts from the default rather than
+# inheriting, which is the isolation we want here.
 _DEFAULT_PLAN_ID = 1
-_current_plan_id = _DEFAULT_PLAN_ID
+_current_plan_id: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "batcher_shuffle_plan_id", default=_DEFAULT_PLAN_ID
+)
 _RESULT_STAGE = 100  # ticket stage for a stage's *finalized* result (kept on the actor)
 # Sub-buckets a memory-bounded join reduce re-partitions each staged side into on disk, so
 # it joins one sub-bucket pair at a time rather than the whole bucket. Matches the
@@ -83,13 +95,33 @@ def new_plan_id() -> int:
 
 
 def set_current_plan_id(plan_id: int) -> None:
-    """Set this process's current shuffle plan id so `_ticket` fences this query.
+    """Set this context's shuffle plan id so `_ticket` fences this query.
 
-    Called once per query: on the driver (which builds the tree-combine tickets) and
-    inside every `_FlightWorker` (which builds publish/fetch tickets), with the same
-    id, so the whole shuffle agrees."""
-    global _current_plan_id
-    _current_plan_id = plan_id
+    Called once per query on the driver (which builds the tree-combine tickets), and
+    re-asserted per call inside every `_FlightWorker` (which builds publish/fetch
+    tickets) from the id the driver sent, so the whole shuffle agrees. Scoped to the
+    calling context, so a second pipeline sharing the same fleet cannot retarget the
+    tickets this one is still building."""
+    _current_plan_id.set(plan_id)
+
+
+def current_plan_id() -> int:
+    """The shuffle plan id fencing the query in flight in this context."""
+    return _current_plan_id.get()
+
+
+def _use_plan(plan_id: int | None) -> None:
+    """Adopt the driver-sent plan id for the duration of this actor call.
+
+    A fleet actor is shared by every query in the session — including, once several
+    pipelines run at once, by two queries interleaving calls on it. So the fence cannot
+    live in the actor's own state the way it did when a worker served one query at a
+    time: each call carries the id of the query making it. Ray runs an actor's tasks one
+    at a time, so setting it at method entry is sufficient. `None` means a caller that
+    predates the plumbing — keep the actor's spawn-time id.
+    """
+    if plan_id is not None:
+        set_current_plan_id(plan_id)
 
 
 def _ticket(stage: int, src: int, dst: int, epoch: int = 0) -> ShuffleTicket:
@@ -102,10 +134,10 @@ def _ticket(stage: int, src: int, dst: int, epoch: int = 0) -> ShuffleTicket:
     can never be read — defense in depth atop the address-redirect the recovery loop
     already does.
     """
-    return ShuffleTicket(_current_plan_id, stage, src, dst, epoch)
+    return ShuffleTicket(_current_plan_id.get(), stage, src, dst, epoch)
 
 
-def _combine_sources(session, gk, aj, sources):
+def _combine_sources(session, gk, aj, sources, replicas=None):
     """Fetch each `(addr, ticket)` concurrently and merge into one running partial.
 
     The bounded-memory merge: hold one combined partial, never the whole source
@@ -113,9 +145,16 @@ def _combine_sources(session, gk, aj, sources):
     node's fan-in (and memory) is bounded regardless of cluster size. A lost source
     surfaces as a `RetryableShuffleError` (the tree node's task fails → driver
     recompute), preserving the propagate-on-fault contract of the serial path.
+
+    `replicas[i]` are fallback addresses holding a copy of `sources[i]` — positional,
+    so it must be built alongside `sources` rather than indexed by worker id. A lost
+    source served from a replica costs a re-fetch instead of a recompute round; only
+    when every copy is gone does it raise.
     """
     nat = engine()
-    running, unreachable = session.gather_combine(gk, aj, list(sources), finalize=False)
+    running, unreachable = session.gather_combine(
+        gk, aj, list(sources), finalize=False, replicas=replicas
+    )
     if unreachable:
         raise nat.RetryableShuffleError(f"combiner lost sources {unreachable}")
     return running
@@ -149,6 +188,7 @@ try:
             shm: bool = False,
             preemption: bool = False,
             tls_config: ShuffleTlsConfig | None = None,
+            port_range: tuple[int, int] | None = None,
         ) -> None:
             nat = engine()
             from batcher.carbonite.transfer import ShuffleSession
@@ -198,7 +238,20 @@ try:
             # cross-node-reachable address instead of loopback (which a reducer on
             # another host could never dial). On a single-host cluster this is the
             # local IP and behaves like before.
-            advertise_host = ray.util.get_node_ip_address()
+            #
+            # `BATCHER_ADVERTISE_HOST` overrides it for a topology where Ray's view of
+            # the node is not the address peers must dial: a multi-homed host whose
+            # shuffle traffic belongs on a second NIC, or a NAT'd / VPC-peered network
+            # where the reachable address is not the local one. It is read *here*, in the
+            # worker, rather than shipped from the driver, because the right value differs
+            # per node — a single driver-side setting would hand every worker one host and
+            # be wrong everywhere but one. Set it per node (pod spec, node env) and each
+            # worker advertises its own address.
+            import os
+
+            advertise_host = (
+                os.environ.get("BATCHER_ADVERTISE_HOST") or ray.util.get_node_ip_address()
+            )
             shuffle_token = token or None
             # Opt-in AIMD adaptive credits: the window adjusts to this worker's memory
             # pressure per fetch. Decided on the driver (the worker can't see the
@@ -209,12 +262,19 @@ try:
 
                 self.session = ShuffleSession(
                     credits,
-                    flow_control=AIMDFlowControl(),
+                    # Warm-start AIMD at the driver's grant. `credits` is what Carbonite's
+                    # `grant_credits(signature=)` just computed from Kyber's per-operator
+                    # estimate *and* this shuffle's learned converged window — and under
+                    # adaptive credits `_window()` reads the controller, never the session's
+                    # static `credits`, so a bare controller silently discarded all of it and
+                    # every channel re-climbed from `default_credits` (4) on every query.
+                    flow_control=AIMDFlowControl(initial_window=credits),
                     pressure=PressureMonitor(),
                     advertise_host=advertise_host,
                     token=shuffle_token,
                     shm=shm,
                     tls=shuffle_tls,
+                    port_range=port_range,
                 )
             else:
                 self.session = ShuffleSession(
@@ -223,6 +283,7 @@ try:
                     token=shuffle_token,
                     shm=shm,
                     tls=shuffle_tls,
+                    port_range=port_range,
                 )
             # The driver's EngineConfig (this worker process can't see the driver's
             # config_context), used for every local execute_plan on this actor.
@@ -277,8 +338,9 @@ try:
             return ray.get_runtime_context().get_node_id()
 
         def map_publish(
-            self, map_ir, gk, aj, partition, n_keys, n_reducers, src=None, epoch=0
+            self, map_ir, gk, aj, partition, n_keys, n_reducers, src=None, epoch=0, plan_id=None
         ) -> str:
+            _use_plan(plan_id)
             nat = engine()
             from batcher.dist.executors.partition_io import (
                 iter_partition_descriptor,
@@ -313,7 +375,9 @@ try:
                 self._bucket_bytes[r] = sum(b.nbytes for b in bucket)
             return self.session.addr
 
-        def replicate_buckets(self, primary_addr, src, n_buckets, stage=0, epoch=0) -> str:
+        def replicate_buckets(
+            self, primary_addr, src, n_buckets, stage=0, epoch=0, plan_id=None
+        ) -> str:
             """Pull every bucket source `src` published on `primary_addr` and re-publish it
             here, under the *same* ticket — a second copy of that mapper's shuffle output.
 
@@ -330,12 +394,16 @@ try:
             fall back to a half-filled replica would silently drop that mapper's rows. The
             driver therefore only advertises a replica whose ack it has in hand.
             """
+            _use_plan(plan_id)
             for r in range(n_buckets):
                 ticket = _ticket(stage, src, r, epoch)
                 self.session.publish(ticket, self.session.fetch(primary_addr, ticket))
             return self.session.addr
 
-        def reduce_fetch(self, gk, aj, mapper_addrs, reducer_id, epochs=None, replicas=None):
+        def reduce_fetch(
+            self, gk, aj, mapper_addrs, reducer_id, epochs=None, replicas=None, plan_id=None
+        ):
+            _use_plan(plan_id)
             # Fetch every mapper's partial *concurrently* and fold them into one running
             # merged state in Rust (bounded by the session's fan-in), instead of one
             # blocking round-trip per mapper. The reducer holds one merged partial (sized
@@ -409,7 +477,7 @@ try:
                 shutil.rmtree(work, ignore_errors=True)
 
         def reduce_fetch_publish(
-            self, gk, aj, mapper_addrs, reducer_id, epochs=None, replicas=None
+            self, gk, aj, mapper_addrs, reducer_id, epochs=None, replicas=None, plan_id=None
         ):
             """Like `reduce_fetch`, but PUBLISH the finalized result on this worker's own
             Flight server and return only a `(addr, ticket, rows, schema)` handle.
@@ -419,6 +487,7 @@ try:
             reducer's result back to the driver. The status protocol is unchanged
             (`"retry"` on a lost mapper), so it composes with the recovery loop.
             """
+            _use_plan(plan_id)
             status, payload = self.reduce_fetch(gk, aj, mapper_addrs, reducer_id, epochs, replicas)
             if status != "ok" or payload is None:
                 return (status, payload)  # retry, or an empty bucket (no handle)
@@ -426,23 +495,27 @@ try:
             self.session.publish(ticket, [payload])
             return ("ok", (self.session.addr, ticket, payload.num_rows, payload.schema))
 
-        def combine_publish(self, gk, aj, sources, out_ticket):
+        def combine_publish(self, gk, aj, sources, out_ticket, replicas=None):
             # One interior node of the combiner tree: merge <= fan_in upstream
             # partials and republish the result for the next level to fetch.
-            running = _combine_sources(self.session, gk, aj, sources)
+            # `replicas` is positional over `sources` (see `_combine_sources`); it is
+            # populated only at the leaf level, since a combiner's own output is
+            # published on one node and never replicated.
+            running = _combine_sources(self.session, gk, aj, sources, replicas)
             self.session.publish(out_ticket, [running] if running is not None else [])
             return self.session.addr
 
-        def combine_finalize_fetch(self, gk, aj, sources):
+        def combine_finalize_fetch(self, gk, aj, sources, replicas=None):
             # The tree root for one bucket: merge the last <= fan_in partials and
             # finalize to output rows.
             nat = engine()
-            running = _combine_sources(self.session, gk, aj, sources)
+            running = _combine_sources(self.session, gk, aj, sources, replicas)
             return None if running is None else nat.combine_finalize(gk, aj, [running])
 
         def map_publish_raw(
-            self, sub_ir, key_names, partition, n_buckets, stage, src=None, epoch=0
+            self, sub_ir, key_names, partition, n_buckets, stage, src=None, epoch=0, plan_id=None
         ) -> str:
+            _use_plan(plan_id)
             nat = engine()
             from batcher.dist.executors.partition_io import read_partition_descriptor
 
@@ -469,7 +542,7 @@ try:
                 )
             return self.session.addr
 
-        def map_publish_join(self, left, right, n_buckets, src=None, epoch=0) -> str:
+        def map_publish_join(self, left, right, n_buckets, src=None, epoch=0, plan_id=None) -> str:
             """Publish BOTH sides of one join source partition in a single actor call.
 
             `left`/`right` are each `(sub_ir, key_names, partition)`.
@@ -483,10 +556,16 @@ try:
             one `ObjectRef`, so either side's exception propagates to the barrier as the error
             it actually is.
             """
-            self.map_publish_raw(left[0], left[1], left[2], n_buckets, 0, src, epoch)
-            return self.map_publish_raw(right[0], right[1], right[2], n_buckets, 1, src, epoch)
+            _use_plan(plan_id)
+            self.map_publish_raw(left[0], left[1], left[2], n_buckets, 0, src, epoch, plan_id)
+            return self.map_publish_raw(
+                right[0], right[1], right[2], n_buckets, 1, src, epoch, plan_id
+            )
 
-        def reduce_window(self, win_ir, addrs, reducer_id, epochs=None, replicas=None):
+        def reduce_window(
+            self, win_ir, addrs, reducer_id, epochs=None, replicas=None, plan_id=None
+        ):
+            _use_plan(plan_id)
             nat = engine()
             # A window partition is computed whole, so this reducer holds all of its
             # bucket's raw rows (memory = the bucket, which shrinks as workers grow).
@@ -517,9 +596,11 @@ try:
             finalize=True,
             epochs=None,
             replicas=None,
+            plan_id=None,
         ):
             import functools
 
+            _use_plan(plan_id)
             nat = engine()
             # A join needs its bucket's whole left and right side, so it holds them
             # both (memory = the bucket's data, which shrinks as workers grow). Fetch
@@ -686,6 +767,7 @@ try:
             right_schema,
             epochs=None,
             replicas=None,
+            plan_id=None,
         ):
             """Like `reduce_join`, but PUBLISH this bucket's joined rows on the worker's own
             Flight server and hand back only an `(addr, ticket, rows, schema)` handle.
@@ -703,6 +785,7 @@ try:
             loop: `("retry", unreachable)` on a lost mapper, `("ok", None)` for an empty
             bucket (nothing to publish).
             """
+            _use_plan(plan_id)
             status, batches = self.reduce_join(
                 join_ir,
                 addrs,
@@ -714,6 +797,7 @@ try:
                 True,
                 epochs,
                 replicas,
+                plan_id,
             )
             if status != "ok":
                 return (status, batches)  # retry: `batches` carries the unreachable mappers
@@ -790,6 +874,7 @@ try:
             partition,
             src=None,
             epoch=0,
+            plan_id=None,
         ) -> str:
             """Range-partition this split's rows by `boundaries` and publish each bucket.
 
@@ -803,6 +888,7 @@ try:
             `epoch` rises on each recompute, so a regenerated bucket is published under a
             fresh ticket and a zombie worker's stale one can never be read.
             """
+            _use_plan(plan_id)
             nat = engine()
             from batcher.dist.executors.partition_io import bucketize, read_partition_descriptor
 
@@ -817,7 +903,8 @@ try:
                 self.session.publish(_ticket(0, src, r, epoch), buckets[r])
             return self.session.addr
 
-        def sort_reduce(self, sort_ir, addrs, reducer_id, epochs=None, replicas=None):
+        def sort_reduce(self, sort_ir, addrs, reducer_id, epochs=None, replicas=None, plan_id=None):
+            _use_plan(plan_id)
             nat = engine()
             # This reducer owns one contiguous key range; fetch its bucket from every
             # mapper concurrently, concatenate, and sort by all keys — the bucket is
@@ -870,7 +957,20 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     # all clients present the same secret. Env var overrides config (N5).
     import os
 
-    token = os.environ.get("BATCHER_SHUFFLE_TOKEN") or dc.shuffle_token or ""
+    # An `env:`/`file:` reference is resolved here so an operator can mount the token as a
+    # secret file instead of writing it into a config. It resolves on the *driver*, not per
+    # worker, because every peer must present the SAME shared secret — shipping the
+    # reference and resolving per node would silently split the fleet if one node's mount
+    # differed. The token then travels to actors exactly as it does today.
+    from batcher.io.credentials import resolve_secret
+
+    token = (
+        resolve_secret(
+            os.environ.get("BATCHER_SHUFFLE_TOKEN") or dc.shuffle_token or "",
+            what="shuffle_token",
+        )
+        or ""
+    )
     # Flight transport timeouts decided on the driver and shipped to every worker
     # (which can't see the driver's config_context), in milliseconds for the native
     # setter. 0 keepalive = off.
@@ -889,6 +989,12 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     # auto-upgrades `resilience` to "spot" on a detected spot node, so a fresh user is
     # protected without setting it by hand.
     preemption = dc.resilience == "spot"
+    # Shuffle listener port range, decided on the driver (the worker can't see the driver's
+    # config_context) and shipped to every actor so the whole fleet binds inside the range
+    # the operator opened in their firewall. Env var overrides config, matching the token.
+    port_range = _shuffle_port_range(os.environ.get("BATCHER_SHUFFLE_PORT_RANGE")) or (
+        tuple(dc.shuffle_port_range) if dc.shuffle_port_range else None
+    )
     pg = create_worker_placement(workers, current_envelope())
     # Resolve the fleet-uniform actor options once (they read the live topology), then vary
     # only the per-bundle index — so spawning W workers is O(W), not O(W x nodes).
@@ -908,7 +1014,30 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
             shm,
             preemption,
             dc.tls,
+            port_range,
         )
         for i in range(workers)
     ]
     return actors, pg
+
+
+def _shuffle_port_range(raw: str | None) -> tuple[int, int] | None:
+    """Parse a ``"40000-40100"`` port range, or None when unset.
+
+    A malformed value is a deployment mistake that would otherwise degrade silently to an
+    ephemeral port outside the operator's firewall rule — where the shuffle then hangs
+    unreachable rather than failing. Raise instead."""
+    if not raw or not raw.strip():
+        return None
+    lo, _, hi = raw.strip().partition("-")
+    try:
+        port_range = (int(lo), int(hi))
+    except ValueError as e:
+        raise ConfigError(
+            f"BATCHER_SHUFFLE_PORT_RANGE must look like '40000-40100', got {raw!r}"
+        ) from e
+    if not (0 < port_range[0] <= port_range[1] <= 65535):
+        raise ConfigError(
+            f"BATCHER_SHUFFLE_PORT_RANGE must be an ascending range within 1-65535, got {raw!r}"
+        )
+    return port_range

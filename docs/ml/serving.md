@@ -34,9 +34,10 @@ converted to NumPy in the order given by `input_columns`; output arrays come bac
 by name and are appended as new columns. The input batch passes through unchanged, so
 inference adds columns rather than replacing the row.
 
-Shapes survive the round trip. A tensor input column (every row a same-shape N-d array,
-like decoded images) keeps its `(N, *shape)` form across the boundary; a 1-D output
-array becomes a scalar column, and a higher-rank output becomes a tensor column.
+Shapes survive the round trip. A tensor input column, meaning every row holds a
+same-shape N-d array such as a decoded image, keeps its `(N, *shape)` form across the
+boundary. A 1-D output array becomes a scalar column, and a higher-rank output becomes a
+tensor column.
 
 ## Adapters
 
@@ -83,6 +84,19 @@ udf = serving_udf(
     output_columns=["logits"],
 )
 scored = ds.ml.map_batches(udf, concurrency=(2, 8))
+```
+
+When the server returns raw `logits` (a list per row), turn them into a probability
+distribution in the data plane with `.list.softmax()`, and rank the classes with
+`.list.arg_sort()` reversed for highest-first. No per-row Python runs:
+
+```python
+# docs: skip
+from batcher import col
+scored = scored.with_columns(
+    prob=col("logits").list.softmax(),
+    ranked=col("logits").list.arg_sort().list.reverse(),  # class indices, best first
+)
 ```
 
 ## Batching

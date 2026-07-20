@@ -248,9 +248,7 @@ class LineRangeSplit:
         # explicit schema (unioned over the whole file) makes every range parse to
         # the same schema the source advertises; `ignore` keeps a truly-unexpected
         # field from re-introducing per-range drift. Mirrors `CSVRangeSplit`.
-        parse = pajson.ParseOptions(
-            explicit_schema=schema, unexpected_field_behavior="ignore"
-        )
+        parse = pajson.ParseOptions(explicit_schema=schema, unexpected_field_behavior="ignore")
         table = pajson.read_json(io.BytesIO(buf), parse_options=parse)
         return table.select(projection) if projection is not None else table
 

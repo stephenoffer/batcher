@@ -21,10 +21,16 @@ use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 
 mod avro;
+mod bloom;
+mod footer_stats;
+mod page_index;
 mod predicate;
 mod store;
 
 pub use avro::read_avro_bytes;
+pub use footer_stats::{
+    parquet_file_manifest, parquet_footer_stats, ColumnFooterStats, FooterStats,
+};
 
 /// How many row-groups to fetch+decode concurrently. The single-stream reader processes
 /// row-groups one at a time, so a worker reading a many-row-group file waited on each
@@ -57,6 +63,11 @@ pub enum IoError {
     ObjectStore(#[from] object_store::Error),
     #[error("avro error: {0}")]
     Avro(#[from] arrow::error::ArrowError),
+    /// An Arrow-side failure that is not an Avro decode — building the footer-statistics
+    /// batch, concatenating bounds. String-backed rather than `#[from]`, since
+    /// `ArrowError` is already claimed by [`IoError::Avro`].
+    #[error("arrow error: {0}")]
+    Arrow(String),
 }
 
 /// One shared multi-threaded Tokio runtime for all reads in the process. The async
@@ -164,10 +175,20 @@ pub fn read_parquet_many(
 }
 
 /// Process-wide cache of parsed Parquet footers, keyed by URI: `(file_size, metadata)`.
-/// Parquet files are write-once, so the footer is immutable and safe to cache. This is
-/// the "never read the same metadata twice" guarantee: multiple splits of one file, and
-/// repeated queries over warm (session-fleet) workers, parse + fetch the footer ONCE
-/// instead of per read. `ArrowReaderMetadata` is `Arc`-backed, so a hit is a cheap clone.
+///
+/// This is the "never read the same metadata twice" guarantee: multiple splits of one
+/// file, and repeated queries over warm (session-fleet) workers, fetch + parse the footer
+/// ONCE instead of per read. `ArrowReaderMetadata` is `Arc`-backed, so a hit is a cheap
+/// clone.
+///
+/// It used to be justified by "Parquet files are write-once, so the footer is immutable".
+/// That holds for an immutable lake and not for a pipeline re-run, which overwrites its
+/// own output under the same deterministic name. The stored size is therefore *checked*
+/// rather than merely recorded: a hit whose file has changed size is treated as a miss.
+///
+/// The failure this prevents is not a stale-looking answer — it is reading the new bytes
+/// with the **old row-group offsets**, which surfaces as a corrupt-file error
+/// (`Column cannot have more than one dictionary`) on a perfectly valid file.
 fn meta_cache(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, ArrowReaderMetadata)>> {
     static C: OnceLock<
@@ -176,18 +197,78 @@ fn meta_cache(
     C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Load many files' Parquet footers in ONE runtime pass, best-effort, in URI order.
+///
+/// The metadata counterpart to [`read_parquet_many`]: footer loads are latency-bound
+/// round trips, so they overlap under the same file-concurrency budget instead of running
+/// one at a time. Every load goes through [`load_metadata_cached`], so a file the reader
+/// has already touched this process costs one HEAD rather than a fetch and parse.
+///
+/// A file whose footer cannot be read maps to `None` rather than failing the batch — a
+/// statistics pass over a directory must survive one unreadable object, and the caller
+/// counts how many it actually got so it can decline to report an exact row count.
+pub(crate) fn load_metadata_many(
+    uris: &[String],
+) -> Result<Vec<Option<ArrowReaderMetadata>>, IoError> {
+    runtime().block_on(async {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(file_concurrency()));
+        let handles: Vec<_> = uris
+            .iter()
+            .map(|uri| {
+                let uri = uri.clone();
+                let sem = sem.clone();
+                tokio::spawn(async move {
+                    let _permit = sem.acquire_owned().await;
+                    let resolved = store::resolve(&uri)?;
+                    load_metadata_cached(&uri, &resolved).await.map(|(_, m)| m)
+                })
+            })
+            .collect();
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            // A panicked task is the only fatal case; a failed *read* is just a skipped file.
+            match h.await {
+                Ok(Ok(md)) => out.push(Some(md)),
+                Ok(Err(_)) => out.push(None),
+                Err(e) => return Err(IoError::Store(e.to_string())),
+            }
+        }
+        Ok(out)
+    })
+}
+
 async fn load_metadata_cached(
     uri: &str,
     resolved: &store::Resolved,
 ) -> Result<(u64, ArrowReaderMetadata), IoError> {
-    if let Some(hit) = meta_cache().lock().unwrap().get(uri) {
-        return Ok(hit.clone());
-    }
-    // Cold: one HEAD for the size, then one ranged GET for the footer (no probing), parse
-    // once. Stored so no later read of this file re-reads or re-parses the footer.
+    let cached = meta_cache().lock().unwrap().get(uri).cloned();
+    // One HEAD confirms the file is the one the entry describes. It is the same request
+    // the cold path makes, and it leaves the expensive half — the ranged footer GET and
+    // the parse — served from the cache, so a hit still costs a single round trip rather
+    // than a fetch-and-parse. Serving an unvalidated hit costs correctness instead.
     let meta = resolved.store.head(&resolved.path).await?;
+    if let Some((size, amd)) = cached {
+        if size == meta.size {
+            return Ok((size, amd));
+        }
+    }
+    // Cold or changed: one ranged GET for the footer (no probing), parsed once. Stored so
+    // no later read of this file re-fetches or re-parses it.
+    // Load the ColumnIndex/OffsetIndex alongside the footer. They are what `page_index`
+    // prunes with, they live in the same footer region the ranged GET already covers, and
+    // they are cached with it — so a read that never uses them pays a parse of a few KB,
+    // while one that does skips whole pages instead of decoding them.
+    //
+    // The preload flags must be set on the **reader**, not via
+    // `ArrowReaderOptions::with_page_index`. `ParquetObjectReader::get_metadata` ignores the
+    // options' page-index policy entirely and consults its own `preload_*` fields, so the
+    // options form compiles, runs, and silently loads no index at all — `column_index()`
+    // stays `None` and every page survives. That reads exactly like a working feature: the
+    // results are correct, the tests pass, and nothing is pruned.
     let mut probe = ParquetObjectReader::new(resolved.store.clone(), resolved.path.clone())
-        .with_file_size(meta.size);
+        .with_file_size(meta.size)
+        .with_preload_column_index(true)
+        .with_preload_offset_index(true);
     let amd = ArrowReaderMetadata::load_async(&mut probe, ArrowReaderOptions::new()).await?;
     meta_cache()
         .lock()
@@ -217,10 +298,9 @@ async fn read_parquet_async(
     // Predicate pushdown: drop the row-groups whose footer statistics prove no row can
     // match (a whole group of column-chunk GETs + decode skipped). Superset-safe — the
     // engine keeps the `Filter`, so a group we cannot prune is simply read and re-filtered.
-    if let Some(json) = predicate {
-        if let Some(pred) = predicate::parse(json) {
-            targets = predicate::surviving_row_groups(arrow_meta.metadata(), &pred, &targets);
-        }
+    let parsed = predicate.and_then(predicate::parse);
+    if let Some(pred) = parsed.as_ref() {
+        targets = predicate::surviving_row_groups(arrow_meta.metadata(), pred, &targets);
     }
     if targets.is_empty() {
         return Ok(Vec::new()); // every row-group pruned → provably empty
@@ -254,12 +334,33 @@ async fn read_parquet_async(
         let reader = ParquetObjectReader::new(store.clone(), loc.clone()).with_file_size(size);
         let amd = arrow_meta.clone();
         let proj = projection.clone();
+        // Page-level pruning *within* a surviving row group. Computed here, on the metadata
+        // this task already holds, and scoped to this one row group — which is what makes
+        // the selection's row numbering trivially correct, since the builder below reads
+        // exactly this group and nothing else.
+        let selection = parsed
+            .as_ref()
+            .and_then(|pred| page_index::row_selection(arrow_meta.metadata(), pred, rg));
+        let bloom_pred = parsed.clone();
+        let bloom_meta = arrow_meta.clone();
         tokio::spawn(async move {
             let mut b = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, amd)
                 .with_batch_size(batch_size)
                 .with_row_groups(vec![rg]);
             if let Some(p) = proj {
                 b = b.with_projection(p);
+            }
+            if let Some(s) = selection {
+                b = b.with_row_selection(s);
+            }
+            // Last, and only for equality predicates: the bloom. It is the one pruning step
+            // that costs a round trip, so it runs after the free ones have narrowed things,
+            // and it answers the case they cannot — an equality on a high-cardinality
+            // unordered column, where every page's [min, max] spans the domain.
+            if let Some(pred) = bloom_pred.as_ref() {
+                if bloom::provably_absent(&mut b, bloom_meta.metadata(), pred, rg).await {
+                    return Ok(Vec::new());
+                }
             }
             let stream = b.build()?;
             stream.try_collect::<Vec<RecordBatch>>().await
@@ -544,11 +645,9 @@ mod tests {
         let p64 = dir.join("u64.parquet");
         let schema64 = Arc::new(Schema::new(vec![Field::new("u", DataType::UInt64, false)]));
         let big = 10_000_000_000_000_000_000u64; // > i64::MAX
-        let u64b = RecordBatch::try_new(
-            schema64,
-            vec![Arc::new(UInt64Array::from(vec![5u64, big]))],
-        )
-        .unwrap();
+        let u64b =
+            RecordBatch::try_new(schema64, vec![Arc::new(UInt64Array::from(vec![5u64, big]))])
+                .unwrap();
         write_parquet(&p64, &[u64b], 1000);
         // `u >= 9e18` (< i64::MAX) must keep the group — `big` matches.
         let ge64 = r#"{"node":"cmp","col":"u","op":"ge","lit":9000000000000000000}"#;
@@ -574,6 +673,168 @@ mod tests {
         assert_eq!(rows, 500);
         assert_eq!(out[0].num_columns(), 1);
         assert_eq!(out[0].schema().field(0).name(), "b");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod bloom_tests {
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    use super::*;
+
+    /// Write a file whose `k` column carries a bloom filter.
+    ///
+    /// Batcher's own writer cannot emit blooms (the pinned pyarrow has no option for it),
+    /// so this fixture is what makes the read path testable at all. Without it the feature
+    /// would be unverifiable — and an unverifiable pruner is exactly how the page-index
+    /// work first shipped as a silent no-op.
+    fn write_with_bloom(path: &std::path::Path, keys: &[i64], rows_per_group: usize) {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(keys.to_vec()))],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_bloom_filter_enabled(true)
+            .set_max_row_group_size(rows_per_group)
+            .build();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    fn dir_for(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bcio_bloom_{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn eq_pred(value: i64) -> String {
+        format!(r#"{{"node":"cmp","col":"k","op":"eq","lit":{value}}}"#)
+    }
+
+    /// The gap this closes: an equality on a high-cardinality *unordered* column, where
+    /// every group's `[min, max]` spans the domain so range pruning achieves nothing.
+    fn scattered(n: i64) -> Vec<i64> {
+        // A fixed stride over a large domain: each row group's min/max still spans nearly
+        // everything, so only a bloom can decide. Deterministic (no rng in a unit test).
+        (0..n).map(|i| (i * 7919) % 1_000_003).collect()
+    }
+
+    #[test]
+    fn a_value_that_is_absent_prunes_every_row_group() {
+        let dir = dir_for("absent");
+        let p = dir.join("t.parquet");
+        let keys = scattered(4000);
+        write_with_bloom(&p, &keys, 1000);
+
+        // 1_000_003 is the modulus, so no key can equal it — and it sits inside the
+        // min/max range, which is what makes range pruning useless here.
+        let out = read_parquet_filtered(p.to_str().unwrap(), &[], None, 512, &eq_pred(1_000_002))
+            .unwrap();
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+
+        assert!(!keys.contains(&1_000_002));
+        assert_eq!(rows, 0, "bloom did not prune an absent value");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_value_that_is_present_is_never_pruned() {
+        // The safety direction. A bloom has no false negatives, so a present value must
+        // always survive — losing it would be silent data loss.
+        let dir = dir_for("present");
+        let p = dir.join("t.parquet");
+        let keys = scattered(4000);
+        write_with_bloom(&p, &keys, 1000);
+
+        for probe in [keys[0], keys[1500], keys[3999]] {
+            let out = read_parquet_filtered(p.to_str().unwrap(), &[], None, 512, &eq_pred(probe))
+                .unwrap();
+            let found: Vec<i64> = out
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert!(
+                found.contains(&probe),
+                "bloom pruned a value that is present"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_without_blooms_is_unaffected() {
+        let dir = dir_for("noindex");
+        let p = dir.join("t.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from((0..1000i64).collect::<Vec<_>>()))],
+        )
+        .unwrap();
+        let file = std::fs::File::create(&p).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        // No bloom to consult; the row group is read and the engine's Filter does the work.
+        let out =
+            read_parquet_filtered(p.to_str().unwrap(), &[], None, 512, &eq_pred(500)).unwrap();
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+
+        assert!(rows > 0, "a file without blooms must still be read");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_disjunction_needs_both_sides_absent_to_prune() {
+        // The lattice, in the direction that loses rows if inverted: `a OR b` is empty only
+        // when BOTH are. Treating one absent side as proof would drop the other's matches.
+        let dir = dir_for("disjunction");
+        let p = dir.join("t.parquet");
+        let keys = scattered(4000);
+        write_with_bloom(&p, &keys, 1000);
+        let present = keys[42];
+        let pred = format!(
+            r#"{{"node":"or","left":{},"right":{}}}"#,
+            eq_pred(1_000_002),
+            eq_pred(present)
+        );
+
+        let out = read_parquet_filtered(p.to_str().unwrap(), &[], None, 512, &pred).unwrap();
+        let found: Vec<i64> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+
+        assert!(
+            found.contains(&present),
+            "an OR was pruned by one absent side"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

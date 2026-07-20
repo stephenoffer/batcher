@@ -194,6 +194,11 @@ def execute_local_metered(
     rather than raising.
     """
     _native = engine()
+    # The same tracing bridge `LocalExecutor.execute` installs. Without it a session whose
+    # queries are *all* profiled (`stats()` / `explain(analyze=True)`) — which is exactly
+    # when data-plane traces are wanted — never got any, because this second entry point to
+    # the same native call silently skipped the install.
+    _ensure_native_tracing(_native)
     cfg = active_config()
     out, metrics_json = _native.execute_plan_metered(
         plan.to_json(), sources, cfg.engine_config_json_with(plan.op_budgets())

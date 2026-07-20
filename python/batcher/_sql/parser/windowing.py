@@ -18,6 +18,97 @@ def _is_window(p) -> bool:
     return isinstance(_unwrap_alias(p), exp.Window)
 
 
+def _own_windows(p) -> list:
+    """Every window in projection `p` that belongs to *this* query's scope.
+
+    A window inside a scalar subquery belongs to the inner query and is evaluated
+    when that subquery is translated, so it is excluded — the same scoping rule
+    `_has_aggregate` applies to aggregates.
+    """
+    from sqlglot import expressions as exp
+
+    return [
+        w for w in _unwrap_alias(p).find_all(exp.Window) if w.find_ancestor(exp.Subquery) is None
+    ]
+
+
+def _has_window(p) -> bool:
+    """Whether `p` contains a window function anywhere, not only as the whole item.
+
+    `_is_window` only sees a projection that *is* a window (`sum(x) OVER () AS r`).
+    A window nested inside a larger expression (`sum(x) OVER () + 1`, or TPC-DS q98's
+    `sum(x) * 100 / sum(sum(x)) OVER (...)`) is just as much a window query, and
+    treating it as an ordinary scalar is what made those fail.
+    """
+    return bool(_own_windows(p))
+
+
+def hoist_nested_windows(projections) -> tuple[list, list]:
+    """Replace windows nested inside larger projections with `__bc_win<n>` columns.
+
+    A window that *is* the whole projection is left alone — `_window` already names its
+    output column with the user's alias and `_projection_map` reads it back. A window
+    nested in a bigger expression cannot be handled that way, because the surrounding
+    arithmetic has to be evaluated *after* the window column exists. Each such window
+    becomes a synthetic `__bc_win<n>` item computed by `_window`, and the projection
+    keeps only a reference to it. The `__bc_` prefix keeps it out of `SELECT *`.
+
+    Args:
+        projections: The SELECT list.
+
+    Returns:
+        The rewritten projections and the synthetic window items to materialize.
+    """
+    from sqlglot import expressions as exp
+
+    synthetic: list = []
+    out: list = []
+    for p in projections:
+        if _is_window(p):  # a whole-item window keeps the existing direct path
+            out.append(p)
+            continue
+        nested = _own_windows(p)
+        if not nested:
+            out.append(p)
+            continue
+        p = p.copy()
+        for win in _own_windows(p):
+            alias = f"__bc_win{len(synthetic)}"
+            # Copy before replacing: `synthetic` keeps the window expression itself,
+            # the projection keeps only a reference to its output column.
+            synthetic.append(exp.alias_(win.copy(), alias))
+            win.replace(exp.column(alias))
+        out.append(p)
+    return out, synthetic
+
+
+def rewrite_aggs_in_windows(tr, items) -> None:
+    """Point aggregates inside window items at the columns the GROUP BY produced.
+
+    In an aggregate query a window runs *after* grouping, so `sum(sum(x)) OVER ()` is a
+    window sum over the already-grouped `sum(x)`. The inner aggregate was registered by
+    `_aggregate` and materialized as a column; replacing it in place with a reference to
+    that column is what lets the window pass see a plain column argument (which is all
+    `_window_func` / `_window_order` / `_window_partition` accept).
+
+    The outer aggregate is deliberately not in `_agg_map` — `_aggregate` skips any
+    aggregate whose parent is a `Window` — so only the inner one is rewritten.
+
+    Args:
+        tr: The translator, read for its live `_agg_map`.
+        items: The window projection items to rewrite, in place.
+    """
+    from sqlglot import expressions as exp
+
+    if not tr._agg_map:
+        return
+    for item in items:
+        for agg in list(_unwrap_alias(item).find_all(exp.AggFunc)):
+            entry = tr._agg_map.get(agg.sql())
+            if entry is not None:
+                agg.replace(exp.column(entry[0]))
+
+
 def _inline_named_windows(node) -> None:
     """Copy `WINDOW w AS (PARTITION BY … ORDER BY …)` specs onto `OVER w` refs.
 
@@ -213,11 +304,76 @@ def _const_int(node, ctx: str) -> int:
     raise NotImplementedError(f"window function {ctx!r} requires a constant integer argument")
 
 
+def _ignore_nulls_func(win, fn, order):
+    """Map `<value fn>(x IGNORE NULLS) OVER (...)` onto the runtime's fill primitives.
+
+    `IGNORE NULLS` makes a value function skip nulls when picking its answer. Two shapes
+    are exactly the engine's existing fills, so they need no new operator:
+
+    * ``last_value(x IGNORE NULLS)`` over the default frame (everything up to the current
+      row) is "the most recent non-null so far" — a **forward fill**.
+    * ``first_value(x IGNORE NULLS)`` over ``CURRENT ROW AND UNBOUNDED FOLLOWING`` is "the
+      next non-null from here" — a **backward fill**.
+
+    Other combinations (`lag`/`lead`/`nth_value` with IGNORE NULLS, or a value function
+    over some other frame) need per-row null-skipping the runtime does not have, and are
+    rejected rather than silently answered with the null-*respecting* result — which would
+    be a wrong answer, not a slower one.
+
+    Args:
+        win: The `Window` node, read for its frame spec.
+        fn: The inner function node that `IgnoreNulls` wraps.
+        order: The window's ORDER BY, required by every value function.
+
+    Returns:
+        The `ds.window` functions-value — a `(fill, column)` pair.
+    """
+    from sqlglot import expressions as exp
+
+    name = type(fn).__name__.lower()
+    if not order:
+        raise NotImplementedError(f"window function {name!r} requires ORDER BY")
+    arg = fn.this
+    if not isinstance(arg, exp.Column):
+        raise NotImplementedError("IGNORE NULLS supports a single plain column argument only")
+
+    def bound(key: str) -> str:
+        """A frame bound as an upper-case keyword, or "" when it is an offset literal.
+
+        An offset bound (`1 PRECEDING`) parses as a `Literal`, not a keyword string, so it
+        must not be coerced — it simply is not one of the shapes handled here.
+        """
+        if spec is None:
+            return ""
+        v = spec.args.get(key)
+        return v.upper() if isinstance(v, str) else ""
+
+    spec = win.args.get("spec")
+    kind, start, end = bound("kind"), bound("start"), bound("end")
+    # The default frame (no spec) runs from the partition start to the current row, which
+    # is what makes `last_value` a forward fill.
+    trailing = spec is None or (start == "UNBOUNDED" and end == "CURRENT ROW")
+    leading = kind in {"ROWS", "RANGE"} and start == "CURRENT ROW" and end == "UNBOUNDED"
+
+    if name == "lastvalue" and trailing:
+        return ("forward_fill", arg.name)
+    if name == "firstvalue" and leading:
+        return ("backward_fill", arg.name)
+    raise NotImplementedError(
+        f"{name}(x IGNORE NULLS) over this frame is not supported. Supported: "
+        "last_value(x IGNORE NULLS) over the default frame (a forward fill) and "
+        "first_value(x IGNORE NULLS) OVER (... ROWS BETWEEN CURRENT ROW AND UNBOUNDED "
+        "FOLLOWING) (a backward fill)"
+    )
+
+
 def _window_func(win, order):
     """Map a window function node to a `ds.window` functions-value."""
     from sqlglot import expressions as exp
 
     fn = win.this
+    if type(fn).__name__.lower() == "ignorenulls":
+        return _ignore_nulls_func(win, fn.this, order)
     name = type(fn).__name__.lower()
 
     # Ranking family (no input; needs ORDER BY). `percent_rank`/`cume_dist` produce
@@ -241,7 +397,17 @@ def _window_func(win, order):
         n = fn.this
         if n is None or getattr(n, "this", None) is None:
             raise NotImplementedError("ntile(n) requires a constant bucket count")
-        return ("ntile", int(n.this))
+        # Via `_const_int`, not `int(n.this)`: a negative literal is a `Neg` wrapping a
+        # `Literal`, so the naive read raised a bare `TypeError` from inside sqlglot.
+        buckets = _const_int(n, "ntile")
+        # The engine's `ntile` clamps `buckets.max(1)`, so an unvalidated 0 or negative
+        # silently put every row in bucket 1 instead of failing. `bt.ntile()` already
+        # rejects `n < 1`; the SQL front-end must agree (DuckDB errors here too).
+        if buckets < 1:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(f"ntile(n) requires n >= 1, got {buckets}")
+        return ("ntile", buckets)
 
     aggregates = {"sum": "sum", "avg": "avg", "min": "min", "max": "max", "count": "count"}
     if name in aggregates:

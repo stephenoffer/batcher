@@ -19,20 +19,19 @@ or set ``AWS_ENDPOINT_URL`` (and HDFS via ``hdfs://namenode:8020/path``).
 
 from __future__ import annotations
 
-import contextlib
-import fnmatch
 import functools
-import io
 import os
-import posixpath
-import uuid
-from collections.abc import Iterator
-from typing import IO, Any, Protocol, runtime_checkable
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.fs as pafs
 
 from batcher._internal.errors import IOError
+
+# The `FileSystem` protocol and its `pyarrow.fs` adapter live in a sibling module (the
+# interface, separate from this module's job of choosing a backend for a URI); re-exported
+# here because every caller and test imports them by this path.
+from batcher.io._backend import FileSystem, _ArrowFileSystem, _scheme
 
 # The local-SSD read-through cache lives in a sibling module (its own responsibility);
 # re-exported here since the filesystem is its only caller and tests import it by this path.
@@ -55,9 +54,6 @@ _OBJECT_STORE_SCHEMES = frozenset(
 )
 # Cloud scheme aliases → the canonical scheme `from_uri` / fsspec understand.
 _SCHEME_ALIASES = {"s3a": "s3", "gcs": "gs", "abfss": "abfs", "wasbs": "wasb"}
-# Read-ahead buffer for a remote handle-path read — 1 MiB coalesces the split readers'
-# tiny reads into few large GETs instead of the 8 KiB `BufferedReader` default.
-_REMOTE_READ_BUFFER = 1 << 20
 
 
 @functools.cache
@@ -86,325 +82,6 @@ def cap_arrow_cpu_threads() -> None:
         pa.set_cpu_count(usable)
 
 
-def _scheme(path: str) -> str:
-    """The URI scheme of `path` (``""`` for a bare local path)."""
-    idx = path.find("://")
-    return path[:idx].lower() if idx > 0 else ""
-
-
-def _is_data_file(path: str) -> bool:
-    """Whether `path`'s basename is a data file rather than a metadata/marker file.
-
-    Files whose basename starts with ``_`` or ``.`` are skipped — ``_SUCCESS``,
-    ``_metadata``, ``_committed_*``, ``.crc``, ``.DS_Store``, and Spark temp files.
-    This is the Spark/Hive/Hadoop convention and fixes reading those marker files as
-    data when a directory or glob is expanded (Ray Data's ray#57704 / ray#61373:
-    ``read_parquet`` choking on ``_SUCCESS``/``.crc`` next to the real files)."""
-    base = os.path.basename(path.rstrip("/"))
-    return bool(base) and not base.startswith(("_", "."))
-
-
-@runtime_checkable
-class FileSystem(Protocol):
-    """The minimal filesystem surface the IO bases depend on."""
-
-    def expand(self, path: str, *, suffix: str | tuple[str, ...]) -> list[str]:
-        """Resolve a file, directory, or glob into a sorted list of file paths.
-
-        ``suffix`` may be a single extension or a tuple of them; a directory listing
-        keeps files matching *any* of them in one pass (a source with several accepted
-        extensions must not re-list the directory once per extension).
-        """
-        ...
-
-    def open(self, path: str, mode: str = "rb") -> IO[Any]:
-        """Open a single file for reading; the handle is accepted by pyarrow."""
-        ...
-
-    def native_read_target(self, path: str) -> tuple[Any, str] | None:
-        """The `(pyarrow.fs.FileSystem, in_path)` pair for `path`, or None.
-
-        A reader handed this pair does its own I/O in C++ — pre-buffering, parallel column
-        chunks, no GIL. Handed a Python file object it round-trips every read through the
-        interpreter, serializing its decode threads: a four-column read of a 16 GB Parquet
-        file took 2,831 ms through a handle against 1,653 ms through this pair (one column
-        is identical — the cost is per column chunk). None when the backend cannot expose
-        one (a read-through byte cache serves reads through `open`).
-        """
-        ...
-
-    def atomic_writer(self, path: str) -> contextlib.AbstractContextManager[IO[Any]]:
-        """A context manager yielding a write handle that becomes visible at `path`
-        only on clean exit. A crash/exception mid-write leaves any prior file at
-        `path` intact (no truncated/half-written output) — closing Ray Data's
-        ``write_parquet`` overwrite data-loss (ray#62019)."""
-        ...
-
-    def size(self, path: str) -> int:
-        """The size of `path` in bytes."""
-        ...
-
-    def exists(self, path: str) -> bool:
-        """Whether a file already exists at `path`. With atomic writes, a file is
-        present only if a prior write fully committed it — so this is the
-        skip-if-done test for resumable writes."""
-        ...
-
-    def mkdirs(self, path: str, *, exist_ok: bool = True) -> None:
-        """Create a directory and any missing parents."""
-        ...
-
-    def list_dirs(self, path: str) -> list[str]:
-        """The immediate subdirectories of `path` (one cheap, non-recursive list).
-
-        Used to distribute directory-tree listing: the driver enumerates top-level
-        partition dirs, and each worker lists only its own subtree.
-        """
-        ...
-
-    def remove(self, path: str) -> None:
-        """Delete a single file (no error if it is already absent). Used to clear the
-        stale part-files left behind when compacting a multi-file output in place."""
-        ...
-
-
-class _ArrowFileSystem:
-    """A `pyarrow.fs.FileSystem` behind the small façade the IO bases use.
-
-    `prefix` is the ``scheme://authority`` portion that pyarrow strips from a URI to
-    get an in-filesystem path (``""`` for local); it is removed on the way in and
-    re-attached on the way out, so callers always see full paths/URIs while pyarrow
-    sees its bucket-relative ones.
-    """
-
-    __slots__ = ("_atomic_rename", "_cacheable", "_fs", "_prefix", "_strip_query")
-
-    def __init__(
-        self,
-        fs: pafs.FileSystem,
-        prefix: str,
-        *,
-        atomic_rename: bool,
-        strip_query: bool = True,
-        cacheable: bool = False,
-    ) -> None:
-        self._fs = fs
-        self._prefix = prefix
-        self._atomic_rename = atomic_rename
-        # Remote object-store reads may be served from a local-SSD read-through cache
-        # (`FileBytesCache`, below) when one is configured; local backends never cache
-        # (the bytes are already local).
-        self._cacheable = cacheable
-        # Native backends carry config in the URI query (e.g. ``?endpoint_override=``),
-        # which pyarrow has already consumed — so it is dropped from the object path.
-        # fsspec-backed URLs (e.g. presigned ``https://…?signature=…``) keep it: the
-        # query IS part of the addressable object there.
-        self._strip_query = strip_query
-
-    # ---- path <-> URI mapping ---------------------------------------------
-    def _p(self, path: str) -> str:
-        """A full path/URI → the in-filesystem path the backend expects."""
-        p = path.split("?", 1)[0] if self._strip_query else path
-        if self._prefix and p.startswith(self._prefix):
-            return p[len(self._prefix) :]
-        return p
-
-    def _uri(self, in_path: str) -> str:
-        """An in-filesystem path → the full path/URI callers see."""
-        return f"{self._prefix}{in_path}" if self._prefix else in_path
-
-    def native_read_target(self, path: str) -> tuple[pafs.FileSystem, str] | None:
-        """This backend *is* a pyarrow filesystem, so hand it over directly.
-
-        Withheld when a read-through byte cache is configured: that cache serves reads
-        through `open`, and bypassing it would silently disable it.
-        """
-        if self._cacheable and get_file_cache() is not None:
-            return None
-        return self._fs, self._p(path)
-
-    # ---- shared surface ----------------------------------------------------
-    def expand(self, path: str, *, suffix: str | tuple[str, ...]) -> list[str]:
-        if any(ch in path for ch in "*?["):
-            return self._glob(path)
-        # `str.endswith` takes a tuple directly, so a multi-extension source lists the
-        # directory once and keeps any matching file — not once per extension.
-        suffixes = (suffix,) if isinstance(suffix, str) else tuple(suffix)
-        # A trailing slash on an object-store directory (``s3://bucket/dir/``) makes
-        # pyarrow's `get_file_info` return `NotFound` — object stores have no real
-        # directories, so the key ``dir/`` does not exist as an object. Strip it (but
-        # never the lone root ``/``) so a directory URI written either way resolves to
-        # the same listing. Harmless on local/`file://` paths (a dir resolves the same
-        # with or without the slash).
-        in_path = self._p(path)
-        if len(in_path) > 1:
-            in_path = in_path.rstrip("/")
-        info = self._fs.get_file_info(in_path)
-        if info.type == pafs.FileType.Directory:
-            sel = pafs.FileSelector(in_path, recursive=False)
-            files = sorted(
-                fi.path
-                for fi in self._fs.get_file_info(sel)
-                if fi.type == pafs.FileType.File
-                and fi.path.endswith(suffixes)
-                and _is_data_file(fi.path)
-            )
-            if not files:
-                raise IOError(f"no {'/'.join(suffixes)} files found in directory {path!r}")
-            return [self._uri(f) for f in files]
-        if info.type == pafs.FileType.NotFound:
-            raise IOError(f"path {path!r} does not exist")
-        return [path]
-
-    def _glob(self, pattern: str) -> list[str]:
-        in_pat = self._p(pattern)
-        # Fast path: push the glob's literal key-prefix to the store's own prefix-scoped
-        # LIST (via fsspec) — globbing `dir/00000*.jpg` in a 200k-object bucket is one LIST
-        # of the ~10 matches, not a page of every object. Opt-only: it short-circuits only
-        # on a positive hit, so the pyarrow listing below stays the correctness backstop.
-        fast = self._glob_prefix_scoped(pattern, in_pat)
-        if fast is not None:
-            return fast
-        # The directory portion before the first wildcard is the listing root.
-        base = in_pat
-        for i, ch in enumerate(in_pat):
-            if ch in "*?[":
-                base = posixpath.dirname(in_pat[:i])
-                break
-        recursive = "**" in in_pat
-        sel = pafs.FileSelector(base or ".", recursive=recursive, allow_not_found=True)
-        matches = sorted(
-            fi.path
-            for fi in self._fs.get_file_info(sel)
-            if fi.type == pafs.FileType.File
-            and _is_data_file(fi.path)
-            and fnmatch.fnmatch(fi.path, in_pat)
-        )
-        if not matches:
-            raise IOError(f"glob {pattern!r} matched no files")
-        return [self._uri(m) for m in matches]
-
-    def _glob_prefix_scoped(self, pattern: str, in_pat: str) -> list[str] | None:
-        """A prefix-scoped remote glob via fsspec, or ``None`` to fall back to pyarrow.
-
-        Returns matched URIs only when fsspec is installed for the scheme *and* found files,
-        so an empty/errored probe never masks the pyarrow listing (which owns the empty-is-
-        error and credential-failure semantics). Local/backendless schemes return ``None``.
-        """
-        scheme = _scheme(pattern)
-        if scheme in ("", "file"):
-            return None  # local globbing is already a cheap single-directory listing.
-        # Only worth it when the *filename* has a literal prefix before its wildcard
-        # (``dir/PREFIX*.ext``) — that prefix scopes the LIST; a bare ``dir/*.ext`` lists
-        # the whole directory either way, so skip fsspec and let pyarrow do it.
-        last = in_pat.rsplit("/", 1)[-1]
-        first_wild = min((last.find(c) for c in "*?[" if c in last), default=len(last))
-        if first_wild <= 0:
-            return None
-        try:
-            import fsspec
-        except ImportError:
-            return None
-        try:
-            backend = fsspec.filesystem(scheme)
-            matches = backend.glob(in_pat)
-        except Exception:
-            return None  # missing backend (e.g. s3fs), credential, or API issue → pyarrow.
-        files = sorted(self._uri(m) for m in matches if _is_data_file(m))
-        return files or None
-
-    def open(self, path: str, mode: str = "rb") -> IO[Any]:  # noqa: ARG002 (read-only façade)
-        # A buffered wrapper over the pyarrow input file gives the full Python file protocol
-        # (read/readline/seek) the byte-range split readers rely on, and pyarrow accepts it.
-        in_path = self._p(path)
-        local = self._cached_local(in_path)
-        if local is not None:
-            return io.BufferedReader(open(local, "rb"))
-        # A 1 MiB buffer (not the 8 KiB default) coalesces the tiny reads the byte-range
-        # split readers issue into far fewer, larger GETs against object storage — the
-        # small-request tax on a high-latency remote path. Matches `_download`'s chunk size.
-        return io.BufferedReader(
-            self._fs.open_input_file(in_path),  # type: ignore[arg-type]
-            buffer_size=_REMOTE_READ_BUFFER,
-        )
-
-    def _cached_local(self, in_path: str) -> str | None:
-        """The local-cache copy of a remote file, fetching it on a miss; `None` when
-        caching is off or unavailable. Best-effort — any failure falls back to a direct
-        remote read, so the cache never breaks a read.
-
-        The cache key folds in the file's size and mtime (one cheap HEAD/stat per open),
-        so overwriting the same remote path with new content is a miss, not a stale hit
-        — correctness over saving a metadata round-trip."""
-        if not self._cacheable:
-            return None
-        try:
-            cache = get_file_cache()
-            if cache is None:
-                return None
-            info = self._fs.get_file_info(in_path)
-            key = f"{in_path}\0{info.size}\0{info.mtime_ns}"
-            return cache.get_or_fetch(key, lambda dst: self._download(in_path, dst))
-        except Exception:  # pragma: no cover - a cache failure must not break reads
-            return None
-
-    def _download(self, in_path: str, dst: str) -> None:
-        """Stream a remote file to local `dst` (chunked, so a large file never fully
-        materializes in memory)."""
-        with self._fs.open_input_file(in_path) as src, open(dst, "wb") as out:
-            while chunk := src.read(1 << 20):
-                out.write(chunk)
-
-    @contextlib.contextmanager
-    def atomic_writer(self, path: str) -> Iterator[IO[Any]]:
-        dest = self._p(path)
-        # Ensure the parent directory exists (pyarrow's output stream does not create
-        # it). Cheap and idempotent; a no-op marker on object stores.
-        parent = posixpath.dirname(dest)
-        if parent:
-            self._fs.create_dir(parent, recursive=True)
-        if not self._atomic_rename:
-            # Object store: a single PUT is atomic — write straight to the destination.
-            with self._fs.open_output_stream(dest) as fh:
-                yield fh
-            return
-        # Local / HDFS: write a unique temp sibling, then atomically rename into place;
-        # on any error drop the temp so the prior file at `path` is never touched.
-        tmp = f"{dest}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
-        try:
-            with self._fs.open_output_stream(tmp) as fh:
-                yield fh
-            self._fs.move(tmp, dest)
-        except BaseException:
-            with contextlib.suppress(Exception):
-                self._fs.delete_file(tmp)
-            raise
-
-    def size(self, path: str) -> int:
-        return self._fs.get_file_info(self._p(path)).size or 0
-
-    def exists(self, path: str) -> bool:
-        return self._fs.get_file_info(self._p(path)).type != pafs.FileType.NotFound
-
-    def mkdirs(self, path: str, *, exist_ok: bool = True) -> None:  # noqa: ARG002 (parity)
-        # pyarrow `create_dir(recursive=True)` is already exist-ok; `exist_ok` is kept
-        # for interface parity.
-        self._fs.create_dir(self._p(path), recursive=True)
-
-    def list_dirs(self, path: str) -> list[str]:
-        sel = pafs.FileSelector(self._p(path), recursive=False, allow_not_found=True)
-        dirs = sorted(
-            fi.path for fi in self._fs.get_file_info(sel) if fi.type == pafs.FileType.Directory
-        )
-        return [self._uri(d) for d in dirs]
-
-    def remove(self, path: str) -> None:
-        in_path = self._p(path)
-        if self._fs.get_file_info(in_path).type != pafs.FileType.NotFound:
-            with contextlib.suppress(FileNotFoundError):
-                self._fs.delete_file(in_path)
-
-
 class LocalFileSystem(_ArrowFileSystem):
     """The local filesystem (``pyarrow.fs.LocalFileSystem``), kept as a named type for
     callers/tests that construct it directly."""
@@ -420,7 +97,12 @@ def _local_prefix(path: str) -> str:
     return "file://" if path.startswith("file://") else ""
 
 
-def resolve_filesystem(path: str) -> FileSystem:
+def resolve_filesystem(
+    path: str,
+    *,
+    filesystem: Any = None,
+    storage_options: dict[str, str] | None = None,
+) -> FileSystem:
     """Return the `pyarrow.fs`-backed façade for `path`, dispatching on its scheme.
 
     Local and ``file://`` paths use the local filesystem; ``s3``/``gs``/``hdfs``/
@@ -428,9 +110,26 @@ def resolve_filesystem(path: str) -> FileSystem:
     region, and on-prem ``endpoint_override`` come from the URI query string or the
     environment); an unknown scheme falls back to an fsspec backend wrapped behind the
     same `pyarrow.fs` interface, so third-party backends work with no code change.
+
+    `filesystem` accepts an already-constructed filesystem — a `pyarrow.fs.FileSystem`,
+    a `pyarrow.fs.PyFileSystem`, or an **fsspec** filesystem instance — and uses it
+    verbatim. This is the "bring your own filesystem" path: a user who has already built
+    an `S3FileSystem` with a custom retry strategy, or holds an authenticated fsspec
+    handle, hands it in rather than re-expressing it as a URI. It wins over
+    `storage_options`.
+
+    `storage_options` is the portable credential dict every other engine speaks (fsspec,
+    delta-rs, Polars, pandas): keys like ``key``/``secret``/``endpoint_url`` for S3,
+    ``token`` for GCS, ``account_name``/``account_key`` for Azure. It is applied to the
+    native backend, so a boto/gcsfs/adlfs-style config works without threading each value
+    into the URI. Unlike a live `filesystem` object it is a plain dict, so it survives to a
+    distributed worker unchanged — which is why the file sources thread *this*, not the
+    handle, onto their splits.
     """
+    if filesystem is not None:
+        return _wrap_user_filesystem(path, filesystem)
     scheme = _scheme(path)
-    if scheme in ("", "file"):
+    if scheme in ("", "file") and not storage_options:
         prefix = _local_prefix(path)
         return _ArrowFileSystem(pafs.LocalFileSystem(), prefix, atomic_rename=True)
     # Cache the resolved object-store filesystem per (scheme, authority, query-options): every
@@ -442,7 +141,61 @@ def resolve_filesystem(path: str) -> FileSystem:
     base = path.split("?", 1)[0]
     query = path.split("?", 1)[1] if "?" in path else ""
     authority = base.split("://", 1)[1].split("/", 1)[0] if "://" in base else ""
-    return _resolve_uri_fs(f"{scheme}://{authority}" + (f"?{query}" if query else ""))
+    reduced = f"{scheme}://{authority}" + (f"?{query}" if query else "")
+    if storage_options:
+        # A dict is unhashable and would defeat the lru_cache, so fold it into a hashable
+        # key rather than dropping the cache — a scan still resolves the FS once, not per
+        # split. Sorted so option order never splits the cache.
+        return _resolve_uri_fs_opts(reduced, tuple(sorted(storage_options.items())))
+    return _resolve_uri_fs(reduced)
+
+
+def _wrap_user_filesystem(path: str, filesystem: Any) -> FileSystem:
+    """Wrap a user-provided filesystem in the façade, so the rest of IO is unchanged.
+
+    Accepts a native `pyarrow.fs.FileSystem`/`PyFileSystem` directly, and an fsspec
+    filesystem instance via pyarrow's `FSSpecHandler`. The prefix is derived the same way
+    the string paths' is — object stores strip the scheme, so the caller keeps passing full
+    URIs and the façade maps them to in-store paths.
+    """
+    if isinstance(filesystem, pafs.FileSystem):
+        fs = filesystem
+    else:
+        # Duck-typed fsspec: anything with `_strip_protocol` is an fsspec AbstractFileSystem.
+        try:
+            from pyarrow.fs import FSSpecHandler, PyFileSystem
+        except ImportError as exc:  # pragma: no cover - pyarrow always ships these
+            raise IOError("wrapping an fsspec filesystem needs pyarrow's FSSpecHandler") from exc
+        if not hasattr(filesystem, "_strip_protocol"):
+            raise IOError(
+                "filesystem= must be a pyarrow.fs.FileSystem or an fsspec filesystem "
+                f"instance, got {type(filesystem).__name__}"
+            )
+        fs = PyFileSystem(FSSpecHandler(filesystem))
+    scheme = _scheme(path)
+    prefix = f"{scheme}://" if scheme not in ("", "file") else _local_prefix(path)
+    is_object_store = _SCHEME_ALIASES.get(scheme, scheme) in _OBJECT_STORE_SCHEMES
+    return _ArrowFileSystem(
+        fs, prefix, atomic_rename=not is_object_store, cacheable=is_object_store
+    )
+
+
+@functools.lru_cache(maxsize=128)
+def _resolve_uri_fs_opts(uri: str, options: tuple[tuple[str, str], ...]) -> FileSystem:
+    """`_resolve_uri_fs` for an explicit `storage_options` set — folded into `?query` so the
+    one builder handles both the URI-carried and dict-carried config identically.
+
+    A value may be an ``env:NAME`` / ``file:PATH`` reference, resolved here — on the machine
+    building the filesystem, which on a distributed read is the worker. That keeps a secret
+    key out of the `storage_options` dict that rides the split (only the reference travels),
+    the same discipline the crypto-key and connector-credential paths already use. The
+    cache keys on the *reference*, so the resolved secret never enters a cache key either."""
+    from batcher.io.credentials import resolve_secret
+
+    resolved = [(k, resolve_secret(v, what=f"storage option {k}") or "") for k, v in options]
+    extra = "&".join(f"{k}={v}" for k, v in resolved)
+    joined = f"{uri}{'&' if '?' in uri else '?'}{extra}" if extra else uri
+    return _resolve_uri_fs(joined)
 
 
 @functools.lru_cache(maxsize=128)
@@ -450,9 +203,32 @@ def _resolve_uri_fs(uri: str) -> FileSystem:
     """Build (once, cached) the `pyarrow.fs` façade for an object-store `uri` reduced to
     `scheme://authority?query` (see `resolve_filesystem`)."""
     scheme = _scheme(uri)
+    # Canonicalize BEFORE `from_uri`, not after. `s3a://` (the Hadoop spelling) and
+    # `gcs://` name backends pyarrow implements natively but does not answer to under
+    # those aliases, so asking it first and aliasing only in the failure path meant every
+    # Hadoop-ecosystem URI silently took the slower fsspec route — correct results, quietly
+    # worse, with nothing to indicate it.
+    canonical_uri = uri
+    canonical_scheme = _SCHEME_ALIASES.get(scheme, scheme)
+    if canonical_scheme != scheme:
+        canonical_uri = f"{canonical_scheme}{uri[len(scheme) :]}"
     try:
-        fs, in_path = pafs.FileSystem.from_uri(uri)
-    except (ValueError, OSError, pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        fs, in_path = pafs.FileSystem.from_uri(canonical_uri)
+    except (ValueError, OSError, pa.ArrowInvalid, pa.ArrowNotImplementedError) as e:
+        # "Scheme not implemented natively" (→ fsspec) vs "implemented, but you passed an
+        # option it does not take". Both arrive as ArrowInvalid; falling back on the second
+        # is harmful, because the fsspec path keeps the query string (`strip_query=False`,
+        # for presigned URLs) so a rejected `?anonymous=true` becomes part of the KEY —
+        # surfacing a config mistake as `NoSuchKey` on a path nobody asked for.
+        if "query parameter" in str(e):
+            # `from_uri` takes a narrow option set, but the `S3FileSystem` *constructor*
+            # takes the ones an on-prem store actually needs — explicit keys, `anonymous`,
+            # `force_virtual_addressing` (path- vs virtual-hosted style), timeouts, a proxy.
+            # Build it directly rather than refusing: refusing left Ceph-behind-a-proxy and
+            # path-style-only deployments with no in-URI escape hatch at all.
+            if canonical_scheme == "s3":
+                return _s3_with_options(uri)
+            raise IOError(f"unsupported option in {scheme}:// URI: {e}") from e
         # A scheme pyarrow.fs doesn't implement natively → fsspec fallback.
         return _fsspec_backed(scheme, uri)
     path = uri
@@ -464,16 +240,85 @@ def _resolve_uri_fs(uri: str) -> FileSystem:
     # Strip the trailing slash off `base` before the suffix math so the two align.
     base = path.split("?", 1)[0]
     trimmed = base.rstrip("/")
-    prefix = (
-        trimmed[: len(trimmed) - len(in_path)]
-        if in_path and trimmed.endswith(in_path)
-        else base[: len(base) - len(in_path)]
-    )
+    if in_path and trimmed.endswith(in_path):
+        # The common shape: the backend's path is a suffix of the URI.
+        prefix, root = trimmed[: len(trimmed) - len(in_path)], ""
+    else:
+        # Azure: `in_path` (``container/key``) is not a suffix of
+        # ``abfs://container@account…/key``, so no suffix arithmetic can recover it — the
+        # old `len()` subtraction sliced mid-hostname and sent every read, list, and WRITE
+        # to a wrong container/key. Split at the authority and let the backend say what it
+        # prepends. `rstrip` because `from_uri` reports a bare authority as ``container/``
+        # and the URL path already starts with "/".
+        prefix, urlpath = _split_authority(trimmed)
+        root = (in_path[: len(in_path) - len(urlpath)] if urlpath else in_path).rstrip("/")
     canonical = _SCHEME_ALIASES.get(scheme, scheme)
     is_object_store = canonical in _OBJECT_STORE_SCHEMES
     return _ArrowFileSystem(
-        fs, prefix, atomic_rename=not is_object_store, cacheable=is_object_store
+        fs, prefix, atomic_rename=not is_object_store, cacheable=is_object_store, root=root
     )
+
+
+def _split_authority(uri: str) -> tuple[str, str]:
+    """Split ``scheme://authority/path`` into its ``scheme://authority`` and ``/path``.
+
+    Returns the whole URI and ``""`` when there is no path component, so the caller's
+    suffix arithmetic degenerates safely rather than slicing into the authority."""
+    marker = uri.find("://")
+    if marker < 0:
+        return uri, ""
+    slash = uri.find("/", marker + 3)
+    return (uri, "") if slash < 0 else (uri[:slash], uri[slash:])
+
+
+#: Query options `S3FileSystem.__init__` accepts, with the coercion each needs. Anything
+#: outside this set is rejected by name so a typo is not silently ignored by the builder.
+_S3_BOOL_OPTS = ("anonymous", "force_virtual_addressing", "background_writes")
+_S3_INT_OPTS = ("connect_timeout", "request_timeout")
+_S3_STR_OPTS = (
+    "access_key",
+    "secret_key",
+    "session_token",
+    "role_arn",
+    "session_name",
+    "external_id",
+    "region",
+    "scheme",
+    "endpoint_override",
+)
+
+
+def _s3_with_options(uri: str) -> FileSystem:
+    """An `S3FileSystem` built from the URI query, for options `from_uri` will not take.
+
+    The on-prem escape hatch: MinIO and Ceph RGW commonly need path-style addressing
+    (``force_virtual_addressing=false``), a plain-HTTP endpoint, explicit keys, or a
+    longer timeout — none of which `from_uri` accepts. An unknown option is an error
+    naming the option, because `S3FileSystem` would otherwise ignore it silently and the
+    user would debug a connection that quietly used none of their settings."""
+    from urllib.parse import parse_qsl, urlsplit
+
+    parts = urlsplit(uri)
+    opts: dict[str, object] = {}
+    for key, value in parse_qsl(parts.query):
+        if key in _S3_BOOL_OPTS:
+            opts[key] = value.strip().lower() in ("1", "true", "yes", "on")
+        elif key in _S3_INT_OPTS:
+            opts[key] = int(value)
+        elif key in _S3_STR_OPTS:
+            opts[key] = value
+        else:
+            raise IOError(
+                f"unknown s3:// option {key!r}. Supported: "
+                f"{', '.join(sorted(_S3_BOOL_OPTS + _S3_INT_OPTS + _S3_STR_OPTS))}"
+            )
+    try:
+        fs = pafs.S3FileSystem(**opts)  # type: ignore[arg-type]
+    except (ValueError, OSError, pa.ArrowInvalid) as exc:
+        raise IOError(f"cannot open s3:// storage with the given options: {exc}") from exc
+    # A directly-constructed S3FileSystem addresses objects as `bucket/key`, so the mapping
+    # is the plain `s3://` prefix strip — the same shape `from_uri` produces.
+    return _ArrowFileSystem(fs, "s3://", atomic_rename=False, cacheable=True)
 
 
 def _fsspec_backed(scheme: str, path: str) -> FileSystem:
@@ -487,7 +332,32 @@ def _fsspec_backed(scheme: str, path: str) -> FileSystem:
             f"reading {scheme}:// paths needs the cloud extra: pip install 'batcher-engine[cloud]'"
         ) from exc
     protocol = _SCHEME_ALIASES.get(scheme, scheme)
-    fsspec_fs = fsspec.filesystem(protocol)
+    try:
+        fsspec_fs = fsspec.filesystem(protocol)
+    except ImportError as exc:
+        # fsspec knows the protocol but its driver package is absent. Name the driver, not
+        # the `[cloud]` extra — that extra carries s3fs/gcsfs/adlfs, and a scheme outside
+        # those (an in-house or third-party backend) is not fixed by installing it.
+        raise IOError(
+            f"reading {scheme}:// paths needs the fsspec driver for '{protocol}': {exc}"
+        ) from exc
+    except (ValueError, OSError) as exc:
+        # Two very different failures share these types, and conflating them sends the user
+        # the wrong way. Only "Protocol not known" means the scheme is unimplemented —
+        # `wasb://`/`wasbs://` (legacy Azure Blob) land there. Everything else is a backend
+        # that exists but could not be constructed: adlfs raising ValueError because no
+        # Azure credentials were supplied, or the HDFS driver raising OSError because it
+        # cannot load libjvm. Reporting either of those as "unsupported scheme" would send
+        # someone hunting for a missing feature instead of fixing their credentials or JVM,
+        # so pass the backend's own message through untouched.
+        if "protocol not known" not in str(exc).lower():
+            raise IOError(f"cannot open {scheme}:// storage: {exc}") from exc
+        hint = (
+            " — for legacy Azure Blob URIs use the current abfs:// / abfss:// spelling"
+            if protocol in ("wasb", "wasbs")
+            else ""
+        )
+        raise IOError(f"unsupported storage scheme {scheme}://: {exc}{hint}") from exc
     fs = PyFileSystem(FSSpecHandler(fsspec_fs))
     # The in-filesystem path is whatever fsspec's `_strip_protocol` produces — object
     # stores strip the scheme ("bucket/key"), but HTTP(S) keep the whole URL. Derive

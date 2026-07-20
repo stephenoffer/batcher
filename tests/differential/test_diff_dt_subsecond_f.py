@@ -14,13 +14,12 @@ import datetime as dt
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
 def test_strftime_subsecond_f_is_microseconds(duck):
     """``strftime(ts, '…%S.%f')`` renders 6-digit microseconds, not 9-digit nanos."""
-    from conftest import assert_same
-
     ts = [
         dt.datetime(2024, 2, 15, 13, 45, 30, 123456),
         dt.datetime(1969, 6, 15, 13, 45, 30, 500000),
@@ -29,16 +28,12 @@ def test_strftime_subsecond_f_is_microseconds(duck):
     ]
     t = pa.table({"ts": pa.array(ts, pa.timestamp("us"))})
     duck.register("sf", t)
-    out = bt.from_arrow(t).select(
-        r=col("ts").dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-    ).collect()
+    out = bt.from_arrow(t).select(r=col("ts").dt.strftime("%Y-%m-%d %H:%M:%S.%f")).collect()
     assert_same(out, duck.sql("SELECT strftime(ts, '%Y-%m-%d %H:%M:%S.%f') r FROM sf"))
 
 
 def test_strptime_subsecond_f_scales_as_microseconds(duck):
     """``strptime(s, '…%S.%f')`` scales the fraction to microseconds (``.5`` → 500000)."""
-    from conftest import assert_same
-
     s = [
         "2024-02-15 13:45:30.123456",
         "2024-02-15 13:45:30.5",
@@ -48,7 +43,5 @@ def test_strptime_subsecond_f_scales_as_microseconds(duck):
     ]
     t = pa.table({"s": pa.array(s, pa.string())})
     duck.register("sp", t)
-    out = bt.from_arrow(t).select(
-        d=col("s").str.to_datetime("%Y-%m-%d %H:%M:%S.%f")
-    ).collect()
+    out = bt.from_arrow(t).select(d=col("s").str.to_datetime("%Y-%m-%d %H:%M:%S.%f")).collect()
     assert_same(out, duck.sql("SELECT try_strptime(s, '%Y-%m-%d %H:%M:%S.%f') d FROM sp"))

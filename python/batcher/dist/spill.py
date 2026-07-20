@@ -35,8 +35,10 @@ from batcher._internal.native import engine
 from batcher.carbonite.spill import TieredSpillStore
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source, _single_source
+from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.io.source import Source
 from batcher.plan.expr_ir import col
+from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import (
     Aggregate,
     Distinct,
@@ -254,7 +256,7 @@ def spill_collect(
                 batches = list(gen)
                 if batches:
                     return pa.Table.from_batches(batches)
-                return pa.table({c: [] for c in plan.available_columns()})
+                return empty_result_table(plan, plan.available_columns())
     # Peel the row-wise / limit operators sitting *above* a spillable breaker (e.g. the
     # output `Project` of a `COUNT(DISTINCT)`, whose raw plan is `Project → Aggregate`),
     # spill the breaker out-of-core, then re-apply the peeled ops to its bounded result.
@@ -285,10 +287,7 @@ def execute_spilling_aggregate(
     """Aggregate `agg` out-of-core, spilling hash-partitioned partials to disk."""
     nat = engine()
     cfg_json = active_config().engine_config_json()
-    group_keys_json = json.dumps(
-        [{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys]
-    )
-    aggregates_json = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
+    group_keys_json, aggregates_json = agg_spec_json(agg)
     n_keys = len(agg.group_keys)
     # A global aggregate (no keys) cannot shuffle by key → a single bucket.
     n_buckets = 1 if n_keys == 0 else _fd_safe(num_partitions)
@@ -364,8 +363,10 @@ def execute_spilling_aggregate(
 
 
 def _empty_table(agg: Aggregate) -> pa.Table:
+    # Typed, not null-typed: an empty aggregate result must carry the same column types a
+    # non-empty one would, or `distributed == single-node` is false for every empty result.
     names = [k.alias for k in agg.group_keys] + [s.alias for s in agg.aggregates]
-    return pa.table({n: [] for n in names})
+    return empty_result_table(agg, names)
 
 
 # Max grace-recursion depth: a bucket that is still over budget after this many

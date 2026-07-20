@@ -12,7 +12,7 @@ client. Read only. Batcher has no Event Hubs sink.
 | **Auth** | Connection string only. No `DefaultAzureCredential`, no managed identity. |
 | **Restart** | None. The native reader re-applies `starting_position` on every restart. |
 
-```
+```bash
 pip install 'batcher-engine[eventhubs]'
 ```
 
@@ -105,8 +105,8 @@ means four workers can read; the fifth has nothing to do.
 ## Restart semantics, before you rely on a checkpoint
 
 :::{important}
-The native reader has no working resume. It records a checkpointed position like every other
-broker source, but nothing consults it: each poll re-derives its consumer from
+The native reader has no working resume. It records a checkpointed position as every other
+broker source does, but nothing consults it: each poll re-derives its consumer from
 `starting_position`. A restarted query starts from `starting_position` again, not from where it
 stopped. Concretely, with the default `"-1"`, a restart replays the whole retained stream.
 :::

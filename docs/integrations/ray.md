@@ -60,9 +60,9 @@ result = (
 
 `collect(distributed="auto")`, the default, uses Ray when it detects a multi-node cluster and runs
 in-process otherwise. `True` and `False` force it. The result is identical either way, because the
-distributed path composes the *same* mergeable primitives (`partial` → shuffle → `combine` →
-`finalize`) the single-node parallel executor uses. There is no second semantics to disagree with
-the first.
+distributed path composes the *same* mergeable primitives that the single-node parallel executor
+uses: `partial`, then shuffle, then `combine`, then `finalize`. There is no second semantics to
+disagree with the first.
 
 :::{tip}
 Do not reach for `distributed=True` reflexively. On a single node the in-process engine wins by a
@@ -72,8 +72,19 @@ wide margin; distribution is for scale-out and larger-than-memory, and it costs 
 ## Attaching to a cluster
 
 `config.distributed` is where the cluster lives. `ray_address=None` (the default) attaches to a
-running cluster when `RAY_ADDRESS` is set, or when a managed control plane (Anyscale) is detected,
-and falls back to starting a local Ray only when nothing is reachable.
+running cluster when `RAY_ADDRESS` is set, or when a managed control plane is detected, and falls
+back to starting a local Ray only when nothing is reachable.
+
+Detection is env-var only, never a metadata-service call on a hot path. It covers Anyscale, any
+KubeRay-operated cluster, which is the on-prem, self-hosted, and any-cloud Kubernetes case, and an
+explicit `BATCHER_RAY_CLUSTER=1` escape hatch for a platform none of those name. No platform is
+privileged; batcher behaves identically wherever it runs. If detection is wrong, `_ensure_ray`
+still falls back to a local start when no cluster turns out to be reachable, so a false positive
+degrades rather than fails.
+
+You do not need to pre-install batcher on the workers: when batcher initializes Ray against a
+cluster it ships its own package (including the compiled extension) via `runtime_env`. Set
+`trust_cluster_image=True` to skip that upload when your image already bakes batcher in.
 
 ```python
 from batcher import Config

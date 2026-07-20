@@ -12,6 +12,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 from batcher.api.dataset.frame import Dataset
 from batcher.config import active_config
@@ -44,8 +45,6 @@ def _pushed(ds, ndv):
 
 
 def test_max_grouped_by_right_column(duck):
-    from conftest import assert_same
-
     emp = _tile(pa.table({"dept_id": [1, 1, 2, 2, 3], "sal": [100, 200, 150, 300, 50]}))
     dept = pa.table({"dept_id": [1, 2, 3], "name": ["eng", "sales", "ops"]})
     duck.register("emp", emp)
@@ -66,8 +65,6 @@ def test_max_grouped_by_right_column(duck):
 def test_min_max_under_fan_out(duck):
     """The dimension has duplicate keys → left rows replicate; min/max stay correct
     (a sum would be multiplied — which is why the rule excludes it)."""
-    from conftest import assert_same
-
     fact = _tile(pa.table({"k": [1, 1, 2, 3], "v": [10, 40, 20, 5]}))
     dim = pa.table({"k": [1, 1, 2, 2, 3], "g": ["a", "a", "b", "b", "c"]})  # fan-out on k
     duck.register("fact", fact)
@@ -86,8 +83,6 @@ def test_min_max_under_fan_out(duck):
 
 
 def test_grouped_by_left_column(duck):
-    from conftest import assert_same
-
     fact = _tile(
         pa.table(
             {
@@ -120,8 +115,6 @@ def test_measure_pushdown_left_join_count(duck):
     """Pre-aggregating the right (measure) side below a LEFT join, grouped by the left
     key, must match DuckDB — the TPC-H Q13 shape, including customers with no orders
     (an unmatched left row whose COUNT must be 0, not NULL)."""
-    from conftest import assert_same
-
     cust = pa.table({"ck": [1, 2, 3, 4], "name": ["a", "b", "c", "d"]})
     orders = _tile(pa.table({"ok": [10, 11, 12, 13, 14], "ck": [1, 1, 1, 3, 3]}))
     duck.register("cust", cust)
@@ -143,8 +136,6 @@ def test_measure_pushdown_left_join_count(duck):
 def test_measure_pushdown_inner_sum_min_fan_out(duck):
     """Inner join, multiple decomposable measures (SUM, MIN, MAX) on the right side with
     duplicate left keys (fan-out) — the merge of partials must equal the direct result."""
-    from conftest import assert_same
-
     left = pa.table({"k": [1, 1, 2, 3], "g": ["p", "p", "q", "q"]})
     right = _tile(pa.table({"k": [1, 1, 2, 2, 2], "v": [10, 20, 5, 7, 9]}))
     duck.register("lf", left)
@@ -166,8 +157,6 @@ def test_measure_pushdown_left_side_computed_expr(duck):
     """Measure on the *left* side via a computed expression, grouped by a *right* column
     (the operator-mix join→agg shape): pre-aggregating the left side by the join key and
     merging must match DuckDB, including duplicate join keys (fan-out)."""
-    from conftest import assert_same
-
     line = _tile(
         pa.table(
             {

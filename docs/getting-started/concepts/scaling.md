@@ -1,15 +1,15 @@
 # One core to a cluster
 
-Aggregation and join carry state across rows; so do distinct and window. Each of them
+Aggregation, join, distinct, and window all carry state across rows. Each of them
 is written exactly once, as a *mergeable* primitive: a `partial` step builds
 partition-local state, `combine` merges those states associatively, and `finalize`
 produces rows. `combine` is associative and commutative, so partials merge in any order.
 
-![Mergeable algebra: each partition computes a partial state, an associative combine merges them in any order, and finalize produces the result. The same code runs on one core or many machines.](../../_static/diagrams/mergeable.png)
+![Mergeable algebra: each partition computes a partial state, an associative combine merges them in any order, and finalize produces the result. The same code runs on one core or many machines.](../../_static/diagrams/mergeable.svg)
 
-That one implementation then serves a single core, many cores (the parallel executor
-morselizes and merges), and many machines (the distributed path partitions the data,
-then runs the partials and combines them).
+That one implementation then serves a single core, many cores, and many machines. On
+many cores the parallel executor morselizes the input and merges the partials. On many
+machines the distributed path partitions the data, runs the partials, and combines them.
 
 Distribution is a *scheduling* concern rather than a second set of semantics. A result
 is identical whether a laptop or a cluster produced it.
@@ -31,7 +31,7 @@ query.
 
 The mergeable form is also what bounds memory: each `partial` stays small, and a
 partition that grows too large spills to disk instead of failing. So scaling out is a
-flag. The plan and the result do not change.
+flag. The plan and the result don't change.
 
 ```python
 # docs: skip

@@ -1,11 +1,11 @@
 # User-defined functions
 
-The first rule of a UDF in Batcher is not to write one. An expression
-(`bt.col("x") * 2`, `.str.contains(...)`, `.list.cosine_distance(...)`) lowers to Rust,
-runs vectorized over Arrow, and can be JIT-compiled; a Python UDF cannot be any of
-those things. The optimizer also cannot see through your function: it will not push a
-filter past it or prune a column it might read. Reach for a UDF when the expression
-language genuinely has no answer, and when you do, hand it whole batches.
+The first rule of a UDF in Batcher is not to write one. An expression such as
+`bt.col("x") * 2` or `.str.contains(...)` lowers to Rust, runs vectorized over Arrow, and
+can be JIT-compiled. A Python UDF is none of those things. The optimizer also can't see
+through your function, so it won't push a filter past it or prune a column it might read.
+Reach for a UDF when the expression language genuinely has no answer, and when you do,
+hand it whole batches.
 
 | Form | What the engine sees | Cost per row |
 | --- | --- | --- |
@@ -57,15 +57,15 @@ operations still believe the old schema, so a `select` on your new column fails 
 time. Declare it whenever the columns differ from the input.
 
 `num_workers` defaults to `"auto"`, which fans the per-batch calls across local cores.
-That helps only if `fn` releases the GIL (Arrow, NumPy, torch all do). For a CPU-bound
+That helps only if `fn` releases the GIL, which Arrow, NumPy, and torch all do. For a CPU-bound
 pure-Python `fn`, pass `multiprocessing=True`. Then `fn` must be importable and your
 script needs an `if __name__ == "__main__":` guard, because the workers re-import it.
 
 ## Declare what you read with input_columns
 
 `input_columns` tells the optimizer which columns `fn` actually reads, so projection
-pushdown can prune the scan to those and skip decoding the rest. On a wide Parquet
-table that is the difference between reading 4 columns and 200.
+pushdown can prune the scan to those and skip decoding the rest. On a wide Parquet table
+that is the difference between reading a handful of columns and reading all of them.
 
 ```python
 priced = ds.map_batches(
@@ -90,8 +90,9 @@ which keeps every column alive.
 
 :::{tip}
 A plain function is re-created on every batch. A class is instantiated **once per
-worker** and then called per batch, which is the difference between loading a model
-5,000 times and loading it once. This is the single highest-leverage line in the API.
+worker** and then called per batch, which is the difference between loading a model once
+per batch and loading it once per worker. This is the single highest-leverage line in the
+API.
 :::
 
 ```python
@@ -109,14 +110,14 @@ print(ds.map_batches(Splitter(","), output_columns=["text", "price", "qty", "par
 # {'text': ['a,b', 'c', 'd,e,f'], 'parts': [2, 1, 3]}
 ```
 
-Pass the class itself (`map_batches(Classifier, num_gpus=1)`) when construction needs
-to happen inside the worker, which is the case for anything holding a CUDA context. The
+Pass the class itself, as in `map_batches(Classifier, num_gpus=1)`, when construction
+needs to happen inside the worker. That is the case for anything holding a CUDA context. The
 engine warns you if a GPU stage gets a bare function, because that is the single most
 expensive mistake in this API. See [inference](../ml/inference.md).
 
 ## batch_format: numpy, pandas, torch
 
-`batch_format` converts around the call only; the engine boundary stays Arrow.
+`batch_format` converts around the call only. The engine boundary stays Arrow.
 
 ```python
 def scale(batch):  # batch is {column: ndarray}
@@ -156,14 +157,14 @@ print(ds.select(tok=bt.col("text").str.split(",")).explode("tok").to_pydict())
 :::
 ::::
 
-Same rows, and the expression form is roughly an order of magnitude faster. Check for
-one before you write the loop.
+Same rows, and the expression form builds no Python object per row. Check for an
+expression before you write the loop.
 
 ## @udf: a function bundled with its config
 
 `@bt.udf` bundles a function with its `map_batches` options so the transform is a
-reusable, named thing you apply to a dataset. Options go on the decorator; the call site
-stays clean.
+reusable, named thing you apply to a dataset. Options go on the decorator, so the call
+site stays clean.
 
 ```python
 @bt.udf(output_columns=["text", "price", "qty", "discounted"])
@@ -215,7 +216,7 @@ print(bt.sql("SELECT bump(qty) AS q FROM t", t=ds).to_pydict())
 ```
 
 Scalar SQL functions do not work inside `GROUP BY` keys, aggregate arguments, or
-`ORDER BY`; compute them in a subquery or a projected alias first. For a function that
+`ORDER BY`. Compute them in a subquery or a projected alias first. For a function that
 transforms a whole table, register it with `table=True` and it follows the `map_batches`
 contract.
 
@@ -223,9 +224,9 @@ contract.
 
 :::{warning}
 Under `distributed=True`, a worker that gets preempted mid-batch is reassigned and its
-partition **recomputed**. So `fn` must be idempotent. A pure transform is safe; a `fn`
+partition **recomputed**. So `fn` must be idempotent. A pure transform is safe. A `fn`
 that POSTs to an API, upserts into a vector DB, or increments an external counter can
-apply that effect twice. Make the sink idempotent (upsert on a key), or move the side
+apply that effect twice. Make the sink idempotent by upserting on a key, or move the side
 effect out of the UDF and into a `write`.
 :::
 
@@ -235,7 +236,7 @@ effect out of the UDF and into a `write`.
 - [Inference](../ml/inference.md): the class-per-worker pattern with a real model.
 - [Explain plans](explain-plans.md): see what a UDF does to the plan the optimizer builds.
 - [Expression evaluation](../deep-dives/expression-evaluation.md): what an expression
-  gets that a UDF cannot — vectorization, fusion, and the JIT.
+  gets that a UDF cannot, meaning vectorization, fusion, and the JIT.
 - [Arrow memory](../deep-dives/arrow-memory.md): why `fn` is handed a zero-copy
   `RecordBatch` and what happens when you convert it.
 - [Expressions API](../api/expressions.md): the method surface to check before you write

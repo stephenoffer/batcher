@@ -23,47 +23,43 @@ registry; a new media kind is one new file overriding `_meta_fields` /
 
 from __future__ import annotations
 
-import mimetypes
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import IO, Any, ClassVar
+from typing import Any, ClassVar
 
 import pyarrow as pa
 
 from batcher._internal.errors import IOError as BatcherIOError
 from batcher._internal.hardware import available_cpu_count
+from batcher.io.base._tolerance import ErrorPolicy
 from batcher.io.filesystem import resolve_filesystem
+from batcher.io.formats.multimodal._batching import pack_by_count_and_bytes, probe_sizes
+from batcher.io.formats.multimodal._mime import sniff_mime
+from batcher.io.formats.multimodal._pruning import prune_files
+from batcher.plan.source_stats import SourceStatistics
+from batcher.plan.stats import ColumnStat, Provenance
 
-__all__ = ["MediaSource", "MediaSplit", "read_blob_bytes"]
-
-# How many leading bytes are enough to sniff a media type by magic number and to
-# read a format header. Kept small so metadata extraction stays header-only.
-_MAGIC_PEEK_BYTES = 4096
+__all__ = ["MediaSource", "MediaSplit"]
 
 # In reference mode (no full-byte materialization) we still read a header chunk so
 # MIME sniffing and header-only metadata work; large enough for image/audio/video
 # container headers, tiny next to a multi-GB payload.
 _HEADER_BYTES = 1 << 16  # 64 KiB
-
+# Default byte ceiling on one file-batch. Media file sizes span orders of magnitude, so a
+# batch bounded only by file count is unbounded in memory; 256 MiB keeps a batch inside a
+# worker's envelope while staying large enough that per-batch overhead stays negligible.
+_DEFAULT_BATCH_BYTES = 256 << 20
 # Common columns every media source emits, in order.
 _COMMON_FIELDS: tuple[tuple[str, pa.DataType], ...] = (
     ("uri", pa.string()),
-    ("bytes", pa.binary()),
+    # `large_binary` (64-bit offsets), not `binary` (32-bit): this column exists to hold
+    # large per-row payloads, and a batch of them overflows a 32-bit offset array at 2 GB
+    # *total*. At the default 64 files per batch that is one 32 MB average file — well
+    # inside ordinary video and point-cloud sizes — and the overflow raises mid-read
+    # rather than being caught at plan time. `read_blob_bytes` already got this right.
+    ("bytes", pa.large_binary()),
     ("size", pa.int64()),
     ("mime", pa.string()),
-)
-
-# Magic-number prefixes for media types stdlib `mimetypes` may miss by extension.
-_MAGIC_PREFIXES: tuple[tuple[bytes, str], ...] = (
-    (b"\x89PNG\r\n\x1a\n", "image/png"),
-    (b"\xff\xd8\xff", "image/jpeg"),
-    (b"GIF87a", "image/gif"),
-    (b"GIF89a", "image/gif"),
-    (b"BM", "image/bmp"),
-    (b"RIFF", "image/webp"),  # disambiguated below by the WEBP/WAVE tag at [8:12]
-    (b"OggS", "audio/ogg"),
-    (b"fLaC", "audio/flac"),
-    (b"\x1aE\xdf\xa3", "video/x-matroska"),
 )
 
 
@@ -96,24 +92,44 @@ class MediaSource:
     suffixes: ClassVar[tuple[str, ...]] = ()
     format_name: ClassVar[str] = ""
 
-    __slots__ = ("_batch_files", "_files_cache", "_fs", "_materialize_bytes", "_path", "_with_meta")
+    __slots__ = (
+        "_batch_bytes",
+        "_batch_files",
+        "_chunk_cache",
+        "_errors",
+        "_files_cache",
+        "_fs",
+        "_materialize_bytes",
+        "_path",
+        "_with_meta",
+    )
 
     def __init__(
         self,
         path: str,
         *,
         batch_files: int = 64,
+        batch_bytes: int = _DEFAULT_BATCH_BYTES,
         with_meta: bool = True,
         materialize_bytes: bool = True,
+        on_error: str = "raise",
     ) -> None:
         if batch_files < 1:
             raise ValueError("batch_files must be >= 1")
+        if batch_bytes < 1:
+            raise ValueError("batch_bytes must be >= 1")
         self._path = path
         self._batch_files = batch_files
+        self._batch_bytes = batch_bytes
         self._with_meta = with_meta
         self._materialize_bytes = materialize_bytes
         self._fs = resolve_filesystem(path)
+        # A media corpus at scale always holds a few unreadable members — a truncated
+        # upload, a zero-byte object, a JPEG whose trailer never arrived. `on_error`
+        # decides whether one of them costs the whole read.
+        self._errors = ErrorPolicy(on_error)
         self._files_cache: list[str] | None = None
+        self._chunk_cache: list[list[str]] | None = None
 
     # ---- shared, do-not-override ------------------------------------------
     def _files(self) -> list[str]:
@@ -133,6 +149,30 @@ class MediaSource:
                 ) from exc
             self._files_cache = sorted(matches)
         return self._files_cache
+
+    def _chunks(self) -> list[list[str]]:
+        """The file-batches this source reads, bounded by **both** count and bytes.
+
+        A fixed file count is the wrong unit for media. A directory mixing 4 KB thumbnails
+        with 200 MB videos batched 64-at-a-time yields batches spanning four orders of
+        magnitude — the worst case is 64 x 200 MB = 12.8 GB in one batch, which is an OOM
+        rather than a slow query, and the sibling batch of thumbnails leaves its worker
+        idle. Bounding bytes as well turns that into evenly-weighted work.
+
+        One definition, used by `read`, `iter_batches` *and* `splits`, because a split that
+        chunked differently from `iter_batches` would make the distributed result a
+        different set of batches from the single-node one.
+        """
+        if self._chunk_cache is None:
+            files = self._files()
+            self._chunk_cache = pack_by_count_and_bytes(
+                files, self._file_sizes(files), self._batch_files, self._batch_bytes
+            )
+        return self._chunk_cache
+
+    def _file_sizes(self, files: list[str]) -> list[int]:
+        """Every file's size, probed concurrently (see `_batching.probe_sizes`)."""
+        return probe_sizes(files, self._fs.size)
 
     def schema(self) -> pa.Schema:
         """The output schema: common columns plus (if enabled) metadata columns."""
@@ -154,20 +194,21 @@ class MediaSource:
         defeat the point.
         """
         files = self._files()
-        if len(files) <= self._batch_files:
+        chunks = self._chunks()
+        if len(chunks) <= 1:
             return list(self.iter_batches(projection))
         reads = self._read_chunk(files)  # one concurrent wave over every file
         out: list[pa.RecordBatch] = []
-        for start in range(0, len(files), self._batch_files):
-            sl = slice(start, start + self._batch_files)
+        start = 0
+        for chunk in chunks:
+            sl = slice(start, start + len(chunk))
             batch = self._assemble(files[sl], reads[sl])
             out.append(batch.select(projection) if projection is not None else batch)
+            start += len(chunk)
         return out
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
-        files = self._files()
-        for start in range(0, len(files), self._batch_files):
-            chunk = files[start : start + self._batch_files]
+        for chunk in self._chunks():
             batch = self._build_batch(chunk)
             yield batch.select(projection) if projection is not None else batch
 
@@ -178,17 +219,72 @@ class MediaSource:
     def identity(self) -> str:
         return f"{self.format_name}:{self._path}"
 
-    def splits(self, target_size: int | None = None) -> list[MediaSplit]:  # noqa: ARG002
-        """One split per file-batch; each carries only its file-path locators."""
+    def statistics(self) -> SourceStatistics:
+        """Row count, total bytes and a `size` zone map — all from the listing.
+
+        A media source used to report nothing, so Kyber planned it blind: it costed a
+        directory of 200 MB videos exactly like one of 4 KB thumbnails, and the byte axes
+        that gate broadcast eligibility and task sizing had only a generic per-row prior
+        (36 B for a binary column) to work from. Every number here comes from the file
+        listing and a stat — the same probe the batching already performs — so this costs
+        nothing beyond what a read does anyway.
+
+        The `size` bounds are **exact** (they are the values, not per-chunk bounds), which
+        is what lets a `WHERE size > …` prune files outright rather than conservatively.
+
+        Returns:
+            The statistics, with an exact row count and an exact `size` column stat.
+        """
         files = self._files()
+        sizes = self._file_sizes(files)
+        columns: dict[str, ColumnStat] = {}
+        if sizes:
+            columns["size"] = ColumnStat(
+                min=min(sizes), max=max(sizes), null_count=0, provenance=Provenance.EXACT
+            )
+        return SourceStatistics(
+            row_count=len(files),
+            byte_size=sum(sizes) or None,
+            columns=columns,
+            exact_rows=True,
+        )
+
+    def splits(
+        self, target_size: int | None = None, predicate: dict | None = None
+    ) -> list[MediaSplit]:
+        """One split per file-batch; each carries only its file-path locators.
+
+        Args:
+            target_size: Rough bytes to aim for per split. Overrides the source's
+                `batch_bytes` for this call, which is how the distributed planner asks for
+                coarser splits than a streaming read would use. Previously ignored, so a
+                split was a fixed *file count* and a video split could be a thousand times
+                the weight of a thumbnail split.
+            predicate: Kyber's pushed filter, as its IR dictionary. A predicate over the
+                columns a listing already knows — ``uri``, ``size``, ``mime`` — prunes
+                whole files here, so they never become a split and are never opened. That
+                is the difference between reading a directory and reading a terabyte for
+                a query like ``WHERE mime = 'video/mp4' AND size < 50000000``. Any other
+                predicate is ignored (the engine's `Filter` still applies it).
+        """
+        files = self._files()
+        sizes = self._file_sizes(files)
+        pruned = prune_files(files, sizes, predicate)
+        if pruned is not None:
+            files, sizes = pruned
+        bound = target_size if target_size is not None else self._batch_bytes
+        if pruned is None and bound == self._batch_bytes:
+            chunks = self._chunks()  # the memoized, unpruned chunking
+        else:
+            chunks = pack_by_count_and_bytes(files, sizes, self._batch_files, bound)
         return [
             MediaSplit(
                 self.format_name,
-                tuple(files[s : s + self._batch_files]),
+                tuple(chunk),
                 self._with_meta,
                 self._materialize_bytes,
             )
-            for s in range(0, len(files), self._batch_files)
+            for chunk in chunks
         ]
 
     # ---- batch assembly ---------------------------------------------------
@@ -217,16 +313,19 @@ class MediaSource:
         mimes: list[str] = []
         meta_rows: list[dict[str, Any]] = []
         meta_fields = self._meta_fields() if self._with_meta else []
-        for path, (header, payload, size) in zip(chunk, reads, strict=True):
+        for path, read in zip(chunk, reads, strict=True):
+            if read is None:  # unreadable and tolerated — contributes no row
+                continue
+            header, payload, size = read
             uris.append(path)
             blobs.append(payload)  # None in reference mode
             sizes.append(size)
-            mimes.append(_sniff_mime(path, header))
+            mimes.append(sniff_mime(path, header))
             if self._with_meta:
                 meta_rows.append(self._safe_extract(header, meta_fields))
         arrays: list[pa.Array] = [
             pa.array(uris, pa.string()),
-            pa.array(blobs, pa.binary()),
+            pa.array(blobs, pa.large_binary()),
             pa.array(sizes, pa.int64()),
             pa.array(mimes, pa.string()),
         ]
@@ -245,7 +344,7 @@ class MediaSource:
         capped so a large chunk does not open an unbounded number of connections at once.
         """
         if len(chunk) <= 1:
-            return [self._read_payload(chunk[0])] if chunk else []
+            return [self._read_payload_safe(chunk[0])] if chunk else []
         from concurrent.futures import ThreadPoolExecutor
 
         # Latency-bound tiny-file reads scale with concurrency well past core count; cap
@@ -253,7 +352,34 @@ class MediaSource:
         # are thread-safe under fan-out — unlike a footer *parse*, which is not).
         workers = min(len(chunk), max(8, available_cpu_count() * 2), 64)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(self._read_payload, chunk))  # order preserved
+            return list(pool.map(self._read_payload_safe, chunk))  # order preserved
+
+    def _read_payload_safe(self, path: str) -> tuple[bytes, bytes | None, int] | None:
+        """`_read_payload`, honoring `on_error` — None marks a file to drop."""
+        try:
+            return self._read_payload(path)
+        except Exception as exc:
+            if not self._errors.tolerate(path, exc, format_name=self.format_name):
+                raise
+            return None
+
+    def corrupt_files(self) -> list[str]:
+        """The paths this source skipped, in failure order (empty unless `on_error="skip"`).
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.io import ImageSource  # doctest: +SKIP
+                >>> src = ImageSource("s3://bucket/imgs/", on_error="skip")  # doctest: +SKIP
+                >>> _ = src.read()  # doctest: +SKIP
+                >>> src.corrupt_files()  # doctest: +SKIP
+                ['s3://bucket/imgs/truncated.jpg']
+
+        Returns:
+            The skipped paths. A skipped file leaves no row, so this is the only way to
+            tell a clean read from a partial one.
+        """
+        return self._errors.skipped()
 
     def _read_payload(self, path: str) -> tuple[bytes, bytes | None, int]:
         """Return ``(header_bytes, payload_or_None, size)`` for one file.
@@ -314,6 +440,17 @@ class MediaSplit:
     with_meta: bool
     materialize_bytes: bool = True
 
+    @property
+    def rows(self) -> int:
+        """This split's exact row count — one row per file, known with no I/O.
+
+        The distributed planner reads `rows` off a split to size its task fan-out and to
+        weight the partition balance. Without it a media source looked *uncountable*: the
+        fan-out fell back to a blunt worker count and every split weighed the same, so a
+        split of 200 MB videos was balanced against one of thumbnails as if equal.
+        """
+        return len(self.files)
+
     def _source(self) -> MediaSource:
         """Rebuild a source restricted to this split's files (no re-listing)."""
         from batcher.io.formats.base import SOURCES
@@ -344,80 +481,3 @@ class MediaSplit:
 
     def identity(self) -> str:
         return f"{self.format_name}:{self.files[0]}+{len(self.files)}"
-
-
-def read_blob_bytes(
-    batch: pa.RecordBatch, *, uri_col: str = "uri", into: str = "bytes"
-) -> pa.RecordBatch:
-    """Materialize file payloads for a batch of reference handles.
-
-    Reads each row's `uri_col` file and writes its bytes into the `into` column
-    (replacing it if present, else appending). Intended to run inside `map_batches`
-    *after* filtering/sampling reference-mode handles, so only the surviving rows'
-    payloads are ever read — and with a small ``batch_size``, only a few payloads
-    are resident at once. The bytes land in a `large_binary` column, so a batch of
-    GB-scale payloads cannot overflow 32-bit offsets.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt  # doctest: +SKIP
-            >>> from batcher import col  # doctest: +SKIP
-            >>> from batcher.io import read_blob_bytes  # doctest: +SKIP
-            >>> ds = bt.read.video("s3://clips/", materialize_bytes=False)  # doctest: +SKIP
-            >>> big = ds.filter(col("size") < 500_000_000)  # doctest: +SKIP
-            >>> # ... metadata pruned first, so only surviving payloads are read.
-            >>> decoded = big.map_batches(read_blob_bytes, batch_size=4)  # doctest: +SKIP
-
-    Args:
-        batch: A batch of reference handles, one row per file.
-        uri_col: Column holding each row's file URI.
-        into: Column the payload bytes are written to.
-
-    Returns:
-        `batch` with `into` holding each row's file contents (null where the URI
-        is null).
-    """
-    uris = batch.column(uri_col).to_pylist()
-    blobs: list[bytes | None] = []
-    for u in uris:
-        if u is None:
-            blobs.append(None)
-            continue
-        with resolve_filesystem(u).open(u) as fh:
-            blobs.append(fh.read())
-    # `large_binary` (64-bit offsets) so a batch of GB payloads can't overflow the
-    # 2 GB limit of 32-bit `binary` — the whole point is large per-row payloads.
-    arr = pa.array(blobs, pa.large_binary())
-    if into in batch.schema.names:
-        return batch.set_column(batch.schema.get_field_index(into), into, arr)
-    return batch.append_column(into, arr)
-
-
-def _sniff_mime(path: str, data: bytes) -> str:
-    """Best-effort MIME type from magic bytes, falling back to the extension.
-
-    Magic bytes win (a file is what its bytes say it is); the stdlib
-    `mimetypes` extension guess is the fallback, and an unknown type is
-    ``application/octet-stream``.
-    """
-    head = data[:_MAGIC_PEEK_BYTES]
-    for prefix, mime in _MAGIC_PREFIXES:
-        if head.startswith(prefix):
-            if prefix == b"RIFF":
-                tag = head[8:12]
-                if tag == b"WEBP":
-                    return "image/webp"
-                if tag == b"WAVE":
-                    return "audio/x-wav"
-                if tag == b"AVI ":
-                    return "video/x-msvideo"
-                continue
-            return mime
-    guessed, _ = mimetypes.guess_type(path)
-    return guessed or "application/octet-stream"
-
-
-def _read_header(fh: IO[Any]) -> bytes:  # pragma: no cover - convenience for subclasses
-    """Read just the leading header bytes from an open handle."""
-    return fh.read(_MAGIC_PEEK_BYTES)

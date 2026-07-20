@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -17,8 +18,6 @@ def t(duck):
 
 
 def test_position_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(

@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 pytestmark = pytest.mark.differential
 
@@ -39,8 +40,6 @@ def _right():
 
 
 def test_asof_backward_float_on_signed_zero(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_left())
         .join_asof(bt.from_arrow(_right()), on="ts", by="sym", direction="backward")
@@ -58,8 +57,6 @@ def test_asof_backward_float_on_signed_zero(duck):
 
 
 def test_asof_forward_float_on_signed_zero(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_left())
         .join_asof(bt.from_arrow(_right()), on="ts", by="sym", direction="forward")

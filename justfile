@@ -70,6 +70,38 @@ lint-layers:
 lint-structure:
     python tools/lint_structure.py
 
+# The daily agentic self-improvement loop: agents review the codebase, make narrow verified
+# improvements in isolated worktrees, and leave branches + a report for review. Nothing is
+# merged automatically and your working tree is never touched. See tools/agentic/README.md.
+daily args="":
+    python tools/agentic/daily.py {{args}}
+
+# Same loop, read-only: find work and report it, change nothing.
+daily-review:
+    python tools/agentic/daily.py --reviews-only
+
+# Exercise the loop without an agent — creates worktrees and runs every pass's gate, which
+# is how you catch a broken verify command before it silently passes everything.
+daily-dry:
+    python tools/agentic/daily.py --dry-run
+
+# Capture the observable surfaces (optimizer rule order, IR tags, public API, IO registry,
+# FFI signatures) before a refactor that claims to preserve behavior. Diff after, and a
+# silent change — a rule that moved position, a format that stopped registering — shows up
+# as a diff instead of as a bug later. Use around any move-and-re-export change.
+surface-save path="/tmp/batcher-surface.json":
+    python tools/surface_snapshot.py --save {{path}}
+
+# Diff the current surfaces against a saved snapshot. Exits 1 on any observable change.
+surface-diff path="/tmp/batcher-surface.json":
+    python tools/surface_snapshot.py --diff {{path}}
+
+# Regenerate MAP.md — the file-level index of what every module is for. It is derived
+# from each module's own docstring and each crate's manifest, so it cannot drift; run
+# this after adding, moving, or re-documenting a module. `--check` runs in CI.
+map:
+    python tools/gen_map.py
+
 # Copy-paste detector. The subsystems cannot import each other, so copy-paste is the only
 # *wrong* way to share between them — this is what catches it.
 lint-duplication:
@@ -107,7 +139,7 @@ docs:
 # Regenerate the architecture diagram PNGs from their Graphviz sources (needs
 # graphviz: `brew install graphviz`). The PNGs are committed; rerun after editing.
 diagrams:
-    python docs/_static/diagrams/render.py
+    python tools/diagrams/render.py
 
 # Run TPC-H vs the single-node lineup (batcher, duckdb, polars, pyarrow). Pass extra
 # flags through, e.g. `just bench --scale 10` or `just bench --engines batcher,duckdb,spark`.

@@ -60,21 +60,15 @@ def _has_breaker(node: LogicalPlan) -> bool:
 def _is_row_wise(node: LogicalPlan) -> bool:
     """Whether `node` is a stateless, partition-independent transform of its input.
 
-    Running these on each partition and concatenating gives exactly the single-node result:
-    `Unnest` (explode) and `Unpivot` (melt) multiply rows but hold no state, and a
-    **fraction** `Sample` keeps a row iff a seeded hash of its values falls under the
-    fraction — a per-row predicate, so partitioning cannot change which rows survive. (That
-    hash reads every column, which is why `kyber.rules.projections` must not prune below a
-    `Sample`; with pruning, a worker sampled a different column set than single-node did.)
-
-    A *fixed-count* `Sample` (`n=`) is NOT row-wise: it keeps the `n` smallest-hash rows of
-    the WHOLE relation, so running it per partition would keep `n` rows on every worker.
+    The classification itself lives in `plan.logical.transforms` (neutral), because the
+    streaming path needs the identical rule: a node that is safe to run per *batch* is
+    exactly a node that is safe to run per *partition*. These were two hand-maintained
+    copies carrying a comment that they MUST agree; now there is one definition and
+    nothing to keep in sync.
     """
-    from batcher.plan.logical import Sample, Unpivot
+    from batcher.plan.logical.transforms import is_partition_independent
 
-    if isinstance(node, Sample):
-        return node.n is None
-    return isinstance(node, (Filter, Project, Unnest, Unpivot))
+    return is_partition_independent(node)
 
 
 def _split_at(plan: LogicalPlan, breaker_type: type):
@@ -332,10 +326,12 @@ def empty_result_table(plan: LogicalPlan, names: list[str]) -> pa.Table:
     placeholders when the plan cannot state its types (an opaque `map_batches` output) or when
     they disagree with `names` — strictly safer than trusting a mismatched schema.
     """
-    schema = plan.available_schema()
-    if schema is None or list(schema.arrow.names) != list(names):
-        return pa.table({n: pa.array([], pa.null()) for n in names})
-    return pa.Table.from_batches([], schema=schema.arrow)
+    # The schema rule itself lives in neutral `plan` so `api`, `dist`, and `core` cannot
+    # drift apart on it (they had, in three different directions). This function stays as
+    # the `dist`-facing spelling that returns a *table* rather than a schema.
+    from batcher.plan.logical import empty_result_schema
+
+    return pa.Table.from_batches([], schema=empty_result_schema(plan, names))
 
 
 def _empty_agg_table(agg: Aggregate) -> pa.Table:

@@ -7,6 +7,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, count
 
 
@@ -26,8 +27,6 @@ def t(duck):
 
 
 def test_count_distinct_grouped_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .group_by("g")
@@ -41,23 +40,17 @@ def test_count_distinct_grouped_vs_duckdb(duck, t):
 
 
 def test_count_distinct_global_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).group_by().agg(nv=col("v").n_unique()).collect()
     expected = duck.sql("SELECT COUNT(DISTINCT v) nv FROM t")
     assert_same(out, expected)
 
 
 def test_count_distinct_via_sql(duck, t):
-    from conftest import assert_same
-
     q = "SELECT g, COUNT(DISTINCT v) AS nv FROM t GROUP BY g"
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
 def test_count_distinct_excludes_nulls_vs_duckdb(duck):
-    from conftest import assert_same
-
     tbl = pa.table(
         {
             "g": pa.array([1, 1, 1, 2, 2], type=pa.int64()),
@@ -93,7 +86,6 @@ def _tight_cap():
 
 def test_count_distinct_grouped_spilled(duck):
     from batcher.config import config_context
-    from conftest import assert_same
 
     tbl = _skewed_with_nulls()
     duck.register("s", tbl)
@@ -104,7 +96,6 @@ def test_count_distinct_grouped_spilled(duck):
 
 def test_count_distinct_global_spilled(duck):
     from batcher.config import config_context
-    from conftest import assert_same
 
     tbl = _skewed_with_nulls()
     duck.register("s", tbl)
@@ -118,7 +109,6 @@ def test_count_distinct_strings_spilled(duck):
     # f64 cast would collide strings), so a high-cardinality string column spills and
     # still matches DuckDB.
     from batcher.config import config_context
-    from conftest import assert_same
 
     rng = np.random.default_rng(7)
     n = 20000

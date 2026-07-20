@@ -42,7 +42,7 @@ from batcher.carbonite.policies import (
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
 from batcher.plan.physical import PhysicalPlan
-from batcher.plan.resource import FeasibilityVerdict, SchedulingEnvelope
+from batcher.plan.resource import FeasibilityVerdict, ResourceBounds, SchedulingEnvelope
 
 __all__ = ["ResourceManager"]
 
@@ -292,13 +292,50 @@ class ResourceManager:
         Compares the plan's estimated peak memory (the dominant breaker, via the
         `MemoryEstimator`) against the unified hard budget. When the estimate won't
         fit, the conductor routes the query through the spilling executor so it
-        completes under bounded memory instead of OOMing. Conservative: an unsized
-        plan (no Kyber estimate) never spills on a guess.
+        completes under bounded memory instead of OOMing.
+
+        The estimate is not trusted as the *only* signal, because it systematically
+        under-predicts in exactly the cases that OOM. Kyber emits `0` for any operator
+        whose cardinality is unknown (`kyber.annotate`), so an un-sized plan used to
+        take the `return False` fast path and run fully in memory no matter how much
+        of the box was already gone. So the estimate can only ever *add* a spill: when
+        it does not force one, the live **measured** footprint decides. That reading
+        (`PressureMonitor`, cgroup-current else RSS) is the one number here that cannot
+        be wrong the way an estimate can, and it was already computed for the morsel/
+        cache ladder — it simply never gated this decision.
+
+        Spilling is result-invariant — it only trades time for bounded memory — so a
+        false positive costs latency while a false negative costs the process. That
+        asymmetry is why the measured signal is allowed to overrule "no estimate".
+        `classify()` (not `level()`) reads the level so this does not consume the AIMD
+        round's sample.
         """
         estimated = self._peak_bytes(plan)
-        if estimated <= 0:
-            return False
-        return estimated > self._hard_budget()
+        if estimated > 0 and estimated > self._hard_budget():
+            return True
+        return self._pressure.classify() >= PressureLevel.SPILL
+
+    def input_exceeds_budget(self, input_bytes: int) -> bool:
+        """Whether reading the sources whole would not fit the memory envelope.
+
+        The in-memory path resolves every source to a list of Arrow batches *before* the
+        engine runs, so the input is resident in full no matter how small the result is —
+        a `GROUP BY` returning four rows still materializes every projected column of
+        every row. That makes the input, not the operator state, the dominant term for a
+        scan-heavy query, and it is the one term the plan estimate never covered:
+        `m_max_bytes` sizes an operator's *working set*, so a plan whose breakers are all
+        small reads as "fits" while the scan feeding them does not.
+
+        This is metadata-only — a declared `row_count()` times the projected schema width
+        — so it costs no I/O and is available *before* the decision it informs. `0` means
+        the sources could not size themselves, which is not evidence of fitting, so the
+        caller falls back to the other signals rather than treating it as a `False`.
+
+        Returning `True` routes the query to the out-of-core executor, which reads through
+        a bounded streaming tap instead of resolving the sources — the same relation,
+        bounded memory.
+        """
+        return input_bytes > 0 and input_bytes > self._hard_budget()
 
     def recommend_spill_partitions(self, plan: PhysicalPlan) -> int | None:
         """Number of out-of-core buckets to shard `plan`'s spilled state into, or ``None``.
@@ -325,6 +362,58 @@ class ResourceManager:
         basis = volume if volume > 0 else peak
         parts = max(_MIN_SPILL_PARTITIONS, -(-basis // _SPILL_BYTES_PER_PARTITION))  # ceil-div
         return min(_MAX_SPILL_PARTITIONS, int(parts))
+
+    def flap_rate(self) -> float | None:
+        """This run's measured pressure-level flap rate, or `None` if too few samples.
+
+        The producer side of the hysteresis loop: `__init__` reads a *past* run's rate back
+        (`load_flap_rate` -> `hysteresis_alpha_from_flap`) to stiffen de-escalation for a
+        workload that oscillates. Nothing measured it, so that read was always cold and the
+        anti-oscillation mechanism never engaged. The conductor persists this at end of run.
+
+        Returns:
+            The fraction of sampled levels that reversed direction, or `None` when the
+            monitor took fewer than two samples (nothing to conclude).
+        """
+        return self._pressure.flap_rate()
+
+    def partitions_for_bounds(self, plan: PhysicalPlan, bounds: ResourceBounds | None) -> int:
+        """Fewest spill buckets that make each bucket fit `bounds`, or ``0`` if unconstrained.
+
+        This is the **return leg** of the Kyber↔Carbonite contract. When admission refuses a
+        plan it does not merely say "no": `BudgetingAdmission.validate` attaches a
+        `suggested_bounds` counter-offer naming the per-operator byte envelope the plan *would*
+        fit in. Nothing consumed it, so the conductor degraded an infeasible verdict to a bare
+        `must_spill` boolean and then sharded the out-of-core phase by
+        `_SPILL_BYTES_PER_PARTITION` — a fixed constant that knows nothing about the machine's
+        actual budget. On a memory-tight host that produces buckets which individually still do
+        not fit, which is the exact failure admission had just diagnosed.
+
+        Sharding by the offered envelope instead makes the counter-offer binding: with a peak
+        (or measured spill volume) of `B` and an envelope of `E`, `ceil(B / E)` buckets each
+        hold about `E`. Clamped to `_MAX_SPILL_PARTITIONS` like every other recommendation.
+
+        Result-invariant: partition count only *shards* the shuffle, and the mergeable algebra
+        gives an identical merged result for any count. This is a memory-safety lever only.
+
+        Args:
+            plan: The physical plan about to be routed out-of-core.
+            bounds: Carbonite's counter-offer, or `None` when admission raised no objection.
+
+        Returns:
+            The minimum bucket count, or `0` when there is no bound or the plan is un-sized
+            (the caller then keeps whatever count it already chose).
+        """
+        if bounds is None or bounds.m_max_bytes <= 0:
+            return 0
+        # Same basis as `recommend_spill_partitions`: the measured spill volume when a family
+        # has a spill history, else the learned-blended peak.
+        volume = self._mem_model.predicted_spill_bytes(plan.ops)
+        basis = volume if volume > 0 else self._peak_bytes(plan)
+        if basis <= 0:
+            return 0
+        parts = -(-basis // bounds.m_max_bytes)  # ceil-div
+        return min(_MAX_SPILL_PARTITIONS, int(max(1, parts)))
 
     def recommend_spill_compression(self, plan: PhysicalPlan) -> bool | None:
         """Whether spilling `plan` should compress its buckets, from the learned peak.

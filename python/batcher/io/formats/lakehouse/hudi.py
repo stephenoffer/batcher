@@ -34,12 +34,13 @@ tables — the ones a split read is for — keep the parallel path.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.splits import Split, WholeSourceSplit
 from batcher.plan.source_stats import SourceStatistics
@@ -49,13 +50,9 @@ __all__ = ["HudiFileSliceSplit", "HudiSink", "HudiSource"]
 
 def _require_hudi() -> Any:
     """Import and return the hudi-rs `HudiTable` class or raise `BackendError`."""
-    try:
-        from hudi import HudiTable
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError(
-            "Hudi read support requires hudi-rs: pip install 'batcher-engine[hudi]'"
-        ) from exc
-    return HudiTable
+    return require(
+        "hudi", "HudiTable", feature="Hudi read support", provides="hudi-rs", extra="hudi"
+    )
 
 
 _HUDI_OP = {"eq": "=", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
@@ -112,8 +109,16 @@ class HudiFileSliceSplit:
 
     table_uri: str
     base_file_path: str
-    options: dict[str, str]
+    # `repr=False`: the reader options carry the cloud storage credentials
+    # (``aws.secret.key`` and friends). A split's `repr` is rendered into task logs and
+    # into every traceback that crosses a worker, so a generated one publishes the secret
+    # to wherever those are collected.
+    options: dict[str, str] = field(repr=False)
     rows: int | None = None
+    # Carried because a worker sees only the split: a slice enumerated as of an instant
+    # must also be *read* as of it, or a merge-on-read slice resolves against the latest
+    # log files and the historical read silently returns current data.
+    as_of_instant: str | None = None
 
     def _table(self) -> pa.Table:
         hudi_table = _require_hudi()
@@ -133,7 +138,9 @@ class HudiFileSliceSplit:
         return table.select(projection) if projection is not None else table
 
     def schema(self) -> pa.Schema:
-        return HudiSource(self.table_uri, options=dict(self.options)).schema()
+        return HudiSource(
+            self.table_uri, options=dict(self.options), as_of_instant=self.as_of_instant
+        ).schema()
 
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
@@ -208,13 +215,34 @@ class HudiSource:
         return result.select(projection) if projection is not None else result
 
     def _file_slices(self, predicate: dict | None = None) -> list[Any]:
-        """The table's file slices, partition-pruned by `predicate` where it can be."""
+        """The table's file slices, partition-pruned by `predicate` where it can be.
+
+        Honours `as_of_instant`. Enumerating the *latest* slices for a time-travel read
+        was silent: `read()` applied the instant, but `splits()` did not, so the same
+        as-of query returned the historical snapshot single-node and the current table
+        distributed — and a `count()`, which is answered from the slices, reported the
+        current row count for a historical read with `exact_rows=True`.
+        """
         table = self._table()
         filters = _hudi_filters(predicate)
-        try:
-            return list(table.get_file_slices(filters=filters))
-        except Exception:
-            return list(table.get_file_slices())
+        instant = self._as_of_instant
+        for attempt in (
+            lambda: (
+                table.get_file_slices_as_of(instant, filters=filters)
+                if instant is not None
+                else table.get_file_slices(filters=filters)
+            ),
+            lambda: (
+                table.get_file_slices_as_of(instant)
+                if instant is not None
+                else table.get_file_slices()
+            ),
+        ):
+            try:
+                return list(attempt())
+            except Exception:
+                continue
+        return list(table.get_file_slices())
 
     def schema(self) -> pa.Schema:
         return self._table().get_schema()
@@ -295,6 +323,7 @@ class HudiSource:
                 s.base_file_relative_path(),
                 dict(self._options),
                 int(s.num_records) if s.num_records is not None else None,
+                self._as_of_instant,
             )
             for s in slices
         ]

@@ -19,6 +19,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -45,8 +46,6 @@ def tables(duck):
 
 
 def _check(duck, tables, q):
-    from conftest import assert_same
-
     emp, dept = tables
     assert_same(bt.sql(q, emp=emp, dept=dept).collect(), duck.sql(q))
 
@@ -134,9 +133,29 @@ def test_min_max_distinct(duck, tables, q):
     _check(duck, tables, q)
 
 
-def test_sum_distinct_clean_error(tables):
-    # SUM(DISTINCT) needs a per-group dedup the engine has no flag for — it must
-    # raise a clear, actionable error, not leak a confusing internal one.
+def test_sum_distinct(duck, tables):
+    # SUM(DISTINCT) is now supported: it is SUM over rows deduped on the group keys plus
+    # the aggregated expression, so the dedup happens once up front. This test previously
+    # asserted a clean *error*; the limitation it pinned is gone, so it now pins the
+    # result instead. Full coverage lives in `test_diff_distinct_agg.py`.
+    #
+    # Aliased explicitly because Batcher's auto-generated alias lowercases the DISTINCT
+    # keyword (`sum(distinct sal)`) where DuckDB preserves it — a pre-existing naming
+    # difference that `count(DISTINCT ...)` shares, unrelated to the aggregate's value.
+    _check(duck, tables, "SELECT sum(DISTINCT sal) AS s FROM emp")
+
+
+def test_sum_distinct_mixed_with_plain_agg(duck, tables):
+    # A plain aggregate alongside a DISTINCT one is now supported via a two-level
+    # aggregate (level 1 groups by the keys plus the distinct expression, deduping it
+    # implicitly while pre-aggregating the plain one; level 2 combines the partials).
+    # Full coverage lives in `test_diff_distinct_agg.py`.
+    _check(duck, tables, "SELECT sum(DISTINCT sal) AS s, count(sal) AS c FROM emp")
+
+
+def test_sum_distinct_with_non_mergeable_agg_clean_error(tables):
+    # `avg` has no single-column mergeable partial, so it cannot be pre-aggregated
+    # alongside the dedup. That must stay an explicit error, never a plausible wrong number.
     emp, dept = tables
-    with pytest.raises(NotImplementedError, match="DISTINCT"):
-        bt.sql("SELECT sum(DISTINCT sal) FROM emp", emp=emp, dept=dept).collect()
+    with pytest.raises(NotImplementedError, match="mergeable partial"):
+        bt.sql("SELECT sum(DISTINCT sal) s, avg(sal) a FROM emp", emp=emp, dept=dept).collect()

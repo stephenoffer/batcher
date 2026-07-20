@@ -8,6 +8,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same, assert_same_ordered
 
 
 @pytest.fixture
@@ -61,15 +62,11 @@ def dates(duck):
     ],
 )
 def test_sql_math_functions(duck, nums, fn):
-    from conftest import assert_same
-
     q = f"SELECT {fn}(x) AS r FROM n"
     assert_same(bt.sql(q, n=nums).collect(), duck.sql(q))
 
 
 def test_sql_round(duck, nums):
-    from conftest import assert_same
-
     assert_same(
         bt.sql("SELECT round(x) AS r FROM n", n=nums).collect(),
         duck.sql("SELECT round(x) AS r FROM n"),
@@ -91,8 +88,6 @@ def test_sql_round(duck, nums):
     ],
 )
 def test_sql_string_functions(duck, strs, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, s=strs).collect(), duck.sql(q))
 
 
@@ -100,22 +95,16 @@ def test_sql_string_functions(duck, strs, q):
     "fn", ["year", "month", "day", "hour", "minute", "second", "quarter", "week"]
 )
 def test_sql_date_functions(duck, dates, fn):
-    from conftest import assert_same
-
     q = f"SELECT {fn}(d) AS r FROM d"
     assert_same(bt.sql(q, d=dates).collect(), duck.sql(q))
 
 
 def test_sql_function_in_where_and_nested(duck, strs):
-    from conftest import assert_same
-
     q = "SELECT upper(s) AS u FROM s WHERE length(s) > 3"
     assert_same(bt.sql(q, s=strs).collect(), duck.sql(q))
 
 
 def test_sql_nested_functions(duck, nums):
-    from conftest import assert_same
-
     q = "SELECT sqrt(abs(x)) AS r FROM n"
     assert_same(bt.sql(q, n=nums).collect(), duck.sql(q))
 
@@ -143,22 +132,59 @@ def emp(duck):
     ],
 )
 def test_sql_group_by_expression(duck, emp, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, emp=emp).collect(), duck.sql(q))
 
 
 def test_sql_order_by_expression(duck, emp):
-    from conftest import assert_same_ordered
-
     # ORDER BY a function; unique lengths/names avoid tie ambiguity.
     q = "SELECT name FROM emp ORDER BY length(name), name"
     assert_same_ordered(bt.sql(q, emp=emp).collect(), duck.sql(q))
 
 
 def test_sql_order_by_aggregate(duck, emp):
-    from conftest import assert_same_ordered
-
     # ORDER BY an aggregate (resolved to its output column); salaries are distinct.
     q = "SELECT dept, SUM(salary) s FROM emp GROUP BY dept ORDER BY SUM(salary)"
     assert_same_ordered(bt.sql(q, emp=emp).collect(), duck.sql(q))
+
+
+def test_sql_ml_activation_functions():
+    """`sigmoid`/`relu`/`softplus`/`logit` are callable in SQL (a small ML-in-SQL surface).
+    DuckDB has none of these, so check against the closed-form reference."""
+    import math
+
+    tbl = pa.table({"x": [-2.0, -0.5, 0.0, 0.5, 2.0]})
+    out = bt.sql("SELECT sigmoid(x) sg, relu(x) rl, softplus(x) sp FROM t", t=tbl).to_pydict()
+    xs = tbl.column("x").to_pylist()
+    assert out["sg"] == pytest.approx([1 / (1 + math.exp(-x)) for x in xs])
+    assert out["rl"] == pytest.approx([max(0.0, x) for x in xs])
+    assert out["sp"] == pytest.approx([math.log1p(math.exp(x)) for x in xs])
+
+    probs = pa.table({"p": [0.1, 0.5, 0.9]})
+    lg = bt.sql("SELECT logit(p) v FROM t", t=probs).to_pydict()["v"]
+    assert lg == pytest.approx([math.log(p / (1 - p)) for p in [0.1, 0.5, 0.9]])
+
+
+def test_sql_modern_activation_functions_match_expr():
+    """The modern activations (silu/swish/gelu/mish/hardswish) are callable in SQL and equal
+    the DataFrame `Expr` methods (which are torch-matched)."""
+    from batcher import col
+
+    tbl = pa.table({"x": [-2.0, -0.5, 0.0, 0.5, 2.0]})
+    sql_out = bt.sql(
+        "SELECT silu(x) si, swish(x) sw, gelu(x) g, mish(x) m, hardswish(x) hw FROM t", t=tbl
+    ).to_pydict()
+    ref = (
+        bt.from_arrow(tbl)
+        .select(
+            si=col("x").silu(),
+            g=col("x").gelu(),
+            m=col("x").mish(),
+            hw=col("x").hardswish(),
+        )
+        .to_pydict()
+    )
+    assert sql_out["si"] == pytest.approx(ref["si"])
+    assert sql_out["sw"] == pytest.approx(ref["si"])  # swish is an alias for silu
+    assert sql_out["g"] == pytest.approx(ref["g"])
+    assert sql_out["m"] == pytest.approx(ref["m"])
+    assert sql_out["hw"] == pytest.approx(ref["hw"])

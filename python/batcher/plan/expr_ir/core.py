@@ -18,6 +18,7 @@ avoid an import-time cycle.
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, NoReturn, Union
 
@@ -211,15 +212,22 @@ class Expr:
         return Binary("mod", _wrap(other), self)
 
     def __floordiv__(self, other: IntoExpr) -> Expr:
-        """Floor division ``a // b`` — ``floor(a / b)`` (Polars/Python semantics:
-        rounds toward negative infinity, unlike SQL integer division which truncates
-        toward zero). The numerator is cast to Float64 so the division is true
-        (not integer) division before flooring; desugars to existing ops, no new IR."""
-        return MathExpr("floor", Binary("div", self.cast("float64"), _wrap(other)))
+        """Floor division ``a // b`` — the quotient rounded toward negative infinity.
+
+        These are Polars/Python semantics, deliberately *not* SQL integer division,
+        which truncates toward zero: ``-7 // 3`` is ``-3`` here, where ``-7 / 3``
+        gives ``-2``.
+
+        The operation is **type-preserving for integers**: Int64 ``//`` Int64 stays
+        Int64 and is computed exactly, including above 2^53 where routing through
+        Float64 would silently lose precision. A zero divisor yields NULL (matching
+        DuckDB and Polars) rather than ``inf``/``nan``. Float operands give the IEEE
+        ``floor(a / b)``."""
+        return Binary("floor_div", self, _wrap(other))
 
     def __rfloordiv__(self, other: IntoExpr) -> Expr:
         """Reflected floor division so ``scalar // expr`` works; see :meth:`__floordiv__`."""
-        return MathExpr("floor", Binary("div", _wrap(other).cast("float64"), self))
+        return Binary("floor_div", _wrap(other), self)
 
     # --- unary arithmetic operators ----------------------------------------
     def __neg__(self) -> Expr:
@@ -1436,9 +1444,7 @@ class Expr:
         """
         return self - self.mean().over(partition_by=list(partition_by))
 
-    def is_outlier(
-        self, threshold: float = 3.0, partition_by: Iterable[IntoExpr] = ()
-    ) -> Expr:
+    def is_outlier(self, threshold: float = 3.0, partition_by: Iterable[IntoExpr] = ()) -> Expr:
         """True where the value lies more than `threshold` standard deviations from the mean.
 
         The z-score outlier rule, as a predicate you can filter on directly.
@@ -1528,6 +1534,206 @@ class Expr:
                 {'s': [0.6931471805599453]}
         """
         return (Lit(1.0) + self.exp()).ln()
+
+    def silu(self) -> Expr:
+        """The SiLU / Swish activation ``x * sigmoid(x)``.
+
+        The self-gated activation used across modern architectures (EfficientNet, many
+        transformer MLP blocks). Smooth, non-monotonic, and unbounded above.
+
+        Returns:
+            A Float64 expression of the SiLU values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(s=bt.col("x").silu()).to_pydict()["s"]]
+                [0.0, 0.7311]
+        """
+        return self * self.sigmoid()
+
+    def gelu(self) -> Expr:
+        """The GELU activation (tanh approximation) — the transformer feed-forward default.
+
+        ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x**3)))``, matching
+        ``torch.nn.functional.gelu(x, approximate="tanh")`` (GPT-2 / BERT). Composed from
+        the engine's ``tanh`` so it runs in the data plane with no per-row Python.
+
+        Returns:
+            A Float64 expression of the GELU values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(g=bt.col("x").gelu()).to_pydict()["g"]]
+                [0.0, 0.8412]
+        """
+        coeff = Lit(math.sqrt(2.0 / math.pi))
+        inner = coeff * (self + Lit(0.044715) * self * self * self)
+        return Lit(0.5) * self * (Lit(1.0) + inner.tanh())
+
+    def mish(self) -> Expr:
+        """The Mish activation ``x * tanh(softplus(x))``.
+
+        A smooth, self-regularizing activation (YOLOv4 and others). Composed from the
+        engine's ``softplus`` and ``tanh``. Matches ``torch.nn.functional.mish``.
+
+        Returns:
+            A Float64 expression of the Mish values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(m=bt.col("x").mish()).to_pydict()["m"]]
+                [0.0, 0.8651]
+        """
+        return self * self.softplus().tanh()
+
+    def hardsigmoid(self) -> Expr:
+        """The hard sigmoid ``clip((x + 3) / 6, 0, 1)`` — the cheap piecewise-linear sigmoid.
+
+        The mobile-friendly approximation used in MobileNetV3. Matches
+        ``torch.nn.functional.hardsigmoid``.
+
+        Returns:
+            A Float64 expression in ``[0, 1]``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-3.0, 0.0, 3.0]})
+                >>> ds.select(h=bt.col("x").hardsigmoid()).to_pydict()
+                {'h': [0.0, 0.5, 1.0]}
+        """
+        return ((self + Lit(3.0)) / Lit(6.0)).clip(lower=Lit(0.0), upper=Lit(1.0))
+
+    def hardswish(self) -> Expr:
+        """The hard swish ``x * hardsigmoid(x)`` — the cheap piecewise-linear SiLU.
+
+        The activation in MobileNetV3's later layers. Matches
+        ``torch.nn.functional.hardswish``.
+
+        Returns:
+            A Float64 expression of the hard-swish values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-3.0, 0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(h=bt.col("x").hardswish()).to_pydict()["h"]]
+                [-0.0, 0.0, 0.6667]
+        """
+        return self * self.hardsigmoid()
+
+    def leaky_relu(self, negative_slope: float = 0.01) -> Expr:
+        """The leaky ReLU: ``x`` for ``x > 0``, else ``negative_slope * x``.
+
+        A ReLU that lets a small gradient through for negative inputs. Matches
+        ``torch.nn.functional.leaky_relu``.
+
+        Args:
+            negative_slope: The slope applied to negative inputs (default ``0.01``).
+
+        Returns:
+            A Float64 expression of the leaky-ReLU values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-2.0, 0.0, 3.0]})
+                >>> ds.select(r=bt.col("x").leaky_relu()).to_pydict()
+                {'r': [-0.02, 0.0, 3.0]}
+        """
+        from batcher.plan.expr_ir.constructors import when
+
+        return when(self > Lit(0.0)).then(self).otherwise(Lit(negative_slope) * self)
+
+    def elu(self, alpha: float = 1.0) -> Expr:
+        """The exponential linear unit: ``x`` for ``x > 0``, else ``alpha * (exp(x) - 1)``.
+
+        A smooth activation with negative saturation at ``-alpha``. Matches
+        ``torch.nn.functional.elu``.
+
+        Args:
+            alpha: The negative-saturation scale (default ``1.0``).
+
+        Returns:
+            A Float64 expression of the ELU values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(r=bt.col("x").elu()).to_pydict()["r"]]
+                [0.0, 1.0]
+        """
+        from batcher.plan.expr_ir.constructors import when
+
+        return when(self > Lit(0.0)).then(self).otherwise(Lit(alpha) * (self.exp() - Lit(1.0)))
+
+    def hardtanh(self) -> Expr:
+        """The hard tanh ``clip(x, -1, 1)`` — a cheap piecewise-linear tanh.
+
+        Matches ``torch.nn.functional.hardtanh``.
+
+        Returns:
+            A Float64 expression clamped to ``[-1, 1]``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-2.0, 0.5, 2.0]})
+                >>> ds.select(h=bt.col("x").hardtanh()).to_pydict()
+                {'h': [-1.0, 0.5, 1.0]}
+        """
+        return self.clip(lower=Lit(-1.0), upper=Lit(1.0))
+
+    def softsign(self) -> Expr:
+        """The softsign activation ``x / (1 + |x|)`` — a smooth, bounded ``(-1, 1)`` map.
+
+        A cheaper-to-compute alternative to tanh. Matches ``torch.nn.functional.softsign``.
+
+        Returns:
+            A Float64 expression in ``(-1, 1)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [-2.0, 0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(s=bt.col("x").softsign()).to_pydict()["s"]]
+                [-0.6667, 0.0, 0.5]
+        """
+        return self / (Lit(1.0) + self.abs())
+
+    def tanhshrink(self) -> Expr:
+        """The tanhshrink activation ``x - tanh(x)``.
+
+        Matches ``torch.nn.functional.tanhshrink``.
+
+        Returns:
+            A Float64 expression of the tanhshrink values.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
+                >>> [round(v, 4) for v in ds.select(t=bt.col("x").tanhshrink()).to_pydict()["t"]]
+                [0.0, 0.2384]
+        """
+        return self - self.tanh()
 
     def is_positive(self) -> Expr:
         """True where the value is strictly greater than zero (nulls stay null).

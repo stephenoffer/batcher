@@ -27,6 +27,7 @@ from batcher.kyber.rules.selection import BuildSideDecision
 from batcher.metadata import MetadataHub
 from batcher.plan.logical import LogicalPlan
 from batcher.plan.physical import PhysicalPlan
+from batcher.plan.resource import HardwareProfile
 from batcher.plan.stats import RelStats
 from batcher.plan.visitor import children
 
@@ -43,10 +44,15 @@ class Optimizer:
         hub: MetadataHub | None = None,
         rules: list[Rule] | None = None,
         source_stats: list | None = None,
+        hardware: HardwareProfile | None = None,
     ) -> None:
         self._config = config or active_config()
         self._sources = sources or []
         self._hub = hub
+        # The hardware the plan targets. `None` → detect this machine (the single-node and
+        # driver case); the conductor supplies a cluster-derived profile for a distributed run
+        # so cache/memory/VRAM-sized thresholds track the workers, not the driver.
+        self._hardware = hardware or HardwareProfile.local()
         # Per-source `SourceStatistics` the conductor collected at plan-build time
         # (footer/manifest/catalog metadata). Kyber never reads `io` itself — the
         # stats are handed in, keeping the layer boundary intact.
@@ -74,6 +80,7 @@ class Optimizer:
             hub=self._hub,
             estimator=estimator,
             cost_model=cost_model,
+            hardware=self._hardware,
         )
 
     def _run(self, logical: LogicalPlan, ctx: OptimizerContext) -> tuple[LogicalPlan, dict | None]:
@@ -182,6 +189,20 @@ class Optimizer:
                     f"  - left≈{d.left_rows:,.0f} right≈{d.right_rows:,.0f} "
                     f"[{d.provenance}] → {action}"
                 )
+        # The other decision notes rules record. `OptimizerContext.notes` is documented as
+        # the bag rules write to "for explain/telemetry", but only `build_side_decisions` was
+        # ever read back — `gpu_resource_sizing` and `runtime_join_filters` were written on
+        # every applicable plan and surfaced nowhere, so the reasoning behind a GPU sizing
+        # choice or a runtime join filter was unobservable.
+        for key, heading in (
+            ("gpu_resource_sizing", "gpu resource sizing:"),
+            ("runtime_join_filters", "runtime join filters:"),
+        ):
+            notes = ctx.notes.get(key) or []
+            if notes:
+                lines.append("")
+                lines.append(heading)
+                lines.extend(f"  - {n}" for n in notes)
         return "\n".join(lines)
 
 
@@ -249,26 +270,36 @@ def optimize_full(
     sources: list | None = None,
     hub: MetadataHub | None = None,
     source_stats: list | None = None,
+    hardware: HardwareProfile | None = None,
 ) -> tuple[PhysicalPlan, LogicalPlan, list[BuildSideDecision]]:
     """Optimize once (physical + logical + decisions), reusing a cached plan when one exists.
 
-    Optimization is pure in `(logical, sources, config, learned stats)`, so an identical
-    query need not be re-planned — see `kyber.plan_cache` for what the key captures and why
-    an in-memory source is keyed by object identity. `optimizer.plan_cache_entries = 0`
-    disables the memo; a cold plan is computed exactly as before.
+    Optimization is pure in `(logical, sources, config, learned stats, hardware)`, so an
+    identical query on the same hardware need not be re-planned — see `kyber.plan_cache` for
+    what the key captures and why an in-memory source is keyed by object identity.
+    `optimizer.plan_cache_entries = 0` disables the memo; a cold plan is computed exactly as
+    before. `hardware` is `None` for the single-node path (the Optimizer detects this machine);
+    the conductor supplies a cluster-derived profile for a distributed run so the plan — and
+    the cache entry it is stored under — reflects the workers, not the driver.
     """
     cfg = config if config is not None else active_config()
     max_entries = cfg.optimizer.plan_cache_entries
     if max_entries <= 0:
-        return Optimizer(cfg, sources, hub, source_stats=source_stats).optimize_full(logical)
+        return Optimizer(
+            cfg, sources, hub, source_stats=source_stats, hardware=hardware
+        ).optimize_full(logical)
 
-    key = plan_cache.cache_key(logical.content_key(), sources, cfg, hub, source_stats=source_stats)
+    key = plan_cache.cache_key(
+        logical.content_key(), sources, cfg, hub, source_stats=source_stats, hardware=hardware
+    )
     cached = plan_cache.lookup(key)
     if cached is not None:
         phys, plan, decisions = cached
         return phys, plan, list(decisions)  # decisions are telemetry; hand out a copy
 
-    result = Optimizer(cfg, sources, hub, source_stats=source_stats).optimize_full(logical)
+    result = Optimizer(
+        cfg, sources, hub, source_stats=source_stats, hardware=hardware
+    ).optimize_full(logical)
     plan_cache.store(key, result, sources, max_entries)
     phys, plan, decisions = result
     return phys, plan, list(decisions)

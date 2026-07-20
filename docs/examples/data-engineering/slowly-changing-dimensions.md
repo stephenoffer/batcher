@@ -6,7 +6,7 @@ does what dimension loads do: it upserts the new city over the old one.
 :::{warning}
 In May, someone reruns the Q1 revenue-by-city report. New York is down $50 and San
 Francisco is up $50, and no transaction in Q1 changed. The report is not wrong about
-today; it is wrong about February, because the dimension no longer remembers February.
+today. It is wrong about February, because the dimension no longer remembers February.
 :::
 
 That is the entire case for SCD type 2, and it is the reason "just upsert the dimension"
@@ -15,8 +15,8 @@ is a decision, not a default.
 | Type | The table keeps | You can answer | You lose |
 |---|---|---|---|
 | type 1 | one row per key, current values only | "where do they live now" | every past value, permanently |
-| type 2 | one row per key *per version*, with validity intervals | "where did they live in February" | nothing — at the cost of a growing table |
-| type 3 | one row per key, plus a `<attr>_prev` column | "did they move recently" | everything before the previous value |
+| type 2 | one row per key *per version*, with validity intervals | "where did they live in February" | nothing, at the cost of a growing table |
+| type 3 | one row per key, plus a `<attr>_prev` column | "did they move since last time" | everything before the previous value |
 
 ## Type 2: versions, not values
 
@@ -147,7 +147,7 @@ bt.from_pydict({"customer_id": [1], "city": ["SF"]}).scd.type1(dim, keys="custom
 ```
 
 It is the right choice for an attribute nobody will ever ask a historical question about
-(a corrected spelling, an internal flag). Do not reach for it because it is simpler; reach
+(a corrected spelling, an internal flag). Do not reach for it because it is simpler. Reach
 for it because the history has no value.
 :::
 
@@ -170,7 +170,7 @@ print(bt.read.parquet(t3).to_pydict())
 ```
 
 One row per key, "before and after" available, and the row count never grows. It answers
-"did they move recently" and nothing else. If a third move happens, NYC is gone for good.
+"did they move since last time" and nothing else. If a third move happens, NYC is gone for good.
 :::
 
 ::::
@@ -178,7 +178,7 @@ One row per key, "before and after" available, and the row count never grows. It
 ## What to watch
 
 The incoming snapshot must have **one row per natural key**. Two rows for the same key is
-a cardinality violation and the merge will tell you so; deduplicate first (see
+a cardinality violation and the merge will tell you so. Deduplicate first (see
 [deduplication](deduplication.md)).
 
 :::{warning}
@@ -195,8 +195,8 @@ Delta if you want a real transaction around the commit.
 
 :::{important}
 Type 2 only tracks what you list in `track`. An attribute outside that list is overwritten
-in place, type-1 style, in whatever version happens to be current — so its past values are
-gone from every historical version too, not just from the current one. Choose the tracked
+in place, type-1 style, in whatever version happens to be current. Its past values are then
+gone from every historical version too, not only from the current one. Choose the tracked
 set deliberately, because it is the one thing here you cannot fix retroactively.
 :::
 

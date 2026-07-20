@@ -1,10 +1,6 @@
 # Expression evaluation
 
-Every scalar computation in the engine (a filter predicate, a projected column, a sort key,
-a group key, a window's `PARTITION BY`) is one `bc_expr::Expr` tree evaluated over one
-Arrow `RecordBatch`. There is exactly one such type, and `Expr::eval` is the correctness
-oracle for the whole system. The JIT, the parallel executor, and the distributed path are
-all measured against what it produces.
+An *expression* is one `bc_expr::Expr` tree evaluated over one Arrow `RecordBatch`. Every scalar computation in the engine is one of these: a filter predicate, a projected column, a sort key, a group key, a window's `PARTITION BY`. There is exactly one such type, and `Expr::eval` is the correctness oracle for the whole system. The JIT, the parallel executor, and the distributed path are all measured against what it produces.
 
 :::{important}
 `Expr::eval` is the oracle. Every other tier is checked against it, which means it is not
@@ -69,9 +65,7 @@ the semantics:
 
 **Scalar literal broadcast.** `try_scalar_binary` (`crates/bc-expr/src/eval/binary.rs`)
 recognizes `<numeric column> <arith|cmp> <numeric literal>` in either operand order and
-broadcasts the literal as a length-1 Arrow `Scalar` (a `Datum`) instead of materializing N
-copies of it. Same kernels, same promotion rules, bit-identical result. It just does not
-allocate a 16,384-element array of the number `1`.
+broadcasts the literal as a length-1 Arrow `Scalar`, a `Datum`, instead of materializing N copies of it. Same kernels, same promotion rules, bit-identical result. What it avoids is allocating a 16,384-element array of the number `1`.
 
 **Dictionary decode at the leaf.** A `DictionaryArray` (common from Parquet) is decoded to
 its value type in the `Col` arm, so every downstream kernel sees a plain array and no kernel
@@ -81,9 +75,7 @@ directly instead.
 ## Type promotion and null semantics
 
 Promotion follows Arrow: if either operand of an arithmetic or comparison node is a float,
-the node computes in `Float64`; otherwise in `Int64`. Narrow numerics never reach here: the
-FFI boundary widens `Int8/16/32 → Int64` and `Float16/32 → Float64` once
-(`crates/bc-py/src/normalize.rs`), so the kernels below see a small set of types.
+the node computes in `Float64`, otherwise in `Int64`. Narrow numerics never reach here. The FFI boundary widens `Int8/16/32 → Int64` and `Float16/32 → Float64` once in `crates/bc-py/src/normalize.rs`, so the kernels below see a small set of types.
 
 Nulls propagate the way SQL says they do, which is not the way a naive `map` would:
 
@@ -112,18 +104,16 @@ The variants beyond the arithmetic core are grouped by family, one module each u
 | Module | What it holds |
 |---|---|
 | `binary.rs` | arithmetic, comparison, boolean, bitwise, the scalar fast path |
-| `cast.rs` | `CAST` (strict; errors on a bad value) and `TRY_CAST` (yields null) |
-| `str.rs` | string functions: `contains`, `replace`, `substr`, regex, and the rest |
+| `cast.rs` | `CAST`, which is strict and errors on a bad value, and `TRY_CAST`, which yields null |
+| `str/` | string functions: `contains`, `replace`, `substr`, regex, JSON, and the rest |
 | `date.rs` | date/time extraction, `date_trunc`, `strftime`/`strptime`, date offsets |
 | `math.rs` | unary/binary math, `coalesce`, `greatest`/`least`, `is_nan`/`is_inf` |
-| `list.rs`, `list_ops.rs` | list construction, indexing, slicing, `filter`/`transform` |
-| `map.rs`, `hash.rs`, `in_list.rs` | map lookup, hashing, `IN (…)` |
+| `list.rs`, `list_ops/` | list construction, indexing, slicing, `filter`/`transform` |
+| `map.rs`, `hash.rs`, `in_list.rs` | map lookup, hashing, `IN (...)` |
 | `media/` | image/audio/video decode: library-backed, per-row, heavy |
-| `security.rs`, `timezone.rs` | masking/encryption, timezone conversion |
+| `security/`, `timezone.rs` | masking/encryption, timezone conversion |
 
-The cast dtype vocabulary is not per-module: `bc_arrow::dtype_from_name` is the single
-name→type table, and the Python `CAST_DTYPES` set is parity-tested against the live engine
-vocabulary so the two cannot drift.
+The cast dtype vocabulary is not per-module. `bc_arrow::dtype_from_name` is the single name-to-type table, and the Python `CAST_DTYPES` set in `plan/types.py` is pinned to the live engine vocabulary by `tests/unit/test_dtype_registry_parity.py`, so the two cannot drift.
 
 ## Media decode is different
 
@@ -167,28 +157,13 @@ a branch on the *result* of `is_null`, which is never itself null.
 
 ## What it costs, and where it loses
 
-The intermediate-array cost is real and it is why the JIT exists, but note what the
-interpreter buys with it: every sub-expression is a materialized Arrow array, so a batch can
-be handed to any Arrow kernel and any operator at any point, and an operator's state lives in
-Arrow rather than in registers. That is what lets a compiled pipeline be abandoned at a
-pipeline breaker without losing progress.
+The intermediate-array cost is real and it's why the JIT exists, but consider what the interpreter buys with it. Every sub-expression is a materialized Arrow array, so a batch can be handed to any Arrow kernel and any operator at any point, and an operator's state lives in Arrow rather than in registers. That is what lets a compiled pipeline be abandoned at a pipeline breaker without losing progress.
 
-Kernel dispatch is per batch, not per row, so the overhead amortizes over 16,384 rows. On the
-operator benchmarks a filter-then-project over TPC-H `lineitem` at scale factor 1 runs in
-13.9 ms against DuckDB's 12.9 ms and Polars' 9.2 ms. This is a shape where the engine is
-competitive but not ahead, and the gap is expression-evaluation overhead, not scheduling.
-
-## Where the code lives
-
-- `crates/bc-expr/src/lib.rs`: the `Expr` enum (the wire contract; serde tag `e`)
-- `crates/bc-expr/src/eval/dispatch.rs`: `Expr::eval`, the oracle
-- `crates/bc-expr/src/eval/`: one module per function family
-- `crates/bc-expr/src/analyze.rs`: static predicates over a tree (no data touched)
-- `crates/bc-py/src/normalize.rs`: the boundary type normalization the kernels rely on
+Kernel dispatch is per batch, not per row, so the overhead amortizes over 16,384 rows. On the operator benchmarks a filter-then-project over TPC-H `lineitem` at scale factor 1 runs in 13.9 ms against DuckDB's 12.9 ms and Polars' 9.2 ms. This is a shape where the engine is competitive but not ahead, and the gap is expression-evaluation overhead, not scheduling.
 
 ## The two tiers, side by side
 
-Both consume the same `Expr`. That is the whole guarantee.
+Both tiers consume the same `Expr`. That is the whole guarantee.
 
 ::::{tab-set}
 :::{tab-item} Tier-0 (bc-expr)
@@ -202,13 +177,21 @@ this is the answer everything else is compared against
 
 :::{tab-item} Tier-1 (bc-codegen)
 ```text
-numeric Col/Lit/Binary/Not/Case/Cast only — a small subset on purpose
+numeric Col/Lit/Binary/Not/Case/Cast only: a small subset on purpose
 one Cranelift-compiled loop, values in registers, only the output allocated
 bit-for-bit identical to Tier-0 on that subset, or it falls back to it
 compiled once per (expr, column types, simd) and reused across every morsel
 ```
 :::
 ::::
+
+## Where the code lives
+
+- `crates/bc-expr/src/lib.rs`: the `Expr` enum, the wire contract, serde tag `e`
+- `crates/bc-expr/src/eval/dispatch.rs`: `Expr::eval`, the oracle
+- `crates/bc-expr/src/eval/`: one module per function family
+- `crates/bc-expr/src/analyze.rs`: static predicates over a tree, touching no data
+- `crates/bc-py/src/normalize.rs`: the boundary type normalization the kernels rely on
 
 ## See also
 

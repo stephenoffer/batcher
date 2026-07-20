@@ -156,6 +156,15 @@ def _disambiguate_columns(tr, node) -> None:
     source owning a colliding column is wrapped in a subquery renaming it to a flat
     ``alias__col`` name, and matching ``alias.col`` references are rewritten. Columns
     merged by a USING / NATURAL / same-name-``ON``-equi join keep their bare name.
+
+    A merged key keeping its bare name is not the whole story, though: the join coalesces
+    the pair, so reusing that one column for a *qualified* ``L.k`` / ``R.k`` made both
+    report the coalesced value. Under a RIGHT/FULL join that is a silent wrong answer —
+    ``L.k`` echoed the right side's key where SQL requires NULL. So a merged key that the
+    query references by qualifier additionally gets a per-side ``alias__col`` *copy*
+    (`_key_shadows`), and only the qualified references are redirected onto it. The bare
+    name still resolves to the coalesced column, which is what USING/NATURAL specify and
+    what the ``ON`` form is leniently allowed here (DuckDB calls that one ambiguous).
     """
     from sqlglot import expressions as exp
 
@@ -201,32 +210,77 @@ def _disambiguate_columns(tr, node) -> None:
     if natural:  # NATURAL merges every shared column; leave them all bare.
         protected |= shared
     flatten = shared - protected
-    if not flatten:
+    shadow_keys = _key_shadows(node, joins, shared & protected)
+    if not flatten and not shadow_keys:
         return
 
     alias_map: dict[str, dict[str, str]] = {}
+    shadow_map: dict[str, dict[str, str]] = {}
     for t, alias, cols in per_source:
         flat = {c: f"{alias}__{c}" for c in cols if c in flatten}
-        if not flat:
+        shadow = {c: f"{alias}__{c}" for c in cols if c in shadow_keys}
+        if not flat and not shadow:
             continue
         alias_map[alias] = flat
+        shadow_map[alias] = shadow
         # Non-colliding columns keep their bare name so an unqualified unique
-        # reference (`sal`) still resolves.
+        # reference (`sal`) still resolves. A shadowed key keeps its bare name *and*
+        # gains the `alias__key` copy, so the join still merges the bare pair.
         inner = exp.Select(
             expressions=[
                 exp.alias_(exp.column(c), flat[c]) if c in flat else exp.column(c) for c in cols
             ]
+            + [exp.alias_(exp.column(c), s) for c, s in shadow.items()]
         ).from_(exp.table_(t.name))
         t.replace(exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier(alias))))
 
     # A bare `alias.col` projected directly keeps its output name (`col`).
+    both = {a: {**alias_map.get(a, {}), **shadow_map.get(a, {})} for a in alias_map}
     for p in list(node.expressions):
-        if isinstance(p, exp.Column) and p.table in alias_map and p.name in alias_map[p.table]:
-            p.replace(exp.alias_(exp.column(alias_map[p.table][p.name]), p.name))
+        if isinstance(p, exp.Column) and p.name in both.get(p.table, ()):
+            p.replace(exp.alias_(exp.column(both[p.table][p.name]), p.name))
     for c in list(node.find_all(exp.Column)):
-        if (
-            c.table in alias_map
-            and c.name in alias_map[c.table]
-            and c.find_ancestor(exp.Select) is node
-        ):
-            c.replace(exp.column(alias_map[c.table][c.name]))
+        if c.find_ancestor(exp.Select) is not node:
+            continue
+        # Inside the join's own ON, a shadowed key must stay bare: it is what the join
+        # keys on, and redirecting it would un-merge the pair the shadow exists beside.
+        table = alias_map if c.find_ancestor(exp.Join) is not None else both
+        if c.name in table.get(c.table, ()):
+            c.replace(exp.column(table[c.table][c.name]))
+
+
+def _key_shadows(node, joins, merged_keys: set[str]) -> set[str]:
+    """The merged join keys that need a per-side copy: those referenced by a qualifier.
+
+    A copy is only worth materializing where the query actually asks a side for its own
+    key (``SELECT L.k, R.k``); an unqualified query, or ``SELECT *``, wants the merged
+    column and would only be confused by extra output columns. Two whole shapes need no
+    copy at all:
+
+    * **No outer join.** An inner join emits only matched rows, so the merged key is
+      provably equal to both sides' — there is nothing for a copy to say differently.
+    * **Semi/anti.** They emit the left relation's columns alone, so there is no second
+      side to tell apart and nothing was coalesced away to begin with.
+
+    Args:
+        node: The `Select` node being translated.
+        joins: Its `Join` nodes.
+        merged_keys: Key names the join merges into one column.
+
+    Returns:
+        The subset of `merged_keys` that a qualified reference outside the ON clause names.
+    """
+    from sqlglot import expressions as exp
+
+    if not merged_keys or any((j.kind or "").upper() in {"SEMI", "ANTI"} for j in joins):
+        return set()
+    if not any((j.side or "").upper() in {"LEFT", "RIGHT", "FULL"} for j in joins):
+        return set()
+    return {
+        c.name
+        for c in node.find_all(exp.Column)
+        if c.name in merged_keys
+        and c.table
+        and c.find_ancestor(exp.Select) is node
+        and c.find_ancestor(exp.Join) is None
+    }

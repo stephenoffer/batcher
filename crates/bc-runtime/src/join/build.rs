@@ -78,7 +78,7 @@ pub(super) fn build_sharded<K: JoinKeys + Sync>(
     right_null: &[bool],
     shards: usize,
     bloom: Option<BloomFilter>,
-) -> (Vec<HashTable<u32>>, Vec<u32>, Option<BloomFilter>) {
+) -> (Vec<HashTable<u32>>, Vec<u32>, Option<BloomFilter>, bool) {
     // `partition_side` carries the hash itself as the partition's key, so it is computed once
     // here and reused by both the insert below and the bloom — the serial build hashed each
     // row exactly once too.
@@ -126,10 +126,22 @@ pub(super) fn build_sharded<K: JoinKeys + Sync>(
         })
         .collect();
 
-    let mut next: Vec<u32> = vec![u32::MAX; right_rows];
+    // A shard pushes to `chain` only on an `Occupied` entry, i.e. only when a key repeats. So
+    // "every chain is empty" is exactly "the build key is unique", decided here for free from
+    // work already done. On a unique build (any join to a primary key — `orders.o_orderkey`,
+    // `part.p_partkey`, every dimension table) `next` would then be `u32::MAX` in every slot and
+    // never read, so allocating and zeroing it is pure waste: 24 MB of memset at 6M build rows,
+    // serial, on the critical path. See `JoinTable::unique` for the probe-side half.
+    let unique = built.iter().all(|(_, chain, _)| chain.is_empty());
+    let mut next: Vec<u32> = if unique {
+        Vec::new()
+    } else {
+        vec![u32::MAX; right_rows]
+    };
     let mut heads = Vec::with_capacity(shards);
     let mut merged = bloom;
     for (shard_heads, chain, shard_bloom) in built {
+        // Empty for every shard when `unique` — so this never indexes the empty `next`.
         for (row, nxt) in chain {
             next[row as usize] = nxt;
         }
@@ -138,7 +150,7 @@ pub(super) fn build_sharded<K: JoinKeys + Sync>(
         }
         heads.push(shard_heads);
     }
-    (heads, next, merged)
+    (heads, next, merged, unique)
 }
 
 #[cfg(test)]

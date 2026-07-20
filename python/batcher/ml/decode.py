@@ -293,19 +293,68 @@ def _resample(wave: Any, src_sr: int, dst_sr: int) -> Any:
 def _decode_video_bytes(data: bytes, num_frames: int, height: int, width: int) -> Any:
     import io
 
-    import numpy as np
-    from PIL import Image
-
     try:
         import av
     except ImportError as exc:  # pragma: no cover - optional extra
         raise PlanError("video decode needs PyAV: pip install 'batcher-engine[video]'") from exc
+    # Retaining every decoded frame to sample `num_frames` of them costs the whole clip in
+    # RAM: a 1-minute 1080p clip at 30fps is ~1,800 x 6.2 MB ≈ 11 GB, for 8 frames of
+    # output. Instead, learn the frame count first, then decode a second time keeping only
+    # the frames we were going to keep anyway — peak memory becomes the output plus one
+    # frame, independent of clip length. The selected indices and the resize are unchanged,
+    # so the result is identical to the retaining version.
+    # Try the frame count the container header advertises — free when present. It is only
+    # a hint (a stream copy or a truncated file can leave it wrong), so `_sample_frames`
+    # reports a mismatch instead of trusting it, and we redo the selection against a
+    # counted total. The recount costs one extra decode; being wrong would silently sample
+    # different frames than the retaining implementation did.
     with av.open(io.BytesIO(data)) as container:
-        frames = [f.to_ndarray(format="rgb24") for f in container.decode(video=0)]
-    if not frames:
+        advertised = int(container.streams.video[0].frames)
+    out = _sample_frames(av, data, advertised, num_frames, height, width)
+    if out is not None:
+        return out
+    with av.open(io.BytesIO(data)) as container:
+        counted = sum(1 for _ in container.decode(video=0))
+    return _sample_frames(av, data, counted, num_frames, height, width)
+
+
+def _sample_frames(
+    av: Any, data: bytes, total: int, num_frames: int, height: int, width: int
+) -> Any:
+    """Decode `data`, keeping only the `num_frames` frames sampled from a clip of `total`.
+
+    Returns None when `total` does not match what the container actually decodes, which is
+    the caller's signal to recount rather than emit a differently-sampled result.
+    """
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    if total <= 0:
         return None
-    idx = np.linspace(0, len(frames) - 1, num=num_frames).astype(int)
+    idx = np.linspace(0, total - 1, num=num_frames).astype(int)
+    wanted = set(idx.tolist())
+    kept: dict[int, Any] = {}
+    seen = 0
+    with av.open(io.BytesIO(data)) as container:
+        for pos, frame in enumerate(container.decode(video=0)):
+            seen = pos + 1
+            if pos in wanted:
+                rgb = frame.to_ndarray(format="rgb24")
+                kept[pos] = np.asarray(Image.fromarray(rgb).resize((width, height)))
+                if len(kept) == len(wanted):
+                    # Every frame we need is in hand; the tail of the clip is never decoded.
+                    return _stack(kept, idx, num_frames, height, width)
+    if seen != total:
+        return None
+    return _stack(kept, idx, num_frames, height, width) if kept else None
+
+
+def _stack(kept: dict, idx: Any, num_frames: int, height: int, width: int) -> Any:
+    import numpy as np
+
     out = np.empty((num_frames, height, width, 3), dtype=np.uint8)
     for j, k in enumerate(idx):
-        out[j] = np.asarray(Image.fromarray(frames[k]).resize((width, height)))
+        out[j] = kept[int(k)]
     return out

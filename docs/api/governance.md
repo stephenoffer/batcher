@@ -3,7 +3,7 @@
 Row filters, column masks, and lineage. Governance is a **plan rewrite**, not a runtime
 check: {py:obj}`enforce <batcher.governance.enforce>` rewrites the `LogicalPlan` before it
 executes, so a principal who may not see a column never causes that column to be read.
-There is no filtering pass after the fact, and no privileged bypass to forget.
+There's no filtering pass after the fact, and no privileged bypass to forget.
 
 ```python
 from batcher.governance import Principal, SecurityCatalog, Grant, Redact, enforce
@@ -14,9 +14,7 @@ page is the symbol reference.
 
 :::{important}
 Because enforcement is a rewrite rather than a check, there is no execution path that can
-skip it. A principal who may not read a column does not read it and then get filtered; the
-column never enters the plan. That is also why a policy costs a pushed-down filter rather
-than a per-row callback.
+skip it. A principal who may not read a column doesn't read it and then get filtered. The column never enters the plan. That's also why a policy costs a pushed-down filter rather than a per-row callback.
 :::
 
 ## Identity
@@ -72,7 +70,7 @@ ordinary pushed-down filter and costs nothing extra.
 ## Column masks
 
 A mask changes how a column *reads* rather than whether it reads at all. An analyst sees
-`XXXX1234`; the fraud team sees the number. Bind a mask to one column with
+`XXXX1234`, while the fraud team sees the number. Bind a mask to one column with
 {py:obj}`ColumnMask <batcher.governance.ColumnMask>`, or to a *tag* with
 {py:obj}`TagMask <batcher.governance.TagMask>` so it applies everywhere that tag
 appears, however many tables grow later.
@@ -88,9 +86,7 @@ appears, however many tables grow later.
 ### Mask functions
 
 The masking primitives themselves. {py:obj}`Pseudonymize <batcher.governance.Pseudonymize>`
-is deterministic, so masked values still join and group correctly;
-{py:obj}`Encrypt <batcher.governance.Encrypt>` is reversible with the key;
-{py:obj}`Nullify <batcher.governance.Nullify>` is not.
+is deterministic, so masked values still join and group correctly. {py:obj}`Encrypt <batcher.governance.Encrypt>` is reversible with the key, and {py:obj}`Nullify <batcher.governance.Nullify>` isn't.
 
 ```{eval-rst}
 .. autoclass:: Redact

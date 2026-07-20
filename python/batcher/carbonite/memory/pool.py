@@ -19,6 +19,8 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 
+from batcher._internal.native import engine_or_none
+
 __all__ = ["BufferPool", "current_process_pool", "process_pool"]
 
 
@@ -64,11 +66,13 @@ class _FallbackPool:
 
 def _make_native_pool(limit_bytes: int):
     """The Rust `MemoryPool` if the engine is built, else the Python fallback."""
-    try:
-        from batcher._native import MemoryPool as _NativePool
-    except ImportError:
+    # Through the one sanctioned accessor: a direct `import batcher._native` is attributed
+    # by the import graph to the root `batcher` package, forging a phantom cycle that breaks
+    # the layer-independence contracts (see `batcher._internal.native`).
+    mod = engine_or_none()
+    if mod is None:
         return _FallbackPool(limit_bytes)
-    return _NativePool(limit_bytes)
+    return mod.MemoryPool(limit_bytes)
 
 
 class BufferPool:
@@ -139,6 +143,13 @@ def process_pool(limit_bytes: int) -> BufferPool:
     against the same budget. The pool is created on first call; later calls reset
     the limit to `limit_bytes` (an autoscaler or a differently-configured query can
     grow/shrink the envelope) without dropping the live `used` accounting.
+
+    A *shrink* is deferred while the pool still holds reservations. Several pipelines share
+    this one envelope, so applying a cheap query's smaller budget mid-flight would shrink
+    the envelope an expensive concurrent query is already running inside — pushing it into
+    spurious spilling, or failing a reservation for work Carbonite had correctly admitted.
+    Growth always applies at once (capacity the autoscaler just added must not wait), and a
+    deferred shrink lands on the next call once the pool is idle.
     """
     global _process_pool
     if _process_pool is None:
@@ -146,7 +157,9 @@ def process_pool(limit_bytes: int) -> BufferPool:
             if _process_pool is None:
                 _process_pool = BufferPool(limit_bytes)
                 return _process_pool
-    if _process_pool.limit != limit_bytes:
+    if limit_bytes > _process_pool.limit or (
+        limit_bytes < _process_pool.limit and _process_pool.used == 0
+    ):
         _process_pool.set_limit(limit_bytes)
     return _process_pool
 

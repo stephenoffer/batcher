@@ -19,6 +19,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -55,8 +56,6 @@ def test_vector_distance_dimension_mismatch_errors(duck, method, duck_fn):
 
 
 def test_vector_distance_equal_length_still_matches(duck):
-    from conftest import assert_same
-
     t = pa.table(
         {
             "a": pa.array([[1.0, 2.0], [3.0, 4.0]], pa.list_(pa.float64())),
@@ -77,8 +76,6 @@ def test_vector_distance_equal_length_still_matches(duck):
 
 # --- Bug 2: array_agg / list_agg keeps NULL elements ----------------------------------
 def test_array_agg_keeps_nulls(duck):
-    from conftest import assert_same
-
     t = pa.table(
         {
             "g": pa.array([1, 1, 1, 1, 2], pa.int64()),
@@ -101,8 +98,6 @@ def test_array_agg_keeps_nulls(duck):
 
 # --- Bug 3: avg/mean over a Decimal128 column returns a double -------------------------
 def test_mean_over_decimal_returns_double(duck):
-    from conftest import assert_same
-
     d = pa.array(
         [Decimal("1.50"), Decimal("2.50"), Decimal("3.50"), Decimal("4.50")],
         pa.decimal128(10, 2),
@@ -120,8 +115,6 @@ def test_mean_over_decimal_returns_double(duck):
 # --- Bug 4: set ops of int64 ∪ float64 coerce to double -------------------------------
 @pytest.mark.parametrize("distinct", [True, False])
 def test_union_int64_float64_coerces_to_double(duck, distinct):
-    from conftest import assert_same
-
     a = pa.table({"x": pa.array([1, 2, 3], pa.int64())})
     b = pa.table({"x": pa.array([2.5, 3.0], pa.float64())})
     duck.register("a", a)
@@ -133,8 +126,6 @@ def test_union_int64_float64_coerces_to_double(duck, distinct):
 
 @pytest.mark.parametrize("op", ["intersect", "except_"])
 def test_intersect_except_int64_float64_coerces(duck, op):
-    from conftest import assert_same
-
     a = pa.table({"x": pa.array([1, 2, 3], pa.int64())})
     b = pa.table({"x": pa.array([2.5, 3.0], pa.float64())})
     duck.register("a", a)

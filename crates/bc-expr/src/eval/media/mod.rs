@@ -9,6 +9,7 @@ use rayon::prelude::*;
 
 pub(crate) mod audio;
 pub(crate) mod image;
+pub(crate) mod mel;
 pub(crate) mod video;
 
 pub(crate) use audio::eval_audio;

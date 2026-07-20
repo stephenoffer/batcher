@@ -48,7 +48,7 @@ A query may use:
 - `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS JOIN` (equi-keys; an extra non-equi
   `AND` condition is applied as a filter)
 - `UNION` / `INTERSECT` / `EXCEPT`, `WITH` (CTEs), and subqueries
-- Window functions, including explicit `ROWS BETWEEN …` frames
+- Window functions, including explicit `ROWS BETWEEN ...` frames
 - `CASE` expressions and `CAST`
 
 You can also register Python functions and call them from SQL, and define tables and
@@ -134,9 +134,9 @@ print(s.sql("SELECT COUNT(*) AS n FROM t").to_pydict())
 # {'n': [6]}
 ```
 
-Register a Python function and call it from SQL. A scalar function is vectorized
-(it receives an Arrow array); it lowers to the same `map_batches` path as the
-DataFrame API, so Python and SQL share one plan:
+Register a Python function and call it from SQL. A scalar function is vectorized, so it
+receives an Arrow array rather than a value. It lowers to the same `map_batches` path as
+the DataFrame API, so Python and SQL share one plan:
 
 ```python
 import pyarrow.compute as pc
@@ -147,7 +147,7 @@ print(s.sql("SELECT discount(price) AS net FROM t ORDER BY price").to_pydict())
 ```
 
 `CREATE TABLE/VIEW AS` and `DROP TABLE` register and unregister a lazy table in the
-session (no materialization until a terminal op):
+session. Nothing materializes until a terminal op:
 
 ```python
 s.sql("CREATE VIEW cheap AS SELECT category, price FROM t WHERE price < 30")

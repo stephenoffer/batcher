@@ -10,6 +10,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 
 
 def _ab(duck):
@@ -21,22 +22,16 @@ def _ab(duck):
 
 
 def test_intersect_with_nulls(duck):
-    from conftest import assert_same
-
     a, b = _ab(duck)
     assert_same(a.intersect(b).collect(), duck.sql("SELECT * FROM a INTERSECT SELECT * FROM b"))
 
 
 def test_except_with_nulls(duck):
-    from conftest import assert_same
-
     a, b = _ab(duck)
     assert_same(a.except_(b).collect(), duck.sql("SELECT * FROM a EXCEPT SELECT * FROM b"))
 
 
 def test_intersect_dedups(duck):
-    from conftest import assert_same
-
     a = pa.table({"x": [1, 1, 2, 2, 3]})
     b = pa.table({"x": [1, 2, 2, 4]})
     duck.register("a2", a)
@@ -48,8 +43,6 @@ def test_intersect_dedups(duck):
 
 
 def test_except_single_column_nulls(duck):
-    from conftest import assert_same
-
     a = pa.table({"x": [1, 2, None, 3]})
     b = pa.table({"x": [2, None]})
     duck.register("a3", a)
@@ -61,8 +54,6 @@ def test_except_single_column_nulls(duck):
 
 
 def test_sql_intersect_except_with_nulls(duck):
-    from conftest import assert_same
-
     a = pa.table({"x": [1, 2, None, 4]})
     b = pa.table({"x": [2, None, 5]})
     duck.register("sa", a)

@@ -15,7 +15,7 @@ splits a codepoint.
 :::{warning}
 Overlap is not optional. Cut at a hard boundary and the sentence that answers the question
 is half in chunk 3 and half in chunk 4, so neither embeds close to the query and neither is
-retrieved. An overlap of 10–20% of the chunk size costs a little storage and buys back the
+retrieved. An overlap of 10 to 20% of the chunk size costs a little storage and buys back the
 straddling sentences.
 :::
 

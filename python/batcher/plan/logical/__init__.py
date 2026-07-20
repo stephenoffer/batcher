@@ -6,7 +6,7 @@ input's available columns) happens here at build time so mistakes fail fast,
 before the optimizer or engine ever runs. Logical plans lower to the relational
 IR JSON via `to_ir()`; types of derived columns are resolved by the engine.
 
-This package is split by node family — `base`, `relational`, `aggregate`,
+This package is split by node family — `base`, `relational`, `reshape`, `aggregate`,
 `window`, `join`, and `transforms` — and re-exports the flat public surface here.
 """
 
@@ -27,16 +27,16 @@ from batcher.plan.logical.relational import (
     MapBatches,
     Project,
     Projection,
-    RowId,
     Sample,
     Scan,
     Union,
-    Unnest,
-    Unpivot,
     WatermarkDedup,
 )
+from batcher.plan.logical.reshape import RowId, Unnest, Unpivot
 from batcher.plan.logical.transforms import (
+    empty_result_schema,
     is_cartesian_key_pair,
+    is_partition_independent,
     is_streamable,
     remap_sources,
 )
@@ -68,7 +68,9 @@ __all__ = [
     "Window",
     "WindowFrame",
     "WindowFuncSpec",
+    "empty_result_schema",
     "is_cartesian_key_pair",
+    "is_partition_independent",
     "is_streamable",
     "remap_sources",
 ]

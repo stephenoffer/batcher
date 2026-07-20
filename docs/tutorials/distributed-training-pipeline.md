@@ -51,7 +51,7 @@ print(featured.columns)
 
 :::{important}
 The split comes first, because a preprocessor fitted on the test rows has already leaked. No
-error is raised and no metric looks wrong; the model simply scores better offline than it
+error is raised and no metric looks wrong. The model scores better offline than it
 ever will in production. Split, then fit, in that order, every time.
 :::
 
@@ -142,11 +142,11 @@ The next epoch reshuffles. `usable_length` is how many sample positions the epoc
 always a multiple of `world_size`, trimmed with `drop_last=True` (the default) or padded
 without.
 
-That order is **computed, not materialized**. A shuffled index list for a 10-billion-sample
-corpus would cost ~280 GB of driver RAM before a single row is read; `epoch_permutation` is a
-keyed bijection on `[0, n)` (index in, shuffled index out, no state), so it costs the same
-~0.8 MB at 1 billion samples as at 1 trillion, and seeking to sample 900,000,000,000 is
-modular arithmetic rather than a walk.
+That order is **computed, not materialized**. A shuffled index list costs about 28 bytes per
+sample in CPython, so a 10-billion-sample corpus would want roughly 280 GB of driver RAM
+before a single row is read. `epoch_permutation` is a keyed pseudorandom bijection on
+`[0, n)` instead: index in, shuffled index out, no state. Its memory is constant whatever the
+corpus size, and seeking to sample 900,000,000,000 is modular arithmetic rather than a walk.
 
 ## 6. One iterable per rank
 
@@ -156,7 +156,7 @@ that global order.
 :::{warning}
 `stream_loader` is the *only* shard authority. Do not add a `DistributedSampler` on top of
 it: the two will shard the same data twice, each rank will see a slice of a slice, and most
-of your corpus will silently never reach the model. Nothing errors. The loss curve just gets
+of your corpus will silently never reach the model. Nothing errors. The loss curve gets
 worse for a reason you cannot see.
 :::
 

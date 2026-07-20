@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, when
 
 pytestmark = pytest.mark.differential
@@ -23,8 +24,6 @@ def _floats():
 
 
 def test_alias_positional_select_matches_duckdb(duck):
-    from conftest import assert_same
-
     t = pa.table({"a": [1, 2, 3], "x": [10, 20, 30], "y": [1, 2, 3]})
     duck.register("t2", t)
     # Positional column ref + aliased derived expression.
@@ -40,8 +39,6 @@ def test_alias_is_ir_transparent():
 
 
 def test_clip_matches_duckdb_case(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_floats()).select(c=col("x").clip(2.0, 8.0)).collect()
     duck.register("t", _floats())
     # CLIP as a null-preserving CASE (LEAST/GREATEST would drop nulls to a bound).
@@ -52,16 +49,12 @@ def test_clip_matches_duckdb_case(duck):
 
 
 def test_clip_lower_only(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_floats()).select(c=col("x").clip(lower=3.0)).collect()
     duck.register("t", _floats())
     assert_same(out, duck.sql("SELECT CASE WHEN x < 3.0 THEN 3.0 ELSE x END AS c FROM t"))
 
 
 def test_case_null_when_falls_through(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_floats())
         .select(r=when(col("x") < 2.0).then(99.0).otherwise(col("x")))
@@ -72,8 +65,6 @@ def test_case_null_when_falls_through(duck):
 
 
 def test_is_nan_matches_duckdb(duck):
-    from conftest import assert_same
-
     data = pa.table({"x": pa.array([1.0, _NAN, 3.0], type=pa.float64())})
     out = bt.from_arrow(data).select(n=col("x").is_nan()).collect()
     duck.register("t", data)
@@ -84,8 +75,6 @@ _INF = float("inf")
 
 
 def test_is_infinite_matches_duckdb(duck):
-    from conftest import assert_same
-
     data = pa.table({"x": pa.array([1.0, _INF, _NAN, -_INF, None], type=pa.float64())})
     out = bt.from_arrow(data).select(n=col("x").is_infinite()).collect()
     duck.register("t", data)
@@ -93,8 +82,6 @@ def test_is_infinite_matches_duckdb(duck):
 
 
 def test_is_finite_matches_duckdb(duck):
-    from conftest import assert_same
-
     data = pa.table({"x": pa.array([1.0, _INF, _NAN, -_INF, None], type=pa.float64())})
     out = bt.from_arrow(data).select(n=col("x").is_finite()).collect()
     duck.register("t", data)
@@ -102,8 +89,6 @@ def test_is_finite_matches_duckdb(duck):
 
 
 def test_is_not_nan_matches_duckdb(duck):
-    from conftest import assert_same
-
     data = pa.table({"x": pa.array([1.0, _NAN, 3.0, -2.5], type=pa.float64())})
     out = bt.from_arrow(data).select(n=col("x").is_not_nan()).collect()
     duck.register("t", data)
@@ -111,8 +96,6 @@ def test_is_not_nan_matches_duckdb(duck):
 
 
 def test_is_nan_and_not_nan_with_nulls_matches_duckdb(duck):
-    from conftest import assert_same
-
     # All three float states + null. is_nan/is_not_nan are dedicated ops (not the
     # `x != x` trick), so NaN is flagged correctly whether or not the column has
     # nulls — null → null, NaN → true/false, normal → false/true.
@@ -125,8 +108,6 @@ def test_is_nan_and_not_nan_with_nulls_matches_duckdb(duck):
 
 
 def test_float_comparisons_on_nan_match_duckdb(duck):
-    from conftest import assert_same
-
     # The engine's comparison operators use total ordering (NaN == NaN, and NaN
     # sorts greater than every non-NaN value), matching DuckDB. The Cranelift JIT
     # must agree with this, not fall back to IEEE (where NaN compares unordered).

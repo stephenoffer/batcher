@@ -22,7 +22,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from conftest import assert_tables_equal
+from _harness import assert_tables_equal
 
 pytestmark = pytest.mark.differential
 

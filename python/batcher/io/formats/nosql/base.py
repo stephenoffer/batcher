@@ -105,7 +105,7 @@ class _ScanSplit:
     """
 
     source_cls: type[ScanSource]
-    conn_kwargs: dict[str, Any]
+    conn_kwargs: dict[str, Any] = field(repr=False)
     partition: PartitionLocator
     identity_prefix: str
     predicate: dict | None = None
@@ -250,7 +250,48 @@ class ScanSource(ABC):
         return None
 
     def identity(self) -> str:
-        return f"{self.format_name}:{self._identity_suffix()}"
+        """The learned-statistics key: the store, the human locator, and the connection.
+
+        `identity()` is the key a source's learned statistics are stored under, so two
+        sources sharing an identity are treated by Kyber as the *same relation*. Every
+        connector here built one from `_identity_suffix()` alone, and every suffix is a
+        partial view of the connection: Elasticsearch used the bare index name, so
+        ``orders`` on production and ``orders`` on staging were one relation; Redis used
+        ``host:port/db`` and dropped the ``match`` glob, so a scan of ``user:*`` and a scan
+        of ``session:*`` shared a key. Kyber then applies the billion-row relation's
+        cardinalities to the thousand-row one and picks a plan for the wrong data. Nothing
+        errors — the query is correct and the plan is wrong.
+
+        Folding the fingerprint in *here* rather than in each `_identity_suffix()` is what
+        makes it hold for every connector, including ones added later: a subclass cannot
+        forget the part that keeps its statistics its own.
+
+        `connection_fingerprint` is `sha256` (not `hash()`, which Python salts per process,
+        so the key would differ every run and no statistic would ever be reused) and it
+        excludes credential-ish keys, so rotating a password neither leaks into the
+        persisted key nor orphans everything already learned.
+        """
+        # Deferred: importing `batcher.io.formats.sql._common` executes the `sql` package
+        # __init__, which imports every SQL connector. That is a needless import-time cost
+        # for a NoSQL read, and it only matters once, when an identity is actually asked for.
+        from batcher.io.formats.sql._common import connection_fingerprint
+
+        return (
+            f"{self.format_name}:{self._identity_suffix()}:"
+            f"{connection_fingerprint(self._fingerprint_material())}"
+        )
+
+    def _fingerprint_material(self) -> dict[str, Any]:
+        """The connection kwargs as they should be fingerprinted; `_conn_kwargs` by default.
+
+        `connection_fingerprint` drops credentials it can recognize *by key name*, so a
+        rotated ``password=`` does not change the key and orphan everything learned. That
+        misses a credential embedded inside a larger value — a ``bolt://user:pass@host``
+        URI is one field, and rotating the password inside it silently re-keys the
+        relation. A connector whose connection carries a credential that way overrides
+        this to mask it first, exactly as `odbc._connection_key` does.
+        """
+        return self._conn_kwargs
 
     def splits(
         self,
@@ -311,6 +352,22 @@ class ScanSource(ABC):
         `Filter` re-checks every row regardless, so ignoring a predicate is always correct and
         merely slower.
         """
+
+    def _secret(self, key: str) -> Any:
+        """A credential from `_conn_kwargs`, resolving an ``env:``/``file:`` reference.
+
+        Call this from `_client`/`_driver`/`_cluster` — i.e. where the connection is
+        actually opened, which is the worker — never from `__init__` or anything the
+        driver evaluates. The source object and its pickled split then carry only the
+        reference, so the secret never crosses the wire and cannot surface in a traceback
+        or log line. A plain literal passes through unchanged, so a user who supplies a raw
+        password keeps working exactly as before.
+        """
+        from batcher.io.credentials import resolve_secret
+
+        return resolve_secret(
+            self._conn_kwargs.get(key), what=f"{self.format_name or 'connector'} {key}"
+        )
 
     def _identity_suffix(self) -> str:
         """A non-secret identity suffix; defaults to the connection target.

@@ -327,9 +327,12 @@ pub fn framed_value(
                     WindowFn::LastValue => Some(b - 1),
                     // `nth_value`: the `nth`-th row (1-based) counting from the frame
                     // start; null if the frame holds fewer than `nth` rows.
+                    // Compare the 1-based offset against the frame *width* rather than
+                    // forming `a + (nth - 1)`: `nth` arrives unvalidated from the IR, and
+                    // that sum overflows i64 for a large `nth`, wrapping to a negative that
+                    // passes an `idx < b` bound check and then indexes out of bounds.
                     WindowFn::NthValue => {
-                        let idx = a as i64 + (nth - 1);
-                        (nth >= 1 && idx < b as i64).then_some(idx as usize)
+                        (nth >= 1 && nth - 1 < (b - a) as i64).then(|| a + (nth - 1) as usize)
                     }
                     other => {
                         return Err(RuntimeError::UnsupportedWindow {
@@ -422,6 +425,32 @@ fn framed_i64(
         let mut dq: VecDeque<usize> = VecDeque::new();
         for pos in 0..len {
             let (a, b) = frame_bounds(frame, pos, len, peers.as_ref());
+            // Remove the *leaving* rows before adding the *entering* ones. Both bounds are
+            // non-decreasing, so either order yields the same frame — but adding first
+            // makes the accumulator transiently hold the union of the old and new frames,
+            // a superset of both. For i64 SUM that union can overflow when neither frame
+            // does (`ROWS CURRENT ROW` over `[i64::MAX, 1]`), and `checked_add` would abort
+            // a perfectly valid query with `SumOverflow`. Removing first keeps `sum` exactly
+            // over `[cur_a, cur_b)` at every point.
+            while cur_a < a {
+                if cur_a < cur_b && arr.is_valid(part[cur_a]) {
+                    if need_sum {
+                        sum -= arr.value(part[cur_a]);
+                    }
+                    cnt -= 1;
+                }
+                cur_a += 1;
+            }
+            cur_b = cur_b.max(cur_a);
+            if need_extreme {
+                while let Some(&front) = dq.front() {
+                    if front < cur_a {
+                        dq.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+            }
             while cur_b < b {
                 let row = part[cur_b];
                 if arr.is_valid(row) {
@@ -445,25 +474,6 @@ fn framed_i64(
                     }
                 }
                 cur_b += 1;
-            }
-            while cur_a < a {
-                if cur_a < cur_b && arr.is_valid(part[cur_a]) {
-                    if need_sum {
-                        sum -= arr.value(part[cur_a]);
-                    }
-                    cnt -= 1;
-                }
-                cur_a += 1;
-            }
-            cur_b = cur_b.max(cur_a);
-            if need_extreme {
-                while let Some(&front) = dq.front() {
-                    if front < cur_a {
-                        dq.pop_front();
-                    } else {
-                        break;
-                    }
-                }
             }
             if cnt == 0 {
                 continue; // empty / all-null frame → null
@@ -1022,6 +1032,33 @@ mod tests {
         );
     }
 
+    /// A huge `nth` must yield null, not overflow the frame-relative index.
+    ///
+    /// Regression: the index was computed as `a as i64 + (nth - 1)`, which wraps
+    /// negative for a large `nth` once the frame start `a` is past 0. The wrapped value
+    /// then passed the `idx < b as i64` bound check and was cast back with `as usize`,
+    /// indexing the partition far out of bounds — a panic in release, an arithmetic
+    /// overflow abort in debug. `nth` reaches here unvalidated from the IR offset (the
+    /// Python builder checks only `n >= 1`). Comparing the offset against the frame
+    /// *width* instead never forms the large sum.
+    #[test]
+    fn nth_value_with_huge_n_is_null_not_a_panic() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50]));
+        let ordered = vec![vec![0usize, 1, 2, 3, 4]];
+        // ROWS BETWEEN 2 PRECEDING AND CURRENT ROW — `a` reaches 2, so `a + (nth-1)`
+        // overflows for `nth` near `i64::MAX`.
+        let frame = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::Preceding(2),
+            end: FrameBound::CurrentRow,
+        };
+        for nth in [i64::MAX, i64::MAX - 1, 1 << 62] {
+            let got =
+                framed_value(WindowFn::NthValue, &ordered, &values, nth, frame, None, 5).unwrap();
+            assert_eq!(got.null_count(), 5, "nth_value({nth}) must be all null");
+        }
+    }
+
     /// A sliding float SUM over large-magnitude values must stay exact. The naive
     /// add-then-subtract slide computed `1e16 + 1 - 1e16 == 0` for a trailing 2-row
     /// window over `[1e16, 1, 1, 1]`, where DuckDB (and a fresh re-add) gives 2.0. The
@@ -1080,6 +1117,33 @@ mod tests {
         assert_eq!(mn.as_primitive::<Int64Type>().values(), &[big, big, big]);
         let mx = framed_aggregate(WindowFn::Max, &ordered, &values, frame, None, 3).unwrap();
         assert_eq!(mx.as_primitive::<Int64Type>().values(), &[big, big, big]);
+    }
+
+    /// A sliding i64 SUM/AVG must not overflow on a frame whose own values fit.
+    ///
+    /// Regression: the slide added the *entering* rows before removing the *leaving*
+    /// ones, so between the two loops the accumulator held the union of the old and new
+    /// frames — a superset of either. With `ROWS BETWEEN CURRENT ROW AND CURRENT ROW`
+    /// over `[i64::MAX, 1]`, every individual frame is a single value that fits, but the
+    /// transient union `{i64::MAX, 1}` does not, and `checked_add` aborted the whole
+    /// query with `SumOverflow`. Both bounds are non-decreasing, so removing first is
+    /// equivalent and keeps the frame exact at every point.
+    #[test]
+    fn framed_i64_sum_does_not_overflow_on_a_frame_that_fits() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, 1]));
+        let ordered = vec![vec![0usize, 1]];
+        let frame = Frame {
+            unit: FrameUnit::Rows,
+            start: FrameBound::CurrentRow,
+            end: FrameBound::CurrentRow,
+        };
+        let s = framed_aggregate(WindowFn::Sum, &ordered, &values, frame, None, 2).unwrap();
+        assert_eq!(s.as_primitive::<Int64Type>().values(), &[i64::MAX, 1]);
+        let a = framed_aggregate(WindowFn::Avg, &ordered, &values, frame, None, 2).unwrap();
+        assert_eq!(
+            a.as_primitive::<Float64Type>().values(),
+            &[i64::MAX as f64, 1.0]
+        );
     }
 
     /// The O(n) sliding kernel must match a naive O(n·w) recompute for every frame
@@ -1308,8 +1372,7 @@ mod tests {
         let keys: ArrayRef = Arc::new(Int64Array::from(key_vals.to_vec()));
         let conv = RowConverter::new(vec![SortField::new(keys.data_type().clone())]).unwrap();
         let rows = conv.convert_columns(std::slice::from_ref(&keys)).unwrap();
-        let raw: Vec<Option<i64>> =
-            vec![Some(1), None, Some(3), Some(4), None, Some(6), Some(7)];
+        let raw: Vec<Option<i64>> = vec![Some(1), None, Some(3), Some(4), None, Some(6), Some(7)];
         let values: ArrayRef = Arc::new(Int64Array::from(raw.clone()));
         let part: Vec<usize> = (0..7).collect();
         let ordered = vec![part.clone()];
@@ -1368,15 +1431,10 @@ mod tests {
                     WindowFn::Max,
                     WindowFn::Count,
                 ] {
-                    let got = framed_aggregate(func, &ordered, &values, frame, Some(&rows), n)
-                        .unwrap();
-                    let want =
-                        naive_groups(func, &part, &group_of, num_groups, &raw, start, end);
-                    assert_eq!(
-                        fmt(&got),
-                        want,
-                        "func={func:?} start={start:?} end={end:?}"
-                    );
+                    let got =
+                        framed_aggregate(func, &ordered, &values, frame, Some(&rows), n).unwrap();
+                    let want = naive_groups(func, &part, &group_of, num_groups, &raw, start, end);
+                    assert_eq!(fmt(&got), want, "func={func:?} start={start:?} end={end:?}");
                 }
             }
         }

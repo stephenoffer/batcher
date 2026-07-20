@@ -14,6 +14,7 @@ import tempfile
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import Config, col, config_context
 
 
@@ -31,8 +32,6 @@ def _written(tmp: str, *, index: bool) -> tuple[str, pa.Table]:
 
 
 def test_absent_equality_pruned_matches_duckdb(duck):
-    from conftest import assert_same
-
     with tempfile.TemporaryDirectory() as tmp:
         path, table = _written(tmp, index=True)
         duck.register("t", table)
@@ -42,8 +41,6 @@ def test_absent_equality_pruned_matches_duckdb(duck):
 
 
 def test_present_equality_matches_duckdb(duck):
-    from conftest import assert_same
-
     with tempfile.TemporaryDirectory() as tmp:
         path, table = _written(tmp, index=True)
         duck.register("t2", table)
@@ -52,8 +49,6 @@ def test_present_equality_matches_duckdb(duck):
 
 
 def test_in_list_absent_matches_duckdb(duck):
-    from conftest import assert_same
-
     with tempfile.TemporaryDirectory() as tmp:
         path, table = _written(tmp, index=True)
         duck.register("t3", table)
@@ -63,8 +58,6 @@ def test_in_list_absent_matches_duckdb(duck):
 
 
 def test_index_off_still_correct(duck):
-    from conftest import assert_same
-
     with tempfile.TemporaryDirectory() as tmp:
         path, table = _written(tmp, index=False)  # no index built
         duck.register("t4", table)

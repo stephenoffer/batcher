@@ -13,12 +13,11 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, count
 
 duckdb = pytest.importorskip("duckdb")
 pytest.importorskip("batcher._native", reason="native engine not built")
-
-from conftest import assert_same  # noqa: E402  (pytest puts the test dir on sys.path)
 
 
 @pytest.fixture

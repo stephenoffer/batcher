@@ -107,8 +107,8 @@ print(bt.read_memory("totals_demo").count())  # 3 rows accumulated
 
 Sinks available on the write namespace:
 
-- `ds.write(path, format=..., trigger=...)` writes files (Parquet/CSV/JSON/…), one
-  `part-batch*` file per micro-batch, idempotent on restart.
+- `ds.write(path, format=..., trigger=...)` writes files such as Parquet, CSV, or JSON,
+  one `part-batch*` file per micro-batch, idempotent on restart.
 - `ds.write.delta(uri, trigger=...)` makes a transactional Delta append per micro-batch.
 - `ds.write.console(trigger=...)` prints each micro-batch. Development only.
 - `ds.write.memory(name, trigger=...)` builds an in-memory table you read back with
@@ -246,7 +246,7 @@ arrive later than that. The query is otherwise identical to the batch one:
 windowed = (
     bt.read.kafka(topic="clicks")
     .with_watermark("ts", "10 minutes")
-    .group_by(w=bt.window(col("ts"), "1 hour"))
+    .group_by(w=bt.window(col("ts"), "1h"))
     .agg(hits=col("n").sum())
 )
 windowed.write.delta("gold/hourly", trigger=bt.Trigger.processing_time("1 minute"),
@@ -277,7 +277,7 @@ deduped = records.drop_duplicates_within_watermark(["id"], event_time="ts",
 print(sorted(deduped.to_pydict()["id"]))  # ['x', 'y', 'z'] — the second 'x' dropped
 ```
 
-## Stream–stream joins
+## Stream-to-stream joins
 
 `join_stream` joins two streams on keys **and** an event-time interval
 (`|left_time - right_time| <= within`). The time bound is what lets buffered state be
@@ -306,7 +306,7 @@ The sink's half of that is worth being concrete about, because replay is not opt
 the engine records a micro-batch's source offset *before* it processes the batch, so a
 crash in between leaves a batch the next run **will** re-emit. A plain append would then
 write those rows twice. Writing to Delta, each micro-batch instead commits with a
-transaction id — the query name plus the batch number — and the sink checks the log for
+transaction id, the query name plus the batch number, and the sink checks the log for
 it first. A replayed batch finds its own transaction already recorded, writes no file and
 commits nothing. That is what turns the engine's at-least-once replay into end-to-end
 exactly-once, and it is why the log holds exactly one transaction per micro-batch however
@@ -315,7 +315,7 @@ many times one was retried.
 Give the query a stable `query_name` if you rely on this: the name is the transaction's
 application id, so it has to be the same across restarts for the check to find the
 previous run's commits. Without one it is derived from the destination table, which is
-stable but shared — so two different unnamed queries writing the same table would collide.
+stable but shared, so two different unnamed queries writing the same table would collide.
 
 ```python
 # docs: skip
@@ -338,15 +338,15 @@ What it does *not* do is commit once per worker. The workers write their files w
 committing them, and the driver then publishes the whole epoch as a **single**
 transaction. So the guarantees above survive the fan-out unchanged:
 
-- **one transaction per micro-batch**, whatever the worker count — the log still reads as
-  a record of the stream, not of the machines that ran it;
-- **exactly-once**, because that one commit carries the micro-batch's transaction id, so a
-  replayed epoch (a lost worker, a restart) finds itself already committed and writes
-  nothing.
+- **one transaction per micro-batch**, whatever the worker count. The log still reads as
+  a record of the stream, not of the machines that ran it.
+- **exactly-once**, because that one commit carries the micro-batch's transaction id. A
+  replayed epoch, from a lost worker or a restart, finds itself already committed and
+  writes nothing.
 
 The source's offsets are written to the checkpoint *between* staging an epoch and
-publishing it, which is what bounds a crash to an epoch that was staged and never
-published — one the next run safely replays.
+publishing it. That bounds a crash to an epoch that was staged and never published, which
+is one the next run safely replays.
 
 ```python
 # docs: skip
@@ -362,13 +362,14 @@ q = (bt.read.files_incremental("lake/landing", "parquet", state_dir="lake/bronze
 q.stop()   # the query runs until you stop it — an idle minute is not the end of a stream
 ```
 
-A streaming aggregation distributes too: each worker aggregates only its share of the
-epoch and returns a partial result, which the driver merges — the same
-`partial → combine → finalize` the single-node aggregate uses, so the answer is identical.
+A streaming aggregation distributes too. Each worker aggregates only its share of the
+epoch and returns a partial result, which the driver merges. That is the same
+`partial`, `combine`, `finalize` sequence the single-node aggregate uses, so the answer is
+identical.
 
 Write to Delta if you want the exactly-once guarantee. Iceberg has no transaction-id
 check, so a replayed micro-batch there would duplicate rows rather than be recognized as
-already-committed; a distributed streaming write to it is refused rather than quietly
+already-committed. A distributed streaming write to it is refused rather than quietly
 giving you a weaker guarantee than this page promises.
 
 ## The medallion pattern
@@ -406,4 +407,5 @@ bt.read.kafka(topic="events").write(
 - {doc}`../architecture/execution`: the pipelines-and-breakers execution model that
   makes batch and streaming one engine.
 - {doc}`../ml/streaming`: streaming a query as bounded-memory training data.
-```
+- {doc}`../agents/index`: the `write-a-streaming-pipeline` agent skill covers this
+  surface as a procedure, including the batch-vs-stream return-type trap.

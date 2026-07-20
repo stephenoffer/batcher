@@ -27,12 +27,29 @@ if TYPE_CHECKING:
 __all__ = ["start_streaming_query"]
 
 
-def _build_run_batch(plan: LogicalPlan, sources: list[Source]):
+def _build_run_batch(
+    plan: LogicalPlan, sources: list[Source]
+) -> tuple[object, list[str] | None, dict | None]:
     """Build the Kyber-optimized per-micro-batch runner for a stateless pipeline.
 
-    Mirrors `api/terminal/stream.py::_iter_streaming`: a `map_batches` pipeline runs
-    its opaque UDF per batch; a relational pipeline is optimized once so the source
+    Mirrors `api/terminal/stream/dispatch.py::_iter_streaming`: a `map_batches` pipeline
+    runs its opaque UDF per batch; a relational pipeline is optimized once so the source
     projection/predicate is pushed down, and each batch feeds the metadata learner.
+
+    Returns the runner **and** the source projection/predicate, because pushdown is only
+    real if the caller reads the source through them. This used to return the runner
+    alone, so `LocalRunner` read with `iter_batches(None)` and a `select("a")` over a
+    Kafka topic decoded every column of every message forever — while the identical
+    `iter_batches` pipeline pushed the projection down. The distributed launcher already
+    threaded the projection, so single-node and distributed streaming disagreed too.
+
+    Args:
+        plan: The streaming pipeline's logical plan.
+        sources: Its bound sources (single-source; validated by the caller).
+
+    Returns:
+        `(run_batch, projection, predicate)`. Projection and predicate are `None` for a
+        `map_batches` pipeline, whose UDF is opaque to Kyber.
     """
     from batcher import core, kyber
     from batcher.io.source import InMemorySource
@@ -47,7 +64,7 @@ def _build_run_batch(plan: LogicalPlan, sources: list[Source]):
         def run_batch(batch: pa.RecordBatch) -> list[pa.RecordBatch]:
             return core.execute_with_udfs(resident, [InMemorySource([batch])])
 
-        return run_batch
+        return run_batch, None, None
 
     hub = core.default_hub()
     opt_plan = kyber.optimize(plan, sources=sources, hub=hub)
@@ -55,7 +72,7 @@ def _build_run_batch(plan: LogicalPlan, sources: list[Source]):
     def run_batch(batch: pa.RecordBatch) -> list[pa.RecordBatch]:
         return core.execute_local(opt_plan, [[batch]], feedback=hub)
 
-    return run_batch
+    return run_batch, opt_plan.source_projections.get(0), opt_plan.source_predicates.get(0)
 
 
 def start_streaming_query(
@@ -101,7 +118,9 @@ def start_streaming_query(
         _warn_if_checkpoint_not_durable(checkpoint)
         store = CheckpointStore(checkpoint)
 
-    run_batch = _build_run_batch(plan, sources) if _is_stateless(plan) else None
+    run_batch, projection, predicate = (
+        _build_run_batch(plan, sources) if _is_stateless(plan) else (None, None, None)
+    )
     processor = core.make_processor(plan, output_mode, run_batch)
     query_name = name or _next_name()
     engine = core.StreamingQueryEngine(
@@ -112,6 +131,8 @@ def start_streaming_query(
         trigger=trigger,
         output_mode=output_mode,
         checkpoint=store,
+        projection=projection,
+        predicate=predicate,
     )
     query = StreamingQuery(query_name, engine)
     with _LOCK:

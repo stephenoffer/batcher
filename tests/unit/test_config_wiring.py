@@ -15,6 +15,12 @@ from batcher.config import (
     config_context,
 )
 
+# The data-plane spill budget a Config carries when nobody has pinned `max_memory_bytes`.
+# It is deliberately NOT 0: a 0 budget means "unbounded" to the engine and disarms the
+# whole spill path at once (no bc-resource pool, no agg_spill, check_budget a no-op), so
+# an un-resolved Config would OOM on a large query instead of spilling.
+_DEFAULT_BUDGET = int(MemoryConfig().default_total_bytes * MemoryConfig().hard_limit)
+
 
 def test_pid_defaults_are_canonical_gains():
     """Regression for the ki/kd transposition: the only PID controller that exists
@@ -54,15 +60,15 @@ _TUNING_DEFAULTS = {
 
 def test_engine_config_json_shape_and_defaults():
     """The wire contract with bc_ir::EngineConfig: morsel_rows + morsel_bytes +
-    parallelism + the spill envelope + the performance-threshold knobs. By default the
-    budget is 0 (unbounded — the in-memory fast path is unchanged) and spill_dir is
-    None."""
+    parallelism + the spill envelope + the performance-threshold knobs. The default
+    budget is the static `default_total_bytes` envelope, never 0 — a 0 would disarm
+    the data plane's spill machinery entirely (see `_DEFAULT_BUDGET`)."""
     payload = json.loads(Config().engine_config_json())
     assert payload == {
         "morsel_rows": 16_384,
         "morsel_bytes": 1 << 20,
         "parallelism": 0,
-        "memory_budget_bytes": 0,
+        "memory_budget_bytes": _DEFAULT_BUDGET,
         "spill_dir": None,
         "spill_compression": "auto",
         "fuse_linear": True,
@@ -79,7 +85,7 @@ def test_engine_config_json_shape_and_defaults():
         "morsel_rows": 4096,
         "morsel_bytes": 1 << 15,
         "parallelism": 3,
-        "memory_budget_bytes": 0,
+        "memory_budget_bytes": _DEFAULT_BUDGET,
         "spill_dir": None,
         "spill_compression": "auto",
         "fuse_linear": True,
@@ -118,7 +124,7 @@ def test_engine_config_with_op_budgets_adds_string_keyed_map():
     assert payload["op_budgets"] == {"0": 1_048_576, "3": 2_048}
     # The base knobs still ride along unchanged.
     assert payload["morsel_rows"] == 16_384
-    assert payload["memory_budget_bytes"] == 0
+    assert payload["memory_budget_bytes"] == _DEFAULT_BUDGET
 
 
 def test_engine_config_ships_spill_budget_when_capped():

@@ -34,7 +34,7 @@ One reader per topic partition. No sink; publish back through `for_each_batch`.
 :::{grid-item-card} {octicon}`broadcast;1.1em` Kinesis
 :link: kinesis
 :link-type: doc
-A split per shard, and the sturdiest resume path of the five.
+A split per shard, and an exact resume from the stored sequence number.
 :::
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Pulsar
@@ -112,8 +112,14 @@ No writer here. That is Spark or Flink; Batcher is the consumer.
 
 ## Databases
 
-::::{grid} 1 2 2 2
+::::{grid} 1 2 2 3
 :gutter: 3
+
+:::{grid-item-card} {octicon}`database;1.1em` SQL databases
+:link: databases
+:link-type: doc
+One connection URI for Postgres, MySQL, Oracle, and the rest. Plus any DB-API driver.
+:::
 
 :::{grid-item-card} {octicon}`stack;1.1em` MongoDB
 :link: mongodb
@@ -177,6 +183,7 @@ databricks
 delta-lake
 iceberg
 hudi
+databases
 mongodb
 elasticsearch
 ray

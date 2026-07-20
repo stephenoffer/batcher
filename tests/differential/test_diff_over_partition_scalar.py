@@ -22,8 +22,8 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 pytestmark = pytest.mark.differential
 
@@ -37,17 +37,13 @@ def t(duck):
 
 def test_over_string_partition_key(duck, t):
     """``over(partition_by="grp")`` partitions by column ``grp``, not by ``['g','r','p']``."""
-    out = bt.from_arrow(t).with_columns(
-        s=col("v").sum().over(partition_by="grp")
-    ).collect()
+    out = bt.from_arrow(t).with_columns(s=col("v").sum().over(partition_by="grp")).collect()
     assert_same(out, duck.sql("SELECT *, SUM(v) OVER (PARTITION BY grp) AS s FROM t"))
 
 
 def test_over_expr_partition_key(duck, t):
     """``over(partition_by=col("grp"))`` completes (no OOM hang) and partitions correctly."""
-    out = bt.from_arrow(t).with_columns(
-        s=col("v").sum().over(partition_by=col("grp"))
-    ).collect()
+    out = bt.from_arrow(t).with_columns(s=col("v").sum().over(partition_by=col("grp"))).collect()
     assert_same(out, duck.sql("SELECT *, SUM(v) OVER (PARTITION BY grp) AS s FROM t"))
 
 
@@ -55,9 +51,7 @@ def test_over_scalar_equals_list_spelling(t):
     """The scalar, `Expr`, and explicit-list spellings all produce the same result."""
     ds = bt.from_arrow(t)
     as_str = ds.with_columns(s=col("v").sum().over(partition_by="grp")).collect().to_pydict()
-    as_expr = (
-        ds.with_columns(s=col("v").sum().over(partition_by=col("grp"))).collect().to_pydict()
-    )
+    as_expr = ds.with_columns(s=col("v").sum().over(partition_by=col("grp"))).collect().to_pydict()
     as_list = ds.with_columns(s=col("v").sum().over(partition_by=["grp"])).collect().to_pydict()
     assert as_str == as_list == as_expr
 

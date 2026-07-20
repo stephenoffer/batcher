@@ -8,15 +8,13 @@ boundary speak Arrow `RecordBatch`. No internal row struct, no bespoke buffer, n
 format that has to be converted back. This is a hard invariant, not a preference.
 :::
 
-That constraint has teeth, and it is worth being explicit about what it buys:
-
-- The Python boundary is **zero-copy**. A pyarrow `RecordBatch` and a Rust `arrow::RecordBatch`
-  are the same bytes, described by the Arrow C Data Interface. Nothing is serialized.
-- An operator's state is Arrow, so a compiled pipeline can be thrown away at a pipeline breaker
-  and rebuilt without losing progress, because the relational state lives in `bc-runtime` structures,
-  not in generated code.
-- Spilling and the network shuffle are the same operation with a different sink, because Arrow
-  IPC serializes what is already in memory.
+That constraint has teeth, and three consequences follow from it. The Python boundary is
+**zero-copy**: a pyarrow `RecordBatch` and a Rust `arrow::RecordBatch` are the same bytes,
+described by the Arrow C Data Interface, and nothing is serialized. An operator's state is Arrow
+rather than generated code, so a compiled pipeline can be thrown away at a pipeline breaker and
+rebuilt without losing progress, because the relational state lives in `bc-runtime` structures.
+And spilling and the network shuffle become the same operation with a different sink, because
+Arrow IPC serializes what is already in memory.
 
 ```text
     Python                      │                       Rust
@@ -47,7 +45,7 @@ The crate DAG points one way, and where a piece of memory machinery lives is dec
 | Crate | Owns | Depends on |
 |---|---|---|
 | `bc-arrow` | `Morsel`, `MorselTarget`, `RuntimeTuning`, and the workspace's single Arrow version pin | arrow only |
-| `bc-resource` | `MemoryPool`, `MemoryReservation`, `Pressure` — deliberately `std` + `thiserror`, no Arrow | nothing in the workspace |
+| `bc-resource` | `MemoryPool`, `MemoryReservation`, `Pressure`, on `std` + `thiserror` with no Arrow | nothing in the workspace |
 | `bc-expr` → `bc-ir` → `bc-runtime` / `bc-codegen` → `bc-interp` | the operators and the state they hold | strictly downward |
 | `bc-py` | the C Data Interface boundary, type normalization, and the global allocator | everything |
 
@@ -82,9 +80,10 @@ re-exports rather than on `arrow` directly, so an Arrow bump is a one-line chang
 ::::{tab-set}
 :::{tab-item} On the way in
 ```text
-Int8 / Int16 / Int32   ──►  Int64
-Float16 / Float32      ──►  Float64
-Dictionary<K, V>       ──►  V        (decoded to its value type)
+Int8 / Int16 / Int32            ──►  Int64
+UInt8 / UInt16 / UInt32 / UInt64 ──►  Int64
+Float16 / Float32               ──►  Float64
+Dictionary<K, V>                ──►  V   (decoded to its normalized value type)
 ```
 So no operator special-cases a narrow or dictionary input, and the kernel surface stays small
 enough to test exhaustively. This is value-preserving, and it is why the JIT can assume `Int64`
@@ -133,8 +132,8 @@ hot-path tuple touch if you do it inside a loop.
 Arrow arrays share buffers when sliced, and `Array::get_array_memory_size()` reports the **whole
 parent buffer** for a slice. Morselize one 32 MB table into 122 morsels, sum that figure, and
 you get **3.9 GB**: every morsel re-counting the entire buffer. Carbonite fits its memory model
-on this number, so over-counting by ~100x has it budget a hundred times the real footprint and
-spill — or reject — plans that fit comfortably.
+on this number, so over-counting by ~100x has it budget a hundred times the real footprint. It
+then spills, or outright rejects, plans that fit comfortably.
 :::
 
 ```text

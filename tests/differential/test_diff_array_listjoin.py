@@ -12,6 +12,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import array, col
 
 
@@ -26,15 +27,11 @@ def t(duck):
 
 
 def test_array_of_columns(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select("id", a=array(col("x"), col("y"))).collect()
     assert_same(out, duck.sql("SELECT id, [x, y] a FROM t"))
 
 
 def test_array_of_expressions(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(a=array(col("x") + 1, col("y") * 2)).collect()
     assert_same(out, duck.sql("SELECT [x + 1, y * 2] a FROM t"))
 
@@ -48,8 +45,6 @@ def test_array_requires_an_element():
 
 
 def test_list_join_after_split(duck):
-    from conftest import assert_same
-
     tbl = pa.table({"s": pa.array(["a,b,c", "x", "p,q", None])})
     duck.register("t", tbl)
     out = bt.from_arrow(tbl).select(j=col("s").str.split(",").list.join("-")).collect()
@@ -58,7 +53,5 @@ def test_list_join_after_split(duck):
 
 
 def test_list_join_of_array_literal(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(j=array(col("x"), col("y")).list.join("|")).collect()
     assert_same(out, duck.sql("SELECT array_to_string([x, y], '|') j FROM t"))

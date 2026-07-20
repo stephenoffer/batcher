@@ -18,6 +18,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, lag, lead
 
 pytestmark = pytest.mark.differential
@@ -25,8 +26,6 @@ pytestmark = pytest.mark.differential
 
 @pytest.mark.parametrize("n", [-1, -2, -3])
 def test_negative_lag_lead_flip_direction(duck, n):
-    from conftest import assert_same
-
     t = pa.table(
         {
             "id": pa.array(list(range(6)), pa.int64()),
@@ -54,8 +53,6 @@ def test_negative_lag_lead_flip_direction(duck, n):
 
 @pytest.mark.parametrize("fn", ["min", "max"])
 def test_string_min_max_over_explicit_rows_frame(duck, fn):
-    from conftest import assert_same
-
     t = pa.table(
         {
             "id": pa.array(list(range(6)), pa.int64()),
@@ -71,16 +68,13 @@ def test_string_min_max_over_explicit_rows_frame(duck, fn):
         .collect()
     )
     want = duck.sql(
-        f"SELECT id, {fn}(s) OVER (ORDER BY k "
-        f"ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) r FROM t"
+        f"SELECT id, {fn}(s) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) r FROM t"
     )
     assert_same(got, want)
 
 
 @pytest.mark.parametrize("fn", ["min", "max"])
 def test_boolean_min_max_whole_partition(duck, fn):
-    from conftest import assert_same
-
     t = pa.table(
         {
             "id": pa.array(list(range(6)), pa.int64()),
@@ -101,8 +95,6 @@ def test_boolean_min_max_whole_partition(duck, fn):
 
 @pytest.mark.parametrize("fn", ["min", "max"])
 def test_boolean_min_max_running_and_framed(duck, fn):
-    from conftest import assert_same
-
     t = pa.table(
         {
             "id": pa.array(list(range(6)), pa.int64()),
@@ -128,7 +120,6 @@ def test_boolean_min_max_running_and_framed(duck, fn):
         .collect()
     )
     want = duck.sql(
-        f"SELECT id, {fn}(b) OVER (ORDER BY k "
-        f"ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) r FROM t"
+        f"SELECT id, {fn}(b) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) r FROM t"
     )
     assert_same(got, want)

@@ -2,7 +2,7 @@
 
 This is the widest margin Batcher has, and it holds on Ray Data's own home turf rather
 than only on SQL, where Ray Data is weakest. The reason is structural. Ray Data pays a
-fixed per-operation cost of roughly 300–4,500 ms even on a warm cluster (task scheduling plus
+fixed per-operation cost of roughly 300 ms to 4,500 ms even on a warm cluster (task scheduling plus
 the block/pandas bridge), and Batcher, in-process and native over Arrow, pays none of it. On
 small and medium work, that fixed cost *is* the runtime.
 
@@ -18,7 +18,7 @@ model runs) before a time is recorded. A run whose result disagrees with the ora
 The tables on this page come from three different machines: a 16-core node for reads and
 writes, a 96-core node for the `map_batches` data plane, and an 8×T4 Ray cluster for the
 model work. Ratios hold *within* a table. A number lifted out of one and set against a
-number from another says nothing. [Methodology](methodology.md) lists the hardware per
+number from another says nothing. {doc}`methodology` lists the hardware per
 family.
 :::
 
@@ -55,7 +55,7 @@ training ingest. Single node, 96 cores, 188 GB; 20M rows across 96 files. Ratio 
 | `class_inference` (`map_batches(Model)`, load once) | 2,067 ms | 2,672 ms | **1.29×** |
 | `many_files_map` (2,000 files → map → sum) | 2,356 ms | 2,982 ms | **1.27×** |
 | `pandas_format` (`batch_format="pandas"`) | 1,663 ms | 1,702 ms | 1.02× |
-| `py_map` (pure-Python per-row UDF → sum) | 1,123–1,808 ms | ~2,400 ms | **1.3–2.2×** |
+| `py_map` (pure-Python per-row UDF → sum) | 1,123 ms to 1,808 ms | ~2,400 ms | **1.3x to 2.2x** |
 
 `pandas_format` is a tie, and it is the honest shape of the result: when the UDF boundary
 forces a pandas conversion, most of the wall clock is that conversion and the engine
@@ -133,7 +133,7 @@ The zero-config row is not a speed claim. `ds.map_batches(Model, num_gpus=1)` wi
 GPUs` on Ray Data. Batcher picks a VRAM-safe default, streams it with stage overlap, and
 halves the batch on a CUDA OOM: 2,451 img/s at 82% utilization with no knobs.
 
-[AI and GPU](ai-and-gpu.md) has the detail.
+{doc}`ai-and-gpu` has the detail.
 
 ## Tabular feature engineering
 
@@ -197,7 +197,7 @@ leaves out.
 ## Distributed
 
 Even distributed-against-distributed, with both engines on the same live cluster, Batcher
-beats Ray Data on every pipeline at every scale tested. See [scaling](scaling.md).
+beats Ray Data on every pipeline at every scale tested. See {doc}`scaling`.
 
 ## Reproduce
 
@@ -212,15 +212,15 @@ python benchmarks/cluster/gpu_pipeline.py
 
 ## See also
 
-- [AI and GPU](ai-and-gpu.md): the ten GPU workload families in full.
-- [Scaling](scaling.md): the distributed cluster runs.
-- [Ray integration](../integrations/ray.md): how the two systems actually compose, which is
+- {doc}`ai-and-gpu`: the ten GPU workload families in full.
+- {doc}`scaling`: the distributed cluster runs.
+- {doc}`../integrations/ray`: how the two systems actually compose, which is
   the answer for most people who read this page.
-- [Distributed scheduling](../deep-dives/distributed-scheduling.md) and
-  [shuffle over Flight](../deep-dives/shuffle-flight.md): why the data plane bypasses the
+- {doc}`../deep-dives/distributed-scheduling` and
+  {doc}`../deep-dives/shuffle-flight`: why the data plane bypasses the
   Ray object store.
-- [Mergeable algebra](../deep-dives/mergeable-algebra.md): the `partial → combine →
+- {doc}`../deep-dives/mergeable-algebra`: the `partial → combine →
   finalize` behind the 139× fraud aggregation.
-- [Batch inference](../ml/inference.md): the warm pool the large ratios come from.
-- [Methodology](methodology.md): hardware per family; the rows are not comparable to each
+- {doc}`../ml/inference`: the warm pool the large ratios come from.
+- {doc}`methodology`: hardware per family; the rows are not comparable to each
   other.

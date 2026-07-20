@@ -78,8 +78,16 @@ def collect_source_stats(
         # stats out of the shared cache (it self-memoizes). File identities are data-stable.
         stable = getattr(s, "stable_stats_identity", True)
         ident = _source_identity(s)
-        if stable and ident and ident in _SOURCE_STATS_CACHE:
-            out.append(_SOURCE_STATS_CACHE[ident])
+        # The memo key carries the source's content *version*, not just its identity.
+        # Keyed on identity alone it survives the path being rewritten — and this memo
+        # holds zone maps, so a stale entry prunes against bounds the data no longer has
+        # and returns wrong rows rather than a slow plan. `invalidate_source_stats` covers
+        # Batcher's own writes; nothing covered an external writer, which is the ordinary
+        # case (the upstream job, a Spark run, a compaction). A source that cannot supply
+        # a version cheaply keeps the identity-only key it had before.
+        key = _cache_key(s, ident)
+        if stable and key and key in _SOURCE_STATS_CACHE:
+            out.append(_SOURCE_STATS_CACHE[key])
             continue
         narrowed = _resident_subset_stats(s, need_columns) if need_columns is not None else None
         if narrowed is not None:
@@ -91,8 +99,8 @@ def collect_source_stats(
         if stats is None and hub is not None:
             cached = load_source_stats(hub, ident)
             stats = replace(cached, exact_rows=False) if cached is not None else None
-        if stable and ident:
-            _SOURCE_STATS_CACHE[ident] = stats
+        if stable and key:
+            _SOURCE_STATS_CACHE[key] = stats
         out.append(stats)
     return out
 
@@ -181,6 +189,20 @@ def invalidate_source_stats(path: str, fmt: str) -> None:
     prefix = f"{fmt}:{path}"
     for key in [k for k in _SOURCE_STATS_CACHE if k == prefix or k.startswith(prefix + "@")]:
         _SOURCE_STATS_CACHE.pop(key, None)
+
+
+def _cache_key(source: Source, identity: str) -> str | None:
+    """The memo key for `source`: its identity qualified by its content version."""
+    if not identity:
+        return None
+    version_fn = getattr(source, "stats_version", None)
+    if version_fn is None:
+        return identity
+    try:
+        version = version_fn()
+    except Exception:  # a source that cannot version itself keeps the identity-only key
+        return identity
+    return identity if version is None else f"{identity}@{version}"
 
 
 def _source_identity(source: Source) -> str:

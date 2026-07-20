@@ -153,6 +153,8 @@ class StreamingQueryEngine:
         output_mode: str,
         checkpoint=None,
         runner_factory: Callable[[Callable[[], bool]], MicroBatchRunner] | None = None,
+        projection: list[str] | None = None,
+        predicate: dict | None = None,
     ) -> None:
         from batcher.core.streaming_runner import LocalRunner
 
@@ -168,10 +170,13 @@ class StreamingQueryEngine:
         # the Ray fan-out for `distributed=True` — `core` never imports `dist`. The factory
         # takes the stop predicate, so a runner that waits for data on an idle stream still
         # observes `stop()` promptly.
+        # `projection`/`predicate` are Kyber's source pushdown for this plan. They reach the
+        # runner so the *source* decodes only the columns the plan needs; without them a
+        # `select` over a wide stream decoded every column of every message forever.
         self._runner: MicroBatchRunner = (
             runner_factory(self._stop.is_set)
             if runner_factory is not None
-            else LocalRunner(source, processor, sink)
+            else LocalRunner(source, processor, sink, projection=projection, predicate=predicate)
         )
         self._thread: threading.Thread | None = None
         self._progress: deque[StreamingQueryProgress] = deque(maxlen=100)
@@ -306,9 +311,10 @@ class StreamingQueryEngine:
 
         errs: tuple[type[BaseException], ...] = (ResourceError,)
         with contextlib.suppress(Exception):
-            from batcher._native import RetryableShuffleError
+            from batcher._internal.native import engine_or_none
 
-            errs = (*errs, RetryableShuffleError)
+            if (mod := engine_or_none()) is not None:
+                errs = (*errs, mod.RetryableShuffleError)
         with contextlib.suppress(Exception):
             import ray
 
@@ -437,9 +443,4 @@ def make_processor(
 
 def _distinct_as_aggregate(distinct) -> Aggregate:
     """A `Distinct` is a group-by over all columns — reuse the aggregate fold."""
-    from batcher.plan.expr_ir import Col
-    from batcher.plan.logical import Aggregate, Projection
-
-    cols = distinct.input.available_columns()
-    group_keys = tuple(Projection(c, Col(c)) for c in cols)
-    return Aggregate(distinct.input, group_keys, ())
+    return distinct.as_aggregate()

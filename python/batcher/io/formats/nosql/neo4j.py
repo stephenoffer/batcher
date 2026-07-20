@@ -27,6 +27,7 @@ from batcher.io.formats.nosql.base import (
     require_driver,
     rows_to_batches,
 )
+from batcher.io.formats.sql.uri import redact_uri
 
 __all__ = ["Neo4jSource"]
 
@@ -80,12 +81,32 @@ class Neo4jSource(ScanSource):
     def _driver(self) -> Any:
         neo4j = require_driver("neo4j", "neo4j")
         kw = self._conn_kwargs
-        return neo4j.GraphDatabase.driver(kw["uri"], auth=(kw["username"], kw["password"]))
+        return neo4j.GraphDatabase.driver(
+            self._secret("uri"), auth=(kw["username"], self._secret("password"))
+        )
 
     def _identity_suffix(self) -> str:
+        """The Bolt target and database, with any password in the URI masked.
+
+        A Bolt URI may carry credentials inline (``bolt://user:hunter2@host``), and this
+        string goes into `identity()` — the key learned statistics are *persisted* under.
+        The password was therefore being written to the metadata store, where it outlives
+        the process; that is strictly worse than a `repr` leak, which at least dies with
+        the traceback.
+        """
         kw = self._conn_kwargs
         db = kw["database"] or "default"
-        return f"{kw['uri']}/{db}"
+        return f"{redact_uri(str(kw['uri']))}/{db}"
+
+    def _fingerprint_material(self) -> dict[str, Any]:
+        """Connection kwargs with the URI's password masked before it is fingerprinted.
+
+        `connection_fingerprint` excludes `password` by key name, but a password embedded
+        in `uri` is invisible to it. Masking first means rotating that password does not
+        change the fingerprint — so the relation keeps the statistics it has already
+        accumulated instead of silently reverting to cold estimates on every rotation.
+        """
+        return {**self._conn_kwargs, "uri": redact_uri(str(self._conn_kwargs["uri"]))}
 
     def _run(self, driver: Any, cypher: str) -> Iterator[dict[str, Any]]:
         with driver.session(database=self._conn_kwargs["database"]) as session:
@@ -133,6 +154,12 @@ class Neo4jSource(ScanSource):
             rows = list(self._run(driver, counted))
         except Exception:
             return None
+        finally:
+            # This `finally` was missing entirely. The failure path here is the *expected*
+            # one — an older server with no CALL subqueries, or a query that cannot be
+            # wrapped — so the common case leaked a Bolt driver and its whole connection
+            # pool on every partition enumeration.
+            driver.close()
         if not rows:
             return None
         value = rows[0].get("__bc_n") if isinstance(rows[0], dict) else None
@@ -157,8 +184,11 @@ class Neo4jSource(ScanSource):
             cypher += f" SKIP {skip}"
             if limit:
                 cypher += f" LIMIT {limit}"
-        driver = self._driver()
+        # Resolved before the driver is opened: `self.schema()` opens a driver of its own,
+        # so this held two at once, and a raise from it landed between `_driver()` and the
+        # `try` — stranding the outer one with nothing left holding a reference to close it.
         schema = self.schema() if not projection else None
+        driver = self._driver()
         try:
             for batch in rows_to_batches(self._run(driver, cypher), schema=schema):
                 yield batch.select(projection) if projection else batch

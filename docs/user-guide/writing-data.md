@@ -5,7 +5,7 @@ plan and streams Arrow batches to the sink, so the same memory bounds and spill
 behavior that govern `collect` apply here too.
 
 The format-specific helpers are `write.parquet`, `write.csv`, and `write.json`. The
-generic `write(path, fmt=...)` covers all of them and is the place to pass a
+generic `write(path, format=...)` covers all of them and is the place to pass a
 partitioning scheme.
 
 ```python
@@ -54,18 +54,18 @@ preserves types, so prefer it for anything that will be read back by Batcher.
 ## Other file and database sinks
 
 The write namespace mirrors the reader namespace: every format has a typed writer,
-and the generic `write(path, fmt=...)` reaches them all, each returning a
-`WriteManifest`. Beyond Parquet/CSV/JSON:
+and the generic `write(path, format=...)` reaches them all, each returning a
+`WriteManifest`. Beyond Parquet, CSV, and JSON:
 
 | Writer | Writes | Needs |
 | --- | --- | --- |
-| `write.orc(path)` | ORC files | — |
-| `write.arrow(path)` | Arrow/Feather IPC files | — |
+| `write.orc(path)` | ORC files | nothing extra |
+| `write.arrow(path)` | Arrow/Feather IPC files | nothing extra |
 | `write.avro(path)` | Avro files | `[avro]` |
 | `write.lance(path)` | A Lance dataset (columnar ML format) | `[lance]` |
 | `write.msgpack(path)` | MessagePack files | `[msgpack]` |
-| `write.sql(table, uri=...)` | A database table via ADBC/FlightSQL | driver + reachable DB |
-| `write.snowflake(table, ...)` | A Snowflake table | Snowflake account |
+| `write.sql(table, driver=..., db_kwargs=...)` | A database table via ADBC/FlightSQL | driver + reachable DB |
+| `write.snowflake(table, connection_kwargs=...)` | A Snowflake table | Snowflake account |
 | `write.mongo(collection, ...)` | A MongoDB collection | a running MongoDB |
 
 Delta, Iceberg, and Hudi table writes (transactional append and merge/upsert) are
@@ -76,7 +76,10 @@ a live service are shown but not executed:
 # docs: skip
 ds.write.msgpack("output/data.msgpack")
 ds.write.avro("output/data.avro")
-ds.write.snowflake("ORDERS", account="acct", warehouse="WH", database="DB")
+ds.write.snowflake(
+    "ORDERS",
+    connection_kwargs={"account": "acct", "warehouse": "WH", "database": "DB"},
+)
 ```
 
 ## Partitioned output
@@ -94,14 +97,14 @@ ds.write.parquet("output/events", partition_by=["category"])
 
 ```python
 # docs: skip
-ds.write("output/events", fmt="parquet", partition_by=["category"])
+ds.write("output/events", format="parquet", partition_by=["category"])
 ```
 
 ## Compacting small files
 
-Incremental or streaming writes leave many tiny part files, which slow later reads
-(the small-files problem). `compact` fixes a dataset in place. It reads `path`,
-repartitions to a target file size (or an exact `num_files`), writes the result back,
+Incremental or streaming writes leave many tiny part files, which slow later reads. This
+is the small-files problem, and `compact` fixes a dataset in place. It reads `path`,
+repartitions to a target file size or to an exact `num_files`, writes the result back,
 and deletes the now-stale parts. It runs on local files, so it executes here:
 
 ```python
@@ -119,11 +122,11 @@ print(len(glob.glob(os.path.join(comp_dir, "*.parquet"))))
 ## Distributed writes
 
 For large outputs, write across workers. Each worker writes its own files into the
-target directory; the returned `WriteManifest` lists what was produced.
+target directory, and the returned `WriteManifest` lists what was produced.
 
 ```python
 # docs: skip
-manifest = ds.write("s3://bucket/events", fmt="parquet", distributed=True, num_workers=8)
+manifest = ds.write("s3://bucket/events", format="parquet", distributed=True, num_workers=8)
 ```
 
 The distributed path uses the same mergeable execution as a single-node write, so

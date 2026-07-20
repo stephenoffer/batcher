@@ -20,6 +20,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
 from batcher.io.splits import Split
 
@@ -28,11 +29,7 @@ __all__ = ["ZarrChunkSplit", "ZarrSource"]
 
 def _require_zarr() -> Any:
     """Import and return the `zarr` module or raise `BackendError`."""
-    try:
-        import zarr
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError("Zarr requires zarr: pip install 'batcher-engine[zarr]'") from exc
-    return zarr
+    return require("zarr", feature="Zarr", provides="zarr", extra="zarr")
 
 
 def _slice_to_batch(array: Any, projection: list[str] | None) -> pa.RecordBatch:

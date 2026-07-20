@@ -12,7 +12,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from conftest import assert_same
+from _harness import assert_same
 
 pytestmark = pytest.mark.differential
 
@@ -35,9 +35,7 @@ def test_hex_of_blob_uses_raw_bytes(duck):
 def test_octet_length_of_blob_counts_all_bytes(duck):
     """octet_length of a non-UTF-8 BLOB is its byte count, not NULL/0."""
     t = _tbl()
-    out = bt.from_arrow(t).select(
-        v=bt.col("b").str.octet_length(), row=bt.col("row")
-    ).collect()
+    out = bt.from_arrow(t).select(v=bt.col("b").str.octet_length(), row=bt.col("row")).collect()
     duck.register("t", t)
     assert_same(out, duck.sql("SELECT octet_length(b) AS v, row FROM t"))
 

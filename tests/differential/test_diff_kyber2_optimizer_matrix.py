@@ -27,13 +27,12 @@ import random
 import pyarrow as pa
 import pytest
 
-from conftest import assert_same
-
 pytestmark = pytest.mark.differential
 
 bt = pytest.importorskip("batcher")
 duckdb = pytest.importorskip("duckdb")
 
+from _harness import assert_same  # noqa: E402
 from batcher import col, count  # noqa: E402
 
 _INT = pa.int64()

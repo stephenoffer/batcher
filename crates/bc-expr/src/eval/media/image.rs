@@ -11,7 +11,8 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, FixedSizeListArray, Int32Array, StructArray, UInt8Array,
+    Array, ArrayRef, BinaryArray, FixedSizeListArray, GenericBinaryArray, Int32Array, Int64Array,
+    OffsetSizeTrait, StructArray, UInt8Array,
 };
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field};
@@ -19,24 +20,116 @@ use arrow::datatypes::{DataType, Field};
 use super::map_rows;
 use crate::{ExprError, ImageFunc};
 
-/// Evaluate an image function over a Binary array of encoded image bytes.
+/// Evaluate an image function over a Binary or LargeBinary array of encoded image bytes.
+///
+/// Both offset widths are accepted because a media source stores its payloads as
+/// `LargeBinary`: 32-bit offsets cap one array at 2 GB in total, which a batch of
+/// ordinary video or high-resolution image files reaches. Accepting only `Binary` made
+/// `.image.decode()` fail on exactly the inputs the namespace exists for.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_image(
     func: ImageFunc,
     arr: &ArrayRef,
     width: Option<i64>,
     height: Option<i64>,
+    mean: Option<&[f64]>,
+    std: Option<&[f64]>,
+    channels_first: bool,
 ) -> Result<ArrayRef, ExprError> {
-    let bytes =
-        arr.as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| ExprError::ExpectedBinary {
+    let norm = Normalization::resolve(func, mean, std, channels_first)?;
+    match arr.data_type() {
+        DataType::Binary => eval_image_sized::<i32>(func, arr, width, height, norm),
+        DataType::LargeBinary => eval_image_sized::<i64>(func, arr, width, height, norm),
+        other => Err(ExprError::ExpectedBinary {
+            func: format!("{func:?}"),
+            got: other.to_string(),
+        }),
+    }
+}
+
+/// Validated per-channel normalization for `ToTensorF32`: `(pixel/255 - mean) / std`,
+/// plus the output layout. `mean`/`std` default to identity (`0`/`1`) so a bare
+/// `to_tensor_f32` just scales to `[0, 1]`.
+struct Normalization {
+    mean: [f32; 3],
+    inv_std: [f32; 3],
+    channels_first: bool,
+}
+
+impl Normalization {
+    fn resolve(
+        func: ImageFunc,
+        mean: Option<&[f64]>,
+        std: Option<&[f64]>,
+        channels_first: bool,
+    ) -> Result<Self, ExprError> {
+        // These knobs only make sense for the float tensor; reject them elsewhere rather
+        // than silently ignore, so a mistaken `.image.to_tensor(...)` with a mean doesn't
+        // look like it worked.
+        if !matches!(func, ImageFunc::ToTensorF32)
+            && (mean.is_some() || std.is_some() || channels_first)
+        {
+            return Err(ExprError::InvalidArgument {
                 func: format!("{func:?}"),
-                got: arr.data_type().to_string(),
-            })?;
+                reason: "mean/std/channels_first apply only to to_tensor_f32".to_string(),
+            });
+        }
+        let m = Self::three("to_tensor_f32 mean", mean, 0.0)?;
+        let s = Self::three("to_tensor_f32 std", std, 1.0)?;
+        for v in s {
+            if v == 0.0 {
+                return Err(ExprError::InvalidArgument {
+                    func: "to_tensor_f32".to_string(),
+                    reason: "std values must be non-zero".to_string(),
+                });
+            }
+        }
+        Ok(Self {
+            mean: m,
+            inv_std: [1.0 / s[0], 1.0 / s[1], 1.0 / s[2]],
+            channels_first,
+        })
+    }
+
+    /// A length-3 (RGB) parameter, or the identity `default` for all three when absent.
+    fn three(what: &str, v: Option<&[f64]>, default: f32) -> Result<[f32; 3], ExprError> {
+        match v {
+            None => Ok([default; 3]),
+            Some(s) if s.len() == 3 => Ok([s[0] as f32, s[1] as f32, s[2] as f32]),
+            Some(s) => Err(ExprError::InvalidArgument {
+                func: "to_tensor_f32".to_string(),
+                reason: format!(
+                    "{what} must have 3 values (one per RGB channel), got {}",
+                    s.len()
+                ),
+            }),
+        }
+    }
+}
+
+fn eval_image_sized<O: OffsetSizeTrait>(
+    func: ImageFunc,
+    arr: &ArrayRef,
+    width: Option<i64>,
+    height: Option<i64>,
+    norm: Normalization,
+) -> Result<ArrayRef, ExprError> {
+    // The match above already established the offset width, so this cannot fail.
+    let bytes = arr
+        .as_any()
+        .downcast_ref::<GenericBinaryArray<O>>()
+        .ok_or_else(|| ExprError::ExpectedBinary {
+            func: format!("{func:?}"),
+            got: arr.data_type().to_string(),
+        })?;
     match func {
         ImageFunc::Decode => decode_dims(bytes),
         ImageFunc::ToTensor => to_tensor(bytes, width, height),
+        ImageFunc::ToTensorF32 => to_tensor_f32(bytes, width, height, &norm),
+        ImageFunc::CenterCrop => center_crop(bytes, width, height),
+        ImageFunc::ToGrayscale => to_grayscale(bytes, width, height),
         ImageFunc::Resize => resize(bytes, width, height),
+        ImageFunc::Dhash => dhash(bytes),
     }
 }
 
@@ -64,8 +157,8 @@ fn dim(func: &str, arg: &'static str, value: Option<i64>) -> Result<u32, ExprErr
 }
 
 /// `resize(w, h)` → re-encoded PNG bytes at the new size. Null/undecodable → null.
-fn resize(
-    bytes: &BinaryArray,
+fn resize<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
     width: Option<i64>,
     height: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
@@ -106,7 +199,7 @@ fn resize_png(data: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
 }
 
 /// `decode` → struct `{width: Int32, height: Int32}` (header read only).
-fn decode_dims(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
+fn decode_dims<O: OffsetSizeTrait>(bytes: &GenericBinaryArray<O>) -> Result<ArrayRef, ExprError> {
     // Read each header in parallel (an undecodable/null row → `None`), then unzip into
     // the three column buffers. The header read is the cost; the unzip is a cheap memcpy.
     let dims: Vec<Option<(i32, i32)>> = map_rows(bytes.len(), |i| {
@@ -147,8 +240,8 @@ fn decode_dims(bytes: &BinaryArray) -> Result<ArrayRef, ExprError> {
 }
 
 /// `to_tensor(w, h)` → `FixedSizeList<UInt8>` of length `w*h*3` (RGB8, resized).
-fn to_tensor(
-    bytes: &BinaryArray,
+fn to_tensor<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
     width: Option<i64>,
     height: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
@@ -203,6 +296,277 @@ fn to_tensor(
         Some(NullBuffer::from(valid)),
     );
     Ok(Arc::new(arr))
+}
+
+/// `to_tensor_f32(w, h, mean, std, channels_first)` → `FixedSizeList<Float32>` of length
+/// `w*h*3`: decode, resize, scale to `[0, 1]`, apply per-channel `(x - mean) / std`, and
+/// lay out HWC (default) or CHW.
+///
+/// This is the model-ready counterpart to [`to_tensor`]. It exists so a vision pipeline —
+/// `read.images(decode=True)` → normalize → model — stays entirely in the engine: the
+/// `/255`, per-channel standardization, and channel-first permute that a torch pipeline
+/// otherwise does in a per-batch Python UDF all happen here in one pass over the decoded
+/// RGB8 buffer, and the output is a canonical fixed-shape-tensor column ready for the
+/// zero-copy handoff to the model.
+fn to_tensor_f32<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+    width: Option<i64>,
+    height: Option<i64>,
+    norm: &Normalization,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::Float32Array;
+
+    let w = dim("to_tensor_f32", "width", width)?;
+    let h = dim("to_tensor_f32", "height", height)?;
+    // Same overflow guard as `to_tensor`: the element length is an Arrow i32, and the
+    // product is a query-parameter-driven allocation size. Computed in u64 so the multiply
+    // cannot itself overflow.
+    let per_row = (w as u64) * (h as u64) * 3;
+    if per_row > i32::MAX as u64 {
+        return Err(ExprError::InvalidArgument {
+            func: "to_tensor_f32".to_string(),
+            reason: format!(
+                "tensor of {w}x{h}x3 = {per_row} floats per row exceeds the maximum \
+                 element length of {}",
+                i32::MAX
+            ),
+        });
+    }
+    let per_row = per_row as usize;
+    let hw = (w as usize) * (h as usize);
+
+    // Decode+resize in parallel (the hot path), then normalize into the flat child buffer.
+    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        decode_rgb_resized(bytes.value(i), w, h).filter(|buf| buf.len() == per_row)
+    });
+    let mut values: Vec<f32> = vec![0.0; bytes.len() * per_row];
+    let mut valid: Vec<bool> = Vec::with_capacity(bytes.len());
+    for (i, row) in rows.into_iter().enumerate() {
+        match row {
+            Some(rgb) => {
+                let out = &mut values[i * per_row..(i + 1) * per_row];
+                // `rgb` is HWC RGB8. Normalize each channel; write HWC or CHW.
+                for p in 0..hw {
+                    for c in 0..3 {
+                        let x = (rgb[p * 3 + c] as f32) / 255.0;
+                        let v = (x - norm.mean[c]) * norm.inv_std[c];
+                        let idx = if norm.channels_first {
+                            c * hw + p
+                        } else {
+                            p * 3 + c
+                        };
+                        out[idx] = v;
+                    }
+                }
+                valid.push(true);
+            }
+            None => valid.push(false),
+        }
+    }
+    let field = Arc::new(Field::new("item", DataType::Float32, false));
+    let arr = FixedSizeListArray::new(
+        field,
+        per_row as i32,
+        Arc::new(Float32Array::from(values)),
+        Some(NullBuffer::from(valid)),
+    );
+    Ok(Arc::new(arr))
+}
+
+/// `center_crop(w, h)` → `FixedSizeList<UInt8>` of length `w*h*3` (RGB8, center-cropped).
+///
+/// Decodes at native resolution and copies the centered `(h, w)` window. When the image is
+/// smaller than the crop in a dimension the missing border is left zero (black), matching
+/// torchvision `CenterCrop`, so the output is always exactly `w*h*3` bytes.
+fn center_crop<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+    width: Option<i64>,
+    height: Option<i64>,
+) -> Result<ArrayRef, ExprError> {
+    let w = dim("center_crop", "width", width)? as usize;
+    let h = dim("center_crop", "height", height)? as usize;
+    // Same overflow/allocation guard as `to_tensor`: the element length is an Arrow i32.
+    let per_row = (w as u64) * (h as u64) * 3;
+    if per_row > i32::MAX as u64 {
+        return Err(ExprError::InvalidArgument {
+            func: "center_crop".to_string(),
+            reason: format!(
+                "crop of {w}x{h}x3 = {per_row} bytes per row exceeds the maximum element \
+                 length of {}",
+                i32::MAX
+            ),
+        });
+    }
+    let per_row = per_row as usize;
+
+    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let img = image::load_from_memory(bytes.value(i)).ok()?.into_rgb8();
+        let (sw, sh) = (img.width() as i64, img.height() as i64);
+        // Centered top-left of the crop window (may be negative when the image is smaller).
+        let x0 = (sw - w as i64) / 2;
+        let y0 = (sh - h as i64) / 2;
+        let src = img.as_raw(); // row-major RGB8
+        let mut out = vec![0u8; per_row];
+        for oy in 0..h {
+            let sy = y0 + oy as i64;
+            if sy < 0 || sy >= sh {
+                continue; // padded row
+            }
+            for ox in 0..w {
+                let sx = x0 + ox as i64;
+                if sx < 0 || sx >= sw {
+                    continue; // padded column
+                }
+                let s = ((sy * sw + sx) * 3) as usize;
+                let d = (oy * w + ox) * 3;
+                out[d..d + 3].copy_from_slice(&src[s..s + 3]);
+            }
+        }
+        Some(out)
+    });
+
+    let mut values: Vec<u8> = vec![0u8; bytes.len() * per_row];
+    let mut valid: Vec<bool> = Vec::with_capacity(bytes.len());
+    for (i, row) in rows.into_iter().enumerate() {
+        match row {
+            Some(buf) => {
+                values[i * per_row..(i + 1) * per_row].copy_from_slice(&buf);
+                valid.push(true);
+            }
+            None => valid.push(false),
+        }
+    }
+    let field = Arc::new(Field::new("item", DataType::UInt8, false));
+    let arr = FixedSizeListArray::new(
+        field,
+        per_row as i32,
+        Arc::new(UInt8Array::from(values)),
+        Some(NullBuffer::from(valid)),
+    );
+    Ok(Arc::new(arr))
+}
+
+/// `to_grayscale(w, h)` → `FixedSizeList<UInt8>` of length `w*h` (shape `(h, w, 1)`).
+///
+/// Decode, resize to `(w, h)`, and reduce each RGB pixel to one Rec.601 luminance byte
+/// (`round((299·R + 587·G + 114·B) / 1000)`) — the standard grayscale conversion, matching
+/// PIL `convert("L")`. Reuses the SIMD decode→resize path, then a cheap per-pixel reduction.
+fn to_grayscale<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+    width: Option<i64>,
+    height: Option<i64>,
+) -> Result<ArrayRef, ExprError> {
+    let w = dim("to_grayscale", "width", width)?;
+    let h = dim("to_grayscale", "height", height)?;
+    // One byte per pixel; the product is the element length (an Arrow i32).
+    let per_row = (w as u64) * (h as u64);
+    if per_row > i32::MAX as u64 {
+        return Err(ExprError::InvalidArgument {
+            func: "to_grayscale".to_string(),
+            reason: format!(
+                "grayscale of {w}x{h} = {per_row} pixels per row exceeds the maximum \
+                 element length of {}",
+                i32::MAX
+            ),
+        });
+    }
+    let per_row = per_row as usize;
+
+    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        // `decode_rgb_resized` yields `w*h*3` RGB8 bytes; reduce each pixel to one luma byte.
+        let rgb = decode_rgb_resized(bytes.value(i), w, h).filter(|b| b.len() == per_row * 3)?;
+        let mut gray = vec![0u8; per_row];
+        for (p, g) in gray.iter_mut().enumerate() {
+            let base = p * 3;
+            let (r, gr, b) = (rgb[base] as u32, rgb[base + 1] as u32, rgb[base + 2] as u32);
+            // +500 for round-to-nearest on the /1000 divide; the sum maxes at 255000 < u32.
+            *g = ((299 * r + 587 * gr + 114 * b + 500) / 1000) as u8;
+        }
+        Some(gray)
+    });
+
+    let mut values: Vec<u8> = vec![0u8; bytes.len() * per_row];
+    let mut valid: Vec<bool> = Vec::with_capacity(bytes.len());
+    for (i, row) in rows.into_iter().enumerate() {
+        match row {
+            Some(buf) => {
+                values[i * per_row..(i + 1) * per_row].copy_from_slice(&buf);
+                valid.push(true);
+            }
+            None => valid.push(false),
+        }
+    }
+    let field = Arc::new(Field::new("item", DataType::UInt8, false));
+    let arr = FixedSizeListArray::new(
+        field,
+        per_row as i32,
+        Arc::new(UInt8Array::from(values)),
+        Some(NullBuffer::from(valid)),
+    );
+    Ok(Arc::new(arr))
+}
+
+/// `dhash()` → UInt64, the 64-bit difference hash of each image.
+///
+/// The image is reduced to a 9x8 grayscale thumbnail and each row's 8 adjacent pixel
+/// pairs are compared, giving 8x8 = 64 bits of "is this pixel brighter than the one to
+/// its right". Comparing *gradients* rather than absolute values is what makes the hash
+/// survive re-encoding, rescaling and brightness shifts while still separating different
+/// images — which is exactly the invariance an image-dedup pass needs.
+///
+/// The 64 bits are returned as **`Int64`, not `UInt64`**, reinterpreted rather than
+/// clamped. That is not cosmetic: the FFI boundary normalizes to `i64` and *rejects* a
+/// `u64` above `i64::MAX`, so a `UInt64` hash would make every hash with its high bit set
+/// — half of them — unusable in the very expression this exists to enable. Sign is
+/// irrelevant to the intended use, because XOR and popcount are bit operations:
+/// `a.bitwise_xor(b).bit_count()` is the Hamming distance whichever way the bits are
+/// read, and a threshold on it is a near-duplicate predicate.
+fn dhash<O: OffsetSizeTrait>(bytes: &GenericBinaryArray<O>) -> Result<ArrayRef, ExprError> {
+    // 9 wide so that each of the 8 output columns is a comparison between two real
+    // neighbouring pixels, rather than wrapping at the edge.
+    const W: u32 = 9;
+    const H: u32 = 8;
+
+    let hashes: Vec<Option<i64>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let rgb = decode_rgb_resized(bytes.value(i), W, H)?;
+        if rgb.len() != (W * H * 3) as usize {
+            return None;
+        }
+        let mut bits: u64 = 0;
+        for row in 0..H as usize {
+            for col in 0..(W - 1) as usize {
+                let left = luma(&rgb, row, col, W as usize);
+                let right = luma(&rgb, row, col + 1, W as usize);
+                bits = (bits << 1) | u64::from(left > right);
+            }
+        }
+        // Reinterpret, never saturate: the bit pattern is the hash.
+        Some(bits as i64)
+    });
+    Ok(Arc::new(Int64Array::from(hashes)))
+}
+
+/// Rec. 601 luma of the pixel at `(row, col)` in a row-major RGB8 buffer `width` wide.
+///
+/// Integer weights (the standard 299/587/114 per mille) keep the hash bit-for-bit
+/// reproducible across platforms — a float dot product would not be, and a perceptual
+/// hash that varies by machine cannot be stored or compared across runs.
+fn luma(rgb: &[u8], row: usize, col: usize, width: usize) -> u32 {
+    let base = (row * width + col) * 3;
+    let (r, g, b) = (rgb[base] as u32, rgb[base + 1] as u32, rgb[base + 2] as u32);
+    299 * r + 587 * g + 114 * b
 }
 
 /// Read just the image header to get `(width, height)`; `None` on any failure.
@@ -285,7 +649,20 @@ fn decode_jpeg_scaled(data: &[u8], w: u32, h: u32) -> Option<(Vec<u8>, u32, u32)
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::LargeBinaryArray;
+
     use super::*;
+
+    /// `eval_image` without normalization — the non-`to_tensor_f32` ops ignore it, so
+    /// the tests for those stay readable at four arguments.
+    fn ei(
+        func: ImageFunc,
+        arr: &ArrayRef,
+        w: Option<i64>,
+        h: Option<i64>,
+    ) -> Result<ArrayRef, ExprError> {
+        eval_image(func, arr, w, h, None, None, false)
+    }
 
     /// A 2×3 red PNG, encoded once so the test has no I/O.
     fn red_png(width: u32, height: u32) -> Vec<u8> {
@@ -295,6 +672,134 @@ mod tests {
             .write_to(&mut out, image::ImageFormat::Png)
             .unwrap();
         out.into_inner()
+    }
+
+    /// Encode an RGB image as PNG so a test can build one inline.
+    fn png_of(img: image::RgbImage) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    /// A smooth 2-D wave with `cycles` horizontal periods.
+    ///
+    /// A monotonic ramp would be useless here: its gradient has one sign everywhere, so
+    /// every comparison is false and the hash is 0 — indistinguishable from a flat image.
+    /// A wave reverses direction `cycles` times per row, giving a rich bit pattern, and
+    /// it is low-frequency enough to survive downscaling to 9x8 (which is what makes the
+    /// rescaling test meaningful rather than accidental).
+    fn wave(w: u32, h: u32, cycles: f32) -> image::RgbImage {
+        use std::f32::consts::PI;
+        image::RgbImage::from_fn(w, h, |x, y| {
+            let fx = (x as f32 / w as f32) * cycles * 2.0 * PI;
+            let fy = (y as f32 / h as f32) * 2.0 * PI;
+            let v = (128.0 + 120.0 * (fx.sin() * fy.cos())).clamp(0.0, 255.0) as u8;
+            image::Rgb([v, v, v])
+        })
+    }
+
+    fn hash_of(png: &[u8]) -> Option<i64> {
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(png)]));
+        let out = ei(ImageFunc::Dhash, &arr, None, None).unwrap();
+        let a = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        (!a.is_null(0)).then(|| a.value(0))
+    }
+
+    /// The property the whole feature rests on: the same image hashes the same.
+    #[test]
+    fn dhash_is_deterministic() {
+        let png = png_of(wave(64, 64, 3.0));
+        let h = hash_of(&png);
+        assert_eq!(h, hash_of(&png));
+        // Guard the guard: a hash of 0 would make the equality above vacuous, and 0 is
+        // exactly what a degenerate test image produces.
+        assert_ne!(h, Some(0), "test image has no usable gradient structure");
+    }
+
+    /// Rescaling must not change the hash much — that is what makes it *perceptual*
+    /// rather than a checksum, and what lets it match a thumbnail to its original.
+    #[test]
+    fn dhash_survives_rescaling() {
+        let big = hash_of(&png_of(wave(256, 256, 3.0))).unwrap();
+        let small = hash_of(&png_of(wave(64, 64, 3.0))).unwrap();
+        let distance = (big ^ small).count_ones();
+        assert!(distance <= 8, "rescaled image moved {distance} bits");
+    }
+
+    /// ...while a visibly different image must be far away, or the hash separates nothing.
+    #[test]
+    fn dhash_separates_different_images() {
+        let three = hash_of(&png_of(wave(64, 64, 3.0))).unwrap();
+        let seven = hash_of(&png_of(wave(64, 64, 7.0))).unwrap();
+        let distance = (three ^ seven).count_ones();
+        assert!(
+            distance >= 16,
+            "different images only {distance} bits apart"
+        );
+    }
+
+    /// Null and undecodable rows yield null rather than failing the batch, matching
+    /// every other media kernel.
+    #[test]
+    fn dhash_nulls_and_garbage_yield_null() {
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(png_of(wave(32, 32, 3.0)).as_slice()),
+            None,
+            Some(b"not an image".as_slice()),
+        ]));
+        let out = ei(ImageFunc::Dhash, &arr, None, None).unwrap();
+        let a = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(!a.is_null(0));
+        assert!(a.is_null(1));
+        assert!(a.is_null(2), "undecodable bytes must be null, not an error");
+    }
+
+    /// A flat image has no gradients anywhere, so every comparison is false.
+    #[test]
+    fn dhash_of_a_flat_image_is_zero() {
+        let flat = image::RgbImage::from_pixel(32, 32, image::Rgb([128, 128, 128]));
+        assert_eq!(hash_of(&png_of(flat)), Some(0));
+    }
+
+    /// `LargeBinary` must decode identically to `Binary`.
+    ///
+    /// A media source stores payloads as `LargeBinary` (32-bit offsets cap an array at
+    /// 2 GB *total*, which a batch of images or clips reaches), so this is the layout the
+    /// `.image` namespace actually sees in production. Accepting only `Binary` made every
+    /// one of these calls fail at run time, and nothing in the Rust tests noticed because
+    /// they all built `BinaryArray`.
+    #[test]
+    fn large_binary_matches_binary_for_every_image_func() {
+        let png = red_png(4, 6);
+        let rows = vec![Some(png.as_slice()), None];
+        let narrow: ArrayRef = Arc::new(BinaryArray::from(rows.clone()));
+        let wide: ArrayRef = Arc::new(LargeBinaryArray::from(rows));
+
+        for func in [
+            ImageFunc::Decode,
+            ImageFunc::ToTensor,
+            ImageFunc::Resize,
+            ImageFunc::Dhash,
+        ] {
+            let (w, h) = (Some(2), Some(3));
+            let from_narrow = ei(func, &narrow, w, h).unwrap();
+            let from_wide = ei(func, &wide, w, h).unwrap();
+            assert_eq!(
+                from_narrow.as_ref(),
+                from_wide.as_ref(),
+                "{func:?} disagreed between Binary and LargeBinary"
+            );
+        }
+    }
+
+    /// A type that is neither Binary nor LargeBinary still reports a clear error.
+    #[test]
+    fn a_non_binary_argument_is_rejected() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let err = ei(ImageFunc::Decode, &arr, None, None).unwrap_err();
+        assert!(format!("{err}").contains("Int32"), "{err}");
     }
 
     /// Manual throughput check (ignored). Run:
@@ -323,9 +828,9 @@ mod tests {
         let arr: ArrayRef = Arc::new(BinaryArray::from_iter(
             blobs.iter().map(|b| Some(b.as_slice())),
         ));
-        let _ = eval_image(ImageFunc::ToTensor, &arr, Some(224), Some(224)).unwrap(); // warm
+        let _ = ei(ImageFunc::ToTensor, &arr, Some(224), Some(224)).unwrap(); // warm
         let t = Instant::now();
-        let out = eval_image(ImageFunc::ToTensor, &arr, Some(224), Some(224)).unwrap();
+        let out = ei(ImageFunc::ToTensor, &arr, Some(224), Some(224)).unwrap();
         let dt = t.elapsed().as_secs_f64();
         assert_eq!(out.len(), n);
         println!(
@@ -343,7 +848,7 @@ mod tests {
             None,
             Some(b"not an image".as_slice()),
         ]));
-        let out = eval_image(ImageFunc::Decode, &arr, None, None).unwrap();
+        let out = ei(ImageFunc::Decode, &arr, None, None).unwrap();
         let s = out.as_any().downcast_ref::<StructArray>().unwrap();
         let w = s.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         let h = s.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
@@ -353,12 +858,70 @@ mod tests {
     }
 
     #[test]
+    fn center_crop_takes_the_middle_and_pads_when_smaller() {
+        use image::{Rgb, RgbImage};
+        // An 8x8 image: left half red, right half green — so a centered 4x4 crop straddles
+        // the seam and its columns split red/green, proving we took the middle, not a corner.
+        let mut img = RgbImage::new(8, 8);
+        for (x, _y, px) in img.enumerate_pixels_mut() {
+            *px = if x < 4 {
+                Rgb([255, 0, 0])
+            } else {
+                Rgb([0, 255, 0])
+            };
+        }
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(png_of(img).as_slice()), None]));
+        let out = ei(ImageFunc::CenterCrop, &arr, Some(4), Some(4)).unwrap();
+        let fsl = out.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        assert_eq!(fsl.value_length(), 4 * 4 * 3);
+        assert!(fsl.is_valid(0) && fsl.is_null(1));
+        let row = fsl.value(0);
+        let px = row.as_any().downcast_ref::<UInt8Array>().unwrap();
+        // Crop window covers source x in [2,6): first crop column (x=2) is red, last (x=5) green.
+        assert_eq!((px.value(0), px.value(1), px.value(2)), (255, 0, 0));
+        let last = (4 * 3) - 3; // start of the 4th pixel in row 0
+        assert_eq!(
+            (px.value(last), px.value(last + 1), px.value(last + 2)),
+            (0, 255, 0)
+        );
+
+        // A crop larger than the image zero-pads the border (torchvision CenterCrop).
+        let small: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(2, 2).as_slice())]));
+        let padded = ei(ImageFunc::CenterCrop, &small, Some(4), Some(4)).unwrap();
+        let pf = padded
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let r = pf.value(0);
+        let p = r.as_any().downcast_ref::<UInt8Array>().unwrap();
+        assert_eq!(p.value(0), 0); // top-left corner is padding
+    }
+
+    #[test]
+    fn to_grayscale_reduces_to_one_luma_channel() {
+        // A solid red image → luma = round(299*255/1000) = round(76.245) = 76 everywhere.
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(red_png(8, 8).as_slice()),
+            None,
+        ]));
+        let out = ei(ImageFunc::ToGrayscale, &arr, Some(4), Some(4)).unwrap();
+        let fsl = out.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        assert_eq!(fsl.value_length(), 4 * 4); // one byte per pixel, not *3
+        assert!(fsl.is_valid(0) && fsl.is_null(1));
+        let row = fsl.value(0);
+        let px = row.as_any().downcast_ref::<UInt8Array>().unwrap();
+        for k in 0..16 {
+            assert_eq!(px.value(k), 76, "pixel {k}");
+        }
+    }
+
+    #[test]
     fn to_tensor_decodes_and_resizes() {
         let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
             Some(red_png(8, 8).as_slice()),
             None,
         ]));
-        let out = eval_image(ImageFunc::ToTensor, &arr, Some(4), Some(4)).unwrap();
+        let out = ei(ImageFunc::ToTensor, &arr, Some(4), Some(4)).unwrap();
         let fsl = out.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
         assert_eq!(fsl.value_length(), 4 * 4 * 3);
         assert!(fsl.is_valid(0));
@@ -369,6 +932,100 @@ mod tests {
         assert_eq!(px.value(0), 255);
         assert_eq!(px.value(1), 0);
         assert_eq!(px.value(2), 0);
+    }
+
+    #[test]
+    fn to_tensor_f32_scales_normalizes_and_lays_out() {
+        use arrow::array::Float32Array;
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(red_png(8, 8).as_slice()),
+            None,
+        ]));
+
+        // Bare: just /255. Solid red → first pixel (1.0, 0.0, 0.0), HWC.
+        let out = eval_image(
+            ImageFunc::ToTensorF32,
+            &arr,
+            Some(2),
+            Some(2),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let fsl = out.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        assert_eq!(fsl.value_length(), 2 * 2 * 3);
+        assert!(fsl.is_valid(0) && fsl.is_null(1));
+        let row = fsl.value(0);
+        let px = row.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(px.value(0), 1.0); // R
+        assert_eq!(px.value(1), 0.0); // G
+        assert_eq!(px.value(2), 0.0); // B (HWC: first three are the first pixel's RGB)
+
+        // Normalized + channels-first: value = (channel/255 - mean)/std, laid out CHW so
+        // the whole first plane is the red channel.
+        let mean = [0.5f64, 0.5, 0.5];
+        let std = [0.25f64, 0.25, 0.25];
+        let out = eval_image(
+            ImageFunc::ToTensorF32,
+            &arr,
+            Some(2),
+            Some(2),
+            Some(&mean),
+            Some(&std),
+            true,
+        )
+        .unwrap();
+        let fsl = out.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let row = fsl.value(0);
+        let px = row.as_any().downcast_ref::<Float32Array>().unwrap();
+        // CHW: indices [0, hw) are the red plane (all 1.0 → (1-0.5)/0.25 = 2.0),
+        // [hw, 2hw) green (0 → (0-0.5)/0.25 = -2.0).
+        let hw = 2 * 2;
+        assert_eq!(px.value(0), 2.0);
+        assert_eq!(px.value(hw), -2.0);
+        assert_eq!(px.value(2 * hw), -2.0);
+    }
+
+    #[test]
+    fn to_tensor_f32_rejects_bad_params() {
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(4, 4).as_slice())]));
+        // Wrong-length mean.
+        let bad_mean = [0.5f64, 0.5];
+        assert!(eval_image(
+            ImageFunc::ToTensorF32,
+            &arr,
+            Some(2),
+            Some(2),
+            Some(&bad_mean),
+            None,
+            false
+        )
+        .is_err());
+        // Zero std.
+        let zero_std = [1.0f64, 0.0, 1.0];
+        assert!(eval_image(
+            ImageFunc::ToTensorF32,
+            &arr,
+            Some(2),
+            Some(2),
+            None,
+            Some(&zero_std),
+            false
+        )
+        .is_err());
+        // Normalization params on a non-f32 op are rejected, not silently ignored.
+        let mean = [0.5f64, 0.5, 0.5];
+        assert!(eval_image(
+            ImageFunc::ToTensor,
+            &arr,
+            Some(2),
+            Some(2),
+            Some(&mean),
+            None,
+            false
+        )
+        .is_err());
     }
 
     #[test]
@@ -394,7 +1051,7 @@ mod tests {
             }
         }
         let arr: ArrayRef = Arc::new(BinaryArray::from_iter(rows));
-        let out = eval_image(ImageFunc::ToTensor, &arr, Some(4), Some(4)).unwrap();
+        let out = ei(ImageFunc::ToTensor, &arr, Some(4), Some(4)).unwrap();
         let fsl = out.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
         assert_eq!(fsl.len(), n);
         for i in 0..n {
@@ -434,7 +1091,7 @@ mod tests {
 
         // End to end: the tensor is 128×128×3 and stays the source color (± JPEG noise).
         let arr: ArrayRef = Arc::new(BinaryArray::from_iter(vec![Some(jpg.as_slice())]));
-        let out = eval_image(ImageFunc::ToTensor, &arr, Some(128), Some(128)).unwrap();
+        let out = ei(ImageFunc::ToTensor, &arr, Some(128), Some(128)).unwrap();
         let fsl = out.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
         assert_eq!(fsl.value_length(), 128 * 128 * 3);
         assert!(fsl.is_valid(0));
@@ -477,20 +1134,20 @@ mod tests {
         let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(4, 4).as_slice())]));
         for &bad in &[-1_i64, 0, i64::from(u32::MAX) + 1, i64::MAX] {
             assert!(
-                eval_image(ImageFunc::ToTensor, &arr, Some(bad), Some(4)).is_err(),
+                ei(ImageFunc::ToTensor, &arr, Some(bad), Some(4)).is_err(),
                 "to_tensor width {bad} should be rejected"
             );
             assert!(
-                eval_image(ImageFunc::ToTensor, &arr, Some(4), Some(bad)).is_err(),
+                ei(ImageFunc::ToTensor, &arr, Some(4), Some(bad)).is_err(),
                 "to_tensor height {bad} should be rejected"
             );
             assert!(
-                eval_image(ImageFunc::Resize, &arr, Some(bad), Some(4)).is_err(),
+                ei(ImageFunc::Resize, &arr, Some(bad), Some(4)).is_err(),
                 "resize width {bad} should be rejected"
             );
         }
         // The error names the arg but never the (potentially huge) allocation it prevented.
-        let err = eval_image(ImageFunc::ToTensor, &arr, Some(-1), Some(4)).unwrap_err();
+        let err = ei(ImageFunc::ToTensor, &arr, Some(-1), Some(4)).unwrap_err();
         assert!(err.to_string().contains("width"), "{err}");
     }
 
@@ -502,16 +1159,16 @@ mod tests {
         // now be a clean error, returned *before* any allocation.
         let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(4, 4).as_slice())]));
         // 40_000 * 40_000 * 3 = 4.8e12 > i32::MAX, but each dim is well within u32.
-        let err = eval_image(ImageFunc::ToTensor, &arr, Some(40_000), Some(40_000)).unwrap_err();
+        let err = ei(ImageFunc::ToTensor, &arr, Some(40_000), Some(40_000)).unwrap_err();
         assert!(err.to_string().contains("exceeds"), "{err}");
         // Just over the boundary: 26_756 * 26_756 * 3 = 2_147_449_008 > i32::MAX (2_147_483_647)?
         // 26_756^2 * 3 = 2_147_608_... let's use a clearly-over value.
-        assert!(eval_image(ImageFunc::ToTensor, &arr, Some(30_000), Some(30_000)).is_err());
+        assert!(ei(ImageFunc::ToTensor, &arr, Some(30_000), Some(30_000)).is_err());
         // A legitimate, bounded request still succeeds.
-        assert!(eval_image(ImageFunc::ToTensor, &arr, Some(64), Some(64)).is_ok());
+        assert!(ei(ImageFunc::ToTensor, &arr, Some(64), Some(64)).is_ok());
         // `resize` guards the same product (its per-row RGB buffer is `w * h * 3`).
-        assert!(eval_image(ImageFunc::Resize, &arr, Some(40_000), Some(40_000)).is_err());
-        assert!(eval_image(ImageFunc::Resize, &arr, Some(8), Some(8)).is_ok());
+        assert!(ei(ImageFunc::Resize, &arr, Some(40_000), Some(40_000)).is_err());
+        assert!(ei(ImageFunc::Resize, &arr, Some(8), Some(8)).is_ok());
     }
 
     #[test]
@@ -521,7 +1178,7 @@ mod tests {
             None,
             Some(b"not an image".as_slice()),
         ]));
-        let out = eval_image(ImageFunc::Resize, &arr, Some(4), Some(2)).unwrap();
+        let out = ei(ImageFunc::Resize, &arr, Some(4), Some(2)).unwrap();
         let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
         assert!(b.is_valid(0));
         // The re-encoded PNG decodes back to the requested 4×2 dimensions.

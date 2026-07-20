@@ -19,6 +19,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same_ordered
 
 # Comfortably over the 131_072-row threshold that turns on the sample-sort.
 PARALLEL_ROWS = 200_000
@@ -37,8 +38,6 @@ def _string_table(n: int, distinct: int, *, nulls: bool = False) -> pa.Table:
 @pytest.mark.differential
 @pytest.mark.parametrize("descending", [False, True])
 def test_parallel_string_sort_matches_duckdb(duck, descending):
-    from conftest import assert_same_ordered
-
     t = _string_table(PARALLEL_ROWS, distinct=5_000)
     duck.register("t", t)
     direction = "DESC" if descending else "ASC"
@@ -48,8 +47,6 @@ def test_parallel_string_sort_matches_duckdb(duck, descending):
 
 @pytest.mark.differential
 def test_parallel_string_sort_with_nulls_matches_duckdb(duck):
-    from conftest import assert_same_ordered
-
     t = _string_table(PARALLEL_ROWS, distinct=3_000, nulls=True)
     duck.register("t", t)
     out = bt.from_arrow(t).sort("s").collect()
@@ -81,8 +78,6 @@ def test_parallel_string_sort_is_stable_and_deterministic():
 @pytest.mark.differential
 def test_serial_string_sort_below_threshold_matches_duckdb(duck):
     """Small inputs decline the sample-sort; the serial path must still agree."""
-    from conftest import assert_same_ordered
-
     t = _string_table(1_000, distinct=50)
     duck.register("t", t)
     out = bt.from_arrow(t).sort("s").collect()
@@ -92,8 +87,6 @@ def test_serial_string_sort_below_threshold_matches_duckdb(duck):
 @pytest.mark.differential
 def test_parallel_string_sort_single_distinct_key(duck):
     """All keys equal: boundaries collapse, the sample-sort declines, order is input order."""
-    from conftest import assert_same_ordered
-
     t = _string_table(PARALLEL_ROWS, distinct=1)
     duck.register("t", t)
     out = bt.from_arrow(t).sort("s").collect()

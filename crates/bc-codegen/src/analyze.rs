@@ -141,6 +141,12 @@ pub(crate) fn analyze(
                     Err(CodegenError::Unsupported("bitwise op".into()))
                 }
                 AddMonths => Err(CodegenError::Unsupported("date month arithmetic".into())),
+                // Floored division always falls back to the interpreter. Cranelift's
+                // `sdiv` truncates toward zero, so compiling it would need the explicit
+                // remainder-sign correction the interpreter applies — and the integer
+                // arm additionally traps on a zero divisor. The interpreter is exact
+                // and NULL-safe there; parity is worth more than the compile.
+                FloorDiv => Err(CodegenError::Unsupported("floored division".into())),
                 And | Or => unreachable!("handled above"),
             }
         }
@@ -249,6 +255,7 @@ pub(crate) fn analyze(
         Expr::Hash { .. } => Err(CodegenError::Unsupported("hash".into())),
         Expr::Sequence { .. } => Err(CodegenError::Unsupported("sequence".into())),
         Expr::ListSet { .. } => Err(CodegenError::Unsupported("list set op".into())),
+        Expr::ListZip { .. } => Err(CodegenError::Unsupported("list arithmetic".into())),
         Expr::ListTransform { .. } => Err(CodegenError::Unsupported("list transform".into())),
         Expr::ListFilter { .. } => Err(CodegenError::Unsupported("list filter".into())),
         Expr::MakeStruct { .. } => Err(CodegenError::Unsupported("struct construction".into())),

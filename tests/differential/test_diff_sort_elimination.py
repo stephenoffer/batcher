@@ -7,6 +7,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 
 
 def _t(duck):
@@ -32,7 +33,5 @@ def test_coarser_resort_order(duck):
 
 
 def test_resort_multiset_matches_duckdb(duck):
-    from conftest import assert_same
-
     out = _t(duck).sort("x").sort("x").collect()
     assert_same(out, duck.sql("SELECT * FROM t ORDER BY x"))

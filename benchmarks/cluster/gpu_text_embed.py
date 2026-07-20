@@ -15,13 +15,13 @@ Run:
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import functools
 import os
 import time
 
 import numpy as np
 import pyarrow as pa
+from _ray_env import init_batcher_ray
 
 print = functools.partial(print, flush=True)
 
@@ -219,33 +219,7 @@ def bench(cfg: dict, n: int) -> dict:
 
 
 def _init() -> None:
-    import importlib.util
-
-    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
-        v = os.environ.get(var)
-        if v:
-            head = v.lstrip("[{\"' ").split(".")[0].split("[")[0]
-            if head and importlib.util.find_spec(head) is None:
-                os.environ.pop(var, None)
-    import batcher
-    from batcher.config import active_config, set_config
-
-    pkg = os.path.dirname(os.path.abspath(batcher.__file__))
-    renv = {
-        "py_modules": [pkg],
-        "pip": None,
-        "env_vars": {"HF_HOME": os.environ.get("HF_HOME", "/mnt/cluster_storage/hf_cache")},
-    }
-    base = active_config()
-    set_config(
-        base.replace(
-            distributed=dataclasses.replace(base.distributed, ray_address="auto", runtime_env=renv)
-        )
-    )
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(address="auto", runtime_env=renv, logging_level="ERROR", log_to_driver=False)
+    init_batcher_ray(hf_cache="/mnt/cluster_storage/hf_cache")
 
 
 def main() -> int:

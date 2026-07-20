@@ -8,7 +8,7 @@ answer with a straight face.
 
 Two tables, which is the point. `assignments` is the randomization: one row per user, the
 arm they were bucketed into, and a segment. `events` is what they did. Some users generated
-several events; one user (`u4`) generated none at all.
+several events, and one user, `u4`, generated none at all.
 
 ```python
 import batcher as bt
@@ -121,8 +121,8 @@ Both arms now have four users, which is what randomization promised and what the
 query destroyed. `bool_or` is the right reducer for a boolean: converted-at-least-once.
 
 :::{important}
-Note the direction of the join: `assignments ⟕ per_user`, never the other way. The
-exposure denominator comes from the assignment log, not from the behaviour log. Anything
+Note the direction of the join. `assignments` is the left side and `per_user` is the right,
+never the other way. The exposure denominator comes from the assignment log, not from the behaviour log. Anything
 computed from the behaviour log conditions on having behaved, which is the whole thing you
 are trying to measure.
 :::
@@ -131,7 +131,7 @@ are trying to measure.
 
 With four users per arm: no. But do the arithmetic explicitly rather than eyeballing it. A
 two-proportion z-test is two lines over a two-row result. The aggregation happened in the
-engine; what comes back to Python is a summary you can do scalar math on.
+engine, so what comes back to Python is a summary you can do scalar math on.
 
 ```python
 import math
@@ -153,7 +153,7 @@ Eight users cannot resolve a 25-point effect, and this test says so.
 ## Simpson's paradox, in one table
 
 Before you believe any pooled number, break it by the segments you know about. Randomization
-balances segments *in expectation*; in a real experiment with real traffic it often does not,
+balances segments *in expectation*. In a real experiment with real traffic it often does not,
 and then the pooled average lies.
 
 ```python

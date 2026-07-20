@@ -22,8 +22,8 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same, assert_tables_equal
 from batcher import col
-from conftest import assert_same, assert_tables_equal
 
 pytestmark = pytest.mark.differential
 

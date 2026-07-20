@@ -33,10 +33,10 @@ print(activity.count())
 ## Cohort and day number
 
 Same skeleton as [cohort analysis](cohort-analysis.md), in days rather than months. The
-cohort is the user's first active day; `day_n` is days since then.
+cohort is the user's first active day, and `day_n` is days since then.
 
 Dates do not subtract and window aggregates do not reduce a `Date32`, so convert to an
-integer day number once, up front. `dt.epoch()` gives seconds; divide by 86,400 and cast.
+integer day number once, up front. `dt.epoch()` gives seconds, so divide by 86,400 and cast.
 The string form of the date goes along for the ride as a readable cohort label. `min` over a
 string is well defined, and ISO dates sort correctly as text.
 

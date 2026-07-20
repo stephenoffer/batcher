@@ -418,7 +418,15 @@ def push_filter_through_aggregate(node: Filter, _ctx: OptimizerContext) -> Logic
     if not referenced_columns(node.predicate) <= set(key_exprs):
         return None
     pushed = substitute_columns(node.predicate, key_exprs)
-    return Aggregate(Filter(inner.input, pushed), inner.group_keys, inner.aggregates)
+    # Carry the watermark. Rebuilding `Aggregate` positionally drops it (it is the
+    # fourth field, defaulting to None), which turns a watermark-bounded streaming
+    # aggregate into one whose state nothing ever evicts — a memory leak that no bounded
+    # test can see, because a bounded input releases the state at end-of-input anyway.
+    # The filter goes *below* the aggregate's input, so the input schema — and therefore
+    # the watermark's time column — is unchanged.
+    return Aggregate(
+        Filter(inner.input, pushed), inner.group_keys, inner.aggregates, inner.watermark
+    )
 
 
 @rule(name="push_filter_through_sort", phase=Phase.PUSHDOWN, matches=(Filter,))

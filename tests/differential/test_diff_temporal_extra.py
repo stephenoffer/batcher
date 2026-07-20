@@ -16,6 +16,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, lit
 from batcher.kyber.rules.extra import temporal_extra as _temporal_extra  # noqa: F401  (registers)
 
@@ -84,8 +85,6 @@ def empty(duck):
     ],
 )
 def test_date_trunc_inequality_on_timestamp(duck, t, unit, op, sql_op):
-    from conftest import assert_same
-
     bound = {"month": dt.datetime(2021, 3, 1), "year": dt.datetime(2021, 1, 1)}.get(
         unit, dt.datetime(2021, 3, 5)
     )
@@ -104,8 +103,6 @@ def test_date_trunc_inequality_on_timestamp(duck, t, unit, op, sql_op):
 
 
 def test_date_trunc_inequality_on_date_column(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .filter(col("d").dt.truncate("month") >= lit(dt.date(2021, 3, 1)))
@@ -116,8 +113,6 @@ def test_date_trunc_inequality_on_date_column(duck, t):
 
 
 def test_date_trunc_inequality_over_empty_input(duck, empty):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(empty)
         .filter(col("ts").dt.truncate("year") > lit(dt.datetime(2021, 1, 1)))
@@ -130,8 +125,6 @@ def test_date_trunc_inequality_over_empty_input(duck, empty):
 
 
 def test_date_trunc_unaligned_literal_matches_nothing(duck, t):
-    from conftest import assert_same
-
     # Not a month boundary: no row's truncation can equal it. The rule leaves the
     # comparison alone; the engine must still agree with DuckDB.
     out = (
@@ -153,16 +146,12 @@ def test_date_trunc_unaligned_literal_matches_nothing(duck, t):
     [("%Y", "2021"), ("%Y-%m", "2021-03"), ("%Y-%m-%d", "2024-02-29")],
 )
 def test_strftime_equality(duck, t, fmt, value):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter(col("d").dt.strftime(fmt) == lit(value)).select("v").collect()
     assert_same(out, duck.sql(f"SELECT v FROM t WHERE strftime(d, '{fmt}') = '{value}'"))
 
 
 @pytest.mark.parametrize(("op", "sql_op"), [("ge", ">="), ("le", "<="), ("gt", ">"), ("lt", "<")])
 def test_strftime_inequality_on_timestamp(duck, t, op, sql_op):
-    from conftest import assert_same
-
     formatted = col("ts").dt.strftime("%Y-%m")
     expr = {
         "ge": formatted >= lit("2021-03"),
@@ -175,8 +164,6 @@ def test_strftime_inequality_on_timestamp(duck, t, op, sql_op):
 
 
 def test_strftime_year_boundary_and_leap_day(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .filter(
@@ -196,8 +183,6 @@ def test_strftime_year_boundary_and_leap_day(duck, t):
 
 
 def test_strftime_impossible_literal(duck, t):
-    from conftest import assert_same
-
     # `2021-02-30` never renders — the rule refuses it, and both engines return nothing.
     out = (
         bt.from_arrow(t)
@@ -221,8 +206,6 @@ def test_strftime_impossible_literal(duck, t):
     ],
 )
 def test_extraction_predicates(duck, t, expr_fn, sql):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).filter(expr_fn()).select("v").collect()
     assert_same(out, duck.sql(f"SELECT v FROM t WHERE {sql}"))
 
@@ -232,8 +215,6 @@ def test_extraction_predicates(duck, t, expr_fn, sql):
 
 @pytest.mark.parametrize(("op", "sql_op"), [("ge", ">="), ("lt", "<"), ("eq", "="), ("ne", "!=")])
 def test_date_cast_comparison(duck, t, op, sql_op):
-    from conftest import assert_same
-
     cast = col("d").cast("timestamp")
     bound = lit(dt.datetime(2021, 3, 1))
     expr = {"ge": cast >= bound, "lt": cast < bound, "eq": cast == bound, "ne": cast != bound}[op]
@@ -248,8 +229,6 @@ def test_date_cast_comparison(duck, t, op, sql_op):
 
 
 def test_nested_date_trunc_projection(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(col("ts").dt.truncate("day").dt.truncate("year").alias("r"), col("v"))
@@ -259,8 +238,6 @@ def test_nested_date_trunc_projection(duck, t):
 
 
 def test_repeated_date_trunc_projection(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(col("ts").dt.truncate("month").dt.truncate("month").alias("r"), col("v"))
@@ -270,8 +247,6 @@ def test_repeated_date_trunc_projection(duck, t):
 
 
 def test_fold_date_func_of_literal(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(
@@ -292,8 +267,6 @@ def test_fold_date_func_of_literal(duck, t):
 
 
 def test_fold_date_offset_of_literal(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(lit(dt.date(2024, 2, 28)).dt.offset_by("1d").alias("r"), col("v"))
@@ -305,8 +278,6 @@ def test_fold_date_offset_of_literal(duck, t):
 
 
 def test_fold_temporal_literal_comparison(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .filter(lit(dt.date(2021, 1, 1)) < lit(dt.date(2021, 3, 5)))

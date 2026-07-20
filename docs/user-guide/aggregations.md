@@ -24,7 +24,7 @@ ds = bt.from_pydict(
 `group_by` takes the grouping keys; `agg` takes the output aggregates. Pass them as
 keywords to name the output, or positionally to keep the source column's name.
 {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; the column aggregates are methods
-on an expression (`.sum()`, `.mean()`, …) or the top-level shorthands
+on an expression (`.sum()`, `.mean()`, and so on) or the top-level shorthands
 {py:obj}`bt.sum("x") <batcher.sum>`, `bt.mean`, `bt.min`, `bt.max`, `bt.median`,
 `bt.std`, `bt.var`, `bt.n_unique`. `bt.sum("x")` reads as `col("x").sum()`, the
 Polars `pl.sum` convention.
@@ -53,10 +53,10 @@ When you reduce *every* value column the same way, a shortcut method is shorter
 than spelling out `agg`. The set is `sum`, `mean`, `min`, `max`, `median`,
 `quantile(q)`, `n_unique`, `std`, `var`, `count` (non-null values per column), and
 `len` (the per-group row count). With no arguments they reduce every non-key
-column, keeping its name; pass column names or a
+column, keeping its name. Pass column names or a
 [selector](transformations.md) to reduce a subset. The arithmetic reductions
 (`sum`, `mean`, `median`, `quantile`, `std`, `var`) default to numeric columns
-only, like pandas' ``numeric_only``.
+only, matching pandas' `numeric_only`.
 
 ```python
 print(ds.group_by("category").sum().sort("category").to_pydict())
@@ -165,7 +165,7 @@ print(bivariate.to_pydict())
 ## Expressions over aggregates
 
 An `agg` keyword takes not just a single aggregate but a whole expression *over*
-aggregates — a ratio, a difference, any arithmetic. `col("price").sum() /
+aggregates: a ratio, a difference, any arithmetic. `col("price").sum() /
 bt.count()` is an average priced as one aggregate pass; `col("price").max() -
 col("price").min()` is the per-group spread. The engine computes each distinct
 aggregate once and evaluates the surrounding arithmetic in a projection, so the
@@ -218,7 +218,7 @@ print(fit.to_pydict())
 ## Derived statistics
 
 Because an aggregate result is itself an expression, a family of standard statistics that
-the base aggregates don't name directly comes for free — each is a small formula over the
+the base aggregates don't name directly comes for free. Each is a small formula over the
 mergeable primitives, so it stays identical single-node and distributed.
 {py:obj}`bt.var_pop(x) <batcher.var_pop>` / {py:obj}`bt.stddev_pop(x) <batcher.stddev_pop>`
 are the *population* variance and standard deviation (Batcher's `var`/`std` are the sample
@@ -228,8 +228,8 @@ are the geometric, harmonic, and quadratic means; and {py:obj}`bt.cv(x) <batcher
 {py:obj}`bt.sem(x) <batcher.sem>`, and {py:obj}`bt.midrange(x) <batcher.midrange>` give the
 coefficient of variation, the standard error of the mean, and the midrange.
 {py:obj}`bt.weighted_mean(value, weight) <batcher.weighted_mean>` averages one column in
-proportion to another. You can also apply a math function to any aggregate yourself —
-`col("x").sum().sqrt()`, `col("x").mean().round(2)`.
+proportion to another. You can also apply a math function to any aggregate yourself, such
+as `col("x").sum().sqrt()` or `col("x").mean().round(2)`.
 
 ```python
 stats = ds.group_by("category").agg(
@@ -249,10 +249,10 @@ sketch-backed aggregates trade a little accuracy for bounded memory and
 mergeability: `approx_n_unique` (HyperLogLog), `approx_quantile(q)` and
 `approx_median` (KLL). They merge exactly across partitions, so the estimate is
 identical single-node or distributed. On small inputs it typically matches the
-exact count. Each also has a top-level spelling —
+exact count. Each also has a top-level spelling:
 {py:obj}`bt.approx_n_unique(x) <batcher.approx_n_unique>`,
-{py:obj}`bt.approx_quantile(x, q) <batcher.approx_quantile>`,
-{py:obj}`bt.approx_median(x) <batcher.approx_median>` — alongside the exact
+{py:obj}`bt.approx_quantile(x, q) <batcher.approx_quantile>`, and
+{py:obj}`bt.approx_median(x) <batcher.approx_median>`. They sit alongside the exact
 {py:obj}`bt.quantile(x, q) <batcher.quantile>` and the value-tally
 {py:obj}`bt.histogram(x) <batcher.histogram>`.
 

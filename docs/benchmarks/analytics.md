@@ -13,7 +13,7 @@ and Polars return the wrong revenue, so neither gets a number there.
 :::{note}
 Not every table below was measured on the same machine, because the workload families were
 not. Ratios hold *within* a table; a number from one table set against a number from another
-says nothing. [Methodology](methodology.md) lists the hardware per family.
+says nothing. {doc}`methodology` lists the hardware per family.
 :::
 
 ## Operators
@@ -66,7 +66,7 @@ Two caveats, in both directions:
 
 ### Why the join gap exists
 
-It is not a tuning knob. Single-node parallelism currently reaches roughly 1.7–3.8× on 16
+It isn't a tuning knob. Single-node parallelism plateaus after about 8 of 16
 cores where Daft uses effectively all of them, and Batcher performs about 2× more CPU work
 per query. Closing it is a runtime-parallelism and kernel-efficiency effort, and it is the
 top open lever in `benchmarks/BENCHMARK_RESULTS.md`.
@@ -107,7 +107,7 @@ or the plan itself, even after a transform chain:
 
 `filter(...).count()` was a loss until `.count()` was compiled to a `COUNT(*)` aggregate:
 projection pushdown then prunes the scan to just the predicate's column and fuses it into
-`count_if`. That took it from 2,187 ms to 47 ms — from 3.2× behind Ray Data to 15× ahead.
+`count_if`. That took it from 2,187 ms to 47 ms, moving from 3.2x behind Ray Data to 15x ahead.
 
 ## vs Daft
 
@@ -116,9 +116,9 @@ TPC-H scale factor 1:
 
 | Shape | Result |
 |---|---|
-| Top-N and sort-limit | Batcher, 8–10×, on the fused top-N heap |
+| Top-N and sort-limit | Batcher, 8x to 10x, on the fused top-N heap |
 | Global aggregation, group-by, single-stage expression ETL | Parity |
-| Join-heavy queries | **Daft, 2–12×** |
+| Join-heavy queries | **Daft, up to 2x** |
 | Per-batch Python UDFs | **Daft, ~2×** |
 
 Daft computes TPC-H q6 incorrectly (it folds `0.06 + 0.01` in IEEE double to `0.06999999999999999`, dropping every `l_discount = 0.07` row and returning 75.2M
@@ -127,14 +127,14 @@ Daft is purely speed, never correctness.
 
 ## See also
 
-- [TPC-H](tpch.md): the per-query detail behind the geometric mean.
-- [vs DuckDB](vs-duckdb.md), [vs Polars](vs-polars.md), [vs Daft](vs-daft.md): the same
+- {doc}`tpch`: the per-query detail behind the geometric mean.
+- {doc}`vs-duckdb`, {doc}`vs-polars`, {doc}`vs-daft`: the same
   numbers arranged one engine at a time.
-- [AI and GPU benchmarks](ai-and-gpu.md): the other half of the measurement.
-- [Expression evaluation](../deep-dives/expression-evaluation.md) and
-  [JIT compilation](../deep-dives/jit-compilation.md): where the filtered count's 5× comes
+- {doc}`ai-and-gpu`: the other half of the measurement.
+- {doc}`../deep-dives/expression-evaluation` and
+  {doc}`../deep-dives/jit-compilation`: where the filtered count's 5× comes
   from.
-- [Aggregation internals](../deep-dives/aggregation-internals.md): the radix combine behind
+- {doc}`../deep-dives/aggregation-internals`: the radix combine behind
   the group-by numbers.
-- [Performance tuning](../user-guide/performance.md): making *your* query faster.
-- [Methodology](methodology.md): hardware, gating, and the reproduce commands.
+- {doc}`../user-guide/performance`: making *your* query faster.
+- {doc}`methodology`: hardware, gating, and the reproduce commands.

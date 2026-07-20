@@ -5,6 +5,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
+from _harness import assert_same
 from batcher._sql.parser import sql as bsql
 
 
@@ -35,8 +36,6 @@ def dept_info(duck):
 
 # --- CTEs ------------------------------------------------------------------
 def test_simple_cte(duck, emp):
-    from conftest import assert_same
-
     q = """
         WITH high AS (SELECT dept, name, salary FROM emp WHERE salary > 150)
         SELECT dept, name, salary FROM high
@@ -46,8 +45,6 @@ def test_simple_cte(duck, emp):
 
 
 def test_chained_multi_cte(duck, emp):
-    from conftest import assert_same
-
     q = """
         WITH a AS (SELECT dept, salary FROM emp WHERE salary >= 150),
              b AS (SELECT dept, salary FROM a WHERE salary < 300)
@@ -58,8 +55,6 @@ def test_chained_multi_cte(duck, emp):
 
 
 def test_cte_used_in_join(duck, emp, dept_info):
-    from conftest import assert_same
-
     q = """
         WITH e AS (SELECT dept, name, salary FROM emp WHERE salary > 100)
         SELECT e.dept AS dept, e.name AS name, dept_info.region AS region
@@ -71,8 +66,6 @@ def test_cte_used_in_join(duck, emp, dept_info):
 
 # --- ranking window functions ----------------------------------------------
 def test_row_number(duck, emp):
-    from conftest import assert_same
-
     q = """
         SELECT dept, salary,
                row_number() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn
@@ -83,8 +76,6 @@ def test_row_number(duck, emp):
 
 
 def test_rank_and_dense_rank(duck, emp):
-    from conftest import assert_same
-
     q = """
         SELECT dept, salary,
                rank() OVER (PARTITION BY dept ORDER BY salary DESC) AS rk,
@@ -97,16 +88,12 @@ def test_rank_and_dense_rank(duck, emp):
 
 # --- whole-partition aggregate window functions ----------------------------
 def test_sum_over_partition(duck, emp):
-    from conftest import assert_same
-
     q = "SELECT dept, salary, SUM(salary) OVER (PARTITION BY dept) AS tot FROM emp"
     out = bsql(q, emp=emp).collect()
     assert_same(out, duck.sql(q))
 
 
 def test_avg_min_max_count_over_partition(duck, emp):
-    from conftest import assert_same
-
     q = """
         SELECT dept, salary,
                AVG(salary) OVER (PARTITION BY dept) AS av,
@@ -120,8 +107,6 @@ def test_avg_min_max_count_over_partition(duck, emp):
 
 
 def test_multiple_window_functions_mixed(duck, emp):
-    from conftest import assert_same
-
     q = """
         SELECT dept, salary,
                row_number() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn,
@@ -135,8 +120,6 @@ def test_multiple_window_functions_mixed(duck, emp):
 # --- running (cumulative) aggregate frames ---------------------------------
 @pytest.mark.parametrize("fn", ["SUM", "AVG", "MIN", "MAX", "COUNT"])
 def test_running_aggregate_window_vs_duckdb(duck, emp, fn):
-    from conftest import assert_same
-
     # ORDER BY salary has ties (250,250 in dept b), exercising RANGE peer-sharing.
     q = (
         f"SELECT dept, name, salary, "
@@ -147,8 +130,6 @@ def test_running_aggregate_window_vs_duckdb(duck, emp, fn):
 
 # --- QUALIFY (filter on window results) ------------------------------------
 def test_qualify_row_number(duck, emp):
-    from conftest import assert_same
-
     # Tiebreak by name so row_number is deterministic over the tied salaries.
     q = (
         "SELECT dept, name, salary, "
@@ -159,8 +140,6 @@ def test_qualify_row_number(duck, emp):
 
 
 def test_qualify_rank_filter(duck, emp):
-    from conftest import assert_same
-
     q = (
         "SELECT dept, salary, rank() OVER (PARTITION BY dept ORDER BY salary) rk "
         "FROM emp QUALIFY rk = 1"

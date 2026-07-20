@@ -11,8 +11,8 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 
 def test_json_extract_object_leaf_preserves_key_order(duck):
@@ -59,13 +59,15 @@ def test_json_extract_big_integer_keeps_digits(duck):
 
 
 def test_json_extract_nested_object_leaf(duck):
-    tbl = pa.table(
-        {"j": pa.array(['{"a":{"deep":{"d":1,"c":2,"b":3}}}', '{"a":{"deep":{}}}'])}
-    )
+    tbl = pa.table({"j": pa.array(['{"a":{"deep":{"d":1,"c":2,"b":3}}}', '{"a":{"deep":{}}}'])})
     duck.register("t", tbl)
-    got = bt.from_arrow(tbl).select(
-        v=col("j").json.extract_string("$.a.deep"),
-    ).collect()
+    got = (
+        bt.from_arrow(tbl)
+        .select(
+            v=col("j").json.extract_string("$.a.deep"),
+        )
+        .collect()
+    )
     assert_same(got, duck.sql("SELECT json_extract_string(j, '$.a.deep') AS v FROM t"))
 
 

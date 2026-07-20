@@ -531,3 +531,96 @@ mod dense_tests {
         assert_eq!(got, want, "parallel distinct set differs from serial");
     }
 }
+
+#[cfg(test)]
+mod scratch_timing {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn time_ungrouped() {
+        let n = 8_000_000usize;
+        let card = 5_000_000i64;
+        let mut s: u64 = 7;
+        let vals: Vec<i64> = (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((s >> 20) % card as u64) as i64
+            })
+            .collect();
+        let values: ArrayRef = Arc::new(Int64Array::from(vals.clone()));
+        let gids = vec![0u32; n];
+
+        let t = Instant::now();
+        let st = distinct_state(&values, &gids, 1).unwrap();
+        println!("distinct_state(num_groups=1): {:?} -> len {}", t.elapsed(), st.len());
+
+        // sub-parts
+        let grp: ArrayRef = Arc::new(Int64Array::from(vec![0i64; n]));
+        let t = Instant::now();
+        let (dg, dv) = par_dedup_pairs(
+            grp.as_primitive::<Int64Type>(),
+            values.as_any().downcast_ref::<Int64Array>().unwrap(),
+            n,
+        );
+        println!("  par_dedup_pairs: {:?} -> {} distinct", t.elapsed(), dg.len());
+
+        let dvals: ArrayRef = Arc::new(Int64Array::from(dv));
+        let t = Instant::now();
+        let l = bucket_values_into_list(&Int64Array::from(dg), &dvals, 1).unwrap();
+        println!("  bucket_values_into_list: {:?} -> {}", t.elapsed(), l.len());
+
+        let t = Instant::now();
+        let m = merge_distinct(&st, &[0u32], 1).unwrap();
+        println!("merge_distinct: {:?} -> {}", t.elapsed(), m.len());
+    }
+
+    /// Simulate the ungrouped executor path: per-morsel partials (parallel) then combine.
+    #[test]
+    #[ignore]
+    fn time_ungrouped_pipeline() {
+        use crate::agg::{combine_with, finalize, partial, AggCall, AggFunc};
+        use arrow::datatypes::{Field, Schema};
+        use rayon::prelude::*;
+
+        let n = 8_000_000usize;
+        let card = 5_000_000i64;
+        let morsel = 16_384usize;
+        let mut s: u64 = 7;
+        let vals: Vec<i64> = (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((s >> 20) % card as u64) as i64
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let morsels: Vec<RecordBatch> = vals
+            .chunks(morsel)
+            .map(|c| {
+                let a: ArrayRef = Arc::new(Int64Array::from(c.to_vec()));
+                RecordBatch::try_new(schema.clone(), vec![a]).unwrap()
+            })
+            .collect();
+        println!("morsels: {}", morsels.len());
+
+        let t = Instant::now();
+        let partials: Vec<_> = morsels
+            .par_iter()
+            .map(|b| {
+                let v: ArrayRef = b.column(0).clone();
+                partial(&[], &[AggCall::new(AggFunc::CountDistinct, Some(v))], b.num_rows())
+            })
+            .collect::<Result<_, _>>()
+            .unwrap();
+        println!("partial (parallel): {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let merged = combine_with(&partials, &[AggFunc::CountDistinct], 200_000).unwrap();
+        println!("combine_with: {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let out = finalize(&[AggFunc::CountDistinct], &merged).unwrap();
+        println!("finalize: {:?} -> {:?}", t.elapsed(), out[0].len());
+    }
+}

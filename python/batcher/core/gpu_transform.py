@@ -16,7 +16,10 @@ than silently returning wrong results, so a caller falls back to the CPU engine 
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
+
+from batcher._internal.hardware import accelerator_backend, gpu_devices_absent
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -24,20 +27,48 @@ if TYPE_CHECKING:
 __all__ = ["gpu_available", "gpu_groupby_agg"]
 
 # The reductions a GPU group-by supports; each maps to a scatter-based kernel below.
+# Torch device string per detected backend. ROCm speaks the CUDA API, so it uses the
+# ``cuda`` string; a backend with no torch device (or an unknown one) falls back to CPU
+# rather than raising — the accelerated path is an optimization, never a requirement.
+_TORCH_DEVICE = {"cuda": "cuda", "rocm": "cuda", "xpu": "xpu", "mps": "mps"}
+
 _SUPPORTED_AGGS = ("sum", "count", "mean", "min", "max")
 
 
+@functools.lru_cache(maxsize=1)
 def gpu_available() -> bool:
     """Whether a CUDA-capable torch is importable *and* a device is present in this process.
 
     False on a GPU-less host (the driver), where a caller dispatches to a GPU worker or falls
-    back to the CPU engine. Never raises."""
+    back to the CPU engine. Never raises.
+
+    Short-circuits on the cheap device-node check before touching torch, and memoizes the
+    answer. Importing torch costs ~2 s and this is reached from the post-collect GPU-crossover
+    probe, so *every* run on a GPU-less host paid that once — a 2 s first-query stall to
+    discover there is no GPU to use, on the machines least able to profit from it. Device
+    presence cannot change within a process, so caching loses nothing.
+    """
+    if gpu_devices_absent():
+        return False
     try:
         import torch
 
         return bool(torch.cuda.is_available())
     except Exception:
         return False
+
+
+def _validate_aggs(aggs: dict[str, tuple[str, str]]) -> None:
+    """Reject a reduction this backend cannot compute, naming the offending output.
+
+    Called from both entry points — the dispatcher and the device kernel, which tests
+    drive directly on ``device="cpu"`` — so neither can be reached with an aggregate the
+    kernel would silently mis-handle."""
+    from batcher._internal.errors import BackendError
+
+    for name, (_col, red) in aggs.items():
+        if red not in _SUPPORTED_AGGS:
+            raise BackendError(f"unsupported GPU reduction {red!r} for {name!r}")
 
 
 def gpu_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]]) -> pa.Table:
@@ -54,16 +85,40 @@ def gpu_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]])
     falls back to a torch scatter-reduce kernel otherwise. Both are result-identical to the CPU
     engine (up to float summation order). Raises `BackendError` if no GPU is available.
     """
+    from batcher._internal.errors import BackendError
+
+    # Validate the request before probing hardware: an unsupported reduction is a caller
+    # error whatever device is attached, and reporting "no accelerator" for a typo'd
+    # aggregate would send the reader hunting for a GPU they do not need.
+    _validate_aggs(aggs)
     if not gpu_available():
-        from batcher._internal.errors import BackendError
-
         raise BackendError("gpu_groupby_agg needs a CUDA-capable torch on a GPU device")
-    try:
-        import cudf  # noqa: F401
+    # cuDF is CUDA-only by construction, so it is tried only on a CUDA/ROCm device. The
+    # torch kernel is device-parameterized (see `_torch_groupby_agg`), so an Intel XPU or
+    # Apple MPS host runs the accelerated path on *its* device instead of the CUDA string,
+    # which would have raised and dropped the whole stage back to the CPU engine.
+    backend = accelerator_backend()
+    device = _TORCH_DEVICE.get(backend)
+    # `_TORCH_DEVICE` maps only accelerator backends, so an unknown/absent one is `None`.
+    # (A `device == "cpu"` disjunct used to sit here; no entry has that value, so it read as
+    # covering a case it could never match.)
+    if device is None:
+        # No accelerator to run on. Raise rather than quietly computing on the CPU *inside*
+        # the GPU kernel: the caller asked for the accelerated backend and owns the decision
+        # to fall back, and a silent CPU computation here would report GPU acceleration that
+        # never happened — the exact failure this backend is supposed to make visible.
+        raise BackendError(
+            f"gpu_groupby_agg found no usable accelerator (detected backend {backend!r}); "
+            "the caller should use the CPU engine"
+        )
+    if backend in ("cuda", "rocm"):
+        try:
+            import cudf  # noqa: F401
 
-        return _cudf_groupby_agg(table, key, aggs)
-    except ImportError:
-        return _torch_groupby_agg(table, key, aggs, device="cuda")
+            return _cudf_groupby_agg(table, key, aggs)
+        except ImportError:
+            pass
+    return _torch_groupby_agg(table, key, aggs, device=device)
 
 
 def _cudf_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]]) -> pa.Table:
@@ -96,11 +151,7 @@ def _torch_groupby_agg(
     import pyarrow as pa
     import torch
 
-    for name, (_col, red) in aggs.items():
-        if red not in _SUPPORTED_AGGS:
-            from batcher._internal.errors import BackendError
-
-            raise BackendError(f"unsupported GPU reduction {red!r} for {name!r}")
+    _validate_aggs(aggs)
 
     dev = torch.device(device)
     keys_np = table.column(key).to_numpy(zero_copy_only=False)

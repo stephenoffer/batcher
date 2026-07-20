@@ -110,7 +110,7 @@ print(flagged.sort("user", "ts").to_pydict()["is_new"])
 ```
 
 Third, number the sessions. A running sum of the flag, in time order, within the user. Each
-boundary bumps the counter; everything between keeps the number. The SQL tab writes out all
+boundary bumps the counter, and everything between keeps the number. The SQL tab writes out all
 three steps as CTEs, one window function per projection, and lands on the same plan.
 
 ::::{tab-set}
@@ -158,11 +158,11 @@ print(sql_sessions.to_pydict()["session"])
 
 :::{note}
 Each window function gets its own projection in the SQL, and the arithmetic happens in the
-next CTE. That is not a Batcher quirk so much as good hygiene; it is also how the plan
+next CTE. That is not a Batcher quirk so much as good hygiene, and it is also how the plan
 looks internally either way.
 :::
 
-`(user, session)` is now a key you can group on like any other.
+`(user, session)` is now a key you can group on as you would any other.
 
 ## Session-level metrics
 
@@ -189,7 +189,7 @@ print(summary.select("user", "session", "pages", "duration_s").to_pydict())
 ```
 
 Four sessions, and `u2`'s first one has a duration of zero: a single-page visit. Those are
-real and you should not filter them out just because they look like noise. A bounce rate is
+real and you should not filter them out only because they look like noise. A bounce rate is
 exactly the fraction of sessions with `pages == 1`.
 
 ## The shortcut

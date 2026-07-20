@@ -21,6 +21,7 @@ from batcher.plan.expr_ir.func_nodes import (
     ListSimhash,
     ListSlice,
     ListTransform,
+    ListZip,
     MapFunc,
     StrFunc,
     StructField,
@@ -456,6 +457,73 @@ class _ListNamespace:
                 {'r': [[1, 2, 3]]}
         """
         return ListSet("array_union", self._e, _wrap(other))
+
+    def add(self, other: Any) -> ListZip:
+        """Element-wise sum of this vector and ``other`` (→ List<Float64>).
+
+        The embedding-math primitive: combine two embedding columns, or add a bias
+        vector. Both must be the same length per row (a mismatch raises); a null element
+        on either side yields null at that position. A null list row yields a null row.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List<Float64> expression of the per-element sums.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1.0, 2.0]], "b": [[10.0, 20.0]]})
+                >>> ds.select(bt.col("a").list.add(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[11.0, 22.0]]}
+        """
+        return ListZip("list_add", self._e, _wrap(other))
+
+    def subtract(self, other: Any) -> ListZip:
+        """Element-wise difference ``this - other`` (→ List<Float64>).
+
+        Mean-center an embedding by subtracting a centroid, or take a difference vector.
+        Same length rules as :meth:`add`.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List<Float64> expression of the per-element differences.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[10.0, 20.0]], "b": [[1.0, 2.0]]})
+                >>> ds.select(bt.col("a").list.subtract(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[9.0, 18.0]]}
+        """
+        return ListZip("list_subtract", self._e, _wrap(other))
+
+    def multiply(self, other: Any) -> ListZip:
+        """Element-wise (Hadamard) product of this vector and ``other`` (→ List<Float64>).
+
+        Gate or weight an embedding per dimension (e.g. a learned feature mask). Same
+        length rules as :meth:`add`.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A new List<Float64> expression of the per-element products.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[2.0, 3.0]], "b": [[5.0, 10.0]]})
+                >>> ds.select(bt.col("a").list.multiply(bt.col("b")).alias("r")).to_pydict()
+                {'r': [[10.0, 30.0]]}
+        """
+        return ListZip("list_multiply", self._e, _wrap(other))
 
     # --- embedding / vector helpers -------------------------------------------------
 
@@ -999,6 +1067,52 @@ class _ListNamespace:
         """
         return ListBinary("l2_distance", self._e, _wrap(other))
 
+    def l1_distance(self, other: Any) -> ListBinary:
+        """Manhattan (L1) distance to another vector column (→ Float64).
+
+        The sum of absolute per-element differences ``Σ|aᵢ - bᵢ|`` — the metric some
+        embedding models and sparse features are trained under. Both vectors must have
+        the same length.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A new Float64 expression: the Manhattan distance.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[0.0, 0.0]], "b": [[3.0, 4.0]]})
+                >>> ds.select(bt.col("a").list.l1_distance(bt.col("b")).alias("r")).to_pydict()
+                {'r': [7.0]}
+        """
+        return ListBinary("l1_distance", self._e, _wrap(other))
+
+    def hamming_distance(self, other: Any) -> ListBinary:
+        """Number of positions where two vectors differ (→ Float64).
+
+        The distance for **binary or quantized embeddings** (each element ``0``/``1`` or a
+        small integer), where it is far cheaper than a float metric and is what a binary
+        vector index ranks by. Both vectors must have the same length.
+
+        Args:
+            other: The other vector column (or an ``array(...)`` literal).
+
+        Returns:
+            A new Float64 expression: the count of differing positions.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 0, 1, 1]], "b": [[1, 1, 0, 1]]})
+                >>> ds.select(bt.col("a").list.hamming_distance(bt.col("b")).alias("r")).to_pydict()
+                {'r': [2.0]}
+        """
+        return ListBinary("hamming", self._e, _wrap(other))
+
 
 # Python accessor name → engine `ListFunc` wire tag.
 _LIST_FUNCS = {
@@ -1017,8 +1131,14 @@ _LIST_FUNCS = {
     "median": "median",
     "arg_min": "arg_min",  # index of min element (→ Int64)
     "arg_max": "arg_max",  # index of max element (→ Int64)
+    "arg_sort": "arg_sort",  # indices that sort ascending (→ list of Int64)
     "l2_norm": "l2_norm",  # Euclidean norm = sqrt(sum of squares) (-> Float64)
+    "l1_norm": "l1_norm",  # Manhattan norm = sum of absolute values (-> Float64)
+    "max_abs": "max_abs",  # max absolute value = the MaxAbs-scaling divisor (-> Float64)
     "normalize": "normalize",  # L2-normalize to unit length (→ list); embedding prep
+    "softmax": "softmax",  # logits → probability distribution per row (→ list)
+    "cum_sum": "cum_sum",  # cumulative sum per row (→ list)
+    "diff": "diff",  # first difference xᵢ−xᵢ₋₁ per row, leading null (→ list)
 }
 
 

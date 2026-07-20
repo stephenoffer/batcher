@@ -18,6 +18,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 from batcher.api.dataset import Dataset
 from batcher.api.orchestration import collect_source_stats
@@ -30,7 +31,6 @@ from batcher.plan.schema import SchemaRef
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
 from batcher.plan.visitor import walk
-from conftest import assert_same
 
 # `id` unique, `dept` a partition with a NULL, `k` a non-null constant, `sal` with ties and a
 # NULL — every edge a window rule can trip over.

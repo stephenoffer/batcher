@@ -20,6 +20,9 @@ echo "pre-commit: lint-duplication (copy-paste across the subsystems)…"
 echo "pre-commit: lint-guardrails (the agent docs must stay true)…"
 "$py" tools/lint_guardrails.py
 
+echo "pre-commit: MAP.md is current (the file-level index must match the tree)…"
+"$py" tools/gen_map.py --check
+
 echo "pre-commit: ruff (lint + commented-out code)…"
 ruff check python tests benchmarks
 

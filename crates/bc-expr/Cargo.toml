@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 bc-arrow.workspace = true
+bc-secrets.workspace = true
 arrow.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -73,6 +74,13 @@ symphonia = { version = "0.5", default-features = false, features = [
 dasp_signal = "0.11"
 dasp_interpolate = { version = "0.11", features = ["sinc"] }
 dasp_ring_buffer = "0.11"
+# Real-input FFT for `.audio.mel_spectrogram` — the log-mel front end every speech model
+# (Whisper, wav2vec2, HuBERT) consumes. `realfft` wraps `rustfft` (pure-Rust, SIMD) for
+# real signals, returning the n_fft/2+1 half-spectrum directly. Doing the STFT + mel
+# filterbank natively keeps audio preprocessing in the data plane instead of a per-file
+# Python `torchaudio`/`librosa` UDF (a control-plane hot-path touch). Conventions match
+# `torchaudio.transforms.MelSpectrogram` defaults so results are model-drop-in.
+realfft = "3"
 # Video decode for the `.video` namespace — OPTIONAL (links the system FFmpeg C
 # libraries). Off by default; build with `--features video` to enable. Without it,
 # the `Expr::Video` variant still deserializes but evaluating it errors clearly.

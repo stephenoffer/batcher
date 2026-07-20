@@ -1,10 +1,8 @@
 # TPC-H
 
-TPC-H is the page that shows both sides of the engine, which makes it the most useful one
-here. **Against DuckDB reading the same Arrow, Batcher wins all 22 queries.** Against DuckDB
-on its own compressed store — where DuckDB never pays an ingest and decompresses as it scans —
-DuckDB still wins 15 of 22. Both numbers are below, because only publishing the first would be
-marketing and only publishing the second would be false modesty.
+This page reports Batcher's TPC-H results against DuckDB, Daft, and Polars, and explains where the remaining gap comes from.
+
+TPC-H shows both sides of the engine. Against DuckDB reading the same Arrow, Batcher wins all 22 queries. Against DuckDB on its own compressed store, where DuckDB never pays an ingest and decompresses as it scans, DuckDB still wins 15 of 22. Both numbers are below. Publishing only the first would be marketing and publishing only the second would be false modesty.
 
 All 22 queries, scale factor 1 (`lineitem` = 6,001,215 rows), single node, 16 cores, 30 GB,
 release build, measured 2026-07-18.
@@ -28,11 +26,9 @@ The gate earns its keep on other engines, too:
 | Daft | **q6 is wrong** (returns 75.2M against the official 123,141,078.2283); cannot parse `SUBSTRING(x FROM a FOR b)` in q22. |
 | Polars | **q6 is wrong** (same 75.2M); its SQL frontend errors on most of the suite (multi-table `FROM`, `EXISTS`, non-equi joins). |
 
-:::{dropdown} What Daft and Polars actually get wrong on q6 — it is not `interval '1' year`
+:::{dropdown} What Daft and Polars actually get wrong on q6
 The predicate is `l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01`. In IEEE double,
-`0.06 + 0.01` is `0.06999999999999999` — a hair *under* `0.07` — so an engine that folds the
-bound in floating point drops every `l_discount = 0.07` row and loses about 39% of the
-revenue. TPC-H defines `l_discount` as `DECIMAL`, so the 0.07 rows belong in the answer.
+`0.06 + 0.01` is `0.06999999999999999`, a hair under `0.07`, so an engine that folds the bound in floating point drops every `l_discount = 0.07` row and loses about 39% of the revenue. TPC-H defines `l_discount` as `DECIMAL`, so the 0.07 rows belong in the answer.
 
 Ground truth was computed independently in PyArrow over the identical input and equals the
 official sf1 answer, `123141078.2283`. Batcher returns exactly that. This page previously
@@ -42,15 +38,12 @@ attributed the error to `interval '1' year`, which was wrong.
 ## Where the suite stands
 
 **Against DuckDB reading the same Arrow (a like-for-like *execution* comparison), Batcher
-wins all 22 queries**, by 1.1×–6.9×. That is the comparison Batcher's Arrow-only contract
-makes fair, and q21 now runs — correlated subqueries are supported, so all 22 are comparable.
+wins all 22 queries**, by 1.1x to 6.9x. That is the comparison Batcher's Arrow-only contract makes fair. q21 runs too, because correlated subqueries are supported, so all 22 are comparable.
 
 :::{warning}
 **Against DuckDB on its own native compressed store, DuckDB is faster on 15 of 22**, geometric
 mean **≈1.40× in DuckDB's favor** (≈1.29× excluding q17, an 8× outlier). That is not a
-like-for-like execution comparison — DuckDB decompresses its own format on the fly and never
-pays an Arrow ingest — but it is the number a user gets from `duckdb` at a prompt, so we
-publish it. Batcher wins the scan-and-aggregate-dominated queries (q15 0.46×, q12 0.74×,
+like-for-like execution comparison, because DuckDB decompresses its own format on the fly and never pays an Arrow ingest. It is the number you get from `duckdb` at a prompt, so it's published here. Batcher wins the scan-and-aggregate-dominated queries (q15 0.46×, q12 0.74×,
 q11 0.80×, q1/q9 0.88×) and loses the join- and subquery-heavy ones (q17 7.9×, q20 2.8×,
 q3 2.6×, q21 2.4×).
 :::
@@ -109,24 +102,22 @@ in Batcher's favour (up to 7×) than against it (up to 2×). Daft additionally *
 complete four**: q6 is wrong (above), q18 returns an unaliased column, q21 fails to bind a
 correlated subquery, and q22 cannot parse `SUBSTRING(x FROM a FOR b)`.
 
-Earlier revisions of this page reported Daft 4–12× ahead on the join-heavy queries. That gap
+Earlier revisions of this page reported Daft 4x to 12x ahead on the join-heavy queries. That gap
 is gone: the parallel radix join and the whole-partition window kernel landed since, taking
 q3 from 3.8× behind to 1.55× and q4 to 1.51×.
 :::
 
 ## Why
 
-It would be convenient if this were a slow kernel. It is not. The in-memory microbenchmark
-in the run log loads ~60M rows into Arrow once, so no I/O is in the way, and times each
-engine's kernels on the same 16 cores:
+It would be convenient if this were a slow kernel. It isn't. The in-memory microbenchmark in the run log (`benchmarks/microbench.py`) loads about 60M rows into Arrow once, so no I/O is in the way, and times each engine's kernels on the same 16 cores:
 
-| Operator | Batcher | Daft | DuckDB |
+| Operator | Batcher | Daft | Polars |
 |---|---:|---:|---:|
-| filter | 28 ms | 188 ms | 1,601 ms |
-| group-by | 359 ms | 487 ms | 2,729 ms |
-| sum | 10 ms | 181 ms | 92 ms |
+| filter | 28 ms | 188 ms | 156 ms |
+| group-by | 359 ms | 487 ms | 223 ms |
+| sum | 10 ms | 181 ms | 6 ms |
 
-The kernels win. The queries built out of them lose. Two things account for it:
+Batcher's kernels beat Daft's on all three and trade with Polars, which is ahead on group-by and sum. Nothing here is slow enough to explain the query-level gap. The kernels hold up and the queries built out of them lose, so two other things account for it:
 
 1. **Single-node parallelism plateaus after about 8 cores.** Measured on q3 with the plan
    built once: 171 ms at 1 core → 43 ms at 8 → 42.8 ms at 16, a 4.0× speedup from 16 cores
@@ -136,9 +127,7 @@ The kernels win. The queries built out of them lose. Two things account for it:
 
 One documented cause of (1) is now fixed: the radix join's partition loop ran on a single
 core, so a join too large to broadcast funnelled a fully-parallel build and probe into a
-serial kernel. Joining the partitions concurrently — concatenating them in partition order,
-which reproduces the sequential output exactly — took TPC-H q4 from 115.6 ms to 43.0 ms and
-q3 from 110.3 ms to 66.3 ms. What remains is an unexplained roughly-constant serial section
+serial kernel. Joining the partitions concurrently, concatenating them in partition order so the sequential output is reproduced exactly, took TPC-H q4 from 115.6 ms to 43.0 ms and q3 from 110.3 ms to 66.3 ms. What remains is an unexplained roughly-constant serial section
 inside the join; three plausible causes (serial hash-table build, fixed per-query overhead,
 memory-bandwidth-bound output gather) were each tested and **ruled out**, so the next step is
 a real profiler on `bc-interp`'s join path rather than more black-box timing.
@@ -158,7 +147,7 @@ against Daft, and the q5 `orders ⋈ lineitem` join went 419 ms → 175 ms.
 **Cold-start join cardinality.** The estimator's join model is right (`|L||R| / max(ndv)`),
 but its NDV map read only *learned* NDV from past runs, so a cold join fell back to
 `max(left, right)`, which under-estimates a low-NDV many-to-many join badly enough to steer
-join order into 12–18M-row intermediates. Cold q5 ran 7,115 ms against a warm 300 ms. NDV is
+join order into 12M to 18M-row intermediates. Cold q5 ran 7,115 ms against a warm 300 ms. NDV is
 now seeded from source statistics (footer and written-file HLL sketches), so the cold plan is
 no longer flying blind.
 
@@ -171,12 +160,10 @@ python benchmarks/run.py --benchmark tpch --engines batcher,daft   # vs Daft (Ra
 
 ## See also
 
-- [vs DuckDB](vs-duckdb.md) and [vs Daft](vs-daft.md): the full engine scorecards.
-- [Analytics and I/O](analytics.md): operators and connectors.
-- [Join algorithms](../deep-dives/join-algorithms.md): the shuffle and broadcast paths the
-  gap lives in.
-- [Cardinality estimation](../deep-dives/cardinality-estimation.md): the cold-start NDV
-  problem that ran q5 at 7,115 ms.
-- [Cost model](../deep-dives/cost-model.md): how the build side is now chosen.
-- [SQL guide](../user-guide/sql.md): the supported SQL surface, including what q21 needs.
-- [Methodology](methodology.md): the correctness gate in detail.
+- {doc}`vs-duckdb` and {doc}`vs-daft` for the full engine scorecards.
+- {doc}`analytics` for operators and connectors.
+- {doc}`../deep-dives/join-algorithms` for the shuffle and broadcast paths the gap lives in.
+- {doc}`../deep-dives/cardinality-estimation` for the cold-start NDV problem that ran q5 at 7,115 ms.
+- {doc}`../deep-dives/cost-model` for how the build side is chosen.
+- {doc}`../user-guide/sql` for the supported SQL surface.
+- {doc}`methodology` for the correctness gate in detail.

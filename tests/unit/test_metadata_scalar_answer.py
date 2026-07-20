@@ -155,3 +155,35 @@ def test_sum_is_candidate_but_executes_without_recorded_total(pq_path):
     assert is_global_aggregate(ds._plan) is True  # now a candidate
     assert metadata_aggregate_table(ds._plan, ds._sources) is None  # not derivable → execute
     assert ds.to_pydict() == {"s": [11]}
+
+
+def test_learned_quantile_resolves_the_source_qualified_key():
+    """The reader used a bare column name; every writer qualifies by source — a 100% miss.
+
+    `record_column_stats` stores learned column statistics under `source_key \\x1f column`
+    (a bare name identifies nothing — two tables both have an `id`) and refuses to write a
+    source it cannot key. `answer_learned_quantile` looked up `grid[column]` directly, so it
+    could never hit anything the live path wrote, and `Dataset.approx_quantile` always fell
+    through to the streaming TDigest. The existing coverage passed only because it seeded the
+    legacy unqualified shape that nothing in production writes.
+    """
+    import batcher as bt
+    from batcher import kyber
+    from batcher.kyber.metadata_answer import answer_learned_quantile
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends import InProcessBackend
+    from batcher.plan.source_stats import source_stats_key
+
+    hub = MetadataHub(InProcessBackend())
+    ds = bt.from_pydict({"q": [float(i) for i in range(101)]})
+    key = source_stats_key(ds._sources[0])
+    assert key is not None
+
+    grid = {"q": {"probs": [0.0, 0.5, 1.0], "values": [0.0, 50.0, 100.0]}}
+    kyber.record_column_stats(hub, {}, grid, source_key=key)
+
+    # Qualified exactly as written -> resolves.
+    assert answer_learned_quantile("q", 0.5, hub, key) == 50.0
+    assert answer_learned_quantile("q", 0.25, hub, key) == 25.0  # interpolated
+    # A different source must not borrow this one's grid.
+    assert answer_learned_quantile("q", 0.5, hub, "id:parquet:/somewhere/else") is None

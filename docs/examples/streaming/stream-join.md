@@ -117,7 +117,7 @@ for a straggler; it costs you exactly that much more buffer.
 | --- | --- | --- |
 | `within` | the event-time interval a match must fall inside | it is a business rule first: too wide and a click ten hours later counts as an attribution |
 | `lateness` | grace on top of `within` before buffered rows are evicted | exactly that much more buffer |
-| `memory.streaming_state_max_bytes` | the cap the retained buffers are checked against | nothing — it turns an OOM into a `ResourceError` that names the stall |
+| `memory.streaming_state_max_bytes` | the cap the retained buffers are checked against | nothing, because it turns an OOM into a `ResourceError` that names the stall |
 
 ## The limits, before you build on this operator
 
@@ -130,8 +130,8 @@ Batcher's streaming story and it is worth knowing before you build a topology ar
 :::
 
 :::{note}
-**Inner join only.** No outer/left variants, so an impression that is never clicked simply
-does not appear. If you need "impressions with no click within 30 minutes", the interval
+**Inner join only.** No outer/left variants, so an impression that is never clicked never
+appears in the output. If you need "impressions with no click within 30 minutes", the interval
 join will not give it to you.
 :::
 
@@ -189,7 +189,7 @@ with config_context(tight):
 :::
 
 When that error fires, ask which side stopped producing, not whether to raise the cap. A
-one-sided stream is a broken pipeline, and a bigger budget just delays the diagnosis.
+one-sided stream is a broken pipeline, and a bigger budget only delays the diagnosis.
 
 ## See also
 

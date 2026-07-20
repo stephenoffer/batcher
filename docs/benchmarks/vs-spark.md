@@ -15,8 +15,8 @@ worth writing down because the design difference is specific and testable.
 |---|---|
 | Head-to-head Spark timings | **None.** Not run, not published, not claimed. |
 | Architectural comparison | Below, and it is an argument rather than a measurement. |
-| Measured distributed results | Real, but against [Ray Data](vs-ray-data.md) and [Daft](vs-daft.md), not Spark. See [scaling](scaling.md). |
-| API migration | Mapped verb by verb in the [migration guide](../migration/index.md). |
+| Measured distributed results | Real, but against {doc}`vs-ray-data` and {doc}`vs-daft`, not Spark. See {doc}`scaling`. |
+| API migration | Mapped verb by verb in the {doc}`../migration/index`. |
 
 ## Adaptation: stage boundaries versus pipeline breakers
 
@@ -70,22 +70,22 @@ result. It is not one.
 What *is* measured, and does bear on the comparison, is the layer beneath: Batcher's
 distributed path beats Ray Data on every pipeline at every scale tested, beats Daft on 4 of
 5 distributed pipelines, and keeps per-node memory bounded through the mergeable algebra and
-spill. See [scaling](scaling.md).
+spill. See {doc}`scaling`.
 
 ## Migrating
 
 If you are coming from Spark, the API is deliberately close. `Session`, SQL, `write` modes,
 triggers, watermarks, and output modes all mirror the Spark spelling. The
-[migration guide](../migration/index.md) maps them verb by verb.
+{doc}`../migration/index` maps them verb by verb.
 
 ## See also
 
-- [Scaling](scaling.md): the distributed measurements that do exist.
-- [Methodology](methodology.md): what has to be true before a number is published.
-- [Optimization](../architecture/optimization.md): how breaker-level re-planning works.
-- [Adaptive re-optimization](../deep-dives/adaptive-reoptimization.md): the pipeline-breaker
+- {doc}`scaling`: the distributed measurements that do exist.
+- {doc}`methodology`: what has to be true before a number is published.
+- {doc}`../architecture/optimization`: how breaker-level re-planning works.
+- {doc}`../deep-dives/adaptive-reoptimization`: the pipeline-breaker
   mechanism, in detail.
-- [Learned metadata](../deep-dives/learned-metadata.md): the feedback that outlives the
+- {doc}`../deep-dives/learned-metadata`: the feedback that outlives the
   query.
-- [Migration guide](../migration/index.md): `Session`, SQL, triggers, watermarks, output
+- {doc}`../migration/index`: `Session`, SQL, triggers, watermarks, output
   modes, verb by verb.

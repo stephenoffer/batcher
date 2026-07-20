@@ -146,7 +146,7 @@ else:
 
 :::{tip}
 Pick the threshold from what the feed actually does on a normal day, and alert on the rate
-itself, not just on the breach. A feed whose reject rate walks from 0.1% to 0.9% over a
+itself, not only on the breach. A feed whose reject rate walks from 0.1% to 0.9% over a
 month is telling you something before it trips the gate.
 :::
 
@@ -163,12 +163,12 @@ print(orphans.to_pydict())
 ```
 
 Run this *before* the join that consumes the key. An inner join with an orphan key drops
-the row and reports nothing; you find out from a row count that does not tie out. See
+the row and reports nothing, so you find out from a row count that does not tie out. See
 [multi-source join](multi-source-join.md), where that is the whole story.
 
 ## Where the gate goes
 
-Before the write, not after. A gate downstream of the load is a report; a gate upstream
+Before the write, not after. A gate downstream of the load is a report. A gate upstream
 of it is a gate.
 
 ```python
@@ -187,7 +187,7 @@ clean.write.delta("s3://lake/orders", merge_on="order_id")
 Two things this does not do. It will not catch a plausible-but-wrong value: an amount of
 `42.0` that should have been `4.20` passes every constraint you can write. And the checks
 cost a pass over the data. They are ordinary relational operators, so they fuse and run in
-Rust rather than in a Python loop, but "cheap" is not "free" — put the expensive ones
+Rust rather than in a Python loop, but "cheap" is not "free". Put the expensive ones
 (`unique`, `foreign_key`, which both hash) on the path where they earn it, and the scalar
 predicates everywhere.
 

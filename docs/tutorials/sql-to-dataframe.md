@@ -2,7 +2,7 @@
 
 You know SQL. This tutorial takes one query and rewrites it as a DataFrame chain, then
 proves the two are the *same query*: same plan, same optimizer, same Rust engine. After
-that, mixing them is not a compromise, it is just choosing a spelling.
+that, mixing them is not a compromise. It is choosing a spelling.
 
 Everything here runs as written.
 

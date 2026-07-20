@@ -188,6 +188,9 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
     accelerator_type = next(
         (n.accelerator_type for n in stages if getattr(n, "accelerator_type", None)), None
     )
+    # Custom accelerator resources (TPU / neuron_cores / HPU / an on-prem resource), taken
+    # from the first stage that names any — the same first-wins rule as `accelerator_type`.
+    resources = next((tuple(n.resources) for n in stages if getattr(n, "resources", ())), ())
 
     # Cold-start GPU request: VRAM-pack a small model onto a fraction when we know both
     # the model size and the GPU's VRAM (auto-detected); otherwise honor the declared
@@ -233,6 +236,7 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
         n_tasks=max(1, n_tasks),
         credits=cfg.flow_control.default_credits,
         accelerator_type=accelerator_type,
+        resources=resources,
         inflight_depth=inflight_depth,
     )
 

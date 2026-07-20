@@ -32,21 +32,43 @@ pub(super) fn output_field(item: &ProjectionItem, array: &ArrayRef, batch: &Reco
             Err(_) => Field::new(&item.alias, array.data_type().clone(), true),
         },
         bc_expr::Expr::Image {
-            func: bc_expr::ImageFunc::ToTensor,
+            func: bc_expr::ImageFunc::ToTensor | bc_expr::ImageFunc::CenterCrop,
             width: Some(w),
             height: Some(h),
             ..
-        } => tensor_field(&item.alias, array.data_type().clone(), *h, *w),
+        } => tensor_field(&item.alias, array.data_type().clone(), [*h, *w, 3]),
+        bc_expr::Expr::Image {
+            func: bc_expr::ImageFunc::ToGrayscale,
+            width: Some(w),
+            height: Some(h),
+            ..
+        } => tensor_field(&item.alias, array.data_type().clone(), [*h, *w, 1]),
+        bc_expr::Expr::Image {
+            func: bc_expr::ImageFunc::ToTensorF32,
+            width: Some(w),
+            height: Some(h),
+            channels_first,
+            ..
+        } => {
+            // The float tensor's shape follows the requested layout: CHW vs HWC.
+            let shape = if *channels_first {
+                [3, *h, *w]
+            } else {
+                [*h, *w, 3]
+            };
+            tensor_field(&item.alias, array.data_type().clone(), shape)
+        }
         _ => Field::new(&item.alias, array.data_type().clone(), true),
     }
 }
 
-/// A field tagged with the canonical `arrow.fixed_shape_tensor` extension metadata
-/// (shape `(H, W, 3)`, RGB8) — the *same* metadata `pa.fixed_shape_tensor` writes, so the
-/// storage `FixedSizeList<u8, H*W*3>` reconstructs to a shaped tensor on the pyarrow side
-/// of the FFI, with no per-batch Python re-type pass (which otherwise forces the whole
-/// decode through the slow opaque-UDF path — the physical-AI ingest bottleneck).
-fn tensor_field(alias: &str, dtype: DataType, h: i64, w: i64) -> Field {
+/// A field tagged with the canonical `arrow.fixed_shape_tensor` extension metadata for
+/// the given per-row `shape` — the *same* metadata `pa.fixed_shape_tensor` writes, so the
+/// flat `FixedSizeList` storage reconstructs to a shaped tensor on the pyarrow side of the
+/// FFI, with no per-batch Python re-type pass (which otherwise forces the whole decode
+/// through the slow opaque-UDF path — the physical-AI ingest bottleneck).
+fn tensor_field(alias: &str, dtype: DataType, shape: [i64; 3]) -> Field {
+    let [a, b, c] = shape;
     let metadata = HashMap::from([
         (
             "ARROW:extension:name".to_string(),
@@ -54,7 +76,7 @@ fn tensor_field(alias: &str, dtype: DataType, h: i64, w: i64) -> Field {
         ),
         (
             "ARROW:extension:metadata".to_string(),
-            format!("{{\"shape\":[{h},{w},3]}}"),
+            format!("{{\"shape\":[{a},{b},{c}]}}"),
         ),
     ]);
     Field::new(alias, dtype, true).with_metadata(metadata)

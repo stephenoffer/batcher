@@ -112,3 +112,49 @@ def test_credit_window_is_result_invariant():
         wide = q()
     assert _rows(narrow) == _rows(wide) == _rows(q())
     assert base is active_config()  # scope restored
+
+
+def test_the_drivers_grant_reaches_the_adaptive_controller():
+    """Under adaptive credits the whole grant was discarded and every channel re-climbed.
+
+    `adaptive_credits` defaults to True, and in that mode `ShuffleSession._window()` reads
+    the AIMD controller and never the session's static `credits`. The worker built a bare
+    `AIMDFlowControl()`, so the window Carbonite's `grant_credits(signature=)` had just
+    computed — from Kyber's per-operator estimate *and* this shuffle's learned converged
+    window — was dropped on the floor, and every channel restarted from `default_credits`
+    on every query. Both the estimate-driven grant and the whole learned warm-start loop
+    were inert on the default distributed path.
+
+    A credit window only bounds in-flight buffering, so none of this changes a result.
+    """
+    from batcher.carbonite.policies import AIMDFlowControl
+
+    bare = AIMDFlowControl()
+    granted = AIMDFlowControl(initial_window=bare.window + 16)
+    assert granted.window == bare.window + 16  # the grant is honored, not ignored
+
+
+def test_a_reused_fleet_is_re_granted_under_adaptive_credits():
+    """`set_grant` -> `set_credits` was a silent no-op whenever a controller was set.
+
+    A warm shuffle fleet outlives the query that spawned it, so `set_grant` re-grants each
+    worker for the query about to borrow it — the fix for a measured 0.6s -> 3.2s stale-grant
+    regression on TPC-H sf10. Under adaptive credits (the default) the re-grant landed on
+    `_credits`, which `_window()` never reads, so the fleet kept the previous query's window
+    and the documented regression was live again.
+    """
+    from batcher.carbonite.policies import AIMDFlowControl
+    from batcher.carbonite.transfer.session import ShuffleSession
+
+    ctl = AIMDFlowControl(initial_window=64)
+    session = ShuffleSession(64, flow_control=ctl)
+    assert session._window() == 64
+
+    session.set_credits(4)  # a small query borrows the warm fleet
+    assert ctl.window == 4
+    assert session._window() == 4  # the re-grant actually reaches the fetch window
+
+    # Static (non-adaptive) sessions keep their existing behavior exactly.
+    static = ShuffleSession(64)
+    static.set_credits(4)
+    assert static._window() == 4

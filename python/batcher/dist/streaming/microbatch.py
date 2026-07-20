@@ -26,7 +26,6 @@ same operator as the single-node one, not a second implementation of it.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -34,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from batcher._internal.native import engine
+from batcher.core.mergeable import RunningAggregate
 from batcher.io.manifest import WriteManifest, WrittenFile
 
 if TYPE_CHECKING:
@@ -114,7 +114,7 @@ class DistributedRunner:
         # The conductor already chose what the workers run (the optimized plan, or an
         # aggregate's input pipeline) — `dist` schedules it, it does not re-decide it.
         self._agg = agg
-        self._fold = _AggState(agg) if agg is not None else None
+        self._fold = RunningAggregate(agg) if agg is not None else None
         self._plan_ir = plan_ir
         self._projection = projection
 
@@ -135,15 +135,17 @@ class DistributedRunner:
         """
         import time
 
+        from batcher.io.source import is_bounded
+
         while not self._spent:
             splits = list(self._source.splits())
             epoch = self._fan_out(batch_id, splits) if splits else _StagedEpoch()
             if epoch.input_rows:
                 # A bounded source hands back the *same* splits on every pass, so its
                 # entire content is this one epoch; asking again would re-read it.
-                self._spent = getattr(self._source, "bounded", True)
+                self._spent = is_bounded(self._source)
                 return epoch
-            if self._drain or self._should_stop() or getattr(self._source, "bounded", True):
+            if self._drain or self._should_stop() or is_bounded(self._source):
                 return None
             time.sleep(_IDLE_POLL_SECONDS)
         return None
@@ -188,7 +190,11 @@ class DistributedRunner:
     def finalize(self) -> list[pa.RecordBatch]:
         return []  # the running result is emitted every epoch; nothing is left open
 
-    def emit_final(self, batch_id: int, rows: pa.RecordBatch) -> None:  # pragma: no cover
+    def emit_final(
+        self,
+        batch_id: int,  # noqa: ARG002 (protocol signature; this path never runs)
+        rows: pa.RecordBatch,  # noqa: ARG002 (same)
+    ) -> None:  # pragma: no cover
         raise AssertionError("distributed streaming emits its result each epoch")
 
     # --- staging ----------------------------------------------------------
@@ -221,7 +227,7 @@ class DistributedRunner:
 
     def _agg_spec(self) -> tuple[str, str] | None:
         """The aggregate's ``(group_keys, aggregates)`` IR, or None for a stateless epoch."""
-        return self._fold.spec() if self._fold is not None else None
+        return self._fold.spec if self._fold is not None else None
 
     def _merge(self, splits: list[Any], results: list[dict]) -> _StagedEpoch:
         """Combine the workers' metadata into one epoch (a commutative merge)."""
@@ -268,7 +274,7 @@ class DistributedRunner:
     def _publish_aggregate(self, batch_id: int, staged: _StagedEpoch) -> int:
         """Combine the workers' partial states and emit the running result."""
         for partial in staged.partials:
-            self._fold.combine(partial)
+            self._fold.absorb(partial)
         result = self._fold.finalize()
         if result is None or not result.num_rows:
             return 0
@@ -281,41 +287,6 @@ class DistributedRunner:
         )
         sink.write_batch(batch_id, pa.Table.from_batches([result]))
         return result.num_rows
-
-
-class _AggState:
-    """The running aggregate, combined from the workers' partials (`bc-runtime` merge)."""
-
-    __slots__ = ("_aggs", "_keys", "_nat", "_running")
-
-    def __init__(self, agg: Any) -> None:
-        self._nat = engine()
-        self._keys = json.dumps(
-            [{"expr": k.expr.to_ir(), "alias": k.alias} for k in agg.group_keys]
-        )
-        self._aggs = json.dumps([s.agg.to_ir(s.alias) for s in agg.aggregates])
-        self._running: pa.RecordBatch | None = None
-
-    def spec(self) -> tuple[str, str]:
-        return self._keys, self._aggs
-
-    def combine(self, partial: pa.RecordBatch) -> None:
-        self._running = (
-            partial
-            if self._running is None
-            else self._nat.combine(self._keys, self._aggs, [self._running, partial])
-        )
-
-    def finalize(self) -> pa.RecordBatch | None:
-        if self._running is None:
-            return None
-        return self._nat.combine_finalize(self._keys, self._aggs, [self._running])
-
-    def state(self) -> pa.RecordBatch | None:
-        return self._running
-
-    def restore(self, state: pa.RecordBatch) -> None:
-        self._running = state
 
 
 def _sink_writer(fmt: str) -> str:

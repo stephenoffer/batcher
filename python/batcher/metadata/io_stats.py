@@ -13,12 +13,72 @@ folds into it consistently per source), smoothed across runs so one noisy read d
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from batcher.config import active_config
 from batcher.metadata.hub import MetadataHub
 
-__all__ = ["load_source_throughput_mbps", "predicted_read_seconds", "record_source_io"]
+if TYPE_CHECKING:
+    import pyarrow as pa
+
+__all__ = [
+    "load_source_throughput_mbps",
+    "predicted_read_seconds",
+    "record_source_io",
+    "scanned_byte_count",
+]
 
 _NAMESPACE = "io.throughput_mbps"
+
+# Byte counts already measured, keyed by (source identity, projection, rows). Bounded because
+# a long-lived session reads many distinct sources; the key set is small and hot in practice
+# (a served query re-reads the same source with the same projection), so a plain FIFO clear at
+# the ceiling costs a rebuild of a handful of entries and never grows without bound.
+_BYTES_MEMO: dict[tuple[str, str, int], int] = {}
+_BYTES_MEMO_MAX = 512
+
+
+def scanned_byte_count(
+    identity: str, projection: object, rows: int, batches: list[pa.RecordBatch]
+) -> int:
+    """Decoded bytes of `batches`, memoized per (source, projection, row count).
+
+    `RecordBatch.nbytes` is the figure this module's throughput is defined on, and it is the
+    only correct one: it *deduplicates buffers shared between batches*, so a source whose
+    batches are slices of one parent buffer is counted once. That correctness is not free —
+    measured at **2.86 ms** for a 49-batch, 16-column relation, which was **over half** the
+    latency of a small query, paid again on every repeat of the same read.
+
+    `get_total_buffer_size()` is 18.7x faster and is **not** a substitute: it counts a shared
+    parent buffer once per slice, reporting 1.6 GB for 100 slices of one 16 MB batch. Feeding
+    that to `record_source_io` would invent a 100x read throughput and quietly corrupt the
+    cost model Kyber plans against — a measurement bug that no result-correctness test can see.
+
+    So keep the exact figure and stop recomputing it: the same source, read with the same
+    projection, yielding the same row count, has the same byte count. A changed row count
+    misses the memo and is measured afresh, which is what makes this safe for a source whose
+    contents move underneath it.
+
+    Args:
+        identity: The source's stable identity, as `record_source_io` keys throughput on.
+        projection: The columns this read requested, or None for all of them.
+        rows: Rows actually scanned — part of the key, so changed data re-measures.
+        batches: The batches read.
+
+    Returns:
+        The summed `nbytes` of `batches`, 0 when the source has no stable identity to key on.
+    """
+    if not identity:
+        return sum(b.nbytes for b in batches)
+    key = (identity, repr(projection), rows)
+    hit = _BYTES_MEMO.get(key)
+    if hit is not None:
+        return hit
+    total = sum(b.nbytes for b in batches)
+    if len(_BYTES_MEMO) >= _BYTES_MEMO_MAX:
+        _BYTES_MEMO.clear()
+    _BYTES_MEMO[key] = total
+    return total
 
 
 def record_source_io(

@@ -16,7 +16,7 @@ from typing import IO, Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.base import FileSink, FileSource
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SINKS, SOURCES
@@ -27,13 +27,7 @@ __all__ = ["ArrowBlockSplit", "ArrowIPCSink", "ArrowIPCSource"]
 
 def _require_ipc() -> Any:
     """Import and return `pyarrow.ipc` or raise `BackendError`."""
-    try:
-        import pyarrow.ipc as ipc
-    except ImportError as exc:  # pragma: no cover - pyarrow ships ipc by default
-        raise BackendError(
-            "Arrow IPC support requires pyarrow: pip install 'batcher-engine[all]'"
-        ) from exc
-    return ipc
+    return require("pyarrow.ipc", feature="Arrow IPC support", provides="pyarrow", extra="all")
 
 
 def _select(batch: pa.RecordBatch, projection: list[str] | None) -> pa.RecordBatch:
@@ -96,6 +90,19 @@ class ArrowIPCSource(FileSource):
         reader = ipc.open_file(fh)
         return [_select(reader.get_batch(i), projection) for i in range(reader.num_record_batches)]
 
+    def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        """Stream one IPC file batch by batch rather than holding every batch at once.
+
+        The IPC file format already stores discrete record batches; `_read_file` merely
+        collects them into a list, which is the whole file in memory. Yielding them keeps
+        peak memory at one batch.
+        """
+        ipc = _require_ipc()
+        with self._fs.open(path) as fh:
+            reader = ipc.open_file(fh)
+            for i in range(reader.num_record_batches):
+                yield _select(reader.get_batch(i), projection)
+
     def _file_row_count(self, path: str) -> int | None:
         ipc = _require_ipc()
         with self._fs.open(path) as fh:
@@ -125,7 +132,8 @@ class ArrowIPCSink(FileSink):
 
     __slots__ = ("compression",)
 
-    def __init__(self, compression: str | None = "zstd") -> None:
+    def __init__(self, compression: str | None = "zstd", **kwargs: Any) -> None:
+        super().__init__(**kwargs)  # carries filesystem= / storage_options=
         self.compression = compression
 
     def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:

@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -19,8 +20,6 @@ def lr(duck):
 
 @pytest.mark.parametrize("how", ["full", "outer"])
 def test_full_outer_join_dataframe(duck, lr, how):
-    from conftest import assert_same
-
     left, right = lr
     out = (
         bt.from_arrow(left)
@@ -35,8 +34,6 @@ def test_full_outer_join_dataframe(duck, lr, how):
 
 
 def test_full_outer_join_string_keys(duck):
-    from conftest import assert_same
-
     left = pa.table({"k": ["a", "b", "c"], "x": [1, 2, 3]})
     right = pa.table({"k": ["b", "c", "d"], "y": [20, 30, 40]})
     duck.register("ls", left)
@@ -56,8 +53,6 @@ def test_full_outer_join_string_keys(duck):
 
 
 def test_full_outer_join_multi_key(duck):
-    from conftest import assert_same
-
     left = pa.table({"a": [1, 1, 2], "b": [1, 2, 1], "lv": [10, 20, 30]})
     right = pa.table({"a": [1, 2, 3], "b": [2, 1, 1], "rv": [200, 300, 400]})
     duck.register("lm", left)
@@ -78,8 +73,6 @@ def test_full_outer_join_multi_key(duck):
 
 
 def test_full_outer_join_sql(duck, lr):
-    from conftest import assert_same
-
     out = bt.sql("SELECT k, lv, rv FROM l FULL JOIN r ON l.k = r.k", l=lr[0], r=lr[1]).collect()
     assert_same(
         out, duck.sql("SELECT coalesce(l.k, r.k) k, lv, rv FROM l FULL OUTER JOIN r ON l.k = r.k")

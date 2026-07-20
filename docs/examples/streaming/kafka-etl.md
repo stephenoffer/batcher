@@ -5,7 +5,7 @@ What makes it a streaming job is the restart.
 
 :::{important}
 Batcher records a micro-batch's source offset *before* it processes the batch, so a crash in
-between leaves a batch the next run will read again. A sink that just appends writes those
+between leaves a batch the next run will read again. A sink that only appends writes those
 rows twice. The engine is at-least-once by design, and end-to-end exactly-once is bought by
 the sink, not by the source. Everything below is arranged around that one fact.
 :::

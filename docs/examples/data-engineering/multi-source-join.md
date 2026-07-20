@@ -81,7 +81,7 @@ print(orphans.to_pydict())
 
 :::{important}
 Order 4 is real. It has money attached. It is not in the report, because an inner join is
-a filter and nobody told you it filtered — the row is gone from the output and nothing in
+a filter and nobody told you it filtered. The row is gone from the output and nothing in
 the run records that it existed.
 :::
 
@@ -218,7 +218,7 @@ print("hash_join" in orders.join(one_per_customer, on="customer_id").explain())
 # True
 ```
 
-`explain()` prints the plan with the row estimates it used; `explain(analyze=True)` runs it
+`explain()` prints the plan with the row estimates it used, and `explain(analyze=True)` runs it
 and prints what actually happened. When a join is slow, that gap is the first place to look:
 an estimate that was wrong by 100x usually means a stale or missing statistic, and the
 adaptive layer will correct it mid-query at the pipeline breaker, but a plan that started

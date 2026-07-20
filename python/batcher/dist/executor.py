@@ -58,6 +58,7 @@ from batcher.dist.executors.ray_runtime import (
     topology_scope,
     worker_node_memory_bytes,
 )
+from batcher.dist.fleet.plan_id import with_query_shuffle_scope
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import (
@@ -93,6 +94,7 @@ def resolve_worker_fanout(num_workers: int | None) -> int:
     return fill[0] if fill is not None else available_cpu_count()
 
 
+@with_query_shuffle_scope
 def execute_distributed(
     plan: LogicalPlan,
     sources: list[Source],
@@ -135,8 +137,14 @@ def execute_distributed(
     # one-off big job doesn't pin the cluster scaled-up), clamp the fan-out to
     # schedulable capacity, and pick the transport from the resulting topology.
     num_cpus, num_gpus = (envelope.num_cpus, envelope.num_gpus) if envelope else (1.0, 0.0)
+    accel = tuple(envelope.resources) if envelope else ()
     token = set_scheduling_envelope(envelope)
-    request_autoscale(math.ceil(workers * num_cpus), workers * num_gpus)
+    request_autoscale(
+        math.ceil(workers * num_cpus),
+        workers * num_gpus,
+        # Scale the per-task accelerator ask by the fan-out, as the GPU floor is.
+        tuple((name, amount * workers) for name, amount in accel),
+    )
     try:
         _ensure_ray(workers)
         # Wait (bounded, growth-detected) for the autoscaler to bring the cluster toward

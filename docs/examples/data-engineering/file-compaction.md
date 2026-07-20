@@ -7,7 +7,7 @@ and the read that used to take four seconds takes four minutes.
 :::{warning}
 The data did not grow. The number of files grew, and on object storage each one costs a
 footer read plus a round trip before a single row is decoded. Nothing about the query
-changed; the table underneath it did.
+changed. The table underneath it did.
 :::
 
 ## Watch it happen
@@ -111,8 +111,8 @@ print(len(glob.glob(os.path.join(sized, "*.parquet"))))
 # 2
 ```
 
-(That target is absurdly small so the example produces more than one file; use 128 for
-real data.)
+That target is absurdly small so the example produces more than one file. Use 128 for
+real data.
 :::
 
 :::{tab-item} Size the files by rows
@@ -138,7 +138,7 @@ print(len(glob.glob(os.path.join(capped, "*.parquet"))))
 
 For a streaming sink, the honest answer is that per-micro-batch files are the price of low
 latency. Write them small, and run compaction on a schedule. Trying to buffer your way out
-of it in the writer just moves the latency somewhere less visible.
+of it in the writer moves the latency somewhere less visible instead of removing it.
 
 ## Compaction is also your chance to cluster
 

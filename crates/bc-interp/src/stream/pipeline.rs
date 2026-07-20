@@ -63,7 +63,7 @@ where
 ///
 /// The row-by-row bookkeeping mirrors `ops::limit` exactly (skip `offset`, take `n`, slice the
 /// straddling morsel), so the rows and their order are the oracle's.
-pub(super) fn limit_stream(child: Morsels<'_>, n: usize, offset: usize) -> Morsels<'_> {
+pub(crate) fn limit_stream(child: Morsels<'_>, n: usize, offset: usize) -> Morsels<'_> {
     Box::new(Limit {
         child,
         remaining_skip: offset,

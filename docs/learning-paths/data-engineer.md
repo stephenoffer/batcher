@@ -7,24 +7,24 @@ operation, and all per-row work runs in Rust.
 ## Reading order
 
 1. [Getting started](../getting-started/index.md): install and run a first query.
-2. [Your first pipeline](../tutorials/first-pipeline.md): the end-to-end flow.
-3. [Reading data](../user-guide/reading-data.md): sources and file formats.
-4. [Transformations](../user-guide/transformations.md): `select`, `with_columns`,
+1. [Your first pipeline](../tutorials/first-pipeline.md): the end-to-end flow.
+1. [Reading data](../user-guide/reading-data.md): sources and file formats.
+1. [Transformations](../user-guide/transformations.md): `select`, `with_columns`,
    `filter`, `sort`.
-5. [Filtering](../user-guide/filtering.md): predicate expressions.
-6. [Aggregations](../user-guide/aggregations.md): `group_by` and `.agg`.
-7. [Joins](../user-guide/joins.md): join kinds and keys.
-8. [Window functions](../user-guide/window-functions.md): ranking and rolling
+1. [Filtering](../user-guide/filtering.md): predicate expressions.
+1. [Aggregations](../user-guide/aggregations.md): `group_by` and `.agg`.
+1. [Joins](../user-guide/joins.md): join kinds and keys.
+1. [Window functions](../user-guide/window-functions.md): ranking and rolling
    aggregates.
-9. [Writing data](../user-guide/writing-data.md): output formats and partitioning.
-10. [Lakehouse tables](../user-guide/lakehouse.md): Delta read/write/merge and SCD.
-11. [Data quality](../user-guide/data-quality.md): validate against a contract and
-    quarantine what fails it.
-12. [Cloud storage](../user-guide/cloud-storage.md): object-store paths.
-13. [Performance and memory](../user-guide/performance.md): caching and spill.
-14. [Best practices](../user-guide/best-practices.md) and
-    [troubleshooting](../user-guide/troubleshooting.md).
-15. [Dataset API reference](../api/dataset.md).
+1. [Writing data](../user-guide/writing-data.md): output formats and partitioning.
+1. [Lakehouse tables](../user-guide/lakehouse.md): Delta read/write/merge and SCD.
+1. [Data quality](../user-guide/data-quality.md): validate against a contract and
+   quarantine what fails it.
+1. [Cloud storage](../user-guide/cloud-storage.md): object-store paths.
+1. [Performance and memory](../user-guide/performance.md): caching and spill.
+1. [Best practices](../user-guide/best-practices.md) and
+   [troubleshooting](../user-guide/troubleshooting.md).
+1. [Dataset API reference](../api/dataset.md).
 
 ## Example: transform and aggregate
 
@@ -105,7 +105,7 @@ The column that changed type under you.
 ::::
 
 :::{seealso}
-- [Integrations](../integrations/index.md) — connecting to Kafka, Snowflake, Delta, and the rest.
-- [Building a lakehouse](../tutorials/building-a-lakehouse.md) — the same pieces, end to end.
-- [Custom connectors](../user-guide/custom-connectors.md) — when the format you need isn't built in.
+- [Integrations](../integrations/index.md): connecting to Kafka, Snowflake, Delta, and the rest.
+- [Building a lakehouse](../tutorials/building-a-lakehouse.md): the same pieces, end to end.
+- [Custom connectors](../user-guide/custom-connectors.md): when the format you need isn't built in.
 :::

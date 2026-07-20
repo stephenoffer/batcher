@@ -1,12 +1,8 @@
 # Errors
 
-Batcher raises typed exceptions so failures are specific and actionable. These
-types live in `batcher._internal.errors`. That module is internal: there is no
-public `batcher.exceptions` module to import from, and the names are not part of
-the stable public API. You catch these errors by type when they surface, but you
-do not construct them yourself.
+Batcher raises typed exceptions so failures are specific and actionable. These types live in `batcher._internal.errors`. That module is internal: there's no public `batcher.exceptions` module to import from, and the names aren't part of the stable public API. You catch these errors by type when they surface, but you don't construct them yourself.
 
-In practice you handle them with `try` / `except`, usually catching the base type.
+In practice you handle them with `try` and `except`, usually catching the base type.
 
 ```python
 import batcher as bt
@@ -39,8 +35,7 @@ can catch a specific type when you want to react differently.
 | `AccessDeniedError` | A principal may select no column of a governed table. A *column* it cannot select is instead absent, surfacing as `PlanError`. |
 | `FormatError`, `BackendError`, `CommitError`, `TransportError` | Lower-level IO, backend, write-commit, and shuffle failures. |
 
-`PlanError` is the one most user code encounters, because it is raised eagerly
-when you build an invalid plan rather than when you execute it.
+`PlanError` is the one most user code encounters, because it's raised eagerly when you build an invalid plan rather than when you execute it.
 
 ## Catching errors
 
@@ -58,8 +53,7 @@ except BatcherError as exc:
 # query failed: projection 'missing' references unknown column(s) ['missing']; available: ['a']
 ```
 
-Catching `BatcherError` covers every Batcher-specific failure while letting
-unrelated exceptions (a bug in your own batch function, for example) propagate.
+Catching `BatcherError` covers every Batcher-specific failure while letting unrelated exceptions propagate, such as a bug in your own batch function.
 
 ## Next steps
 

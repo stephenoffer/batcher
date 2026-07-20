@@ -18,7 +18,7 @@ _BINOP_SYM = {
     "sub": "-",
     "mul": "*",
     "truediv": "/",
-    "floordiv": "//",
+    "floor_div": "//",
     "mod": "%",
     "pow": "**",
     "eq": "==",

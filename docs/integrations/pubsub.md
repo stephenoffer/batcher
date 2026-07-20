@@ -12,7 +12,7 @@
 | **Credentials** | The ambient `google.auth` environment; `roles/pubsub.subscriber` |
 | **Restart** | The subscription's own unacked backlog |
 
-```
+```bash
 pip install 'batcher-engine[pubsub]'
 ```
 
@@ -74,7 +74,7 @@ and union the results downstream, or write a custom source (see
 [custom connectors](../user-guide/custom-connectors.md)).
 
 `poll_size` maps to `max_messages` on the pull request. The service treats it as an upper
-bound and routinely returns far fewer, so the default 16,384 is not an error, just optimistic.
+bound and routinely returns far fewer, so the default 16,384 is optimistic rather than wrong.
 A value around 1,000 matches what the API will actually hand back.
 
 ## Delivery: at-least-once, and the ack deadline

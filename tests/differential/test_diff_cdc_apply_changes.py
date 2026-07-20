@@ -16,9 +16,9 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher.api.merge import cdc_stored_columns, compose_cdc_apply
 from batcher.plan.expr_ir import Col
-from conftest import assert_same
 
 pytestmark = pytest.mark.differential
 

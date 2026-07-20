@@ -138,12 +138,13 @@ def annotate_ops(
                 in_rows = sum(usable) if len(usable) == len(child_rows) else rows
                 in_rows = in_rows or rows
                 n_par = max(1, math.ceil(in_rows / target_rows))
-                # A breaker whose shuffle volume is small enough to keep node-local
-                # (≤ the broadcast threshold — the existing "small enough to not pay
-                # the network" knob) prefers PACK over SPREAD: co-locating its few
-                # workers avoids a cross-node shuffle that buys nothing. Large shuffles
-                # keep SPREAD so the network load distributes. dist makes the final call.
-                prefers_local = int(in_rows * width) <= config.optimizer.broadcast_max_bytes
+                # A breaker whose shuffle volume is small enough to keep node-local prefers
+                # PACK over SPREAD: co-locating its few workers avoids a cross-node shuffle that
+                # buys nothing. Large shuffles keep SPREAD so the network load distributes; dist
+                # makes the final call. This is a *network* threshold (`locality_max_bytes`),
+                # deliberately separate from the *cache*-sized broadcast threshold the two used
+                # to share — an L3-derived broadcast size must not drag this placement choice.
+                prefers_local = int(in_rows * width) <= config.optimizer.locality_max_bytes
             else:
                 n_par = 0
             # Desired credit window: enough in-flight batch slots to cover one task's
@@ -170,6 +171,9 @@ def annotate_ops(
                     inputs=(),
                     properties=PlanProperties(
                         est_rows=rows,
+                        # Publish the width the envelope above was sized with, so a consumer
+                        # never has to invert `m_max_bytes` by the flat default to recover it.
+                        row_size=width,
                         provenance=est.provenance,
                         signature=estimator.signature_of(node),
                         est_rows_raw=estimator.reportable_estimate(node),

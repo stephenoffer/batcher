@@ -17,6 +17,7 @@ The ``boto3`` import is deferred to construction; if the extra is missing a
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from batcher._internal.errors import BackendError
@@ -183,8 +184,15 @@ def _seq_to_offset(sequence_number: str) -> int:
     The raw sequence is a large decimal string; take it modulo 2**63 so it fits
     the fixed int64 ``offset`` column while preserving monotonic ordering within
     the precision of int64 (sequence numbers within a shard are increasing).
+
+    A non-numeric sequence falls back to a `sha256` digest rather than `hash()`: Python salts
+    `str` hashing per process, so the fallback produced a different `offset` for the same
+    record on every run and on every worker — silently breaking the ordering and de-dup the
+    column exists for, across exactly the restart and distributed boundaries that matter.
     """
     try:
         return int(sequence_number) % (1 << 63)
     except ValueError:
-        return abs(hash(sequence_number)) % (1 << 63)
+        return int.from_bytes(
+            hashlib.sha256(sequence_number.encode("utf-8")).digest()[:8], "big"
+        ) % (1 << 63)

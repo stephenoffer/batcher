@@ -16,7 +16,7 @@ import pyarrow as pa
 
 from batcher.config import active_config
 from batcher.kyber.pass_base import OptimizerContext
-from batcher.kyber.rules.join_order import _rebuild_dp, _rebuild_dphyp
+from batcher.kyber.rules.joins.order import _rebuild_dp, _rebuild_dphyp
 from batcher.kyber.stats.estimator import StatsEstimator
 from batcher.plan.logical import Join, Project, Scan
 from batcher.plan.schema import SchemaRef
@@ -121,7 +121,7 @@ def test_dphyp_bails_to_greedy_on_dense_large_graph(monkeypatch):
     # A dense (near-complete) graph has ~3ⁿ connected subsets/pairs — DPhyp must bail
     # to greedy (return None) rather than blow the planning budget (small-query
     # mandate). A tiny budget makes the bail observable without a huge enumeration.
-    from batcher.kyber.rules import join_order as jo
+    from batcher.kyber.rules.joins import order as jo
 
     monkeypatch.setattr(jo, "_MAX_DP_PAIRS", 50)
     n = 13

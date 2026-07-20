@@ -5,12 +5,11 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same_ordered
 from batcher import col
 
 
 def test_sort_single_key(duck):
-    from conftest import assert_same_ordered
-
     t = pa.table({"x": [3, 1, 2, 5, 4], "y": [10, 20, 30, 40, 50]})
     duck.register("t", t)
     out = bt.from_arrow(t).sort("x").collect()
@@ -18,8 +17,6 @@ def test_sort_single_key(duck):
 
 
 def test_sort_desc(duck):
-    from conftest import assert_same_ordered
-
     t = pa.table({"x": [3, 1, 2, 5, 4]})
     duck.register("t", t)
     out = bt.from_arrow(t).sort("x", descending=True).collect()
@@ -27,8 +24,6 @@ def test_sort_desc(duck):
 
 
 def test_sort_multi_key_mixed(duck):
-    from conftest import assert_same_ordered
-
     t = pa.table({"a": [1, 1, 2, 2, 1], "b": [2, 1, 4, 3, 3], "v": [10, 20, 30, 40, 50]})
     duck.register("t", t)
     out = bt.from_arrow(t).sort("a", "b", descending=[False, True]).collect()
@@ -36,8 +31,6 @@ def test_sort_multi_key_mixed(duck):
 
 
 def test_top_n(duck):
-    from conftest import assert_same_ordered
-
     t = pa.table({"x": list(range(20, 0, -1))})  # 20..1
     duck.register("t", t)
     out = bt.from_arrow(t).sort("x").limit(5).collect()
@@ -45,8 +38,6 @@ def test_top_n(duck):
 
 
 def test_limit_offset(duck):
-    from conftest import assert_same_ordered
-
     t = pa.table({"x": list(range(10))})
     duck.register("t", t)
     out = bt.from_arrow(t).sort("x").limit(3, offset=4).collect()
@@ -54,8 +45,6 @@ def test_limit_offset(duck):
 
 
 def test_sql_limit_offset(duck):
-    from conftest import assert_same_ordered
-
     t = pa.table({"x": list(range(10))})
     duck.register("t", t)
     q = "SELECT x FROM t ORDER BY x LIMIT 3 OFFSET 4"
@@ -63,8 +52,6 @@ def test_sql_limit_offset(duck):
 
 
 def test_sql_bare_offset(duck):
-    from conftest import assert_same_ordered
-
     t = pa.table({"x": list(range(10))})
     duck.register("t", t)
     q = "SELECT x FROM t ORDER BY x OFFSET 7"
@@ -72,8 +59,6 @@ def test_sql_bare_offset(duck):
 
 
 def test_sort_by_expression(duck):
-    from conftest import assert_same_ordered
-
     t = pa.table({"x": [1, 2, 3, 4], "y": [4, 3, 2, 1]})
     duck.register("t", t)
     out = bt.from_arrow(t).sort(col("x") + col("y"), col("x")).collect()
@@ -89,8 +74,6 @@ def test_sort_by_null_typed_key_orders_by_remaining(duck):
     natural order; arrow's sort kernels reject it, so the engine used to raise
     "The data type type Null has no natural order" on a query DuckDB runs fine.
     """
-    from conftest import assert_same_ordered
-
     t = pa.table(
         {
             "n": pa.array([None, None, None, None, None], type=pa.null()),
@@ -106,8 +89,6 @@ def test_sort_by_null_typed_key_orders_by_remaining(duck):
 
 def test_sort_by_sole_null_typed_key(duck):
     """ORDER BY only an all-null column preserves input order (a stable no-op sort)."""
-    from conftest import assert_same_ordered
-
     t = pa.table({"n": pa.array([None, None, None], type=pa.null()), "p": [10, 20, 30]})
     duck.register("t", t)
     out = bt.from_arrow(t).sort("n").collect()

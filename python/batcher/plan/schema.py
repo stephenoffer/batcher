@@ -14,7 +14,22 @@ from dataclasses import dataclass
 
 import pyarrow as pa
 
-__all__ = ["SchemaRef", "suggest_columns"]
+__all__ = ["SchemaRef", "placeholder_schema", "suggest_columns"]
+
+
+def placeholder_schema(names: list[str]) -> pa.Schema:
+    """Null-typed placeholders carrying just `names` — the last-resort empty-result schema.
+
+    Used only when a zero-batch result's types cannot be inferred (an opaque `map_batches`
+    output). Prefer `plan.logical.empty_result_schema`, which falls back to this.
+
+    Args:
+        names: The column names the result is expected to carry.
+
+    Returns:
+        A schema with one null-typed field per name.
+    """
+    return pa.schema([pa.field(name, pa.null()) for name in names])
 
 
 def suggest_columns(name: str, available: list[str]) -> str:

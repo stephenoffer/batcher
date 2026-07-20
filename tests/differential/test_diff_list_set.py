@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -34,8 +35,6 @@ def _distinct_order(keep):
 
 
 def test_intersect_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _data())
     out = bt.from_arrow(_data()).select(i=col("a").list.intersect(col("b"))).collect()
     assert_same(out, duck.sql("SELECT list_intersect(a, b) AS i FROM t"))

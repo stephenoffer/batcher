@@ -24,13 +24,13 @@ use crate::eval::list::{
     eval_array, eval_list, eval_list_binary, eval_list_contains, eval_list_get, eval_list_join,
     eval_list_position, eval_make_struct, eval_struct_field, rebuild_list, require_list,
 };
-use crate::eval::list_ops::{eval_list_filter, eval_list_set, eval_list_transform};
+use crate::eval::list_ops::{eval_list_filter, eval_list_set, eval_list_transform, eval_list_zip};
 use crate::eval::map::eval_map;
 use crate::eval::math::{
     eval_coalesce, eval_extreme, eval_is_inf, eval_is_nan, eval_math, eval_math2,
 };
 use crate::eval::media::{eval_audio, eval_image, eval_video};
-use crate::eval::str::eval_str;
+use crate::eval::str::{eval_str, try_dict_str};
 use crate::eval::timezone::eval_convert_timezone;
 use crate::{BinaryOp, Expr, ExprError};
 
@@ -139,6 +139,21 @@ impl Expr {
                 start,
                 length,
             } => {
+                // Fast path: a *dictionary* column applies the function to its distinct
+                // values and gathers through the keys, never decoding the column. Checked
+                // before `eval`, which decodes at the leaf — the whole point is to avoid
+                // materializing the decoded column at all.
+                if let Some(out) = try_dict_str(
+                    *func,
+                    input,
+                    batch,
+                    pattern.as_deref(),
+                    replacement.as_deref(),
+                    *start,
+                    *length,
+                )? {
+                    return Ok(out);
+                }
                 let arr = input.eval(batch)?;
                 eval_str(
                     *func,
@@ -158,13 +173,32 @@ impl Expr {
                 input,
                 width,
                 height,
+                mean,
+                std,
+                channels_first,
             } => {
                 let arr = input.eval(batch)?;
-                eval_image(*func, &arr, *width, *height)
+                eval_image(
+                    *func,
+                    &arr,
+                    *width,
+                    *height,
+                    mean.as_deref(),
+                    std.as_deref(),
+                    *channels_first,
+                )
             }
-            Expr::Audio { func, input, rate } => {
+            Expr::Audio {
+                func,
+                input,
+                rate,
+                n_fft,
+                hop_length,
+                n_mels,
+                n_mfcc,
+            } => {
                 let arr = input.eval(batch)?;
-                eval_audio(*func, &arr, *rate)
+                eval_audio(*func, &arr, *rate, *n_fft, *hop_length, *n_mels, *n_mfcc)
             }
             Expr::Video { func, input } => {
                 let arr = input.eval(batch)?;
@@ -199,6 +233,10 @@ impl Expr {
             Expr::ListSet { op, left, right } => {
                 let (l, r) = (left.eval(batch)?, right.eval(batch)?);
                 eval_list_set(*op, &l, &r)
+            }
+            Expr::ListZip { op, left, right } => {
+                let (l, r) = (left.eval(batch)?, right.eval(batch)?);
+                eval_list_zip(*op, &l, &r)
             }
             Expr::ListTransform { input, func } => eval_list_transform(&input.eval(batch)?, func),
             Expr::ListFilter { input, pred } => eval_list_filter(&input.eval(batch)?, pred),

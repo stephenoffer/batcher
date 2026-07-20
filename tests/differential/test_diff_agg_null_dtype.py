@@ -16,8 +16,8 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 pytestmark = pytest.mark.differential
 
@@ -41,9 +41,7 @@ def test_grouped_sum_of_all_null_column_is_null(duck, t):
     )
     assert_same(
         out,
-        duck.sql(
-            "SELECT g, sum(x) s, min(x) mn, max(x) mx, avg(x) a FROM t GROUP BY g"
-        ),
+        duck.sql("SELECT g, sum(x) s, min(x) mn, max(x) mx, avg(x) a FROM t GROUP BY g"),
     )
 
 

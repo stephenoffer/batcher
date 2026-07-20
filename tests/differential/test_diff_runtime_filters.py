@@ -28,6 +28,7 @@ import batcher as bt
 
 # Importing the package registers its rules into the default registry.
 import batcher.kyber.rules.extra.runtime_filters
+from _harness import assert_same
 from batcher import col
 from batcher.api.dataset import Dataset
 from batcher.io.source import InMemorySource, source_statistics
@@ -39,7 +40,6 @@ from batcher.plan.schema import SchemaRef
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
 from batcher.plan.visitor import walk
-from conftest import assert_same
 
 JOIN_TYPES = ["inner", "left", "right", "full", "semi", "anti"]
 

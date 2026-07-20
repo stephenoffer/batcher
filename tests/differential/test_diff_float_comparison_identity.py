@@ -34,7 +34,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from conftest import assert_same, assert_same_ordered, duck_materialize
+from _harness import assert_same, assert_same_ordered, duck_materialize
 
 pytestmark = pytest.mark.differential
 

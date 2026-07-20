@@ -8,11 +8,10 @@ from __future__ import annotations
 
 from typing import Any
 
-import pyarrow as pa
-
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Col, Expr, Lit
-from batcher.plan.logical import JoinOutputCol, LogicalPlan
+from batcher.plan.logical import JoinOutputCol, empty_result_schema
+from batcher.plan.schema import placeholder_schema
 
 __all__ = [
     "_as_expr",
@@ -141,29 +140,8 @@ def _broadcast(flag: bool | list[bool], n: int, name: str) -> list[bool]:
     return list(flag)
 
 
-def _empty_schema(names: list[str]) -> pa.Schema:
-    # Last-resort schema for a zero-batch result whose types cannot be inferred (an
-    # opaque `map_batches` output): null-typed placeholders carrying just the names.
-    return pa.schema([pa.field(name, pa.null()) for name in names])
-
-
-def _empty_result_schema(plan: LogicalPlan, names: list[str]) -> pa.Schema:
-    """The schema of a zero-batch result: the plan's inferred types, else null placeholders.
-
-    A query that returns no rows still has a schema, and it must be the one a *matching*
-    run would produce. Most shapes emit a zero-row batch (so the schema survives), but a
-    few — notably `filter(<no match>).limit(k)`, where the limit stops before any batch is
-    produced — emit none at all, and the null-typed fallback then handed the caller
-    `i: null, v: null` for what a single matching row would have typed `int64`. That breaks
-    `concat`, `write_parquet`, and any typed projection downstream, and it made an empty
-    distributed result differ from an empty single-node one.
-
-    `available_schema()` infers the types for every relational shape; an opaque
-    `map_batches` returns `None` and keeps the placeholders. The name guard keeps this
-    strictly safer than the old behavior: a schema that disagrees with the caller's
-    expected columns is discarded rather than trusted.
-    """
-    schema = plan.available_schema()
-    if schema is None or list(schema.arrow.names) != list(names):
-        return _empty_schema(names)
-    return schema.arrow
+# Both empty-result helpers now live in neutral `plan`, so `api`, `dist`, and `core` share
+# one spelling instead of three that disagreed on an empty result's column types. Re-exported
+# here under their original private names to keep this module's callers unchanged.
+_empty_schema = placeholder_schema
+_empty_result_schema = empty_result_schema

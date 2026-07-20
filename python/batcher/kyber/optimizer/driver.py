@@ -73,6 +73,40 @@ def _applicable(rules: list[Rule], present: frozenset[type]) -> list[Rule]:
     return [r for r in rules if r.matches is None or (r.matches & present)]
 
 
+def _fingerprint(plan: LogicalPlan) -> object:
+    """A structural fingerprint of `plan`, for the fixpoint's "did anything change" test.
+
+    The JSON IR is the fingerprint of choice: it is cheap, already memoized on the
+    immutable nodes, and compares by value. But it is only defined for nodes that lower
+    to Rust, and the streaming operators (`WatermarkDedup`, `WatermarkStreamJoin`)
+    deliberately define no `to_ir()` — they are executed by the Python driver. Calling
+    `to_ir()` on a plan containing one raises `NotImplementedError`, which is why *no*
+    optimizer entry point could accept a streaming plan and why the streaming path had to
+    optimize around those nodes rather than through them.
+
+    The fallback is `repr`, deliberately, and **not** the node itself. `LogicalPlan`s are
+    frozen dataclasses, so comparing two of them looks like a structural comparison — but
+    it recurses into the `Expr`s they carry, and `Expr.__eq__` *builds an expression*
+    rather than comparing (that is what makes `col("a") == 1` a predicate). Taking its
+    truth value raises `PlanError: the truth value of an Expr is ambiguous`, so a plan
+    equality test does not return False, it explodes. `repr` is structural, total, and
+    cannot re-enter operator overloading.
+
+    It is used only on the path where rule application already returned a *new* tree, so
+    the common converged case still costs one identity check.
+
+    Args:
+        plan: The plan to fingerprint.
+
+    Returns:
+        The plan's IR when it has one, else a structural `repr` of the plan.
+    """
+    try:
+        return plan.to_ir()
+    except NotImplementedError:
+        return repr(plan)
+
+
 def _run_phase(
     plan: LogicalPlan,
     rules: list[Rule],
@@ -118,8 +152,8 @@ def _run_phase(
             converged = True
             break
         if current_ir is None:
-            current_ir = plan.to_ir()
-        updated_ir = updated.to_ir()
+            current_ir = _fingerprint(plan)
+        updated_ir = _fingerprint(updated)
         if updated_ir == current_ir:  # equal-but-new tree (an unconditional rebuilder)
             converged = True
             break

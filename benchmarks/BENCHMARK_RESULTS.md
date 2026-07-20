@@ -1,5 +1,431 @@
 # Batcher vs Ray Data vs Daft — CPU benchmark results
 
+## Parquet metadata was 90% Python, not I/O — `count()` 16.6x (2026-07-19)
+
+The driver's footer pass was assumed to be I/O-bound. It was not. Reading 200 files' footers
+costs **94 ms**; walking them from Python cost **752 ms** on top of that — one pybind11 object
+per *column chunk* (`meta.row_group(rg).column(ci).statistics.min`), so O(files × row_groups ×
+columns) interpreter work, single-threaded under the GIL, before a single data page is read.
+On this shape that is 120,000 chunks and 480,000 `getattr` calls.
+
+That walk now happens in `bc_io::parquet_footer_stats`, over footers the reader has usually
+already parsed and cached. Typed bounds come from the `parquet` crate's `StatisticsConverter`
+(which maps physical statistics onto each file's *Arrow* type — decimals, timestamps, and
+schema-evolved columns included) and cross to Python as a 2-row Arrow batch, row 0 = min and
+row 1 = max, so every bound keeps its exact type with no per-value conversion.
+
+Measured on a release build, local NVMe. "warm" = repeated call (Rust footer cache hot);
+"cold" = first call in a fresh process. Both paths verified to return identical statistics.
+
+| Shape | Measurement | Python | Native | |
+|---|---|---|---|---|
+| 200 files × 20 rg × 30 col | `count()` end-to-end | 851.5 ms | 51.4 ms | **16.6x** |
+| 200 files × 20 rg × 30 col | `parquet_statistics` cold | 910.1 ms | 58.8 ms | 15.5x |
+| 200 files × 20 rg × 30 col | `parquet_statistics` warm | 832.1 ms | 22.9 ms | 36.3x |
+| 1,000 files × 5 rg × 30 col | `count()` end-to-end | 1307.3 ms | 142.6 ms | **9.2x** |
+| 1,000 files × 5 rg × 30 col | `parquet_statistics` cold | 1262.9 ms | 138.8 ms | 9.1x |
+| 1,000 files × 5 rg × 30 col | `parquet_statistics` warm | 1281.6 ms | 70.6 ms | 18.1x |
+
+The many-small-files row is lower because per-file footer I/O is irreducible locally and now
+dominates; on object storage the reader's 64-way file concurrency widens the gap rather than
+narrowing it. After the move, profiling shows ~0 % of the pass left in Python.
+
+### OPEN: the glob listing-metadata stat storm is now the largest remaining metadata cost
+
+With the footer walk native, the next cost on the metadata path is `files_version`, which
+stats every file to build the identity token that keeps a statistics memo from outliving the
+files it describes. `_backend.py::_glob` deliberately does **not** record the sizes/mtimes its
+own listing already fetched (the comment there explains why: the entries outlive the listing,
+and a file overwritten afterwards would still report its old identity — caught by
+`test_iceberg_count_is_not_answered_from_a_stale_summary`). So a glob-sourced read stats every
+file, three times per query.
+
+Measured locally, where a stat is ~6 µs: 1.1 ms per call at 200 files, 5.9 ms at 1,000 — i.e.
+3.3 ms and 17.8 ms per query, against a `count()` that now costs 51 ms and 143 ms. **6–12 % of
+the remaining time, locally.** On object storage each stat is a HEAD, so the same 3,000 calls
+at 1,000 files are the dominant cost rather than a fraction of it; an earlier profile of a
+2,000-small-file read put the stat storm above the Parquet read itself (820 → 513 ms when the
+listing data was recorded).
+
+**Not attempted here, deliberately.** The fix is the generation-stamped listing cache
+prescribed in `docs/internals/ray_pitfall_parity.md` G5 — entries valid only for a fresh
+listing, invalidated when a cached path list is served — and it spans `io/_backend.py` and the
+path-list cache in `io/base/source.py`. Doing it requires an object-store target to prove the
+win on, since locally the effect is single-digit milliseconds and the *risk* is a stale
+identity token, which is a wrong answer rather than a slow one. Changing a path that has
+already been tried and reverted, without being able to measure the benefit, is how the
+stale-metadata bug comes back.
+
+### Two things that were measured *against* intuition, and one non-fix
+
+* **Reducing bounds per file was slower than batching them.** Collapsing each file's
+  row-group bounds on arrival keeps the accumulator small but costs a sort-and-take per
+  (file, column) — 60,000 Arrow kernel calls to reduce 5 values each on the 1,000-file shape.
+  Appending raw and reducing once per column took that case from 99.4 ms to 70.6 ms
+  (13.6x → 18.1x). Memory stays bounded by an 8,192-bound collapse threshold.
+* **Fanning footer reads across a thread pool REGRESSES local disk.** Fixing the serial
+  handle-path read (which `file_cache_dir` silently forced on the whole dataset) by pooling it
+  measured **613 ms pooled against 387 ms serial** on 1,000 local files — dispatch costs more
+  than a local footer read saves. This is the same result `files_version` had already measured
+  for stats and documented. The serial-for-local / pooled-for-remote policy now lives in
+  `io/_concurrent.py::read_each_file`, so every metadata extractor inherits it.
+* **`sorted_by` is deliberately NOT computed natively.** It is the one statistic that lets
+  Kyber *delete* a `Sort`, so a wrong claim silently reorders rows rather than costing time.
+  Rust reports only the cheap precondition (does every row group declare the same ascending,
+  nulls-last sort key); the rare datasets where that holds fall back to the existing proof in
+  `io/stats/sortedness.py`. The common case skips the proof entirely.
+
+⚠️ **`ArrowWriter` overflows its stack** closing a file with ~8.7k row groups in a **debug**
+build (`max_row_group_size=1`). *Reading* such a file is fine — verified against a
+pyarrow-written one. A test that writes many row groups will fail on the writer while proving
+nothing about the code under test.
+
+## The per-file MERGE manifest re-read every footer the statistics pass had cached (2026-07-19)
+
+`parquet_file_manifest` builds the per-file zone map a copy-on-write `MERGE` prunes with
+(`io.stats.key_pruning`). It walked footers from Python and — more expensively — read them
+*again*: 200 files cost 179.6 ms and 1,000 files 409.6 ms on a single key column, of which
+**~95 % was footer I/O for footers `parquet_statistics` had already fetched and parsed on the
+Rust side moments earlier**. The Python walk itself was only ~20 ms; the duplicate read was
+the cost. It now goes through `bc_io::parquet_file_manifest`, which builds the add-action
+layout natively from the shared, validated footer cache.
+
+| Files | Python cold | Native cold | | Python warm | Native warm | |
+|---|---|---|---|---|---|---|
+| 200 | 653.0 ms | 50.8 ms | **12.9x** | 159.3 ms | 6.3 ms | **25.3x** |
+| 1,000 | 1835.2 ms | 171.5 ms | **10.7x** | 435.1 ms | 25.3 ms | **17.2x** |
+
+Values are identical to the Python path on all three benchmark datasets, including the
+Hive-partitioned one (where the partition column lives in the path and no file describes it).
+
+### The equivalence test caught an unsoundness, not a slowdown
+
+The first native version reduced each column's bounds over *whatever row groups had
+statistics*. The Python path it replaced deliberately does not:
+
+```python
+if stats is None or not getattr(stats, "has_min_max", False):
+    known = False   # a partial min/max is a bound over PART of the file
+    break
+```
+
+A bound covering part of a file **prunes away rows that are really there** — a wrong answer
+for a `MERGE`, not a slow one. The native path now requires every row group to have
+contributed a bound (and no NaN), exactly as the Python path does.
+
+A second, subtler divergence surfaced in the same test: for an all-null column the native
+path reported `null_count = 2` where Python reports `None`. That looks like strictly better
+information, and it would have changed which files a merge opens — `file_skipping::_all_null_mask`
+skips a file whose `null_count == num_records`, so the native path would have **skipped a file
+the Python path keeps**, on backends with a native read target only. Same query, same data,
+different files scanned depending on the storage backend. `null_count` is now tied to the
+bounds as a unit, matching the path it mirrors. Decoupling them is a real improvement — an
+all-null column *could* be skipped outright — but it is a semantic change to make deliberately
+in both paths at once, not a side effect of an optimization.
+
+Neither would have been caught by a test that asserted expected values; both came out of
+asserting the two paths agree.
+
+## A pushed predicate used to LOSE the native reader — selective scans 2.3–3.8x (2026-07-19)
+
+`ParquetSource.read` tried the native Rust reader **only when there was no predicate**:
+
+```python
+pa_filter = self._pa_filter(predicate)
+if pa_filter is None:
+    batched = self._native_read_many(projection)   # native, but only unfiltered
+```
+
+So the *selective* scan — the case pushdown exists for — fell to PyArrow, while
+`_parquet_native.read_row_groups_filtered` (native row-group **and** page-index pruning) had
+exactly one caller in the tree, in `dist/`. `read()` now tries native-filtered first, then
+PyArrow `filters=`, then an unfiltered read: each step down reads strictly more rows and none
+changes the answer, so a predicate the reader cannot bind is a slower scan, never a wrong one.
+
+Measured on 200 files / 40 M rows, `id < N`, **local NVMe**, 5 repeats, best-of:
+
+| Shape | PyArrow | Native | |
+|---|---|---|---|
+| 1.25% selective, 2 cols | 102.2 ms | 27.1 ms | **3.8x** |
+| 10% selective, 1 col | 119.6 ms | 52.8 ms | **2.3x** |
+| 10% selective, 2 cols | 133.2 ms | 58.0 ms | **2.3x** |
+| 10% selective, 5 cols | ~177 ms | ~186 ms | ~parity |
+| 10% selective, 10 cols | 245 ms | 221 ms | 1.1x |
+| 10% selective, 20 cols | 380.6 ms | 233.0 ms | 1.6x |
+| 50% selective, 2 cols | 249.5 ms | 214.2 ms | 1.2x |
+
+Both paths return identical row counts at every point, so pruning is equivalent, not merely
+faster. **The win concentrates where pushdown is supposed to help — selective predicates and
+narrow projections — and flattens to parity elsewhere.**
+
+⚠️ A single earlier reading showed the 5-column case at **0.88x** and it was nearly reported as
+a regression. Re-running it five times showed 181.2 vs 181.9 and 172.8 vs 189.9 — parity, with
+run-to-run variance wider than the effect. On a shared, loaded box, one reading of a ~10 %
+difference is not a measurement.
+
+### A pre-existing wrong-store read: BYO credentials reached the native reader
+
+Found while reviewing the above, and older than it. The native FFI (`bc_py::read_parquet*`)
+takes a **bare URI** and resolves the object store itself, from the environment and the URI's
+query string — so it cannot see a caller-supplied `filesystem=` or `storage_options=`. Two
+read paths handed it one anyway, gating only on the byte cache:
+
+```python
+if self._fs.native_read_target(files[0]) is None:   # _native_read_many
+if self._fs.native_read_target(path) is None:       # _read_by_path
+```
+
+With `storage_options={"endpoint_override": "http://minio:9000"}` — the documented way to
+reach on-prem MinIO/Ceph — a bare `s3://bucket/key` then addresses **real S3**. That is a
+different object or an auth failure, not a slower read, and it happens on exactly the
+configuration those options exist to serve.
+
+`_file_splits` had already made this trade for row-group splits, explicitly ("trading finer
+sub-file granularity for correct credentials on exactly the on-prem / custom-backend case that
+needs them"); the read paths simply never got the same rule. Both now go through
+`_native_uri_is_addressable`.
+
+**It costs the common case nothing**, which is why it is not a trade: a plain source still
+reaches the native reader (pinned by a test), the clustered selective read still measures
+**116.4 ms → 30.7 ms (3.8x)**, and only a BYO-configured source drops to PyArrow — where it
+was always going to have to be. `tests/unit/test_parquet_byo_credentials.py` asserts on *which
+reader was called* rather than on returned rows, because with no MinIO to point at a
+wrong-store read raises rather than silently returning wrong bytes — a row assertion would
+have passed for the wrong reason. Verified to have teeth: 4 of its 11 cases fail when the
+gates are reverted.
+
+### Two regressions this change shipped with, both caught only by adversarial benchmarking
+
+Neither showed up in correctness tests — the engine's `Filter` keeps the answers right — and
+neither showed up in the benchmark above, because that benchmark used the *convenient* shape.
+
+**1. A predicated read handed the driver 100x the memory.** The benchmark above uses a
+sequential `id`, so row-group pruning is maximally effective and the native path returns
+almost exactly the matching rows. Re-run it on data where the key is scattered so pruning
+*cannot* fire (20 M rows, 100 row groups, `k` uniform over 1e6, `k < 10000` ≈ 1 % selective):
+
+| | wall clock | rows to driver | bytes to driver |
+|---|---|---|---|
+| PyArrow `filters=` | 166.3 ms | 199,575 | **3.2 MB** |
+| native, as first written | 126.4 ms | 20,000,000 | **320 MB** |
+
+Faster on the clock, 100x worse on memory — an OOM on a large scan that did not exist before,
+sitting behind a wall-clock *win*. Contract-legal (`read_source` documents that a source may
+return a superset because the engine still filters) and therefore invisible to every
+correctness test. Fixed by doing both: prune row-groups natively **and** apply the predicate
+to the returned batches as a vectorized Arrow filter. Pruning at the reader and filtering at
+the reader were never mutually exclusive. Now: **199,575 rows / 3.2 MB, and 100.1 ms against
+PyArrow's 131.9 ms** — the memory of the old path with the speed of the new one. The
+pre-existing `test_a_pushed_predicate_reads_the_same_rows_either_way` passes again on its
+original assertion, with no test edited.
+
+**2. Native streaming anti-scaled with read-ahead depth.** `_iter_native_windows` was measured
+on a single large-row-group file, where it wins 3.9x. Across many files it inverts, because
+the reader's own row-group concurrency and the outer file read-ahead are two routes to the
+same parallelism and using both oversubscribes the shared runtime:
+
+| read-ahead depth | PyArrow | native, as first written |
+|---|---|---|
+| 1 | 783 ms | 516 ms |
+| 2 | 986 ms | 502 ms |
+| 4 | 574 ms | 644 ms |
+| **16 (the default)** | **291 ms** | **961 ms** |
+
+A **3.3x regression at the depth that actually runs**. Now parity or better at every depth,
+with the single-file win retained.
+
+**The lesson, which cost real time five separate times this session:** *"add concurrency"* and
+*"return more rows, the engine will filter"* both measured backwards here — footer pooling
+(387 → 613 ms), streaming read-ahead, multi-source reads (1.14x for a permanent learner-stat
+cost), per-file bound reduction, and this superset read. Benchmark the shape you do **not**
+want to measure: clustered data hid a 100x memory amplification, and one file hid a 3.3x
+regression. Related: three separate readings in this session showed a "regression" that
+re-running 3–5 times proved was variance — a single reading of a <20 % difference on a shared
+box is not a measurement.
+
+⚠️ **These numbers understate the change.** The native reader's actual design advantage is
+issuing a file's column-chunk GETs concurrently against object storage; on local NVMe that
+advantage cannot appear. The S3 figures in `_parquet_native`'s docstring (3–4x) are the
+relevant ones for a cloud deployment, and are not re-measured here.
+
+Correctness: 924 differential tests vs DuckDB covering parquet/pushdown/predicate/filter/scan,
+plus 41 new tests including a superset property (the filtered read contains exactly the
+matching rows).
+
+## ORC planning decoded the whole table — now footer-only, 55x and O(1) (2026-07-19)
+
+`ORCSplit.row_count()` was `self._file().read_stripe(self.stripe).num_rows`, and
+`read_stripe` **decodes the stripe's data**. `_balance` calls `row_count()` on every split to
+bin-pack them, so planning a distributed ORC read decoded the entire table on the driver
+before dispatching a single task. `_file()` also re-opened the file and re-read the footer on
+every call, with no cache (Parquet had `_parquet_footer`; ORC had nothing).
+
+Verified by monkeypatching `ORCFile.read_stripe` and counting calls on a 3 M-row, 4-stripe
+file:
+
+| | plan + `row_count()` on all splits | `read_stripe` calls |
+|---|---|---|
+| before | 21.9 ms | 4 (whole table decoded) |
+| after | **0.4 ms** | **0** |
+
+**55x here, but the ratio is the point, not the number**: the old cost was O(rows) and the new
+one is O(stripes), so it widens with dataset size — a 300 M-row file would have decoded 100x
+more for the same planning step.
+
+The trade: `row_count()` now returns an exact count only for a single-stripe file and `None`
+otherwise, because `Split.row_count`'s contract is *exact-if-known-without-reading-data, else
+None* — an even division of `nrows` would be a wrong answer to that contract, not a loose one.
+`_balance` already weights unknown counts as 1 and spreads them evenly, which is sound here
+since ORC stripes are size-uniform. `count()` is still answered exactly from the footers.
+
+### Two connector defects that are NOT fixable at the pinned pyarrow, verified not assumed
+
+* **ORC stripe pruning.** pyarrow 19.0.1 exposes `nstripe_statistics` and
+  `stripe_statistics_length` — a *count* and a *length*, with **no accessor for the contents** —
+  and the dataset API's ORC `FileFragment` has neither `split_by_row_group` nor `statistics`,
+  unlike Parquet's. There is nothing to hand `io.stats.file_skipping`. Dropping the predicate
+  stays sound (every stripe survives; the engine's `Filter` re-checks every row).
+* **JSON streaming.** `pyarrow.json.open_json` does not exist at 19.0.1 (it lands in 21) and the
+  project pins `pyarrow>=16`. The `pyarrow.dataset` `format="json"` alternative was tested and
+  **rejected**: on a file whose column type widens late, `read_json` succeeds while the dataset
+  scanner raises `ArrowInvalid` and misses a late-appearing column — it would have turned
+  working reads into hard errors. JSON *projection* pushdown was implemented (via
+  `ParseOptions.explicit_schema`), so unwanted columns are never parsed.
+
+Both are recorded in-code with the exact API gap, so the dead end is not rediscovered.
+
+Delta and Iceberg `iter_batches` also now genuinely stream (`fragment.to_batches` /
+`to_record_batches`) instead of building a whole table and calling `.to_batches()` on it —
+a memory-scalability fix, not a throughput one. Iceberg's per-batch
+`pa.Table.from_batches([batch])` wrap/unwrap in the scan hot path is gone: the normalization
+target schema is derived once and batches are cast in place.
+
+## Corrections to claims below, re-measured on a verified release build (2026-07-19)
+
+Two open-target claims further down this file no longer hold. Both were re-measured
+correctness-gated on a 47 MB release build, in an isolated worktree (see the warning below):
+
+* **`op-window-sum-partition` is a win, not a 1.06x loss.** Measured **0.94x–0.99x vs Polars**
+  and **0.73x–0.82x vs DuckDB**. The "What is left" section below still lists it as the top
+  structural target and prescribes a mergeable-aggregate + per-morsel-broadcast rewrite of the
+  whole-partition window; that rewrite is **not needed for this row**. (The four conditions that
+  drop a window node to one core — no `PARTITION BY`, `< 32,768` rows, *any* non-aggregate or
+  framed function in the same node, or one bucket holding >50% of rows — are real and still
+  worth fixing; the third means `SUM(x) OVER (PARTITION BY k)` next to `LAG(x) OVER (PARTITION BY k)`
+  serializes both. But this benchmark row is not evidence for them.)
+* **TPC-H q21 runs.** Listed below as "still unrunnable — correlated subqueries unimplemented".
+  It completes in **141–184 ms** and matches `duckdb_arrow` (0.48x–0.53x, `OK`).
+
+⚠️ **`explain(analyze=True)` is not usable as a profiler.** It reports a fixed `cpu utilization:
+7% of cores` and `interp` for *every* query, bottleneck shares over **100%** of wall time
+("419% of wall time"), and re-executes on the sequential tier — q1 reads 478 ms there against
+39 ms real. Anything diagnosed with it (including "this query runs single-threaded") is an
+artifact of the instrumentation, not the engine. Use per-phase timing or `parallelism`-swept
+wall clock instead.
+
+⚠️ **A shared tree will silently replace your engine mid-run.** During this session another
+agent's `maturin develop` (no `--release`) twice overwrote the extension with a **327 MB debug**
+build, making every timing 8–20x slow with nothing in the output saying so. `ls -la` on the
+`.so` before *and* after a benchmark, or work in an isolated worktree + venv.
+
+## Half of a small query's latency was the control plane counting bytes (2026-07-19)
+
+The per-query floor this file measures at **~5.8 ms** — the thing that loses `op-filter-project`
+to Polars (whose passthrough is 0.14 ms) and sets the serving-concurrency ceiling — was mostly
+one line. `cProfile` over 30 passthrough (`SELECT * FROM lineitem`) collects:
+
+```
+ncalls  tottime  cumtime  filename:lineno(function)
+    30    0.000    0.205  api/dataset/frame.py:3313(collect)          <- whole query
+  1500    0.105    0.105  api/orchestration/run.py:425(<genexpr>)     <- 51% of it
+```
+
+1500 calls for 30 queries is **once per batch**, and the genexpr is `sum(b.nbytes for b in
+batches)` — the byte volume fed to `record_source_io` for the I/O throughput learner. Measured
+on the 49-batch, 16-column lineitem: `num_rows` 0.004 ms, **`nbytes` 2.86 ms**. Control-plane
+work proportional to data volume, which `.claude/rules/performance.md` names outright ("avoid
+anything `O(rows)` in the Python control plane").
+
+**The obvious fix is wrong, and silently so.** `get_total_buffer_size()` is 18.7x faster
+(0.153 ms) and agreed to 0.0001% here — but it counts a *shared* buffer once per batch that
+references it, where `nbytes` deduplicates. On 100 slices of one 16 MB batch:
+
+| | reported |
+|---|---:|
+| `sum(nbytes)` | 16,000,000 (correct) |
+| `sum(get_total_buffer_size())` | **1,600,000,000 — 100x** |
+
+A sliced source would have handed `record_source_io` a fabricated 100x read throughput, and
+Kyber plans against that number. No result-correctness test can see a wrong *measurement*; this
+is exactly the "Core measures, Kyber decides" loop CLAUDE.md warns is corruptible while every
+gate stays green.
+
+So keep `nbytes` and stop recomputing it: `metadata.io_stats.scanned_byte_count` memoizes per
+**(source identity, projection, row count)**. Same source, same columns, same rows ⇒ same bytes;
+a changed row count misses the memo and re-measures, which is what keeps it honest for a source
+whose contents move.
+
+| `SELECT * FROM lineitem`, 6M rows | before | after |
+|---|---:|---:|
+| per-query floor | 5.00 ms | **1.45–2.00 ms** |
+
+Unit tests: **22 failed / 4125 passed before and after** — an identical failure set, verified by
+re-running with the change reverted rather than asserting it (the failures are missing optional
+deps: ray, GPU, ML extras).
+
+## The probe-side bloom was pure cost on a FK join — `op-join-agg` 1.57x loss → 0.87x win (2026-07-19)
+
+`op-join-agg` (`lineitem ⋈ orders`, then `GROUP BY o_orderpriority`) was the operator mix's
+worst row: **135.2 ms against DuckDB's 85.9 and Polars' 92.3 (1.57x / 1.46x)**. Bisecting it by
+phase (separate processes per `parallelism`, as this file's earlier trap requires) put the cost
+somewhere unexpected:
+
+| phase, 1.5M-row build @ p=16 | p=1 | p=16 | scaling |
+|---|---:|---:|---:|
+| `parallel::run` (build subtree) | 0.11 ms | 0.5 ms | — |
+| `ops::materialize` (build concat) | 4.30 ms | 3.8 ms | — |
+| **`make_probe` (hash build)** | **110 ms** | **26 ms** | **4.2x** |
+
+The serial build-side *concat* is 4 ms and was never the problem. Inside the hash build, the
+chain-apply is **exactly zero** (`o_orderkey` is a primary key, so no key has a second row), and
+what remained was the **bloom filter** — on both ends:
+
+* **Probe side (~17.5 ms).** `head_for` does one `contains_hash` per probe row: 6M random
+  accesses into the filter. On this join **it rejected 0 rows** — every lineitem has an order —
+  so it bought nothing and cost a cache miss on top of the hash lookup it was meant to save.
+* **Build side (~14 ms).** Each of the 16 shards allocates and zeroes a *full-size* bloom, then
+  they are OR-merged serially: `O(shards x bloom_bits)`, so it gets **worse on bigger machines**
+  (the merge alone went 0.25 ms at 2 shards → 2.20 ms at 16).
+
+**Why the heuristic could not see it.** `use_probe_bloom_with` reads only build/probe row
+*counts* — and a bloom's entire value is its **rejection rate**, which sizes do not predict.
+Worse, on the streaming path `make_probe` cannot know the probe count at all and passes
+`usize::MAX`, which makes the size test vacuously true: the bloom is switched **on
+unconditionally** for every build past the floor.
+
+**The fix: measure it instead** (`JoinTable::bloom_trial`). `probe_range` counts what the bloom
+rejects over the first 64K probe rows and latches it off below a 10% rejection rate. This cannot
+change a result — a bloom *hit* is only a "maybe", so skipping the filter just runs the
+authoritative hash lookup that always followed it. The decision is per *range*, so it costs two
+relaxed atomics per morsel rather than per row, and each tier (sequential, morsel-parallel,
+distributed) adapts independently on what it actually sees.
+
+| `op-join-agg`, correctness-gated | before | after |
+|---|---:|---:|
+| vs DuckDB | 135.2 ms — **1.57x** | **72.7 ms — 0.87x** |
+| vs Polars | **1.46x** | **0.84x** |
+
+TPC-H stays **20/22 vs `duckdb_arrow`**, all 22 `OK`. `latching_the_bloom_off_midway_emits_the_same_rows`
+pins the emitted pairs against a single-range oracle (the verdict flips mid-probe, which is the
+window a wrong implementation would corrupt); `a_selective_bloom_is_kept` pins the other
+direction, so "switch the bloom off" cannot be mistaken for a free win — a probe rejecting ~98%
+keeps its filter.
+
+**Still on the table:** the ~14 ms build-side bloom. It is speculative work — nothing has been
+probed yet, so no runtime evidence exists when it is built. Deciding it needs the cross-query
+learned-stats loop (remember this join's rejection rate and skip the build next run), which is a
+control-plane change, not a `bc-runtime` one. Measured ceiling if it were free: **~69 ms**.
+
 ## Float top-N was 3x DuckDB — fixed to 1.6x, and a latent tie bug fixed with it (2026-07-18)
 
 Chasing `op-sort-limit` (the last operator at ~1.0x vs DuckDB) turned up that a **single

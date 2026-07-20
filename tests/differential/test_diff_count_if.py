@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, count_if
 
 pytestmark = pytest.mark.differential
@@ -21,8 +22,6 @@ def _data():
 
 
 def test_count_if_grouped_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _data())
     out = bt.from_arrow(_data()).group_by("g").agg(n=count_if(col("v") > 100000)).collect()
     # A NULL predicate is treated as false (not counted), matching DuckDB.
@@ -30,8 +29,6 @@ def test_count_if_grouped_matches_duckdb(duck):
 
 
 def test_count_if_global_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _data())
     out = bt.from_arrow(_data()).agg(n=count_if(col("v") > 100000)).collect()
     assert_same(out, duck.sql("SELECT count_if(v > 100000) AS n FROM t"))

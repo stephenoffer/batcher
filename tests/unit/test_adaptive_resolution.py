@@ -25,7 +25,7 @@ import pytest
 
 import batcher as bt
 from batcher import col
-from batcher.api import adaptive as adaptive_mod
+from batcher.api.adaptive import gating as adaptive_mod
 from batcher.api.adaptive import resolve_adaptive
 
 pytestmark = pytest.mark.unit

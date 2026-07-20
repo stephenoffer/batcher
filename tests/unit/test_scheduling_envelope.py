@@ -272,12 +272,13 @@ def test_annotate_ops_sets_locality_for_small_shuffle_only():
 
     cfg = active_config()
     ds = bt.from_pydict({"k": [1, 2], "v": [3, 4]}).group_by("k").agg(s=bt.col("v").sum())
-    # A tiny shuffle (few rows × width) is below the broadcast threshold → prefers locality.
+    # A tiny shuffle (few rows × width) is below the locality threshold → prefers locality.
     small_est = CardinalityEstimator([_Source(10)])
     small = annotate_ops(ds._plan, small_est, cfg, CostModel(small_est))
     assert next(op for op in small if op.kind == "Aggregate").bounds.prefers_locality is True
-    # A shuffle of ~broadcast_max_bytes *rows* (× width ≫ threshold) → no locality preference.
-    big_est = CardinalityEstimator([_Source(cfg.optimizer.broadcast_max_bytes)])
+    # A shuffle of ~locality_max_bytes *rows* (× width ≫ threshold) → no locality preference.
+    # (This is the network PACK/SPREAD knob, split from the cache-sized broadcast threshold.)
+    big_est = CardinalityEstimator([_Source(cfg.optimizer.locality_max_bytes)])
     big = annotate_ops(ds._plan, big_est, cfg, CostModel(big_est))
     assert next(op for op in big if op.kind == "Aggregate").bounds.prefers_locality is False
 
@@ -332,15 +333,19 @@ def test_engine_config_json_folds_envelope_budget():
     # `execute_plan` spills its reducer bucket within its share instead of OOMing.
     import json
 
+    from batcher.config import MemoryConfig
     from batcher.dist.executors.ray_runtime import (
         engine_config_json,
         reset_scheduling_envelope,
         set_scheduling_envelope,
     )
 
-    # No envelope → unchanged (the single-node default budget, 0 = unbounded).
+    # No envelope → the single-node default budget. That is the static
+    # `default_total_bytes` envelope, never 0: a 0 would mean "unbounded" to the data
+    # plane and disarm its spill machinery on every worker.
+    default_budget = int(MemoryConfig().default_total_bytes * MemoryConfig().hard_limit)
     base = json.loads(engine_config_json())
-    assert base["memory_budget_bytes"] == 0
+    assert base["memory_budget_bytes"] == default_budget
 
     env = SchedulingEnvelope(num_cpus=1.0, memory_bytes=4 << 20, num_gpus=0.0, n_tasks=4, credits=4)
     token = set_scheduling_envelope(env)
@@ -352,11 +357,12 @@ def test_engine_config_json_folds_envelope_budget():
     finally:
         reset_scheduling_envelope(token)
 
-    # A zero-memory (unsized) envelope leaves the config untouched.
+    # A zero-memory (unsized) envelope leaves the config untouched — it falls back to
+    # the driver's default budget rather than to an unbounded data plane.
     zero_env = SchedulingEnvelope(num_cpus=1.0, memory_bytes=0, num_gpus=0.0, n_tasks=2, credits=4)
     token = set_scheduling_envelope(zero_env)
     try:
-        assert json.loads(engine_config_json())["memory_budget_bytes"] == 0
+        assert json.loads(engine_config_json())["memory_budget_bytes"] == default_budget
     finally:
         reset_scheduling_envelope(token)
 

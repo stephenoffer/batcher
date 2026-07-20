@@ -15,6 +15,9 @@ from batcher.plan.expr_ir.core import Cast, Expr
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
 
+# Where `str.chunk` may end a chunk; mirrors `bc-expr`'s `chunk::Boundary`.
+_CHUNK_BOUNDARIES = frozenset({"char", "word", "sentence", "line"})
+
 
 class _StrNamespace:
     """String functions on a text column: ``col("s").str.upper()``, ``.str.contains("x")``.
@@ -2751,6 +2754,79 @@ class _StrNamespace:
         """
         return StrFunc("levenshtein", self._e, pattern=target)
 
+    def damerau_levenshtein(self, target: str) -> StrFunc:
+        """Damerau-Levenshtein edit distance to the constant string ``target`` (→ Int64).
+
+        DuckDB ``damerau_levenshtein`` against a literal: like `levenshtein`, but a swap of
+        two adjacent characters counts as **one** edit rather than two — so it scores a
+        typo like ``"teh"`` vs ``"the"`` as distance 1. The better default for matching
+        human-typed text (search queries, names) where transpositions are common.
+
+        Args:
+            target: The literal string to measure distance to.
+
+        Returns:
+            A new Int64 expression: the Damerau-Levenshtein distance.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["teh"]})
+                >>> ds.select(r=bt.col("s").str.damerau_levenshtein("the")).to_pydict()
+                {'r': [1]}
+        """
+        return StrFunc("damerau_levenshtein", self._e, pattern=target)
+
+    def jaro_similarity(self, target: str) -> StrFunc:
+        """Compute the Jaro similarity to the constant string ``target`` (→ Float64).
+
+        DuckDB ``jaro_similarity`` against a literal: a ``[0, 1]`` fuzzy-match score (1.0
+        identical, 0.0 nothing in common) based on matching characters and transpositions.
+        The go-to metric for **entity resolution / record linkage** on short strings like
+        names, where an edit distance is too coarse.
+
+        Args:
+            target: The literal string to score against.
+
+        Returns:
+            A new Float64 expression: the Jaro similarity.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["MARTHA"]})
+                >>> r = ds.select(sim=bt.col("s").str.jaro_similarity("MARHTA")).to_pydict()
+                >>> round(r["sim"][0], 4)
+                0.9444
+        """
+        return StrFunc("jaro_similarity", self._e, pattern=target)
+
+    def jaro_winkler_similarity(self, target: str) -> StrFunc:
+        """Compute the Jaro-Winkler similarity to the constant string ``target`` (→ Float64).
+
+        DuckDB ``jaro_winkler_similarity`` against a literal: Jaro plus a bonus for a shared
+        prefix (up to 4 characters), so strings that agree at the start — as names usually
+        do — score higher. ``[0, 1]``. Preferred over plain Jaro for name matching.
+
+        Args:
+            target: The literal string to score against.
+
+        Returns:
+            A new Float64 expression: the Jaro-Winkler similarity.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["MARTHA"]})
+                >>> r = ds.select(sim=bt.col("s").str.jaro_winkler_similarity("MARHTA")).to_pydict()
+                >>> round(r["sim"][0], 4)
+                0.9611
+        """
+        return StrFunc("jaro_winkler_similarity", self._e, pattern=target)
+
     def soundex(self) -> StrFunc:
         """Compute the American Soundex phonetic code, a 4-character key.
 
@@ -2864,8 +2940,8 @@ class _StrNamespace:
         """
         return StrFunc("strip_html", self._e)
 
-    def chunk(self, size: int, overlap: int = 0) -> StrFunc:
-        """Slice text into fixed-size overlapping windows → List<Utf8>.
+    def chunk(self, size: int, overlap: int = 0, boundary: str = "char") -> StrFunc:
+        """Slice text into overlapping windows, optionally on word/sentence lines → List<Utf8>.
 
         The *split* stage of a RAG ingest pipeline: chunk each document, `explode` the
         list into one row per chunk, then embed. Chunks start every ``size - overlap``
@@ -2878,16 +2954,33 @@ class _StrNamespace:
         never bytes, so a chunk boundary never splits a codepoint. An empty string
         yields an empty list; null yields null.
 
+        `boundary` decides where a cut is allowed. The default ``"char"`` cuts at exactly
+        `size` characters, which can split a word in half — and a chunk ending
+        ``…diagnosed with hyperten`` embeds as something the query ``hypertension
+        treatment`` will not match, so a mid-word cut silently costs recall on the very
+        chunk that should have answered. ``"word"``, ``"sentence"`` and ``"line"`` back
+        the cut off to the last such separator inside the window. When a window holds
+        none, the mode degrades to the next-finer one — ``"sentence"`` and ``"line"`` fall
+        back to a word boundary before ever cutting mid-word — and only a token longer
+        than `size` itself is hard-cut, since it must still be emitted.
+
+        With ``overlap=0`` every mode is lossless: the chunks concatenate back to the
+        input, because a separator ends the chunk it belongs to instead of being skipped.
+
         Args:
             size: Characters per chunk. Must be at least 1.
             overlap: Characters each chunk repeats from the previous one. Must be in
                 ``[0, size)`` — an overlap equal to `size` would never advance.
+            boundary: Where a chunk may end — ``"char"`` (anywhere), ``"word"`` (after
+                whitespace), ``"sentence"`` (after ``.``/``!``/``?``) or ``"line"``
+                (after a newline).
 
         Returns:
             A List<Utf8> expression, one element per chunk.
 
         Raises:
-            PlanError: If `size` < 1 or `overlap` is outside ``[0, size)``.
+            PlanError: If `size` < 1, `overlap` is outside ``[0, size)``, or `boundary`
+                is not one of the four modes.
 
         Examples:
             .. doctest::
@@ -2899,14 +2992,25 @@ class _StrNamespace:
 
                 >>> ds.select(r=bt.col("doc").str.chunk(4, overlap=2)).to_pydict()
                 {'r': [['abcd', 'cdef', 'efg']]}
+
+                >>> # Word boundaries keep each chunk's last word whole.
+                >>> words = bt.from_pydict({"doc": ["alpha beta gamma"]})
+                >>> words.select(r=bt.col("doc").str.chunk(9, boundary="word")).to_pydict()
+                {'r': [['alpha ', 'beta ', 'gamma']]}
         """
         if size < 1:
             raise PlanError(f"str.chunk(): size must be >= 1, got {size}")
         if not 0 <= overlap < size:
             raise PlanError(f"str.chunk(): overlap must be in [0, {size}), got {overlap}")
+        if boundary not in _CHUNK_BOUNDARIES:
+            raise PlanError(
+                f"str.chunk(): boundary must be one of {sorted(_CHUNK_BOUNDARIES)}, "
+                f"got {boundary!r}"
+            )
         # `length` carries the chunk size and `start` the overlap — the same reuse of
-        # the two scalar slots that `repeat`/`right`/`split_part` already make.
-        return StrFunc("chunk", self._e, start=overlap, length=size)
+        # the two scalar slots that `repeat`/`right`/`split_part` already make — and
+        # `pattern` carries the boundary mode, which is otherwise unused by `chunk`.
+        return StrFunc("chunk", self._e, pattern=boundary, start=overlap, length=size)
 
     def minhash(self, num_perm: int = 128, ngram: int = 5) -> StrFunc:
         """A MinHash signature of the text → List<Int64> of `num_perm` values.

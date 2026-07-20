@@ -98,7 +98,7 @@ commit runs at the end.
 
 ## The registries
 
-`SOURCES` and `SINKS` are name → class registries. Registering under a name is what
+`SOURCES` and `SINKS` map a name to a class. Registering under a name is what
 makes `bt.read(path, format="myfmt")` and `ds.write(path, format="myfmt")` resolve to
 your class, and it is also how a worker rebuilds a reader from a `FileSplit`: the
 split ships the format *name*, not the object.
@@ -321,3 +321,5 @@ The same trick applies to a custom source over an object store: yield handles fr
   repeatedly, without re-reading what it already saw.
 - [Multimodal ingest benchmark](../benchmarks/multimodal-ingest.md): the reference-row
   pattern measured against the alternatives.
+- [Agent skills](../agents/index.md): `add-an-io-format-or-connector`, the ordered
+  procedure and the tests a new connector must carry.

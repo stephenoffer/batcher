@@ -141,16 +141,26 @@ def test_delta_sharing_url_validation() -> None:
 
 
 def test_missing_backend_raises_actionable_error(monkeypatch) -> None:
-    import builtins
+    """A missing driver must surface the extra that installs it, not a bare ImportError.
 
-    real_import = builtins.__import__
+    Blocks `importlib.import_module`, which is the layer `_internal.optional.require`
+    actually calls. Blocking `builtins.__import__` instead made this test order-dependent:
+    `import_module` returns a module already in `sys.modules` *without* consulting
+    `__import__`, so once any earlier test had imported deltalake (it is installed here)
+    the block was bypassed, `require` succeeded, and no `BackendError` was raised. It
+    passed alone and failed in a full run — for a reason that had nothing to do with the
+    behavior under test.
+    """
+    import importlib
+
+    real_import_module = importlib.import_module
 
     def _block(name, *args, **kwargs):
         if name == "deltalake" or name.startswith("deltalake."):
             raise ImportError("no deltalake")
-        return real_import(name, *args, **kwargs)
+        return real_import_module(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", _block)
+    monkeypatch.setattr(importlib, "import_module", _block)
     with pytest.raises(BackendError, match=r"\[delta\]"):
         DeltaSource("/tmp/t").schema()
 

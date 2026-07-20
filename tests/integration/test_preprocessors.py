@@ -203,3 +203,30 @@ def test_multihot_encoder_indicators():
     assert out["tags_a"] == [1, 0, 1]
     assert out["tags_b"] == [1, 1, 0]
     assert out["tags_c"] == [0, 1, 0]
+
+
+def test_target_encoder_smoothing_matches_m_estimate():
+    from batcher.ml.preprocessors import TargetEncoder
+
+    # a: 3 rows, target mean 1.0; b: 2 rows, target mean 0.0; prior = 3/5 = 0.6
+    ds = bt.from_pydict({"c": ["a", "a", "a", "b", "b"], "y": [1.0, 1.0, 1.0, 0.0, 0.0]})
+    m = 10.0
+    prior = 0.6
+    enc = TargetEncoder(["c"], "y", smoothing=m).fit(ds)
+    assert enc.prior_ == pytest.approx(prior)
+    exp_a = (3 * 1.0 + m * prior) / (3 + m)
+    exp_b = (2 * 0.0 + m * prior) / (2 + m)
+    got = enc.transform(ds).collect().to_pydict()["c"]
+    assert got[:3] == pytest.approx([exp_a] * 3)
+    assert got[3:] == pytest.approx([exp_b] * 2)
+
+
+def test_target_encoder_unseen_maps_to_prior():
+    from batcher.ml.preprocessors import TargetEncoder
+
+    train = bt.from_pydict({"c": ["a", "a", "b", "b"], "y": [1.0, 1.0, 0.0, 0.0]})
+    enc = TargetEncoder(["c"], "y", smoothing=0.0).fit(train)  # no smoothing → raw means
+    test = bt.from_pydict({"c": ["a", "b", "zzz", None]})
+    got = enc.transform(test).collect().to_pydict()["c"]
+    # a→1.0, b→0.0, unseen and null → prior (global mean 0.5)
+    assert got == pytest.approx([1.0, 0.0, 0.5, 0.5])

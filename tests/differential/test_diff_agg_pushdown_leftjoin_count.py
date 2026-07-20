@@ -22,8 +22,8 @@ from batcher.kyber.rules import agg_pushdown
 bt = pytest.importorskip("batcher")
 duckdb = pytest.importorskip("duckdb")
 
+from _harness import assert_same  # noqa: E402
 from batcher import col  # noqa: E402
-from conftest import assert_same  # noqa: E402
 
 
 @pytest.fixture

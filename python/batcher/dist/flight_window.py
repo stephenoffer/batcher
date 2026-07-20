@@ -26,6 +26,7 @@ from batcher.dist.executors.ray_runtime import (
 )
 from batcher.dist.fleet import acquire_fleet, release_fleet
 from batcher.dist.flight_aggregate import _shuffle_credits
+from batcher.dist.flight_worker import current_plan_id
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Window
 
@@ -90,7 +91,7 @@ def execute_window_flight(
         addrs, dead = map_barrier(
             workers,
             lambda host, src: actors[host].map_publish_raw.remote(
-                map_ir, key_names, parts[src], n_buckets, 0, src
+                map_ir, key_names, parts[src], n_buckets, 0, src, 0, current_plan_id()
             ),
         )
 
@@ -160,7 +161,9 @@ def _window_reduce_with_recovery(
 
         def _launch(r: int, avoid: set[int]):
             host = _host_for(r, avoid)
-            ref = actors[host].reduce_window.remote(win_json, addrs, r)
+            ref = actors[host].reduce_window.remote(
+                win_json, addrs, r, None, None, current_plan_id()
+            )
             ref_host[ref] = host
             return ref
 
@@ -196,7 +199,7 @@ def _window_reduce_with_recovery(
             target = _pick_live({src})
             addrs[src] = ray.get(
                 actors[target].map_publish_raw.remote(
-                    map_ir, key_names, parts[src], n_buckets, 0, src
+                    map_ir, key_names, parts[src], n_buckets, 0, src, 0, current_plan_id()
                 )
             )
 

@@ -54,19 +54,19 @@ Consequences worth internalizing:
 
 An `Int32` overflow that would have wrapped in another engine does not wrap here, because
 the arithmetic runs in 64 bits. A `Float32` sum accumulates in double precision, so it
-differs (slightly, and for the better) from a `Float32` engine's answer.
+differs slightly from a `Float32` engine's answer, and it is the more accurate of the two.
 
 :::{warning}
-A schema assertion copied from a pandas or Spark test will fail on the type *name*, and
-it will look like a data bug when it is not one. `int32` in the file is `int64` in the
+A schema assertion copied from a pandas or Spark test fails on the type *name*, and it
+reads as a data bug when it is not one. `int32` in the file is `int64` in the
 `Dataset`, every time. Assert on the value, or assert on `int64`.
 :::
 
 ## Getting narrow types back on output
 
 By default, output types match `Dataset.schema` exactly: what you see before running is
-what you get after. If a narrow output column matters (you are writing Parquet and want
-the smaller footprint), turn on `shrink_output_dtypes`. A pass-through of a narrow
+what you get after. If a narrow output column matters, because you are writing Parquet
+and want the smaller footprint, turn on `shrink_output_dtypes`. A pass-through of a narrow
 *source* column is then cast back to its source width where that is lossless.
 
 ```python
@@ -85,8 +85,9 @@ type of a computed column. `cast` that one explicitly.
 :::{note}
 The re-narrowing happens on the way out of the engine, so a `collect()` with no operations
 at all (`bt.from_arrow(t).collect()`, a bare scan) skips it and hands back the normalized
-`Int64`. Any real query — a `select`, a `filter`, anything — takes the engine path and
-narrows. If you want the narrow type from a bare scan, project the columns.
+`Int64`. Any real query takes the engine path and narrows, whether that is a `select`, a
+`filter`, or anything else. If you want the narrow type from a bare scan, project the
+columns.
 :::
 
 ## cast and try_cast
@@ -145,7 +146,7 @@ print(ds.select(small=bt.col("i32").cast("int32")).schema)
 ```
 
 `ds.cast({"col": "type"})` casts several columns at once, and `strict=False` makes the
-whole set behave like `try_cast`.
+whole set behave the way `try_cast` does.
 
 ```python
 print(ds.cast({"i32": "float64", "i8": "string"}).schema)
@@ -158,8 +159,8 @@ print(ds.cast({"i32": "float64", "i8": "string"}).schema)
 
 ## Null is absence, NaN is a value
 
-They are not the same thing and no operator conflates them. A null has no value; a NaN
-is a float that is the result of `0.0 / 0.0`. `is_null()` never sees a NaN, and
+They are not the same thing and no operator conflates them. A null has no value. A NaN
+is a float, the result of an operation such as `0.0 / 0.0`. `is_null()` never sees a NaN, and
 `fill_null()` never replaces one. `fill_nan()` does.
 
 ```python

@@ -6,8 +6,8 @@ different schemas under one path.
 
 :::{warning}
 Nothing in your pipeline errors. Under the default `schema_mode="strict"`, the reader
-takes the first file's schema as the truth for the whole directory, and the new column is
-simply not in the result. The row counts are right, the sums are right, and a column of
+takes the first file's schema as the truth for the whole directory, and the added column is
+not in the result. The row counts are right, the sums are right, and a column of
 data is missing.
 :::
 
@@ -38,7 +38,7 @@ pq.write_table(
 
 `schema_mode` defaults to `"strict"`, and strict means *the first file's schema stands
 for the whole directory*. It does not check the others. Read the directory and `region`
-is simply not there:
+is not there:
 
 ```python
 print(bt.read.parquet(raw).columns)
@@ -71,7 +71,7 @@ in first-seen order, each promoted to the common supertype of its occurrences, a
 column a given file lacks is filled with NULL for that file's rows.
 
 The old rows get `region = NULL`, which is the honest answer. They were written before
-the column existed; nobody knows what region they were.
+the column existed, and nobody knows what region they were.
 
 Type promotion follows a lattice, not a coin flip. NULL adopts the other side, integers
 widen to `int64`, floats to `float64`, an int/float mix promotes to `float64`. So the
@@ -95,7 +95,7 @@ The whole lattice, since it is the thing deciding what your column ends up as:
 | `int32` and `int64` | `int64` |
 | `float32` and `float64` | `float64` |
 | an integer and a float | `float64` |
-| `int64` and `string` | nothing — the read fails |
+| `int64` and `string` | nothing, because the read fails |
 
 `schema_mode="latest"` is the other useful mode: the newest file's schema wins outright
 and older files are cast toward it. Reach for it when the newest file *is* the contract
@@ -183,7 +183,7 @@ print(bt.read.delta(narrow).sort("id").to_pydict())
 ```
 
 :::{tip}
-`merge_schema=True` is a widening operation only. It adds columns; it will not change a
+`merge_schema=True` is a widening operation only. It adds columns. It will not change a
 column's type. A type change is still a rewrite.
 :::
 

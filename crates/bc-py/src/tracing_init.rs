@@ -47,7 +47,12 @@ fn level_filter(level: &str) -> LevelFilter {
         "TRACE" => LevelFilter::TRACE,
         "DEBUG" => LevelFilter::DEBUG,
         "INFO" => LevelFilter::INFO,
+        "WARN" | "WARNING" => LevelFilter::WARN,
         "ERROR" | "CRITICAL" => LevelFilter::ERROR,
+        // `observability.verbosity="silent"` asks for no data-plane tracing at all. Without
+        // this arm "OFF" fell through to the catch-all and enabled WARN — so the quietest
+        // setting still paid to emit and filter events, and "silent" was not silent here.
+        "OFF" | "NONE" => LevelFilter::OFF,
         _ => LevelFilter::WARN,
     }
 }

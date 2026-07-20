@@ -23,7 +23,7 @@ a win.
 ## No generated data — established public sources only
 
 The suite **never generates data**. Every table is read from a canonical public
-parquet location and normalized once (`sources.py`) so all engines see identical
+parquet location and normalized once (`sources/`) so all engines see identical
 inputs:
 
 | Dataset    | Default source                                                                 | Access |
@@ -63,7 +63,7 @@ layout the only variable:
 At scale 1 and 10 all three hold an **identical row count** (8,388,608 and 83,886,080),
 so the `_ms` columns are comparable across families. At scale 100 and above the
 many-small corpus is *not* row-count-equivalent (it mixes in a few ~133 MiB files, which
-`sources.py` filters to keep the layout genuinely many-small), so there the cross-family
+`sources/` filters to keep the layout genuinely many-small), so there the cross-family
 comparison is indicative and the per-engine one within a family still exact.
 
 Nine shapes run against each layout, chosen to separate the costs a layout moves:
@@ -191,7 +191,7 @@ engine adapter already has a `read_parquet`.
 benchmarks/
   harness.py     correctness check + best-of-N timing (the measurement core)
   registry.py    the benchmark registry, the suite(...) decorator, and sql_case
-  sources.py     established public parquet sources (no data generation)
+  sources/       established public parquet sources (no data generation)
   context.py     loads a benchmark's tables once, serves every engine
   engines/       one adapter per engine, behind a common contract
     base.py  lineup.py  batcher.py  duckdb.py  polars.py  pyarrow.py
@@ -203,9 +203,11 @@ benchmarks/
     multimodal/  unstructured ingest: images.py (list/decode/resize) vs Ray Data + Daft
   cluster/       distributed GPU multimodal benchmarks (inference/LLM/audio/video) vs Ray
   run.py         the CLI: select engines, load data, run, report
-  distributed.py             single-node == many-partition equivalence + timing
-  optimizer_bench.py         Kyber planning latency as the rule set grows
-  shuffle_vs_object_store.py Arrow Flight shuffle vs the Ray object store
+  internals/     benchmarks of Batcher's own subsystems, with their own reporting
+    distributed.py             single-node == many-partition equivalence + timing
+    optimizer_bench.py         Kyber planning latency as the rule set grows
+    metadata_bench.py          metadata-answered queries vs the O(rows) computation
+    shuffle_vs_object_store.py Arrow Flight shuffle vs the Ray object store
 ```
 
 ### Adding a benchmark
@@ -315,11 +317,11 @@ rows have been verified to match the reference engine. `PARTIAL` means an engine
 lineup legitimately could not express that query (e.g. Polars' SQL subset, PyArrow on
 the SQL suites) — the verified engines still agreed.
 
-## distributed.py: single-node vs many-partition equivalence
+## internals/distributed.py: single-node vs many-partition equivalence
 
 ```bash
-python3 benchmarks/distributed.py            # TPC-H scale 1, 8 partitions
-python3 benchmarks/distributed.py 10 16      # scale 10, 16 partitions
+python3 benchmarks/run.py --benchmark distributed        # TPC-H scale 1, 8 partitions
+python3 benchmarks/internals/distributed.py 10 16        # scale 10, 16 partitions
 ```
 
 Each query runs single-node and again across several partitions via

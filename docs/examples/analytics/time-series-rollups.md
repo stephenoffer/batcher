@@ -119,7 +119,7 @@ Five rows, one per day, and June 3rd says zero out loud.
 :::{important}
 Be deliberate about the fill. Zero is right for a count or a sum, because "no orders"
 really is zero revenue. It is wrong for an average, a price, or a gauge: the temperature
-on a day your sensor was offline was not 0°C. For those, leave the null, or carry the last
+on a day your sensor was offline was not 0 degrees. For those, leave the null, or carry the last
 known value forward with `col("x").forward_fill(order_by=["day"])`.
 :::
 
@@ -132,7 +132,7 @@ print(smoothed.select("day", "revenue", "ma3").to_pydict()["ma3"])
 ```
 
 Three rows *is* three days now, because the spine guarantees it. The leading rows average
-a partial frame, which is what SQL does; pass `min_periods=3` if you would rather they be
+a partial frame, which is what SQL does. Pass `min_periods=3` if you would rather they be
 null than half-formed.
 
 The whole argument of the page, in one table:

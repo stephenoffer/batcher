@@ -8,18 +8,18 @@ batch.
 ## Reading order
 
 1. [Getting started](../getting-started/index.md): install and run a first query.
-2. [Your first pipeline](../tutorials/first-pipeline.md): the data flow a model
+1. [Your first pipeline](../tutorials/first-pipeline.md): the data flow a model
    plugs into.
-3. [Batch inference](../tutorials/batch-inference.md): the `.ml.map_batches`
+1. [Batch inference](../tutorials/batch-inference.md): the `.ml.map_batches`
    pattern.
-4. [Feature engineering](../tutorials/feature-engineering.md): build a model-ready
+1. [Feature engineering](../tutorials/feature-engineering.md): build a model-ready
    feature matrix with fit/transform preprocessors.
-5. [ML overview](../ml/index.md): the accessor and its operations.
-6. [Inference](../ml/inference.md): `ds.ml.infer` and `ds.ml.embed`.
-7. [GPU execution](../ml/gpu.md): reserving and sharing GPUs.
-8. [PyTorch integration](../ml/pytorch.md).
-9. [Streaming](../ml/streaming.md): processing batches as a stream.
-10. [ML API reference](../api/ml.md).
+1. [ML overview](../ml/index.md): the accessor and its operations.
+1. [Inference](../ml/inference.md): `ds.ml.infer` and `ds.ml.embed`.
+1. [GPU execution](../ml/gpu.md): reserving and sharing GPUs.
+1. [PyTorch integration](../ml/pytorch.md).
+1. [Streaming](../ml/streaming.md): processing batches as a stream.
+1. [ML API reference](../api/ml.md).
 
 ## Example: map a function over batches
 
@@ -116,7 +116,7 @@ Why the device idles, and what stage-overlap does about it.
 ::::
 
 :::{seealso}
-- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md) — ten workload families, measured.
+- [AI and GPU benchmarks](../benchmarks/ai-and-gpu.md): ten workload families, measured.
 - [PyTorch](../integrations/pytorch.md) and [Hugging Face](../integrations/huggingface.md).
-- [Tensor columns](../deep-dives/tensor-columns.md) — how an image becomes a column.
+- [Tensor columns](../deep-dives/tensor-columns.md): how an image becomes a column.
 :::

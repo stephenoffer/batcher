@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 _BASE = dt.datetime(2024, 1, 1, 0, 0, 0)
@@ -34,8 +35,6 @@ _DUCK_INTERVAL = {"1h": "1 hour", "30m": "30 minutes", "15m": "15 minutes", "20m
 
 @pytest.mark.parametrize("width", ["1h", "30m", "15m"])
 def test_tumbling_window_matches_duckdb(duck, width):
-    from conftest import assert_same
-
     tbl = _data()
     got = (
         bt.from_arrow(tbl)
@@ -53,8 +52,6 @@ def test_tumbling_window_matches_duckdb(duck, width):
 
 @pytest.mark.parametrize(("width", "slide"), [("1h", "30m"), ("1h", "20m")])
 def test_sliding_window_matches_duckdb(duck, width, slide):
-    from conftest import assert_same
-
     tbl = _data()
     got = (
         bt.from_arrow(tbl)

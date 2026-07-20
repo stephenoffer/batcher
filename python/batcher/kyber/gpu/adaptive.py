@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher.config import active_config
+from batcher.kyber.ols import fit_ols, ols_update
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
@@ -28,17 +29,10 @@ if TYPE_CHECKING:
 __all__ = ["learned_gpu_min_rows", "record_backend_timing"]
 
 _NS = "gpu_backend_xover"
-# Trust the fit only after enough spread-out samples per backend — single-run timings are noisy,
-# so a handful of points can swing the intercept wildly. This keeps the (already well-chosen)
-# config default in charge until there is real evidence, and the loop stays conservative.
-_MIN_SAMPLES = 8
-# And even then, clamp the learned crossover to a band around the config default, so one bad
-# early fit can only nudge the threshold within a bounded range, never send it to an absurd value.
+# Clamp the learned crossover to a band around the config default, so one bad early fit can
+# only nudge the threshold within a bounded range, never send it to an absurd value. (The
+# sample-count and spread gates that decide whether a fit is usable at all live in `kyber.ols`.)
 _BAND = 8.0  # learned ∈ [default / _BAND, default * _BAND]
-# The x-spread a bucket needs, as a fraction of its magnitude, before a line is identifiable
-# from it. 1% of the largest observed input: enough that `n*sxx - sx*sx` is signal rather than
-# float noise, and easily cleared by any bucket that has genuinely seen different input sizes.
-_MIN_RELATIVE_SPREAD = 0.01
 
 
 def record_backend_timing(hub: MetadataHub | None, backend: str, rows: int, wall_ms: float) -> None:
@@ -47,49 +41,15 @@ def record_backend_timing(hub: MetadataHub | None, backend: str, rows: int, wall
         return
     try:
         s = hub.get_keyed_param(_NS, backend) or {}
-        x, y = float(rows), float(wall_ms)
-        hub.put_keyed_param(
-            _NS,
-            backend,
-            {
-                "n": int(s.get("n", 0)) + 1,
-                "sx": float(s.get("sx", 0.0)) + x,
-                "sy": float(s.get("sy", 0.0)) + y,
-                "sxx": float(s.get("sxx", 0.0)) + x * x,
-                "sxy": float(s.get("sxy", 0.0)) + x * y,
-                # track the row-count spread so the fit is only trusted once the samples
-                # actually span a range (two runs at the same size can't fix a slope).
-                "xmin": min(float(s.get("xmin", x)), x),
-                "xmax": max(float(s.get("xmax", x)), x),
-            },
-        )
+        hub.put_keyed_param(_NS, backend, ols_update(s, float(rows), float(wall_ms)))
     except Exception:  # pragma: no cover - learning must never break a query
         return
 
 
-def _fit(s: dict) -> tuple[float, float] | None:
-    """`(intercept_ms, slope_ms_per_row)` from a backend's OLS sufficient statistics, or `None`
-    when there aren't enough spread-out samples to identify a line."""
-    n = int(s.get("n", 0))
-    xmin, xmax = float(s.get("xmin", 0.0)), float(s.get("xmax", 0.0))
-    if n < _MIN_SAMPLES or xmax <= xmin:
-        return None
-    # The spread must be **relative**, not merely non-zero. `denom = n*sxx - sx*sx` is the
-    # unstable textbook form: with runs clustered near one input size, `n*sxx` and `sx*sx` agree
-    # to ~14 significant digits and their difference is float noise. The `denom <= 0` guard below
-    # catches the negative half of that noise but not the small-positive half, so an *absolute*
-    # `xmax > xmin` let a garbage line through. Measured: 8 runs at ~10M rows spread over 3 rows,
-    # with ±0.5 ms of ordinary timing jitter on a 100 ms measurement, fit intercept 954,873 (true
-    # 100) and a sign-flipped slope — and that intercept is the whole numerator of the crossover.
-    if xmax - xmin < _MIN_RELATIVE_SPREAD * abs(xmax):
-        return None
-    sx, sy, sxx, sxy = s.get("sx", 0.0), s.get("sy", 0.0), s.get("sxx", 0.0), s.get("sxy", 0.0)
-    denom = n * sxx - sx * sx
-    if denom <= 0.0:
-        return None
-    slope = (n * sxy - sx * sy) / denom
-    intercept = (sy - slope * sx) / n
-    return intercept, slope
+# `(intercept_ms, slope_ms_per_row)` for a backend, or None when the samples are too few or
+# too clustered to identify a line. Shared with the broadcast/sort-merge crossovers, which
+# fold the same statistics — the two copies of this fit had already diverged once.
+_fit = fit_ols
 
 
 def learned_gpu_min_rows(hub: MetadataHub | None) -> int | None:

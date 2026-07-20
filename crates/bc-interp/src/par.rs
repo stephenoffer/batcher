@@ -226,13 +226,20 @@ enum Admit {
 /// estimate cannot enforce on its own. With no envelope (the default) `op_budget`
 /// is `None`, so it always admits with no accounting and the fast path is unchanged.
 impl ExecOptions {
-    /// Worker threads this query may use — `parallelism`, or the rayon pool's width when it is
-    /// `0` ("all available cores"). The streaming executor shards its driving scan by this.
+    /// Worker threads this query may use — `parallelism`, or the machine's available cores when
+    /// it is `0` ("all available cores"). The streaming executor shards its driving scan by this.
+    ///
+    /// Reads `available_parallelism` rather than `rayon::current_num_threads` deliberately. The
+    /// latter reports the *global* pool's width, and on a Ray worker that pool is built before
+    /// the actor's CPU affinity is applied and so is stuck at one thread (the throttle
+    /// [`execute_parallel_with_metrics`] documents). Sizing the shard count from it would inherit
+    /// that mistake and split a whole partition into a single shard; `available_parallelism`
+    /// reads the affinity that has since landed.
     pub fn workers(&self) -> usize {
         if self.parallelism > 0 {
             self.parallelism
         } else {
-            rayon::current_num_threads()
+            bc_arrow::usable_cores()
         }
     }
 }
@@ -344,9 +351,7 @@ fn auto_width(opts: &ExecOptions, sources: &[Vec<RecordBatch>], plan: &RelOp) ->
     if opts.parallelism > 0 {
         return opts.parallelism;
     }
-    let cores = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1);
+    let cores = bc_arrow::usable_cores();
     if plan.contains_media_decode() {
         return cores.max(1);
     }
@@ -447,9 +452,7 @@ fn pin_threads_enabled() -> bool {
 /// best-effort and never errors out of execution.
 #[cfg(target_os = "linux")]
 fn pin_current_thread(idx: usize) {
-    let n = std::thread::available_parallelism()
-        .map(|x| x.get())
-        .unwrap_or(1);
+    let n = bc_arrow::usable_cores();
     let core = idx % n;
     // SAFETY: a zeroed `cpu_set_t` is a valid empty set; `CPU_SET` sets one valid
     // core index (`< n`), and `sched_setaffinity(0, ...)` targets the current thread
@@ -559,13 +562,15 @@ fn exec(
             input,
             column,
             alias,
+            outer,
+            index_alias,
         } => {
             let parts = exec(input, sources, opts, m, ids)?;
             let rows_in = count_rows(&parts);
             let t0 = Stopwatch::start();
             let out: Vec<RecordBatch> = parts
                 .par_iter()
-                .map(|b| ops::unnest_batch(b, column, alias))
+                .map(|b| ops::unnest_batch(b, column, alias, *outer, index_alias.as_deref()))
                 .collect::<Result<_, InterpError>>()?;
             // Unnest multiplies rows (a list of N explodes one row into N), so a
             // within-budget input morsel can produce an over-budget output morsel.
@@ -1378,6 +1383,13 @@ fn exec(
                 });
                 if eligible {
                     let right = ops::materialize(&right_batches)?;
+                    // NOT morselized, unlike the planner-chosen broadcast above. Measured:
+                    // doing so here is a 4% geomean REGRESSION across TPC-H (10 queries worse,
+                    // 4 better). This branch is reached after the planner picked `Hash`, so the
+                    // probe has come through a filter/project that already re-morselized it —
+                    // the extra pass buys no parallelism and costs a copy. The other site is
+                    // fed straight from a scan, which is why it needs the split and this
+                    // does not.
                     if let Some(out) = broadcast_join_streaming(
                         &left_batches,
                         &right,
@@ -3273,12 +3285,22 @@ mod tests {
                     input: Box::new(Expr::Col { name: "k".into() }),
                     width: Some(224),
                     height: Some(224),
+                    mean: None,
+                    std: None,
+                    channels_first: false,
                 },
                 alias: "img".into(),
             }],
         };
-        let cores = std::thread::available_parallelism().map_or(1, |v| v.get());
-        assert_eq!(auto_width(&opts, one_morsel, &decode), cores.max(1));
+        // "All cores" means the cores this process may actually *use*: `usable_cores` caps
+        // `available_parallelism` by the cgroup CPU quota. Asserting against the raw
+        // `available_parallelism` would pin the oversubscription this lift used to cause on a
+        // quota-throttled node — the media path is exactly where it hurts, since it lifts the
+        // morsel cap specifically to take every core.
+        assert_eq!(
+            auto_width(&opts, one_morsel, &decode),
+            bc_arrow::usable_cores()
+        );
         // An explicit parallelism still wins over the media lift (control-plane decision).
         let pinned = ExecOptions {
             parallelism: 3,
@@ -4236,6 +4258,8 @@ mod tests {
         }
 
         let plan = RelOp::Unnest {
+            outer: false,
+            index_alias: None,
             input: Box::new(RelOp::Scan { source_id: 0 }),
             column: "xs".into(),
             alias: "x".into(),

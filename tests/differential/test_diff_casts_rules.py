@@ -15,9 +15,9 @@ import pytest
 
 import batcher as bt
 import batcher.kyber.rules.extra.casts  # registers the rules into DEFAULT_REGISTRY
+from _harness import assert_same
 from batcher import col, lit, when
 from batcher.plan.expr_ir import Binary
-from conftest import assert_same
 
 
 @pytest.fixture

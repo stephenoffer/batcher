@@ -153,6 +153,23 @@ pub enum RelOp {
         /// Output column name for the exploded element (defaults to `column` on the
         /// control-plane side).
         alias: String,
+        /// Keep a row whose list is null or empty, with a NULL element (Spark
+        /// `explode_outer`, SQL `LEFT JOIN LATERAL … ON true`). Default `false` is the
+        /// DuckDB `UNNEST` semantics: such a row contributes nothing.
+        ///
+        /// This matters for document pipelines: with the default, a document that
+        /// chunked to nothing vanishes from the relation entirely, taking its id and
+        /// metadata with it — invisible row loss rather than an error.
+        #[serde(default)]
+        outer: bool,
+        /// When set, also emit this column holding each element's 0-based position
+        /// within its list (Spark `posexplode`). NULL for a row kept only by `outer`,
+        /// which has no element and therefore no position.
+        ///
+        /// 0-based to match `RowId`/`with_row_index`, not the 1-based SQL `WITH
+        /// ORDINALITY` — one convention per engine beats matching each source dialect.
+        #[serde(default)]
+        index_alias: Option<String>,
     },
 
     /// Append a 0-based (plus `offset`) sequential row-index column over the input,
@@ -376,7 +393,9 @@ pub struct WindowFrame {
 
 /// Frame units. `Rows` counts physical rows; `Range`/`Groups` count peer groups
 /// (rows with an equal ORDER BY value). `Range` supports peer bounds (CURRENT ROW /
-/// UNBOUNDED); a numeric `RANGE` offset falls back to the default running frame.
+/// UNBOUNDED) only; a numeric `RANGE` offset is value-based and is *rejected* by the
+/// interpreter rather than approximated, since substituting the peer frame would
+/// silently return wrong rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameUnits {

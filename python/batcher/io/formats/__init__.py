@@ -16,9 +16,11 @@ import batcher.io.formats.lakehouse
 import batcher.io.formats.ml
 import batcher.io.formats.multimodal
 import batcher.io.formats.nosql
+import batcher.io.formats.robotics
 import batcher.io.formats.sql
 import batcher.io.formats.streaming  # noqa: F401
 from batcher.io.formats.base import SINKS, SOURCES, SinkFormat, SourceFormat
+from batcher.io.formats.robotics import MCAP_SCHEMA, MDF_SCHEMA, MCAPSource, MDFSource
 from batcher.io.formats.semistructured import JSONSink, JSONSource
 from batcher.io.formats.structured import (
     CSVSink,
@@ -30,6 +32,8 @@ from batcher.io.formats.structured import (
 from batcher.io.formats.unstructured import BinarySource, TextSource
 
 __all__ = [
+    "MCAP_SCHEMA",
+    "MDF_SCHEMA",
     "SINKS",
     "SOURCES",
     "BinarySource",
@@ -37,6 +41,8 @@ __all__ = [
     "CSVSource",
     "JSONSink",
     "JSONSource",
+    "MCAPSource",
+    "MDFSource",
     "ParquetDatasetSource",
     "ParquetSink",
     "ParquetSource",

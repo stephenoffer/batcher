@@ -155,7 +155,16 @@ def llm_generate(
             usage=usage,
         )
 
-    pool = InferencePool(make_worker, num_workers=num_workers, target_batch_rows=target_batch_rows)
+    # Offline bulk generation is the throughput objective: engage the hill-climbing
+    # autobatcher (as `embed` does) so more prompts reach the engine's scheduler per step —
+    # under the default "latency" objective, with no `target_latency_ms`, no controller ran
+    # and the batch size was fixed.
+    pool = InferencePool(
+        make_worker,
+        num_workers=num_workers,
+        target_batch_rows=target_batch_rows,
+        objective="throughput",
+    )
     yield from pool.run(batches)
 
 
@@ -275,6 +284,20 @@ def _usage_columns(engine: object, n: int):
 
     reported = getattr(engine, "last_usage", None)
     pairs = list(reported) if reported is not None else [None] * n
+    if len(pairs) != n:
+        # Otherwise this surfaces far from its cause, as an opaque "arrays must all be
+        # the same length" from `RecordBatch.from_arrays`, with nothing naming the
+        # engine. A mismatch means the engine reported usage for a different number of
+        # requests than it returned outputs for, which would silently misalign every
+        # token count against its row.
+        from batcher._internal.errors import BackendError
+
+        msg = (
+            f"{type(engine).__name__}.last_usage reported {len(pairs)} usage pairs for "
+            f"{n} generated outputs; they must correspond one-to-one and in prompt "
+            "order. Pass usage=False to skip token accounting for this engine."
+        )
+        raise BackendError(msg)
     prompt = [p[0] if p else None for p in pairs]
     completion = [p[1] if p else None for p in pairs]
     return pa.array(prompt, type=pa.int64()), pa.array(completion, type=pa.int64())

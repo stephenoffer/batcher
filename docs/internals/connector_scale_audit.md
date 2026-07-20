@@ -314,10 +314,24 @@ plan is cheap by definition) can pay for two. Same decision, inverted cost. Meas
 
 1. **Thread `predicate`/projection through `splits()` and `Split.read()`** — the opt-in
    machinery already exists; 52 sources just have to opt in. BigQuery is two lines and buys the
-   most. **This is now the single highest-value item.**
-2. **Make `iter_batches` actually stream** (S5) — drop the `list()` in
-   `io/base/source.py:224-225` and give the 16 non-streaming formats a real `_iter_file`. This
-   is what caps *file size*, and it currently holds 16 whole decoded files at once.
+   most. **Largely done since this audit:** 38 of 57 sources now accept a predicate. The
+   multimodal sources were the remaining gap and now prune on the columns a *listing* already
+   knows (`uri`/`size`/`mime`, `io/formats/multimodal/_pruning.py`) — exact rather than
+   conservative, since those are the values themselves and not per-chunk bounds. Still
+   dropping it: `binary`, `text`, `lance`, `hdf5`, `zarr` and the streaming sources.
+2. **Make `iter_batches` actually stream** (S5) — **the spine is fixed.** The `list()` around
+   the per-file generator is gone, replaced by `io/base/_readahead.py`: an order-preserving
+   read-ahead bounded by *bytes* rather than by file count, because a file count says nothing
+   about memory when one row can be a 200 MB video. Measured **324 MB → 69 MB (4.7x)** on a
+   single 132 MB CSV, and now flat in file size. (The bound is per in-flight file, not global
+   — a single shared budget deadlocks, since the consumer only releases credit by draining the
+   *head* file.)
+
+   Real `_iter_file` implementations landed for **CSV, ORC, Arrow IPC, Avro** and **text
+   line-mode** (748 MB → 57 MB, 13x, on a 128 MB log). **Still whole-file:** xml, documents,
+   webdataset, tfrecord, msgpack, protobuf, excel, numpy, hdf5, zarr, point-cloud ASCII-PLY,
+   logs, binary and media. For those the byte bound still throttles *delivery*, but the decode
+   itself materializes one whole file per in-flight file.
 3. **Coalesce splits** (S1) and **raise/replace the 1,024-entry footer cache** (S3).
 4. **Delta `_partition_expressions` / `_pruned_dataset` / worker-side unpruned index** — the
    three that keep Delta from being the answer at 1M files.
@@ -325,3 +339,123 @@ plan is cheap by definition) can pay for two. Same decision, inverted cost. Meas
    `inspect.data_files()`; read the manifest through `lakehouse_manifest` like Delta does).
 6. **`eventhubs`** (cannot make progress at all) and **`kinesis`** (silent loss on reshard).
 7. **Metadata-only `schema()`** for the six SQL connectors that currently execute the query.
+
+## 7. Added since this audit
+
+Not gaps closed but capability that did not exist, all in the multimodal/unstructured path:
+
+- **Per-file error tolerance.** The IO layer had **zero** `try`/`except` in its read spine, so
+  one corrupt file aborted a 10,000-file read. `on_error="skip"` (file and media sources) drops
+  the file, records it, and carries on; `corrupt_files()` is the audit trail, because a
+  silently-partial read is worse than a loud failure.
+- **Byte-aware blob batching.** `MediaSource`/`BinarySource` batched by a fixed `batch_files=64`
+  and *discarded* the `target_size` argument to `splits()`. 64 videos was 12.8 GB in one batch.
+  Now bounded by count **and** bytes, with one shared chunking definition so `splits()`,
+  `read()` and `iter_batches()` cannot disagree — a disagreement would make a distributed read
+  return different batches from a single-node one.
+- **Media statistics.** A media source reported no `statistics()` at all and its splits carried
+  no `rows`, so Kyber planned a directory of 200 MB videos exactly like one of 4 KB thumbnails.
+  It now reports an exact row count, real `byte_size`, and an exact `size` zone map — all from
+  the listing and a stat the batching already performs.
+- **64-bit blob offsets.** Blob columns were `binary` (32-bit offsets), which overflows at 2 GB
+  *per batch* — reachable with 64 x 32 MB files. Now `large_binary`. This required teaching the
+  Rust image/audio kernels to accept both offset widths; they took `BinaryArray` only, so the
+  fix would otherwise have broken `.image.decode()` on exactly the inputs it exists for.
+- **Avro temporal/decimal writes.** The writer mapped every temporal and decimal Arrow type to
+  Avro `string`, and fastavro rejects `date`/`datetime`/`Decimal` values against a string
+  branch — so writing *any* such column raised. The reader had always mapped the logical types
+  back correctly; this is the write side of that map.
+- **Avro multi-branch unions.** `_arrow_type` mapped a union to its **first non-null branch**,
+  so `["null", "long", "string"]` was advertised as `int64` — and the read then *raised* an
+  opaque pyarrow conversion error, making a valid Avro file unreadable and pointing the reader
+  at pyarrow rather than at the mapping. Multi-branch unions are how Avro spells an evolving or
+  sum-typed field, so this is ordinary data, not a corner case. Now mapped to a struct with one
+  nullable `memberN` per branch — the same choice Spark's Avro reader makes — while the far
+  commoner `["null", T]` idiom stays exactly the nullable scalar it always was.
+- **SQL `schema()` no longer runs the query.** Every relational connector (ADBC, ODBC,
+  ClickHouse, ConnectorX, Databricks, Snowflake, BigQuery) answered `schema()` by executing the
+  user's query in full and reading `.schema` off the materialized table. The column names of a
+  billion-row join cost the billion-row join; and since the planner needs the schema *before* it
+  executes, an ordinary `read(...).filter(...).collect()` submitted the whole query **twice** —
+  on a per-query or per-byte-billed warehouse, a second real invoice for a discarded result.
+  Snowflake additionally *downloaded a result chunk from cloud storage*, and BigQuery opened and
+  drained stream 0 when `create_read_session` already returns the Arrow schema for free.
+  Now a zero-row `WHERE 1 = 0` probe (BigQuery: the session's own `arrow_schema`).
+  The probe result is *checked* (`probe_is_typed`) and falls back to the full read if a driver
+  returns untyped empty columns — a cheap-but-wrong `schema()` would be the same broken contract
+  the CSV and Avro fixes were about, reintroduced by the optimization meant to speed it up.
+  Both connectors also indexed `splits()[0]` unguarded, so an **empty relation** — which still
+  has columns — raised `IndexError` instead of reporting its schema.
+- **Delta change feed lost data on a partial read.** `DeltaStreamSource.iter_batches`
+  advanced `_cursor` to the latest version *before the first `yield`*, so
+  `snapshot_position()` reported a window as consumed while its batches were still inside an
+  unstarted generator. A consumer that checkpoints — which is the only reason
+  `snapshot_position`/`seek` exist — and then failed mid-drain resumed past data it never
+  saw. Measured: the consumer took one batch of 3 rows, and resuming from its own checkpoint
+  returned **0** of the remaining 3. The cursor now advances after the drain, making the
+  stream at-least-once: a failure replays the window, which is the correct failure mode for
+  a change feed and the one checkpointing consumers already handle.
+- **Delta `row_count()` raised on a log without `num_records`.** A writer is not obliged to
+  record it, and `_snapshot` already guards the same column for its zone maps. Reading it
+  unguarded turned a best-effort statistic — a number the planner can do without — into a
+  `KeyError` that failed the query. Now degrades to `None`.
+- **Delta Sharing discarded the server's zone maps.** `_stats_manifest` built its table with
+  `pa.Table.from_pylist`, which takes its column set from the **first dict alone**. A shared
+  table whose first file carries no `stats` lost every `min.`/`max.`/`null_count.` column,
+  for the whole table, silently — so nothing was ever pruned. Rows are now normalized to the
+  union of keys first. (Fail-safe in direction, total in cost.)
+- **Delta Sharing re-fetched row counts it already had.** The split carried only the URL, so
+  `row_count()` opened a **pre-signed URL per split** to read a footer whose `numRecords` the
+  manifest had already parsed — serially, on the driver, on every planner balance. The split
+  now carries `rows`, as the sibling `DeltaFileSplit` always has.
+- **Iceberg loaded the same table twice per split.** `_scan()` calls `_table()`, and every
+  caller of `_scan()` called `_table()` again first — so an ordinary split read was two
+  catalog round trips plus two metadata-JSON fetches, and since `_source()` builds a fresh
+  source per split, a 1,000-split scan cost 2,000 of them before a byte of data moved.
+  `_table()` is now memoized on the source, which is the correct scope: a source is pinned
+  to one identifier and optionally one snapshot, so the table it names cannot change
+  underneath it within its own lifetime.
+- **Parquet page index: written, now read.** Row-group pruning is coarse — a row group is
+  ~1M rows, so a selective predicate still decoded one whole. The writer had always emitted
+  the ColumnIndex/OffsetIndex precisely so a reader could do better, and nothing read it
+  back. `bc-io::page_index` now turns a pushed predicate into a `RowSelection` over the
+  surviving pages: per-page min/max from the ColumnIndex, page→row ranges from the
+  OffsetIndex, `And` intersecting selections and `Or` unioning them. Measured on a 2M-row
+  single-row-group file, `k < 100`: **32,768 rows decoded instead of 2,000,000 (61x less),
+  67.1 ms → 3.8 ms (17.5x)**.
+
+  Superset-safe at every step, since the engine keeps its `Filter`: an undecidable leaf
+  contributes nothing, an `And` with an undecidable side keeps the other side, an `Or` with
+  one is `None` outright, and `None` at the root reads the group whole exactly as before.
+
+  **The first working build of this pruned nothing and every test passed.**
+  `ParquetObjectReader::get_metadata` ignores `ArrowReaderOptions::with_page_index` and
+  consults its own `preload_column_index`/`preload_offset_index` flags instead — so the
+  option compiled, ran, loaded no index, and left every page surviving. Correct results, a
+  green suite, a no-op feature. `test_pruning_actually_engages` asserts the decoder returns
+  fewer rows than the group holds, which is the only assertion that can tell the difference.
+- **Parquet bloom filters: now read.** Range pruning — footer stats and the page index — is
+  only as good as the data's clustering. On a **high-cardinality unordered** column every
+  page's `[min, max]` spans the domain, so an equality prunes nothing: measured on 2M random
+  keys in one row group, `k == <value>` kept **2,000,000 rows after page pruning, a 1.00x
+  reduction**. That is the shape blooms answer, and it is the common shape for join keys,
+  user ids and hashes. `bc-io::bloom` consults the bloom for equality terms and skips a row
+  group whose bloom proves the value absent.
+
+  Safe because a bloom has **no false negatives** — a negative verdict is definitive, and a
+  false positive merely decodes a group the engine's `Filter` then empties. The lattice is
+  the dual of the page index's: a conjunction is empty if *either* side is, a disjunction
+  only if *both* are.
+
+  The one way it could lose rows is a **physical-type mismatch**: the bloom hashes the
+  column's physical bytes, so probing an `i64` against an `INT32` bloom hashes different
+  bytes and can answer "absent" for a value that is present. Every probe therefore requires
+  an exact physical-type match and otherwise declines to prune.
+
+  Cost is bounded: a syntactic `has_eq` pre-check means a predicate with no equality never
+  triggers a fetch, and a column with no bloom costs no I/O at all (the offset is absent from
+  the footer the reader already holds). Batcher's own writer emits no blooms — the pinned
+  pyarrow has no option for it — so this is about reading Spark/Databricks/DuckDB-written
+  lakes well. The test fixture is therefore written from Rust, which is also what makes the
+  feature verifiable at all; an unverifiable pruner is how the page-index work first shipped
+  as a silent no-op.

@@ -1,131 +1,112 @@
 # Adaptive re-optimization
 
-Every cost-based optimizer runs on estimates, and estimates are wrong. A cardinality
-error compounds multiplicatively up a join tree, so a 10× miss at the leaves becomes a
-1000× miss at the root, and the plan you get is not merely suboptimal. It is planned for
-a different query.
+This page describes how Batcher re-plans a query while it runs, using row counts it measured rather than row counts it guessed.
+
+Every cost-based optimizer plans on estimates, and estimates are wrong. A cardinality error compounds multiplicatively up a join tree, so a 10x miss at the leaves becomes a 1000x miss at the root. The plan you get isn't merely suboptimal. It's a plan for a different query.
+
+Batcher's answer is to execute the plan one *pipeline breaker* at a time. A breaker has to materialize its input anyway, so at that point the engine isn't estimating the size of what it just processed. It counted it. Splicing the measured result back in as a source with an exact row count lets the optimizer re-plan the rest of the query against a fact.
+
+## How it compares to other engines
+
+Re-planning mid-query isn't unique to Batcher, and the honest comparison is narrower than it first looks.
 
 | System | When it re-plans |
 |---|---|
-| DuckDB | never — it optimizes once and lives with it |
-| Spark AQE | at stage boundaries, which means only where a shuffle already forced a materialization |
-| Batcher | at every pipeline breaker, on measured cardinalities |
+| DuckDB | Never. It optimizes once and runs that plan. |
+| Spark AQE | At stage boundaries, meaning only where a shuffle already forced a materialization. |
+| Batcher | At pipeline breakers, the same granularity as Spark AQE, and on a single node as well as on a cluster. |
 
-Batcher's answer: execute the plan one *pipeline breaker* at a time. A breaker has to
-materialize its input anyway, so at that point the engine is not estimating the size of
-what it just processed. It counted it. Splice the measured result back in as a source
-with an exact row count, and re-plan the rest.
+Batcher's loop is stage-boundary adaptation. It isn't finer-grained than Spark AQE, and the module that implements it says so in its own first line. What Batcher adds over Spark is that the loop runs single-node too, and that it sits alongside a sketch-backed cross-query learned-stats loop that neither DuckDB nor Spark has. See [Learned metadata](learned-metadata.md) for that second half.
+
+## Pipeline breakers
+
+A breaker is an operator that can't emit its first output row until it has consumed its whole input. `plan_surgery.py` names the seven of them in the module constant `BREAKERS`: `Aggregate`, `Sort`, `Distinct`, `Window`, `Limit`, `Join`, and `Union`. Everything else streams. A `Filter -> Project -> MapBatches` chain never segments, because there's nothing to materialize and nothing to count.
+
+Breakers are where the pipeline already stops, which is what makes them free places to measure.
+
+![A streaming Scan-Filter-Project pipeline feeding two pipeline breakers: the HashJoin build, then the Aggregate.](../_static/diagrams/pipeline_breakers.svg)
 
 ## The loop
 
-It lives in `python/batcher/api/adaptive.py`, in the `api` layer, and it is entirely
-Python. There is no Rust component; Rust returns per-operator metrics, and the control
-plane does the segmenting.
+The loop lives in `python/batcher/api/adaptive/`, in the `api` layer, and it's entirely Python. There's no Rust component. Rust returns per-operator metrics and the control plane does the segmenting. The package splits three ways: `staging.py` runs the loop, `gating.py` decides whether to be adaptive and whether an estimate held, and `plan_surgery.py` walks and rewrites the plan tree.
 
-Kyber optimizes the logical plan once, up front. Then:
+Kyber optimizes the logical plan once, up front. Then each round does the following:
 
-1. `_lowest_breaker(plan)` finds a breaker whose inputs are all breaker-free: the first
-   thing that must materialize.
-2. `_estimate_rows` asks Kyber's `CardinalityEstimator` how big it thinks that stage's
-   output will be. This is the prediction under test.
-3. `_run_stage` runs it through the full Kyber → Carbonite → Core sequence and gets back a
-   table.
-4. `_stage_row_count` reads `num_rows`. That is the measurement.
-5. The stage node is replaced with a `Scan` over the materialized result
-   (`_replace(plan, target, Scan(sid, schema))`), and the loop repeats.
+1. `plan_surgery.lowest_breaker(plan)` finds a breaker whose inputs are all breaker-free, which is the first thing that must materialize.
+1. `gating._estimate_rows` asks Kyber's `CardinalityEstimator` how big it thinks that stage's output will be. This is the prediction under test.
+1. `staging._run_stage` runs the stage through the full Kyber, Carbonite, Core sequence and gets back a table or a partitioned source.
+1. `staging._stage_row_count` reads the exact output rows. That's the measurement.
+1. `plan_surgery.replace` swaps the stage node for a `Scan` over the materialized result, and the loop repeats.
 
 ```text
    the optimized logical plan
-            │
-   ┌───────►│
-   │        ▼
-   │   _lowest_breaker(plan)        a breaker whose inputs are all breaker-free
-   │        │
-   │        ▼
-   │   _estimate_rows(stage)        Kyber's PREDICTION — the thing under test
-   │        │
-   │        ▼
-   │   _run_stage(stage)            Kyber → Carbonite → Core, one full round
-   │        │
-   │        ▼
-   │   _stage_row_count(table)      the MEASUREMENT. counted, not guessed.
-   │        │
-   │        ├─── inside the band? ──────►  break: run the whole residual plan in one shot
-   │        │      q-error ≤ 1 + optimizer.reoptimize_error   (default 2.0 → a 3× band)
-   │        │
-   │        ▼  outside the band
-   │   replace the stage node with Scan(the materialized result)
-   │        │
-   └────────┘
+            |
+   +------->|
+   |        v
+   |   lowest_breaker(plan)         a breaker whose inputs are all breaker-free
+   |        |
+   |        v
+   |   _estimate_rows(stage)        Kyber's PREDICTION, the thing under test
+   |        |
+   |        v
+   |   _run_stage(stage)            Kyber -> Carbonite -> Core, one full round
+   |        |
+   |        v
+   |   _stage_row_count(result)     the MEASUREMENT. counted, not guessed.
+   |        |
+   |        +--- inside the band? -----> break: run the whole residual plan in one shot
+   |        |      q-error <= 1 + optimizer.reoptimize_error   (default 2.0, a 3x band)
+   |        |
+   |        v  outside the band
+   |   replace the stage node with Scan(the materialized result)
+   |        |
+   +--------+
 ```
 
 :::{important}
-Step 5 is what makes this work. The spliced source is an `InMemorySource` with a known row
-count, so its cardinality carries `Provenance.EXACT`. The next iteration is not merely
-re-optimized; it is optimized on a plan where one subtree's size is *known*. Join order,
-build-side choice, and broadcast eligibility above that point are decided against a fact rather
-than a guess.
+Step 5 is what makes this work. A collected table is spliced back as an `InMemorySource` with a known row count, so its cardinality carries `Provenance.EXACT`. The next iteration isn't merely re-optimized. It's optimized on a plan where one subtree's size is *known*. Join order, build-side choice, and broadcast eligibility above that point are decided against a fact rather than a guess.
 :::
 
-The breakers are the module constant `_BREAKERS = (Aggregate, Sort, Distinct, Window,
-Limit, Join, Union)`. A `Filter → Project → MapBatches` chain never segments, because it
-streams; there is nothing to materialize and nothing to count.
+On the distributed path a stage can stay partitioned on disk or on the Flight fleet instead of collecting to the driver, and its `row_count` feeds the next round the same way. A large multi-stage query never funnels every breaker's output through driver memory.
 
-## The trigger, and why its polarity is backwards from what you'd expect
+## The trigger, and why its polarity runs backwards
 
-`_estimate_accurate` compares estimate against actual as a *symmetric q-error*:
+`gating._estimate_accurate` compares estimate against actual as a *symmetric q-error*:
 
 ```text
 max(actual/estimate, estimate/actual) <= 1.0 + optimizer.reoptimize_error
 ```
 
-with `reoptimize_error` defaulting to `2.0`, so the tolerance band is a 3× q-error in
-either direction. (Relative error was tried first and abandoned: `|actual − est| / est` is
-bounded by 1 for any over-estimate, so it called every over-estimate accurate.)
+`reoptimize_error` defaults to `2.0`, so the tolerance band is a 3x q-error in either direction. Relative error was tried first and abandoned. `|actual - est| / est` is bounded by 1 for any over-estimate, so it called every over-estimate accurate, and an over-estimate is exactly what the loop exists to catch.
 
 :::{note}
-Staging is not *triggered* by a bad estimate. Staging is the default, and a *good* estimate
-stops it: if a stage's measured rows land inside the band, the loop breaks and runs the whole
-residual plan in one shot. Inaccuracy is what keeps the loop paying for another round. That is
-backwards from what most readers of the code expect on their first pass.
+Staging isn't *triggered* by a bad estimate. Staging is the default, and a *good* estimate stops it. If a stage's measured rows land inside the band, the loop breaks and runs the whole residual plan in one shot. Inaccuracy is what keeps the loop paying for another round. That runs backwards from what most readers of the code expect on a first pass.
 :::
 
-That inverts the usual framing but it is the right economics. Each stage costs roughly
-20–40 ms of control plane. If the estimator is already tracking reality, buying another
-measurement is pure overhead. If it is not, every additional measurement is worth more
-than it costs.
+The economics justify the inversion. Each stage costs roughly 20 to 40 ms of control plane. If the estimator is already tracking reality, buying another measurement is pure overhead. If it isn't, every additional measurement is worth more than it costs.
 
-The consequence to be honest about: on a query whose estimates are accurate, the "adaptive
-loop" adapts at exactly one breaker and then behaves like a static optimizer. The claim
-"re-plans the rest of the query at every breaker" is true only while estimates keep
-missing, which, to be fair, is the case the mechanism exists for.
+The consequence worth being honest about: on a query whose estimates are accurate, the loop adapts at exactly one breaker and then behaves like a static optimizer. Re-planning at every breaker happens only while estimates keep missing, which is the case the mechanism exists for.
+
+The early exit has one guard. A residual plan that still has no one-shot distributed path, such as a 4-table bushy join, keeps staging regardless of accuracy, because the dispatcher would otherwise refuse it. The shortcut may skip re-optimization, never the staging a plan structurally requires.
 
 ## When it turns on
 
-`adaptive="auto"` is the default on `collect()`. `resolve_adaptive` turns it on when:
+`adaptive="auto"` is the default on `collect()`, and `gating.resolve_adaptive` turns it on in any of three cases:
 
-- the plan requires staging on the distributed path (a 3+-table star join, which the
-  one-shot dispatcher cannot handle); or
-- the plan has a join, its total scan rows clear `_ADAPTIVE_MIN_INPUT_ROWS` (20M, a
-  hard-coded module constant, not a config knob), and some join operand is non-streamable
-  with a merely-default-provenance estimate; or
-- the `MetadataHub` says it has helped for this plan signature before
-  (`learned_adaptive_helps`: the estimate flipped outside the band on ≥25% of at least 3
-  prior runs).
+- The plan requires staging on the distributed path, such as a 3-or-more-table star join that the one-shot dispatcher can't route at all. There staging isn't an optimization, it's the only distributed path.
+- The plan has a join, its total scan rows clear `_ADAPTIVE_MIN_INPUT_ROWS` (20,000,000, a hard-coded module constant in `gating.py` rather than a config knob), and some join operand is both non-streamable and sized by a merely-default-provenance estimate.
+- The `MetadataHub` says adaptivity has helped this plan signature before. `learned_adaptive_helps` requires at least 3 prior runs with the estimate flipping outside the band on at least 25% of them.
 
-So on a small query, adaptive is off and stays off. That floor exists because a
-sub-second query cannot afford a 40 ms staging round-trip to learn something it could have
-guessed. Below 20M rows you can still force it with `adaptive=True`.
+So on a small single-node query, adaptive is off and stays off. That floor exists because a sub-second query can't afford a staging round-trip to learn something it could have guessed. The gate reads exact source row counts, which separates scales cleanly: TPC-H sf1 is roughly 9M rows and stays off, sf10 is roughly 90M and turns on. Below 20M rows you can still force it with `adaptive=True`.
 
 ## Two feedback loops, one measurement layer
 
-The adaptive loop's measurement is just a row count. It is not the only thing Core
-measures, and the second loop is the more consequential one over time.
+The adaptive loop's measurement is a row count. It isn't the only thing Core measures, and the second loop is the more consequential one over time.
 
 ::::{tab-set}
 :::{tab-item} Within-query (this page)
 ```text
-measurement:  num_rows of the stage just materialized
+measurement:  the exact output rows of the stage just materialized
 consumer:     the next iteration of the staging loop
 effect:       the residual plan is re-optimized against an EXACT row count
 lifetime:     one collect()
@@ -141,13 +122,12 @@ measurement:  ExecMetrics { ops: Vec<OpMetric> } from execute_plan_metered
 consumer:     the MetadataHub, via core/executor.py::_record_op_feedback
 effect:       per-signature cardinality correction, calibrated cost coefficients,
               memory sized from measured peaks
-lifetime:     the process, or forever with a durable backend
+lifetime:     the process, or longer with a durable backend
 ```
 :::
 ::::
 
-They share the measurement plumbing and nothing else. The across-query half is what makes plans
-improve the more a query shape is run; see [Learned metadata](learned-metadata.md).
+They share the measurement plumbing and nothing else. The across-query half is what makes plans improve the more a query shape runs. Each adaptive run also folds its own outcome back in: `gating._record_adaptive_flip` records whether any stage's measured size diverged from its estimate, which is what `learned_adaptive_helps` reads on the next run.
 
 ## Watching it work
 
@@ -164,45 +144,41 @@ print(q.explain(analyze=True))
 
 :::{dropdown} The `analyze=True` output, estimate against actual
 ```text
-aggregate                       est≈7 actual=7 (1.0x)  0.2ms (1%)  cpu=100%  out=112B  interp
-  filter                        est≈3,500 actual=3,899 (1.1x)  1.1ms (4%)  cpu=100%  out=0B  jit
-    scan                        est≈4,000 actual=4,000 (1.0x)  0.0ms (0%)  cpu=100%  out=62KB  interp
+aggregate                       est~7 actual=7 (1.0x)  0.2ms (1%)  cpu=100%  out=112B  interp
+  filter                        est~3,500 actual=3,899 (1.1x)  1.1ms (4%)  cpu=100%  out=0B  jit
+    scan                        est~4,000 actual=4,000 (1.0x)  0.0ms (0%)  cpu=100%  out=62KB  interp
 ```
 :::
 
-The `(1.1x)` on the filter is the q-error for that operator. The filter's estimate came
-from the Selinger default for a range predicate (a third of rows), which happened to land
-close. A `LIKE '%x%'` or a correlated conjunction is where you see the number blow out,
-and that is exactly what gets recorded and corrected next run.
+The `(1.1x)` on the filter is the q-error for that operator. The filter's estimate came from the Selinger default for a range predicate, a third of rows, which happened to land close. A `LIKE '%x%'` or a correlated conjunction is where you see the number blow out, and that's exactly what gets recorded and corrected next run.
 
-## Limits worth stating
+## Requirements and limitations
 
-Re-optimization is *between* stages, never mid-operator. A stage runs to completion. There
-is no runtime plan switch inside a hash join, no operator-level abort, no bail-out halfway
-through a sort. If a join's build side turns out to be 100× the estimate, you find out when
-the build finishes, not while it is running.
+Re-optimization happens *between* stages, never mid-operator. A stage runs to completion. There's no runtime plan switch inside a hash join, no operator-level abort, and no bail-out halfway through a sort. If a join's build side turns out to be 100x the estimate, you find out when the build finishes, not while it's running.
 
-Only the seven breaker types segment. A badly mis-estimated selective filter is measured
-only when it feeds a breaker, which for a pure `scan → filter → collect` is never.
+Only the seven breaker types segment. A badly mis-estimated selective filter is measured only when it feeds a breaker, which for a pure `scan -> filter -> collect` is never.
 
-And the granularity has a floor: staging materializes. A plan with many small breakers
-pays the control-plane round-trip at each one, which is why the accuracy early-exit exists
-and why the whole mechanism is gated behind a 20M-row input floor.
+Granularity has a floor, because staging materializes. A plan with many small breakers pays the control-plane round-trip at each one, which is why the accuracy early-exit exists and why the structural heuristic won't turn adaptivity on below 20M input rows. The distributed-staging and learned-history paths ignore that floor, since one is a correctness requirement and the other has measured evidence for the shape.
+
+A stage carrying `map_batches` is opaque to the IR, so the whole-plan Kyber optimize is skipped for a UDF plan and each stage is optimized on its own instead.
 
 ## Code map
 
 | Concern | File |
 |---|---|
-| The loop, segmentation, splicing | `python/batcher/api/adaptive.py` |
+| The stage loop, splicing, intermediate cleanup | `python/batcher/api/adaptive/staging.py` |
+| The on/off gate and the q-error test | `python/batcher/api/adaptive/gating.py` |
+| Breaker set, plan walk, subtree replacement | `python/batcher/api/adaptive/plan_surgery.py` |
 | Breaker-free test | `python/batcher/plan/logical/transforms.py::is_streamable` |
+| Learned adaptive gate | `python/batcher/kyber/learned_tuning/priors.py::learned_adaptive_helps` |
 | Per-operator metrics (Rust) | `crates/bc-interp/src/metrics.rs` |
-| Metric → feedback transcription | `python/batcher/core/executor.py` |
+| Metric to feedback transcription | `python/batcher/core/executor.py::_record_op_feedback` |
 | The `reoptimize_error` knob | `python/batcher/config/config.py::OptimizerConfig` |
 
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): the contract loop this closes — Core measures, Kyber decides
+- [Architecture](../architecture/index.md): the contract loop this closes, where Core measures and Kyber decides
 - [Kyber optimizer](../internals/kyber.md): the pass pipeline that runs at each stage
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the regret and stability arguments
 - [Adaptive execution](../getting-started/concepts/adaptive.md): the same idea, without the code

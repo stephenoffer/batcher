@@ -36,6 +36,7 @@ Read it bottom-up: a package may import anything **below** its line, never above
 | 3 · subsystems | `core` | **Executor.** Drives the engine, runs the adaptive re-optimization loop, **measures** runtime metadata. | layers 0–2, `_internal.native` |
 | 3 · subsystems | `governance` | **Policy.** Row filters / column masks as a pure plan rewrite; lineage. | layers 0–2 |
 | 2 · neutral IO | `io` | Sources, sinks, formats, filesystem, schema evolution. **Neutral**: it imports no subsystem, so anyone may depend on it. | layers 0–1, `_internal.native` |
+| 2 · neutral sinks | `observe` | **Observability sinks**: the terminal progress reporter, the bounded activity store, and the web dashboard (`bt.start_ui()`). Consumes the event bus (`_internal.events`) that every subsystem publishes to; it reads events, never the engine. **Neutral** — it imports no subsystem (not even `io`), which is what keeps observability decoupled from the thing it observes. | layers 0–1 |
 | 1 · contracts | `plan` | `LogicalPlan`/`PhysicalPlan`, `expr_ir`, schema, the JSON IR (`to_ir`), IR tags. | layer 0 |
 | 1 · contracts | `metadata` | Learned stats (`MetadataHub`) — Core measures, Kyber consumes. | `plan`, layer 0 |
 | 0 · utilities | `config`, `_internal` | Config/profiles; errors, registry, logging, hardware, and `_internal.native` — **the one accessor for the compiled engine**. | each other only |

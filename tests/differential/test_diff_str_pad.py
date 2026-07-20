@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -17,15 +18,11 @@ def t(duck):
 
 
 def test_repeat_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(r3=col("s").str.repeat(3), r0=col("s").str.repeat(0)).collect()
     assert_same(out, duck.sql("SELECT repeat(s, 3) r3, repeat(s, 0) r0 FROM t"))
 
 
 def test_lpad_rpad_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(

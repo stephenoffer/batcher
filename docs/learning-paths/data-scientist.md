@@ -8,15 +8,15 @@ is what materializes the result.
 ## Reading order
 
 1. [Getting started](../getting-started/index.md): install and run a first query.
-2. [Concepts](../getting-started/concepts/index.md): datasets, laziness, expressions.
-3. [Expressions](../user-guide/expressions.md): column math, conditionals, string
+1. [Concepts](../getting-started/concepts/index.md): datasets, laziness, expressions.
+1. [Expressions](../user-guide/expressions.md): column math, conditionals, string
    and date accessors.
-4. [Filtering](../user-guide/filtering.md): predicates and `is_in` / `between`.
-5. [Aggregations](../user-guide/aggregations.md): `group_by`, `.agg`, quantiles.
-6. [SQL](../user-guide/sql.md): query a dataset with {py:obj}`bt.sql <batcher.sql>`.
-7. [Window functions](../user-guide/window-functions.md): ranking and rolling
+1. [Filtering](../user-guide/filtering.md): predicates and `is_in` / `between`.
+1. [Aggregations](../user-guide/aggregations.md): `group_by`, `.agg`, quantiles.
+1. [SQL](../user-guide/sql.md): query a dataset with {py:obj}`bt.sql <batcher.sql>`.
+1. [Window functions](../user-guide/window-functions.md): ranking and rolling
    aggregates.
-8. [Expression API reference](../api/expressions.md) and
+1. [Expression API reference](../api/expressions.md) and
    [SQL API reference](../api/sql.md).
 
 ## Example: derive and summarize
@@ -105,7 +105,7 @@ Per-event and per-user disagree, and one of them is wrong.
 ::::
 
 :::{seealso}
-- [SQL to DataFrame](../tutorials/sql-to-dataframe.md) — the same query, both ways.
+- [SQL to DataFrame](../tutorials/sql-to-dataframe.md): the same query, both ways.
 - [Window functions](../user-guide/window-functions.md) and [pivoting](../user-guide/pivoting.md).
-- [Explain plans](../user-guide/explain-plans.md) — why your query did what it did.
+- [Explain plans](../user-guide/explain-plans.md): why your query did what it did.
 :::

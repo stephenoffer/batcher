@@ -59,9 +59,7 @@ fn shuffle_runtime_threads() -> usize {
             }
         }
     }
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let cores = bc_arrow::usable_cores();
     // A codec is active by default; size to the cores for parallel (de)compression. Plain
     // uncompressed decode keeps the measured [4, 8] sweet spot.
     if bc_transport::compression().is_some() {

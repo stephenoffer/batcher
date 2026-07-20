@@ -12,14 +12,13 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same, assert_same_ordered
 from batcher import col
 
 pytestmark = pytest.mark.differential
 
 
 def test_partition_avg_i64_above_2_53(duck):
-    from conftest import assert_same
-
     # avg([2^53+1, 1]) is exactly 2^52+1 = 4503599627370497, not 2^52 that a running
     # `sum += v as f64` produced. A second partition of ordinary values guards the path.
     t = pa.table(
@@ -34,8 +33,6 @@ def test_partition_avg_i64_above_2_53(duck):
 
 
 def test_partition_avg_i64_sum_overflows_i64(duck):
-    from conftest import assert_same
-
     # avg([2^62, 2^62]) = 2^62: the sum overflows i64 but DuckDB (128-bit sum) still
     # returns a finite average, so the exact accumulator must not overflow either.
     t = pa.table(
@@ -50,8 +47,6 @@ def test_partition_avg_i64_sum_overflows_i64(duck):
 
 
 def test_running_avg_i64_above_2_53(duck):
-    from conftest import assert_same_ordered
-
     # `AVG(i) OVER ()` drives a *separate* accumulator (`running_numeric_i64` in window.rs)
     # than the whole-partition PARTITION-BY path above — all rows are peers of one frame, so
     # every row gets the whole-frame average. It must sum in 128-bit too: the running
@@ -68,6 +63,4 @@ def test_running_avg_i64_above_2_53(duck):
         "SELECT j, AVG(i) OVER () AS a FROM t ORDER BY j",
         t=bt.from_arrow(t),
     ).collect()
-    assert_same_ordered(
-        out, duck.sql("SELECT j, AVG(i) OVER () AS a FROM t ORDER BY j")
-    )
+    assert_same_ordered(out, duck.sql("SELECT j, AVG(i) OVER () AS a FROM t ORDER BY j"))

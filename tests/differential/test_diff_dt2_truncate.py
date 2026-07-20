@@ -15,6 +15,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 # Instants chosen to exercise the edges: pre-1970 (negative epoch, incl. a
@@ -58,8 +59,6 @@ _UNITS = [
 
 @pytest.mark.parametrize("unit", _UNITS)
 def test_date_trunc_all_units_vs_duckdb(duck, t, unit):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(v=col("ts").dt.truncate(unit)).collect()
     expected = duck.sql(f"SELECT date_trunc('{unit}', ts) AS v FROM t")
     assert_same(out, expected)

@@ -17,12 +17,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
-from batcher._native import FlightShuffleServer as _Server
-from batcher._native import ShuffleClient as _Client
-from batcher._native import flight_fetch as _fetch
-from batcher._native import gather_combine as _gather_combine
-from batcher._native import gather_concat as _gather_concat
-from batcher._native import gather_to_files as _gather_to_files
+from batcher._internal.native import engine
 
 if TYPE_CHECKING:
     from batcher.carbonite.transfer.tls import ShuffleTlsMaterial
@@ -52,6 +47,10 @@ class FlightShuffleServer:
     `advertise_host` is the node's routable address (the Ray node IP): when set the
     server binds all interfaces and advertises `{advertise_host}:{port}` so reducers
     on other nodes can reach it. Omitted/empty keeps single-host loopback behavior.
+
+    `port_range` confines the listener to a closed ``(min, max)`` port range instead of
+    taking an OS-ephemeral port, so a firewalled cluster can open exactly that range
+    node-to-node. None keeps the ephemeral default.
     """
 
     def __init__(
@@ -59,18 +58,24 @@ class FlightShuffleServer:
         advertise_host: str | None = None,
         token: str | None = None,
         tls: ShuffleTlsMaterial | None = None,
+        port_range: tuple[int, int] | None = None,
     ) -> None:
+        port_min, port_max = port_range if port_range else (None, None)
         if tls is None:
-            self._srv = _Server(advertise_host, token)
+            self._srv = engine().FlightShuffleServer(
+                advertise_host, token, None, None, None, port_min, port_max
+            )
         else:
             # TLS-secured server: present this node's certificate, and (under mTLS)
             # require a client certificate the cluster CA signed.
-            self._srv = _Server(
+            self._srv = engine().FlightShuffleServer(
                 advertise_host,
                 token,
                 tls.server_cert_pem,
                 tls.server_key_pem,
                 tls.client_ca_pem,
+                port_min,
+                port_max,
             )
         # Shuffle output volume this server has made available for reducers to fetch — the
         # network-egress magnitude a `spilled: bool` / credit window cannot show. Measurement
@@ -191,7 +196,7 @@ class FlightShuffleServer:
         """
         src = [(addr, str(ticket)) for addr, ticket in sources]
         if credits is None:
-            return _gather_combine(
+            return engine().gather_combine(
                 self._srv,
                 client._client,
                 group_keys_json,
@@ -202,7 +207,7 @@ class FlightShuffleServer:
                 shm=shm,
                 replicas=replicas or [],
             )
-        return _gather_combine(
+        return engine().gather_combine(
             self._srv,
             client._client,
             group_keys_json,
@@ -236,7 +241,7 @@ class FlightShuffleServer:
         """
         src = [(addr, str(ticket)) for addr, ticket in sources]
         if credits is None:
-            return _gather_to_files(
+            return engine().gather_to_files(
                 self._srv,
                 client._client,
                 src,
@@ -245,7 +250,7 @@ class FlightShuffleServer:
                 shm=shm,
                 replicas=replicas or [],
             )
-        return _gather_to_files(
+        return engine().gather_to_files(
             self._srv,
             client._client,
             src,
@@ -280,10 +285,10 @@ class FlightShuffleServer:
         """
         src = [(addr, str(ticket)) for addr, ticket in sources]
         if credits is None:
-            return _gather_concat(
+            return engine().gather_concat(
                 self._srv, client._client, src, fan_in, shm=shm, replicas=replicas or []
             )
-        return _gather_concat(
+        return engine().gather_concat(
             self._srv, client._client, src, fan_in, credits, token, shm, replicas or []
         )
 
@@ -299,7 +304,7 @@ class ShuffleClient:
     """
 
     def __init__(self) -> None:
-        self._client = _Client()
+        self._client = engine().ShuffleClient()
 
     def fetch(
         self,
@@ -337,7 +342,12 @@ def fetch(addr: str, ticket: ShuffleTicket, credits: int | None = None) -> list[
     Carbonite grants; `None` uses the engine's conservative default window.
     """
     global _BYTES_FETCHED
-    batches = _fetch(addr, str(ticket)) if credits is None else _fetch(addr, str(ticket), credits)
+    flight_fetch = engine().flight_fetch
+    batches = (
+        flight_fetch(addr, str(ticket))
+        if credits is None
+        else flight_fetch(addr, str(ticket), credits)
+    )
     _BYTES_FETCHED += sum(b.nbytes for b in batches)
     return batches
 

@@ -8,7 +8,7 @@ implementation is delta-rs plus Batcher's own commit path.
 | | |
 | --- | --- |
 | **Read** | `bt.read.delta(uri)`, with `version=`, `timestamp=`, or `stream=True` |
-| **Write** | `ds.write.delta(uri)` — `mode="append"`/`"overwrite"`, `merge_on=`, `replace_where=` |
+| **Write** | `ds.write.delta(uri)` with `mode="append"`/`"overwrite"`, `merge_on=`, `replace_where=` |
 | **Extra** | `pip install 'batcher-engine[delta]'` |
 | **Parallelism** | One split per surviving data file, chosen from the log at plan time |
 | **Pushdown** | Predicates skip files by the log's per-file min/max statistics |
@@ -75,7 +75,7 @@ Two write shapes, answering two different questions.
 
 ::::{tab-set}
 
-:::{tab-item} `merge_on=` — upsert by key
+:::{tab-item} `merge_on=`, upsert by key
 
 `merge_on=` runs a native Delta `MERGE INTO` keyed on those columns: matched rows update,
 unmatched rows insert. A merge rewrites the files it touches, so it does read its change set back.
@@ -90,7 +90,7 @@ print(bt.read.delta(table).sort("id").to_pydict()["amount"])
 ```
 :::
 
-:::{tab-item} `replace_where=` — replace a slice
+:::{tab-item} `replace_where=`, replace a slice
 
 `replace_where=` is the other shape, and the one most backfills actually want: atomically replace
 every row matching a predicate and leave the rest alone. Re-running yesterday's job replaces

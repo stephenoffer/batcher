@@ -159,8 +159,41 @@ def credit_ceiling(config: Config, effective_morsel_bytes: int | None = None) ->
     fc = config.flow_control
     count_ceiling = fc.default_credits * fc.credit_ceiling_factor
     morsel_bytes = max(1, effective_morsel_bytes or config.execution.morsel_bytes)
-    byte_ceiling = max(1, fc.credit_byte_budget // morsel_bytes)
+    byte_ceiling = max(1, _channel_byte_budget(config) // morsel_bytes)
     return max(1, min(count_ceiling, byte_ceiling))
+
+
+#: Share of the machine's memory the *whole* shuffle may hold in flight across all its
+#: concurrent channels. Deliberately small: this buffer is pure transit, competing with the
+#: build tables and aggregate state that are the query's actual working set, and a shuffle
+#: that stalls for credit is slow while one that OOMs the node is fatal.
+_SHUFFLE_BUFFER_FRACTION = 0.10
+
+
+def _channel_byte_budget(config: Config) -> int:
+    """The per-channel buffered-byte budget: the configured cap, held under a share of the
+    memory this machine actually has.
+
+    `credit_byte_budget` is a fixed 256 MiB per channel, and `shuffle_fetch_fan_in` channels
+    fetch at once — up to 8 GiB in flight on the defaults. That is unremarkable on a 512 GiB
+    node and more than half the RAM of a 16 GiB one, and nothing in the credit path had ever
+    read how much memory exists: the admission path is memory-aware (`BudgetingAdmission`),
+    the backpressure path was not, so a node could be admitted for a query and then OOM'd by
+    the transit buffers carrying it.
+
+    Caps only — it never raises the configured budget, so an operator who tuned this down
+    keeps their value and the change can only ever buffer *less* than before.
+    """
+    fc = config.flow_control
+    configured = fc.credit_byte_budget
+    total = total_memory_bytes()
+    if total <= 0:
+        return configured
+    fan_in = max(1, fc.shuffle_fetch_fan_in)
+    headroom_per_channel = int(total * _SHUFFLE_BUFFER_FRACTION) // fan_in
+    # Floor at one morsel: a tiny container still has to be able to move one batch, and a
+    # zero budget here would collapse the window to a single credit and deadlock progress.
+    return max(config.execution.morsel_bytes, min(configured, headroom_per_channel))
 
 
 def learned_channel_morsel_bytes(ctx: ResourceContext) -> int | None:
@@ -281,6 +314,29 @@ class AIMDFlowControl:
     def grant(self, requested: int, ctx: ResourceContext) -> int:  # noqa: ARG002
         return self.window
 
+    def rewindow(self, credits: int) -> int:
+        """Restart the window at a new grant — a reused channel now serving a *different* query.
+
+        A warm shuffle fleet outlives the query that spawned it, and `set_grant` re-grants each
+        worker for the query about to borrow it. Under adaptive credits that re-grant had
+        nowhere to land: the controller owns the window, so the new grant was dropped and the
+        fleet kept the window it had converged to for the *previous* query — the very
+        stale-grant regression (`0.6 s -> 3.2 s` on TPC-H sf10) that `set_grant` exists to
+        prevent, reintroduced on the default path.
+
+        Leaves slow-start off, exactly as a warm `initial_window` does: the grant already
+        reflects a real estimate, so an exponential ramp from it would overshoot.
+
+        Args:
+            credits: The new grant (1 credit = 1 in-flight batch), clamped to the band.
+
+        Returns:
+            The new current window.
+        """
+        self._window = float(min(max(credits, self._floor), self._ceiling))
+        self._slow_start = False
+        return self.window
+
     def observe(self, *, congested: bool) -> int:
         """Update the window from one round's congestion signal; return the new window.
 
@@ -388,7 +444,12 @@ class DefaultSchedulingPolicy:
         # grant instead of one sized from the plan guess; cold families pass through.
         model = ctx.memory_model
         peak = model.plan_peak(plan.ops) if model is not None else peak_operator_bytes(plan)
-        morsel_bytes = max(1, cfg.execution.morsel_rows * cfg.optimizer.row_bytes)
+        # The configured value, not `morsel_rows * row_bytes`. The two agree only at the
+        # defaults (16,384 x 64 == 1 MiB); `ResourceManager.adapted_config` rewrites
+        # `morsel_rows` (from the learned per-row width) and `morsel_bytes` (from the
+        # pressure factor) *independently*, so after any adaptive resize the derivation
+        # drifts from the real morsel — and this value is the per-task memory floor below.
+        morsel_bytes = max(1, cfg.execution.morsel_bytes)
         if peak <= 0:
             # Kyber could not size the plan — a cold start, an unbounded source, or a
             # shape its estimator abstained on. Granting 0 here leaves each worker's

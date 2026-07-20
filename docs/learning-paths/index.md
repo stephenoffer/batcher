@@ -32,6 +32,15 @@ Configure the engine, bound its memory, and keep it running under load.
 :::
 ::::
 
+## See also
+
+:::{seealso}
+- {doc}`../getting-started/index`: install and run a first query before starting a path.
+- {doc}`../user-guide/index`: the capability-by-capability reference each path points into.
+- {doc}`../examples/index`: runnable code for the workloads the paths describe.
+- {doc}`../migration/index`: start here instead if you are porting existing code.
+:::
+
 ```{toctree}
 :hidden:
 

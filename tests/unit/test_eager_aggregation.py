@@ -89,3 +89,80 @@ def test_idempotent():
     once = eager_aggregation(ds._plan, ctx)
     # The pushed side is already reduced; a second push finds no further reduction.
     assert eager_aggregation(once, ctx) is None
+
+
+def test_a_measured_non_reducing_group_by_vetoes_the_push():
+    """`learned_partial_agg` was written on every query and read by nothing.
+
+    `record_group_reduction` records each group-by's real `groups / input_rows`; the reader
+    existed but had no production caller, so the measurement never reached a decision. It now
+    vetoes pre-aggregation for a group-by a past run measured as barely reducing — the case the
+    ratio exists to identify, and where the pushed hash table is pure waste.
+
+    The veto never *licenses* a push: `_reduces_enough` still has to approve it from the
+    estimator's `ndv` first, so a stale measurement can only skip a beneficial rewrite, never
+    introduce a bad one. Result-invariant either way (the pre-aggregate is an algebraic
+    identity).
+    """
+    from batcher.kyber.learned_tuning import record_group_reduction
+    from batcher.kyber.signature import plan_signature
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends.in_process import InProcessBackend
+
+    ds = _grouped_max()
+    est = StatsEstimator(ds._sources, learned={"__column_ndv__": {"dept_id": 3.0}})
+
+    # Cold hub: no measurement, so the estimator's ndv decides exactly as before.
+    hub = MetadataHub(InProcessBackend())
+    ctx = OptimizerContext(config=active_config(), sources=ds._sources, hub=hub, estimator=est)
+    assert eager_aggregation(ds._plan, ctx) is not None
+
+    # A past run measured this group-by collapsing 1000 rows into 990 groups — no reduction.
+    record_group_reduction(hub, plan_signature(ds._plan), 990.0, 1000.0)
+    assert eager_aggregation(ds._plan, ctx) is None
+
+    # A strongly-reducing measurement leaves the push in place.
+    hub2 = MetadataHub(InProcessBackend())
+    record_group_reduction(hub2, plan_signature(ds._plan), 3.0, 1000.0)
+    ctx2 = OptimizerContext(config=active_config(), sources=ds._sources, hub=hub2, estimator=est)
+    assert eager_aggregation(ds._plan, ctx2) is not None
+
+
+def _wide_emp():
+    """1,000 rows over 100 departments — a 10x reduction, enough to clear the ratio gate."""
+    dept = [i % 100 for i in range(1000)]
+    return bt.from_pydict({"dept_id": dept, "sal": list(range(len(dept)))})
+
+
+def _one_dept():
+    """A single department — so the join keeps ~1/100th of the left side."""
+    return bt.from_pydict({"dept_id": [7], "name": ["eng"]})
+
+
+def test_a_more_selective_join_vetoes_the_push():
+    """The ratio gate is blind to what the join does with the side it shrank.
+
+    `_reduces_enough` prices the push only against the input it reduces, so a large ratio
+    over a huge table sails through even when the join downstream is the far stronger
+    reducer. Pre-aggregating in front of one is pure added work: the group-by still reads
+    every source row, and the join then emits fewer rows than the group-by produced.
+
+    This is TPC-H Q17 in miniature. There, lineitem pre-aggregated 6,001,215 rows to 201,152
+    groups — 29.8x, comfortably past the gate — to feed a join against 195 filtered parts
+    whose output was 5,514 rows, and the query went 12 ms -> 242 ms. Here 1,000 rows reduce
+    10x to 100 groups to feed a join that emits ~10.
+    """
+    ds = _wide_emp().join(_one_dept(), on="dept_id").group_by("name").agg(top=col("sal").max())
+    assert eager_aggregation(ds._plan, _ctx(ds, ndv={"dept_id": 100.0})) is None
+
+
+def test_a_fanning_join_still_pushes():
+    """The veto must not fire when the join preserves rows — the classic eager-aggregation win.
+
+    Same reduction as the vetoed case above; the only difference is that every left row finds
+    a match, so the join's output is far larger than the pre-aggregate's and the push pays.
+    Without this, the guard above would be indistinguishable from disabling the rule.
+    """
+    dept = bt.from_pydict({"dept_id": list(range(100)), "name": [f"d{i}" for i in range(100)]})
+    ds = _wide_emp().join(dept, on="dept_id").group_by("name").agg(top=col("sal").max())
+    assert eager_aggregation(ds._plan, _ctx(ds, ndv={"dept_id": 100.0})) is not None

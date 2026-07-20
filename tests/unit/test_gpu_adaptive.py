@@ -191,3 +191,25 @@ def test_genuinely_spread_samples_still_fit_exactly():
     intercept, slope = fit
     assert intercept == pytest.approx(100.0)
     assert slope == pytest.approx(1e-5)
+
+
+def test_every_ols_crossover_shares_the_spread_guard():
+    """The broadcast / sort-merge crossovers must reject a cluster too, not just the GPU one.
+
+    `gpu/adaptive.py` and `learned_tuning/crossover.py` fold *identical* OLS sufficient
+    statistics, and their `_fit` bodies were copies. The relative-spread guard was added
+    here after the measured failure above and never reached the other copy, so the same
+    garbage fit stayed live on the path feeding `learned_broadcast_max_bytes` and
+    `learned_sort_merge_min_rows` — consumed by `kyber/rules/selection.py`, where a bad
+    intercept flips join strategy. Both now resolve to the one `kyber.ols.fit_ols`.
+    """
+    from batcher.kyber.gpu.adaptive import _fit as gpu_fit
+    from batcher.kyber.learned_tuning.crossover import _fit as crossover_fit
+    from batcher.kyber.ols import fit_ols
+
+    assert gpu_fit is fit_ols and crossover_fit is fit_ols
+    # The exact case the guard was written for: unidentifiable from either entry point.
+    assert crossover_fit(_stats(1e7, 3, noise=0.5)) is None
+    assert crossover_fit(_stats(1e7, 3)) is None
+    # ...while a genuinely spread sample still fits exactly, so the guard is not over-eager.
+    assert crossover_fit(_stats(1e6, 7e6)) == pytest.approx((100.0, 1e-5))

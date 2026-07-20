@@ -35,9 +35,9 @@ print(ds.to_pydict())
 ```
 
 :::{dropdown} What each tensor shape becomes as a column
-An `(n, dim)` tensor becomes a `FixedSizeList<…, dim>` column (the embedding convention), and a
-higher-rank tensor becomes a fixed-shape-tensor column that keeps its per-row shape. A tuple of
-tensors becomes one column each (`col_0`, `col_1`, …).
+An `(n, dim)` tensor becomes a fixed-size-list column of width `dim`, which is the embedding
+convention, and a higher-rank tensor becomes a fixed-shape-tensor column that keeps its per-row
+shape. A tuple of tensors becomes one column each, named `col_0`, `col_1`, and so on.
 :::
 
 This is for adapting something you already have in memory. It is not the ingest path; for that,

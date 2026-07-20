@@ -292,11 +292,18 @@ def build_distinct(
     return ranked.filter(Col(rn) == 1).drop(rn)
 
 
-def build_explode(ds: Dataset, column: str, alias: str | None) -> Dataset:
+def build_explode(
+    ds: Dataset,
+    column: str,
+    alias: str | None,
+    *,
+    outer: bool = False,
+    index: str | None = None,
+) -> Dataset:
     """Construct an `Unnest` node (see `Dataset.explode` for the contract)."""
     if column not in ds.columns:
         raise PlanError(f"explode(): unknown column {column!r}")
-    return ds._derive(Unnest(ds._plan, column, alias or column))
+    return ds._derive(Unnest(ds._plan, column, alias or column, outer, index))
 
 
 def build_session_window(

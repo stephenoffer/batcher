@@ -17,7 +17,7 @@ of this page.
 | **Pushdown** | Predicates on both paths. Projection on neither. |
 | **Credentials** | Unity vends short-lived, table-scoped storage credentials at plan time |
 
-```
+```bash
 pip install 'batcher-engine[databricks]'
 ```
 
@@ -71,7 +71,8 @@ that costs you.
 
 Under the hood of the direct path, the SDK looks up the table, calls Unity's
 `temporary_table_credentials` API for `READ` access, gets back the table's storage location plus a
-cloud-specific credential block (AWS keys, an Azure SAS or AAD token, a GCP OAuth token), and hands
+cloud-specific credential block of AWS keys, an Azure SAS or AAD token, or a Google Cloud OAuth
+token, and hands
 both to the Delta reader as storage options. From there it is an ordinary Delta scan.
 
 The token needs `SELECT` on the table and `EXTERNAL USE SCHEMA` on its schema, which is the Unity

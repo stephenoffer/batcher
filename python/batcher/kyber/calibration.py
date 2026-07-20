@@ -138,9 +138,11 @@ def calibrate(hub: MetadataHub | None, config: Config | None = None) -> CostCoef
     fingerprint = (
         defaults,
         cfg.optimizer.cost_calibration_min_samples,
-        cfg.optimizer.learning_smoothing_alpha,
         cfg.optimizer.cost_calibration_clamp,
     )
+    # `learning_smoothing_alpha` is deliberately *not* in the fingerprint: neither
+    # `_calibrate` nor `_measured_jit_speedup` reads it, so including it only forced a
+    # whole-history op_stats re-scan on a knob that cannot change the fit.
     # Throttle: a cost fit is a statistical estimate that barely moves with one more
     # sample among many, so reuse it until enough *new* feedback accrues rather than
     # re-scanning the whole op-stats history on every `collect()` (the hub version bumps

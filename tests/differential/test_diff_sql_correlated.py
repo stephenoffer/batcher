@@ -6,6 +6,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -42,8 +43,6 @@ def tables(duck):
     ],
 )
 def test_correlated_exists(duck, tables, q):
-    from conftest import assert_same
-
     emp, proj = tables
     assert_same(bt.sql(q, emp=emp, proj=proj).collect(), duck.sql(q))
 
@@ -58,8 +57,6 @@ def test_correlated_exists(duck, tables, q):
     ],
 )
 def test_correlated_in(duck, tables, q):
-    from conftest import assert_same
-
     emp, proj = tables
     assert_same(bt.sql(q, emp=emp, proj=proj).collect(), duck.sql(q))
 
@@ -78,7 +75,5 @@ def test_correlated_in(duck, tables, q):
     ],
 )
 def test_correlated_scalar(duck, tables, q):
-    from conftest import assert_same
-
     emp, proj = tables
     assert_same(bt.sql(q, emp=emp, proj=proj).collect(), duck.sql(q))

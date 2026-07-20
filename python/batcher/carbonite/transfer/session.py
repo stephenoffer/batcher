@@ -110,8 +110,9 @@ class ShuffleSession:
         token: str | None = None,
         shm: bool = False,
         tls: ShuffleTlsMaterial | None = None,
+        port_range: tuple[int, int] | None = None,
     ) -> None:
-        self._server = FlightShuffleServer(advertise_host, token, tls)
+        self._server = FlightShuffleServer(advertise_host, token, tls, port_range)
         self._credits = credits
         self._token = token
         # Same-node shared-memory transfer (opt-in): a mapper mirrors each bucket to an
@@ -154,13 +155,18 @@ class ShuffleSession:
         credit — one in-flight batch) keeps that window for every later query on it, and
         the next join's exchange serializes behind it.
 
-        A no-op under adaptive flow control, which owns the window itself (`_flow_control`).
+        Under adaptive flow control the controller owns the window, so the re-grant is
+        applied there (`rewindow`) rather than to the static `_credits` that `_window()`
+        would never read. It used to be dropped silently in that mode — which is the
+        default — so the fleet-reuse fix above never actually applied to a real run.
 
         Args:
-            credits: The new static credit window (1 credit = 1 in-flight batch).
+            credits: The new credit window (1 credit = 1 in-flight batch).
         """
         if self._flow_control is None:
             self._credits = credits
+        else:
+            self._flow_control.rewindow(credits)
 
     def _window(self) -> int | None:
         """The credit window for the next fetch — adaptive when a controller is set."""

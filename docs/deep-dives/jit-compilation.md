@@ -1,15 +1,12 @@
 # JIT compilation
 
-The interpreter materializes a full Arrow array for every node of an expression tree. For
-`(a - b) * c` over a morsel that is two temporary 16,384-element arrays, three kernel passes,
-and three trips through memory. The values never stay in registers.
+*Tier-1* is Batcher's just-in-time compiler for scalar expressions. It lives in `bc-codegen` and turns an `Expr` tree into native machine code with Cranelift. This page describes what it compiles, how it handles nulls, and why it falls back more often than you might expect.
 
-Tier-1 fixes that one thing. `bc-codegen` compiles the expression tree into a single native
-loop with Cranelift: one pass over the row index, each output element computed in registers
-and written straight to the result buffer. No intermediates. The win grows with the depth of
-the expression.
+The problem it solves is allocation. The interpreter materializes a full Arrow array for every node of an expression tree. For `(a - b) * c` over a morsel that is two temporary 16,384-element arrays, three kernel passes, and three trips through memory. The values never stay in registers.
 
-It is a narrow tool, deliberately.
+Tier-1 fixes that one thing. It compiles the expression tree into a single native loop: one pass over the row index, each output element computed in registers and written straight to the result buffer. No intermediates. The win grows with the depth of the expression.
+
+It's a narrow tool, deliberately.
 
 :::{important}
 On the subset it accepts, the JIT must be **bit-for-bit identical** to `bc_expr::Expr::eval`.
@@ -41,13 +38,12 @@ the interpreter.
 ## The generated code
 
 ```text
-fn(n: i64, col0: *const u8, col1: *const u8, ..., out: *mut u8)
+fn(n: i64, cols: *const *const u8, out: *mut u8)
 ```
 
-Each `colK` is the raw values buffer of the K-th referenced column, in stable first-seen
-order. `out` is a fresh output buffer: `n` `i64`s, `n` `f64`s, or, for a boolean result, a
-packed Arrow bitmask of `ceil(n/8)` zeroed bytes that the loop ORs one bit per row into,
-LSB-first, so the resulting `BooleanArray` wraps the buffer with no repack pass.
+`cols` is an array of pointers, one per referenced column, in stable first-seen order. Each entry points at that column's raw values buffer. Passing them as an array rather than as separate arguments means there's no fixed ceiling on how many distinct columns an expression may reference. `out` is a fresh output buffer holding `n` `i64`s, `n` `f64`s, or, for a boolean result, a packed Arrow bitmask of `ceil(n/8)` zeroed bytes that the loop ORs one bit per row into, LSB-first, so the resulting `BooleanArray` wraps the buffer with no repack pass.
+
+The Kleene body described below uses a wider signature that also carries per-column validity in and a validity buffer out.
 
 Type promotion mirrors Arrow: if any operand in a subtree is `f64`, the whole subtree is
 computed in `f64` with `i64 → f64` conversions inserted; otherwise it computes in `i64`.
@@ -106,11 +102,7 @@ The scalar loop is the baseline. `crates/bc-codegen/src/simd.rs` emits a vector 
 every node is in the vectorizable subset: numeric leaves, integer `+`/`-`/`*` and float
 `+`/`-`/`*`/`/`, the comparisons (the big filter win), `Not`, and exact numeric casts.
 
-Width comes from the host at compile time via `bc_arrow::HardwareProfile` (2 lanes on
-SSE2/NEON, 4 on AVX2, an opt-in 8 on AVX-512), and Cranelift legalizes a wider IR vector into
-native instructions where the ISA has them and splits it into 128-bit ops otherwise. A width
-that does not lower natively is at worst a no-op, never a wrong answer. A scalar remainder
-loop handles the rows past the last full step.
+Width comes from the host at compile time via `bc_arrow::HardwareProfile`: 2 f64 lanes on SSE2 and NEON, 4 on AVX2, and 8 on AVX-512. Detection caps the automatic choice at 4 even on an AVX-512 host, because 512-bit code can down-clock the core, so the 8-lane width is opt-in. Cranelift legalizes a wider IR vector into native instructions where the ISA has them and splits it into 128-bit ops otherwise. A width that doesn't lower natively is at worst a no-op, never a wrong answer. A scalar remainder loop handles the rows past the last full step.
 
 The excluded ops are excluded because their per-lane result would not be bit-identical:
 integer `Div`/`Mod` scalarize and can trap, float `Mod` is an `fmod` libcall, `Math`/`Math2`
@@ -125,10 +117,7 @@ of `(expr, the types of the columns it references, the SIMD override)`. The samp
 consulted only for column types, never for values. So the artifact is reusable across every
 morsel, every operator instance, and every `execute_plan` call that shares the triple.
 
-Without a memo, the engine recompiled every filter and projection on *each* `execute_plan`:
-a measured **16.6 ms of fixed overhead on a 64-row query** with one filter and two
-projections. That is pure loss for a small query and catastrophic for the per-batch streaming
-path and the per-operator UDF path, both of which call `execute_plan` in a loop.
+Without a memo, the engine recompiles every filter and projection on *each* `execute_plan`. That cost is fixed, so it doesn't shrink with the input: on a small query it's pure loss, and it's worst on the per-batch streaming path and the per-operator UDF path, both of which call `execute_plan` in a loop. The memo in `crates/bc-codegen/src/cache.rs` is what makes the compile an admission price paid once rather than once per call.
 
 :::{warning}
 `crates/bc-codegen/src/cache.rs` keys its process-wide `HashMap` on the *full structural
@@ -157,7 +146,7 @@ fn eval_jit(jit: &Jit, expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef, Int
             return Ok(arr);           // Tier-1
         }
     }
-    Ok(expr.eval(batch)?)             // Tier-0 — per-batch fallback
+    Ok(expr.eval(batch)?)             // Tier-0: per-batch fallback
 }
 ```
 

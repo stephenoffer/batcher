@@ -1,8 +1,6 @@
 # Quick reference
 
-A one-page map of the public API. Everything below is reachable from
-`import batcher as bt`. The Dataset and Expr surfaces are deliberately small: there
-is one obvious way to do each thing.
+This page is a one-page map of the public API, for looking a name up fast. Everything below is reachable from `import batcher as bt`. The [area pages](index.md) explain the same surface with runnable examples, and the [complete reference](complete.md) renders every signature and docstring.
 
 ```python
 import batcher as bt
@@ -13,6 +11,8 @@ print(ds.columns)
 ```
 
 ## Construction
+
+Each of these builds a `Dataset` from data you already hold in the process:
 
 | Call | Source |
 | --- | --- |
@@ -27,8 +27,7 @@ print(ds.columns)
 
 ## Readers
 
-All readers take a local or cloud path and return a Dataset. `bt.read` infers the
-format from the path; the rest are explicit.
+All readers take a local or cloud path and return a Dataset. `bt.read` infers the format from the path, and the rest are explicit.
 
 | Call | Format |
 | --- | --- |
@@ -85,6 +84,8 @@ Each returns a new lazy Dataset.
 
 ## Dataset terminal operations
 
+Each of these executes the plan and returns a result or writes it out:
+
 | Method | Returns |
 | --- | --- |
 | `.collect(distributed=False, num_workers=None, spill=False, num_partitions=16, adaptive=False, transport="disk")` | pyarrow Table |
@@ -99,6 +100,8 @@ Each returns a new lazy Dataset.
 | `.write.csv(path, **kw)` / `.write.json(path, **kw)` | writes CSV / JSON |
 | `.to_arrow()` | pyarrow Table (alias of `.collect()`) |
 | `.to_pandas()` / `.to_polars()` | a pandas / Polars DataFrame |
+| `.to_numpy(columns=None)` | a `{column: numpy.ndarray}` dict (tensor columns → `(n, *shape)`) |
+| `.to_jax(columns=None)` | a `{column: jax.Array}` dict, the JAX counterpart of `to_numpy` |
 | `.to_torch(columns=None, batch_size=None)` / `.to_tf(...)` | a Torch / TensorFlow dataset |
 | `.to_torch_dataloader(...)` | a `torch.utils.data.DataLoader` |
 
@@ -114,9 +117,11 @@ These compute (or read) a small result and so are eager.
 | `.is_streaming()` | whether the source is unbounded |
 | `.describe(percentiles=(.25,.5,.75))` | summary statistics per column |
 | `.null_count()` | null count per column |
+| `.corr_matrix(columns=None)` | pairwise Pearson correlation matrix over numeric columns (one scan) |
+| `.cov_matrix(columns=None)` | pairwise sample covariance matrix over numeric columns (PCA/whitening input) |
 | `.approx_quantile(column, q)` | a sketch-based quantile estimate |
 | `.stats()` | the last run's measured `RunStats` |
-| `__arrow_c_stream__()` | Arrow PyCapsule export — `pl.DataFrame(ds)`, `duckdb.sql("… FROM ds")`, `pa.table(ds)` consume a `Dataset` directly, lazily and zero-copy |
+| `__arrow_c_stream__()` | Arrow PyCapsule export, so `pl.DataFrame(ds)`, `duckdb.sql("... FROM ds")`, and `pa.table(ds)` consume a `Dataset` directly, lazily and zero-copy |
 
 ```python
 out = ds.filter(bt.col("price") >= 20).sort("price", descending=True)
@@ -126,9 +131,7 @@ print(out.to_pydict())
 
 ## GroupBy
 
-`group_by(*keys)` returns a `GroupBy`; finalize with `.agg(**named_aggs)`. Each
-keyword is the output column name. `group_by()` with no keys aggregates the whole
-dataset.
+`group_by(*keys)` returns a `GroupBy`. Finalize it with `.agg(**named_aggs)`, where each keyword is the output column name. `group_by()` with no keys aggregates the whole dataset.
 
 ```python
 out = (
@@ -141,6 +144,8 @@ print(out.to_pydict())
 ```
 
 ## Expression constructors
+
+These build the `Expr` values every column operation takes:
 
 | Call | Meaning |
 | --- | --- |
@@ -164,6 +169,15 @@ schema wherever a column is expected. They produce a `Selector`.
 | `bt.numeric()` / `bt.integer()` / `bt.floating()` | numeric / integer / float columns |
 | `bt.string()` / `bt.boolean()` / `bt.temporal()` | string / boolean / date-time columns |
 | `bt.exclude(*names)` | every column except the named ones |
+
+`bt.by_dtype`, `bt.matches`, `bt.starts_with`, `bt.ends_with`, and `bt.contains` select by dtype or by name pattern. See the [complete reference](complete.md) for their signatures.
+
+## Scalar, aggregate, and window functions
+
+These are the top-level function forms. Rows marked `(aggregate)` belong inside `.agg(...)`, and rows marked `(window)` need a `.over(...)` binding.
+
+| Call | Meaning |
+| --- | --- |
 | `bt.count()` | COUNT(*) aggregate |
 | `bt.iff(condition, if_true, if_false)` | `if_true` where `condition` is true, else `if_false` (DuckDB `IFF`) |
 | `bt.nanvl(value, fallback)` | `value` unless it is NaN, then `fallback` (Spark `nanvl`) |
@@ -212,11 +226,16 @@ schema wherever a column is expected. They produce a `Selector`.
 
 ## Top-level helpers
 
+These sit outside the `Dataset` and `Expr` surfaces:
+
 | Call | Returns |
 | --- | --- |
-| `bt.date_range(start, end, *, interval_days=1, name="date")` | a one-column Dataset of dates (inclusive ISO `YYYY-MM-DD`) — the date-dimension generator |
+| `bt.date_range(start, end, *, interval_days=1, name="date")` | the date-dimension generator: a one-column Dataset of dates, inclusive, as ISO `YYYY-MM-DD` |
 | `bt.compact(path, *, target_size_mb=128.0, num_files=None, by=None, format=None, **opts)` | rewrite many small files at `path` into fewer larger ones in place; returns a `WriteManifest` |
 | `bt.engine_version()` | the version reported by the compiled Rust engine (`str`) |
+| `bt.start_ui(*, port=4040, host="127.0.0.1", open_browser=False)` | start the web dashboard (queries, plan DAG, per-operator timings, live logs); returns its URL |
+| `bt.stop_ui()` | stop the web dashboard; safe to call when none is running |
+| `bt.ui_url()` | the running dashboard's URL, or `None` |
 
 ## Expression methods
 
@@ -226,8 +245,7 @@ schema wherever a column is expected. They produce a `Selector`.
   `.fill_nan(value)`, `.eq_missing(other)`, `.is_nan()`, `.is_not_nan()`,
   `.is_finite()`, `.is_infinite()`, `.clip(lower, upper)`, `.alias(name)`
 - Binning and gap-filling: `.cut(breaks, labels=None, left_closed=False)`,
-  `.forward_fill()` / `.backward_fill()` (window functions — bind with
-  `.over(order_by=[...])`; an order is required)
+  `.forward_fill()` and `.backward_fill()`. The two fills are window functions, so bind them with `.over(order_by=[...])`. An order is required.
 - Math: `.abs()`, `.round(digits)`, `.pow(e)`, `.sqrt()`, `.floor()`, `.ceil()`,
   `.ln()`, `.log10()`, `.log2()`, `.exp()`, `.sin()`, `.cos()`, `.tan()`, `.asin()`,
   `.acos()`, `.atan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`, `.sign()`,
@@ -239,7 +257,7 @@ schema wherever a column is expected. They produce a `Selector`.
   `.n_unique()` / `.count_distinct()`, `.mode()`, `.first()`, `.last()`,
   `.arg_min()`, `.arg_max()`, `.bool_and()`, `.bool_or()`,
   `.bit_and()` / `.bit_or()` / `.bit_xor()`, `.histogram()`, `.array_agg()`
-- Approximate aggregates (sketch-backed, mergeable — for scale): `.approx_n_unique()` /
+- Approximate aggregates, sketch-backed and mergeable so they scale: `.approx_n_unique()` /
   `.approx_count_distinct()` (HyperLogLog), `.approx_quantile(q)` / `.approx_median()` (KLL)
 - Cumulative & window analytics (bind with `.over(...)`): `.cum_sum()` / `.cum_min()` /
   `.cum_max()` / `.cum_count()`, `.rolling_sum(k)` / `.rolling_mean(k)` /
@@ -261,6 +279,8 @@ print(out.to_pydict())
 
 ## Expression accessor namespaces
 
+Typed methods hang off an expression by namespace rather than crowding `Expr` itself:
+
 | Namespace | Covers |
 | --- | --- |
 | `.str` | casing, trim, search, slice, pad, encode (`upper`, `contains`, `like`, `ilike`, `substr`, `split`, `regexp_replace`, ...) plus unstructured-text ingest: `strip_html()`, `chunk(size, overlap)`, `minhash(num_perm, ngram)` |
@@ -269,15 +289,13 @@ print(out.to_pydict())
 | `.struct` | `field(name)` |
 | `.map` | Arrow `Map` columns: `keys()`, `values()`, `get(key)` |
 | `.json` | `extract_string(path)` |
-| `.image` | `decode()`, `to_tensor(width, height)`, `resize(width, height)` |
-| `.audio` | native WAV/FLAC decode: `decode()` (metadata struct), `to_waveform()` (mono `List<Float32>`) |
-| `.video` | native FFmpeg decode: `decode()` (metadata struct) — needs the `video` engine build feature |
+| `.image` | `decode()`, `to_tensor(width, height)`, `to_tensor_f32(width, height, mean=, std=, channels_first=)`, `center_crop(width, height)`, `to_grayscale(width, height)`, `resize(width, height)` |
+| `.audio` | native WAV/FLAC decode: `decode()` (metadata struct), `to_waveform()` (mono `List<Float32>`), `resample(rate)`, `mel_spectrogram(rate, n_fft=, hop_length=, n_mels=)` (speech-model mel power spectrogram, torchaudio-matching), `mfcc(rate, n_fft=, hop_length=, n_mels=, n_mfcc=)` (MFCC feature, torchaudio-matching) |
+| `.video` | native FFmpeg decode: `decode()` returns a metadata struct, and needs the `video` engine build feature |
 
 ## SQL
 
-`bt.sql(query, table_name=ds_or_table, ...)` returns a Dataset. Each table named in
-the query is bound by a keyword argument. The supported subset is SELECT, WHERE,
-GROUP BY / HAVING, ORDER BY, LIMIT, INNER and LEFT JOIN, CASE, and CAST.
+`bt.sql(query, table_name=ds_or_table, ...)` returns a Dataset. Each table named in the query is bound by a keyword argument. The [SQL page](sql.md) lists the supported clauses and features in full.
 
 ```python
 out = bt.sql("SELECT category, SUM(price) AS total FROM t GROUP BY category ORDER BY category", t=ds)
@@ -303,8 +321,7 @@ model once per worker.
 
 ## Preprocessors
 
-`batcher.ml.preprocessors` holds the scikit-learn-style `fit`/`transform` estimators.
-Fit on the training split, transform both; `Chain` composes them into one pipeline.
+`batcher.ml.preprocessors` holds the scikit-learn-style `fit`/`transform` estimators. Fit on the training split and transform both. `Chain` composes them into one pipeline.
 
 | Class | Learns |
 | --- | --- |

@@ -19,6 +19,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, sequence
 
 
@@ -32,8 +33,6 @@ def _int_in_predicate(values: list[int]):
 
 def test_float_column_int_in_list_fold_matches_duckdb(duck):
     """A float column filtered by >= 5 int-equality disjuncts folds to InList<Float64>."""
-    from conftest import assert_same
-
     tbl = pa.table({"x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, None]})
     duck.register("t", tbl)
     # Five int-literal disjuncts pass the fold threshold -> InList over Float64.
@@ -43,8 +42,6 @@ def test_float_column_int_in_list_fold_matches_duckdb(duck):
 
 def test_float_column_int_in_list_fold_large_set(duck):
     """Past LINEAR_SCAN_MAX the Float64 set takes the hashed branch; still matches."""
-    from conftest import assert_same
-
     tbl = pa.table({"x": [float(i) for i in range(20)] + [None]})
     duck.register("t", tbl)
     members = list(range(0, 20, 2))  # 10 members > LINEAR_SCAN_MAX

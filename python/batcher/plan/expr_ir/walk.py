@@ -45,6 +45,7 @@ from batcher.plan.expr_ir.namespaces import (
     ListSimhash,
     ListSlice,
     ListTransform,
+    ListZip,
     MapFunc,
     Strftime,
     StrFunc,
@@ -193,7 +194,7 @@ def _referenced_columns_impl(expr: Expr) -> set[str]:
             | referenced_columns(expr.stop)
             | referenced_columns(expr.step)
         )
-    if isinstance(expr, (NullIf, Math2Expr, ListBinary, ListSet)):
+    if isinstance(expr, (NullIf, Math2Expr, ListBinary, ListSet, ListZip)):
         return referenced_columns(expr.left) | referenced_columns(expr.right)
     if isinstance(expr, Case):
         cols = referenced_columns(expr.otherwise)
@@ -245,10 +246,23 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         return DateFunc(expr.fn, remap_columns(expr.input, mapping))
     if isinstance(expr, ImageFunc):
         return ImageFunc(
-            expr.fn, remap_columns(expr.input, mapping), width=expr.width, height=expr.height
+            expr.fn,
+            remap_columns(expr.input, mapping),
+            width=expr.width,
+            height=expr.height,
+            mean=expr.mean,
+            std=expr.std,
+            channels_first=expr.channels_first,
         )
     if isinstance(expr, AudioFunc):
-        return AudioFunc(expr.fn, remap_columns(expr.input, mapping), expr.rate)
+        return AudioFunc(
+            expr.fn,
+            remap_columns(expr.input, mapping),
+            rate=expr.rate,
+            n_fft=expr.n_fft,
+            hop_length=expr.hop_length,
+            n_mels=expr.n_mels,
+        )
     if isinstance(expr, VideoFunc):
         return VideoFunc(expr.fn, remap_columns(expr.input, mapping))
     if isinstance(expr, DateTrunc):
@@ -299,6 +313,10 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         )
     if isinstance(expr, ListSet):
         return ListSet(
+            expr.fn, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
+        )
+    if isinstance(expr, ListZip):
+        return ListZip(
             expr.fn, remap_columns(expr.left, mapping), remap_columns(expr.right, mapping)
         )
     if isinstance(expr, Array):

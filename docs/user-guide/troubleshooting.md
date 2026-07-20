@@ -13,8 +13,8 @@ ds = bt.from_pydict({"x": [1, 2, 3], "y": [10, 20, 30]})
 
 ## Nothing happened when I called a transformation
 
-A Dataset is lazy. Transformations build a plan and return a new Dataset; they do no
-work. If you expected output, call a terminal operation.
+A Dataset is lazy. Transformations build a plan and return a new Dataset without doing
+any work. If you expected output, call a terminal operation.
 
 ```python
 filtered = ds.filter(bt.col("x") > 1)  # builds a plan, runs nothing
@@ -98,15 +98,18 @@ bt.col("y")) < 30` and will not do what you want.
 
 ## I cannot find a method I expected
 
-The surface is deliberately small and some operations live in a specific place:
+The surface is deliberately small, and a few operations sit somewhere other than where
+you might reach first:
 
-- There is no `ds.sql(...)` method. Use the top-level {py:obj}`bt.sql(query, table=ds) <batcher.sql>`.
-- There is no dataset-level `.cast`, `.fill_null`, or `.drop_nulls`. Cast and
-  fill nulls on an expression: `ds.with_columns(x=bt.col("x").cast("Float64"))`,
-  `ds.with_columns(x=bt.col("x").fill_null(0))`.
-- There is no `.unique()`; use `.distinct()`.
-- `collect()` returns a pyarrow Table. To get a pandas DataFrame, call
-  `.to_pandas()` on that Table, not on the Dataset.
+- `collect()` returns a pyarrow Table. To get a pandas DataFrame, call `.to_pandas()` on
+  that Table, not on the Dataset.
+- `distinct()` and `unique()` are the same operator under two names, so use whichever
+  spelling your background makes natural.
+- `ds.sql(query)` binds the current dataset as the table `self`. The top-level
+  {py:obj}`bt.sql <batcher.sql>` is what you want when a query names more than one table.
+- `ds.cast`, `ds.fill_null`, and `ds.drop_nulls` work over whole columns. When you want
+  the same thing on one derived value, the expression methods do it:
+  `ds.with_columns(x=bt.col("x").cast("float64"))`.
 
 ```python
 table = ds.collect()
@@ -133,3 +136,5 @@ out = ds.group_by("x").agg(total=bt.col("y").sum()).collect(spill=True)
 - [Distributed fault tolerance](../architecture/fault-tolerance.md): diagnosing a
   failed task, shuffle, or node.
 - [Configuration options](../configuration/options.md): every tunable and its default.
+- [Agent skills](../agents/index.md): `debug-a-batcher-query` is the triage tree a
+  coding agent follows, organized by symptom, with the bisect procedure against DuckDB.

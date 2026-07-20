@@ -409,10 +409,115 @@ class GroupBy:
         """
         return self._reduce("var", columns)
 
+    def product(self, *columns: str | Selector) -> Dataset:
+        """Product of each value column per group (every non-key numeric column by default).
+
+        Args:
+            *columns: Columns (names or selectors) to reduce; defaults to every
+                non-key numeric column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by the per-group products.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [2, 3, 5]})
+                >>> ds.group_by("g").product().sort("g").to_pydict()
+                {'g': ['a', 'b'], 'x': [6.0, 5.0]}
+        """
+        return self._reduce("product", columns)
+
+    def array_agg(self, *columns: str | Selector) -> Dataset:
+        """Collect each value column's values into a list per group (all non-key by default).
+
+        The group-wise ``array_agg`` / ``list`` aggregate — gather each group's values into a
+        `List` column, e.g. to build a per-entity sequence of features for a model. Values
+        appear in input order.
+
+        Args:
+            *columns: Columns (names or selectors) to collect; defaults to every non-key
+                column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by a `List` column per collected column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 2, 3]})
+                >>> ds.group_by("g").array_agg().sort("g").to_pydict()
+                {'g': ['a', 'b'], 'x': [[1, 2], [3]]}
+        """
+        return self._reduce("array_agg", columns)
+
+    def mode(self, *columns: str | Selector) -> Dataset:
+        """The most frequent value of each column per group (all non-key columns by default).
+
+        Args:
+            *columns: Columns (names or selectors) to reduce; defaults to every non-key column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by the per-group modes.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "a", "b"], "x": [5, 5, 7, 9]})
+                >>> ds.group_by("g").mode().sort("g").to_pydict()
+                {'g': ['a', 'b'], 'x': [5, 9]}
+        """
+        return self._reduce("mode", columns)
+
+    def skewness(self, *columns: str | Selector) -> Dataset:
+        """Sample skewness of each column per group (every non-key numeric column by default).
+
+        Args:
+            *columns: Columns (names or selectors) to reduce; defaults to every non-key
+                numeric column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by the per-group skewness.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "a"], "x": [1.0, 2.0, 3.0]})
+                >>> ds.group_by("g").skewness().to_pydict()
+                {'g': ['a'], 'x': [0.0]}
+        """
+        return self._reduce("skewness", columns)
+
+    def kurtosis(self, *columns: str | Selector) -> Dataset:
+        """Sample excess kurtosis of each column per group (numeric columns by default).
+
+        Args:
+            *columns: Columns (names or selectors) to reduce; defaults to every non-key
+                numeric column.
+
+        Returns:
+            A new `Dataset` of the group keys followed by the per-group kurtosis.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "a", "a"], "x": [1.0, 2.0, 3.0, 4.0]})
+                >>> round(ds.group_by("g").kurtosis().to_pydict()["x"][0], 2)
+                -1.2
+        """
+        return self._reduce("kurtosis", columns)
+
     # Reductions whose default (all non-key columns) is restricted to numeric columns,
     # mirroring pandas' `numeric_only`: averaging or summing a string column is an error,
     # so an explicit-columns call is required to attempt it.
-    _NUMERIC_ONLY = frozenset({"sum", "mean", "median", "std", "var"})
+    _NUMERIC_ONLY = frozenset(
+        {"sum", "mean", "median", "std", "var", "product", "skewness", "kurtosis"}
+    )
 
     def _value_columns(self, numeric_only: bool) -> list[str]:
         """The default reduction targets: non-key columns, optionally numeric ones only."""

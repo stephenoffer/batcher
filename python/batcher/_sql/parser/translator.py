@@ -1,9 +1,9 @@
 """The `_Translator` skeleton plus the public `sql()` entry point.
 
 The translator is one stateful class (`_Translator`); its method bodies are
-grouped by theme into sibling modules (`clauses`, `scalar`, `subquery`,
-`windowing`, `grouping`, `literals`) as free functions that take the translator
-instance as their first argument. The methods here are thin delegators so the
+grouped by theme into sibling modules (`clauses`, `subquery`, `windowing`,
+`grouping`, and the `expressions` subpackage) as free functions that take the
+translator instance as their first argument. The methods here are thin delegators so the
 class reads as one cohesive object while each theme stays under the file ceiling.
 """
 
@@ -14,7 +14,15 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
-from batcher._sql.parser import clauses, grouping, scalar, subquery, windowing
+from batcher._sql.parser import (
+    clauses,
+    expressions,
+    from_clause,
+    grouping,
+    grouping_sets,
+    subquery,
+    windowing,
+)
 from batcher._sql.parser.core_utils import _alias_of, _disambiguate_columns, _has_aggregate
 from batcher.api.dataset import Dataset
 from batcher.api.session import from_arrow
@@ -47,6 +55,29 @@ def translate_ast(
     """
     registry = {name: _as_dataset(t) for name, t in tables.items()}
     return _Translator(registry, functions or {}).statement(ast)
+
+
+# Iteration cap for a recursive CTE. A wrong or missing stop condition would otherwise
+# loop forever; failing loudly at a generous bound is better than hanging. DuckDB's
+# equivalent guard is 1024 by default.
+_MAX_RECURSION = 1024
+
+
+def _references(node, name: str) -> bool:
+    """Whether `node` reads the table `name` anywhere beneath it."""
+    from sqlglot import expressions as exp
+
+    return any(t.name == name for t in node.find_all(exp.Table))
+
+
+def _is_self_referential(cte) -> bool:
+    """Whether a CTE's body references the CTE itself — i.e. it is the recursive one.
+
+    `WITH RECURSIVE` marks the whole `WITH` clause, not the individual CTEs, so a recursive
+    block may still hold ordinary non-recursive CTEs alongside the recursive one. Only the
+    self-referential ones need fixpoint evaluation.
+    """
+    return _references(cte.this, cte.alias)
 
 
 def _table_ref_count(root, name: str) -> int:
@@ -119,6 +150,88 @@ class _Translator:
             return from_arrow(ds.collect())
         return ds
 
+    def _recursive_cte(self, cte) -> Dataset:
+        """Evaluate a `WITH RECURSIVE` CTE to a fixpoint, eagerly.
+
+        A recursive CTE is `anchor UNION [ALL] recursive-term`, where the recursive term
+        references the CTE itself. It is evaluated the way the SQL standard defines it: run
+        the anchor, then repeatedly run the recursive term against *only the rows the last
+        iteration produced*, accumulating results, until an iteration yields nothing.
+
+        This is necessarily **eager** — the fixpoint has to run before anything downstream
+        can read the CTE — so it materializes, unlike an ordinary lazy CTE. That is also why
+        it is bounded: a non-terminating recursion (a missing or wrong stop predicate) would
+        otherwise hang, so it raises past `_MAX_RECURSION` iterations rather than spin.
+
+        Args:
+            cte: The `CTE` node whose body is self-referential.
+
+        Returns:
+            A materialized `Dataset` over the accumulated rows.
+        """
+        import pyarrow as pa
+        from sqlglot import expressions as exp
+
+        body = cte.this
+        if not isinstance(body, exp.Union):
+            raise NotImplementedError(
+                "a recursive CTE must be `<anchor> UNION [ALL] <recursive term>`; "
+                f"got {type(body).__name__.lower()}"
+            )
+        anchor_node, step_node = body.this, body.expression
+        if _references(anchor_node, cte.alias):
+            raise NotImplementedError(
+                "the first branch of a recursive CTE is the anchor and must not reference "
+                f"{cte.alias!r}; put the recursive branch second"
+            )
+        distinct = bool(body.args.get("distinct"))
+
+        frontier = self.statement(anchor_node).collect()
+        # Column names come from the CTE header (`c(n)`) when given, else the anchor's.
+        names = [c.name for c in (cte.args.get("alias").columns or [])] or frontier.column_names
+        frontier = frontier.rename_columns(names)
+        accumulated = [frontier]
+
+        saved = self._registry.get(cte.alias)
+        try:
+            for _ in range(_MAX_RECURSION):
+                if frontier.num_rows == 0:
+                    break
+                # The recursive term sees only the previous iteration's rows — that is what
+                # makes this terminate for the usual `SELECT n+1 FROM c WHERE n < k` shape.
+                self._registry[cte.alias] = from_arrow(frontier)
+                produced = self.statement(step_node).collect().rename_columns(names)
+                if distinct and produced.num_rows:
+                    # `UNION` (not ALL) is a set fixpoint: rows already derived must not be
+                    # fed forward, or a step that keeps re-deriving them never terminates
+                    # (`SELECT 1 FROM c` is the degenerate case). Anti-join through the
+                    # engine rather than comparing rows in Python.
+                    seen = pa.concat_tables(accumulated, promote_options="default")
+                    produced = (
+                        from_arrow(produced).join(from_arrow(seen), on=names, how="anti").collect()
+                    )
+                frontier = produced
+                accumulated.append(frontier)
+            else:
+                raise NotImplementedError(
+                    f"recursive CTE {cte.alias!r} did not terminate within "
+                    f"{_MAX_RECURSION} iterations; check its stop condition"
+                )
+        finally:
+            if saved is None:
+                self._registry.pop(cte.alias, None)
+            else:
+                self._registry[cte.alias] = saved
+
+        # Keep an empty table when nothing was derived, so the CTE still carries the
+        # anchor's schema rather than collapsing to "no columns".
+        non_empty = [t for t in accumulated if t.num_rows]
+        out = (
+            pa.concat_tables(non_empty, promote_options="default") if non_empty else accumulated[0]
+        )
+        ds = from_arrow(out)
+        return ds.distinct() if distinct else ds
+
     # --- statement ---------------------------------------------------------
     def statement(self, node) -> Dataset:
         """Translate a top-level statement: a SELECT or a set operation."""
@@ -129,8 +242,12 @@ class _Translator:
         # earlier ones (they are translated and registered sequentially).
         with_ = node.args.get("with") or node.args.get("with_")
         if with_ is not None:
+            recursive = bool(with_.args.get("recursive"))
             for cte in with_.expressions:
-                self._registry[cte.alias] = self._cte_dataset(node, cte)
+                if recursive and _is_self_referential(cte):
+                    self._registry[cte.alias] = self._recursive_cte(cte)
+                else:
+                    self._registry[cte.alias] = self._cte_dataset(node, cte)
             # Strip the WITH so the body translates as an ordinary statement.
             node = node.copy()
             node.set("with", None)
@@ -162,7 +279,7 @@ class _Translator:
             return self.select(node)
         if isinstance(node, exp.Values):
             # A bare `VALUES (..), (..)` statement is an inline literal relation.
-            return clauses._values_table(node)
+            return from_clause._values_table(node)
         if isinstance(node, exp.Command) and str(node.this).upper() == "EXPLAIN":
             # sqlglot does not model EXPLAIN; it parses as a Command carrying the rest
             # of the query as text. Re-parse it, render the *planned* tree (no
@@ -208,15 +325,15 @@ class _Translator:
             ds = ds.limit(n, offset=skip)
         return ds
 
-    # --- clause building (clauses.py) --------------------------------------
+    # --- clause building (clauses.py / from_clause.py) ---------------------
     def select(self, node) -> Dataset:
         return clauses._select(self, node)
 
     def _from(self, node) -> Dataset:
-        return clauses._from(self, node)
+        return from_clause._from(self, node)
 
     def _table(self, node) -> Dataset:
-        return clauses._table(self, node)
+        return from_clause._table(self, node)
 
     def _order(self, ds: Dataset, order, projections=None) -> Dataset:
         return clauses._order(self, ds, order, projections)
@@ -242,13 +359,15 @@ class _Translator:
 
     # --- grouping / aggregation (grouping.py) ------------------------------
     def _grouping_sets_union(self, node, group) -> Dataset:
-        return grouping._grouping_sets_union(self, node, group)
+        return grouping_sets._grouping_sets_union(self, node, group)
 
     def _projection_map(self, ds: Dataset, projections) -> dict[str, Expr]:
         return grouping._projection_map(self, ds, projections)
 
-    def _aggregate(self, ds: Dataset, projections, group, having) -> Dataset:
-        return grouping._aggregate(self, ds, projections, group, having)
+    def _aggregate(
+        self, ds: Dataset, projections, group, having, windows=None, order=None
+    ) -> tuple:
+        return grouping._aggregate(self, ds, projections, group, having, windows, order)
 
     def _distinct_on(self, ds: Dataset, projections, order, on_exprs) -> Dataset:
         return grouping._distinct_on(self, ds, projections, order, on_exprs)
@@ -263,9 +382,9 @@ class _Translator:
     def _window(self, ds: Dataset, projections) -> Dataset:
         return windowing._window(ds, projections)
 
-    # --- scalar expressions (scalar.py) ------------------------------------
+    # --- scalar expressions (expressions/) ---------------------------------
     def _scalar(self, node) -> Expr:
-        return scalar._scalar(self, node)
+        return expressions._scalar(self, node)
 
     # --- shared AST helpers (core_utils.py) --------------------------------
     def _has_aggregate(self, node) -> bool:

@@ -10,12 +10,64 @@ use crate::{ExprError, StrFunc};
 
 mod chunk;
 mod html;
+mod jaro;
 mod json;
 mod like;
 mod minhash;
 mod regex_cache;
 
 /// Evaluate a string function over a Utf8 array (preserving nulls).
+/// Apply a string function to a **dictionary** column's distinct values and gather the
+/// result through its keys, instead of decoding the column and applying it per row.
+///
+/// The identity is the one `try_dict_compare` already relies on, generalized from
+/// comparison to any elementwise function: **an elementwise function commutes with a
+/// gather**, so `f(take(values, keys)) == take(f(values), keys)`. Every `StrFunc` is
+/// elementwise — each output row depends only on the same input row and the *constant*
+/// `pattern`/`replacement`/`start`/`length` arguments — so the rewrite is exact rather
+/// than approximate, which is what lets it live inside the correctness oracle.
+///
+/// The win is the ratio of rows to distinct values, and low-cardinality string columns
+/// are the normal shape of analytic data: a country, a status, a user agent. On 6M rows
+/// over 25 distinct values, `upper()` runs 25 times instead of 6,000,000.
+///
+/// Nulls need no special handling and are worth stating because it looks like they
+/// might: a null *key* gathers to null whatever `f` did, and a null *value* makes
+/// `f(value)` null which then gathers to null. Both match the decoded path exactly.
+///
+/// Returns `None` for any non-dictionary input, so the caller falls back to the array
+/// path unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_dict_str(
+    func: StrFunc,
+    input: &crate::Expr,
+    batch: &arrow::array::RecordBatch,
+    pattern: Option<&str>,
+    replacement: Option<&str>,
+    start: Option<i64>,
+    length: Option<i64>,
+) -> Result<Option<ArrayRef>, ExprError> {
+    use arrow::array::AsArray;
+
+    // Only a bare column: any other expression has already been evaluated (and so already
+    // decoded) by the time it gets here, leaving no dictionary to exploit.
+    let crate::Expr::Col { name } = input else {
+        return Ok(None);
+    };
+    // Read the column straight from the batch rather than through `eval`, which decodes
+    // dictionaries at the leaf.
+    let Some(arr) = batch.column_by_name(name) else {
+        return Ok(None);
+    };
+    if !matches!(arr.data_type(), DataType::Dictionary(_, _)) {
+        return Ok(None);
+    }
+    let dict = arr.as_any_dictionary();
+    // One call per *distinct* value, not per row.
+    let over_values = eval_str(func, dict.values(), pattern, replacement, start, length)?;
+    Ok(Some(arrow::compute::take(&over_values, dict.keys(), None)?))
+}
+
 pub(crate) fn eval_str(
     func: StrFunc,
     arr: &ArrayRef,
@@ -411,7 +463,7 @@ pub(crate) fn eval_str(
             }
             Arc::new(builder.finish())
         }
-        StrFunc::Chunk => chunk::eval_chunk(s, start, length)?,
+        StrFunc::Chunk => chunk::eval_chunk(s, start, length, pattern)?,
         StrFunc::MinHash => minhash::eval_minhash(s, start, length)?,
         StrFunc::StripHtml => Arc::new(map_str(s, html::strip_html_text)),
         StrFunc::SubstringIndex => {
@@ -460,6 +512,30 @@ pub(crate) fn eval_str(
                 s.iter()
                     .map(|o| o.map(|v| levenshtein(v, target) as i64))
                     .collect::<Int64Array>(),
+            )
+        }
+        StrFunc::DamerauLevenshtein => {
+            let target = require_pattern(pattern, func)?;
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| damerau_levenshtein(v, target) as i64))
+                    .collect::<Int64Array>(),
+            )
+        }
+        StrFunc::JaroSimilarity => {
+            let target = require_pattern(pattern, func)?;
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| jaro::jaro(v, target)))
+                    .collect::<arrow::array::Float64Array>(),
+            )
+        }
+        StrFunc::JaroWinklerSimilarity => {
+            let target = require_pattern(pattern, func)?;
+            Arc::new(
+                s.iter()
+                    .map(|o| o.map(|v| jaro::jaro_winkler(v, target)))
+                    .collect::<arrow::array::Float64Array>(),
             )
         }
         StrFunc::Soundex => Arc::new(map_str(s, soundex)),
@@ -567,6 +643,61 @@ fn levenshtein(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut curr);
     }
     prev[b.len()]
+}
+
+/// True (unrestricted) Damerau-Levenshtein distance between `a` and `b`, over UTF-8
+/// **bytes** to match DuckDB's `damerau_levenshtein` (same octet rationale as
+/// [`levenshtein`]). It adds a fourth edit — transposing two adjacent characters at cost 1 —
+/// so a swapped-letter typo (`teh`↔`the`) is one edit.
+///
+/// This is the Lowrance-Wagner algorithm, **not** the simpler Optimal String Alignment
+/// variant: OSA forbids editing a substring more than once and so scores `ca`→`abc` as 3,
+/// whereas true DL (and DuckDB) score it 2. The distinction is why this keeps the full
+/// `(n+2)×(m+2)` matrix and a per-symbol "last seen row" table (`da`) rather than rolling
+/// rows. `da` is indexed by byte value, so its alphabet is a fixed 256 entries.
+fn damerau_levenshtein(a: &str, b: &str) -> usize {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let (n, m) = (a.len(), b.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let big = n + m; // a cost no real alignment can reach, used as the border sentinel
+    let w = m + 2;
+    let mut d = vec![0usize; (n + 2) * w];
+    let at = |i: usize, j: usize| i * w + j;
+    d[at(0, 0)] = big;
+    for i in 0..=n {
+        d[at(i + 1, 0)] = big;
+        d[at(i + 1, 1)] = i;
+    }
+    for j in 0..=m {
+        d[at(0, j + 1)] = big;
+        d[at(1, j + 1)] = j;
+    }
+    let mut da = [0usize; 256];
+    for i in 1..=n {
+        let mut db = 0; // last column j where a[i-1] matched b[j-1]
+        for j in 1..=m {
+            let k = da[b[j - 1] as usize]; // last row where this symbol was seen in `a`
+            let l = db;
+            let cost = if a[i - 1] == b[j - 1] {
+                db = j;
+                0
+            } else {
+                1
+            };
+            d[at(i + 1, j + 1)] = (d[at(i, j)] + cost) // substitution / match
+                .min(d[at(i + 1, j)] + 1) // insertion
+                .min(d[at(i, j + 1)] + 1) // deletion
+                .min(d[at(k, l)] + (i - k - 1) + 1 + (j - l - 1)); // transposition
+        }
+        da[a[i - 1] as usize] = i;
+    }
+    d[at(n + 1, m + 1)]
 }
 
 /// American Soundex — a 4-character phonetic key (first letter + 3 consonant
@@ -1077,6 +1208,312 @@ mod tests {
     /// `chunk` collects the per-row `List<Utf8>` back into `Vec<Vec<String>>`; a null
     /// row becomes `None`.
     #[cfg(test)]
+    /// The dictionary fast path must be **bit-identical** to decoding the column and
+    /// applying the function per row — it lives inside the correctness oracle, so
+    /// "close enough" is not available to it.
+    ///
+    /// Swept across the string-function family rather than one representative, because
+    /// the identity being relied on (an elementwise function commutes with a gather) is
+    /// claimed for *all* of them, and a function that quietly depended on row position
+    /// would only show up here.
+    #[test]
+    fn dict_string_functions_match_the_decoded_column() {
+        use super::{eval_str, try_dict_str};
+        use crate::{Expr, StrFunc};
+        use arrow::array::{ArrayRef, DictionaryArray, Int32Array, RecordBatch, StringArray};
+        use arrow::datatypes::{Field, Int32Type, Schema};
+        use std::sync::Arc;
+
+        // Repeats and nulls in both the keys and the values — the two ways a gather can
+        // differ from a per-row map.
+        let values = StringArray::from(vec![
+            Some("  Hello World  "),
+            Some("aBc"),
+            None,
+            Some(""),
+            Some("ünïcødé"),
+        ]);
+        let keys = Int32Array::from(vec![
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(0),
+            Some(1),
+            None,
+            Some(4),
+        ]);
+        let dict: ArrayRef =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap());
+        let decoded = crate::eval::dispatch::decode_dict(dict.clone()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            dict.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![dict]).unwrap();
+        let col = Expr::Col {
+            name: "s".to_string(),
+        };
+
+        // (func, pattern, replacement, start, length)
+        let cases: Vec<(
+            StrFunc,
+            Option<&str>,
+            Option<&str>,
+            Option<i64>,
+            Option<i64>,
+        )> = vec![
+            (StrFunc::Upper, None, None, None, None),
+            (StrFunc::Lower, None, None, None, None),
+            (StrFunc::Len, None, None, None, None),
+            (StrFunc::Trim, None, None, None, None),
+            (StrFunc::LTrim, None, None, None, None),
+            (StrFunc::RTrim, None, None, None, None),
+            (StrFunc::Reverse, None, None, None, None),
+            (StrFunc::Ascii, None, None, None, None),
+            (StrFunc::Contains, Some("l"), None, None, None),
+            (StrFunc::StartsWith, Some("a"), None, None, None),
+            (StrFunc::EndsWith, Some("c"), None, None, None),
+            (StrFunc::Position, Some("l"), None, None, None),
+            (StrFunc::Substr, None, None, Some(2), Some(3)),
+            (StrFunc::Right, None, None, Some(2), None),
+            (StrFunc::Repeat, None, None, Some(2), None),
+            (StrFunc::Lpad, Some("*"), None, Some(8), None),
+            (StrFunc::Rpad, Some("*"), None, Some(8), None),
+            (StrFunc::Replace, Some("l"), Some("L"), None, None),
+            (StrFunc::RegexpMatches, Some("[A-Z]"), None, None, None),
+        ];
+        for (func, pattern, replacement, start, length) in cases {
+            let fast = try_dict_str(func, &col, &batch, pattern, replacement, start, length)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{func:?} did not take the dictionary path"));
+            let slow = eval_str(func, &decoded, pattern, replacement, start, length).unwrap();
+            assert_eq!(
+                fast.as_ref(),
+                slow.as_ref(),
+                "{func:?} disagreed with the decoded column"
+            );
+        }
+    }
+
+    /// Manual throughput check (ignored). Run:
+    ///   cargo test -p bc-expr dict_str_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dict_str_bench() {
+        use super::{eval_str, try_dict_str};
+        use crate::{Expr, StrFunc};
+        use arrow::array::{ArrayRef, DictionaryArray, Int32Array, RecordBatch, StringArray};
+        use arrow::datatypes::{Field, Int32Type, Schema};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        // ClickBench's shape: millions of rows over a few dozen distinct strings.
+        const ROWS: usize = 6_000_000;
+        const DISTINCT: usize = 25;
+        let values = StringArray::from(
+            (0..DISTINCT)
+                .map(|i| Some(format!("user-agent-string-number-{i}")))
+                .collect::<Vec<_>>(),
+        );
+        let keys = Int32Array::from((0..ROWS).map(|i| (i % DISTINCT) as i32).collect::<Vec<_>>());
+        let dict: ArrayRef =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap());
+        let decoded = crate::eval::dispatch::decode_dict(dict.clone()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            dict.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![dict]).unwrap();
+        let col = Expr::Col {
+            name: "s".to_string(),
+        };
+
+        for func in [StrFunc::Upper, StrFunc::Len, StrFunc::Reverse] {
+            let t = Instant::now();
+            let slow = eval_str(func, &decoded, None, None, None, None).unwrap();
+            let slow_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = Instant::now();
+            let fast = try_dict_str(func, &col, &batch, None, None, None, None)
+                .unwrap()
+                .unwrap();
+            let fast_ms = t.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(fast.as_ref(), slow.as_ref());
+            println!(
+                "{func:?}: decoded {slow_ms:.1} ms -> dict {fast_ms:.1} ms ({:.1}x)",
+                slow_ms / fast_ms
+            );
+        }
+    }
+
+    /// A non-dictionary column must decline the fast path rather than mis-handle it.
+    #[test]
+    fn a_plain_column_does_not_take_the_dictionary_path() {
+        use super::try_dict_str;
+        use crate::{Expr, StrFunc};
+        use arrow::array::{ArrayRef, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), Some("b")]));
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let col = Expr::Col {
+            name: "s".to_string(),
+        };
+
+        assert!(
+            try_dict_str(StrFunc::Upper, &col, &batch, None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn chunks_bounded(
+        input: Vec<Option<&str>>,
+        size: i64,
+        overlap: i64,
+        boundary: &str,
+    ) -> Vec<Option<Vec<String>>> {
+        use crate::StrFunc;
+        use arrow::array::{Array, ArrayRef, ListArray, StringArray};
+        use std::sync::Arc;
+        let arr: ArrayRef = Arc::new(StringArray::from(input));
+        let out = eval_str(
+            StrFunc::Chunk,
+            &arr,
+            Some(boundary),
+            None,
+            Some(overlap),
+            Some(size),
+        )
+        .unwrap();
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        (0..list.len())
+            .map(|i| {
+                if list.is_null(i) {
+                    return None;
+                }
+                let vals = list.value(i);
+                let vals = vals.as_any().downcast_ref::<StringArray>().unwrap();
+                Some((0..vals.len()).map(|j| vals.value(j).to_string()).collect())
+            })
+            .collect()
+    }
+
+    /// A word boundary must never cut a word in half — the failure that silently costs
+    /// retrieval recall, because the truncated fragment embeds as something else.
+    #[test]
+    fn chunk_word_boundary_never_splits_a_word() {
+        let text = "alpha beta gamma delta epsilon";
+        let got = chunks_bounded(vec![Some(text)], 12, 0, "word")
+            .remove(0)
+            .unwrap();
+        for c in &got {
+            let trimmed = c.trim();
+            assert!(
+                trimmed.is_empty() || text.split_whitespace().any(|w| trimmed.ends_with(w)),
+                "chunk {c:?} ends mid-word"
+            );
+        }
+    }
+
+    /// With no overlap, chunking is lossless whatever the boundary mode: a separator ends
+    /// the chunk it belongs to instead of being skipped.
+    #[test]
+    fn chunk_with_no_overlap_is_lossless_in_every_mode() {
+        let text = "One sentence. Another one here! A third? And a tail with no stop";
+        for mode in ["char", "word", "sentence", "line"] {
+            let got = chunks_bounded(vec![Some(text)], 16, 0, mode)
+                .remove(0)
+                .unwrap();
+            assert_eq!(got.concat(), text, "mode {mode} dropped or duplicated text");
+        }
+    }
+
+    /// A sentence boundary ends chunks on terminal punctuation where one is available.
+    #[test]
+    fn chunk_sentence_boundary_ends_on_punctuation() {
+        let text = "First one. Second one. Third one.";
+        let got = chunks_bounded(vec![Some(text)], 16, 0, "sentence")
+            .remove(0)
+            .unwrap();
+        // Every chunk but the last ends at a sentence terminator.
+        for c in &got[..got.len() - 1] {
+            assert!(c.ends_with('.'), "chunk {c:?} does not end a sentence");
+        }
+    }
+
+    /// When a window holds no sentence terminator, `sentence` must fall back to a *word*
+    /// boundary, not to an arbitrary character — asking for readable chunks and getting a
+    /// mid-word cut is worse than not asking.
+    #[test]
+    fn chunk_sentence_falls_back_to_a_word_boundary_not_a_hard_cut() {
+        // The first full stop is past the 40-character window.
+        let text = "The patient was diagnosed with hypertension. Treatment began.";
+        let got = chunks_bounded(vec![Some(text)], 40, 0, "sentence")
+            .remove(0)
+            .unwrap();
+        assert!(
+            got[0].ends_with(' ') || got[0].ends_with('.'),
+            "first chunk {:?} was cut mid-word",
+            got[0]
+        );
+        assert_eq!(got.concat(), text);
+    }
+
+    /// A token longer than the whole chunk has no boundary to back off to, and must
+    /// still be emitted rather than stalling the loop.
+    #[test]
+    fn chunk_emits_a_token_longer_than_the_chunk_size() {
+        let text = "aaaaaaaaaaaaaaaaaaaaaaaa bb";
+        let got = chunks_bounded(vec![Some(text)], 8, 0, "word")
+            .remove(0)
+            .unwrap();
+        assert!(!got.is_empty());
+        assert_eq!(got.concat(), text);
+    }
+
+    /// Boundary mode must not disturb the null/empty contract.
+    #[test]
+    fn chunk_boundary_keeps_the_null_and_empty_contract() {
+        let got = chunks_bounded(vec![None, Some("")], 8, 0, "word");
+        assert_eq!(got[0], None);
+        assert_eq!(got[1], Some(vec![]));
+    }
+
+    /// An unknown mode is rejected rather than silently treated as `char`.
+    #[test]
+    fn chunk_rejects_an_unknown_boundary() {
+        use crate::StrFunc;
+        use arrow::array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("abc")]));
+        let err = eval_str(
+            StrFunc::Chunk,
+            &arr,
+            Some("paragraph"),
+            None,
+            Some(0),
+            Some(2),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("unknown chunk boundary"), "{err}");
+    }
+
+    /// Non-ASCII text takes the offset-table path; boundaries must work there too.
+    #[test]
+    fn chunk_word_boundary_handles_non_ascii() {
+        let text = "café naïve résumé";
+        let got = chunks_bounded(vec![Some(text)], 8, 0, "word")
+            .remove(0)
+            .unwrap();
+        assert_eq!(got.concat(), text);
+    }
+
     fn chunks_of(input: Vec<Option<&str>>, size: i64, overlap: i64) -> Vec<Option<Vec<String>>> {
         use crate::StrFunc;
         use arrow::array::{Array, ArrayRef, ListArray, StringArray};
@@ -1464,6 +1901,22 @@ mod tests {
         assert_eq!(levenshtein("", "abc"), 3);
         assert_eq!(levenshtein("abc", ""), 3);
         assert_eq!(levenshtein("abc", "abc"), 0);
+    }
+
+    #[test]
+    fn damerau_levenshtein_scores_transpositions_as_one() {
+        use super::{damerau_levenshtein, levenshtein};
+        // An adjacent swap is one edit here, two under plain Levenshtein.
+        assert_eq!(damerau_levenshtein("ca", "ac"), 1);
+        assert_eq!(levenshtein("ca", "ac"), 2);
+        assert_eq!(damerau_levenshtein("teh", "the"), 1);
+        // Non-transposition cases agree with Levenshtein.
+        assert_eq!(damerau_levenshtein("kitten", "sitting"), 3);
+        assert_eq!(damerau_levenshtein("abc", "abc"), 0);
+        assert_eq!(damerau_levenshtein("", "abc"), 3);
+        assert_eq!(damerau_levenshtein("abc", ""), 3);
+        // True (unrestricted) DL, matching DuckDB: transpose ca→ac then insert b = 2.
+        assert_eq!(damerau_levenshtein("ca", "abc"), 2);
     }
 
     /// `regexp_replace`/`regexp_replace_all` use DuckDB's RE2 rewrite template: `\1`..`\9`

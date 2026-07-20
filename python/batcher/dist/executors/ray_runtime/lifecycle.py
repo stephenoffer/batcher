@@ -23,6 +23,7 @@ import threading
 
 import pyarrow as pa
 
+from batcher._internal.errors import BackendError
 from batcher._internal.paths import package_dir
 from batcher.config import active_config
 from batcher.io.source import Source, read_source
@@ -280,11 +281,46 @@ def _platform_env_hook_disabled():
 # answer is fixed for the process — a later `_ensure_ray` must not flip it just because
 # Ray now reports initialized.
 _ship_decided = False
+# Serializes Ray bring-up. `_ensure_ray` is check-then-act on `ray.is_initialized()`, and
+# concurrent pipelines both reach it cold: each sees "not initialized" and calls `ray.init`,
+# and the loser dies on Ray's own `AssertionError("Perhaps you called ray.init twice by
+# accident?")`. Observed directly — two pipelines started together, one returned the right
+# answer and the other crashed before it began. The lock also covers `_ship_decided` and
+# `_wrap_tasks`, which rebind module-level names in place.
+_RAY_INIT_LOCK = threading.Lock()
+
+
+def _import_ray():
+    """Import Ray, or raise a typed error naming the extra that installs it.
+
+    Distribution is opt-in (`ray` is an optional extra), so a user who asks for
+    `distributed=True` on a plain install would otherwise get a bare
+    `ModuleNotFoundError: ray` raised from deep inside `dist/` — a traceback that names
+    neither the cause nor the fix. `distributed="auto"` never reaches here (it routes to
+    single-node when Ray is absent); only an *explicit* request does, and an explicit
+    request deserves an explicit answer."""
+    try:
+        import ray
+    except ImportError as e:  # pragma: no cover - exercised only without the extra
+        raise BackendError(
+            "distributed execution requires Ray, which is an optional extra: "
+            "pip install 'batcher-engine[ray]'. "
+            "Use distributed=False (or distributed='auto') to run on this node instead."
+        ) from e
+    return ray
 
 
 def _ensure_ray(workers: int) -> None:
     global _ship_decided
-    import ray
+    ray = _import_ray()
+
+    with _RAY_INIT_LOCK:
+        _ensure_ray_locked(ray, workers)
+
+
+def _ensure_ray_locked(ray, workers: int) -> None:
+    """The bring-up decision, serialized by `_RAY_INIT_LOCK` against other pipelines."""
+    global _ship_decided
 
     if not ray.is_initialized():
         with _platform_env_hook_disabled():

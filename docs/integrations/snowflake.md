@@ -7,13 +7,13 @@ dataset into a table.
 | | |
 | --- | --- |
 | **Read** | `bt.read.snowflake(query, connection_kwargs=...)` |
-| **Write** | `ds.write.snowflake(table, connection_kwargs=...)`, `mode="overwrite"` (default) or `"append"` |
+| **Write** | `ds.write.snowflake(table, connection_kwargs=...)`, `mode="append"` (default) or `"overwrite"` |
 | **Extra** | `pip install 'batcher-engine[snowflake]'` |
 | **Parallelism** | One split per result chunk from `get_result_batches()` |
 | **Pushdown** | Predicates, as a `WHERE` around your query. Projection is not pushed. |
 | **Credentials** | Everything inside the `connection_kwargs` dict |
 
-```
+```bash
 pip install 'batcher-engine[snowflake]'
 ```
 
@@ -144,13 +144,10 @@ lowercase Arrow column names and you get a table whose columns can only ever be 
 `"order_id"`, with the quotes, forever. Alias them to upper case first.
 :::
 
-:::{important}
-`mode` is honored, and the default is `mode="overwrite"` — which replaces the destination
-table. Pass `mode="append"` explicitly to add to it.
-
-This is worth reading twice, because the default is the destructive one. It is consistent
-with `ds.write.delta` and the rest of `write()`, but a Snowflake table is not a file, and
-"overwrite" means the rows that were there are gone.
+:::{warning}
+`mode` defaults to `"append"`, so a re-run adds its rows again rather than replacing them.
+Pass `mode="overwrite"` to replace the destination table instead. Overwrite is the
+destructive one: the rows that were there are gone.
 :::
 
 And it goes through pandas. The Arrow table is converted with `to_pandas()` and staged by

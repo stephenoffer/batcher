@@ -19,7 +19,7 @@ ds = bt.from_pydict(
 ## Build one lazy chain, collect once
 
 A Dataset is lazy and immutable. Each operation returns a new Dataset and runs no
-work; the plan executes only at a terminal operation such as `collect`,
+work. The plan executes only at a terminal operation such as `collect`,
 `to_pydict`, or a write. Chain the whole transformation, then collect once. The
 optimizer sees the entire pipeline and can reorder and fuse it.
 
@@ -51,7 +51,7 @@ print(out.to_pydict()["total"])
 # [10.0, 40.0, 90.0, 160.0, 250.0]
 ```
 
-Do not pull data into Python to compute a column. If you reach for `to_pylist`
+Don't pull data into Python to compute a column. If you reach for `to_pylist`
 inside a loop to build a new field, rewrite it as an expression instead. When a
 computation genuinely needs Python, use `map_batches`, which hands you a whole
 Arrow batch rather than one row at a time.
@@ -82,9 +82,9 @@ plan = ds.filter(bt.col("price") > 20).select("category").explain()
 print(plan)
 ```
 
-The filter sits directly above the scan, and the projection is above it — the shape you
-wanted. Each line carries the row estimate and its provenance (`exact` from the source,
-`default` from a heuristic, `learned` from a previous run):
+The filter sits directly above the scan, and the projection is above it. That is the shape
+you wanted. Each line carries the row estimate and its provenance: `exact` from the source,
+`default` from a heuristic, `learned` from a previous run.
 
 ```text
 project                         est≈4 (default)
@@ -119,7 +119,7 @@ out = (
 )
 ```
 
-Do not turn these on by default. Distribution adds scheduling and shuffle overhead
+Don't turn these on by default. Distribution adds scheduling and shuffle overhead
 that hurts small queries, and spill trades memory for disk I/O. Both earn their cost
 only on a big job.
 

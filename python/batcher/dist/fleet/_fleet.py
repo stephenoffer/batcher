@@ -29,6 +29,7 @@ import threading
 
 from batcher._internal.errors import ResourceError
 from batcher._internal.hardware import available_cpu_count
+from batcher.dist.fleet.plan_id import active_query_scopes, adopt_plan_id, query_shuffle_scope
 
 __all__ = [
     "ShuffleFleet",
@@ -247,6 +248,11 @@ def _acquire_session_fleet(workers: int, credits: int, cfg_json: str) -> Shuffle
     mid-shuffle over its actors — so it is reused as-is and the next uncontended acquire
     resizes it.
 
+    Re-granting is skipped while a **second query** holds the fleet: the in-place rewrite
+    would retune workers a concurrent query is already shuffling over — the poisoning
+    `_regrant_fleet` prevents between queries, now mid-flight. The arriving query runs
+    under the incumbent's grant: a scheduling degradation, never a wrong answer.
+
     A fleet whose actors died (preemption) is torn down and respawned transparently.
 
     Takes a **lease** on the fleet: the idle timer is cancelled for as long as any
@@ -271,8 +277,12 @@ def _acquire_session_fleet(workers: int, credits: int, cfg_json: str) -> Shuffle
             _SESSION = None
         if _SESSION is None:
             _SESSION = ShuffleFleet.spawn(workers, credits, cfg_json)
-        elif _SESSION.credits != credits or _SESSION.cfg_json != cfg_json:
-            # Wide enough, but granted for someone else's query. Re-grant, don't respawn.
+        elif active_query_scopes() <= 1 and (_SESSION.credits, _SESSION.cfg_json) != (
+            credits,
+            cfg_json,
+        ):
+            # Wide enough, but granted for someone else's query. Re-grant, don't respawn —
+            # and only when no concurrent pipeline is shuffling over these same workers.
             with contextlib.suppress(Exception):
                 _regrant_fleet(_SESSION, credits, cfg_json)
         _SESSION_LEASES += 1
@@ -304,6 +314,10 @@ def session_fleet_lease():
 
     Leasing before the fleet exists is fine and intended: the counter gates teardown, and
     the first operator to need a fleet spawns it under the already-held lease.
+
+    This is also where the query's shuffle **plan id** is minted: the one scope that means
+    "one query", and while the fleet under it may be shared with other pipelines, the id
+    must not be.
     """
     global _SESSION_LEASES, _SESSION_TIMER
 
@@ -313,7 +327,8 @@ def session_fleet_lease():
             _SESSION_TIMER = None
         _SESSION_LEASES += 1
     try:
-        yield
+        with query_shuffle_scope():  # the fence, and the one place a query is counted
+            yield
     finally:
         release_session_lease()
 
@@ -355,20 +370,18 @@ def acquire_fleet(workers: int, credits: int, cfg_json: str):
     """
     fleet = current_fleet()
     if fleet is not None:
-        # Re-assert the borrowed fleet's plan id on the driver, so this operator's
-        # tree-combine tickets fence to the same query the workers were spawned for.
-        from batcher.dist.flight_worker import set_current_plan_id
-
-        set_current_plan_id(fleet.plan_id)
+        # Re-assert this operator's plan id on the driver, so its tree-combine tickets
+        # fence to the same query the workers are publishing under. Prefer the id minted
+        # for *this query* over the fleet's spawn-time one: a shared fleet's id is common
+        # to every pipeline borrowing it, which is exactly the collision we are avoiding.
+        adopt_plan_id(fleet.plan_id)
         return fleet.actors, fleet.pg, fleet.addrs, fleet.workers, False
 
     from batcher.config import active_config
 
     if active_config().distributed.reuse_session_fleet:
-        from batcher.dist.flight_worker import set_current_plan_id
-
         session = _acquire_session_fleet(workers, credits, cfg_json)
-        set_current_plan_id(session.plan_id)
+        adopt_plan_id(session.plan_id)
         return session.actors, session.pg, session.addrs, session.workers, False
 
     actors, pg, addrs = _spawn_fleet_with_addrs(workers, credits, cfg_json)
@@ -447,9 +460,17 @@ def maybe_spawn_query_fleet(num_workers: int | None, transport: str) -> ShuffleF
             return None
         from batcher.dist.flight_aggregate import _shuffle_credits
 
-        # An adaptive query fleet reserves its own placement group; free any warm
-        # session fleet first so its held bundles can't deadlock the new gang request.
+        # A fleet reserves the cluster's whole CPU capacity, so two cannot both be placed,
+        # and the release below is a NO-OP while another pipeline holds the warm fleet —
+        # spawning anyway contends with the reservation that pipeline is running on and
+        # degrades to the 1-2 workers it can place (measured: a join 0.6 s -> 16 s). Share
+        # instead; `None` is the documented borrow path, and this query's lease keeps the
+        # fleet alive across its stages. The test is the query count, not whether the
+        # release took: the caller holds this query's own lease already, so the release
+        # always no-ops and cannot see a concurrent holder. >1 means someone else does.
         release_session_fleet()
+        if active_query_scopes() > 1:
+            return None
         return ShuffleFleet.spawn(workers, _shuffle_credits(), engine_config_json())
     finally:
         release_autoscale()

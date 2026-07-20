@@ -30,6 +30,7 @@ import time
 
 import numpy as np
 import pyarrow as pa
+from _ray_env import init_ray
 
 print = functools.partial(print, flush=True)
 
@@ -66,23 +67,6 @@ def write_shards(directory: str, n: int, accounts: int, shards: int) -> str:
         pq.write_table(tbl, os.path.join(directory, f"part-{s:05d}.parquet"))
         idx += rows
     return directory
-
-
-def _init() -> None:
-    import importlib.util
-
-    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
-        v = os.environ.get(var)
-        if v:
-            head = v.lstrip("[{\"' ").split(".")[0].split("[")[0]
-            if head and importlib.util.find_spec(head) is None:
-                os.environ.pop(var, None)
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(
-            address="auto", runtime_env={"pip": None}, logging_level="ERROR", log_to_driver=False
-        )
 
 
 def _score_np(amt, avg, n):
@@ -134,7 +118,7 @@ def _key_scores(tbl: pa.Table) -> dict:
 
 def main() -> int:
     cfg = _cfg()
-    _init()
+    init_ray()
     directory = write_shards(cfg["dir"], cfg["n"], cfg["accounts"], cfg["shards"])
     print(f"txns={cfg['n']}  accounts={cfg['accounts']}  shards={cfg['shards']}\n")
 

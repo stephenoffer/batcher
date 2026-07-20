@@ -149,7 +149,6 @@ def _json_pool(n: int) -> Any:
     """
     global _JSON_POOL, _JSON_POOL_SIZE
     import atexit
-    import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
 
     if _JSON_POOL is None or n > _JSON_POOL_SIZE:
@@ -157,8 +156,9 @@ def _json_pool(n: int) -> Any:
             _JSON_POOL.shutdown(wait=False)
         else:
             atexit.register(lambda: _JSON_POOL and _JSON_POOL.shutdown(wait=False))
-        methods = mp.get_all_start_methods()
-        ctx = mp.get_context("forkserver" if "forkserver" in methods else "fork")
+        from batcher._internal.hardware import process_start_method_context
+
+        ctx = process_start_method_context()
         _JSON_POOL = ProcessPoolExecutor(max_workers=n, mp_context=ctx)
         _JSON_POOL_SIZE = n
     return _JSON_POOL
@@ -192,6 +192,17 @@ def _json_write_part(task: tuple[bytes, str, bool]) -> tuple[str, int, int]:
     with fs.atomic_writer(path) as fh:
         fh.write(data)
     return path, table.num_rows, len(data)
+
+
+def _rewind(fh: IO[Any]) -> bool:
+    """Seek `fh` back to the start, reporting whether the stream can be re-read."""
+    try:
+        if not fh.seekable():
+            return False
+        fh.seek(0)
+    except (OSError, ValueError, AttributeError):
+        return False
+    return True
 
 
 def _size_or_zero(fs: Any, path: str) -> int:
@@ -232,10 +243,59 @@ class JSONSource(FileSource):
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
         import pyarrow.json as pajson
 
+        if projection is not None:
+            parse_options = self._projection_parse_options(projection)
+            if parse_options is not None:
+                try:
+                    return pajson.read_json(fh, parse_options=parse_options).to_batches()
+                except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                    # The explicit schema could not parse this file, but free inference
+                    # might (a value the unified schema does not describe). Rewind and take
+                    # the original path so pushdown can only ever *add* speed, never turn a
+                    # readable file into an error. If the handle cannot be rewound the
+                    # fallback would read from a consumed stream and silently return a
+                    # truncated file, so the error is re-raised instead.
+                    if not _rewind(fh):
+                        raise
+
         table = pajson.read_json(fh)
         if projection is not None:
             table = table.select(projection)
         return table.to_batches()
+
+    def _projection_parse_options(self, projection: list[str]) -> Any:
+        """`ParseOptions` that parse **only** `projection`, or None to read everything.
+
+        `read_json` has no `columns=` argument, so the projected read used to parse every
+        column of every record and then throw the unwanted ones away — the decode cost and
+        the peak memory of a 200-column log file were paid in full to answer a two-column
+        query. An `explicit_schema` listing just the projected fields, with unexpected fields
+        `ignore`d, makes the parser skip the rest outright: they are never converted, never
+        allocated, never freed.
+
+        The schema comes from `self.schema()` — the source's own whole-file inference — so
+        the types are *exactly* the ones the un-projected read would have produced, and the
+        result is byte-identical to `read_json(...).select(projection)` (verified for nested
+        struct and list columns, and for column ordering, which follows `projection` rather
+        than file order). A column the unified schema has but this file lacks parses as all
+        nulls, which is what `_normalize` would have filled in anyway.
+
+        Returns None if the schema is unavailable or does not describe every projected
+        column — with nothing trustworthy to force, reading everything stays correct.
+        """
+        import pyarrow.json as pajson
+
+        try:
+            schema = self.schema()
+            fields = [schema.field(name) for name in projection]
+        except Exception:
+            return None  # inference unavailable/incomplete → no pushdown, same answer
+        return pajson.ParseOptions(
+            explicit_schema=pa.schema(fields),
+            # Anything outside the projection is skipped rather than inferred — the whole
+            # point. Without this, unlisted fields are still parsed and appended.
+            unexpected_field_behavior="ignore",
+        )
 
     def _file_splits(
         self,

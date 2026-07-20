@@ -20,7 +20,7 @@ class Provenance(IntEnum):
     HISTOGRAM = 1  # KLL / t-digest / DDSketch quantile sketch measured from data
     SKETCH = 2     # HLL distinct / Count-Min frequency (approximate by construction)
     LEARNED = 3    # a prior from a past run, keyed by plan signature
-    DEFAULT = 4    # a Selinger heuristic — an unconstrained guess
+    DEFAULT = 4    # Selinger heuristic / an unconstrained guess
 ```
 
 Ordered strongest-first, so trust composes with `max`. There is exactly one combiner:
@@ -103,18 +103,21 @@ estimate.
 Two conjuncts are almost never independent. `country = 'US' AND state = 'CA'` multiplied
 naively gives 0.01. The real figure is nearer 0.1, because the second predicate implies the first.
 
-`kyber/stats/selectivity.py` uses exponential backoff over the *ascending-sorted*
+`kyber/stats/selectivity/combine.py` uses exponential backoff over the ascending-sorted
 selectivities rather than a product:
 
 ```text
 s₁ · s₂^(1/2) · s₃^(1/4) · …
 ```
 
-The most selective conjunct counts fully; each subsequent one is damped by a further square
-root. It is a heuristic, it has no theory behind it, and it is dramatically less wrong than
-independence on correlated columns, which is most real schemas. `OR` uses honest
-inclusion-exclusion (`a + b − ab`). `NOT` subtracts the null mass first, because SQL keeps
-only TRUE.
+The most selective conjunct counts fully, and each subsequent one is damped by a further
+square root. The result lands between the pure independence product, which is a lower bound
+exact only when the conjuncts really are independent, and the most selective conjunct alone,
+which is the upper bound of the perfectly-correlated case. That makes it dramatically less
+wrong than independence on correlated columns, which is most real schemas. Two range
+conjuncts on the same column are recognized first and combined as a single interval, since
+two bounds on one column carve one range rather than two independent predicates. `OR` uses
+honest inclusion-exclusion. `NOT` subtracts the null mass first, because SQL keeps only TRUE.
 
 ## Joins
 
@@ -132,13 +135,19 @@ With no NDV at all it also returns `max(|L|, |R|)`, which assumes many-to-one.
 
 :::{warning}
 That assumption is the known cold-start failure. A genuinely many-to-many low-NDV join gets
-estimated **64–80× low**, and the join order that follows drives into 12–18M-row intermediates.
-TPC-H q5 cold takes 7,115 ms; warm, with the NDV learned, 300 ms. Feeding source-side HLL NDV on
-base join keys is the open fix.
+estimated **64 to 80 times low**, and the join order that follows drives into intermediates of
+12M to 18M rows. TPC-H q5 cold takes 7,115 ms. Warm, with the NDV learned, it takes 300 ms.
 :::
 
-Semi and anti joins use the matched fraction `min(1, d_R/d_L)`; outer joins take the
-appropriate floor (`left` → `max(inner, |L|)`).
+Seeding source-side HLL NDV on base join keys closes that gap before the optimizer runs, but
+only for *resident* sources that are already in memory, where sketching costs no extra I/O
+(`api/terminal/_metadata.py::seed_column_ndv`). A file-backed source is skipped, because
+re-reading it purely to sketch would double the query's I/O, so it still plans blind on its
+first run and learns its NDV from the post-run pass.
+
+A semi join keeps the matched fraction `min(1, d_R/d_L)` of the left rows, and an anti join
+takes the complement, so the two partition `|L|` exactly. Outer joins take the appropriate
+floor, so `left` becomes `max(inner, |L|)`.
 
 Multi-column key sets combine through one shared function, `combine_ndv`, and it uses the
 same exponential-backoff shape.
@@ -185,25 +194,29 @@ One sizes a hot key you already know about; the other finds the ones you do not.
 
 One detail in the HLL worth knowing, because it is a deliberate deviation from the paper.
 The handover from linear counting to the HLL estimator sits at load factor **3.5**, not
-Flajolet's 2.5. At 2.5 the discontinuity produced a +2.4% systematic overestimate at 26–42
+Flajolet's 2.5. At 2.5 the discontinuity produced a +2.4% systematic overestimate at 26 to 42
 standard errors. Bias, not noise. Sweeping the threshold at p=14: 2.5 gives 0.915% RMSE and
 2.56% worst bias; **3.5 gives 0.746% and 0.38%**. HLL++'s alternative is roughly 3,000
 empirical bias-correction constants; moving the handover was cheaper and better.
 
 ### The rule that keeps sketches honest
 
-:::{warning}
-A learned NDV lands on a column **only if that column is not already `EXACT`**
-(`kyber/stats/columns.py::scan_columns`). A `ColumnStat` carries one provenance for the whole
-bundle, so writing an HLL-derived NDV onto a column whose min/max came from a Parquet footer
-would tag that NDV `EXACT` — and let it wrongly answer a `count_distinct`.
+A distinct count is the one statistic that has to be tracked apart from the rest of its bundle.
+A Parquet footer gives exact min, max, and null counts but never a trustworthy distinct count,
+so the only NDV such a column can carry is an HLL estimate. When a `ColumnStat` carried a single
+provenance for the whole bundle, attaching that estimate to an otherwise `EXACT` column tagged
+the NDV `EXACT` too, which would let an approximate count answer a `count_distinct`.
 
-This is not hypothetical. Parquet's `distinct_count` footer field is only an *estimate*, and it
-had been tagged `EXACT`. It is now `SKETCH`.
+:::{important}
+`ColumnStat.ndv_provenance` carries the distinct count's *own* tag, separately from the bundle's
+(`python/batcher/plan/stats.py`). A sketched NDV rides alongside exact bounds, and
+`ndv_is_exact` is the gate every exact-answer path reads, so the sketch informs cost while it
+still refuses to answer a terminal. `kyber/stats/columns.py::scan_columns` merges a measured NDV
+onto a column that has none and tags it `SKETCH` whatever the bounds are worth.
 :::
 
-The purely descriptive stats (quantiles, most-common-values, average bytes) attach to any column
-without disturbing provenance.
+The purely descriptive stats, meaning quantiles, most-common-values, and average bytes, attach
+to any column without disturbing provenance.
 
 ## The correction loop
 
@@ -218,15 +231,22 @@ Guardrails: `cardinality_correction_min_samples` (2) before a factor is trusted;
 (8) averages only the recent past, because the structural estimator itself sharpens as NDVs
 accumulate and an all-history mean would keep applying a correction it has outgrown.
 
-`_CORRECTABLE` is `(Aggregate, Distinct, Join, Unnest)`. `Filter` is excluded on purpose:
-its selectivity is already learned per-signature, and correcting again would double-count.
-`Scan` is excluded because `plan_signature` structures every scan as the bare token
-`["scan"]`, so all scans in a process would collide on one entry.
+`_CORRECTABLE` is `(Aggregate, Distinct, Join, MapBatches, Unnest)`. `Filter` is excluded on
+purpose, because its selectivity is already learned per-signature and correcting it again
+would count the same error twice. `Scan` is excluded because `plan_signature` structures every
+scan as the bare token `["scan"]`, so all scans in a process would collide on one entry.
+
+`MapBatches` belongs for the same reason as `Unnest`. A UDF may filter, explode, or pass rows
+through one for one, and which one it does is a property of the code rather than of the plan,
+so the structural estimator can only assume 1:1. That is safe to correct only because a
+`map_batches` signature carries the UDF's identity by qualified name
+(`kyber.signature._udf_identity`), so one UDF's learned fan-out cannot answer for another's.
+An anonymous lambda still collides, and that is the floor.
 
 ## Cold and warm, side by side
 
 ::::{tab-set}
-:::{tab-item} Cold — nothing measured
+:::{tab-item} Cold: nothing measured
 ```text
 scan     row count from the source (often EXACT)
 filter   Selinger constants: eq 0.1, range 1/3, null 0.05,
@@ -238,7 +258,7 @@ provenance: DEFAULT above the leaves. TPC-H q5 takes 7,115 ms here.
 ```
 :::
 
-:::{tab-item} Warm — the loop has run
+:::{tab-item} Warm: the loop has run
 ```text
 scan     source-side HLL NDV, KLL quantiles, most-common-values, avg bytes
 filter   a learned per-signature selectivity
@@ -256,10 +276,9 @@ The estimator has no multi-column histograms and no correlation model. Exponenti
 is a stand-in for both, and on a query where a filter's columns are strongly correlated it
 will still be off by an order of magnitude on the first run.
 
-`MapBatches` is assumed 1:1 with `DEFAULT` provenance. `Unnest` passes rows through
-unchanged, since its fan-out is structurally unknowable. Both are corrected only by the learned
-loop, which means the first run of an exploding `flat_map` is planned as if it explodes not
-at all.
+A UDF's fan-out and an `Unnest`'s fan-out are both structurally unknowable, so the estimator
+assumes rows pass through unchanged and leaves the learned loop to correct them. The first run
+of an exploding `flat_map` is therefore planned as if it explodes not at all.
 
 And the thing every estimator shares: it is a prediction. What makes it survivable is that
 the engine measures the truth at every pipeline breaker and re-plans on it. See
@@ -270,7 +289,7 @@ the engine measures the truth at every pipeline breaker and re-plans on it. See
 | Concern | File |
 |---|---|
 | The estimator | `python/batcher/kyber/stats/estimator.py` |
-| Predicate selectivity | `python/batcher/kyber/stats/selectivity.py` |
+| Predicate selectivity | `python/batcher/kyber/stats/selectivity/` |
 | Merging learned column stats into a scan | `python/batcher/kyber/stats/columns.py` |
 | `Provenance`, `RelStats`, `ColumnStat` | `python/batcher/plan/stats.py` |
 | The sketches | `crates/bc-sketches/src/` |
@@ -279,7 +298,7 @@ the engine measures the truth at every pipeline breaker and re-plans on it. See
 ## See also
 
 :::{seealso}
-- [Architecture](../architecture/index.md): Kyber's lane — it decides, it never executes or measures
+- [Architecture](../architecture/index.md): Kyber's lane, where it decides and never executes or measures
 - [Kyber optimizer](../internals/kyber.md): the passes these estimates feed
 - `docs/internals/mathematical_foundations.md` (in the repo, not a site page): the sketch error bounds, derived
 - [Reading a plan](../user-guide/explain-plans.md): the `est≈` and provenance tags in the tree

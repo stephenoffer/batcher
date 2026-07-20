@@ -19,7 +19,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from conftest import assert_same, assert_same_ordered
+from _harness import assert_same, assert_same_ordered
 
 
 @pytest.fixture

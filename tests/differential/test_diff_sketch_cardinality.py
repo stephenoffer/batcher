@@ -5,6 +5,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -29,8 +30,6 @@ def test_column_statistics_measures_distinct_counts():
 
 
 def test_learning_path_keeps_results_correct(duck):
-    from conftest import assert_same
-
     t = pa.table({"k": [1, 1, 2, 3, 3, 3], "v": [10, 20, 30, 40, 50, 60]})
     duck.register("t", t)
     ds = bt.from_arrow(t)
@@ -45,8 +44,6 @@ def test_learning_path_keeps_results_correct(duck):
 
 
 def test_learned_join_cardinality_keeps_results_correct(duck):
-    from conftest import assert_same
-
     # A join where learned key ndv refines the cardinality estimate; result must
     # stay identical to DuckDB.
     left = pa.table({"id": [1, 2, 3, 4], "x": [10, 20, 30, 40]})

@@ -17,14 +17,13 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
-from conftest import assert_same
-
 pytestmark = pytest.mark.differential
 
 bt = pytest.importorskip("batcher")
 duckdb = pytest.importorskip("batcher")
 _duck = pytest.importorskip("duckdb")
 
+from _harness import assert_same  # noqa: E402
 from batcher import coalesce, col, lit  # noqa: E402
 
 

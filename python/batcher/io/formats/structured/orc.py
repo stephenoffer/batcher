@@ -11,15 +11,17 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import IO, Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.base import FileSink, FileSource
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.splits import Split
+from batcher.io.stats.file_identity import file_identity
 from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["ORCSink", "ORCSource", "ORCStripeSplit"]
@@ -27,13 +29,63 @@ __all__ = ["ORCSink", "ORCSource", "ORCStripeSplit"]
 
 def _require_orc() -> Any:
     """Import and return `pyarrow.orc` or raise `BackendError`."""
-    try:
-        import pyarrow.orc as orc
-    except ImportError as exc:  # pragma: no cover - pyarrow ships orc by default
-        raise BackendError(
-            "ORC support requires pyarrow built with ORC: pip install 'batcher-engine[all]'"
-        ) from exc
-    return orc
+    return require(
+        "pyarrow.orc", feature="ORC support", provides="pyarrow built with ORC", extra="all"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ORCFooter:
+    """The footer facts split planning needs, detached from the file handle that read them.
+
+    Deliberately *not* the `ORCFile` itself. An `ORCFile` owns an open stream, so caching one
+    would pin a file descriptor per cached entry for the life of the process — the cache would
+    leak handles rather than save round trips. These three scalars are everything the planner
+    asks a footer for, and they outlive the handle safely.
+    """
+
+    nrows: int
+    nstripes: int
+    schema: pa.Schema
+
+
+def _orc_footer(path: str) -> _ORCFooter:
+    """`path`'s ORC footer, read once per *version* of the file and cached.
+
+    ORC had no footer cache at all while Parquet had one, and the asymmetry was not
+    cosmetic: `ORCStripeSplit` re-opened the file and re-parsed the footer on *every*
+    method call — `schema()`, `row_count()`, each `read()` — so planning a 1,000-stripe
+    file cost 1,000 footer round trips (~100 ms each on object storage) to answer
+    questions whose answer is one immutable document.
+
+    Keyed on the file's identity — `(path, size, mtime_ns)` — never on the path alone, for
+    the reason `io.stats.file_identity` spells out: `FileSink` writes deterministic names,
+    so a re-run overwrites its own output and a path-keyed footer then reports the
+    *previous* file's stripe count and row count for the new bytes.
+
+    Bounded (`lru_cache(maxsize=1024)`) because an unbounded dict here grows with every
+    file the process has ever touched — a leak proportional to a long-lived worker's whole
+    scan history, not to its working set. A file that cannot be stat-ed is read uncached
+    rather than cached under a token that could not detect it changing.
+    """
+    identity = file_identity(path)
+    if identity is None:
+        return _read_orc_footer(path)
+    return _orc_footer_cached(identity)
+
+
+@lru_cache(maxsize=1024)
+def _orc_footer_cached(identity: tuple[str, int, int]) -> _ORCFooter:
+    """`_orc_footer` keyed on the file identity (see there)."""
+    return _read_orc_footer(identity[0])
+
+
+def _read_orc_footer(path: str) -> _ORCFooter:
+    orc = _require_orc()
+    fs = resolve_filesystem(path)
+    with fs.open(path) as fh:
+        reader = orc.ORCFile(fh)
+        return _ORCFooter(nrows=reader.nrows, nstripes=reader.nstripes, schema=reader.schema)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,12 +94,21 @@ class ORCStripeSplit:
 
     Carries only ``(path, stripe)`` so it pickles cheaply; `read` reopens the file
     and pulls just that stripe via ``ORCFile.read_stripe``.
+
+    `rows` is the stripe's row count when the footer *proves* one (see `row_count`), captured
+    at split time so balancing never re-opens the file.
     """
 
     path: str
     stripe: int
+    rows: int | None = None
 
     def _file(self) -> Any:
+        """A fresh reader over the file's *data*.
+
+        Metadata questions must not come through here — they go to `_orc_footer`, which is
+        cached. This opens a stream because a stripe read has to.
+        """
         orc = _require_orc()
         fs = resolve_filesystem(self.path)
         return orc.ORCFile(fs.open(self.path))
@@ -63,13 +124,39 @@ class ORCStripeSplit:
         return [batch]
 
     def schema(self) -> pa.Schema:
-        return self._file().schema
+        return _orc_footer(self.path).schema  # cached footer, not a re-open
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
         yield from self.read(projection)
 
     def row_count(self) -> int | None:
-        return self._file().read_stripe(self.stripe).num_rows
+        """The stripe's rows when the footer proves them, else None — never a data read.
+
+        This used to be ``read_stripe(self.stripe).num_rows``, which **decodes the entire
+        stripe** to learn a number. `_balance` calls `row_count()` on every split to bin-pack
+        them, so planning a distributed ORC read decoded the whole table on the driver before
+        a single task was dispatched — the dataset was read twice, the first time serially, to
+        decide how to read it in parallel.
+
+        pyarrow's ORC reader exposes `nstripes` and `nrows` but no *per-stripe* row count
+        (`ORCFile.nstripe_statistics` is only a count of statistics blobs; there is no
+        accessor for their contents), so for a multi-stripe file the honest answer is None.
+        That is exactly what the `Split.row_count` contract asks for — "the row count, or None
+        when counting would cost a data scan" — and `_balance` degrades to equal-weight splits,
+        which for ORC's uniformly sized stripes is a good approximation anyway.
+
+        Returning None here is deliberately *not* an estimate. An even division of `nrows`
+        across `nstripes` would balance marginally better and would be a wrong answer to a
+        question whose contract says exact-or-unknown; `count()` is answered exactly and
+        separately from the footers by `ORCSource.statistics`.
+
+        The single-stripe file is the case where the footer does prove it: that stripe holds
+        every row, so `nrows` is its exact count.
+        """
+        if self.rows is not None:
+            return self.rows
+        footer = _orc_footer(self.path)
+        return footer.nrows if footer.nstripes == 1 else None
 
     def identity(self) -> str:
         return f"orc:{self.path}:stripe{self.stripe}"
@@ -100,6 +187,25 @@ class ORCSource(FileSource):
         if projection is not None:
             table = table.select(projection)
         return table.to_batches()
+
+    def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        """Stream one ORC file a stripe at a time rather than reading it whole.
+
+        A stripe is ORC's own unit of columnar storage — the same role a Parquet row group
+        plays — so reading stripe by stripe holds one stripe rather than the whole decoded
+        file, and needs no re-chunking.
+        """
+        orc = _require_orc()
+        with self._fs.open(path) as fh:
+            reader = orc.ORCFile(fh)
+            for i in range(reader.nstripes):
+                # `read_stripe` yields a RecordBatch (unlike `read`, which yields a Table).
+                batch = reader.read_stripe(i, columns=projection)
+                # It shares `read`'s file-order column behaviour, so the same re-select is
+                # needed for projection order to survive.
+                if projection is not None:
+                    batch = batch.select(projection)
+                yield batch
 
     @staticmethod
     def _pa_filter(predicate: dict | None) -> Any:
@@ -133,20 +239,30 @@ class ORCSource(FileSource):
         yield from dataset.to_batches(columns=projection, filter=flt)
 
     def _file_row_count(self, path: str) -> int | None:
-        orc = _require_orc()
-        with self._fs.open(path) as fh:
-            return orc.ORCFile(fh).nrows
+        return _orc_footer(path).nrows
 
     def _file_splits(
         self,
         path: str,
         target_size: int | None,  # noqa: ARG002
-        predicate: dict | None = None,  # noqa: ARG002 (ORC stripe pruning not wired here)
+        # ORC stripe pruning is not wired here because pyarrow exposes no way to read a
+        # stripe's column statistics. `ORCFile.nstripe_statistics` reports only *how many*
+        # statistics blobs the footer holds; there is no accessor for their min/max, and the
+        # dataset API's ORC `FileFragment` has neither `split_by_row_group` nor `statistics`
+        # (unlike its Parquet counterpart). So there is nothing to hand `file_prune_mask`.
+        # This is a genuine gap in the reader, not a missing call: the moment pyarrow exposes
+        # stripe statistics, the fix is to shape them into the add-action layout and reuse
+        # `io.stats.file_skipping`, exactly as `io/splits/parquet.py::_surviving_row_groups`
+        # does — never a second pruning implementation. Dropping the predicate is meanwhile
+        # sound: every stripe survives, and the engine's `Filter` re-checks every row.
+        predicate: dict | None = None,  # noqa: ARG002 (see above — no stripe statistics exist)
     ) -> list[Split]:
-        orc = _require_orc()
-        with self._fs.open(path) as fh:
-            nstripes = orc.ORCFile(fh).nstripes
-        return [ORCStripeSplit(path, i) for i in range(nstripes)]
+        footer = _orc_footer(path)
+        # A single-stripe file's one stripe holds every row, so the footer's `nrows` is that
+        # split's exact count — carry it so balancing never opens the file. With more than one
+        # stripe the per-stripe split is unknowable from the footer (see `row_count`).
+        rows = footer.nrows if footer.nstripes == 1 else None
+        return [ORCStripeSplit(path, i, rows) for i in range(footer.nstripes)]
 
     def statistics(self) -> SourceStatistics | None:
         """Exact row count from the ORC footers (no data scan)."""
@@ -167,7 +283,8 @@ class ORCSink(FileSink):
 
     __slots__ = ("compression",)
 
-    def __init__(self, compression: str = "zstd") -> None:
+    def __init__(self, compression: str = "zstd", **kwargs: Any) -> None:
+        super().__init__(**kwargs)  # carries filesystem= / storage_options=
         self.compression = compression
 
     def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:

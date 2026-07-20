@@ -145,10 +145,28 @@ impl Meter {
                 rows_build: c.rows_build.load(Ordering::Relaxed),
                 rows_out,
                 elapsed_ns,
-                // Summed across workers, which is what a CPU-time reading means; the streaming
-                // tier does not sample the OS clock per morsel (it would cost more than the
-                // transform), so this is the wall-clock work summed over threads.
-                cpu_ns: elapsed_ns,
+                // `0` means "not measured", and that is the truthful answer here rather than a
+                // defect. A CPU *utilization* needs two numbers — work summed across threads,
+                // and the wall interval it was spread over — and this tier only has the first:
+                // `elapsed_ns` is already the per-morsel transform time summed over every worker
+                // (see the module docs), and no wall span is recorded because operators interleave
+                // in a pipeline and none owns a clock interval outright.
+                //
+                // Reporting `elapsed_ns` here, as this did, was not a conservative approximation
+                // — it was a fabricated constant. The consumer divides `cpu_ns` by
+                // `elapsed_ns * threads` (`plan.feedback.cpu_utilization`), so handing it the same
+                // number twice yields exactly `1 / threads` for *every* operator of *every*
+                // query: a hardcoded 6.25% on a 16-core box. `explain(analyze=True)` printed that
+                // as "cpu utilization: 7% of cores — CPU idle, not CPU-limited" on queries
+                // measured at 8-10x parallelism, i.e. confidently backwards, and
+                // `kyber.cpu_shares.load_cpu_utilization` fed the same constant into the learned
+                // CPU-share model. Its loader ignores non-positive samples, so `0` stops the
+                // corruption rather than merely hiding it.
+                //
+                // Restoring a real number means carrying a wall span per operator (min start /
+                // max end across workers) as its own `OpMetric` field — a two-sided IR change,
+                // deliberately not bundled here.
+                cpu_ns: 0,
                 threads: self.threads,
                 peak_bytes: c.peak_bytes.load(Ordering::Relaxed),
                 result_bytes: c.result_bytes.load(Ordering::Relaxed),

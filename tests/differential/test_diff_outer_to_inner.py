@@ -10,6 +10,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 
 
 def _tables(duck):
@@ -22,8 +23,6 @@ def _tables(duck):
 
 def test_left_join_null_rejecting_right_eq(duck):
     """`WHERE dept = 'eng'` rejects null right rows → left join behaves as inner."""
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = emp.join(dept, on="dept_id", how="left").filter(bt.col("dept") == "eng").collect()
     expected = duck.sql("SELECT * FROM emp LEFT JOIN dept USING (dept_id) WHERE dept = 'eng'")
@@ -31,8 +30,6 @@ def test_left_join_null_rejecting_right_eq(duck):
 
 
 def test_left_join_null_rejecting_right_isnotnull(duck):
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = emp.join(dept, on="dept_id", how="left").filter(bt.col("dept").is_not_null()).collect()
     expected = duck.sql("SELECT * FROM emp LEFT JOIN dept USING (dept_id) WHERE dept IS NOT NULL")
@@ -41,8 +38,6 @@ def test_left_join_null_rejecting_right_isnotnull(duck):
 
 def test_left_join_null_accepting_isnull_stays_left(duck):
     """`WHERE dept IS NULL` keeps exactly the null-extended rows — must NOT collapse."""
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = emp.join(dept, on="dept_id", how="left").filter(bt.col("dept").is_null()).collect()
     expected = duck.sql("SELECT * FROM emp LEFT JOIN dept USING (dept_id) WHERE dept IS NULL")
@@ -51,8 +46,6 @@ def test_left_join_null_accepting_isnull_stays_left(duck):
 
 def test_left_join_predicate_on_left_col_stays_left(duck):
     """A predicate on a left (preserved) column does not strengthen the join."""
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = emp.join(dept, on="dept_id", how="left").filter(bt.col("name") > "a").collect()
     expected = duck.sql("SELECT * FROM emp LEFT JOIN dept USING (dept_id) WHERE name > 'a'")
@@ -61,8 +54,6 @@ def test_left_join_predicate_on_left_col_stays_left(duck):
 
 def test_right_join_null_rejecting_left_col(duck):
     """`WHERE name = 'a'` rejects null left rows → right join behaves as inner."""
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = emp.join(dept, on="dept_id", how="right").filter(bt.col("name") == "a").collect()
     expected = duck.sql("SELECT * FROM emp RIGHT JOIN dept USING (dept_id) WHERE name = 'a'")
@@ -72,8 +63,6 @@ def test_right_join_null_rejecting_left_col(duck):
 def test_left_join_or_predicate_mixed(duck):
     """`WHERE dept='eng' OR name='d'`: the `name='d'` branch can be true on a
     null-extended row, so the join must NOT collapse. DuckDB is the oracle."""
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = (
         emp.join(dept, on="dept_id", how="left")
@@ -90,8 +79,6 @@ def test_full_join_with_predicate(duck):
     """Full outer join carries a coalescing projection, so a top-level filter does
     not sit directly above the join — the rule leaves it alone, and the result
     still matches DuckDB."""
-    from conftest import assert_same
-
     emp, dept = _tables(duck)
     out = emp.join(dept, on="dept_id", how="full").filter(bt.col("dept") == "eng").collect()
     expected = duck.sql("SELECT * FROM emp FULL OUTER JOIN dept USING (dept_id) WHERE dept = 'eng'")

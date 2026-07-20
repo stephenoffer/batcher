@@ -137,9 +137,7 @@ def test_join_key_bloom_matches_signed_zero_and_nan():
     neg_nan = f64(0xFFF8000000000000)
     pos_nan = f64(0x7FF8000000000000)
     build = pa.record_batch([pa.array([0.0, 1.5, pos_nan], pa.float64())], names=["k"])
-    probe = pa.record_batch(
-        [pa.array([-0.0, neg_nan, 1.5, 9.9], pa.float64())], names=["k"]
-    )
+    probe = pa.record_batch([pa.array([-0.0, neg_nan, 1.5, 9.9], pa.float64())], names=["k"])
     bloom = nat.build_key_bloom([build], [0], 8)
     kept = nat.bloom_filter_batches([probe], [0], bloom)
     survivors = pa.Table.from_batches(kept).column("k").to_pylist() if kept else []

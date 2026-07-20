@@ -44,6 +44,8 @@ from batcher.plan.logical import (
     Union,
     Unnest,
     Unpivot,
+    WatermarkDedup,
+    WatermarkStreamJoin,
     Window,
 )
 
@@ -122,7 +124,18 @@ def projection_inlining_into_agg(node: Aggregate, _ctx: OptimizerContext) -> Log
         input2 = subst(spec.agg.input2) if spec.agg.input2 is not None else None
         agg = AggExpr(spec.agg.func, subst(spec.agg.input), param=spec.agg.param, input2=input2)
         new_aggs.append(dataclasses.replace(spec, agg=agg))
-    return Aggregate(proj.input, new_keys, tuple(new_aggs))
+    # The watermark names an event-time column of the aggregate's *input*. Dropping the
+    # projection re-parents the aggregate onto `proj.input`, where that column may be
+    # known by its pre-rename name — so the watermark has to be remapped through the
+    # same substitution the keys and aggregates got. Rebuilding without it at all (the
+    # previous behavior) silently unbounded the streaming state.
+    watermark = node.watermark
+    if watermark is not None:
+        source = mapping.get(watermark.time_col)
+        if source is None:
+            return None  # the time column is not produced by this projection — don't guess
+        watermark = dataclasses.replace(watermark, time_col=source.name)
+    return Aggregate(proj.input, new_keys, tuple(new_aggs), watermark)
 
 
 @rule(name="eliminate_identity_project", phase=Phase.NORMALIZE, matches=(Project,))
@@ -284,10 +297,16 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
             # arg_min/arg_max also reference an ordering key (the second input).
             if spec.agg.input2 is not None:
                 child_need |= referenced_columns(spec.agg.input2)
+        # A watermark's event-time column is read by the streaming driver, not by any
+        # expression in the plan, so column pruning cannot see that it is needed. Pruning
+        # it away leaves the driver with no clock: the watermark never advances, closed
+        # windows never evict, and the "bounded" state grows forever.
+        if node.watermark is not None:
+            child_need.add(node.watermark.time_col)
         child = _rewrite(node.input, child_need)
         if child is node.input:
             return node
-        return Aggregate(child, node.group_keys, node.aggregates)
+        return Aggregate(child, node.group_keys, node.aggregates, node.watermark)
     if isinstance(node, Sort):
         child_need = set(need)
         for key in node.keys:
@@ -401,6 +420,37 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
     if isinstance(node, MapBatches):
         child = _rewrite(node.input, _map_batches_need(node, need))
         return node if child is node.input else dataclasses.replace(node, input=child)
+    if isinstance(node, WatermarkDedup):
+        # The dedup emits whole rows, so everything needed above must survive — plus the
+        # two column sets its *state* depends on, which nothing above it references: the
+        # `subset` keys it dedups on and the `event_time` it evicts by. Pruning either
+        # would not fail loudly; it would silently dedup on the wrong key or stall the
+        # watermark, which is a wrong answer on an unbounded input only.
+        child_need = set(need) | set(node.subset) | {node.event_time}
+        child = _rewrite(node.input, child_need)
+        return node if child is node.input else dataclasses.replace(node, input=child)
+    if isinstance(node, WatermarkStreamJoin):
+        # Mirrors the `Join` arm, plus each side's event-time column: the interval
+        # predicate and the state eviction both read it even though it need not appear
+        # in the output.
+        new_output = tuple(spec for spec in node.output if spec.alias in need)
+        if not new_output:
+            new_output = node.output
+        left_need = {
+            *node.left_keys,
+            node.left_time,
+            *(s.name for s in new_output if s.side == "left"),
+        }
+        right_need = {
+            *node.right_keys,
+            node.right_time,
+            *(s.name for s in new_output if s.side == "right"),
+        }
+        left = _rewrite(node.left, left_need)
+        right = _rewrite(node.right, right_need)
+        if left is node.left and right is node.right and len(new_output) == len(node.output):
+            return node
+        return dataclasses.replace(node, left=left, right=right, output=new_output)
     raise TypeError(f"projection rewrite: unhandled node {type(node).__name__}")
 
 

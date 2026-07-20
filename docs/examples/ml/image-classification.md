@@ -153,10 +153,32 @@ catalog = bt.read.parquet("s3://bucket/catalog.parquet")  # a "url" column
 scored = (
     catalog.ml.download("url", output_column="bytes", on_error="null", max_concurrency=32)
     .filter(bt.col("bytes").is_not_null())
-    .with_columns(image=bt.col("bytes").image.to_tensor(224, 224))
+    .with_columns(
+        image=bt.col("bytes").image.to_tensor_f32(
+            224,
+            224,
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+            channels_first=True,
+        )
+    )
     .ml.infer(ResNet, batch_size=256, num_gpus=1, concurrency=4, max_errored_rows=1000)
 )
 ```
+
+`.image.to_tensor_f32(w, h, mean=, std=, channels_first=)` does the full torchvision
+`ToTensor` + `Normalize` step natively: it decodes, resizes, scales to `[0, 1]`, applies
+the per-channel ImageNet mean/std, and emits a channel-first `float32` tensor. The
+whole preprocessing chain stays in the engine, and the model receives a ready tensor with
+no per-batch Python (`/255`, `Normalize`, `permute`). Use the plain `.image.to_tensor(w, h)`
+when the model wants raw `uint8` HWC pixels instead.
+
+When the model was trained with the classic *resize-then-crop* recipe (`Resize(256)` then
+`CenterCrop(224)`), `.image.center_crop(w, h)` is the crop half. It decodes and takes the
+centered `(w, h)` window, zero-padding a too-small image the way torchvision `CenterCrop`
+does, so you can chain it with the tensor step to match the model's exact eval
+transform. For a model that takes a single-channel input, `.image.to_grayscale(w, h)` decodes,
+resizes, and reduces to one Rec.601 luminance channel (`(h, w, 1)`) in the same native pass.
 :::
 
 Count what you dropped rather than trusting that you dropped nothing:

@@ -59,7 +59,7 @@ print(baseline.sort("host").to_pydict())
 ## The trap, part two: the outlier eats its own evidence
 
 Look at host `a`: mean 153ms, standard deviation 126ms. Both numbers are nonsense. `a`'s
-normal latency is 98–105ms; it has a *mean* of 153 and a *sigma* of 126 only because the
+normal latency is 98ms to 105ms. It has a *mean* of 153 and a *sigma* of 126 only because the
 410ms spike is inside the sample it is being compared against.
 
 ```python
@@ -94,7 +94,7 @@ much.
 
 :::{tip}
 Swap the mean for the median and the standard deviation for the median absolute deviation.
-The median of six points does not move when one of them goes to 410; neither does the MAD.
+The median of six points does not move when one of them goes to 410, and neither does the MAD.
 The estimator stops defending the outlier.
 :::
 
@@ -180,9 +180,9 @@ range: `col("latency").quantile(0.75) - col("latency").quantile(0.25)`.
 A whole-history baseline is also not a baseline. Comparing today's latency to the median of
 the last two years hides slow drift and screams at every deploy. What you usually want is a
 trailing window: `col("latency").rolling_mean(60, partition_by=["host"], order_by=["minute"])`
-gives a moving reference, and the deviation from *that* is what you threshold. Note that
-`rolling_*` counts rows, not minutes, so the series has to be dense first (see
-[time series rollups](time-series-rollups.md)). Otherwise a gap in the metrics quietly
+gives a moving reference, and the deviation from *that* is what you threshold. The
+`rolling_*` functions count rows, not minutes, so the series has to be dense first. See
+[time series rollups](time-series-rollups.md). Otherwise a gap in the metrics quietly
 stretches your one-hour window across a day.
 :::
 

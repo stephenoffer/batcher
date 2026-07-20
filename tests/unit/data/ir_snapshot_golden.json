@@ -368,6 +368,18 @@
       "name": "b"
     }
   },
+  "list_zip": {
+    "e": "list_zip",
+    "fn": "list_add",
+    "left": {
+      "e": "col",
+      "name": "a"
+    },
+    "right": {
+      "e": "col",
+      "name": "b"
+    }
+  },
   "list_simhash": {
     "e": "list_simhash",
     "input": {

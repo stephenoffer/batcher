@@ -155,3 +155,57 @@ def test_learned_morsel_is_result_invariant():
     with config_context(tightened):
         adapted = q()
     assert _rows(adapted) == _rows(baseline)
+
+
+def test_the_monitor_measures_the_flap_rate_its_hysteresis_consumes():
+    """`record_flap_rate` had no producer, so the anti-oscillation mechanism never engaged.
+
+    `ResourceManager.__init__` reads a past run's flap rate back
+    (`load_flap_rate` -> `hysteresis_alpha_from_flap`) to stiffen de-escalation for a
+    workload observed to oscillate SPILL<->NORMAL. Nothing ever wrote one, so the read was
+    permanently cold, `hysteresis_alpha_from_flap(None)` returned `None`, and the monitor
+    always used the static `_EWMA_ALPHA`. The whole `_FLAP_NS`/`_FLAP_STIFFEN` path was dead.
+
+    The monitor is the natural producer — it is the component that sees every level — and it
+    only *measures*, which is all `PressureMonitor` is allowed to do. Hysteresis damps *when*
+    the engine spills or throttles, never what it computes, so this is result-invariant.
+    """
+    from batcher.carbonite.memory.pressure import (
+        PressureLevel,
+        PressureMonitor,
+        hysteresis_alpha_from_flap,
+        load_flap_rate,
+        record_flap_rate,
+    )
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends import InProcessBackend
+
+    monitor = PressureMonitor()
+    assert monitor.flap_rate() is None  # fewer than two samples: nothing to conclude
+
+    # An oscillating run: the level keeps reversing direction.
+    for level in (
+        PressureLevel.NORMAL,
+        PressureLevel.SPILL,
+        PressureLevel.NORMAL,
+        PressureLevel.SPILL,
+        PressureLevel.NORMAL,
+    ):
+        monitor._observe_flap(level)
+    flappy = monitor.flap_rate()
+    assert flappy is not None and flappy > 0.0
+
+    # It round-trips through the hub and actually stiffens the hysteresis.
+    hub = MetadataHub(InProcessBackend())
+    record_flap_rate(hub, flappy)
+    assert load_flap_rate(hub) == flappy
+    stiffened = hysteresis_alpha_from_flap(load_flap_rate(hub))
+    assert stiffened is not None and stiffened < PressureMonitor._EWMA_ALPHA
+
+    # A monotonic climb is not a flap, however many steps it takes.
+    steady = PressureMonitor()
+    for level in (PressureLevel.NORMAL, PressureLevel.ELEVATED, PressureLevel.SPILL):
+        steady._observe_flap(level)
+    assert steady.flap_rate() == 0.0
+    # ...and a quiet history keeps the static default.
+    assert hysteresis_alpha_from_flap(steady.flap_rate()) == PressureMonitor._EWMA_ALPHA

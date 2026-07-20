@@ -1,7 +1,7 @@
 # Feature engineering with preprocessors
 
 Build a **model-ready feature matrix** from a raw table with Batcher's
-scikit-learn-style [preprocessors](../ml/preprocessors.md). You will impute missing
+scikit-learn-style [preprocessors](../ml/preprocessors.md). You impute missing
 values, scale the numerics, encode a categorical, bin a continuous column, and compose
 the lot with `Chain`, fitting every step on the training split and replaying it on the
 test split with the *same* learned statistics. That last discipline is what keeps a
@@ -63,8 +63,8 @@ print(train.columns)
 
 In practice you would produce `train` / `test` with
 {py:obj}`ds.ml.train_test_split <batcher.api.dataset.ml.DatasetML.train_test_split>`,
-which assigns each row by a reproducible hash of its own content. Here we write the two
-splits out explicitly so the numbers below are deterministic.
+which assigns each row by a reproducible hash of its own content. Here the two splits are
+written out explicitly so the numbers below are deterministic.
 
 ## Why you fit on train, never on test
 

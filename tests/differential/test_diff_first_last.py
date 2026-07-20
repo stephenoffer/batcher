@@ -12,6 +12,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -28,8 +29,6 @@ def _t():
 
 
 def test_first_last_grouped_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _t())
     out = (
         bt.from_arrow(_t())
@@ -44,8 +43,6 @@ def test_first_last_grouped_matches_duckdb(duck):
 
 
 def test_first_last_global_no_group(duck):
-    from conftest import assert_same
-
     duck.register("t", _t())
     out = bt.from_arrow(_t()).agg(
         f=col("v").first(order_by=col("t")), l=col("v").last(order_by=col("t"))
@@ -57,8 +54,6 @@ def test_first_last_global_no_group(duck):
 
 
 def test_first_last_vs_sql_ordered_aggregate(duck):
-    from conftest import assert_same
-
     duck.register("t", _t())
     out = bt.from_arrow(_t()).group_by("g").agg(f=col("v").first(order_by=col("t"))).collect()
     assert_same(out, duck.sql("SELECT g, first(v ORDER BY t) f FROM t GROUP BY g"))

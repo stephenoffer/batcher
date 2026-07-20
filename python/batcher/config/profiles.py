@@ -53,10 +53,31 @@ _SPOT_LIFECYCLE_VARS = ("RAY_NODE_TYPE_NAME", "NODE_LIFECYCLE", "INSTANCE_LIFECY
 
 # Explicit autoscaling opt-in/out flag (truthy → autoscaling; falsey → force fixed, even on
 # a managed cluster) and the managed-cluster markers that imply an autoscaling-capable
-# control plane. Anyscale sets these on every cluster; even a rare fixed-size one bails fast
-# via the stall window, so treating "managed cluster" as "can grow" is safe.
+# control plane. Even a rare fixed-size managed cluster bails fast via the stall window, so
+# treating "managed cluster" as "can grow" is safe.
 _AUTOSCALE_FLAG_VARS = ("BATCHER_AUTOSCALE", "RAY_AUTOSCALING")
-_MANAGED_AUTOSCALE_VARS = ("ANYSCALE_SESSION_ID", "ANYSCALE_CLUSTER_ID")
+# Managed Ray control planes, by platform. Batcher must behave the same on any of them, so
+# this is a list of *equally-weighted* vendor markers, not a primary plus special cases:
+#
+#   * Anyscale sets `ANYSCALE_SESSION_ID`/`ANYSCALE_CLUSTER_ID` on every cluster.
+#   * The KubeRay operator sets `RAY_CLUSTER_NAME` and `RAY_CLUSTER_NAMESPACE` on every
+#     Ray pod it creates, and `RAY_USAGE_STATS_KUBERAY_IN_USE` to mark itself — this is
+#     the on-prem / self-hosted / any-cloud Kubernetes case (EKS, GKE, AKS, OpenShift,
+#     bare metal), which is where most non-managed Ray actually runs.
+#   * `BATCHER_RAY_CLUSTER` is the escape hatch for a platform none of the above name —
+#     a hand-rolled on-prem cluster, a vendor we have not seen. Set it to any non-empty
+#     value and batcher attaches to the running cluster instead of starting a local one.
+#
+# Env-var only, no network call (see `detect_spot_environment`). Extend this tuple for a
+# new platform; nothing else needs to change.
+_MANAGED_AUTOSCALE_VARS = (
+    "BATCHER_RAY_CLUSTER",
+    "ANYSCALE_SESSION_ID",
+    "ANYSCALE_CLUSTER_ID",
+    "RAY_CLUSTER_NAME",
+    "RAY_CLUSTER_NAMESPACE",
+    "RAY_USAGE_STATS_KUBERAY_IN_USE",
+)
 
 
 def detect_spot_environment() -> bool:
@@ -98,15 +119,20 @@ def detect_autoscaling_environment() -> bool:
 
 
 def detect_managed_cluster() -> bool:
-    """Best-effort detection of a managed Ray control plane (Anyscale) from cheap local
-    signals.
+    """Best-effort detection of a managed Ray control plane from cheap local signals.
+
+    Covers Anyscale, any KubeRay-operated cluster (the on-prem / self-hosted / any-cloud
+    Kubernetes case), and an explicit `BATCHER_RAY_CLUSTER` for a platform we do not name —
+    see `_MANAGED_AUTOSCALE_VARS`. No platform is privileged: the signals are equivalent,
+    so batcher behaves identically wherever it runs.
 
     When true and no Ray address is configured, batcher attaches to the *running* cluster
     (`ray.init(address="auto")`) instead of starting a local single-node Ray — the fix for
-    a managed workspace that exports neither `RAY_ADDRESS` nor Ray's current-cluster pointer,
-    where a bare `ray.init()` would silently strand a distributed job on one node. Env-var
-    only (no network call), like `detect_spot_environment`; extend `_MANAGED_AUTOSCALE_VARS`
-    for other managed platforms.
+    a cluster that exports neither `RAY_ADDRESS` nor Ray's current-cluster pointer, where a
+    bare `ray.init()` would silently strand a distributed job on one node. Env-var only (no
+    network call), like `detect_spot_environment`; `_ensure_ray` still falls back to a local
+    start if no cluster turns out to be reachable, so a false positive degrades rather than
+    fails.
     """
     return any(os.environ.get(v, "").strip() for v in _MANAGED_AUTOSCALE_VARS)
 

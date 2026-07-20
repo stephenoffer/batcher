@@ -93,7 +93,7 @@ def test_reference_mode_emits_handles_without_payload(tmp_path):
 
 
 def test_reference_mode_round_trips_via_read_blob_bytes(tmp_path):
-    from batcher.io.formats.multimodal.media import read_blob_bytes
+    from batcher.io.formats.multimodal.blob import read_blob_bytes
 
     payloads = [b"alpha", b"beta-payload", b"gamma!!"]
     path = _write_blobs(tmp_path, payloads)

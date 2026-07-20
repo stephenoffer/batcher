@@ -1,9 +1,13 @@
 # Mergeable algebra
 
-A stateful operator can be written twice, once for a single core and once for a cluster, and
-then the two implementations disagree on a float key, or on nulls, or on ties, and the bug
-only appears when the data is big enough to shuffle. That is the failure this design exists
-to make impossible.
+*Mergeable algebra* is the rule that every stateful operator in Batcher is written once, as
+three functions, and that the same three functions serve one core, many cores, bounded memory,
+and many machines. This page describes those functions, the state shapes they force, and the
+single definition of key identity they all depend on.
+
+The failure it exists to prevent is specific. Write a stateful operator twice, once for a
+single core and once for a cluster, and the two implementations eventually disagree on a float
+key, or on nulls, or on ties. The bug only appears when the data is big enough to shuffle.
 
 Every stateful operator in `bc-runtime` is built as three functions:
 
@@ -49,31 +53,44 @@ combine_finalize(partition(partial(p_k))) over all partitions  ==  single-node r
 
 :::{important}
 `combine` MUST be associative **and** commutative. Associativity lets partials merge in a tree
-instead of a chain. Commutativity means the merge order does not matter, which is what makes
+instead of a chain. Commutativity means the merge order doesn't matter, which is what makes
 the result independent of thread scheduling and of network arrival order. If `combine` were
 only associative, a cluster would have to impose a total order on its reducers' inputs, and
 the answer would depend on which worker finished first.
 :::
 
-This is what forces the *shape* of the partial state. The state is not the answer; it is
+This is what forces the *shape* of the partial state. The state isn't the answer. It's
 whatever is enough to compute the answer from any partition:
 
 | Aggregate | Partial state | Finalize |
 |---|---|---|
 | `sum`, `min`, `max`, `count` | the value itself | identity |
 | `mean` | `(sum, count)` | `sum / count` |
-| `var`, `stddev` | `(sum, sum_of_squares, count)` | Bessel-corrected variance |
-| `median`, `quantile`, `array_agg` | the group's non-null values as one `List` column | sort and index |
+| `var`, `stddev` | Welford's `(mean, M2, count)` | Bessel-corrected variance |
+| `median`, `quantile` | the group's non-null values as one `List` column | sort and index |
+| `array_agg` | the group's non-null values as one `List` column | the list as-is, empty becomes null |
 | `count_distinct` | the group's distinct values as one `List` column | union then count |
 | `approx_count_distinct` | an HLL sketch | estimate |
-| `approx_quantile` | a KLL sketch | query |
-| `corr`, `covar` | co-moments | the closed form |
+| `approx_quantile` | a DDSketch | query |
+| `corr`, `covar` | co-moments, as `(n, mean_x, mean_y, C2, M2x, M2y)` | the closed form |
 
 `mean` emitting `(sum, count)` rather than an average is the whole idea in miniature: an
 average of averages is wrong, a sum of sums over a sum of counts is right.
 
+Variance carries Welford's `(mean, M2, count)` and merges it with Chan's parallel formula. The
+obvious state, `(sum, sum_of_squares, count)`, is also mergeable, but it catastrophically
+cancels when the mean is large relative to the spread. Mergeability alone isn't enough. The
+state also has to stay numerically sound under merging.
+
+`approx_quantile` carries a DDSketch rather than a KLL sketch for a reason that belongs on this
+page: DDSketch's merge is **exactly** order-independent, so a distributed result is bit-identical
+to a single-node one. KLL's compaction is order-sensitive and would agree only within its error
+bounds, which breaks the guarantee this whole design exists to give. KLL still ships in
+`bc-sketches`, where Kyber uses it for cardinality estimates, and an estimate that varies within
+its bounds costs nothing.
+
 The list-state aggregates (`median`, `count_distinct`) are **exact and mergeable, at the cost
-of memory linear in the group's values**. That is a real trade. When you cannot afford it,
+of memory linear in the group's values**. That is a real trade. When you can't afford it,
 `approx_count_distinct` and `approx_quantile` give you a bounded-error sketch state instead
 (`crates/bc-sketches/`), which merges in constant space with a fixed seed so partition-built
 sketches merge identically.
@@ -86,7 +103,7 @@ paths for performance reasons, but they answer one semantic question, so the ans
 exactly one place: `crates/bc-runtime/src/keys.rs`.
 
 :::{warning}
-Getting this wrong does not reorder rows. It splits a group. If the shuffle disagrees with the
+Getting this wrong doesn't reorder rows. It splits a group. If the shuffle disagrees with the
 assigner about key identity, two rows that are one group land on different reducers and the
 query returns **two groups where the oracle returns one**. Both directions have actually
 happened here: a float key split across `-0.0` and `0.0`, because Arrow's `RowConverter`
@@ -96,7 +113,7 @@ encodes them to different bytes, and null integer keys scattered across every bu
 So `keys.rs` fixes the policy once:
 
 ```rust
-// canonical u64 key bits for an f64 — all NaNs are one group, ±0.0 are one group
+// canonical u64 key bits for an f64: all NaNs are one group, +/-0.0 are one group
 fn canon_f64(v: f64) -> u64 {
     if v.is_nan()      { 0x7ff8_0000_0000_0000 }   // one canonical quiet NaN
     else if v == 0.0   { 0 }                        // folds -0.0 into 0.0
@@ -108,7 +125,7 @@ const NULL_HASH: u64 = 0xa5a5_5a5a_dead_beef;
 ```
 
 `canonicalize_float_keys` rewrites float key columns into canonical form *before* the general
-shuffle path encodes them, so `RowConverter` and the raw-hash fast paths cannot disagree. And
+shuffle path encodes them, so `RowConverter` and the raw-hash fast paths can't disagree. And
 `float_total_cmp` gives `min`/`max` the same total order `ORDER BY` sorts in (NaN last),
 because otherwise `max(x)` would silently ignore NaN and contradict
 `SELECT x ORDER BY x DESC LIMIT 1` on the same column.
@@ -149,7 +166,7 @@ partition, every partial row for a group lands together, so running `combine` + 
 **one partition at a time** is the global aggregate, with peak memory bounded to one
 partition.
 
-This is not a special spilling algorithm. It is the distributive equivalence property, used
+This isn't a special spilling algorithm. It's the distributive equivalence property, used
 locally to bound memory. The same grace machinery, on the `PARTITION BY` keys, bounds a window
 (`crates/bc-interp/src/window_spill.rs`).
 :::
@@ -166,7 +183,7 @@ bucket shuffle is that mechanism with neither.
 
 ## Proving it, not asserting it
 
-Three layers of test hold this up, and none of them are optional:
+Three layers of test hold this up, and none of them are optional.
 
 1. **Rust unit tests** in `bc-runtime` assert the mergeable invariant directly: partial each
    partition, combine in an arbitrary order, finalize, and compare against the single-node
@@ -213,13 +230,13 @@ True {'g': [0, 1, 2], 's': [16668333, 16661667, 16665000]}
 
 ## The rule when you add an operator
 
-A stateful operator without a mergeable form caps the engine at a single node. That is not an
-acceptable trade here, and it is why the `add-relational-operator` and
+A stateful operator without a mergeable form caps the engine at a single node. That isn't an
+acceptable trade here, and it's why the `add-relational-operator` and
 `add-distributed-operator` skills both start at `bc-runtime`: write `partial`/`combine`/
 `finalize`, prove `combine` associates and commutes, and the parallel path, the spill path,
 and the distributed path all follow from it.
 
-If your operator genuinely has no mergeable form, that is a design conversation, not a `TODO`.
+If your operator genuinely has no mergeable form, that's a design conversation, not a `TODO`.
 
 ## Where the code lives
 

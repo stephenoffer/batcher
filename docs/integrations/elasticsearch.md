@@ -66,9 +66,9 @@ JSON document per hit crossing Python before it becomes a column.
 
 ## Credentials
 
-`hosts` and `api_key` are stored verbatim on the source and never logged; the connector's identity
-is just the index name. Use an API key scoped to the indices you read. A scroll holds a cursor open
-on the cluster, and you do not want that key to be able to do anything else.
+`hosts` and `api_key` are stored verbatim on the source and never logged. The connector's identity
+is the index name alone. Use an API key scoped to the indices you read. A scroll holds a cursor open
+on the cluster, and you don't want that key to be able to do anything else.
 
 ## Predicate pushdown
 

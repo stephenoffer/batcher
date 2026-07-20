@@ -5,12 +5,11 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
 def test_split_then_len_vs_duckdb(duck):
-    from conftest import assert_same
-
     tbl = pa.table({"s": pa.array(["a,b,c", "x", "p,q", "", None])})
     duck.register("t", tbl)
     out = bt.from_arrow(tbl).select(n=col("s").str.split(",").list.len()).collect()

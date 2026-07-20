@@ -19,16 +19,14 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from conftest import assert_same
+from _harness import assert_same
 
 pytestmark = pytest.mark.differential
 
 
 def test_large_utf8_filter_against_string_literal(duck):
     """A LargeUtf8 column compares against a Utf8 literal (was: crash)."""
-    t = pa.table(
-        {"s": pa.array(["a", "a", "b", "c"], pa.large_utf8()), "v": [1, 2, 3, 4]}
-    )
+    t = pa.table({"s": pa.array(["a", "a", "b", "c"], pa.large_utf8()), "v": [1, 2, 3, 4]})
     out = bt.from_arrow(t).filter(bt.col("s") == "a").collect()
     duck.register("t", t)
     assert_same(out, duck.sql("SELECT * FROM t WHERE s = 'a'"))
@@ -37,10 +35,14 @@ def test_large_utf8_filter_against_string_literal(duck):
 def test_large_utf8_string_functions(duck):
     """`str.contains` / `str.upper` on a LargeUtf8 column (was: crash)."""
     t = pa.table({"s": pa.array(["ab", "bc", "ca"], pa.large_utf8())})
-    out = bt.from_arrow(t).select(
-        u=bt.col("s").str.upper(),
-        has_a=bt.col("s").str.contains("a"),
-    ).collect()
+    out = (
+        bt.from_arrow(t)
+        .select(
+            u=bt.col("s").str.upper(),
+            has_a=bt.col("s").str.contains("a"),
+        )
+        .collect()
+    )
     duck.register("t", t)
     assert_same(
         out,
@@ -60,9 +62,7 @@ def test_large_utf8_join_against_utf8_key(duck):
 
 def test_large_utf8_group_by_matches_utf8(duck):
     """Grouping on a LargeUtf8 key agrees with grouping on the decoded Utf8 key."""
-    t = pa.table(
-        {"k": pa.array(["a", "b", "a", "c", "b"], pa.large_utf8()), "v": [1, 2, 3, 4, 5]}
-    )
+    t = pa.table({"k": pa.array(["a", "b", "a", "c", "b"], pa.large_utf8()), "v": [1, 2, 3, 4, 5]})
     out = bt.from_arrow(t).group_by("k").agg(s=bt.col("v").sum()).collect()
     duck.register("t", t)
     assert_same(out, duck.sql("SELECT k, sum(v) AS s FROM t GROUP BY k"))

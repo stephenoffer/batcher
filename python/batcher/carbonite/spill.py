@@ -18,6 +18,7 @@ always works.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 from dataclasses import dataclass
@@ -67,6 +68,28 @@ def _clamp_to_free_disk(local_dir: str, budget: int | None) -> int | None:
         return budget
     safe = int(free * _SPILL_DISK_FRACTION)
     return safe if budget is None else min(budget, safe)
+
+
+# Free bytes below which the local tier is treated as exhausted regardless of how much of
+# its own budget the store has used. The budget accounts for *this store's* bytes, so it is
+# blind to anyone else consuming the same volume — a co-tenant process, another query's
+# scratch, or a log that grew. Re-measuring catches that; this floor is the headroom the
+# measurement is compared against, matching `_SPILL_DISK_FRACTION`'s intent of never taking
+# the last sliver.
+_SPILL_DISK_FLOOR_BYTES = 256 << 20
+
+
+def _free_disk_bytes(path: str) -> int | None:
+    """Measured free bytes on the filesystem holding `path`, or `None` if it can't be stat'd."""
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:  # pragma: no cover - unstat-able volume
+        return None
+
+
+def _is_out_of_space(exc: OSError) -> bool:
+    """Whether `exc` is the disk filling up, as opposed to any other IO failure."""
+    return exc.errno == errno.ENOSPC
 
 
 def _open_local_map(path: str) -> pa.MemoryMappedFile:
@@ -181,7 +204,21 @@ class _BucketWriter:
             return
         if self._writer is None:
             self._open(batch.schema)
-        self._writer.write_batch(batch)
+        try:
+            self._writer.write_batch(batch)
+        except OSError as exc:
+            # A full scratch disk otherwise surfaces as a bare `OSError: [Errno 28]` from
+            # deep inside the Arrow writer, which names neither the spill tier nor the way
+            # out. It cannot be recovered in place — the batches already streamed to this
+            # bucket are not retained, so failing over to the remote tier mid-stream would
+            # silently drop them — so the honest move is to fail with the fix in the message.
+            if self._tier is SpillTier.LOCAL and _is_out_of_space(exc):
+                raise ResourceError(
+                    f"the local spill disk is full while writing {self._path!r}. Free space "
+                    f"on the scratch volume, point memory.spill_dir at a larger one, or set "
+                    f"memory.spill_remote_uri so buckets overflow to object storage instead."
+                ) from exc
+            raise
         if self._tier is SpillTier.LOCAL:
             # Charge the batch's (uncompressed, in-memory) size to the store's live local
             # usage as it lands, not just at close. A slight over-estimate vs the compressed
@@ -192,11 +229,20 @@ class _BucketWriter:
 
     def _open(self, schema: pa.Schema) -> None:
         store = self._store
-        overflow = (
-            store._remote_uri is not None
-            and store._local_budget is not None
+        # Two independent reasons to overflow, and the second is why the first is not enough:
+        # the budget accounts only for bytes *this store* wrote, so a volume filled by anyone
+        # else (a co-tenant, another query's scratch, a growing log) stays invisible to it and
+        # the local tier keeps writing until the filesystem returns ENOSPC — a hard query
+        # failure. The clamp at construction is a single sample taken before any of that
+        # happened. Re-measuring per bucket is the only way overflow can track a disk that
+        # fills *during* the query; a bucket's tier is fixed at open, so this is also the last
+        # point where the choice is still free (mid-stream there are already-written batches
+        # that would have to be rewritten).
+        over_budget = (
+            store._local_budget is not None
             and store._local_used + store._local_pending >= store._local_budget
         )
+        overflow = store._remote_uri is not None and (over_budget or store._local_disk_low())
         if overflow:
             self._tier = SpillTier.REMOTE
             self._path = f"{store._remote_uri}/{self._name}.arrow"
@@ -269,6 +315,16 @@ class TieredSpillStore:
         # Tracking in-flight bytes here lets a later-opened bucket overflow correctly.
         self._local_pending = 0
         self._local_paths: list[str] = []
+
+    def _local_disk_low(self) -> bool:
+        """Whether the scratch volume is too full to start another local bucket.
+
+        Measured, not accounted: this is what catches a disk filled by something other
+        than this store. An unstat-able volume reads as "not low", so the budget alone
+        decides and behavior is exactly as before.
+        """
+        free = _free_disk_bytes(self._local_dir)
+        return free is not None and free < _SPILL_DISK_FLOOR_BYTES
 
     @property
     def local_bytes(self) -> int:

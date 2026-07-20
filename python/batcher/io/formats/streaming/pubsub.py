@@ -2,9 +2,14 @@
 
 Backed by ``google-cloud-pubsub`` (the optional ``pubsub`` extra). A
 :class:`PubSubSource` pulls a batch of messages from a subscription
-(``SubscriberClient.pull(max_messages=N)``), assembles them into one Arrow batch
-via the shared ``_make_batch`` helper, and acknowledges them — at-least-once
-delivery; ack only after a batch is assembled so a crash before ack re-delivers.
+(``SubscriberClient.pull(max_messages=N)``) and assembles them into one Arrow batch
+via the shared ``_make_batch`` helper.
+
+Acks happen only after an epoch is **published**, never when it is pulled: `_poll` holds the
+ack ids and `_commit_delivered` sends them once the engine has published the batch. Acking at
+pull time (as this once did) told Pub/Sub the messages were handled the moment they were
+*read*, so a crash before the publish meant no redelivery and silent data loss. The ordering
+favours a duplicate, absorbed by an idempotent sink, over an unrecoverable gap.
 
 Pub/Sub has no user-visible partitions, so the stream is modeled as a single
 logical partition (``0``): ``splits()`` returns one split. The opaque message id
@@ -16,6 +21,7 @@ missing a :class:`BackendError` instructs the user to install it.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from batcher._internal.errors import BackendError
@@ -23,6 +29,20 @@ from batcher.io.formats.base import SOURCES
 from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource
 
 __all__ = ["PubSubSource"]
+
+
+def _stable_offset(message_id: str) -> int:
+    """A process-stable int64 offset for an opaque Pub/Sub message id.
+
+    This was `abs(hash(message_id))`, and Python salts `str` hashing per process, so the same
+    message got a different `offset` on every run and on every worker. The `offset` column is
+    what downstream de-duplication and ordering key off, so it silently stopped being
+    comparable across restarts and across a distributed read — the two places comparing it
+    matters. `sha256` costs the same call and is stable everywhere.
+    """
+    return int.from_bytes(hashlib.sha256(message_id.encode("utf-8")).digest()[:8], "big") % (
+        1 << 63
+    )
 
 
 def _import_subscriber() -> Any:
@@ -49,7 +69,7 @@ class PubSubSource(BrokerSource):
 
     format_name = "pubsub"
 
-    __slots__ = ("_client_obj",)
+    __slots__ = ("_client_obj", "_pending_acks")
 
     def __init__(
         self,
@@ -61,6 +81,8 @@ class PubSubSource(BrokerSource):
     ) -> None:
         super().__init__(topic, poll_size=poll_size, **options)
         self._client_obj: Any = None
+        # Ack ids pulled but not yet published, acked by `_commit_delivered`.
+        self._pending_acks: list[str] = []
 
     def _client(self) -> Any:
         if self._client_obj is None:
@@ -79,19 +101,32 @@ class PubSubSource(BrokerSource):
             BrokerMessage(
                 value=rm.message.data,
                 partition=0,
-                offset=abs(hash(rm.message.message_id)) % (1 << 63),
+                offset=_stable_offset(rm.message.message_id),
+                # Pub/Sub is not replayable by position — the ack id is what the *next*
+                # commit needs, and it is held in `_pending_acks` rather than checkpointed.
                 timestamp=int(rm.message.publish_time.timestamp() * 1000),
                 topic=self.topic,
                 key=(rm.message.ordering_key or "").encode("utf-8") or None,
             )
             for rm in received
         ]
-        if received:
-            # Ack only after assembling the batch → no message lost on crash.
-            client.acknowledge(
-                request={
-                    "subscription": self.topic,
-                    "ack_ids": [rm.ack_id for rm in received],
-                }
-            )
+        # Deliberately does not acknowledge. Assembling a batch is not publishing it: acking
+        # here told Pub/Sub the messages were handled the moment they were *read*, so a crash
+        # between the pull and the publish meant they were never redelivered and the data was
+        # gone — at-most-once, and silent. The ack ids are held for `_commit_delivered`,
+        # which runs only after the epoch is published.
+        self._pending_acks.extend(rm.ack_id for rm in received)
         return messages
+
+    def _commit_delivered(self) -> None:
+        """Acknowledge the epoch that was just published.
+
+        A crash before this re-delivers the batch, which an idempotent sink absorbs; the
+        ordering favours a duplicate over a gap, because a gap cannot be recovered.
+        """
+        if not self._pending_acks:
+            return
+        self._client().acknowledge(
+            request={"subscription": self.topic, "ack_ids": list(self._pending_acks)}
+        )
+        self._pending_acks = []

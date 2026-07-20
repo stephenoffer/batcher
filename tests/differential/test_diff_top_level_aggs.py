@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -40,8 +41,6 @@ def sales(duck):
     ],
 )
 def test_shorthand_equals_method_and_duckdb(duck, sales, shorthand, method, sql):
-    from conftest import assert_same
-
     ds = bt.from_arrow(sales)
     short = ds.group_by("dept").agg(shorthand("amount")).sort("dept")
     method_form = ds.group_by("dept").agg(getattr(bt.col("amount"), method)()).sort("dept")

@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import cume_dist, ntile, percent_rank
 
 pytestmark = pytest.mark.differential
@@ -26,8 +27,6 @@ def _t():
 
 
 def test_percent_rank_and_cume_dist(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_t())
         .with_columns(
@@ -47,8 +46,6 @@ def test_percent_rank_and_cume_dist(duck):
 
 
 def test_ntile_even_and_remainder(duck):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(_t())
         .with_columns(
@@ -68,8 +65,6 @@ def test_ntile_even_and_remainder(duck):
 
 
 def test_ntile_global_more_buckets_than_rows(duck):
-    from conftest import assert_same
-
     small = pa.table({"v": pa.array([1, 2], type=pa.int64())})
     out = bt.from_arrow(small).with_columns(q=ntile(5).over(order_by=["v"])).collect()
     duck.register("s", small)
@@ -77,8 +72,6 @@ def test_ntile_global_more_buckets_than_rows(duck):
 
 
 def test_percent_rank_global(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_t()).with_columns(pr=percent_rank().over(order_by=["v"])).collect()
     duck.register("t", _t())
     assert_same(out, duck.sql("SELECT *, PERCENT_RANK() OVER (ORDER BY v) AS pr FROM t"))
@@ -91,3 +84,21 @@ def test_ntile_requires_positive_n():
 
     with _pytest.raises(PlanError):
         ntile(0)
+
+
+@pytest.mark.parametrize("n", [0, -3])
+def test_sql_ntile_requires_positive_n(n):
+    """The SQL front-end must reject `n < 1` exactly as the `ntile()` builder does.
+
+    The engine kernel clamps `buckets.max(1)`, so an unvalidated `NTILE(0)` did not
+    fail — it silently put *every* row in bucket 1. DuckDB errors here, and `bt.ntile(0)`
+    already raised `PlanError`; only the SQL path was missing the check. A negative
+    literal additionally leaked a bare `TypeError` from sqlglot, because the bucket count
+    was read as `int(node.this)` rather than through `_const_int`, which exists to fold
+    the `Neg`-wrapping-`Literal` shape.
+    """
+    from batcher._internal.errors import PlanError
+
+    ds = bt.from_arrow(_t())
+    with pytest.raises(PlanError, match="requires n >= 1"):
+        ds.sql(f"SELECT NTILE({n}) OVER (ORDER BY v) AS q FROM self").collect()

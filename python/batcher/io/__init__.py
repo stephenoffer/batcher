@@ -24,7 +24,7 @@ from batcher.io.formats import (
     ParquetSink,
     ParquetSource,
 )
-from batcher.io.formats.multimodal.media import read_blob_bytes
+from batcher.io.formats.multimodal.blob import read_blob_bytes
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.sink import Sink
 from batcher.io.source import InMemorySource, IteratorSource, Source

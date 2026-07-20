@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -40,8 +41,6 @@ def t(duck):
 
 
 def test_like_wildcards_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(
@@ -56,8 +55,6 @@ def test_like_wildcards_vs_duckdb(duck, t):
 
 
 def test_like_literal_metachars_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     # The `.` in the pattern is a LITERAL dot, not a regex wildcard: it must match
     # "a.b" only, NOT "axb".
     out = (
@@ -84,15 +81,11 @@ def test_sql_like_consecutive_percent_vs_duckdb(duck, t, op, pat):
     # The SQL fast path peeled a single boundary `%`, so a pattern with two or more
     # consecutive leading/trailing wildcards left an interior `%` that was matched
     # literally: `'abc' LIKE '%%c'` returned false where DuckDB returns true.
-    from conftest import assert_same
-
     q = f"SELECT (s {op} '{pat}') AS v FROM t"
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
 def test_like_empty_and_case_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(
@@ -134,8 +127,6 @@ def test_like_empty_and_case_vs_duckdb(duck, t):
 )
 @pytest.mark.parametrize("op", ["LIKE", "NOT LIKE"])
 def test_sql_like_ordered_segments_vs_duckdb(duck, t, op, pat):
-    from conftest import assert_same
-
     q = f"SELECT (s {op} '{pat}') AS v FROM t"
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
@@ -161,8 +152,6 @@ def test_sql_like_ordered_segments_vs_duckdb(duck, t, op, pat):
 )
 def test_like_matches_newline_like_duckdb(duck, pred):
     """`%`/`_` span a newline — SQL says "any character", with no `\\n` exception."""
-    from conftest import assert_same
-
     tbl = pa.table({"s": ["a\nb", "axb", "a\nb\nc", "ab", "a%b", "a_b", "plain", "A\nB", None]})
     duck.register("nl", tbl)
     q = f"SELECT ({pred}) AS v FROM nl"

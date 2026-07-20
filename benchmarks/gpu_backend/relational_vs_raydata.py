@@ -25,6 +25,8 @@ import functools
 import os
 import time
 
+from _ray_env import init_ray
+
 print = functools.partial(print, flush=True)
 
 _DATA_DIR = os.environ.get("BENCH_RR_DIR", "/mnt/cluster_storage/gpu_relbench")
@@ -35,27 +37,15 @@ _CUDF_PIP = ["cudf-cu13==26.6.0", "numpy==1.26.4"]
 
 
 def _init() -> None:
-    """Init Ray with `pip: None` — NOT a pip list. The workspace injects a default pip set that
-    includes a broken `batcher-engine[delta]` requirement; passing our own pip list at init still
-    merges that in and every actor's env-setup fails. cuDF is shipped per-TASK instead (Batcher
-    via its own runtime_env, Ray Data via `ray_remote_args`), the pattern `distributed_cudf.py`
-    uses successfully."""
-    # Unconditionally drop the workspace's runtime-env hook: it injects a default dev-pip set
-    # containing a broken `batcher-engine[delta]` requirement into EVERY task (even ones with no
-    # runtime_env, e.g. data generation), failing env setup. We ship cuDF per-task ourselves.
-    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
-        os.environ.pop(var, None)
-    import ray
+    """Attach to the cluster with a clean job-level cuDF+numpy pip set.
 
-    if not ray.is_initialized():
-        # With the hook gone, a clean job-level cuDF+numpy pip installs on every worker (cached
-        # per node) — so Ray Data's GPU map tasks find cuDF without per-op runtime_env plumbing.
-        ray.init(
-            address="auto",
-            runtime_env={"pip": _CUDF_PIP},
-            logging_level="ERROR",
-            log_to_driver=False,
-        )
+    The workspace's runtime-env hook is dropped *unconditionally*: it injects a default
+    dev-pip set containing a broken `batcher-engine[delta]` requirement into EVERY task
+    (even ones with no runtime_env of their own, e.g. data generation), failing env setup.
+    With the hook gone, `_CUDF_PIP` installs once per node and Ray Data's GPU map tasks
+    find cuDF without per-op runtime_env plumbing.
+    """
+    init_ray(pip=_CUDF_PIP, unconditional_hook_strip=True)
 
 
 def _gen_shard(path: str, n: int, groups: int, seed: int) -> int:

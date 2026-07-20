@@ -112,6 +112,25 @@ print(titles.ml.near_duplicates("text", threshold=0.7, ngram=3, key="doc_id").co
 # 1
 ```
 
+## Matching a short field against a reference value
+
+MinHash/LSH clusters a *column* against itself. When you instead need to score each row
+against one **known** string, reach for the edit metrics on `.str`. That covers deduping a
+name column against a canonical spelling, or resolving records to a reference list.
+`.str.jaro_similarity` and `.str.jaro_winkler_similarity` return a `[0, 1]` score, and
+Jaro-Winkler weights a shared prefix, which is what you want for names. `.str.levenshtein`
+gives the raw edit distance, and `.str.damerau_levenshtein` counts a swapped-letter typo as
+a single edit:
+
+```python
+from batcher import col
+
+people = bt.from_pydict({"name": ["Jonathan", "Johnathan", "Jon", "Michael"]})
+scored = people.with_columns(
+    sim=col("name").str.jaro_winkler_similarity("Jonathon"),
+).filter(col("sim") > 0.8)  # keep the likely matches to the canonical spelling
+```
+
 ## Check the test set for contamination
 
 :::{important}

@@ -15,8 +15,8 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 pytestmark = pytest.mark.differential
 

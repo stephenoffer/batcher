@@ -1,0 +1,15 @@
+[package]
+name = "bc-secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Deliberately dependency-free apart from the workspace error type. This crate sits
+# under `bc-expr`, which every consumer of the expression layer links; pulling a cloud
+# SDK (and with it tokio + hyper + rustls) in here would put an async runtime and a TLS
+# stack into builds that never resolve a secret. External key stores are reached through
+# the `cmd:` backend or a host-registered backend instead — see the module docs.
+[dependencies]
+thiserror = { workspace = true }

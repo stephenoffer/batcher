@@ -122,8 +122,8 @@ Nothing has run yet. It is still a lazy plan.
 `ds.write` is the one write surface. Give it a `trigger` and it runs as a streaming query,
 appending each micro-batch and handing you back a `StreamingQuery`.
 
-`Trigger.available_now()` drains everything currently available and stops, which is the
-incremental-batch and backfill cadence, and the one that makes a tutorial finish.
+`Trigger.available_now()` drains everything the source has at that moment and stops, which is
+the incremental-batch and backfill cadence, and the one that makes a tutorial finish.
 `Trigger.processing_time("30 seconds")` is the continuous one.
 
 | Choice | Emits | Use it for |

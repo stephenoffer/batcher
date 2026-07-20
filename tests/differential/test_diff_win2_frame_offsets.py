@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 pytestmark = pytest.mark.differential
 
@@ -21,8 +22,6 @@ _I64_MAX = 9223372036854775807
 
 def test_frame_current_to_i64max_following_is_suffix(duck):
     """CURRENT ROW .. i64::MAX FOLLOWING is the suffix aggregate, and must not panic."""
-    from conftest import assert_same
-
     t = bt.from_pydict({"id": [1, 2, 3, 4, 5], "x": [10, 20, 30, 40, 50]}).collect()
     duck.register("t", t)
     query = (
@@ -34,8 +33,6 @@ def test_frame_current_to_i64max_following_is_suffix(duck):
 
 def test_frame_i64max_preceding_to_current_is_prefix(duck):
     """i64::MAX PRECEDING .. CURRENT ROW is the running (prefix) aggregate, not all-null."""
-    from conftest import assert_same
-
     t = bt.from_pydict({"id": [1, 2, 3, 4, 5], "x": [10, 20, 30, 40, 50]}).collect()
     duck.register("t", t)
     query = (
@@ -47,8 +44,6 @@ def test_frame_i64max_preceding_to_current_is_prefix(duck):
 
 def test_frame_wide_both_sides_covers_whole_partition(duck):
     """A frame far wider than the partition on both sides equals the whole-partition agg."""
-    from conftest import assert_same
-
     t = bt.from_pydict(
         {"g": ["a", "a", "a", "b", "b"], "id": [1, 2, 3, 1, 2], "x": [5.0, 1.0, 9.0, 7.0, 2.0]}
     ).collect()

@@ -492,8 +492,77 @@ struct JoinTable {
     /// synchronization; `next` stays a single absolute-indexed chain either way.
     heads: Vec<HashTable<u32>>,
     next: Vec<u32>,
+    /// Whether no build key repeats — so every chain has length exactly 1.
+    ///
+    /// True for every join to a primary/unique key, which is most of them (`o_orderkey`,
+    /// `p_partkey`, every dimension table). The chain walk in [`Self::probe_range`] then loads
+    /// `next[r]` once per *emitted row* purely to read the `u32::MAX` that ends the loop — a
+    /// random access into a multi-megabyte array, one per output row, whose answer is known in
+    /// advance. Knowing the build is unique lets the probe skip that load entirely, and lets
+    /// [`build::build_sharded`] skip allocating `next` at all.
+    ///
+    /// Result-invariant: a length-1 chain emits the same single `(i, r)` pair either way.
+    unique: bool,
     state: ahash::RandomState,
     bloom: Option<BloomFilter>,
+    /// Runtime verdict on whether the probe-side bloom is *earning* its lookup.
+    ///
+    /// The bloom's value is its **rejection rate**, which no planner-side row count can
+    /// predict: a foreign-key join where every probe row matches (TPC-H `lineitem ⋈ orders`)
+    /// rejects nothing, so the per-row `contains_hash` is a pure random-access cache miss on
+    /// top of the hash lookup it was meant to save. [`use_probe_bloom_with`] can only see
+    /// build/probe *sizes*, and the streaming executor cannot even see the probe count
+    /// (it passes `usize::MAX`), so on that path the bloom is switched on unconditionally.
+    ///
+    /// So measure it instead: [`Self::probe_range`] counts rejections over the first
+    /// [`BLOOM_TRIAL_ROWS`] probe rows and latches the bloom off when the rate is below
+    /// [`BLOOM_MIN_REJECT_RATE`]. This never changes a result — a bloom hit is not a match,
+    /// only a "maybe", so skipping the filter just runs the authoritative hash lookup that
+    /// follows it. Morsel-granular (decided per range, never per row), so the counters cost
+    /// two relaxed atomics per morsel rather than two per row, and every tier — sequential,
+    /// morsel-parallel, and distributed — adapts independently on what it actually sees.
+    bloom_trial: BloomTrial,
+}
+
+/// Probe rows to observe before ruling on the bloom. One morsel-ish sample: long enough that
+/// the rate is not noise, short enough that a useless bloom is abandoned almost immediately.
+const BLOOM_TRIAL_ROWS: u64 = 1 << 16;
+
+/// Rejection rate below which the probe-side bloom costs more than it saves. A rejected row
+/// saves one hash-table probe; a passed row pays one bloom lookup for nothing. Both are random
+/// accesses of the same order, so the filter needs to reject a real fraction to break even —
+/// well under half. Set conservatively: only an obviously-useless bloom is switched off.
+const BLOOM_MIN_REJECT_RATE: f64 = 0.10;
+
+/// Rejection accounting for [`JoinTable::bloom_trial`]. Shared across the worker threads that
+/// probe one broadcast table, so both counters are atomics; they are touched once per probed
+/// range, not per row.
+#[derive(Debug, Default)]
+struct BloomTrial {
+    seen: std::sync::atomic::AtomicU64,
+    rejected: std::sync::atomic::AtomicU64,
+}
+
+impl BloomTrial {
+    /// Whether the bloom is still worth consulting: during the trial always, afterwards only
+    /// if it rejected enough of the sample to pay for itself.
+    #[inline]
+    fn worth_consulting(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let seen = self.seen.load(Relaxed);
+        if seen < BLOOM_TRIAL_ROWS {
+            return true;
+        }
+        (self.rejected.load(Relaxed) as f64) >= (seen as f64) * BLOOM_MIN_REJECT_RATE
+    }
+
+    /// Fold one probed range's tally in. Called once per range.
+    #[inline]
+    fn observe(&self, seen: u64, rejected: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.seen.fetch_add(seen, Relaxed);
+        self.rejected.fetch_add(rejected, Relaxed);
+    }
 }
 
 impl JoinTable {
@@ -516,19 +585,23 @@ impl JoinTable {
         let bloom = use_bloom.then(|| BloomFilter::with_params(right_rows as u64, bloom_fp_rate));
         let shards = build::shard_count(right_rows);
         if shards > 1 {
-            let (heads, next, bloom) =
+            let (heads, next, bloom, unique) =
                 build::build_sharded(keys, &state, right_rows, right_null, shards, bloom);
             return Self {
                 heads,
                 next,
+                unique,
                 state,
                 bloom,
+                bloom_trial: BloomTrial::default(),
             };
         }
 
         let mut heads: HashTable<u32> = HashTable::with_capacity(right_rows);
         let mut next: Vec<u32> = vec![u32::MAX; right_rows];
         let mut bloom = bloom;
+        // Set on the first repeated key — the serial mirror of `build_sharded`'s chain check.
+        let mut unique = true;
         for (i, &is_null) in right_null.iter().enumerate() {
             if is_null {
                 continue;
@@ -547,6 +620,7 @@ impl JoinTable {
                 Entry::Occupied(mut e) => {
                     next[i] = *e.get();
                     *e.get_mut() = i as u32;
+                    unique = false;
                 }
                 Entry::Vacant(e) => {
                     e.insert(i as u32);
@@ -556,22 +630,35 @@ impl JoinTable {
         Self {
             heads: vec![heads],
             next,
+            unique,
             state,
             bloom,
+            bloom_trial: BloomTrial::default(),
         }
     }
 
     /// The chain head for probe (left) row `l` — `None` for a null key, a bloom miss,
     /// or no match; otherwise a real right-row index (`is_some()` ⇒ ≥1 match).
+    /// The bloom is supplied by the caller rather than read from `self`, so a probe loop can
+    /// hoist the "is this bloom worth consulting" decision out of the row loop and tally what
+    /// it rejected. `rejected` counts the rows this bloom short-circuited.
     #[inline]
-    fn head_for<K: JoinKeys>(&self, keys: &K, l: usize, is_null: bool) -> Option<u32> {
+    fn head_for<K: JoinKeys>(
+        &self,
+        keys: &K,
+        l: usize,
+        is_null: bool,
+        bloom: Option<&BloomFilter>,
+        rejected: &mut u64,
+    ) -> Option<u32> {
         if is_null {
             return None;
         }
         let hash = keys.hash_left(&self.state, l);
         // A bloom miss is definitive (no false negatives): the key is not on the build
         // side, so the chain is provably empty — skip the hash-table lookup.
-        if self.bloom.as_ref().is_some_and(|b| !b.contains_hash(hash)) {
+        if bloom.is_some_and(|b| !b.contains_hash(hash)) {
+            *rejected += 1;
             return None;
         }
         // The build put this key in exactly one shard, chosen from its hash — so the probe
@@ -599,8 +686,16 @@ impl JoinTable {
         mut right_matched: Option<&mut [bool]>,
     ) {
         let emit_left_unmatched = matches!(join_type, JoinType::Left | JoinType::Full);
+        // Decide once per range whether to consult the bloom, then tally what it rejected so
+        // the next range can re-decide. `None` here is exactly the "no bloom" path.
+        let bloom = self
+            .bloom
+            .as_ref()
+            .filter(|_| self.bloom_trial.worth_consulting());
+        let mut rejected = 0u64;
+        let seen = range.len() as u64;
         for i in range {
-            let head = self.head_for(keys, i, left_null[i]);
+            let head = self.head_for(keys, i, left_null[i], bloom, &mut rejected);
             match join_type {
                 JoinType::Semi => {
                     if head.is_some() {
@@ -615,6 +710,16 @@ impl JoinTable {
                     }
                 }
                 _ => match head {
+                    // Unique build key ⇒ the chain is exactly one row, so emit it and skip the
+                    // `next[r]` load that would only confirm the end. Same `(i, r)` pair, same
+                    // order, one fewer random multi-megabyte access per emitted row.
+                    Some(r) if self.unique => {
+                        if let Some(rm) = right_matched.as_deref_mut() {
+                            rm[r as usize] = true;
+                        }
+                        left_out.push(i as u32);
+                        right_out.push(r);
+                    }
                     Some(mut r) => {
                         // Walk the chain of right rows sharing this key.
                         loop {
@@ -638,6 +743,11 @@ impl JoinTable {
                     }
                 },
             }
+        }
+        // Only meaningful while the bloom was actually consulted; once it is latched off the
+        // rate is frozen at whatever the trial measured.
+        if bloom.is_some() {
+            self.bloom_trial.observe(seen, rejected);
         }
     }
 }
@@ -1159,6 +1269,89 @@ mod tests {
 
     fn keys(v: &[i64]) -> Vec<ArrayRef> {
         vec![Arc::new(Int64Array::from(v.to_vec())) as ArrayRef]
+    }
+
+    /// Build a table over `build` and probe it with `probe` in `chunk`-row ranges — the way a
+    /// morsel-at-a-time executor does, which is what drives [`BloomTrial`]'s per-range verdict.
+    fn probe_in_chunks(
+        build: &[i64],
+        probe: &[i64],
+        chunk: usize,
+    ) -> (Vec<(u32, Option<u32>)>, JoinTable) {
+        let bk = keys(build);
+        let pk = keys(probe);
+        let bnull = vec![false; build.len()];
+        let pnull = vec![false; probe.len()];
+        let k = I64Keys::try_new(&pk, &bk).expect("i64 keys");
+        // `use_bloom = true`: this is about the runtime verdict, not the size heuristic.
+        let table = JoinTable::build(
+            &I64Keys::try_new(&bk, &bk).expect("i64 keys"),
+            build.len(),
+            &bnull,
+            true,
+            BLOOM_FP_RATE,
+        );
+        let mut pairs = Vec::new();
+        for start in (0..probe.len()).step_by(chunk) {
+            let end = (start + chunk).min(probe.len());
+            let mut l = IndexBuf::with_capacity(end - start);
+            let mut r = IndexBuf::with_capacity(end - start);
+            table.probe_range(&k, start..end, &pnull, JoinType::Inner, &mut l, &mut r, None);
+            let (la, ra) = (l.finish(), r.finish());
+            for i in 0..la.len() {
+                pairs.push((
+                    la.value(i),
+                    if ra.is_null(i) { None } else { Some(ra.value(i)) },
+                ));
+            }
+        }
+        (pairs, table)
+    }
+
+    /// The bloom is a pure short-circuit, so latching it off mid-probe must not change a single
+    /// emitted row. Probed in chunks well past [`BLOOM_TRIAL_ROWS`] so the verdict actually flips
+    /// part-way through — exactly the window a wrong implementation would corrupt.
+    #[test]
+    fn latching_the_bloom_off_midway_emits_the_same_rows() {
+        // Every probe key matches — the shape that makes the bloom useless (TPC-H lineitem⋈orders).
+        let build: Vec<i64> = (0..40_000).collect();
+        let probe: Vec<i64> = (0..(BLOOM_TRIAL_ROWS as i64 * 3)).map(|i| i % 40_000).collect();
+
+        let (chunked, table) = probe_in_chunks(&build, &probe, 8_192);
+        assert!(
+            !table.bloom_trial.worth_consulting(),
+            "a bloom that rejected nothing over 3x the trial must have been latched off",
+        );
+
+        // The oracle: one range, so the verdict never flips and the bloom is consulted throughout.
+        let (whole, _) = probe_in_chunks(&build, &probe, probe.len());
+        assert_eq!(
+            chunked, whole,
+            "latching the bloom off must not change the emitted pairs",
+        );
+        assert_eq!(
+            chunked.len(),
+            probe.len(),
+            "every probe row has exactly one match",
+        );
+    }
+
+    /// The other direction, and the reason the filter exists: a genuinely selective join must
+    /// *keep* its bloom. Without this, "switch the bloom off" would read as a free win and would
+    /// silently cost every selective probe its short-circuit.
+    #[test]
+    fn a_selective_bloom_is_kept() {
+        let build: Vec<i64> = (0..40_000).collect();
+        // 1 probe row in 50 can match; the rest fall far outside the build's key range.
+        let probe: Vec<i64> = (0..(BLOOM_TRIAL_ROWS as i64 * 3))
+            .map(|i| if i % 50 == 0 { i % 40_000 } else { 10_000_000 + i })
+            .collect();
+
+        let (_, table) = probe_in_chunks(&build, &probe, 8_192);
+        assert!(
+            table.bloom_trial.worth_consulting(),
+            "a bloom rejecting ~98% of probe rows must stay engaged",
+        );
     }
 
     /// An inner join emits no NULL index, so `finish` must build no null buffer — that is

@@ -15,13 +15,12 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
 @pytest.mark.differential
 def test_trim_strips_only_space_separators(duck):
-    from conftest import assert_same
-
     # Rows mixing control whitespace (tab/newline/CR/VT/FF) with Zs separators
     # (ASCII space, NBSP U+00A0, ideographic space U+3000). DuckDB keeps the
     # controls and strips only the space separators.
@@ -56,8 +55,6 @@ def test_trim_strips_only_space_separators(duck):
 
 @pytest.mark.differential
 def test_concat_ws_all_null_args_is_empty_string(duck):
-    from conftest import assert_same
-
     tbl = pa.table(
         {
             "a": pa.array(["x", None, None, "p"], pa.string()),
@@ -65,10 +62,6 @@ def test_concat_ws_all_null_args_is_empty_string(duck):
         }
     )
     duck.register("t", tbl)
-    out = (
-        bt.from_arrow(tbl)
-        .select(v=bt.concat_ws("-", col("a"), col("b")))
-        .collect()
-    )
+    out = bt.from_arrow(tbl).select(v=bt.concat_ws("-", col("a"), col("b"))).collect()
     expected = duck.sql("SELECT concat_ws('-', a, b) v FROM t")
     assert_same(out, expected)

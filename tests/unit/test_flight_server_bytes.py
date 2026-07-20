@@ -1,11 +1,25 @@
-"""Shuffle output-byte tracking on the Flight server (network-egress metadata capture)."""
+"""Shuffle output-byte tracking on the Flight server (network-egress metadata capture).
+
+The stubs here replace the module's `engine()` accessor rather than individually-imported
+native names: `server.py` reaches the compiled data plane only through
+`batcher._internal.native.engine`, so that one seam is what a unit test substitutes. Binding
+the native symbols at module import instead would make even the pure-Python `ShuffleTicket`
+unimportable on a tree that has not been built.
+"""
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
 
 pytestmark = pytest.mark.unit
+
+
+def _stub_engine(monkeypatch, srvmod, **attrs):
+    """Point `srvmod.engine()` at a namespace exposing only `attrs` from the data plane."""
+    monkeypatch.setattr(srvmod, "engine", lambda: SimpleNamespace(**attrs))
 
 
 def test_flight_server_tracks_published_bytes(monkeypatch):
@@ -18,7 +32,7 @@ def test_flight_server_tracks_published_bytes(monkeypatch):
         def publish(self, ticket, batches):
             pass
 
-    monkeypatch.setattr(srvmod, "_Server", _StubSrv)
+    _stub_engine(monkeypatch, srvmod, FlightShuffleServer=_StubSrv)
     s = srvmod.FlightShuffleServer()
     assert s.bytes_published == 0  # nothing shuffled yet
 
@@ -36,7 +50,7 @@ def test_fetch_tracks_ingress_bytes(monkeypatch):
     tbl = pa.table({"x": list(range(500))})
     batches = tbl.to_batches()
     n = sum(b.nbytes for b in batches)
-    monkeypatch.setattr(srvmod, "_fetch", lambda *a: batches)  # stub the native fetch
+    _stub_engine(monkeypatch, srvmod, flight_fetch=lambda *a: batches)
     srvmod._BYTES_FETCHED = 0
     before = srvmod.bytes_fetched()
     srvmod.fetch("host:1", "ticket")
@@ -59,7 +73,7 @@ def test_shuffle_client_fetch_tracks_ingress(monkeypatch):
         def fetch(self, *args, **kwargs):
             return batches
 
-    monkeypatch.setattr(srvmod, "_Client", _StubClient)
+    _stub_engine(monkeypatch, srvmod, ShuffleClient=_StubClient)
     srvmod._BYTES_FETCHED = 0
     c = srvmod.ShuffleClient()
     c.fetch("host:1", "ticket")
@@ -84,7 +98,7 @@ def test_local_paths_track_locality_bytes(monkeypatch):
         def shm_fetch(self, addr, ticket):
             return batches
 
-    monkeypatch.setattr(srvmod, "_Server", _StubSrv)
+    _stub_engine(monkeypatch, srvmod, FlightShuffleServer=_StubSrv)
     s = srvmod.FlightShuffleServer()
     assert s.bytes_served_locally == 0
     s.local_fetch("t")  # DIRECT_MEMORY

@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher._internal.errors import PlanError
 
 pytestmark = pytest.mark.differential
@@ -26,8 +27,6 @@ def _data():
 
 
 def test_groups_frame_matches_duckdb(duck):
-    from conftest import assert_same
-
     ds = _data()
     duck.register("t", ds.collect())
     got = ds.window(
@@ -41,8 +40,6 @@ def test_groups_frame_matches_duckdb(duck):
 
 
 def test_range_peer_frame_matches_duckdb(duck):
-    from conftest import assert_same
-
     ds = _data()
     duck.register("t", ds.collect())
     got = ds.window(
@@ -93,8 +90,6 @@ def test_numeric_range_offset_rejected_not_silently_wrong(duck):
 
 
 def test_groups_current_row_is_peer_sum(duck):
-    from conftest import assert_same
-
     ds = _data()
     duck.register("t", ds.collect())
     got = ds.window(

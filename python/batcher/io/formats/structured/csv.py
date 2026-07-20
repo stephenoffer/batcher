@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import IO, Any
 
 import pyarrow as pa
 
+from batcher._internal.errors import SchemaError
 from batcher._internal.hardware import available_cpu_count
 from batcher.config import active_config
 from batcher.io.base import FileSink, FileSource
@@ -36,6 +38,10 @@ class CSVRangeSplit:
     path: str
     start: int
     end: int
+    # The source's declared schema, carried because a worker rebuilds the reader from the
+    # split alone: without it the range re-infers from its own bytes, and a range that
+    # happens to hold only integers disagrees with the source and with its sibling ranges.
+    declared_schema: pa.Schema | None = None
 
     def _header(self) -> bytes:
         fs = resolve_filesystem(self.path)
@@ -65,6 +71,8 @@ class CSVRangeSplit:
         return table.select(projection) if projection is not None else table
 
     def schema(self) -> pa.Schema:
+        if self.declared_schema is not None:
+            return self.declared_schema
         from batcher.io.formats.base import SOURCES
 
         return SOURCES.get("csv")(self.path).schema()
@@ -82,13 +90,44 @@ class CSVRangeSplit:
         return f"csv:{self.path}:{self.start}-{self.end}"
 
 
+@contextlib.contextmanager
+def _mismatch_reported(source: CSVSource):
+    """Turn pyarrow's conversion error into one that says what to do about it.
+
+    A CSV column is typed from the first block, so a value further down that does not fit
+    is not a corrupt file — it is inference having been shown too little. The raw error
+    names the offending value but not the inferred type, nor that the type is declarable,
+    which is the whole of the fix.
+    """
+    try:
+        yield
+    except pa.ArrowInvalid as exc:
+        raise SchemaError(
+            f"CSV value does not fit the inferred column type in {source._path!r}: {exc}. "
+            "The schema is inferred from the file's first block, so a value further down "
+            "may not fit it. Declare the type instead — "
+            'bt.read.csv(path, schema=pa.schema([("col", pa.string()), ...])).'
+        ) from exc
+
+
 @SOURCES.register("csv")
 class CSVSource(FileSource):
     """One or more CSV files (single file, directory, or glob).
 
     Large files are split into newline-aligned byte ranges (`CSVRangeSplit`) so a
     single multi-GB CSV reads in parallel across workers; small files use one split
-    each. Schema is inferred by pyarrow on first access.
+    each.
+
+    **The schema is a contract, and CSV cannot see the future.** It is inferred from the
+    first block — what pyarrow's streaming reader commits to, and what DuckDB and Polars
+    sample — so a column that is integral for a million rows and then holds ``"N/A"``
+    was inferred wrong. Every read path therefore *pins* the advertised schema, so all of
+    them agree. They did not before: `schema()` said `int64`, `read()` re-inferred over
+    the whole file and silently returned `string` (contradicting the schema the engine had
+    already planned against), and `iter_batches()` raised. One file, three answers.
+
+    Pass `schema=` to declare the truth when inference cannot reach it — the escape hatch
+    the mismatch error points at.
 
     Examples:
         .. doctest::
@@ -102,7 +141,53 @@ class CSVSource(FileSource):
     suffix = ".csv"
     format_name = "csv"
 
-    __slots__ = ()
+    __slots__ = ("_declared_schema",)
+
+    def __init__(self, path: str, *, schema: pa.Schema | None = None, **kwargs: Any) -> None:
+        super().__init__(path, **kwargs)
+        self._declared_schema = schema
+
+    def schema(self) -> pa.Schema:
+        """The declared schema when one was given, else the one inferred from the file.
+
+        Inference reads only the file's first block, so a column that is integral for a
+        million rows and then holds ``"N/A"`` is inferred wrong. Declaring the schema is
+        the escape hatch, and every read path is pinned to whatever this returns.
+
+        Examples:
+            .. doctest::
+
+                >>> import pyarrow as pa
+                >>> import batcher as bt
+                >>> _ = open("late.csv", "w").write("k,v\\n1,10\\n2,oops\\n")
+                >>> declared = pa.schema([("k", pa.int64()), ("v", pa.string())])
+                >>> bt.read.csv("late.csv", schema=declared).schema.field("v").type
+                DataType(string)
+
+        Returns:
+            The schema every read path of this source will produce.
+        """
+        return self._declared_schema if self._declared_schema is not None else super().schema()
+
+    def _reader_kwargs(self) -> dict[str, object]:
+        """A declared schema changes how a split parses, so a worker must rebuild it."""
+        base = super()._reader_kwargs()
+        return (
+            {**base, "schema": self._declared_schema} if self._declared_schema is not None else base
+        )
+
+    def _convert_options(self, projection: list[str] | None) -> Any:
+        """Parse options pinning the advertised column types (and the projection).
+
+        Pinning is what makes the read paths agree with `schema()` and with each other.
+        Without it pyarrow re-infers per read, over a different amount of data each time.
+        """
+        import pyarrow.csv as pacsv
+
+        types = {field.name: field.type for field in self.schema()}
+        if projection is not None:
+            types = {name: t for name, t in types.items() if name in set(projection)}
+        return pacsv.ConvertOptions(include_columns=projection, column_types=types)
 
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
         import pyarrow.csv as pacsv
@@ -117,14 +202,28 @@ class CSVSource(FileSource):
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
         import pyarrow.csv as pacsv
 
-        # Push the projection into the parse (`include_columns`) so pyarrow only *converts*
-        # the wanted columns — a projected scan skips the (often costly) string/decimal
-        # conversion of the columns it drops, instead of parsing all then selecting.
-        convert = (
-            pacsv.ConvertOptions(include_columns=projection) if projection is not None else None
-        )
-        table = pacsv.read_csv(fh, convert_options=convert)
+        # The projection is pushed into the parse (`include_columns`) so pyarrow only
+        # *converts* the wanted columns, and the types are pinned so this path cannot
+        # disagree with `schema()` — it used to re-infer over the whole file and return a
+        # widened type the engine had not planned for.
+        with _mismatch_reported(self):
+            table = pacsv.read_csv(fh, convert_options=self._convert_options(projection))
         return table.to_batches()
+
+    def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        """Stream one CSV a block at a time rather than decoding it whole.
+
+        `read_csv` materializes the entire decoded table — measured at ~2.2x the file size
+        in peak RSS for a 225 MB CSV — which makes `iter_batches` streaming in name only and
+        caps the file size a worker can handle. `open_csv` returns pyarrow's incremental
+        reader, so peak memory is one block regardless of how large the file is.
+        """
+        import pyarrow.csv as pacsv
+
+        with self._fs.open(path) as fh:
+            reader = pacsv.open_csv(fh, convert_options=self._convert_options(projection))
+            with _mismatch_reported(self):
+                yield from reader
 
     def _file_splits(
         self,
@@ -140,9 +239,10 @@ class CSVSource(FileSource):
         except (OSError, ValueError):
             return [FileSplit(self.format_name, path)]
         if size <= chunk:
-            return [FileSplit(self.format_name, path)]
+            return [FileSplit(self.format_name, path, self._reader_kwargs())]
         return [
-            CSVRangeSplit(path, start, min(start + chunk, size)) for start in range(0, size, chunk)
+            CSVRangeSplit(path, start, min(start + chunk, size), self._declared_schema)
+            for start in range(0, size, chunk)
         ]
 
 

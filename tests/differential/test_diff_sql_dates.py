@@ -8,6 +8,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 
 
 @pytest.fixture
@@ -39,8 +40,6 @@ def t(duck):
     ],
 )
 def test_date_interval(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
@@ -55,8 +54,6 @@ def test_date_interval(duck, t, q):
     ],
 )
 def test_date_functions(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 
 
@@ -85,8 +82,6 @@ def ts(duck):
 )
 def test_date_trunc(duck, ts, unit):
     """DATE_TRUNC('<unit>', ts) — the ClickBench Q42 shape — matches DuckDB."""
-    from conftest import assert_same
-
     q = f"SELECT id, DATE_TRUNC('{unit}', ev) m FROM ts ORDER BY id"
     assert_same(bt.sql(q, ts=ts).collect(), duck.sql(q))
 
@@ -108,8 +103,6 @@ def test_date_trunc(duck, ts, unit):
     ],
 )
 def test_timestamp_interval(duck, ts, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, ts=ts).collect(), duck.sql(q))
 
 
@@ -127,6 +120,4 @@ def test_timestamp_interval(duck, ts, q):
     ],
 )
 def test_month_year_interval(duck, t, q):
-    from conftest import assert_same
-
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))

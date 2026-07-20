@@ -144,15 +144,15 @@ print(sorted(deduped.to_pydict()["id"]))
 ```
 
 Two of the four documents were going to cost a forward pass each for nothing. On a real
-crawl the near-duplicate rate is routinely 20–40%; that is the same fraction off your
-GPU bill. See [preprocessors](preprocessors.md) for the MinHash/LSH tuning.
+crawl the near-duplicate rate is routinely 20% to 40%, and that is the same fraction off
+your GPU bill. See [preprocessors](preprocessors.md) for the MinHash and LSH tuning.
 
 ## Chunk long documents first
 
 :::{warning}
 An embedding model has a context limit, and text past it is silently truncated. You get a
 vector for the first 512 tokens and a false belief that it represents the document.
-Nothing raises, nothing warns, and the retrieval quality just quietly is not what you
+Nothing raises, nothing warns, and the retrieval quality quietly is not what you
 think it is.
 :::
 
@@ -167,8 +167,8 @@ print(chunks.to_pydict()["chunk"])
 ```
 
 `overlap` keeps a sentence cut across a boundary whole in one of the two chunks. Sizes
-are in characters, so pick one comfortably under the model's token limit (a rough rule is
-4 characters per token). Keep the document id on the row so you can attribute a retrieved
+are in characters, so pick one comfortably under the model's token limit. A rough rule is
+4 characters per token. Keep the document id on the row so you can attribute a retrieved
 chunk back to its source. [RAG](rag.md) walks the full ingest.
 
 ## Storing vectors
@@ -184,16 +184,16 @@ unit.write.lance("s3://bucket/vectors.lance")
 ```
 
 :::{note}
-A 1024-dimension float64 vector is 8 KB per row: a million rows is 8 GB. Cast to
-`float32` before writing if the recall loss is acceptable (it usually is), and keep the
-vector column out of any sort or join that does not need it. `offload_blobs` exists for
-exactly that (see [multimodal](multimodal.md)).
+A 1024-dimension float64 vector is 8 KB per row, so a million rows is 8 GB. Cast to
+`float32` before writing if the recall loss is acceptable, and keep the vector column out
+of any sort or join that does not need it. `offload_blobs` exists for exactly that. See
+[multimodal](multimodal.md).
 :::
 
 ## Driving the pool yourself
 
-When you are composing a stage rather than executing a `Dataset` (a custom loop, a
-serving process), `batcher.ml.embed` does the same work over a bare batch iterator. It
+Sometimes you are composing a stage rather than executing a `Dataset`, inside a custom
+loop or a serving process. `batcher.ml.embed` does the same work over a bare batch iterator. It
 takes an `EncoderFactory`: a zero-argument callable returning an encoder, which is any
 callable from `list[str]` to one vector per string. The factory runs once per worker.
 
@@ -217,7 +217,7 @@ model, an ONNX runtime, and a hosted embedding API are interchangeable at this s
 
 ## See also
 
-- [Vector search](vector-search.md): retrieving against the vectors you just built.
+- [Vector search](vector-search.md): retrieving against the vectors you built.
 - [RAG](rag.md): the full chunk → embed → retrieve → generate pipeline.
 - [GPU scheduling](gpu.md): sizing the actor pool that runs the encoder.
 - [GPU execution](../deep-dives/gpu-execution.md): how a GPU stage is scheduled, and what

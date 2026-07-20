@@ -92,6 +92,7 @@ def cache_key(
     hub: Any,
     kind: str = "full",
     source_stats: list | None = None,
+    hardware: Any = None,
 ) -> str | None:
     """A key identifying this exact optimization, or `None` when it must not be cached.
 
@@ -109,8 +110,9 @@ def cache_key(
     source_ids = _source_keys(sources)
     if source_ids is None:
         return None
-    # Injectivity: the first seven fields are all `|`-free (a fixed `kind`, three hex digests,
-    # three integers), so a `|`-split recovers them and everything after the seventh `|` is the
+    # Injectivity: the first eight fields are all `|`-free (a fixed `kind`, three hex digests,
+    # three integers, a comma-joined hardware fingerprint), so a `|`-split recovers them and
+    # everything after the eighth `|` is the
     # source component. That component is `repr(source_ids)` — unambiguous for a list of
     # strings even when a source identity (a file path) contains `|` or `,`, which a naive
     # delimiter-join would let collide two different source sets onto one key.
@@ -123,8 +125,26 @@ def cache_key(
             str(learning.generation()),
             _calibration_epoch(hub),
             _source_stats_key(source_stats),
+            _hardware_key(hardware),
             repr(source_ids),
         )
+    )
+
+
+def _hardware_key(hardware: Any) -> str:
+    """A compact fingerprint of the target hardware, or ``"-"`` when unspecified.
+
+    Folded into the key because a plan is now a function of the hardware too: the same query
+    planned against a 16 MiB-L3 driver and 64 MiB-L3 cluster workers picks a different broadcast
+    threshold, so reusing the driver's cached plan for the cluster run would ship the wrong one.
+    Keyed only on the fields that actually steer a decision (`|`-free integers), so an
+    unchanged machine keeps hitting its cached plan.
+    """
+    if hardware is None:
+        return "-"
+    h = hardware
+    return (
+        f"{h.cpu_cores},{h.memory_bytes},{h.l3_cache_bytes},{h.gpu_memory_bytes},{h.worker_count}"
     )
 
 
@@ -217,7 +237,7 @@ def _source_keys(sources: list | None) -> list[str] | None:
 # a 100% "change" — but no plan reads them as a value; they weight the averages beside them.
 # Comparing them would make every write look material and defeat the memo entirely (measured:
 # 6 hits in 8 identical runs became 0).
-# The OLS sufficient statistics (`sx`/`sy`/`sxx`/`sxy`, from `learned_tuning._fold_ols`) and
+# The OLS sufficient statistics (`sx`/`sy`/`sxx`/`sxy`, from `learned_tuning.crossover`) and
 # the bandit arm accumulators (`sum`/`sumsq`, from `record_arm`) belong here for the same
 # reason `n` does: every one of them grows monotonically with each observation, so comparing
 # them raw made *every* join run look material and flushed the whole plan cache — the exact

@@ -975,10 +975,6 @@ class StatsEstimator:
                 return True
         return False
 
-    def input_sizes(self, node: Join) -> tuple[RelStats, RelStats]:
-        """The estimated sizes of a join's two inputs (for build-side choice)."""
-        return self.estimate(node.left), self.estimate(node.right)
-
 
 def _ndvs(stats: RelStats) -> dict[str, float]:
     """`{column: ndv}` for every column of `stats` whose distinct count is known.

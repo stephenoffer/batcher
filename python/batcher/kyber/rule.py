@@ -86,8 +86,6 @@ class Rule:
     fn: Callable[[LogicalPlan, OptimizerContext], LogicalPlan]
     matches: frozenset[type] | None = None
     category: RuleCategory = RuleCategory.REWRITE
-    idempotent: bool = True
-    metadata: dict = field(default_factory=dict, compare=False)
     # For a node-local rule, the underlying `f(node, ctx) -> node | None`. The driver
     # uses this to fuse consecutive node-local rules into a *single* bottom-up
     # traversal (instead of one traversal per rule); `fn` remains the equivalent
@@ -115,7 +113,6 @@ def plan_rule(
     *,
     matches: tuple[type, ...] | None = None,
     category: RuleCategory = RuleCategory.REWRITE,
-    idempotent: bool = True,
 ) -> Rule:
     """Wrap a whole-plan function `fn(plan, ctx) -> plan` as a `Rule`.
 
@@ -129,7 +126,6 @@ def plan_rule(
         fn=fn,
         matches=frozenset(matches) if matches is not None else None,
         category=category,
-        idempotent=idempotent,
     )
 
 
@@ -140,7 +136,6 @@ def node_rule(
     *,
     matches: tuple[type, ...],
     category: RuleCategory = RuleCategory.REWRITE,
-    idempotent: bool = True,
     expr_fn: Callable[[Expr], Expr] | None = None,
 ) -> Rule:
     """Wrap a node-local function `fn(node, ctx) -> node | None` as a `Rule`.
@@ -168,7 +163,6 @@ def node_rule(
         fn=whole_plan,
         matches=match_set,
         category=category,
-        idempotent=idempotent,
         node_fn=fn,
         expr_fn=expr_fn,
     )

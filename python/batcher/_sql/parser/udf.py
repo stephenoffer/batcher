@@ -4,7 +4,7 @@ Python cannot run inside the engine's Rust expression evaluator, so a function
 registered with `Session.register_function` lowers to a `MapBatches` stage instead
 of an `Expr`. Two forms:
 
-* table function — ``SELECT * FROM f(t)`` — resolved in `clauses._table` via
+* table function — ``SELECT * FROM f(t)`` — resolved in `from_clause._table` via
   `_apply_table_function`: the whole relation flows through `ds.ml.map_batches`.
 * scalar function — ``SELECT f(x)`` / ``WHERE f(x)`` — resolved by `_hoist_udfs`,
   a pre-pass that materializes each call into a synthetic column (a `map_batches`

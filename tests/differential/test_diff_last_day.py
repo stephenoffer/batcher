@@ -15,6 +15,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -42,8 +43,6 @@ def t(duck):
 
 
 def test_last_day_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).select(l=col("ts").dt.last_day()).collect()
     # Cast DuckDB's DATE result to TIMESTAMP so it aligns with Batcher's
     # Timestamp(us) at midnight.
@@ -52,8 +51,6 @@ def test_last_day_vs_duckdb(duck, t):
 
 
 def test_last_day_and_millennium_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .select(

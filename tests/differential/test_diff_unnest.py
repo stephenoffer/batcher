@@ -13,12 +13,11 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
 def test_explode_int_list(duck):
-    from conftest import assert_same
-
     tbl = pa.table(
         {
             "id": [1, 2, 3, 4],
@@ -33,8 +32,6 @@ def test_explode_int_list(duck):
 
 def test_explode_string_chunks(duck):
     # The RAG chunk fan-out shape: explode a chunks list into one row per chunk.
-    from conftest import assert_same
-
     tbl = pa.table(
         {
             "doc": [1, 2, 3],
@@ -47,8 +44,6 @@ def test_explode_string_chunks(duck):
 
 
 def test_explode_in_place_default_alias(duck):
-    from conftest import assert_same
-
     tbl = pa.table({"id": [1, 2], "xs": pa.array([[1, 2, 3], [4]], type=pa.list_(pa.int64()))})
     duck.register("t", tbl)
     # No alias → the exploded column keeps its name in place.
@@ -59,8 +54,6 @@ def test_explode_in_place_default_alias(duck):
 def test_explode_then_filter(duck):
     # The predicate references the exploded column, so it must stay ABOVE the
     # explode (it cannot be pushed below). Exercises the pushdown safety branch.
-    from conftest import assert_same
-
     tbl = pa.table({"id": [1, 2], "xs": pa.array([[1, 2, 3], [4, 5]], type=pa.list_(pa.int64()))})
     duck.register("t", tbl)
     out = bt.from_arrow(tbl).explode("xs", alias="x").filter(col("x") > 2).collect()
@@ -73,8 +66,6 @@ def test_explode_then_filter(duck):
 def test_explode_only_uses_list_column(duck):
     # Projecting just the exploded value still reads the list column (its length
     # drives the row count) — verifies projection pushdown keeps `xs`.
-    from conftest import assert_same
-
     tbl = pa.table({"id": [1, 2], "xs": pa.array([[7, 8], [9]], type=pa.list_(pa.int64()))})
     duck.register("t", tbl)
     out = bt.from_arrow(tbl).explode("xs", alias="x").select("x").collect()

@@ -282,7 +282,19 @@ pub(crate) fn window_serial(
 
     // Encode the order keys once into arrow's row format. Peer/tie checks then cost
     // one byte comparison by row index instead of re-encoding per comparison.
-    let order_rows = if order_keys.is_empty() {
+    //
+    // Only the functions that actually consult *peers* or a *frame* read this: the rank
+    // family (`rank`/`percent_rank`/`cume_dist`), the framed value/aggregate paths, and the
+    // running aggregate. `ROW_NUMBER` and `NTILE` are pure positions within `ordered`, and a
+    // frameless value function (`LAG`/`LEAD`/`FIRST_VALUE`/…) selects by position too — none
+    // of them look at ties. Encoding unconditionally therefore built a full `RowConverter`
+    // image of every order key for queries that never touched it; at 6M rows that is a ~54 MB
+    // allocation and a full encode pass of pure waste on, e.g., a `LAG` window.
+    let needs_peers = funcs.iter().any(|c| {
+        !matches!(c.func, WindowFn::RowNumber | WindowFn::Ntile)
+            && !(c.func.is_value() && c.frame.is_none())
+    });
+    let order_rows = if order_keys.is_empty() || !needs_peers {
         None
     } else {
         Some(encode_order_keys(order_keys)?)
@@ -521,20 +533,18 @@ fn ordered_partitions_by_global_sort(
     let pconv = RowConverter::new(pfields)?;
     let prows = pconv.convert_columns(partition_keys)?;
 
+    // Runs are collected from slices of known length, so each partition's `Vec` is allocated
+    // once at its exact size rather than regrown from the capacity-0 `Vec` that `mem::take`
+    // leaves behind — see the matching note in `try_ordered_partitions_packed`.
     let mut out: Vec<Vec<usize>> = Vec::new();
-    let mut cur: Vec<usize> = Vec::with_capacity(0);
-    for (pos, &ri) in sorted.iter().enumerate() {
-        let ri = ri as usize;
-        if pos > 0 {
-            let prev = sorted[pos - 1] as usize;
-            if prows.row(ri) != prows.row(prev) {
-                out.push(std::mem::take(&mut cur));
-            }
+    let mut start = 0usize;
+    for pos in 1..=sorted.len() {
+        let boundary = pos == sorted.len()
+            || prows.row(sorted[pos] as usize) != prows.row(sorted[start] as usize);
+        if boundary {
+            out.push(sorted[start..pos].iter().map(|&r| r as usize).collect());
+            start = pos;
         }
-        cur.push(ri);
-    }
-    if !cur.is_empty() {
-        out.push(cur);
     }
     Ok(out)
 }
@@ -624,16 +634,25 @@ fn try_ordered_partitions_packed(
         .collect();
     keyed.par_sort_unstable();
     // Split the sorted tuples into contiguous same-partition runs (partition key changed).
+    //
+    // Each run is collected from a slice of known length, so its `Vec` is allocated once at the
+    // exact size. The previous form pushed into a `cur` reset by `mem::take` — which hands back
+    // a *capacity-0* `Vec` — so every partition regrew 1→2→4, ~3 allocations each. A near-unique
+    // PARTITION BY is the normal case here (`PARTITION BY l_orderkey` is ~1.5M partitions of ~4
+    // rows at SF1), which made that a few million malloc/free pairs inside the timed region.
+    // Identical output: the same runs, in the same order, holding the same indices.
     let mut out: Vec<Vec<usize>> = Vec::new();
-    let mut cur: Vec<usize> = Vec::new();
-    for (pos, &(p, _, idx)) in keyed.iter().enumerate() {
-        if pos > 0 && p != keyed[pos - 1].0 {
-            out.push(std::mem::take(&mut cur));
+    let mut start = 0usize;
+    for pos in 1..=keyed.len() {
+        if pos == keyed.len() || keyed[pos].0 != keyed[start].0 {
+            out.push(
+                keyed[start..pos]
+                    .iter()
+                    .map(|&(_, _, i)| i as usize)
+                    .collect(),
+            );
+            start = pos;
         }
-        cur.push(idx as usize);
-    }
-    if !cur.is_empty() {
-        out.push(cur);
     }
     Some(out)
 }

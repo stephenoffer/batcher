@@ -37,6 +37,7 @@ serde_json = "1"
 
 # Internal crates (path deps wired here so members stay terse).
 bc-arrow = { path = "crates/bc-arrow" }
+bc-secrets = { path = "crates/bc-secrets" }
 bc-resource = { path = "crates/bc-resource" }
 bc-expr = { path = "crates/bc-expr" }
 bc-ir = { path = "crates/bc-ir" }

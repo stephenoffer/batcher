@@ -17,15 +17,11 @@ C Data Interface. The IR carries the plan; the Arrow pointers carry the rows.
 
 ## The two levels
 
-`crates/bc-ir/src/lib.rs` defines the relational IR:
+The document nests two independent trees, each defined by one Rust type.
 
-- **`RelOp`**: the plan DAG. Its serde tag is `op`, `rename_all = "snake_case"`, with
-  `deny_unknown_fields`. Variants: `scan`, `filter`, `project`, `aggregate`, `sort`,
-  `limit`, `hash_join`, `asof_join`, `distinct`, `window`, `union`, `unnest`, `unpivot`,
-  `row_id`, `sample`.
-- **`Expr`** (in `crates/bc-expr/src/lib.rs`): the scalar expression tree carried inside
-  `RelOp` nodes. Its tag is `e`: `col`, `lit`, `binary`, `not`, `cast`, `is_null`, `case`,
-  `str`, `math`, and the rest.
+`RelOp`, in `crates/bc-ir/src/lib.rs`, is the relational plan. Its serde attributes are `tag = "op"`, `rename_all = "snake_case"`, and `deny_unknown_fields`, so every node in the document announces itself with an `op` key holding a snake_case variant name. The fifteen variants are `scan`, `filter`, `project`, `aggregate`, `sort`, `limit`, `hash_join`, `asof_join`, `distinct`, `window`, `union`, `unnest`, `unpivot`, `row_id`, and `sample`.
+
+`Expr`, in `crates/bc-expr/src/lib.rs`, is the scalar expression tree carried inside `RelOp` nodes. It uses the same attributes with `tag = "e"`, and its variants include `col`, `lit`, `binary`, `not`, `cast`, `is_null`, `is_not_null`, `is_nan`, `is_inf`, `case`, `str`, and `date`.
 
 :::{important}
 There is exactly one of each. The interpreter, the JIT, the runtime primitives, and the
@@ -48,7 +44,7 @@ import json
 ds = bt.from_pydict({"g": ["a", "b"], "x": [1, 2]})
 q = ds.filter(bt.col("x") > 1).select("g", "x")
 
-# `_plan` is internal — this is the document Core ships across the FFI boundary.
+# `_plan` is internal. This is the document Core ships across the FFI boundary.
 print(json.dumps(q._plan.to_ir(), indent=2))
 ```
 
@@ -95,9 +91,7 @@ off the filter's `predicate` is tagged `e`:
 Three things to notice.
 
 **`source_id` is an index, not a path.** `Scan { source_id: 0 }` binds to `sources[0]`, the
-list of pyarrow `RecordBatch`es passed alongside the plan. The IR never names a file. IO
-resolution (splits, predicates pushed to the reader, schema evolution) happens in the Python
-`io` layer, which hands the engine batches.
+list of pyarrow `RecordBatch`es passed alongside the plan. The IR never names a file. The Python `io` layer resolves splits, pushes predicates down to the reader, and applies schema evolution, then hands the engine batches.
 
 **There is no schema in the document.** The engine infers types from the Arrow input, which
 already carries them. This keeps the IR small and makes it impossible for a declared schema
@@ -167,8 +161,8 @@ python/batcher/plan/physical.py      document assembly
 
 :::{tab-item} The Rust side
 ```text
-crates/bc-ir/src/lib.rs      RelOp — serde tag "op", snake_case, deny_unknown_fields
-crates/bc-expr/src/lib.rs    Expr  — serde tag "e"
+crates/bc-ir/src/lib.rs      RelOp: serde tag "op", snake_case, deny_unknown_fields
+crates/bc-expr/src/lib.rs    Expr:  serde tag "e"
 crates/bc-py/src/lib.rs      deserialization at the boundary
 ```
 :::

@@ -14,6 +14,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 _BASE = dt.datetime(2024, 1, 1, 0, 0, 0)
@@ -43,8 +44,6 @@ def _data() -> pa.Table:
 
 @pytest.mark.parametrize("gap", ["10m", "1m"])
 def test_session_window_matches_duckdb(duck, gap):
-    from conftest import assert_same
-
     tbl = _data()
     got = (
         bt.from_arrow(tbl)

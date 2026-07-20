@@ -92,14 +92,14 @@ key.
 
 Sample ~8,192 rows to estimate quantile boundaries, range-partition the rows by the leading key,
 and sort each range in parallel. The ranges are globally ordered relative to each other, so the
-sorted relation is just the ranges in key order: no final merge, and no concatenation, because
+sorted relation is the ranges in key order: no final merge, and no concatenation, because
 the executor consumes a `Vec<RecordBatch>` anyway.
 
 ```text
    sample ~8,192 rows ──► quantile boundaries   b0 < b1 < b2
                                 │
                                 ▼
-   route each row to a range by its leading key   (row INDICES only — no payload copy)
+   route each row to a range by its leading key   (row INDICES only, no payload copy)
    ┌──────────┬──────────┬──────────┬──────────┐
    │ range 0  │ range 1  │ range 2  │ range 3  │  globally ordered relative to each other
    └────┬─────┴────┬─────┴────┬─────┴────┬─────┘
@@ -114,7 +114,7 @@ the executor consumes a `Vec<RecordBatch>` anyway.
          gather every column ONCE, per range
                         │
                         ▼
-   the ranges, in key order, ARE the sorted relation — no merge, no concat
+   the ranges, in key order, ARE the sorted relation: no merge, no concat
 ```
 
 The payload is gathered exactly once, and that is the whole point of the design. Materializing
@@ -141,15 +141,31 @@ through the same `DiskSpillStore` the aggregate uses.
 
 ## Top-N is not sort-then-slice
 
-A `LIMIT` above a `Sort` is fused by the optimizer into `Sort { keys, limit }`, and the engine
-runs a *partial* sort, O(n log k) rather than O(n log n). That partial sort is unstable, so
-which tied rows survive is arbitrary and input-size-dependent, which would make single-node and
-the distributed range sort (whose per-bucket reduce runs the same top-N over a differently sized
-slice) disagree on ties. The row-index tie-break key fixes it: the top-N is deterministic and
-identical to a stable sort-then-slice, for one extra unique key in the same partial sort.
+A `LIMIT` above a `Sort` is fused by the optimizer into `Sort { keys, limit }`, and `parallel_top_n`
+reduces each morsel to its own local top-k before merging the narrow set of survivors. The whole
+input is never concatenated and never fully sorted.
 
-This fusion is where the engine's biggest sort win comes from: `sort → LIMIT` runs in 14.1 ms
-against DuckDB's 13.3 ms and Polars' 600.7 ms, because Polars sorts the whole relation and then slices.
+Per morsel, `top_k_indices` picks between two shapes. A single `Utf8` key uses the stable string
+permutation builder and a single integer or temporal key uses the radix, because both are linear,
+so sorting the whole morsel costs no more than selecting k from it. Every other key, including a
+single float key, falls through to an O(n) quickselect over a total-order row comparator that walks
+each `ORDER BY` key in turn and then the row index. A float key used to take the radix full sort
+too, and that was the wrong trade: the float radix runs eight LSD passes scattering by a random key
+byte, so sorting a 13k-row morsel to keep 100 rows costs roughly eight times an O(n) selection and
+thrashes cache. Routing float to the quickselect moved `ORDER BY <f64> DESC LIMIT 100` over 6M rows
+from 3.03x DuckDB to 1.57x.
+
+Quickselect is unstable, so the order in which a morsel hands back its candidates is arbitrary. The
+global merge therefore tie-breaks on the survivor's original `(morsel, row)` rather than on its
+position in the flattened candidate array. Those two agree only when every morsel returns rows in
+ascending-row order, which the radix full sort happened to do and the quickselect does not, and the
+gap between them was a live wrong-answer bug: a different tied row survived at the same rank than
+the stable oracle keeps, visible only with real key ties, since a distinct second sort key removes
+them. `parallel_top_n_float_key_matches_eager` pins the fixed behavior across `-0.0`/`0.0`, `NaN`,
+heavy ties, and every ascending/descending by nulls-first combination.
+
+The fusion is worth the machinery. On the operator sweep `sort → LIMIT` sits at parity with DuckDB
+and runs 33x faster than Polars, which sorts the whole relation and then slices it.
 
 ## The gather is the cost
 

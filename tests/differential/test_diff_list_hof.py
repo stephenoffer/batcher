@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, element
 
 pytestmark = pytest.mark.differential
@@ -22,16 +23,12 @@ def _data():
 
 
 def test_transform_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _data())
     got = bt.from_arrow(_data()).select(r=col("a").list.transform(element() * 2 + 1)).collect()
     assert_same(got, duck.sql("SELECT list_transform(a, x -> x * 2 + 1) AS r FROM t"))
 
 
 def test_filter_matches_duckdb(duck):
-    from conftest import assert_same
-
     duck.register("t", _data())
     got = bt.from_arrow(_data()).select(r=col("a").list.filter(element() > 2)).collect()
     assert_same(got, duck.sql("SELECT list_filter(a, x -> x > 2) AS r FROM t"))

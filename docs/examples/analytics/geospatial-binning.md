@@ -34,7 +34,7 @@ A bin number is a promise: bin `b` holds every point with `b * CELL <= x < (b+1)
 silently.
 :::
 
-The obvious way to snap a coordinate to a 0.01° grid is to divide and turn the result into
+The obvious way to snap a coordinate to a 0.01 degree grid is to divide and turn the result into
 an integer. Both of the obvious ways to turn it into an integer are wrong.
 
 ```python
@@ -51,18 +51,18 @@ print(
 #  'cast': [0, 0, -2, 2], 'floored': [-1, 0, -2, 1]}
 ```
 
-Check the promise against the middle column. A point at longitude −0.005 gets `cast` bin 0,
+Check the promise against the middle column. A point at longitude -0.005 gets `cast` bin 0,
 and bin 0 is supposed to span [0.000, 0.010). The point is not in it. `cast` rounds half-to-even
-rather than truncating, so both −0.005 and +0.005 collapse into bin 0: one double-width cell
+rather than truncating, so both -0.005 and +0.005 collapse into bin 0: one double-width cell
 straddling the meridian, with the two cells either side of it half empty. `round` is off by the
-same half-cell in a different direction. Its bin `b` covers [(b−0.5)·CELL, (b+0.5)·CELL), so the
+same half-cell in a different direction. Its bin `b` covers `[(b - 0.5) * CELL, (b + 0.5) * CELL)`, so the
 number you get back names a cell *centre* while you were reasoning about corners.
 
-| Snap | Bin for −0.005 | Bin for +0.005 | Keeps `b * CELL <= x < (b+1) * CELL`? |
+| Snap | Bin for -0.005 | Bin for +0.005 | Keeps `b * CELL <= x < (b+1) * CELL`? |
 | --- | --- | --- | --- |
-| `.round(0)` | −1.0 | 1.0 | No. Names the cell centre, not its corner. |
+| `.round(0)` | -1.0 | 1.0 | No. Names the cell centre, not its corner. |
 | `.cast("int64")` | 0 | 0 | No. Both signs collapse into one double-width cell. |
-| `.floor().cast("int64")` | −1 | 0 | Yes, on both signs, everywhere. |
+| `.floor().cast("int64")` | -1 | 0 | Yes, on both signs, everywhere. |
 
 :::{tip}
 Only `floor` satisfies the promise. Use it. The follow-on consequences of not using it are
@@ -153,7 +153,7 @@ should be the same point can print differently, and you get two cells where you 
 :::
 
 :::{dropdown} Degrees are not distance
-A 0.01° cell is about 1.1 km tall everywhere. Its *width* is 1.1 km at the equator, 0.87 km
+A 0.01 degree cell is about 1.1 km tall everywhere. Its *width* is 1.1 km at the equator, 0.87 km
 in San Francisco, 0.69 km in London, and it collapses to nothing at the poles. So the cells
 in this grid are not the same size, and a density comparison between London and Singapore
 made on this grid is comparing rectangles of different areas. That is fine for "find the
@@ -178,7 +178,7 @@ print(bay_area.to_pydict()["id"])
 # [1, 2, 3]
 ```
 
-Push this *before* the binning when you can. The grid is a shuffle; the bounding box is a
+Push this *before* the binning when you can. The grid is a shuffle. The bounding box is a
 filter, and Kyber pushes filters down to the scan, so the shuffle only ever sees the rows
 you care about.
 

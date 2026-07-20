@@ -1,12 +1,14 @@
 # The ML accessor
 
+This page covers the `.ml` accessor on a `Dataset` and the `batcher.ml` package behind it. For the relational surface these compose with, see [Dataset](dataset.md).
+
 ML work attaches to a `Dataset` through the `.ml` accessor:
 
 | Method | Use |
 | --- | --- |
 | `ds.ml.map_batches(fn, ...)` | Apply an arbitrary function to each Arrow batch. |
-| `ds.ml.infer(model, ...)` | Run batch inference — a model id + `column`, or a model callable. |
-| `ds.ml.embed(model, ...)` | Generate embeddings — a model id + `column`, or a model callable. |
+| `ds.ml.infer(model, ...)` | Run batch inference from a model id plus `column`, or from a model callable. |
+| `ds.ml.embed(model, ...)` | Generate embeddings from a model id plus `column`, or from a model callable. |
 | `ds.ml.generate(engine, ...)` | Offline LLM text generation, appending the response column. |
 | `ds.ml.download(url_col, ...)` | Fetch bytes at each URL/path into a column. |
 | `ds.ml.upload(data_col, dir, ...)` | Write a bytes column out to object storage. |
@@ -16,10 +18,11 @@ ML work attaches to a `Dataset` through the `.ml` accessor:
 | `ds.ml.random_split(fractions, seed=0)` | The n-way generalization (train/val/test). |
 | `ds.ml.near_duplicates(column, threshold=0.8)` | MinHash + LSH near-duplicate pairs. |
 | `ds.ml.drop_near_duplicates(column, threshold=0.8)` | Fuzzy dedup, keeping one per cluster. |
+| `ds.ml.nearest_neighbors(query, column="embedding", k=10, metric="cosine")` | Exact brute-force top-`k` retrieval against a query vector. |
+| `ds.ml.similarity_to(query, column="embedding", metric="cosine")` | Score every row against a query vector (no top-`k` cut). |
+| `ds.ml.normalize_embeddings(column, output_column=None)` | Unit-normalize an embedding column (L2 = 1). |
 
-These operate on whole `pyarrow.RecordBatch` objects, never on individual rows.
-They are lazy like every other transformation and return a new `Dataset` (except the
-loaders, which return a torch iterator).
+These operate on whole `pyarrow.RecordBatch` objects, never on individual rows. They're lazy, as every other transformation is, and return a new `Dataset`. The loaders are the exception, returning a torch iterator.
 
 ## Whole-batch semantics
 
@@ -68,7 +71,7 @@ print(ds.ml.map_batches(Scale(10)).to_pydict())
 ```
 
 For a real model, the constructor loads the weights and `__call__` runs the
-forward pass. That needs a GPU and a model, so it is shown but not run here.
+forward pass. That needs a GPU and a model, so it's shown but not run here.
 
 ```python
 # docs: skip
@@ -92,7 +95,7 @@ labelled = ds.ml.map_batches(Classifier(), num_gpus=1, concurrency=4)
 
 ## Common arguments
 
-All three methods share these keywords:
+`map_batches`, `infer`, and `embed` share these keywords:
 
 | Argument | Meaning |
 | --- | --- |
@@ -102,21 +105,15 @@ All three methods share these keywords:
 | `num_gpus` | GPUs to reserve per worker (a fraction packs several workers onto one GPU). |
 | `concurrency` | Actor-pool size: an `int` for a fixed pool, or a `(min, max)` tuple to autoscale to the workload. |
 | `accelerator_type` | Pin GPU actors to a device model (a `ray.util.accelerators` name such as `"NVIDIA_A100"`). |
-| `model_memory_gb` | The model's GB footprint — budgets host memory per worker (OOM protection) and VRAM-packs small models onto a shared GPU. |
+| `model_memory_gb` | The model's GB footprint. Budgets host memory per worker to protect against OOM, and VRAM-packs small models onto a shared GPU. |
 | `num_workers` | Number of workers (`map_batches`). |
 
 `num_gpus` and `concurrency` together describe a GPU actor pool: each actor holds
-`num_gpus` of a device, and `concurrency` actors run in parallel. `batch_format`
-converts only around the call; the engine boundary stays Arrow. See
-[GPU scheduling](../ml/gpu.md).
+`num_gpus` of a device, and `concurrency` actors run in parallel. `batch_format` converts only around the call, and the engine boundary stays Arrow. See [GPU scheduling](../ml/gpu.md).
 
 ## infer and embed
 
-`ds.ml.infer(model, ...)` and `ds.ml.embed(model, ...)` are the inference-shaped
-calls. The quickest form is a **model identifier** plus the `column` to run on: the
-model loads once per worker and the result is appended (a prediction for `infer`, a
-vector for `embed`). `infer` resolves a HuggingFace `transformers` pipeline; `embed`
-resolves a `sentence-transformers` model.
+`ds.ml.infer(model, ...)` and `ds.ml.embed(model, ...)` are the inference-shaped calls. The quickest form is a **model identifier** plus the `column` to run on. The model loads once per worker and the result is appended, as a prediction for `infer` and a vector for `embed`. `infer` resolves a HuggingFace `transformers` pipeline, and `embed` resolves a `sentence-transformers` model.
 
 ```python
 # docs: skip
@@ -124,10 +121,7 @@ scored = ds.ml.infer("distilbert-base-uncased-finetuned-sst-2-english", column="
 vectors = ds.ml.embed("sentence-transformers/all-MiniLM-L6-v2", column="text")
 ```
 
-For full control — a custom model, a non-text modality, or your own batching — pass a
-callable or a class that loads weights once per worker, and declare the result schema
-with `output_columns`. Both forms take `batch_size`, `num_gpus`, and `concurrency`.
-Real models need GPUs, so these are not run here.
+For full control over a custom model, a non-text modality, or your own batching, pass a callable or a class that loads weights once per worker, and declare the result schema with `output_columns`. Both forms take `batch_size`, `num_gpus`, and `concurrency`. Real models need GPUs, so these aren't run here.
 
 ```python
 # docs: skip
@@ -138,21 +132,16 @@ vectors = ds.ml.embed(Embedder(), output_columns=[...], batch_size=256, num_gpus
 See [Inference](../ml/inference.md) for the inference workflow and
 [Streaming](../ml/streaming.md) for feeding training loops.
 
-## The `batcher.ml` package
+## What lives outside the accessor
 
-Operators that are not `Dataset` methods live in `batcher.ml` — the standalone
-`embed` / `llm_generate` functions, the [preprocessors](../ml/preprocessors.md),
-the [serving adapters](../ml/serving.md), [vector search](../ml/multimodal.md), the
-`Chain` preprocessor pipeline, the `ResumableSampler` (checkpointable per-rank index
-stream), and the [LLM engines](../ml/llm.md). A *callable* model passed to `map_batches`/`infer`
-receives the whole batch and picks its own columns (no `input_columns=` keyword); the
-model-identifier form of `infer`/`embed` instead takes the `column` to run on.
+Operators that aren't `Dataset` methods live in `batcher.ml`: the standalone `embed` and `llm_generate` functions, the [preprocessors](../ml/preprocessors.md), the [serving adapters](../ml/serving.md), [vector search](../ml/multimodal.md), the `Chain` preprocessor pipeline, the `ResumableSampler` checkpointable per-rank index stream, and the [LLM engines](../ml/llm.md).
+
+A *callable* model passed to `map_batches` or `infer` receives the whole batch and picks its own columns, so there's no `input_columns=` keyword. The model-identifier form of `infer` and `embed` takes the `column` to run on instead.
 
 ## Preprocessors
 
 `batcher.ml.preprocessors` holds the fit/transform feature-engineering estimators.
-Each one `fit`s over a `Dataset` to learn its statistics, then `transform`s any
-`Dataset` with them; `Chain` composes several into one pipeline. See the
+Each one `fit`s over a `Dataset` to learn its statistics, then `transform`s any `Dataset` with them. `Chain` composes several into one pipeline. See the
 [preprocessors guide](../ml/preprocessors.md) for how they fit into a training
 workflow.
 
@@ -167,6 +156,8 @@ workflow.
 ```
 
 ### Scalers and normalizers
+
+These rescale numeric columns:
 
 ```{eval-rst}
 .. autoclass:: StandardScaler
@@ -187,6 +178,8 @@ workflow.
 
 ### Encoders
 
+These turn categorical columns into numeric ones:
+
 ```{eval-rst}
 .. autoclass:: OneHotEncoder
    :members:
@@ -199,9 +192,14 @@ workflow.
 
 .. autoclass:: OrdinalEncoder
    :members:
+
+.. autoclass:: TargetEncoder
+   :members:
 ```
 
 ### Binning, imputation, text, and assembly
+
+The rest of the estimators cover discretization, missing values, text splitting, and feature assembly:
 
 ```{eval-rst}
 .. autoclass:: KBinsDiscretizer
@@ -215,14 +213,14 @@ workflow.
 
 .. autoclass:: Concatenator
    :members:
+
+.. autoclass:: PolynomialFeatures
+   :members:
 ```
 
-## The `batcher.ml` module
+## `batcher.ml` reference
 
-The `.ml` accessor above covers the common path. Underneath it, `batcher.ml` exports the
-same machinery as plain functions over Arrow batch iterators — which is what you reach
-for when you are driving the pipeline yourself (a custom training loop, a serving
-process) rather than executing a `Dataset`.
+The `.ml` accessor above covers the common path. Underneath it, `batcher.ml` exports the same machinery as plain functions over Arrow batch iterators. Reach for those when you're driving the pipeline yourself, such as from a custom training loop or a serving process, rather than executing a `Dataset`.
 
 ```python
 import batcher.ml as ml
@@ -322,9 +320,7 @@ shard.
 
 ### Sampling and resumption
 
-Deterministic, resumable epoch ordering — so a training run that dies at step 40,000
-restarts at step 40,000 seeing the same samples in the same order, rather than silently
-re-showing data it already trained on.
+These give deterministic, resumable epoch ordering. A training run that dies at step 40,000 restarts at step 40,000 seeing the same samples in the same order, rather than silently re-showing data it already trained on.
 
 ```{eval-rst}
 .. autoclass:: ResumableSampler
@@ -343,6 +339,8 @@ re-showing data it already trained on.
 ```
 
 ### Vector search
+
+Build an index over an embedding column and query it:
 
 ```{eval-rst}
 .. autosummary::

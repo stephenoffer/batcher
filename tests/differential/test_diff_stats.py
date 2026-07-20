@@ -7,6 +7,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col, count
 
 
@@ -25,8 +26,6 @@ def t(duck):
 
 
 def test_var_stddev_grouped_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = (
         bt.from_arrow(t)
         .group_by("g")
@@ -41,16 +40,12 @@ def test_var_stddev_grouped_vs_duckdb(duck, t):
 
 
 def test_var_stddev_global_vs_duckdb(duck, t):
-    from conftest import assert_same
-
     out = bt.from_arrow(t).group_by().agg(var=col("v").var(), sd=col("v").std()).collect()
     expected = duck.sql("SELECT var_samp(v) var, stddev_samp(v) sd FROM t")
     assert_same(out, expected)
 
 
 def test_var_stddev_via_sql(duck, t):
-    from conftest import assert_same
-
     q = "SELECT g, var_samp(v) AS var, stddev_samp(v) AS sd FROM t GROUP BY g"
     assert_same(bt.sql(q, t=t).collect(), duck.sql(q))
 

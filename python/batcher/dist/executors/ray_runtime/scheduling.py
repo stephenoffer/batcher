@@ -58,8 +58,18 @@ def task_options(env: SchedulingEnvelope | None) -> dict:
             opts["memory"] = int(env.memory_bytes)
         if env.num_gpus > 0:
             opts["num_gpus"] = env.num_gpus
-            if env.accelerator_type is not None:
-                opts["accelerator_type"] = env.accelerator_type
+        # Custom accelerator resources: Ray reports NVIDIA/AMD/Intel/MetaX as `GPU`
+        # (covered by `num_gpus`) but everything else as a named resource — `TPU`,
+        # `neuron_cores`, `HPU`, `NPU` — as does any resource an operator defined on their
+        # own cluster. Merged, not assigned, so it composes with the CPU-only node selector
+        # below rather than one silently overwriting the other.
+        if env.resources:
+            opts["resources"] = {**opts.get("resources", {}), **dict(env.resources)}
+        # Applied for any accelerator, not just GPUs: a TPU/Trainium node has `num_gpus == 0`,
+        # so gating this on GPUs dropped the device-model pin on exactly the hardware that
+        # most needs it, letting the task land anywhere in the cluster.
+        if env.accelerator_type is not None and (env.num_gpus > 0 or env.resources):
+            opts["accelerator_type"] = env.accelerator_type
         # Hard-restrict a CPU-only fleet to CPU-only nodes when the cluster opts in and can
         # host it (a no-op otherwise). Keeps a CPU shuffle from stealing an inference
         # stage's GPU-node cores; additive to Ray's soft GPU-node avoidance.

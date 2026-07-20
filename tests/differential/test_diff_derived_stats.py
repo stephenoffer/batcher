@@ -14,8 +14,8 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
-from conftest import assert_same
 
 pytestmark = pytest.mark.differential
 
@@ -58,6 +58,54 @@ def test_derived_statistics_match_duckdb(duck, nums):
         "stddev_samp(x) / sqrt(count(x)) AS sem, "
         "(max(x) + min(x)) / 2 AS mid "
         "FROM t GROUP BY g"
+    )
+    assert_same(out.to_arrow(), expected)
+
+
+@pytest.fixture
+def singleton(duck):
+    """A group of one, a group of two, and a group whose only value is null.
+
+    `var_pop`/`stddev_pop` are *population* statistics, so a one-row group is defined
+    and equal to 0 — where the *sample* `var`/`std` are null. The 4-and-3-row fixture
+    above never exercises that, which is how `var_pop` shipped as
+    ``var_samp * (n - 1) / n``: algebraically right, but null at ``n == 1`` because
+    `var_samp` is, so ``NULL * 0`` swallowed the answer.
+    """
+    tbl = pa.table(
+        {
+            "g": ["one", "two", "two", "null"],
+            "x": [5.0, 2.0, 6.0, None],
+        }
+    )
+    duck.register("t", tbl)
+    return tbl
+
+
+def test_rms_of_large_integers_does_not_overflow(duck):
+    """`rms` must widen to Float64 before squaring, not square in the input type.
+
+    Squaring an Int64 column overflows silently: `4e9 * 4e9` wraps to a negative, the
+    mean of those is negative, and the square root of a negative is `NaN`. The true RMS
+    of a constant column is that constant. DuckDB raises `OutOfRangeException` on the
+    un-widened square rather than returning a wrong number, so the oracle here is the
+    explicitly widened `x::double * x::double`.
+    """
+    tbl = pa.table({"x": pa.array([4_000_000_000, 4_000_000_000, 3], type=pa.int64())})
+    duck.register("t", tbl)
+    out = bt.from_arrow(tbl).agg(r=bt.rms("x"))
+    expected = duck.sql("SELECT sqrt(avg(x::double * x::double)) AS r FROM t")
+    assert_same(out.to_arrow(), expected)
+
+
+def test_population_stats_of_a_singleton_group_are_zero(duck, singleton):
+    out = (
+        bt.from_arrow(singleton)
+        .group_by("g")
+        .agg(vp=bt.var_pop("x"), sp=bt.stddev_pop("x"), n=col("x").count())
+    )
+    expected = duck.sql(
+        "SELECT g, var_pop(x) AS vp, stddev_pop(x) AS sp, count(x) AS n FROM t GROUP BY g"
     )
     assert_same(out.to_arrow(), expected)
 

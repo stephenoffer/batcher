@@ -1,10 +1,11 @@
 # Sorting
 
 Sorting is a pipeline breaker: the engine has to see every row before it can emit the
-first one. That makes it one of the few operators where a bug hides easily. A result
-that is *almost* ordered still looks right in a `head(5)`, and an order-independent
-assertion in your test cannot see the difference at all. This page is the contract:
-what `sort` guarantees, where nulls and NaN land, and when not to sort at all.
+first one. That also makes it one of the few operators where a bug hides in plain sight.
+A result that is *almost* ordered still looks right in a `head(5)`, and an
+order-independent assertion in your test cannot see the difference at all. This page is
+the contract: what `sort` guarantees, where nulls and NaN land, and when not to sort at
+all.
 
 ## Setup
 
@@ -100,7 +101,7 @@ print(scores.sort("score", nulls_first=True).to_pydict())
 # {'name': ['b', 'c', 'd', 'a'], 'score': [None, 1, 2, 3]}
 ```
 
-Note what that means for `head`: `sort("score", descending=True).head(1)` gives you the
+That matters for `head`: `sort("score", descending=True).head(1)` gives you the
 maximum, never a null row. If you want nulls out of the result entirely, say so with
 `drop_nulls`. Do not rely on where the sort happens to put them.
 
@@ -108,7 +109,8 @@ maximum, never a null row. If you want nulls out of the result entirely, say so 
 
 NaN is not null and it is not "unordered". Batcher sorts it as larger than every
 number, so ascending puts it after `+inf` and before the nulls; descending puts it
-first. `-0.0` and `0.0` compare equal, so their relative order is a tie like any other.
+first. `-0.0` and `0.0` compare equal, so their relative order is a tie, the same as any
+other tie.
 
 ```python
 floats = bt.from_pydict({"x": [1.0, float("nan"), -0.0, 0.0, None, -1.0]})
@@ -159,8 +161,8 @@ print(ds.top_k(2, by="score").select("name", "score").to_pydict())
 # {'name': ['eve', 'ann'], 'score': [41, 30]}
 ```
 
-`descending=True` is the default there (top means largest); pass `descending=False` for
-the bottom `k`. The same rule applies to `limit`: the optimizer can push a limit into a
+`descending=True` is the default there, since top means largest. Pass `descending=False`
+for the bottom `k`. The same rule applies to `limit`: the optimizer can push a limit into a
 sort, but it cannot push one into a sort you wrote as a separate materialized step.
 
 Sorting to make a *later* operator cheaper is usually wasted too. A `group_by` hashes,

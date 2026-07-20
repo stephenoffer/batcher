@@ -13,6 +13,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 
@@ -30,8 +31,6 @@ def _array_table() -> pa.Table:
 
 
 def test_json_array_index_string(duck):
-    from conftest import assert_same
-
     t = _array_table()
     duck.register("j", t)
     out = (
@@ -52,8 +51,6 @@ def test_json_array_index_string(duck):
 
 
 def test_json_array_nested_index_int(duck):
-    from conftest import assert_same
-
     t = _array_table()
     duck.register("j", t)
     out = bt.from_arrow(t).select(id1=col("j").json.extract_int("$.items[1].id")).collect()
@@ -61,8 +58,6 @@ def test_json_array_nested_index_int(duck):
 
 
 def test_sql_json_extract_string(duck):
-    from conftest import assert_same
-
     t = _array_table()
     duck.register("j", t)
     session = bt.Session()
@@ -72,8 +67,6 @@ def test_sql_json_extract_string(duck):
 
 
 def test_sql_json_extract_cast_and_filter(duck):
-    from conftest import assert_same
-
     t = pa.table(
         {
             "j": [
@@ -96,8 +89,6 @@ def test_sql_json_extract_cast_and_filter(duck):
 
 def test_sql_json_arrow_operator(duck):
     """The ``->>`` arrow operator lowers to the same extractor as the function form."""
-    from conftest import assert_same
-
     t = pa.table({"j": ['{"a": {"b": "x"}}', '{"a": {"b": "y"}}']})
     duck.register("j", t)
     session = bt.Session()

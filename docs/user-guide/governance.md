@@ -72,7 +72,7 @@ Each call records a `Grant`: a role, a table, and the columns that role may read
 (`select=None` means all of them). A catalog is a list of those. That is what keeps it a
 value you can print and diff and review, rather than a service you have to interrogate.
 
-A column the principal may not select simply does not exist for it. Referencing
+A column the principal may not select does not exist for it at all. Referencing
 `salary` raises the ordinary unknown-column error, not "access denied". An error that
 said "you may not read `salary`" would itself confirm that `salary` exists.
 
@@ -225,7 +225,7 @@ unreadable row must not abort a scan of a billion. An all-NULL result is the una
 signal that the key is wrong.
 
 For pseudonymized analytics, prefer `hmac_sha256` over a bare `sha256`: a plain digest
-of a low-entropy value like an email address is recovered by trying every email
+of a low-entropy value such as an email address is recovered by trying every email
 address, while an HMAC is not, because the attacker lacks the key.
 
 ```python
@@ -253,6 +253,98 @@ wire. An inline literal key still works for local development but emits a
 `SecurityWarning`, because it embeds the secret in the query and its serialized plan. A
 missing reference (`env:` var unset, `file:` path absent) fails loudly, naming the
 *reference*, never the key.
+
+### Data at rest on the node
+
+A query that spills writes its actual rows to the local scratch directory. A large
+aggregate, join, sort, or window can all do this. Batcher creates that directory `0o700`,
+so another local user on a shared node cannot read a spilled join off disk.
+
+That is access control, **not encryption**: the bytes on disk are plaintext Arrow IPC. If
+your threat model includes the disk itself (a seized volume, a snapshot, a
+multi-tenant host you do not control), use an encrypted filesystem or an encrypted
+instance volume for `memory.spill_dir`. Column-level `aes_encrypt` protects a column
+end to end, including through a spill, but costs a decrypt wherever the value is used.
+
+### Reaching Vault, KMS, or Secret Manager
+
+Two schemes cover an external key store, and neither links a cloud SDK into the engine:
+
+**A file, via the platform's own secret delivery.** Vault Agent, the External Secrets
+Operator, and the Kubernetes secrets-store CSI driver all materialize a secret as a file,
+so `file:/run/secrets/aes-key` *is* the integration. Rotation, authentication, and audit
+stay with the platform that owns them.
+
+**`cmd:NAME`, via a helper program.** Batcher runs the operator-configured
+`BATCHER_SECRET_COMMAND` with `NAME` as its argument and takes stdout as the secret:
+
+```bash
+export BATCHER_SECRET_COMMAND=/usr/local/bin/fetch-secret   # your wrapper around
+                                                            # vault / aws / gcloud / az
+```
+
+```python
+# docs: skip
+ds.select(c=bt.aes_encrypt(bt.col("ssn"), "cmd:prod/aes-key"))
+```
+
+`cmd:` is **inert unless the operator sets `BATCHER_SECRET_COMMAND`**, and the reference
+supplies only the *argument*, never the program. That asymmetry is the security property:
+a plan is data and may arrive from somewhere less trusted than the cluster, so letting it
+name a program to execute would turn a secret reference into arbitrary code execution. The
+argument is passed as an argument, never through a shell, so metacharacters in a reference
+are inert.
+
+Resolutions are cached for `BATCHER_SECRET_TTL_SECONDS` (default 300, `0` disables),
+because references resolve on a per-batch path. Without a cache, a `cmd:` reference would
+fork a process for every Arrow batch. The TTL bounds how long a rotated secret stays stale.
+
+### Connection credentials take references too
+
+The same `env:` / `file:` indirection works for every connector password, token, API key,
+and connection URI. That is the larger secret surface in most deployments.
+
+```python
+# docs: skip
+import batcher as bt
+
+bt.read.clickhouse(query="SELECT ...", host="ch.internal", database="events",
+                   password="env:CH_PASSWORD")
+
+bt.read.table("connectorx", query="SELECT ...", conn_uri="file:/run/secrets/pg_uri")
+
+bt.read.mongo(uri="env:MONGO_URI", database="app", collection="events")
+```
+
+The reference is resolved on the machine that **opens the connection**, not on the driver
+that builds the plan. So the source object and the pickled split that reaches a Ray worker
+carry only the reference: the secret never crosses the wire, never sits in driver memory,
+and cannot surface in a traceback or a log line that renders a split. A missing reference
+fails loudly, naming the *reference*.
+
+A literal password still works unchanged. This is additive, not a migration.
+
+### Enforcing references in a regulated deployment
+
+The warning is a weak control on its own. `SecurityWarning` is a `UserWarning`, so Python
+prints it once per call site and a process that filtered warnings never sees it. Meanwhile
+an inline key still travels verbatim in the serialized IR, into `explain(format="json")`
+and the plan fingerprint, and out to every worker the plan is shipped to.
+
+Set `BATCHER_REQUIRE_KEY_REFS=1` to refuse inline keys outright. `aes_encrypt`,
+`aes_decrypt`, and `hmac_sha256` then raise `PlanError` at plan-build time unless the key
+is an `env:` / `file:` reference. Set it in the pod spec or node environment for the whole
+deployment; leave it unset in notebooks and tests, where an inline key is legitimate.
+
+```bash
+export BATCHER_REQUIRE_KEY_REFS=1
+```
+
+:::{note}
+Prefer `file:` over `env:` where a user-supplied UDF may run. A UDF executes in a worker
+process that inherits the environment, so it can read an `env:`-referenced key; a `file:`
+reference with restrictive permissions is not readable the same way.
+:::
 
 ## Fingerprints and change detection
 
@@ -301,7 +393,7 @@ print(sample.select(m=bt.col("s").str.md5(), c=bt.col("s").str.crc32()).to_pydic
 
 The same caution the table draws for a bare `sha256` applies to these: a `md5` or
 `sha1` digest is **not** a safe pseudonym. Both are cryptographic hashes, but a digest of
-a low-entropy value like an email address is recovered by hashing every candidate. It
+a low-entropy value such as an email address is recovered by hashing every candidate. It
 leaks exactly what a pseudonym must hide. For pseudonymized-but-joinable analytics use
 `hmac_sha256` (above), whose key the attacker lacks. Reserve `hash_rows`, `md5`, `sha1`,
 `crc32`, and the `xxhash64`/`hash64` pair for fingerprinting, bucketing, and integrity
@@ -437,3 +529,5 @@ own store and check into review.
   consumer.
 - [Complete API reference](../api/complete.md): `SecurityCatalog`, `Principal`,
   `GovernanceEvent`, and `security`.
+- [Agent skills](../agents/index.md): `apply-governance-and-security`, the same
+  surface as a procedure, with what to verify before trusting an enforced plan.

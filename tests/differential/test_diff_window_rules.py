@@ -12,7 +12,7 @@ import pytest
 
 import batcher as bt
 import batcher.kyber.rules.extra.window_rules
-from conftest import assert_same
+from _harness import assert_same
 
 
 @pytest.fixture

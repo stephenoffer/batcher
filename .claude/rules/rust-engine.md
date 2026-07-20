@@ -7,11 +7,32 @@ correct as it grows multiple execution tiers and scales from one core to a clust
 ## Crate DAG — dependencies point one way only
 
 ```
-bc-arrow → bc-expr → bc-ir → ┬→ bc-runtime ┐
-                             └→ bc-codegen  ┴→ bc-interp → bc-py
-bc-sketches   (depends only on bc-arrow / arrow)
-bc-transport  (depends only on bc-arrow / arrow + flight stack)
+                    ┌→ bc-ir → bc-runtime ┐
+bc-arrow → bc-expr →┤                     ├→ bc-interp → bc-py
+                    └→ bc-codegen ────────┘
+leaves (no bc-* deps), pulled in where they are needed:
+  bc-sketches  → bc-runtime (agg/hll, agg/qsketch), bc-py
+  bc-resource  → bc-interp, bc-py
+  bc-transport → bc-py
+  bc-io        → bc-py
+  bc-secrets   → bc-expr (resolves `env:`/`file:`/`cmd:` secret references, with a
+                  TTL cache). Deliberately dependency-free: it sits under bc-expr,
+                  which everything links, so a cloud SDK here would put tokio + a TLS
+                  stack into builds that never resolve a secret. External key stores
+                  are reached via `cmd:` or a host-registered backend.
+  bc-udf       → (nothing depends on it yet — the UDF/inference plane is not
+                  wired into bc-py; do not assume it is on a live path)
 ```
+
+Two things this picture gets right that the shorter `bc-arrow → bc-expr → bc-ir →
+{bc-runtime, bc-codegen} → …` chain got wrong, and that you should not "correct"
+back: **`bc-codegen` does not depend on `bc-ir`** — it compiles scalar `Expr`, so
+it sits beside `bc-ir`, both fed by `bc-expr`. And **`bc-py` is not merely
+downstream of `bc-interp`**: it depends directly on `bc-sketches`, `bc-transport`,
+`bc-io`, and `bc-resource` as well, which makes it a second assembly point, not a
+thin cap on the chain. `MAP.md` prints the live dependency list for every crate,
+read from the manifests — check there rather than trusting this diagram if the two
+ever disagree.
 
 - A crate MUST depend only on crates strictly below it. Never add an upward edge
   (e.g. `bc-runtime` importing `bc-interp`) or a sideways one. If you need a type
@@ -107,5 +128,6 @@ signatures, so SIMD/NUMA/spillable rewrites can land without touching callers.
 
 ## Gate before "done"
 
-`just check` → `just test-rust` → `cargo clippy ... -D warnings`. If you touched
-the FFI surface or IR tags, also `just build` + `just test-py`. See `/run-quality-gate`.
+The canonical gate matrix is in `CLAUDE.md` — run the rows your change touches. Rust
+delta: a new `bc-runtime` primitive needs its mergeability invariant test, and an FFI or
+IR-tag change needs `just surface-diff` to prove the boundary is unchanged.

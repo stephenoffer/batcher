@@ -13,6 +13,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
 from batcher import col
 
 pytestmark = pytest.mark.differential
@@ -39,24 +40,18 @@ def _bools():
 
 
 def test_min_horizontal_matches_duckdb(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_nums()).select(m=bt.min_horizontal(col("a"), col("b"), col("c"))).collect()
     duck.register("t", _nums())
     assert_same(out, duck.sql("SELECT least(a, b, c) AS m FROM t"))
 
 
 def test_max_horizontal_matches_duckdb(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_nums()).select(m=bt.max_horizontal(col("a"), col("b"), col("c"))).collect()
     duck.register("t", _nums())
     assert_same(out, duck.sql("SELECT greatest(a, b, c) AS m FROM t"))
 
 
 def test_horizontal_min_max_agree_with_sql_aliases(duck):
-    from conftest import assert_same
-
     # The Polars-named spellings are the SQL greatest/least — same result.
     out = (
         bt.from_arrow(_nums())
@@ -71,8 +66,6 @@ def test_horizontal_min_max_agree_with_sql_aliases(duck):
 
 
 def test_all_horizontal_matches_duckdb(duck):
-    from conftest import assert_same
-
     x = bt.all_horizontal(col("p"), col("q"), col("r"))
     out = bt.from_arrow(_bools()).select(x=x).collect()
     duck.register("t", _bools())
@@ -80,8 +73,6 @@ def test_all_horizontal_matches_duckdb(duck):
 
 
 def test_any_horizontal_matches_duckdb(duck):
-    from conftest import assert_same
-
     x = bt.any_horizontal(col("p"), col("q"), col("r"))
     out = bt.from_arrow(_bools()).select(x=x).collect()
     duck.register("t", _bools())
@@ -89,8 +80,6 @@ def test_any_horizontal_matches_duckdb(duck):
 
 
 def test_all_horizontal_single_arg(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_bools()).select(x=bt.all_horizontal(col("p"))).collect()
     duck.register("t", _bools())
     assert_same(out, duck.sql("SELECT p AS x FROM t"))
@@ -106,8 +95,6 @@ def test_all_horizontal_single_arg(duck):
     ],
 )
 def test_between_closed_matches_duckdb(duck, closed, lower_op, upper_op):
-    from conftest import assert_same
-
     data = pa.table({"x": pa.array([1, 3, 5, 8, 10, None], type=pa.int64())})
     out = bt.from_arrow(data).select(r=col("x").between(3, 8, closed=closed)).collect()
     duck.register("t", data)
@@ -115,8 +102,6 @@ def test_between_closed_matches_duckdb(duck, closed, lower_op, upper_op):
 
 
 def test_between_default_is_inclusive(duck):
-    from conftest import assert_same
-
     data = pa.table({"x": pa.array([1, 3, 5, 8, 10], type=pa.int64())})
     out = bt.from_arrow(data).select(r=col("x").between(3, 8)).collect()
     duck.register("t", data)
@@ -135,8 +120,6 @@ def _lists():
 
 
 def test_list_first_matches_get_0(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_lists()).select(r=col("a").list.first()).collect()
     duck.register("t", _lists())
     # DuckDB lists are 1-indexed; element [1] is the first (NULL for empty/null list).
@@ -144,8 +127,6 @@ def test_list_first_matches_get_0(duck):
 
 
 def test_list_last_matches_get_neg1(duck):
-    from conftest import assert_same
-
     out = bt.from_arrow(_lists()).select(r=col("a").list.last()).collect()
     duck.register("t", _lists())
     assert_same(out, duck.sql("SELECT a[-1] AS r FROM t"))

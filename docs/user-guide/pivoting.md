@@ -45,9 +45,8 @@ print(sales.pivot(index=["region"], on="quarter", values="amount", aggregate="me
 :::{warning}
 Omit `columns` and the engine runs an eager pass over `on` to discover the distinct
 values, before the real query even starts. On a large scan that is a second read of the
-data, and worse, it makes the output schema unpredictable: a month with no rows yet
-simply has no column, so a downstream `select("q3")` fails on Tuesday and works on
-Wednesday.
+data, and worse, it makes the output schema unpredictable: a month with no rows yet has
+no column, so a downstream `select("q3")` fails on Tuesday and works on Wednesday.
 :::
 
 Pass `columns=[...]` when you know the vocabulary. The pre-pass disappears, the schema
@@ -105,7 +104,7 @@ all:
 
 | | `pivot` | `unpivot` |
 | --- | --- | --- |
-| Direction | long → wide | wide → long |
+| Direction | long to wide | wide to long |
 | Output schema | data-dependent, unless you pass `columns` | fixed by the arguments |
 | Extra pass over the data | yes, unless you pass `columns` | never |
 | Pipeline breaker | yes, it groups | no, it streams |
@@ -152,8 +151,8 @@ print(back.drop_nulls().sort("region", "quarter").to_pydict())
 
 - [Aggregations](aggregations.md): the aggregate a pivot cell is built from.
 - [Transformations](transformations.md): `explode` and `unnest`, the other two reshapers.
-- [SQL](sql.md): the SQL surface. Note that SQL `PIVOT` / `UNPIVOT` are *not* supported and
-  raise `NotImplementedError` — reshaping goes through `ds.pivot(...)` / `ds.unpivot(...)`,
+- [SQL](sql.md): the SQL surface. SQL `PIVOT` and `UNPIVOT` are *not* supported and raise
+  `NotImplementedError`. Reshaping goes through `ds.pivot(...)` and `ds.unpivot(...)`,
   which you can call on the result of a `bt.sql(...)` query.
 - [Aggregation internals](../deep-dives/aggregation-internals.md): the grouped hash
   aggregate a pivot cell is computed by.

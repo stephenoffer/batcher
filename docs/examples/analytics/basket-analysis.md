@@ -80,7 +80,7 @@ print(sql_pairs.to_pydict()["both"])
 ::::
 
 The guard also halves the work, which matters more than the aesthetics. A basket with `k`
-items produces `k²` rows from the join and `k(k−1)/2` after the filter. Batcher pushes the
+items produces `k * k` rows from the join and `k * (k - 1) / 2` after the filter. Batcher pushes the
 predicate down, so the filter runs as the join emits rather than after it materializes.
 The join itself is still quadratic *per basket*, though. One pathological order with 2,000
 line items contributes four million rows on its own. Cap it before you join:
@@ -139,11 +139,11 @@ in opposite orders:
 | bread, jam | 2 | 0.4 | 0.83 |
 | bread, butter | 2 | 0.4 | 0.83 |
 
-Read the bottom row. `bread → butter` has the joint-highest raw count (2) and the joint-
-highest support (0.4), and its lift is **0.83**, below 1. Bread is in four of five
+Read the bottom row. `bread -> butter` has the joint-highest raw count (2) and the
+joint-highest support (0.4), and its lift is **0.83**, below 1. Bread is in four of five
 baskets, so butter appearing alongside it is not a signal, it is arithmetic. Rank by count
 and you would ship "customers who buy bread also buy butter" as an insight. Rank by lift
-and `jam → milk` comes out on top, on a single co-occurrence.
+and `jam -> milk` comes out on top, on a single co-occurrence.
 
 :::{important}
 Which is the other half of the lesson: lift is loud on rare pairs. One order is not
@@ -154,8 +154,8 @@ catalogue), and treat anything below that as noise no matter how good the lift l
 ## Confidence has a direction
 
 `item < item_b` keeps one row per unordered pair. That is right for support and lift, which
-are symmetric, and wrong for confidence, which is not. `confidence(bread → jam)` is 2/4 = 0.5;
-`confidence(jam → bread)` is 2/3 = 0.67. The table above only has the first.
+are symmetric, and wrong for confidence, which is not. `confidence(bread -> jam)` is 2/4 = 0.5.
+`confidence(jam -> bread)` is 2/3 = 0.67. The table above only has the first.
 
 If you want both directions, swap the guard for `!=`, which keeps both orderings and still
 excludes self-pairs. It doubles the row count, and it is the right call when you are
